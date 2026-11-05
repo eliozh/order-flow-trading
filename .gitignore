@@ -1,0 +1,5 @@
+.claude/*.local.md
+.claude/ecc-workflow/
+.env
+.env.*
+!.env.example
