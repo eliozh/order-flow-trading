@@ -1,0 +1,880 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>OFT — Style Specimen</title>
+<style>
+  :root{
+    --bg:#0A0B0D; --panel:#0E1014; --raised:#12151B; --inset:#07080A;
+    --hover:#171B22; --selected:#16242B;
+    --text:#E8EDF2; --text2:#9AA6B2; --muted:#828E9E; --disabled:#56616F;
+    --border:#262C36; --border-subtle:#1D222B; --border-strong:#3A424F; --border-control:#6B7785;
+    --accent:#4DD8E6; --accent-hover:#7BE4EE;
+    --up:#35D07F; --down:#FF5D6A; --flat:#8B98A8;
+    --warn:#FFB020; --ok:#4FD1A5; --info:#62B6FF; --danger:#FF6B6B;
+    --mono:ui-monospace,"SFMono-Regular","JetBrains Mono","Cascadia Code","Roboto Mono",Menlo,Consolas,"Liberation Mono",monospace;
+    --sans:ui-sans-serif,system-ui,-apple-system,"Segoe UI","Noto Sans SC","PingFang SC","Microsoft YaHei",sans-serif;
+    --r:2px;
+    --focus:0 0 0 2px var(--bg),0 0 0 4px var(--accent);
+  }
+  *{box-sizing:border-box}
+  html,body{margin:0;padding:0;background:var(--bg);color:var(--text)}
+  body{font-family:var(--sans);font-size:14px;line-height:1.6;-webkit-font-smoothing:antialiased;text-rendering:optimizeLegibility}
+  .mono{font-family:var(--mono);font-variant-numeric:tabular-nums slashed-zero;font-feature-settings:"tnum" 1,"zero" 1}
+  .wrap{max-width:1600px;margin:0 auto;padding:24px}
+  a{color:var(--accent)}
+  ::selection{background:#1E4A52;color:#F7FAFC}
+  :focus-visible{outline:none;box-shadow:var(--focus)}
+  .sr{position:absolute;width:1px;height:1px;padding:0;margin:-1px;overflow:hidden;clip:rect(0,0,0,0);white-space:nowrap;border:0}
+
+  /* ---------- status bar ---------- */
+  .statusbar{height:40px;display:flex;align-items:center;gap:14px;padding:0 16px;border-bottom:1px solid var(--border);background:var(--panel);font-family:var(--mono);font-size:12px;white-space:nowrap;overflow:hidden}
+  .statusbar .mark{color:var(--text);font-weight:700;letter-spacing:.08em}
+  .statusbar .sep{color:var(--muted)}
+  .statusbar .env{display:inline-flex;align-items:center;gap:6px;height:20px;padding:0 6px;border:1px solid var(--ok);color:var(--ok);background:#0C1D19;font-size:11px;letter-spacing:.04em}
+  .dot{width:6px;height:6px;border-radius:50%;background:var(--ok);display:inline-block}
+  .dot.pulse{animation:pulse 2s cubic-bezier(.2,0,0,1) infinite}
+  @keyframes pulse{0%,100%{opacity:1}50%{opacity:.35}}
+  .statusbar .spacer{flex:1}
+  .kill{height:22px;display:inline-flex;align-items:center;gap:6px;padding:0 8px;border:1px solid var(--border-strong);background:transparent;color:var(--text2);font-family:var(--mono);font-size:11px;cursor:pointer}
+  .kill:hover{border-color:var(--down);color:var(--down)}
+  .kill[aria-pressed="true"]{border-color:var(--down);background:#2A0E12;color:var(--down)}
+
+  /* ---------- header ---------- */
+  .spec-head{display:grid;grid-template-columns:minmax(0,1fr) auto;gap:24px;align-items:end;padding:28px 0 20px;border-bottom:1px solid var(--border)}
+  .eyebrow{font-family:var(--mono);font-size:11px;letter-spacing:.08em;color:var(--muted);text-transform:uppercase}
+  h1{font-size:32px;line-height:1.15;font-weight:700;letter-spacing:-.01em;margin:8px 0 4px}
+  .sub{color:var(--text2);max-width:72ch;margin:0}
+  .headmeta{border:1px solid var(--border);background:var(--panel);padding:10px 12px;min-width:260px}
+  .headmeta div{display:flex;justify-content:space-between;gap:16px;font-family:var(--mono);font-size:11px;line-height:1.8;color:var(--muted)}
+  .headmeta b{color:var(--text2);font-weight:500}
+  .headmeta .hl{color:var(--accent)}
+
+  /* ---------- sections ---------- */
+  .section{margin-top:40px}
+  .section-head{display:flex;align-items:baseline;gap:12px;border-bottom:1px solid var(--border);padding-bottom:8px;margin-bottom:16px}
+  .section-head h2{font-size:20px;line-height:1.25;font-weight:600;margin:0}
+  .section-head .idx{font-family:var(--mono);font-size:11px;color:var(--muted);letter-spacing:.08em}
+  .section-head .note{margin-left:auto;color:var(--muted);font-size:12px}
+  .panel{background:var(--panel);border:1px solid var(--border)}
+  .pad{padding:16px}
+  .grid2{display:grid;grid-template-columns:1fr 1fr;gap:16px}
+  .grid3{display:grid;grid-template-columns:repeat(3,1fr);gap:16px}
+  .stack{display:flex;flex-direction:column;gap:12px}
+  .row{display:flex;gap:12px;align-items:center;flex-wrap:wrap}
+
+  /* ---------- tokens ---------- */
+  .swatches{display:grid;grid-template-columns:repeat(auto-fill,minmax(104px,1fr));gap:8px}
+  .swatch{border:1px solid var(--border);background:var(--panel)}
+  .swatch .box{height:44px;border-bottom:1px solid var(--border-subtle)}
+  .swatch .meta{padding:6px 8px;font-family:var(--mono);font-size:11px;line-height:1.35}
+  .swatch .meta b{display:block;color:var(--text);font-weight:500}
+  .swatch .meta span{color:var(--muted)}
+  .swatch .meta em{display:block;color:var(--text2);font-style:normal;margin-top:2px}
+  .semantic-grid{display:grid;grid-template-columns:repeat(auto-fill,minmax(132px,1fr));gap:8px}
+  .semantic{border:1px solid var(--border);display:flex;align-items:stretch;min-height:52px}
+  .semantic .chipbox{width:8px}
+  .semantic .smeta{padding:7px 9px;font-family:var(--mono);font-size:11px;line-height:1.35}
+  .semantic .smeta b{display:block;color:var(--text);font-weight:500}
+  .semantic .smeta span{color:var(--muted)}
+  .heatpair{display:grid;grid-template-columns:64px 1fr 1fr;border:1px solid var(--border);font-family:var(--mono);font-size:11px}
+  .heatpair>div{padding:4px 6px;border-bottom:1px solid var(--border-subtle);border-right:1px solid var(--border-subtle)}
+  .heatpair .h{color:var(--muted);text-align:center}
+
+  /* ---------- type ---------- */
+  .type-row{display:grid;grid-template-columns:132px minmax(0,1fr);gap:16px;align-items:baseline;padding:10px 0;border-bottom:1px solid var(--border-subtle)}
+  .type-row:last-child{border-bottom:0}
+  .type-label{font-family:var(--mono);font-size:11px;color:var(--muted);line-height:1.4}
+  .type-label b{display:block;color:var(--text2);font-weight:500}
+  .t-micro{font-size:11px;line-height:1.2;font-family:var(--mono);letter-spacing:.08em;text-transform:uppercase}
+  .t-caption{font-size:12px;line-height:1.35;color:var(--text2)}
+  .t-data{font-size:13px;line-height:1.35;font-family:var(--mono);font-variant-numeric:tabular-nums slashed-zero}
+  .t-body{font-size:14px;line-height:1.6;max-width:72ch}
+  .t-title3{font-size:16px;line-height:1.3;font-weight:600}
+  .t-title2{font-size:20px;line-height:1.25;font-weight:600}
+  .t-title1{font-size:24px;line-height:1.2;font-weight:700}
+  .t-display{font-size:32px;line-height:1.1;font-weight:700;letter-spacing:-.01em;font-family:var(--mono);font-variant-numeric:tabular-nums}
+  .numstack{border:1px solid var(--border);background:var(--inset)}
+  .numrow{display:grid;grid-template-columns:1fr repeat(3,120px);gap:0;border-bottom:1px solid var(--border-subtle);font-family:var(--mono);font-size:13px;font-variant-numeric:tabular-nums slashed-zero}
+  .numrow:last-child{border-bottom:0}
+  .numrow>span{padding:5px 8px;border-right:1px solid var(--border-subtle)}
+  .numrow>span:last-child{border-right:0;text-align:right}
+  .numrow.head{font-size:11px;color:var(--muted);text-transform:uppercase;letter-spacing:.04em;background:var(--panel)}
+  .numrow .up{color:var(--up)} .numrow .down{color:var(--down)} .numrow .muted{color:var(--muted)}
+
+  /* ---------- stamps / chips ---------- */
+  .stamp{display:inline-flex;align-items:center;height:18px;padding:0 5px;border:1px solid var(--border-strong);font-family:var(--mono);font-size:11px;letter-spacing:.08em;line-height:1;white-space:nowrap}
+  .stamp.calc{color:var(--text2);border-color:var(--border-strong);background:transparent}
+  .stamp.llm{color:var(--accent);border-color:#4DD8E680;background:#4DD8E60A}
+  .stamp.stale{color:var(--warn);border-color:#FFB02080;background:#FFB0200F}
+  .stamp.na{color:var(--down);border-color:#FF5D6A80;background:#FF5D6A0F}
+  .chip{display:inline-flex;align-items:center;gap:5px;height:20px;padding:0 6px;border:1px solid var(--border-strong);background:var(--panel);font-family:var(--mono);font-size:11px;line-height:1;white-space:nowrap;border-radius:var(--r)}
+  .chip.neutral{color:#C7D2DF;background:#1D222B;border-color:#3A424F}
+  .chip.info{color:var(--info);background:#1A2735;border-color:var(--info)}
+  .chip.ok{color:var(--ok);background:#132B23;border-color:var(--ok)}
+  .chip.warn{color:var(--warn);background:#302616;border-color:var(--warn)}
+  .chip.danger{color:var(--down);background:#301B20;border-color:var(--down)}
+  .chip.accent{color:var(--accent);background:#172C31;border-color:var(--accent)}
+  .chip .sq{width:5px;height:5px;background:currentColor;display:inline-block}
+  .chips{display:flex;flex-wrap:wrap;gap:6px}
+
+  /* ---------- provenance demo ---------- */
+  .prov{display:grid;grid-template-columns:1fr 1fr;gap:0;border:1px solid var(--border)}
+  .prov>div{padding:14px 16px}
+  .prov .calcside{border-right:1px solid var(--border);background:var(--panel)}
+  .prov .llmside{background:#4DD8E60A;border-left:2px solid var(--accent)}
+  .prov h3{font-size:13px;margin:0 0 10px;font-weight:600;display:flex;align-items:center;gap:8px}
+  .metriclist{display:grid;grid-template-columns:1fr auto;gap:0;font-family:var(--mono);font-size:12px}
+  .metriclist span{padding:4px 0;border-bottom:1px solid var(--border-subtle);color:var(--text2)}
+  .metriclist b{padding:4px 0;border-bottom:1px solid var(--border-subtle);text-align:right;font-weight:500;font-variant-numeric:tabular-nums slashed-zero}
+  .metriclist b.up{color:var(--up)} .metriclist b.down{color:var(--down)}
+  .narrative{font-size:14px;line-height:1.65;color:var(--text);margin:0 0 10px}
+  .narrative em{font-style:normal;color:var(--accent)}
+  .provfoot{font-family:var(--mono);font-size:11px;letter-spacing:.04em;color:var(--muted);text-transform:uppercase}
+
+  /* ---------- dense table ---------- */
+  .tablewrap{overflow:auto;border:1px solid var(--border);background:var(--panel)}
+  table.dense{border-collapse:collapse;width:100%;min-width:900px}
+  table.dense caption{text-align:left;padding:8px 10px;color:var(--muted);font-family:var(--mono);font-size:12px;letter-spacing:.04em;border-bottom:1px solid var(--border)}
+  table.dense th{position:sticky;top:0;background:var(--panel);font-family:var(--mono);font-size:12px;letter-spacing:.06em;text-transform:uppercase;color:var(--muted);font-weight:500;text-align:right;padding:7px 8px;border-bottom:1px solid var(--border);white-space:nowrap}
+  table.dense th:first-child,table.dense th:nth-child(2){text-align:left}
+  table.dense td{padding:0 8px;height:32px;border-bottom:1px solid var(--border-subtle);white-space:nowrap;font-size:13px;color:var(--text2)}
+  table.dense td.sym{font-family:var(--mono);color:var(--text);font-weight:500;font-size:13px}
+  table.dense td.n{text-align:right;font-family:var(--mono);font-size:13px;font-variant-numeric:tabular-nums slashed-zero;color:var(--text)}
+  table.dense td.up{color:var(--up)} table.dense td.down{color:var(--down)} table.dense td.muted{color:var(--muted)}
+  table.dense tbody tr:hover td{background:var(--hover)}
+  table.dense tbody tr.sel td{background:var(--selected)}
+  table.dense tbody tr.sel td:first-child{box-shadow:inset 2px 0 0 var(--accent)}
+  .dataq{font-family:var(--mono);font-size:11px;letter-spacing:.04em}
+  .dataq.partial{color:var(--warn)} .dataq.complete{color:var(--ok)} .dataq.stale{color:var(--warn)}
+
+  .density-grid{display:grid;grid-template-columns:minmax(0,1fr) 320px;gap:16px;align-items:start}
+  .queue{background:var(--panel);border:1px solid var(--border)}
+  .queue-head{display:flex;align-items:center;gap:8px;padding:8px 12px;border-bottom:1px solid var(--border)}
+  .queue-head b{font-size:12px;font-weight:600;color:var(--text)}
+  .queue-head .count{margin-left:auto;font-family:var(--mono);font-size:11px;color:var(--warn)}
+  .qitem{padding:10px 12px;border-bottom:1px solid var(--border-subtle);display:grid;grid-template-columns:1fr auto;gap:4px 8px}
+  .qitem:last-child{border-bottom:0}
+  .qitem .sym{font-family:var(--mono);font-size:12px;color:var(--text);font-weight:600}
+  .qitem .why{grid-column:1/-1;font-size:12px;color:var(--text2);line-height:1.45}
+  .qitem .meta{grid-column:1/-1;display:flex;gap:10px;font-family:var(--mono);font-size:11px;color:var(--muted)}
+  .qitem .meta b{color:var(--text2);font-weight:500}
+  .qitem.attn{box-shadow:inset 2px 0 0 var(--warn)}
+  .qitem.act{box-shadow:inset 2px 0 0 var(--accent)}
+  .qlink{font-family:var(--mono);font-size:11px;color:var(--accent);text-decoration:none;border-bottom:1px solid #4DD8E666;align-self:start}
+  .qlink:hover{color:var(--accent-hover)}
+
+  /* ---------- chart ---------- */
+  .chartpanel{border:1px solid var(--border);background:var(--panel)}
+  .charthead{display:flex;align-items:center;gap:10px;flex-wrap:wrap;padding:8px 12px;border-bottom:1px solid var(--border);font-family:var(--mono);font-size:11px}
+  .charthead .pair{font-size:13px;font-weight:600;color:var(--text);letter-spacing:.02em}
+  .charthead .tf{border:1px solid var(--border-strong);padding:1px 5px;color:var(--text2)}
+  .charthead .spacer{flex:1}
+  .chartbody{display:grid;grid-template-columns:minmax(0,1fr) 218px;gap:0;background:var(--inset)}
+  .chart-scroll{overflow-x:auto;min-width:0}
+  .chart-canvas{min-width:600px}
+  svg.chart{display:block;width:100%;height:auto;background:var(--inset)}
+  .fp{border-left:1px solid var(--border);background:var(--panel);min-width:0}
+  .fp-head{padding:6px 8px;border-bottom:1px solid var(--border);font-family:var(--mono);font-size:11px;letter-spacing:.04em;color:var(--muted);display:flex;align-items:center;gap:6px}
+  .fp-head b{color:var(--text2);font-weight:500}
+  .fp-table{font-family:var(--mono);font-size:11px;font-variant-numeric:tabular-nums slashed-zero}
+  .fp-row{display:grid;grid-template-columns:50px 1fr 1fr 40px;border-bottom:1px solid var(--border-subtle)}
+  .fp-row>div{padding:2px 4px;line-height:18px;border-right:1px solid var(--border-subtle);text-align:right;color:var(--text)}
+  .fp-row>div:nth-child(3){text-align:left;padding-left:6px}
+  .fp-row>div:last-child{border-right:0;color:var(--text2)}
+  .fp-row.fh>div{color:var(--muted);font-size:11px;letter-spacing:.04em;text-transform:uppercase;text-align:right}
+  .fp-row.fh>div:nth-child(3){text-align:left;padding-left:6px}
+  .fp-row.fh>div:first-child{text-align:left}
+  .fp-row.poc{outline:1px solid var(--border-strong);outline-offset:-1px}
+  .fp-row.poc>div:first-child{color:var(--warn)}
+  .b1{background:rgba(255,93,106,.10)} .b2{background:rgba(255,93,106,.20)} .b3{background:rgba(255,93,106,.30)} .b4{background:rgba(255,93,106,.42);box-shadow:inset 2px 0 0 rgba(255,93,106,.65)} .b5{background:rgba(255,93,106,.42);box-shadow:inset 2px 0 0 #FF5D6A}
+  .a1{background:rgba(53,208,127,.10)} .a2{background:rgba(53,208,127,.20)} .a3{background:rgba(53,208,127,.30)} .a4{background:rgba(53,208,127,.42);box-shadow:inset 2px 0 0 rgba(53,208,127,.65)} .a5{background:rgba(53,208,127,.42);box-shadow:inset 2px 0 0 #35D07F}
+  .fp-note{padding:6px 8px;font-family:var(--mono);font-size:11px;line-height:1.5;color:var(--muted);border-top:1px solid var(--border)}
+  .legend{display:flex;flex-wrap:wrap;gap:12px;padding:8px 12px;border-top:1px solid var(--border);font-family:var(--mono);font-size:11px;color:var(--muted)}
+  .legend i{display:inline-block;width:14px;height:2px;vertical-align:middle;margin-right:4px}
+  .legend .sqr{width:8px;height:8px;display:inline-block;margin-right:4px}
+  .chart-foot{display:flex;flex-wrap:wrap;gap:8px;padding:8px 12px;border-top:1px solid var(--border);font-family:var(--mono);font-size:11px;color:var(--muted)}
+
+  /* ---------- components ---------- */
+  .btn{height:28px;padding:0 10px;background:var(--raised);border:1px solid var(--border-strong);color:var(--text);font-family:var(--mono);font-size:11px;cursor:pointer;border-radius:var(--r)}
+  .btn:hover{border-color:var(--text2);background:var(--hover)}
+  .btn.primary{background:var(--accent);border-color:var(--accent);color:#07080A;font-weight:700}
+  .btn.primary:hover{background:var(--accent-hover);border-color:var(--accent-hover)}
+  .btn.danger{background:transparent;border-color:var(--down);color:var(--down)}
+  .btn.danger:hover{background:#2A0E12}
+  .btn:disabled{opacity:.45;cursor:not-allowed}
+  .field{display:flex;flex-direction:column;gap:4px;min-width:220px}
+  .field label{font-family:var(--mono);font-size:11px;letter-spacing:.04em;text-transform:uppercase;color:var(--muted)}
+  .input{height:28px;background:var(--inset);border:1px solid var(--border-control);color:var(--text);font-family:var(--mono);font-size:12px;padding:0 8px;border-radius:var(--r)}
+  .input::placeholder{color:var(--disabled)}
+  .input.focus{box-shadow:var(--focus);border-color:var(--accent)}
+  .banner{display:flex;gap:10px;align-items:flex-start;padding:9px 12px;border:1px solid var(--border);border-left-width:2px;background:var(--panel);font-size:13px}
+  .banner.warn{border-left-color:var(--warn);background:#2A2110}
+  .banner.danger{border-left-color:var(--danger);background:#2A1416}
+  .banner.info{border-left-color:var(--info);background:#101F2E}
+  .banner.ok{border-left-color:var(--ok);background:#0C1D19}
+  .banner b{font-weight:600;color:var(--text)}
+  .banner span{color:var(--text2)}
+  .riskbar{height:6px;background:var(--raised);border:1px solid var(--border);position:relative}
+  .riskbar i{display:block;height:100%;background:var(--warn)}
+  .bignum{font-family:var(--mono);font-size:28px;line-height:1.1;font-weight:700;font-variant-numeric:tabular-nums slashed-zero}
+  .caption{font-family:var(--mono);font-size:11px;letter-spacing:.04em;color:var(--muted);text-transform:uppercase}
+
+  /* ---------- CLI ---------- */
+  .term{background:var(--inset);border:1px solid var(--border);padding:14px 16px;font-family:var(--mono);font-size:12px;line-height:1.55;white-space:pre;overflow:auto;color:var(--text2)}
+  .term b{color:var(--text);font-weight:500}
+  .term .c{color:var(--accent)} .term .g{color:var(--up)} .term .r{color:var(--down)} .term .w{color:var(--warn)} .term .m{color:var(--muted)} .term .k{color:var(--info)}
+  .term .prompt{color:var(--accent)}
+  .term .rule{color:var(--muted)}
+  .term .cursor{display:inline-block;width:7px;height:13px;background:var(--accent);vertical-align:-2px;animation:pulse 2s step-end infinite}
+
+  /* ---------- do / don't ---------- */
+  .dodont{display:grid;grid-template-columns:1fr 1fr;gap:16px}
+  .dd{border:1px solid var(--border);padding:14px 16px;background:var(--panel)}
+  .dd h3{margin:0 0 8px;font-size:13px;font-weight:600;display:flex;gap:8px;align-items:center}
+  .dd ul{margin:0;padding-left:18px;color:var(--text2);font-size:13px}
+  .dd li{margin:5px 0}
+  .dd.do h3{color:var(--ok)} .dd.dont h3{color:var(--down)}
+  .dd code{font-family:var(--mono);font-size:11px;color:var(--text);background:var(--raised);padding:1px 4px;border:1px solid var(--border-subtle)}
+
+  footer{margin-top:40px;padding:16px 0 40px;border-top:1px solid var(--border);display:flex;gap:16px;justify-content:space-between;flex-wrap:wrap;font-family:var(--mono);font-size:11px;color:var(--muted);letter-spacing:.04em}
+
+  /* ---------- responsive ---------- */
+  @media (max-width:1200px){
+    .density-grid{grid-template-columns:1fr}
+    .chartbody{grid-template-columns:1fr}
+    .fp{border-left:0;border-top:1px solid var(--border)}
+    .fp-row{grid-template-columns:44px 1fr 1fr 40px}
+    .fp-table,.fp-note{max-width:640px}
+  }
+  @media (max-width:900px){
+    .grid2,.grid3,.prov,.dodont{grid-template-columns:1fr}
+    .prov .calcside{border-right:0;border-bottom:1px solid var(--border)}
+    .spec-head{grid-template-columns:1fr}
+    .headmeta{min-width:0}
+  }
+  @media (max-width:768px){
+    .wrap{padding:16px}
+    h1{font-size:24px}
+    .statusbar .hide-sm{display:none}
+    .type-row{grid-template-columns:1fr;gap:4px}
+    .charthead{font-size:11px}
+    .chart-canvas{min-width:640px}
+    .numrow{grid-template-columns:1fr repeat(3,92px);font-size:12px}
+  }
+  @media (max-width:480px){
+    .wrap{padding:12px}
+    h1{font-size:22px;line-height:1.2}
+    .section{margin-top:32px}
+    .section-head{flex-wrap:wrap}
+    .section-head .note{margin-left:0;width:100%}
+    .statusbar{gap:8px;padding:0 10px}
+    .statusbar .mark{font-size:11px}
+    .headmeta div{font-size:11px}
+    .chips{gap:4px}
+    .numrow{grid-template-columns:1fr repeat(3,80px)}
+  }
+  @media (max-width:640px){
+    .chart-tooltip{display:none}
+  }
+  @media (prefers-reduced-motion:reduce){
+    *,*::before,*::after{animation-duration:.01ms !important;animation-iteration-count:1 !important;transition-duration:.01ms !important}
+  }
+</style>
+</head>
+<body>
+
+<div class="statusbar" role="banner">
+  <span class="mark">OFT<span class="sep"> // </span>ORDER FLOW</span>
+  <span class="env"><span class="dot pulse"></span>PAPER</span>
+  <span class="sep hide-sm">|</span>
+  <span class="hide-sm">DAEMON <span class="dot"></span></span>
+  <span class="hide-sm">NEXT <b style="color:var(--text2)">02:14:07</b> UTC</span>
+  <span class="hide-sm">SCAN 10 SYMBOLS</span>
+  <span class="spacer"></span>
+  <span class="hide-sm" style="color:var(--muted)">BUDGET <span style="color:var(--warn)">$2.18</span> / $10.00</span>
+  <button class="kill" aria-pressed="false">KILL SWITCH</button>
+</div>
+
+<div class="wrap">
+
+  <header class="spec-head">
+    <div>
+      <div class="eyebrow">Stage 3 · Style specimen · 2026-11-06</div>
+      <h1>订单流 LLM 交易系统</h1>
+      <p class="sub">高对比终端方向：近黑画布、可见网格、等宽数字、锐角面板。颜色是数据通道，不是装饰。<br>
+      <span class="mono" style="font-size:11px;letter-spacing:.06em;color:var(--muted)">DARK-FIRST · TABULAR NUMERALS · CALC / LLM PROVENANCE · NO GRADIENT · NO GLASS</span></p>
+    </div>
+    <div class="headmeta" aria-label="Specimen metadata">
+      <div><span>DESIGN DIRECTION</span><b>Market terminal</b></div>
+      <div><span>PRIMARY VIEWPORT</span><b>1440 × 900</b></div>
+      <div><span>TOKENS</span><b class="hl">1.0.0</b></div>
+      <div><span>BASE TYPE</span><b>13 data / 14 body</b></div>
+      <div><span>CONTRAST</span><b>16.7:1 primary</b></div>
+    </div>
+  </header>
+
+  <!-- ============ 01 TOKENS ============ -->
+  <section class="section" aria-labelledby="s1">
+    <div class="section-head"><span class="idx">01</span><h2 id="s1">Tokens</h2><span class="note">Near-black steps, reserved market colors, chart series</span></div>
+
+    <div class="stack">
+      <div>
+        <div class="caption" style="margin-bottom:6px">Neutral ramp · 950 → 50</div>
+        <div class="swatches">
+          <div class="swatch"><div class="box" style="background:#07080A"></div><div class="meta"><b>#07080A</b><span>n950 · inset</span></div></div>
+          <div class="swatch"><div class="box" style="background:#0A0B0D"></div><div class="meta"><b>#0A0B0D</b><span>n900 · canvas</span></div></div>
+          <div class="swatch"><div class="box" style="background:#0E1014"></div><div class="meta"><b>#0E1014</b><span>n850 · panel</span></div></div>
+          <div class="swatch"><div class="box" style="background:#12151B"></div><div class="meta"><b>#12151B</b><span>n800 · raised</span></div></div>
+          <div class="swatch"><div class="box" style="background:#171B22"></div><div class="meta"><b>#171B22</b><span>n750 · hover</span></div></div>
+          <div class="swatch"><div class="box" style="background:#1D222B"></div><div class="meta"><b>#1D222B</b><span>n700 · subtle</span></div></div>
+          <div class="swatch"><div class="box" style="background:#262C36"></div><div class="meta"><b>#262C36</b><span>n650 · border</span></div></div>
+          <div class="swatch"><div class="box" style="background:#3A424F"></div><div class="meta"><b>#3A424F</b><span>n600 · strong</span></div></div>
+          <div class="swatch"><div class="box" style="background:#56616F"></div><div class="meta"><b>#56616F</b><span>n500 · disabled</span></div></div>
+          <div class="swatch"><div class="box" style="background:#7C8898"></div><div class="meta"><b>#7C8898</b><span>n400 · muted</span></div></div>
+          <div class="swatch"><div class="box" style="background:#9AA6B2"></div><div class="meta"><b>#9AA6B2</b><span>n300 · secondary</span></div></div>
+          <div class="swatch"><div class="box" style="background:#C7D2DF"></div><div class="meta"><b>#C7D2DF</b><span>n200 · strong text</span></div></div>
+          <div class="swatch"><div class="box" style="background:#E8EDF2"></div><div class="meta"><b>#E8EDF2</b><span>n100 · primary</span></div></div>
+          <div class="swatch"><div class="box" style="background:#F7FAFC"></div><div class="meta"><b>#F7FAFC</b><span>n50 · max</span></div></div>
+        </div>
+      </div>
+
+      <div>
+        <div class="caption" style="margin-bottom:6px">Semantic · contrast on canvas</div>
+        <div class="semantic-grid">
+          <div class="semantic"><div class="chipbox" style="background:#4DD8E6"></div><div class="smeta"><b>accent #4DD8E6</b><span>focus · link · LLM</span><em>11.51:1</em></div></div>
+          <div class="semantic"><div class="chipbox" style="background:#35D07F"></div><div class="smeta"><b>up #35D07F</b><span>long · positive</span><em>9.83:1</em></div></div>
+          <div class="semantic"><div class="chipbox" style="background:#FF5D6A"></div><div class="smeta"><b>down #FF5D6A</b><span>short · negative</span><em>6.59:1</em></div></div>
+          <div class="semantic"><div class="chipbox" style="background:#8B98A8"></div><div class="smeta"><b>flat #8B98A8</b><span>neutral</span><em>6.71:1</em></div></div>
+          <div class="semantic"><div class="chipbox" style="background:#FFB020"></div><div class="smeta"><b>warn #FFB020</b><span>attention · stale</span><em>10.77:1</em></div></div>
+          <div class="semantic"><div class="chipbox" style="background:#4FD1A5"></div><div class="smeta"><b>ok #4FD1A5</b><span>paper · healthy</span><em>10.31:1</em></div></div>
+          <div class="semantic"><div class="chipbox" style="background:#62B6FF"></div><div class="smeta"><b>info #62B6FF</b><span>informational</span><em>9.05:1</em></div></div>
+          <div class="semantic"><div class="chipbox" style="background:#FF6B6B"></div><div class="smeta"><b>danger #FF6B6B</b><span>destructive · failed</span><em>7.09:1</em></div></div>
+        </div>
+      </div>
+
+      <div class="grid2">
+        <div>
+          <div class="caption" style="margin-bottom:6px">Chart series</div>
+          <div class="semantic-grid">
+            <div class="semantic"><div class="chipbox" style="background:#4DD8E6"></div><div class="smeta"><b>CVD</b><span>#4DD8E6</span></div></div>
+            <div class="semantic"><div class="chipbox" style="background:#FFB020"></div><div class="smeta"><b>OI</b><span>#FFB020</span></div></div>
+            <div class="semantic"><div class="chipbox" style="background:#62B6FF"></div><div class="smeta"><b>Funding</b><span>#62B6FF</span></div></div>
+            <div class="semantic"><div class="chipbox" style="background:#FF8A4C"></div><div class="smeta"><b>Liquidations</b><span>#FF8A4C</span></div></div>
+            <div class="semantic"><div class="chipbox" style="background:#A3E635"></div><div class="smeta"><b>Series 5</b><span>#A3E635</span></div></div>
+            <div class="semantic"><div class="chipbox" style="background:#E879C9"></div><div class="smeta"><b>Series 6</b><span>#E879C9</span></div></div>
+          </div>
+        </div>
+        <div>
+          <div class="caption" style="margin-bottom:6px">Footprint heat · fill capped at 42%, top steps add a bar</div>
+          <div class="heatpair">
+            <div class="h">LVL</div><div class="h">BID</div><div class="h">ASK</div>
+            <div>1</div><div class="b1">12.4</div><div class="a1">9.8</div>
+            <div>2</div><div class="b2">18.2</div><div class="a2">15.6</div>
+            <div>3</div><div class="b3">31.6</div><div class="a3">28.1</div>
+            <div>4</div><div class="b4">52.8</div><div class="a4">36.4</div>
+            <div>5</div><div class="b5">88.4</div><div class="a5">61.2</div>
+          </div>
+          <div class="caption" style="margin-top:6px;text-transform:none;letter-spacing:0">E8EDF2 text stays ≥ 6.6:1 on all steps.</div>
+        </div>
+      </div>
+    </div>
+  </section>
+
+  <!-- ============ 02 TYPE ============ -->
+  <section class="section" aria-labelledby="s2">
+    <div class="section-head"><span class="idx">02</span><h2 id="s2">Typography</h2><span class="note">Mono for machine data · sans for Chinese prose · tabular numerals</span></div>
+
+    <div class="panel pad">
+      <div class="type-row"><div class="type-label"><b>display / 32</b>mono · 700</div><div class="t-display">70,240.5 <span style="font-size:13px;color:var(--up);font-weight:500">+1.84%</span></div></div>
+      <div class="type-row"><div class="type-label"><b>title2 / 20</b>sans · 600</div><div class="t-title2">持仓与风险</div></div>
+      <div class="type-row"><div class="type-label"><b>title3 / 16</b>sans · 600</div><div class="t-title3">BTCUSDT · 4h 分析报告</div></div>
+      <div class="type-row"><div class="type-label"><b>body / 14</b>sans · 400</div><div class="t-body">价格进入 68,700–69,200 区域后出现吸收：CVD 自 −60 回升至 +320，而价格未创新低。该区域与 4h POC 重合，形成可观察的支撑结构。<span style="color:var(--muted)">（LLM 解读，需与 CALC 指标交叉验证。）</span></div></div>
+      <div class="type-row"><div class="type-label"><b>data / 13</b>mono · 500</div><div class="t-data">Δ +520 · CVD +700 · OI Δ +2.4% · Funding 0.0031% · 2026-11-05 20:00 UTC</div></div>
+      <div class="type-row"><div class="type-label"><b>caption / 12</b>mono</div><div class="t-caption">CVD 4H · 自部署起记录 · 无历史清算回补</div></div>
+      <div class="type-row"><div class="type-label"><b>micro / 11</b>mono · caps</div><div class="t-micro" style="color:var(--muted)">CALC · LLM · STALE · N/A · POC · VAH / VAL</div></div>
+    </div>
+
+    <div class="grid2" style="margin-top:16px">
+      <div class="numstack" aria-label="Tabular numeral specimen">
+        <div class="numrow head"><span>SYMBOL</span><span>LAST</span><span>CVD 4H</span><span>Δ</span></div>
+        <div class="numrow"><span>BTCUSDT</span><span>70240.50</span><span class="up">+1310</span><span class="up">+1.84%</span></div>
+        <div class="numrow"><span>ETHUSDT</span><span>3620.40</span><span class="up">+840</span><span class="up">+2.12%</span></div>
+        <div class="numrow"><span>XAUUSDT</span><span>4128.60</span><span class="down">−210</span><span class="down">−0.42%</span></div>
+        <div class="numrow"><span>TSLAUSDT</span><span>421.18</span><span class="up">+520</span><span class="up">+3.06%</span></div>
+      </div>
+      <div class="panel pad">
+        <div class="caption" style="margin-bottom:8px">Numeric rules</div>
+        <ul style="margin:0;padding-left:18px;color:var(--text2);font-size:13px">
+          <li><span class="mono">tabular-nums slashed-zero</span> on every value.</li>
+          <li>Right-aligned, fixed precision by tick size.</li>
+          <li>No thousands separators in dense tables; separators in summaries.</li>
+          <li>Chinese body never below 14px; 11px is Latin/numeric stamps only.</li>
+          <li>IDs, timestamps, order refs and metric codes always mono.</li>
+        </ul>
+      </div>
+    </div>
+  </section>
+
+  <!-- ============ 03 PROVENANCE ============ -->
+  <section class="section" aria-labelledby="s3">
+    <div class="section-head"><span class="idx">03</span><h2 id="s3">Provenance</h2><span class="note">The one memorable detail: deterministic and subjective never blend</span></div>
+
+    <div class="prov">
+      <div class="calcside">
+        <h3><span class="stamp calc">CALC</span> 代码计算 · 可复现</h3>
+        <div class="metriclist">
+          <span>窗口</span><b>2026-11-05 16:00 → 20:00 UTC</b>
+          <span>Delta</span><b class="up">+520</b>
+          <span>CVD</span><b class="up">+700</b>
+          <span>POC / VAH / VAL</span><b>69120 / 69320 / 68760</b>
+          <span>OI Δ</span><b class="up">+2.4%</b>
+          <span>Funding</span><b>0.0031%</b>
+          <span>Liquidations</span><b class="down">N/A · 自部署起</b>
+        </div>
+        <div class="provfoot" style="margin-top:10px">source: aggTrades + metrics · quality: COMPLETE · calc v0.1</div>
+      </div>
+      <div class="llmside">
+        <h3><span class="stamp llm">LLM</span> 模型解读 · 非执行指令</h3>
+        <p class="narrative">价格进入 68,700–69,200 后出现吸收：CVD 自 <em>−60 回升至 +320</em>，价格未创新低。该区域与 4h POC 重合，结构上倾向多头。<em>失效条件：4h 收盘低于 68,700。</em></p>
+        <div class="row">
+          <span class="chip accent">置信度 0.72 · 高</span>
+          <span class="chip neutral">LONG</span>
+        </div>
+        <div class="provfoot" style="margin-top:10px">claude-sonnet-5-5 · prompt v3 · temp 0.2 · $0.041 · schema valid</div>
+      </div>
+    </div>
+    <div class="banner info" style="margin-top:8px"><b>规则</b><span>LLM 叙述不进入执行层。执行必须经过 CALC 风控，风控取“LLM 提议”与“用户上限”中更严的一方。</span></div>
+  </section>
+
+  <!-- ============ 04 DENSITY ============ -->
+  <section class="section" aria-labelledby="s4">
+    <div class="section-head"><span class="idx">04</span><h2 id="s4">Data density</h2><span class="note">32px rows · 12–18 visible at 1440×900 · scan first, decorate never</span></div>
+
+    <div class="density-grid">
+      <div class="tablewrap">
+        <table class="dense">
+          <caption>STARRED SYMBOLS · 10 · NEXT SCAN 2026-11-06 02:14 UTC · LAST 2026-11-05 22:14 UTC</caption>
+          <thead>
+            <tr><th>Symbol</th><th>Last</th><th>24h Δ</th><th>CVD 4h</th><th>OI Δ</th><th>Funding</th><th>Data</th><th>State</th></tr>
+          </thead>
+          <tbody>
+            <tr class="sel"><td class="sym">BTCUSDT</td><td class="n">70240.50</td><td class="n up">+1.84%</td><td class="n up">+1310</td><td class="n up">+2.4%</td><td class="n">0.0031%</td><td><span class="dataq complete">● COMPLETE</span></td><td><span class="chip accent">已触发</span></td></tr>
+            <tr><td class="sym">ETHUSDT</td><td class="n">3620.40</td><td class="n up">+2.12%</td><td class="n up">+840</td><td class="n up">+1.1%</td><td class="n">0.0045%</td><td><span class="dataq complete">● COMPLETE</span></td><td><span class="chip neutral">待机</span></td></tr>
+            <tr><td class="sym">XAUUSDT</td><td class="n">4128.60</td><td class="n down">−0.42%</td><td class="n down">−210</td><td class="n down">−0.6%</td><td class="n">0.0000%</td><td><span class="dataq partial">● PARTIAL</span></td><td><span class="chip warn">观察</span></td></tr>
+            <tr><td class="sym">TSLAUSDT</td><td class="n">421.18</td><td class="n up">+3.06%</td><td class="n up">+520</td><td class="n up">+3.8%</td><td class="n">0.0000%</td><td><span class="dataq partial">● PARTIAL</span></td><td><span class="chip neutral">待机</span></td></tr>
+            <tr><td class="sym">SOLUSDT</td><td class="n">188.42</td><td class="n down">−1.12%</td><td class="n down">−360</td><td class="n down">−1.4%</td><td class="n">0.0092%</td><td><span class="dataq complete">● COMPLETE</span></td><td><span class="chip neutral">待机</span></td></tr>
+            <tr><td class="sym">NVDAUSDT</td><td class="n">182.66</td><td class="n up">+1.44%</td><td class="n up">+190</td><td class="n up">+0.7%</td><td class="n">0.0000%</td><td><span class="dataq partial">● PARTIAL</span></td><td><span class="chip warn">观察</span></td></tr>
+            <tr><td class="sym">AAPLUSDT</td><td class="n">246.10</td><td class="n down">−0.18%</td><td class="n down">−80</td><td class="n down">−0.2%</td><td class="n">0.0000%</td><td><span class="dataq stale">● STALE</span></td><td><span class="chip neutral">待机</span></td></tr>
+            <tr><td class="sym">XAGUSDT</td><td class="n">52.84</td><td class="n up">+0.66%</td><td class="n up">+120</td><td class="n up">+0.4%</td><td class="n">0.0000%</td><td><span class="dataq complete">● COMPLETE</span></td><td><span class="chip neutral">待机</span></td></tr>
+            <tr><td class="sym">BNBUSDT</td><td class="n">720.40</td><td class="n up">+0.92%</td><td class="n up">+210</td><td class="n down">−0.3%</td><td class="n">0.0067%</td><td><span class="dataq complete">● COMPLETE</span></td><td><span class="chip neutral">待机</span></td></tr>
+            <tr><td class="sym">DOGEUSDT</td><td class="n">0.1842</td><td class="n down">−2.31%</td><td class="n down">−540</td><td class="n down">−2.1%</td><td class="n">0.0104%</td><td><span class="dataq partial">● PARTIAL</span></td><td><span class="chip neutral">待机</span></td></tr>
+          </tbody>
+        </table>
+      </div>
+
+      <aside class="queue" aria-label="Decision queue">
+        <div class="queue-head"><b>待处理决策</b><span class="count">2 项</span></div>
+        <div class="qitem act">
+          <span class="sym">BTCUSDT · LONG</span>
+          <a class="qlink" href="#chart">查看</a>
+          <span class="why">价格触及 69,050 触发区；LLM 复核完成，等待人工接受或拒绝。</span>
+          <span class="meta"><span>置信度 <b>0.72</b></span><span>风险 <b>0.8%</b></span><span>CALC <b>通过</b></span></span>
+        </div>
+        <div class="qitem attn">
+          <span class="sym">XAUUSDT · 观察</span>
+          <a class="qlink" href="#">详情</a>
+          <span class="why">TradFi 标的缺少 bookTicker 历史；DOM 指标标记为不可用，不参与触发。</span>
+          <span class="meta"><span>数据 <b>PARTIAL</b></span><span>下一周期 <b>4h</b></span></span>
+        </div>
+        <div class="qitem">
+          <span class="sym">BUDGET · 日</span>
+          <a class="qlink" href="#">预算</a>
+          <span class="why">已使用 $2.18 / $10.00（21.8%）。达到 80% 时经 Telegram 告警；不设硬上限。</span>
+          <div class="riskbar" style="grid-column:1/-1;margin-top:4px"><i style="width:21.8%"></i></div>
+        </div>
+      </aside>
+    </div>
+
+    <div class="chips" style="margin-top:14px">
+      <span class="chip ok"><span class="dot"></span>PAPER</span>
+      <span class="chip danger"><span class="dot"></span>LIVE</span>
+      <span class="chip neutral">待机</span>
+      <span class="chip info">扫描中</span>
+      <span class="chip ok">已完成</span>
+      <span class="chip warn">部分数据</span>
+      <span class="chip warn">数据过期</span>
+      <span class="chip danger">失败</span>
+      <span class="chip neutral">开放</span>
+      <span class="chip accent">已触发</span>
+      <span class="chip neutral">已过期</span>
+      <span class="chip danger">已失效</span>
+      <span class="chip warn">待处理</span>
+      <span class="chip ok">已接受</span>
+      <span class="chip danger">已拒绝</span>
+      <span class="stamp calc">CALC</span>
+      <span class="stamp llm">LLM</span>
+      <span class="stamp stale">STALE</span>
+      <span class="stamp na">N/A</span>
+    </div>
+  </section>
+
+  <!-- ============ 05 CHART ============ -->
+  <section class="section" aria-labelledby="s5">
+    <div class="section-head"><span class="idx">05</span><h2 id="s5">Chart panel</h2><span class="note">Lightweight Charts base · custom footprint / profile / zones overlays</span></div>
+
+    <div class="chartpanel" id="chart">
+      <div class="charthead">
+        <span class="pair">BTCUSDT</span>
+        <span class="tf">4H</span>
+        <span class="stamp calc">CALC 98.2%</span>
+        <span class="stamp stale">LIQ SINCE 11-06</span>
+        <span class="spacer"></span>
+        <span style="color:var(--muted)">CANDLES</span>
+        <span style="color:var(--accent)">VOL</span>
+        <span style="color:var(--accent)">CVD</span>
+        <span style="color:var(--muted)">VP</span>
+        <span style="color:var(--accent)">FP</span>
+        <span style="color:var(--accent)">ZONES</span>
+        <span style="color:var(--muted)">MARKERS</span>
+      </div>
+      <div class="chartbody">
+        <div class="chart-scroll">
+          <div class="chart-canvas">
+            <svg class="chart" id="chartSvg" viewBox="0 0 720 520" role="img" aria-label="BTCUSDT 4 hour candlestick chart with volume, CVD, opportunity zone, entry and exit markers">
+              <title>BTCUSDT 4h chart mock</title>
+            </svg>
+          </div>
+        </div>
+        <div class="fp" aria-label="Footprint ladder">
+          <div class="fp-head"><b>FOOTPRINT</b><span>· 11-05 20:00</span></div>
+          <div class="fp-table">
+            <div class="fp-row fh"><div>PRICE</div><div>BID</div><div>ASK</div><div>Δ</div></div>
+            <div class="fp-row"><div>69320</div><div class="b1">12.4</div><div class="a5">41.8</div><div>+29.4</div></div>
+            <div class="fp-row"><div>69280</div><div class="b2">18.2</div><div class="a4">36.4</div><div>+18.2</div></div>
+            <div class="fp-row"><div>69240</div><div class="b2">22.8</div><div class="a3">28.1</div><div>+5.3</div></div>
+            <div class="fp-row"><div>69200</div><div class="b3">31.6</div><div class="a3">24.2</div><div>−7.4</div></div>
+            <div class="fp-row"><div>69160</div><div class="b4">44.2</div><div class="a2">19.8</div><div>−24.4</div></div>
+            <div class="fp-row poc"><div>69120</div><div class="b5">52.8</div><div class="a2">12.4</div><div>−40.4</div></div>
+            <div class="fp-row"><div>69080</div><div class="b4">38.6</div><div class="a2">21.2</div><div>−17.4</div></div>
+            <div class="fp-row"><div>69040</div><div class="b3">24.1</div><div class="a3">33.8</div><div>+9.7</div></div>
+            <div class="fp-row"><div>69000</div><div class="b2">16.8</div><div class="a4">42.4</div><div>+25.6</div></div>
+            <div class="fp-row"><div>68960</div><div class="b2">11.2</div><div class="a3">30.6</div><div>+19.4</div></div>
+            <div class="fp-row"><div>68920</div><div class="b1">8.4</div><div class="a2">18.2</div><div>+9.8</div></div>
+          </div>
+          <div class="fp-note">POC 69120 · imbalance marker on ask 69320 · fill ≤ 42% so values stay readable.</div>
+        </div>
+      </div>
+      <div class="legend">
+        <span><i style="background:var(--up)"></i>up candle</span>
+        <span><i style="background:var(--down)"></i>down candle</span>
+        <span><i style="background:var(--accent)"></i>CVD</span>
+        <span><i style="background:var(--warn)"></i>opportunity zone / trigger</span>
+        <span><i style="background:#E8EDF2"></i>POC</span>
+        <span><i style="background:var(--muted);border-top:1px dotted var(--muted);height:0"></i>VAH / VAL</span>
+        <span><span class="sqr" style="background:var(--accent)"></span>entry</span>
+        <span><span class="sqr" style="background:#C7D2DF"></span>exit</span>
+        <span style="color:var(--down)">× stop</span>
+        <span style="color:var(--up)">○ target</span>
+      </div>
+      <div class="chart-foot">
+        <span>DATA COMPLETE</span><span>·</span><span>GAPS 0</span><span>·</span><span>SESSION REGULAR</span><span>·</span><span>VOL UP CAP / DOWN OUTLINE</span><span>·</span><span>OI +2.4%</span><span>·</span><span>FUNDING 0.0031%</span><span>·</span><span>LIQUIDATIONS N/A</span>
+      </div>
+    </div>
+  </section>
+
+  <!-- ============ 06 COMPONENTS ============ -->
+  <section class="section" aria-labelledby="s6">
+    <div class="section-head"><span class="idx">06</span><h2 id="s6">States & controls</h2><span class="note">Sharp 2px radius · focus ring 2px cyan · no glass</span></div>
+
+    <div class="grid2">
+      <div class="panel pad stack">
+        <div class="caption">Banners</div>
+        <div class="banner warn"><b>预算预警</b><span>今日已使用 $8.12 / $10.00（81%）。将在 100% 再次告警；调用不会停止。</span></div>
+        <div class="banner danger"><b>KILL SWITCH ON</b><span>不发送新订单。已有持仓保持；恢复需输入 RESUME。</span></div>
+        <div class="banner info"><b>部分数据</b><span>XAUUSDT 无 bookTicker 历史，DOM 指标标记为 N/A，未参与触发判定。</span></div>
+        <div class="banner ok"><b>扫描完成</b><span>10/10 标的 · 2 个新机会 · Telegram 已送达 · scan 20261106-0400</span></div>
+      </div>
+
+      <div class="panel pad stack">
+        <div class="caption">Controls</div>
+        <div class="row">
+          <button class="btn primary">接受入场</button>
+          <button class="btn">请求复核</button>
+          <button class="btn danger">拒绝</button>
+          <button class="btn" disabled>已阻止</button>
+        </div>
+        <div class="row">
+          <div class="field"><label for="sym">Symbol</label><input class="input" id="sym" value="BTCUSDT" spellcheck="false"></div>
+          <div class="field"><label for="focusdemo">Focused</label><input class="input focus" id="focusdemo" value="focus-visible" spellcheck="false"></div>
+        </div>
+        <div class="row" style="gap:8px">
+          <span class="chip neutral">默认</span><span class="chip info">加载中</span><span class="chip warn">部分数据</span><span class="chip danger">错误</span><span class="chip ok">成功</span>
+        </div>
+        <div>
+          <div class="caption" style="margin-bottom:5px">Risk utilization</div>
+          <div class="riskbar"><i style="width:68%"></i></div>
+          <div class="mono" style="font-size:11px;color:var(--muted);margin-top:3px">0.68 / 1.00 % per-trade risk · cap binds at 1.00%</div>
+        </div>
+      </div>
+    </div>
+  </section>
+
+  <!-- ============ 07 CLI ============ -->
+  <section class="section" aria-labelledby="s7">
+    <div class="section-head"><span class="idx">07</span><h2 id="s7">CLI specimen</h2><span class="note">Same semantics · box-drawing tables · LLM blocks prefixed</span></div>
+
+    <div class="term" role="img" aria-label="CLI output specimen">
+<span class="prompt">$</span> <b>oft status</b>
+<span class="m">ENV     </span><span class="g">PAPER</span>      <span class="m">DAEMON</span> <span class="g">●</span>     <span class="m">NEXT</span> 02:14:07 UTC     <span class="m">BUDGET</span> <span class="w">$2.18</span> / $10.00
+<span class="m">SCAN    </span>10 symbols   <span class="m">POSITIONS</span> 2   <span class="m">PENDING</span> <span class="w">1</span>   <span class="m">TELEGRAM</span> <span class="g">delivered</span>
+
+<span class="prompt">$</span> <b>oft trigger list --format table</b>
+<span class="rule">ID          SYMBOL     SIDE   CONF   RISK     STATE</span>
+<span class="rule">────────────────────────────────────────────────────────</span>
+D-1042      BTCUSDT    LONG   0.72   0.8%     <span class="w">PENDING</span>
+D-1041      ETHUSDT    LONG   0.61   0.8%     <span class="g">ACCEPTED</span>
+D-1039      SOLUSDT    SHORT  0.44   0.0%     <span class="r">BLOCKED</span>
+
+<span class="prompt">$</span> <b>oft trigger show D-1042</b>
+<span class="m">TRIGGER  </span>OPP-20261106-014 · 69050 穿越 · 2026-11-05 20:00 UTC · CALC
+<span class="c">LLM ›</span>    入场（多头）· 置信度 0.72 · claude-sonnet-5-5 · prompt v3
+<span class="m">CALC  </span>   单笔风险 0.8% / 上限 1.0% → 通过 · 最终 0.8%
+<span class="m">ACTION</span>   accept | reject --reason "..."     <span class="m">LIVE 未启用</span>
+
+<span class="prompt">$</span> <b>oft live enable</b>
+<span class="r">Live gate: 2/4 weeks paper.</span> Cannot enable.
+<span class="m">Next: continue paper; run `oft log stats --period 4w` to inspect coverage.</span>
+
+<span class="prompt">$</span> <b>oft paper reset</b>
+This clears balances, orders and fills, and restarts the 4-week Live gate.
+Type <span class="w">RESET</span> to continue: <span class="cursor"></span>
+    </div>
+
+    <div class="grid3" style="margin-top:16px">
+      <div class="panel pad"><div class="caption">Output</div><div class="mono" style="font-size:12px;color:var(--text2);line-height:1.7">table · json · ndjson · csv<br>--no-color · --ascii · --quiet<br>NDJSON progress on stderr</div></div>
+      <div class="panel pad"><div class="caption">Exit codes</div><div class="mono" style="font-size:12px;color:var(--text2);line-height:1.7">0 ok · 1 runtime · 2 usage<br>3 partial · 4 risk/guard · 5 auth/config</div></div>
+      <div class="panel pad"><div class="caption">Confirmation</div><div class="mono" style="font-size:12px;color:var(--text2);line-height:1.7">Live → type <span style="color:var(--warn)">LIVE</span><br>Reset → type <span style="color:var(--warn)">RESET</span><br>Kill → immediate, no prompt</div></div>
+    </div>
+  </section>
+
+  <!-- ============ 08 DO / DONT ============ -->
+  <section class="section" aria-labelledby="s8">
+    <div class="section-head"><span class="idx">08</span><h2 id="s8">Direction rules</h2><span class="note">What this system is, and what it refuses to become</span></div>
+    <div class="dodont">
+      <div class="dd do">
+        <h3>Do</h3>
+        <ul>
+          <li>Use near-black <code>#0A0B0D</code>, 1px grid, and 0-radius panels.</li>
+          <li>Keep green/red for market meaning only; use cyan for interaction and LLM provenance.</li>
+          <li>Set all numeric data in mono with <code>tabular-nums slashed-zero</code>.</li>
+          <li>Show data quality and provenance on every surface that uses derived data.</li>
+          <li>Show partial data with <code>N/A</code>/<code>STALE</code> instead of hiding the screen.</li>
+          <li>Encode volume direction by shape too: up = top cap, down = outline.</li>
+          <li>Keep the kill switch available in every state, including errors and mobile.</li>
+        </ul>
+      </div>
+      <div class="dd dont">
+        <h3>Don't</h3>
+        <ul>
+          <li>Purple-to-blue gradients, gradient text, or decorative glow.</li>
+          <li>Glassmorphism, blurred backdrops, translucent floating cards.</li>
+          <li>Rounded cards, nested cards, oversized rounded stat tiles.</li>
+          <li>Emoji as status icons or exclamation-mark error copy.</li>
+          <li>Rainbow heat scales or any color without a stated meaning.</li>
+          <li>Marketing hero sections in an operational terminal.</li>
+        </ul>
+      </div>
+    </div>
+  </section>
+
+  <footer>
+    <span>OFT · STYLE SPECIMEN · NOT THE STAGE 4 INTERACTIVE PREVIEW</span>
+    <span>design/DESIGN.md · design/design-tokens.json · design/flows.md</span>
+  </footer>
+</div>
+
+<script>
+(function(){
+  "use strict";
+  var svg = document.getElementById("chartSvg");
+  if (!svg) return;
+  var NS = "http://www.w3.org/2000/svg";
+  function el(name, attrs){
+    var n = document.createElementNS(NS, name);
+    if (attrs) { for (var k in attrs) { if (Object.prototype.hasOwnProperty.call(attrs, k)) n.setAttribute(k, attrs[k]); } }
+    return n;
+  }
+  function txt(x, y, s, opts){
+    opts = opts || {};
+    var t = el("text", {
+      x: x, y: y,
+      fill: opts.fill || "#9AA6B2",
+      "font-family": "ui-monospace, SFMono-Regular, Menlo, Consolas, monospace",
+      "font-size": opts.size || 11,
+      "text-anchor": opts.anchor || "start",
+      "letter-spacing": opts.spacing || "0"
+    });
+    t.textContent = s;
+    return t;
+  }
+
+  var candles = [
+    {o:68100,h:68320,l:67980,c:68250,v:820,cvd:-420},
+    {o:68250,h:68440,l:68120,c:68360,v:760,cvd:-360},
+    {o:68360,h:68520,l:68240,c:68410,v:690,cvd:-300},
+    {o:68410,h:68600,l:68300,c:68540,v:880,cvd:-210},
+    {o:68540,h:68720,l:68420,c:68610,v:940,cvd:-120},
+    {o:68610,h:68840,l:68550,c:68790,v:1120,cvd:-40},
+    {o:68790,h:68960,l:68680,c:68820,v:980,cvd:-90},
+    {o:68820,h:69010,l:68740,c:68970,v:1240,cvd:30},
+    {o:68970,h:69120,l:68860,c:69040,v:1380,cvd:140},
+    {o:69040,h:69200,l:68920,c:69080,v:1660,cvd:240},
+    {o:69080,h:69180,l:68820,c:68900,v:1820,cvd:120},
+    {o:68900,h:69040,l:68760,c:68840,v:1580,cvd:40},
+    {o:68840,h:68960,l:68700,c:68780,v:1720,cvd:-60},
+    {o:68780,h:68940,l:68700,c:68920,v:1900,cvd:120},
+    {o:68920,h:69140,l:68820,c:69080,v:2140,cvd:320},
+    {o:69080,h:69320,l:69010,c:69280,v:2460,cvd:520},
+    {o:69280,h:69460,l:69180,c:69390,v:2280,cvd:640},
+    {o:69390,h:69520,l:69260,c:69410,v:1980,cvd:700},
+    {o:69410,h:69680,l:69320,c:69620,v:2340,cvd:860},
+    {o:69620,h:69840,l:69510,c:69790,v:2520,cvd:980},
+    {o:69790,h:70020,l:69680,c:69940,v:2680,cvd:1100},
+    {o:69940,h:70120,l:69820,c:70010,v:2200,cvd:1060},
+    {o:70010,h:70280,l:69890,c:70180,v:2380,cvd:1220},
+    {o:70180,h:70320,l:70040,c:70240,v:1860,cvd:1310}
+  ];
+  var pMax = 70500, pMin = 68000;
+  function yP(p){ return 20 + (pMax - p) / (pMax - pMin) * 300; }
+  function xC(i){ return 20 + i * 25.5; }
+  var plotR = 640, plotL = 8;
+
+  // price grid + labels
+  [70500,70200,69800,69400,69000,68600,68200,68000].forEach(function(p){
+    var y = yP(p);
+    svg.appendChild(el("line",{x1:plotL,y1:y,x2:plotR,y2:y,stroke:"#1A1F27","stroke-width":1}));
+    svg.appendChild(txt(648, y+3, p.toFixed(0), {fill:"#7C8898", size:11}));
+  });
+
+  // value area fill + POC / VAH / VAL
+  svg.appendChild(el("rect",{x:plotL,y:yP(69320),width:plotR-plotL,height:yP(68760)-yP(69320),fill:"#8B98A8","fill-opacity":0.05}));
+  svg.appendChild(el("line",{x1:plotL,y1:yP(69120),x2:plotR,y2:yP(69120),stroke:"#E8EDF2","stroke-width":1}));
+  svg.appendChild(txt(plotL+4, yP(69120)-3, "POC 69120", {fill:"#E8EDF2", size:11}));
+  [["VAH 69320",69320],["VAL 68760",68760]].forEach(function(v){
+    svg.appendChild(el("line",{x1:plotL,y1:yP(v[1]),x2:plotR,y2:yP(v[1]),stroke:"#7C8898","stroke-width":1,"stroke-dasharray":"2 4"}));
+    svg.appendChild(txt(plotL+4, yP(v[1])-3, v[0], {fill:"#7C8898", size:11}));
+  });
+
+  // opportunity zone
+  var zy = yP(69200), zh = yP(68800)-yP(69200);
+  svg.appendChild(el("rect",{x:96,y:zy,width:340,height:zh,fill:"#FFB020","fill-opacity":0.08,stroke:"#FFB020","stroke-width":1,"stroke-dasharray":"4 4"}));
+  svg.appendChild(txt(102, zy-5, "OPP-20261106-014 · LONG · 0.72", {fill:"#FFB020", size:11, spacing:"0.02em"}));
+  // trigger line
+  svg.appendChild(el("line",{x1:plotL,y1:yP(69050),x2:plotR,y2:yP(69050),stroke:"#FFB020","stroke-width":1,"stroke-dasharray":"6 4"}));
+  svg.appendChild(txt(600, yP(69050)-4, "TRIGGER 69050", {fill:"#FFB020", size:11, anchor:"end"}));
+
+  // pane separators
+  svg.appendChild(el("line",{x1:plotL,y1:328,x2:plotR,y2:328,stroke:"#262C36","stroke-width":1}));
+  svg.appendChild(el("line",{x1:plotL,y1:396,x2:plotR,y2:396,stroke:"#262C36","stroke-width":1}));
+  svg.appendChild(txt(plotL+2, 340, "VOL", {fill:"#7C8898", size:11, spacing:"0.06em"}));
+  svg.appendChild(txt(plotL+2, 408, "CVD", {fill:"#7C8898", size:11, spacing:"0.06em"}));
+
+  // volume bars: 0.65 fill + non-color direction channel
+  var maxV = 2680, volBottom = 392, volTop = 334;
+  candles.forEach(function(c,i){
+    var up = c.c >= c.o;
+    var h = (c.v / maxV) * (volBottom - volTop);
+    var top = volBottom - h;
+    var col = up ? "#35D07F" : "#FF5D6A";
+    var bar = el("rect",{
+      x: xC(i)+1, y: top, width: 8, height: Math.max(1,h),
+      fill: col, "fill-opacity": 0.65
+    });
+    if (!up) {
+      bar.setAttribute("stroke", col);
+      bar.setAttribute("stroke-width", 1);
+      bar.setAttribute("stroke-opacity", 1);
+    }
+    svg.appendChild(bar);
+    if (up) {
+      svg.appendChild(el("line",{
+        x1: xC(i)+1, y1: top, x2: xC(i)+9, y2: top,
+        stroke: col, "stroke-width": 1, "stroke-opacity": 1
+      }));
+    }
+  });
+
+  // candles
+  candles.forEach(function(c,i){
+    var up = c.c >= c.o;
+    var x = xC(i);
+    var col = up ? "#35D07F" : "#FF5D6A";
+    svg.appendChild(el("line",{x1:x+5,y1:yP(c.h),x2:x+5,y2:yP(c.l),stroke:col,"stroke-width":1,"stroke-opacity":0.7}));
+    var top = yP(Math.max(c.o,c.c));
+    var bot = yP(Math.min(c.o,c.c));
+    svg.appendChild(el("rect",{x:x+1,y:top,width:8,height:Math.max(1,bot-top),fill:col}));
+  });
+
+  // markers
+  // entry triangle at trigger (i=14)
+  var ex = xC(14)+5, ey = yP(69050);
+  svg.appendChild(el("path",{d:"M "+ex+" "+(ey-10)+" L "+(ex-5)+" "+(ey+1)+" L "+(ex+5)+" "+(ey+1)+" Z",fill:"#4DD8E6"}));
+  svg.appendChild(txt(ex+8, ey+2, "ENTRY 69050", {fill:"#4DD8E6", size:11}));
+  // exit square (i=20)
+  var xx = xC(20)+5, xy = yP(69940);
+  svg.appendChild(el("rect",{x:xx-4,y:xy-4,width:8,height:8,fill:"#C7D2DF"}));
+  svg.appendChild(txt(xx-8, xy-9, "EXIT 69940", {fill:"#C7D2DF", size:11, anchor:"end"}));
+  // stop x (i=12)
+  var sx = xC(12)+5, sy = yP(68780);
+  svg.appendChild(el("line",{x1:sx-5,y1:sy-5,x2:sx+5,y2:sy+5,stroke:"#FF5D6A","stroke-width":1.5}));
+  svg.appendChild(el("line",{x1:sx-5,y1:sy+5,x2:sx+5,y2:sy-5,stroke:"#FF5D6A","stroke-width":1.5}));
+  svg.appendChild(txt(sx-8, sy+15, "STOP 68780", {fill:"#FF5D6A", size:11, anchor:"end"}));
+  // target circle (i=23)
+  var tx = xC(23)+5, ty = yP(70200);
+  svg.appendChild(el("circle",{cx:tx,cy:ty,r:4,fill:"none",stroke:"#35D07F","stroke-width":1.5}));
+  svg.appendChild(txt(tx-8, ty-8, "TP 70200", {fill:"#35D07F", size:11, anchor:"end"}));
+
+  // CVD pane
+  var cMin = -420, cMax = 1310, cTop = 404, cBot = 492;
+  function yC(v){ return cBot - (v - cMin) / (cMax - cMin) * (cBot - cTop); }
+  var zeroY = yC(0);
+  svg.appendChild(el("line",{x1:plotL,y1:zeroY,x2:plotR,y2:zeroY,stroke:"#3A424F","stroke-width":1}));
+  svg.appendChild(txt(648, zeroY+3, "0", {fill:"#7C8898", size:11}));
+  svg.appendChild(txt(648, cTop+3, "+1.3k", {fill:"#7C8898", size:11}));
+  var pts = candles.map(function(c,i){ return (xC(i)+5)+","+yC(c.cvd); }).join(" ");
+  svg.appendChild(el("polygon",{
+    points: (xC(0)+5)+","+zeroY+" "+pts+" "+(xC(23)+5)+","+zeroY,
+    fill:"#4DD8E6","fill-opacity":0.08
+  }));
+  svg.appendChild(el("polyline",{points:pts,fill:"none",stroke:"#4DD8E6","stroke-width":1.5,"stroke-linejoin":"round"}));
+  // divergence marker at i=12
+  var dx = xC(12)+5, dy = yC(-60);
+  svg.appendChild(el("rect",{x:dx-3,y:dy-3,width:6,height:6,fill:"#FFB020",transform:"rotate(45 "+dx+" "+dy+")"}));
+
+  // crosshair
+  var ci = 17, cx = xC(ci)+5, cy = yP(candles[ci].c);
+  svg.appendChild(el("line",{x1:cx,y1:20,x2:cx,y2:492,stroke:"#C7D2DF","stroke-width":1,"stroke-dasharray":"3 3","stroke-opacity":0.55}));
+  svg.appendChild(el("line",{x1:plotL,y1:cy,x2:plotR,y2:cy,stroke:"#C7D2DF","stroke-width":1,"stroke-dasharray":"3 3","stroke-opacity":0.55}));
+  // tooltip (upper-left empty area; hidden on narrow screens)
+  var tip = el("g", {class:"chart-tooltip"});
+  tip.appendChild(el("rect",{x:20,y:24,width:164,height:104,fill:"#12151B",stroke:"#3A424F","stroke-width":1,rx:2}));
+  tip.appendChild(txt(28, 39, "11-05 20:00 UTC", {fill:"#7C8898", size:11, spacing:"0.02em"}));
+  tip.appendChild(txt(28, 54, "O 69390   H 69520", {fill:"#E8EDF2", size:11}));
+  tip.appendChild(txt(28, 67, "L 69260   C 69410", {fill:"#E8EDF2", size:11}));
+  tip.appendChild(txt(28, 82, "Δ +520    CVD +700", {fill:"#35D07F", size:11}));
+  tip.appendChild(txt(28, 95, "OIΔ +2.4%  F 0.0031%", {fill:"#9AA6B2", size:11}));
+  tip.appendChild(txt(28, 108, "VOL 1980", {fill:"#9AA6B2", size:11}));
+  tip.appendChild(txt(28, 121, "DATA COMPLETE", {fill:"#4FD1A5", size:11, spacing:"0.04em"}));
+  svg.appendChild(tip);
+
+  // time labels
+  [["11-03",0],["11-04",8],["11-05",16],["11-06",23]].forEach(function(t){
+    svg.appendChild(txt(xC(t[1])+5, 512, t[0], {fill:"#7C8898", size:11, anchor:"middle"}));
+  });
+  svg.appendChild(txt(648, 512, "UTC", {fill:"#7C8898", size:11}));
+})();
+</script>
+</body>
+</html>

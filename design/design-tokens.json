@@ -1,0 +1,639 @@
+{
+  "$schema": "https://design-tokens.org/schema.json",
+  "meta": {
+    "name": "Order Flow Trading System",
+    "version": "1.0.0",
+    "mode": "dark-first",
+    "status": "stage-3-direction",
+    "updated": "2026-11-06",
+    "description": "High-contrast market-terminal token set for the CLI and Web UI. Dark-first, sharp-edged, data-dense. Semantic market colors are reserved and must not be used for decoration.",
+    "tokensVersioning": "Additive changes only within a minor version; renaming a token is a breaking change."
+  },
+  "color": {
+    "primitive": {
+      "neutral": {
+        "n950": "#07080A",
+        "n900": "#0A0B0D",
+        "n850": "#0E1014",
+        "n800": "#12151B",
+        "n750": "#171B22",
+        "n700": "#1D222B",
+        "n650": "#262C36",
+        "n600": "#3A424F",
+        "n500": "#56616F",
+        "n400": "#7C8898",
+        "n300": "#9AA6B2",
+        "n200": "#C7D2DF",
+        "n100": "#E8EDF2",
+        "n50": "#F7FAFC"
+      },
+      "hue": {
+        "cyan400": "#4DD8E6",
+        "cyan300": "#7BE4EE",
+        "green400": "#35D07F",
+        "green300": "#8CF0BE",
+        "red400": "#FF5D6A",
+        "red300": "#FF9AA3",
+        "amber400": "#FFB020",
+        "amber300": "#FFCD66",
+        "teal400": "#4FD1A5",
+        "blue400": "#62B6FF",
+        "rose400": "#E879C9",
+        "lime400": "#A3E635",
+        "orange400": "#FF8A4C"
+      },
+      "alpha": {
+        "white04": "#F7FAFC0A",
+        "white08": "#F7FAFC14",
+        "white12": "#F7FAFC1F",
+        "white16": "#F7FAFC29",
+        "black40": "#07080A66",
+        "black60": "#07080A99",
+        "black72": "#07080AB8",
+        "black88": "#07080AE0"
+      }
+    },
+    "semantic": {
+      "background": {
+        "canvas": "#0A0B0D",
+        "panel": "#0E1014",
+        "raised": "#12151B",
+        "inset": "#07080A",
+        "hover": "#171B22",
+        "selected": "#16242B",
+        "overlay": "#07080AB8",
+        "skeleton": "#12151B",
+        "liveWash": "#2A0E12",
+        "paperWash": "#0C1D19"
+      },
+      "text": {
+        "primary": "#E8EDF2",
+        "secondary": "#9AA6B2",
+        "muted": "#828E9E",
+        "disabled": "#56616F",
+        "inverse": "#07080A",
+        "link": "#4DD8E6",
+        "onLive": "#F7FAFC"
+      },
+      "border": {
+        "subtle": "#1D222B",
+        "default": "#262C36",
+        "strong": "#3A424F",
+        "control": "#6B7785",
+        "focus": "#4DD8E6",
+        "selected": "#4DD8E6",
+        "danger": "#FF5D6A"
+      },
+      "accent": {
+        "primary": "#4DD8E6",
+        "primaryHover": "#7BE4EE",
+        "primaryPressed": "#3CB9C6",
+        "mutedSurface": "#172C31",
+        "onPrimary": "#07080A"
+      },
+      "market": {
+        "up": "#35D07F",
+        "upMuted": "#1E5D3F",
+        "down": "#FF5D6A",
+        "downMuted": "#6E2F36",
+        "flat": "#8B98A8",
+        "upWash": "#0F2A1F",
+        "downWash": "#2A151A"
+      },
+      "status": {
+        "ok": "#4FD1A5",
+        "warn": "#FFB020",
+        "danger": "#FF6B6B",
+        "info": "#62B6FF",
+        "neutral": "#8B98A8",
+        "okWash": "#0C2420",
+        "warnWash": "#2A2110",
+        "dangerWash": "#2A1416",
+        "infoWash": "#101F2E"
+      },
+      "environment": {
+        "paper": "#4FD1A5",
+        "paperSurface": "#0C1D19",
+        "live": "#FF5D6A",
+        "liveSurface": "#2A0E12",
+        "liveBorder": "#FF5D6A",
+        "degraded": "#FFB020",
+        "offline": "#7C8898"
+      }
+    },
+    "chip": {
+      "neutral": {
+        "bg": "#1D222B",
+        "border": "#3A424F",
+        "text": "#C7D2DF"
+      },
+      "info": {
+        "bg": "#1A2735",
+        "border": "#62B6FF",
+        "text": "#62B6FF"
+      },
+      "ok": {
+        "bg": "#132B23",
+        "border": "#4FD1A5",
+        "text": "#4FD1A5"
+      },
+      "warn": {
+        "bg": "#302616",
+        "border": "#FFB020",
+        "text": "#FFB020"
+      },
+      "danger": {
+        "bg": "#301B20",
+        "border": "#FF5D6A",
+        "text": "#FF5D6A"
+      },
+      "accent": {
+        "bg": "#172C31",
+        "border": "#4DD8E6",
+        "text": "#4DD8E6"
+      }
+    },
+    "chart": {
+      "background": "#0A0B0D",
+      "plotBackground": "#0A0B0D",
+      "grid": "#1A1F27",
+      "gridStrong": "#262C36",
+      "axisText": "#7C8898",
+      "axisLine": "#262C36",
+      "crosshair": "#C7D2DF",
+      "crosshairLabelBg": "#1D222B",
+      "tooltipBg": "#12151B",
+      "tooltipBorder": "#3A424F",
+      "watermark": "#1D222B",
+      "candle": {
+        "upBody": "#35D07F",
+        "upBorder": "#35D07F",
+        "upWick": "#35D07FB3",
+        "downBody": "#FF5D6A",
+        "downBorder": "#FF5D6A",
+        "downWick": "#FF5D6AB3",
+        "doji": "#8B98A8",
+        "dojiWick": "#8B98A8B3"
+      },
+      "volume": {
+        "up": "#35D07F",
+        "upAlpha": 0.65,
+        "down": "#FF5D6A",
+        "downAlpha": 0.65,
+        "topCapWidth": "1px",
+        "downOutlineWidth": "1px",
+        "nonColorChannel": "Up bars carry a 1px full-strength top cap; down bars carry a 1px full-strength outline. Direction is encoded by shape as well as hue.",
+        "ma": "#9AA6B2"
+      },
+      "delta": {
+        "positive": "#35D07F",
+        "negative": "#FF5D6A",
+        "zeroLine": "#3A424F"
+      },
+      "cvd": {
+        "line": "#4DD8E6",
+        "lineWidth": 1.5,
+        "zeroLine": "#3A424F",
+        "fill": "#4DD8E61A",
+        "divergenceMarker": "#FFB020"
+      },
+      "footprint": {
+        "bidFill": "#FF5D6A",
+        "askFill": "#35D07F",
+        "heatSteps": [
+          0.1,
+          0.2,
+          0.3,
+          0.42,
+          0.42
+        ],
+        "heatBarSteps": [
+          0,
+          0,
+          0,
+          0.65,
+          1
+        ],
+        "heatBarWidth": "2px",
+        "cellText": "#E8EDF2",
+        "cellTextZero": "#7C8898",
+        "imbalanceMarker": "#FFB020",
+        "border": "#1D222B"
+      },
+      "volumeProfile": {
+        "barFill": "#8B98A8",
+        "barAlpha": 0.65,
+        "barSelected": "#C7D2DF",
+        "poc": "#E8EDF2",
+        "pocStyle": "solid",
+        "valueAreaHigh": "#7C8898",
+        "valueAreaLow": "#7C8898",
+        "valueAreaStyle": "dotted",
+        "valueAreaFill": "#8B98A80F"
+      },
+      "opportunity": {
+        "pendingStroke": "#FFB020",
+        "pendingFill": "#FFB02014",
+        "triggeredStroke": "#4DD8E6",
+        "triggeredFill": "#4DD8E614",
+        "expiredStroke": "#7C8898",
+        "invalidatedStroke": "#FF5D6A",
+        "labelBg": "#12151B"
+      },
+      "markers": {
+        "entryLong": "#4DD8E6",
+        "entryShort": "#4DD8E6",
+        "exit": "#C7D2DF",
+        "stop": "#FF5D6A",
+        "target": "#35D07F",
+        "triggerLine": "#FFB020",
+        "triggerLineStyle": "dashed"
+      },
+      "openInterest": "#FFB020",
+      "funding": "#62B6FF",
+      "liquidations": "#FF8A4C",
+      "takerRatio": "#E879C9",
+      "series": [
+        "#4DD8E6",
+        "#FFB020",
+        "#62B6FF",
+        "#FF8A4C",
+        "#A3E635",
+        "#E879C9"
+      ],
+      "session": {
+        "regular": "#0A0B0D",
+        "preMarket": "#0F1418",
+        "afterMarket": "#0F1418",
+        "overnight": "#0C1014",
+        "noTrading": "#14161A",
+        "noTradingHatch": "#262C36"
+      },
+      "dataQuality": {
+        "complete": "#4FD1A5",
+        "partial": "#FFB020",
+        "stale": "#FFB020",
+        "missing": "#FF5D6A",
+        "estimated": "#62B6FF"
+      }
+    },
+    "provenance": {
+      "calc": {
+        "label": "CALC",
+        "text": "#9AA6B2",
+        "border": "#262C36",
+        "background": "transparent",
+        "rule": "#3A424F"
+      },
+      "llm": {
+        "label": "LLM",
+        "text": "#4DD8E6",
+        "border": "#4DD8E680",
+        "background": "#4DD8E60A",
+        "rule": "#4DD8E6"
+      },
+      "stale": {
+        "label": "STALE",
+        "text": "#FFB020",
+        "border": "#FFB02080",
+        "background": "#FFB0200F",
+        "rule": "#FFB020"
+      },
+      "unavailable": {
+        "label": "N/A",
+        "text": "#FF5D6A",
+        "border": "#FF5D6A80",
+        "background": "#FF5D6A0F",
+        "rule": "#FF5D6A"
+      }
+    },
+    "cli": {
+      "up": "#35D07F",
+      "down": "#FF5D6A",
+      "warn": "#FFB020",
+      "error": "#FF5D6A",
+      "ok": "#4FD1A5",
+      "info": "#62B6FF",
+      "accent": "#4DD8E6",
+      "muted": "#7C8898",
+      "text": "#E8EDF2"
+    },
+    "rules": [
+      "text.muted must not be used on background.selected, accent.mutedSurface, or inside any chip background. Use text.secondary in those contexts.",
+      "text.disabled is inactive-only. It must never carry values, status, errors, timestamps, or axis labels.",
+      "border.control is required for inputs, selects, checkboxes, radios, switches, segmented controls, and search fields. border.default and border.strong are panel edges and table dividers only (decorative, exempt from 3:1).",
+      "Chart volume direction must not rely on hue alone: up bars carry a 1px full-strength top cap; down bars carry a 1px full-strength outline."
+    ]
+  },
+  "typography": {
+    "fontFamily": {
+      "sans": "ui-sans-serif, system-ui, -apple-system, \"Segoe UI\", \"Noto Sans SC\", \"PingFang SC\", \"Microsoft YaHei\", sans-serif",
+      "mono": "ui-monospace, \"SFMono-Regular\", \"JetBrains Mono\", \"Cascadia Code\", \"Roboto Mono\", Menlo, Consolas, \"Liberation Mono\", monospace",
+      "numeric": "ui-monospace, \"SFMono-Regular\", \"JetBrains Mono\", \"Cascadia Code\", \"Roboto Mono\", Menlo, Consolas, \"Liberation Mono\", monospace"
+    },
+    "size": {
+      "micro": "11px",
+      "caption": "12px",
+      "data": "13px",
+      "body": "14px",
+      "title3": "16px",
+      "title2": "20px",
+      "title1": "24px",
+      "display": "32px"
+    },
+    "lineHeight": {
+      "tight": 1.2,
+      "data": 1.35,
+      "body": 1.6,
+      "loose": 1.75
+    },
+    "weight": {
+      "regular": 400,
+      "medium": 500,
+      "semibold": 600,
+      "bold": 700
+    },
+    "letterSpacing": {
+      "tight": "-0.01em",
+      "normal": "0",
+      "label": "0.04em",
+      "stamp": "0.08em"
+    },
+    "numeric": {
+      "fontVariantNumeric": "tabular-nums slashed-zero",
+      "fontFeatureSettings": "\"tnum\" 1, \"zero\" 1",
+      "alignment": "right",
+      "decimalPolicy": "Always show the symbol tick precision; no locale thousands separator in dense tables."
+    }
+  },
+  "space": {
+    "0": "0",
+    "0-5": "2px",
+    "1": "4px",
+    "1-5": "6px",
+    "2": "8px",
+    "3": "12px",
+    "4": "16px",
+    "5": "20px",
+    "6": "24px",
+    "8": "32px",
+    "10": "40px",
+    "12": "48px",
+    "16": "64px",
+    "20": "80px"
+  },
+  "size": {
+    "control": {
+      "sm": "24px",
+      "md": "28px",
+      "lg": "32px"
+    },
+    "row": {
+      "compact": "28px",
+      "default": "32px",
+      "comfortable": "40px"
+    },
+    "icon": {
+      "sm": "14px",
+      "md": "16px",
+      "lg": "20px"
+    },
+    "touchTarget": "44px",
+    "statusBar": "40px",
+    "navRail": "56px",
+    "navExpanded": "208px",
+    "inspector": "360px",
+    "chartAxis": "64px",
+    "contentMax": "1600px",
+    "modal": {
+      "sm": "420px",
+      "md": "560px",
+      "lg": "760px",
+      "xl": "960px"
+    }
+  },
+  "radius": {
+    "none": "0",
+    "xs": "2px",
+    "sm": "3px",
+    "md": "4px",
+    "full": "999px",
+    "usage": "Panels, tables, cells, and chart frames are 0. Inputs, buttons, and chips are 2px. Rounded cards are not part of this system."
+  },
+  "border": {
+    "width": {
+      "hairline": "1px",
+      "thick": "2px",
+      "accentRule": "2px"
+    },
+    "style": {
+      "solid": "solid",
+      "dashed": "dashed",
+      "dotted": "dotted"
+    },
+    "default": "1px solid #262C36",
+    "subtle": "1px solid #1D222B",
+    "strong": "1px solid #3A424F"
+  },
+  "elevation": {
+    "e0": {
+      "boxShadow": "none",
+      "border": "1px solid #262C36",
+      "usage": "Every panel, table, and toolbar"
+    },
+    "e1": {
+      "boxShadow": "0 4px 12px #07080A66",
+      "border": "1px solid #3A424F",
+      "usage": "Popover, dropdown, inspector sheet"
+    },
+    "e2": {
+      "boxShadow": "0 16px 48px #07080A99",
+      "border": "1px solid #3A424F",
+      "usage": "Modal dialog"
+    },
+    "e3": {
+      "boxShadow": "0 24px 64px #07080AB8",
+      "border": "1px solid #FF5D6A",
+      "usage": "Live-arming confirmation only"
+    },
+    "rule": "No soft ambient card shadows. Structure comes from borders and background steps; shadows exist only to lift overlays off the grid."
+  },
+  "motion": {
+    "duration": {
+      "instant": "0ms",
+      "fast": "70ms",
+      "base": "120ms",
+      "medium": "180ms",
+      "slow": "240ms",
+      "priceFlash": "600ms",
+      "skeletonPulse": "1400ms"
+    },
+    "easing": {
+      "standard": "cubic-bezier(0.2, 0, 0, 1)",
+      "exit": "cubic-bezier(0.4, 0, 1, 1)",
+      "linear": "linear"
+    },
+    "reducedMotion": {
+      "duration": "0.01ms",
+      "iterationCount": 1,
+      "usage": "Respect prefers-reduced-motion; disable price flash, pulse, and pane transitions."
+    },
+    "rules": [
+      "Animate color and opacity only; never animate chart geometry or table row height.",
+      "No scroll-triggered reveals, parallax, or decorative loops.",
+      "Live price/value updates flash the background for 600ms and settle; do not animate the digits."
+    ]
+  },
+  "focus": {
+    "ring": {
+      "color": "#4DD8E6",
+      "width": "2px",
+      "offset": "2px",
+      "style": "solid"
+    },
+    "inset": {
+      "color": "#4DD8E6",
+      "width": "2px",
+      "offset": "-2px",
+      "style": "solid"
+    },
+    "rule": "Use :focus-visible. Never remove the ring. On dense tables, the row focus ring is inset; on buttons and inputs it is outset."
+  },
+  "layout": {
+    "breakpoints": {
+      "xs": "375px",
+      "sm": "768px",
+      "md": "1024px",
+      "lg": "1280px",
+      "xl": "1440px",
+      "xxl": "1920px"
+    },
+    "grid": {
+      "columns": 12,
+      "gutter": "12px",
+      "contentMax": "1600px"
+    },
+    "regions": {
+      "statusBar": "40px fixed, full width",
+      "nav": "208px expanded at >=1280px; 56px icon rail at 768-1279px; bottom tab bar at <768px",
+      "inspector": "360px fixed at >=1280px; overlay sheet at <1280px",
+      "contentPadding": "16px at <1024px; 24px at >=1024px"
+    },
+    "zIndex": {
+      "base": 0,
+      "stickyHeader": 10,
+      "dropdown": 100,
+      "inspectorSheet": 200,
+      "modal": 300,
+      "toast": 400,
+      "killSwitch": 500
+    }
+  },
+  "chart": {
+    "library": "TradingView Lightweight Charts (Apache-2.0). Advanced Charts is not licensed for private use and is out of scope.",
+    "paneHeights": {
+      "price": "62%",
+      "volume": "14%",
+      "cvd": "24%",
+      "minPriceHeight": "240px",
+      "minPaneHeight": "64px"
+    },
+    "paneGap": "1px",
+    "axisWidth": "64px",
+    "candle": {
+      "bodyMinWidth": "1px",
+      "bodyMaxWidth": "18px",
+      "wickWidth": "1px",
+      "borderVisible": false
+    },
+    "footprint": {
+      "cellMinWidth": "52px",
+      "cellHeight": "18px",
+      "priceStepRows": "one row per tick-bucket; collapse empty buckets",
+      "maxRows": "40 visible"
+    },
+    "volumeProfile": {
+      "width": "18% of plot",
+      "bins": 60
+    },
+    "tooltip": {
+      "delayMs": 120,
+      "maxWidth": "320px"
+    },
+    "timeframes": [
+      "15m",
+      "1h",
+      "4h"
+    ],
+    "defaults": {
+      "timeframe": "4h",
+      "showVolume": true,
+      "showCvd": true,
+      "showVolumeProfile": true,
+      "showFootprint": true,
+      "showOpportunityZones": true,
+      "showMarkers": true
+    }
+  },
+  "dataViz": {
+    "categorical": [
+      "#4DD8E6",
+      "#FFB020",
+      "#62B6FF",
+      "#FF8A4C",
+      "#A3E635",
+      "#E879C9"
+    ],
+    "sequential": [
+      "#132721",
+      "#173E2E",
+      "#1E5D3F",
+      "#258354",
+      "#2DAA6A"
+    ],
+    "diverging": {
+      "negative": "#FF5D6A",
+      "neutral": "#3A424F",
+      "positive": "#35D07F"
+    },
+    "heatTextRule": "Footprint fills are capped at 42% opacity so E8EDF2 text stays above 6.6:1. The top two intensity levels add a 2px heat bar, not more fill.",
+    "noRainbow": "Never use a rainbow or jet scale for a single ordered metric."
+  },
+  "cli": {
+    "table": {
+      "unicode": true,
+      "asciiFallback": "--ascii",
+      "numericAlignment": "right",
+      "maxWidth": 120,
+      "borderStyle": "box-drawing rows only; no full outer box",
+      "header": "uppercase mono micro label with dim rule"
+    },
+    "color": {
+      "auto": "color when stdout is a TTY and NO_COLOR is unset",
+      "flags": "--no-color, --color=always"
+    },
+    "formats": [
+      "table",
+      "json",
+      "ndjson",
+      "csv"
+    ],
+    "confirmation": {
+      "standard": "[y/N], default N",
+      "typed": "Type the exact token shown; anything else aborts",
+      "liveEnableToken": "LIVE",
+      "paperResetToken": "RESET",
+      "killSwitch": "No confirmation. Stopping is always safe.",
+      "killOffToken": "RESUME"
+    },
+    "exitCodes": {
+      "ok": 0,
+      "runtimeError": 1,
+      "usageError": 2,
+      "partialSuccess": 3,
+      "blockedByRisk": 4,
+      "authOrConfigError": 5
+    },
+    "timestamps": "ISO-8601 UTC by default; --local switches the display zone only, never the stored value."
+  }
+}
