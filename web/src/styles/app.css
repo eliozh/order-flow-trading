@@ -1,0 +1,202 @@
+* {
+  box-sizing: border-box;
+}
+
+html,
+body,
+#root {
+  min-height: 100%;
+}
+
+body {
+  margin: 0;
+  background: var(--oft-bg-canvas);
+  color: var(--oft-text-primary);
+  font-family: var(--oft-font-sans);
+  font-size: 14px;
+  line-height: 1.45;
+}
+
+code {
+  font-family: var(--oft-font-mono);
+  font-size: 12px;
+  color: var(--oft-text-secondary);
+}
+
+.app-shell {
+  display: flex;
+  min-height: 100vh;
+  flex-direction: column;
+}
+
+.app-header {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  height: 40px;
+  padding: 0 var(--oft-space-4);
+  border-bottom: 1px solid var(--oft-border-default);
+  background: var(--oft-bg-panel);
+}
+
+.brand {
+  font-family: var(--oft-font-mono);
+  font-size: 13px;
+  font-weight: 700;
+  letter-spacing: 0.18em;
+  color: var(--oft-accent);
+}
+
+.header-meta {
+  display: flex;
+  align-items: center;
+  gap: var(--oft-space-3);
+}
+
+.muted {
+  color: var(--oft-text-muted);
+  font-family: var(--oft-font-mono);
+  font-size: 11px;
+  letter-spacing: 0.08em;
+  text-transform: uppercase;
+}
+
+.app-main {
+  width: min(960px, 100%);
+  margin: 0 auto;
+  padding: var(--oft-space-8) var(--oft-space-4);
+  flex: 1;
+}
+
+.app-footer {
+  padding: var(--oft-space-3) var(--oft-space-4);
+  border-top: 1px solid var(--oft-border-subtle);
+  color: var(--oft-text-muted);
+  font-family: var(--oft-font-mono);
+  font-size: 11px;
+}
+
+.status-panel h2 {
+  margin: 0 0 var(--oft-space-4);
+  font-family: var(--oft-font-mono);
+  font-size: 13px;
+  font-weight: 600;
+  letter-spacing: 0.14em;
+  text-transform: uppercase;
+  color: var(--oft-text-secondary);
+}
+
+.status-grid {
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(200px, 1fr));
+  gap: 1px;
+  margin: 0 0 var(--oft-space-6);
+  padding: 1px;
+  background: var(--oft-border-subtle);
+  border: 1px solid var(--oft-border-subtle);
+  border-radius: var(--oft-radius-sm);
+}
+
+.status-grid > div {
+  padding: var(--oft-space-3) var(--oft-space-4);
+  background: var(--oft-bg-panel);
+}
+
+.status-grid dt {
+  margin-bottom: var(--oft-space-1);
+  color: var(--oft-text-muted);
+  font-family: var(--oft-font-mono);
+  font-size: 10px;
+  letter-spacing: 0.12em;
+  text-transform: uppercase;
+}
+
+.status-grid dd {
+  margin: 0;
+  font-family: var(--oft-font-mono);
+  font-size: 13px;
+  color: var(--oft-text-primary);
+}
+
+.env-chip {
+  display: inline-block;
+  padding: 2px 6px;
+  border: 1px solid var(--oft-border-strong);
+  border-radius: var(--oft-radius-sm);
+  color: var(--oft-text-secondary);
+  font-family: var(--oft-font-mono);
+  font-size: 10px;
+  letter-spacing: 0.12em;
+}
+
+.env-chip--paper {
+  border-color: var(--oft-status-ok);
+  background: #0c1d19;
+  color: var(--oft-status-ok);
+}
+
+.env-chip--live {
+  border-color: var(--oft-status-danger);
+  background: #2a0e12;
+  color: var(--oft-status-danger);
+}
+
+.env-chip--test {
+  border-color: var(--oft-status-warn);
+  background: #2a2110;
+  color: var(--oft-status-warn);
+}
+
+.symbol-table {
+  width: 100%;
+  border-collapse: collapse;
+  background: var(--oft-bg-panel);
+  border: 1px solid var(--oft-border-subtle);
+  font-family: var(--oft-font-mono);
+  font-size: 12px;
+}
+
+.symbol-table caption {
+  padding: var(--oft-space-2) 0;
+  color: var(--oft-text-muted);
+  font-size: 10px;
+  letter-spacing: 0.12em;
+  text-align: left;
+  text-transform: uppercase;
+}
+
+.symbol-table th,
+.symbol-table td {
+  height: 32px;
+  padding: 0 var(--oft-space-3);
+  border-bottom: 1px solid var(--oft-border-subtle);
+  text-align: left;
+}
+
+.symbol-table th {
+  color: var(--oft-text-muted);
+  font-size: 10px;
+  font-weight: 500;
+  letter-spacing: 0.1em;
+  text-transform: uppercase;
+}
+
+.symbol-table tbody tr:hover {
+  background: var(--oft-bg-hover);
+}
+
+.status-message {
+  color: var(--oft-text-secondary);
+  font-family: var(--oft-font-mono);
+  font-size: 12px;
+}
+
+.status-message--error {
+  color: var(--oft-status-danger);
+}
+
+@media (max-width: 480px) {
+  .app-main {
+    padding: var(--oft-space-4) var(--oft-space-3);
+  }
+}

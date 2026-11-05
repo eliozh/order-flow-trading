@@ -1,0 +1,36 @@
+/* Dark operator-terminal tokens derived from design/design-tokens.json. */
+:root {
+  color-scheme: dark;
+
+  --oft-bg-canvas: #0a0b0d;
+  --oft-bg-panel: #0e1014;
+  --oft-bg-raised: #12151b;
+  --oft-bg-hover: #171b22;
+
+  --oft-text-primary: #e8edf2;
+  --oft-text-secondary: #9aa6b2;
+  --oft-text-muted: #828e9e;
+
+  --oft-border-subtle: #1d222b;
+  --oft-border-default: #262c36;
+  --oft-border-strong: #3a424f;
+
+  --oft-accent: #4dd8e6;
+  --oft-accent-muted-surface: #172c31;
+  --oft-status-ok: #4fd1a5;
+  --oft-status-danger: #ff6b6b;
+  --oft-status-warn: #ffb020;
+
+  --oft-font-mono:
+    ui-monospace, 'SFMono-Regular', 'SF Mono', Menlo, Consolas, 'Liberation Mono', monospace;
+  --oft-font-sans:
+    system-ui, -apple-system, 'Segoe UI', Roboto, 'Helvetica Neue', Arial, sans-serif;
+
+  --oft-radius-sm: 2px;
+  --oft-space-1: 4px;
+  --oft-space-2: 8px;
+  --oft-space-3: 12px;
+  --oft-space-4: 16px;
+  --oft-space-6: 24px;
+  --oft-space-8: 32px;
+}
