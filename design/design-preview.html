@@ -32,12 +32,12 @@
   .statusbar{height:40px;display:flex;align-items:center;gap:14px;padding:0 16px;border-bottom:1px solid var(--border);background:var(--panel);font-family:var(--mono);font-size:12px;white-space:nowrap;overflow:hidden}
   .statusbar .mark{color:var(--text);font-weight:700;letter-spacing:.08em}
   .statusbar .sep{color:var(--muted)}
-  .statusbar .env{display:inline-flex;align-items:center;gap:6px;height:20px;padding:0 6px;border:1px solid var(--ok);color:var(--ok);background:#0C1D19;font-size:11px;letter-spacing:.04em}
+  .statusbar .env{display:inline-flex;align-items:center;gap:6px;padding:6px 8px;line-height:1;border:1px solid var(--ok);color:var(--ok);background:#0C1D19;font-size:11px;letter-spacing:.04em}
   .dot{width:6px;height:6px;border-radius:50%;background:var(--ok);display:inline-block}
   .dot.pulse{animation:pulse 2s cubic-bezier(.2,0,0,1) infinite}
   @keyframes pulse{0%,100%{opacity:1}50%{opacity:.35}}
   .statusbar .spacer{flex:1}
-  .kill{height:22px;display:inline-flex;align-items:center;gap:6px;padding:0 8px;border:1px solid var(--border-strong);background:transparent;color:var(--text2);font-family:var(--mono);font-size:11px;cursor:pointer}
+  .kill{display:inline-flex;align-items:center;gap:6px;padding:6px 8px;line-height:1;border:1px solid var(--border-control);background:transparent;color:var(--text2);font-family:var(--mono);font-size:11px;cursor:pointer}
   .kill:hover{border-color:var(--down);color:var(--down)}
   .kill[aria-pressed="true"]{border-color:var(--down);background:#2A0E12;color:var(--down)}
 
@@ -104,12 +104,12 @@
   .numrow .up{color:var(--up)} .numrow .down{color:var(--down)} .numrow .muted{color:var(--muted)}
 
   /* ---------- stamps / chips ---------- */
-  .stamp{display:inline-flex;align-items:center;height:18px;padding:0 5px;border:1px solid var(--border-strong);font-family:var(--mono);font-size:11px;letter-spacing:.08em;line-height:1;white-space:nowrap}
+  .stamp{display:inline-flex;align-items:center;padding:6px 8px;border:1px solid var(--border-strong);font-family:var(--mono);font-size:11px;letter-spacing:.08em;line-height:1;white-space:nowrap}
   .stamp.calc{color:var(--text2);border-color:var(--border-strong);background:transparent}
   .stamp.llm{color:var(--accent);border-color:#4DD8E680;background:#4DD8E60A}
   .stamp.stale{color:var(--warn);border-color:#FFB02080;background:#FFB0200F}
   .stamp.na{color:var(--down);border-color:#FF5D6A80;background:#FF5D6A0F}
-  .chip{display:inline-flex;align-items:center;gap:5px;height:20px;padding:0 6px;border:1px solid var(--border-strong);background:var(--panel);font-family:var(--mono);font-size:11px;line-height:1;white-space:nowrap;border-radius:var(--r)}
+  .chip{display:inline-flex;align-items:center;gap:5px;padding:6px 8px;border:1px solid var(--border-strong);background:var(--panel);font-family:var(--mono);font-size:11px;line-height:1;white-space:nowrap;border-radius:var(--r)}
   .chip.neutral{color:#C7D2DF;background:#1D222B;border-color:#3A424F}
   .chip.info{color:var(--info);background:#1A2735;border-color:var(--info)}
   .chip.ok{color:var(--ok);background:#132B23;border-color:var(--ok)}
@@ -169,7 +169,7 @@
   .chartpanel{border:1px solid var(--border);background:var(--panel)}
   .charthead{display:flex;align-items:center;gap:10px;flex-wrap:wrap;padding:8px 12px;border-bottom:1px solid var(--border);font-family:var(--mono);font-size:11px}
   .charthead .pair{font-size:13px;font-weight:600;color:var(--text);letter-spacing:.02em}
-  .charthead .tf{border:1px solid var(--border-strong);padding:1px 5px;color:var(--text2)}
+  .charthead .tf{border:1px solid var(--border-control);padding:6px 8px;line-height:1;color:var(--text2)}
   .charthead .spacer{flex:1}
   .chartbody{display:grid;grid-template-columns:minmax(0,1fr) 218px;gap:0;background:var(--inset)}
   .chart-scroll{overflow-x:auto;min-width:0}
@@ -236,7 +236,7 @@
   .dd ul{margin:0;padding-left:18px;color:var(--text2);font-size:13px}
   .dd li{margin:5px 0}
   .dd.do h3{color:var(--ok)} .dd.dont h3{color:var(--down)}
-  .dd code{font-family:var(--mono);font-size:11px;color:var(--text);background:var(--raised);padding:1px 4px;border:1px solid var(--border-subtle)}
+  .dd code{font-family:var(--mono);font-size:11px;line-height:1;color:var(--text);background:var(--raised);padding:6px 8px;border:1px solid var(--border-subtle);display:inline-block;vertical-align:middle}
 
   footer{margin-top:40px;padding:16px 0 40px;border-top:1px solid var(--border);display:flex;gap:16px;justify-content:space-between;flex-wrap:wrap;font-family:var(--mono);font-size:11px;color:var(--muted);letter-spacing:.04em}
 

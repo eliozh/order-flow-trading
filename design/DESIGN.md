@@ -305,6 +305,7 @@ Trading values update in place. Proportional numerals change width, causing colu
 - **Grid:** 12 columns, 12px gutter, max content 1600px. The chart is allowed to take the full remaining width; prose is capped.
 - **Rules:** 1px borders. Table header uses a 1px bottom border and a dim uppercase mono label; row separators use `border.subtle`. No zebra striping — use hover and selection instead, because zebra bands compete with heatmaps.
 - **Information per viewport:** at 1440×900, the primary tables should show 12–18 rows without scrolling. If a design cannot, it is too spacious.
+- **Container padding vs data-grid exemption:** full-border inline controls and code chips (`.tf`, `.dd code`, state chips, provenance stamps) keep ≥8px horizontal and ≥6px vertical content inset. Pure data-grid cells (`.fp-row > div`, `.numrow > span`, `.heatpair > div`, table cells) are exempt: they are divided by rules, not enclosed by a full border, and 2–6px padding is intentional for density. Six-pixel-padded, non-bordered containers (`.fp-head`, `.fp-note`, `.swatch .meta`) are exempt when the rendered text does not touch an edge.
 
 ---
 
