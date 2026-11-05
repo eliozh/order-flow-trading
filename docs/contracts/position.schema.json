@@ -1,0 +1,123 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://schemas.oft.local/v1/position.schema.json",
+  "title": "Position",
+  "description": "An open or closed position in one environment/account. Size is always positive; side determines direction. Every position traces back to a trigger and decision, and every management action is recorded.",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "schema_version",
+    "position_id",
+    "account_id",
+    "environment",
+    "symbol",
+    "side",
+    "state",
+    "size",
+    "entry_price",
+    "avg_entry_price",
+    "mark_price",
+    "notional_usd",
+    "unrealized_pnl_usd",
+    "unrealized_pnl_pct",
+    "stop_price",
+    "target_prices",
+    "leverage",
+    "margin_mode",
+    "margin_usd",
+    "risk_amount_usd",
+    "risk_pct",
+    "fees_usd",
+    "funding_usd",
+    "realized_pnl_usd",
+    "opened_at",
+    "updated_at",
+    "closed_at",
+    "exit_price",
+    "source_trigger_id",
+    "source_decision_id",
+    "management_history",
+    "data_quality",
+    "version"
+  ],
+  "properties": {
+    "schema_version": { "type": "string", "pattern": "^1\\.[0-9]+\\.[0-9]+$" },
+    "position_id": { "$ref": "./common.schema.json#/$defs/id" },
+    "account_id": { "$ref": "./common.schema.json#/$defs/id" },
+    "environment": { "$ref": "./common.schema.json#/$defs/environment" },
+    "symbol": { "$ref": "./common.schema.json#/$defs/symbol" },
+    "side": { "$ref": "./common.schema.json#/$defs/positionSide" },
+    "state": {
+      "type": "string",
+      "enum": ["OPEN", "CLOSED", "LIQUIDATED", "RECONCILING"]
+    },
+    "size": { "$ref": "./common.schema.json#/$defs/decimal" },
+    "entry_price": { "$ref": "./common.schema.json#/$defs/decimal" },
+    "avg_entry_price": { "$ref": "./common.schema.json#/$defs/decimal" },
+    "mark_price": {
+      "anyOf": [{ "$ref": "./common.schema.json#/$defs/decimal" }, { "type": "null" }]
+    },
+    "notional_usd": { "$ref": "./common.schema.json#/$defs/money" },
+    "unrealized_pnl_usd": {
+      "anyOf": [{ "$ref": "./common.schema.json#/$defs/money" }, { "type": "null" }]
+    },
+    "unrealized_pnl_pct": { "type": ["number", "null"] },
+    "stop_price": {
+      "anyOf": [{ "$ref": "./common.schema.json#/$defs/decimal" }, { "type": "null" }]
+    },
+    "target_prices": {
+      "type": "array",
+      "items": { "$ref": "./common.schema.json#/$defs/decimal" }
+    },
+    "leverage": { "type": "number" },
+    "margin_mode": { "type": "string", "enum": ["ISOLATED", "CROSS"] },
+    "margin_usd": { "$ref": "./common.schema.json#/$defs/money" },
+    "risk_amount_usd": { "$ref": "./common.schema.json#/$defs/money" },
+    "risk_pct": { "type": "number" },
+    "fees_usd": { "$ref": "./common.schema.json#/$defs/money" },
+    "funding_usd": { "$ref": "./common.schema.json#/$defs/money" },
+    "realized_pnl_usd": {
+      "anyOf": [{ "$ref": "./common.schema.json#/$defs/money" }, { "type": "null" }]
+    },
+    "opened_at": { "$ref": "./common.schema.json#/$defs/timestamp" },
+    "updated_at": { "$ref": "./common.schema.json#/$defs/timestamp" },
+    "closed_at": {
+      "anyOf": [{ "$ref": "./common.schema.json#/$defs/timestamp" }, { "type": "null" }]
+    },
+    "exit_price": {
+      "anyOf": [{ "$ref": "./common.schema.json#/$defs/decimal" }, { "type": "null" }]
+    },
+    "source_trigger_id": {
+      "anyOf": [{ "$ref": "./common.schema.json#/$defs/id" }, { "type": "null" }]
+    },
+    "source_decision_id": {
+      "anyOf": [{ "$ref": "./common.schema.json#/$defs/id" }, { "type": "null" }]
+    },
+    "management_history": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": ["decision_id", "action", "at", "executed_order_id", "note"],
+        "properties": {
+          "decision_id": { "$ref": "./common.schema.json#/$defs/id" },
+          "action": {
+            "type": "string",
+            "enum": ["HOLD", "PARTIAL_CLOSE", "FULL_CLOSE", "ADD"]
+          },
+          "at": { "$ref": "./common.schema.json#/$defs/timestamp" },
+          "executed_order_id": {
+            "anyOf": [{ "$ref": "./common.schema.json#/$defs/id" }, { "type": "null" }]
+          },
+          "note": { "type": "string" }
+        }
+      }
+    },
+    "data_quality": { "$ref": "./common.schema.json#/$defs/dataQualitySummary" },
+    "version": {
+      "type": "integer",
+      "minimum": 1,
+      "description": "Optimistic concurrency version. Every mutation increments it."
+    }
+  }
+}

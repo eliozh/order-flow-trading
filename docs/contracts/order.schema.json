@@ -1,0 +1,106 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://schemas.oft.local/v1/order.schema.json",
+  "title": "Order",
+  "description": "The internal order record and state machine. An order cannot exist without a persisted risk verdict and the client_order_id that makes retries idempotent. Exchange details are normalized; raw exchange payloads are kept in the audit trail, not in this contract.",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "schema_version",
+    "order_id",
+    "client_order_id",
+    "exchange_order_id",
+    "environment",
+    "account_id",
+    "position_id",
+    "symbol",
+    "side",
+    "type",
+    "time_in_force",
+    "quantity",
+    "price",
+    "stop_price",
+    "reduce_only",
+    "status",
+    "filled_quantity",
+    "avg_fill_price",
+    "quote_quantity",
+    "risk_verdict_id",
+    "approval_id",
+    "intent_hash",
+    "idempotency_key",
+    "created_at",
+    "submitted_at",
+    "updated_at",
+    "filled_at",
+    "error"
+  ],
+  "properties": {
+    "schema_version": { "type": "string", "pattern": "^1\\.[0-9]+\\.[0-9]+$" },
+    "order_id": { "$ref": "./common.schema.json#/$defs/id" },
+    "client_order_id": {
+      "type": "string",
+      "minLength": 1,
+      "maxLength": 64,
+      "description": "Deterministic idempotency key: oft-{env}-{symbol}-{purpose}-{hash}. Unique in the local database and sent to Binance as newClientOrderId."
+    },
+    "exchange_order_id": { "type": ["string", "null"] },
+    "environment": { "$ref": "./common.schema.json#/$defs/environment" },
+    "account_id": { "$ref": "./common.schema.json#/$defs/id" },
+    "position_id": {
+      "anyOf": [{ "$ref": "./common.schema.json#/$defs/id" }, { "type": "null" }]
+    },
+    "symbol": { "$ref": "./common.schema.json#/$defs/symbol" },
+    "side": { "$ref": "./common.schema.json#/$defs/orderSide" },
+    "type": { "$ref": "./common.schema.json#/$defs/orderType" },
+    "time_in_force": { "$ref": "./common.schema.json#/$defs/timeInForce" },
+    "quantity": { "$ref": "./common.schema.json#/$defs/decimal" },
+    "price": {
+      "anyOf": [{ "$ref": "./common.schema.json#/$defs/decimal" }, { "type": "null" }]
+    },
+    "stop_price": {
+      "anyOf": [{ "$ref": "./common.schema.json#/$defs/decimal" }, { "type": "null" }]
+    },
+    "reduce_only": { "type": "boolean" },
+    "status": { "$ref": "./common.schema.json#/$defs/orderStatus" },
+    "filled_quantity": { "$ref": "./common.schema.json#/$defs/decimal" },
+    "avg_fill_price": {
+      "anyOf": [{ "$ref": "./common.schema.json#/$defs/decimal" }, { "type": "null" }]
+    },
+    "quote_quantity": {
+      "anyOf": [{ "$ref": "./common.schema.json#/$defs/money" }, { "type": "null" }]
+    },
+    "risk_verdict_id": {
+      "$ref": "./common.schema.json#/$defs/id",
+      "description": "The persisted risk verdict that authorized this order. The gateway rejects an order without one."
+    },
+    "approval_id": {
+      "anyOf": [{ "$ref": "./common.schema.json#/$defs/id" }, { "type": "null" }],
+      "description": "Human approval record for live entries/size changes. Null in paper automatic paths."
+    },
+    "intent_hash": {
+      "type": "string",
+      "description": "Hash of the normalized OrderIntent. Changing price/size creates a new intent and a new client_order_id."
+    },
+    "idempotency_key": { "type": "string" },
+    "created_at": { "$ref": "./common.schema.json#/$defs/timestamp" },
+    "submitted_at": {
+      "anyOf": [{ "$ref": "./common.schema.json#/$defs/timestamp" }, { "type": "null" }]
+    },
+    "updated_at": { "$ref": "./common.schema.json#/$defs/timestamp" },
+    "filled_at": {
+      "anyOf": [{ "$ref": "./common.schema.json#/$defs/timestamp" }, { "type": "null" }]
+    },
+    "error": {
+      "type": ["object", "null"],
+      "additionalProperties": false,
+      "required": ["code", "message", "retryable", "exchange_code"],
+      "properties": {
+        "code": { "type": "string" },
+        "message": { "type": "string" },
+        "retryable": { "type": "boolean" },
+        "exchange_code": { "type": ["integer", "null"] }
+      }
+    }
+  }
+}

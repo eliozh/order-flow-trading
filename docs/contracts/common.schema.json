@@ -1,0 +1,456 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://schemas.oft.local/v1/common.schema.json",
+  "title": "Common definitions for Order Flow Trading contracts",
+  "description": "Shared primitives, enums, risk objects, provenance, and data-quality objects. Canonical identifiers are logical; no schema is fetched over the network.",
+  "$defs": {
+    "schemaVersion": {
+      "type": "string",
+      "pattern": "^1\\.[0-9]+\\.[0-9]+$",
+      "description": "Contract schema version. Major changes require a new URL major."
+    },
+    "id": {
+      "type": "string",
+      "minLength": 1,
+      "maxLength": 64,
+      "pattern": "^[A-Za-z0-9][A-Za-z0-9._:-]*$",
+      "description": "Opaque identifier. Never parse as a number."
+    },
+    "symbol": {
+      "type": "string",
+      "pattern": "^[A-Z0-9]{2,24}$",
+      "description": "Binance USD-M or TradFi perpetual symbol, e.g. BTCUSDT or XAUUSDT."
+    },
+    "timestamp": {
+      "type": "string",
+      "format": "date-time",
+      "pattern": "^[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}:[0-9]{2}(\\.[0-9]{1,9})?Z$",
+      "description": "ISO-8601 UTC with a trailing Z. Storage and display are UTC unless explicitly labelled otherwise."
+    },
+    "decimal": {
+      "type": "string",
+      "pattern": "^-?(0|[1-9][0-9]*)(\\.[0-9]+)?$",
+      "description": "Exact decimal as a string. Prices, quantities, percentages, and notional must never be JSON numbers."
+    },
+    "money": {
+      "type": "string",
+      "pattern": "^-?(0|[1-9][0-9]*)(\\.[0-9]{1,8})?$",
+      "description": "Exact USD/USDT amount as a string with at most 8 decimal places."
+    },
+    "confidence": {
+      "type": "number",
+      "minimum": 0,
+      "maximum": 1,
+      "description": "Model confidence. 0.70+ is high, 0.40-0.69 medium, below 0.40 low. The UI never states more certainty than this number."
+    },
+    "dataQuality": {
+      "type": "string",
+      "enum": ["COMPLETE", "PARTIAL", "STALE", "MISSING", "ESTIMATED"],
+      "description": "COMPLETE: all required inputs present and fresh. PARTIAL: some inputs missing but the metric is still usable. STALE: present but older than its freshness budget. MISSING: required input does not exist. ESTIMATED: derived by documented resampling, never measured directly."
+    },
+    "environment": {
+      "type": "string",
+      "enum": ["PAPER", "LIVE"]
+    },
+    "positionSide": {
+      "type": "string",
+      "enum": ["LONG", "SHORT"]
+    },
+    "orderSide": {
+      "type": "string",
+      "enum": ["BUY", "SELL"]
+    },
+    "orderType": {
+      "type": "string",
+      "enum": ["MARKET", "LIMIT", "STOP_MARKET", "TAKE_PROFIT_MARKET"]
+    },
+    "timeInForce": {
+      "type": "string",
+      "enum": ["GTC", "IOC", "FOK", "GTX"]
+    },
+    "orderStatus": {
+      "type": "string",
+      "enum": ["CREATED", "SUBMITTED", "PARTIALLY_FILLED", "FILLED", "CANCELED", "REJECTED", "EXPIRED", "UNKNOWN"]
+    },
+    "opportunityState": {
+      "type": "string",
+      "enum": ["OPEN", "TRIGGERED", "EXPIRED", "INVALIDATED"]
+    },
+    "triggerStatus": {
+      "type": "string",
+      "enum": ["PENDING_RECHECK", "RECHECKED", "ACCEPTED", "REJECTED", "BLOCKED", "EXPIRED"]
+    },
+    "decisionType": {
+      "type": "string",
+      "enum": ["MARKET_ANALYSIS", "OPPORTUNITY_PROPOSAL", "ENTRY_RECHECK", "POSITION_MANAGEMENT"]
+    },
+    "provider": {
+      "type": "string",
+      "enum": ["openai", "anthropic", "deepseek", "stub"]
+    },
+    "sourceMode": {
+      "type": "string",
+      "enum": ["LIVE", "BACKFILL", "REPLAY", "DERIVED"]
+    },
+    "metricPeriod": {
+      "type": "string",
+      "enum": ["1m", "5m", "15m", "1h", "4h", "8h", "1d"]
+    },
+    "conditionType": {
+      "type": "string",
+      "enum": [
+        "PRICE_CROSS_ABOVE",
+        "PRICE_CROSS_BELOW",
+        "PRICE_INSIDE_ZONE",
+        "PRICE_TOUCH_ZONE",
+        "PRICE_OUTSIDE_ZONE",
+        "DELTA_ABOVE",
+        "DELTA_BELOW",
+        "CVD_ABOVE",
+        "CVD_BELOW",
+        "CVD_DIVERGENCE",
+        "OI_DELTA_ABOVE",
+        "OI_DELTA_BELOW",
+        "FUNDING_ABOVE",
+        "FUNDING_BELOW",
+        "LIQUIDATION_NOTIONAL_ABOVE",
+        "VOLUME_ABOVE",
+        "FOOTPRINT_IMBALANCE_ABOVE",
+        "SESSION_STATE",
+        "TIME_WINDOW"
+      ],
+      "description": "The closed set of conditions the deterministic trigger evaluator understands. The LLM may select from this set but cannot invent a new type."
+    },
+    "conditionDataType": {
+      "type": "string",
+      "enum": [
+        "AGG_TRADES",
+        "TRADES",
+        "KLINE_1M",
+        "KLINE_1H",
+        "MARK_PRICE",
+        "METRICS_5M",
+        "OPEN_INTEREST",
+        "FUNDING",
+        "LIQUIDATIONS",
+        "VOLUME_PROFILE",
+        "FOOTPRINT",
+        "SESSION",
+        "CONTRACT_SPECS"
+      ]
+    },
+    "condition": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "condition_id",
+        "type",
+        "params",
+        "window",
+        "required_data",
+        "evaluable"
+      ],
+      "properties": {
+        "condition_id": { "$ref": "#/$defs/id" },
+        "type": { "$ref": "#/$defs/conditionType" },
+        "params": {
+          "type": "object",
+          "additionalProperties": true,
+          "description": "Condition-specific parameters, e.g. price, price_low, price_high, threshold, unit, comparator, lookback_bars, session_states. The trigger evaluator validates the required keys per type."
+        },
+        "window": {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["start", "end"],
+          "properties": {
+            "start": { "$ref": "#/$defs/timestamp" },
+            "end": { "$ref": "#/$defs/timestamp" }
+          }
+        },
+        "required_data": {
+          "type": "array",
+          "items": { "$ref": "#/$defs/conditionDataType" },
+          "minItems": 1
+        },
+        "evaluable": {
+          "type": "boolean",
+          "description": "False when a required input does not exist (e.g. historical USD-M liquidations). The UI must show why and must not treat the condition as met."
+        },
+        "unavailable_reason": {
+          "type": ["string", "null"]
+        },
+        "last_value": {
+          "type": ["string", "null"],
+          "description": "Exact decimal string or null when not yet evaluated."
+        },
+        "last_evaluated_at": {
+          "anyOf": [{ "$ref": "#/$defs/timestamp" }, { "type": "null" }]
+        },
+        "last_result": {
+          "type": ["boolean", "null"]
+        }
+      }
+    },
+    "riskRequest": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["entry_price", "stop_price", "quantity", "risk_pct", "leverage", "notional_usd"],
+      "properties": {
+        "entry_price": { "$ref": "#/$defs/decimal" },
+        "stop_price": { "$ref": "#/$defs/decimal" },
+        "quantity": { "anyOf": [{ "$ref": "#/$defs/decimal" }, { "type": "null" }] },
+        "risk_pct": { "type": "number" },
+        "leverage": { "type": "number" },
+        "notional_usd": { "anyOf": [{ "$ref": "#/$defs/money" }, { "type": "null" }] }
+      },
+      "description": "The LLM's requested risk parameters. These are proposals, not authoritative limits."
+    },
+    "riskCaps": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "per_trade_risk_pct",
+        "max_concurrent_positions",
+        "daily_loss_limit_usd",
+        "max_leverage",
+        "max_notional_usd",
+        "max_slippage_bps",
+        "max_spread_bps",
+        "stale_mark_seconds"
+      ],
+      "properties": {
+        "per_trade_risk_pct": { "type": "number" },
+        "max_concurrent_positions": { "type": "integer", "minimum": 1 },
+        "daily_loss_limit_usd": { "$ref": "#/$defs/money" },
+        "max_leverage": { "type": "number" },
+        "max_notional_usd": { "$ref": "#/$defs/money" },
+        "max_slippage_bps": { "type": "number" },
+        "max_spread_bps": { "type": "number" },
+        "stale_mark_seconds": { "type": "integer", "minimum": 1 }
+      }
+    },
+    "riskVerdict": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "verdict",
+        "requested",
+        "allowed",
+        "binding_cap",
+        "reasons",
+        "computed_at",
+        "expires_at",
+        "inputs_hash",
+        "stale_inputs"
+      ],
+      "properties": {
+        "verdict": { "type": "string", "enum": ["ALLOW", "REDUCE", "BLOCK"] },
+        "requested": { "$ref": "#/$defs/riskRequest" },
+        "allowed": {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["quantity", "notional_usd", "leverage", "risk_amount_usd"],
+          "properties": {
+            "quantity": { "anyOf": [{ "$ref": "#/$defs/decimal" }, { "type": "null" }] },
+            "notional_usd": { "anyOf": [{ "$ref": "#/$defs/money" }, { "type": "null" }] },
+            "leverage": { "type": "number" },
+            "risk_amount_usd": { "$ref": "#/$defs/money" }
+          }
+        },
+        "binding_cap": {
+          "type": "string",
+          "enum": [
+            "NONE",
+            "PER_TRADE_RISK",
+            "MAX_POSITIONS",
+            "DAILY_LOSS",
+            "MAX_LEVERAGE",
+            "MAX_NOTIONAL",
+            "EXCHANGE_BRACKET",
+            "MIN_NOTIONAL",
+            "STALE_MARK",
+            "STALE_DATA",
+            "MISSING_STOP",
+            "PRICE_MOVED",
+            "SPREAD",
+            "SLIPPAGE"
+          ]
+        },
+        "reasons": {
+          "type": "array",
+          "items": { "type": "string" }
+        },
+        "computed_at": { "$ref": "#/$defs/timestamp" },
+        "expires_at": { "$ref": "#/$defs/timestamp" },
+        "inputs_hash": { "type": "string" },
+        "stale_inputs": {
+          "type": "array",
+          "items": { "type": "string" },
+          "description": "Named risk inputs that were stale or missing. A non-empty list may reduce or block the verdict."
+        }
+      }
+    },
+    "llmUsage": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["input_tokens", "output_tokens", "cache_read_tokens", "cache_write_tokens", "reasoning_tokens", "total_tokens"],
+      "properties": {
+        "input_tokens": { "type": "integer", "minimum": 0 },
+        "output_tokens": { "type": "integer", "minimum": 0 },
+        "cache_read_tokens": { "type": "integer", "minimum": 0 },
+        "cache_write_tokens": { "type": "integer", "minimum": 0 },
+        "reasoning_tokens": { "type": "integer", "minimum": 0 },
+        "total_tokens": { "type": "integer", "minimum": 0 }
+      }
+    },
+    "llmCost": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["amount_usd", "currency", "price_version", "unpriced"],
+      "properties": {
+        "amount_usd": { "$ref": "#/$defs/money" },
+        "currency": { "type": "string", "enum": ["USD"] },
+        "price_version": { "type": "string" },
+        "unpriced": {
+          "type": "boolean",
+          "description": "True when the model or token class has no configured price. The amount is then an estimate or zero and must be surfaced, never silently treated as free."
+        }
+      }
+    },
+    "provenance": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "provider",
+        "model",
+        "model_snapshot",
+        "prompt_id",
+        "prompt_version",
+        "prompt_hash",
+        "knowledge_artifact_hash",
+        "input_hash",
+        "schema_version",
+        "temperature",
+        "seed",
+        "request_id",
+        "latency_ms",
+        "usage",
+        "cost",
+        "recorded_at"
+      ],
+      "properties": {
+        "provider": { "$ref": "#/$defs/provider" },
+        "model": { "type": "string" },
+        "model_snapshot": { "type": ["string", "null"] },
+        "prompt_id": { "$ref": "#/$defs/id" },
+        "prompt_version": { "type": "integer", "minimum": 1 },
+        "prompt_hash": { "type": "string" },
+        "knowledge_artifact_hash": { "type": ["string", "null"] },
+        "input_hash": { "type": "string" },
+        "schema_version": { "$ref": "#/$defs/schemaVersion" },
+        "temperature": { "type": "number" },
+        "seed": { "type": ["integer", "null"] },
+        "request_id": { "type": "string" },
+        "latency_ms": { "type": "integer", "minimum": 0 },
+        "usage": { "$ref": "#/$defs/llmUsage" },
+        "cost": { "$ref": "#/$defs/llmCost" },
+        "recorded_at": { "$ref": "#/$defs/timestamp" }
+      }
+    },
+    "actor": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["kind", "id"],
+      "properties": {
+        "kind": { "type": "string", "enum": ["USER", "SYSTEM", "SCHEDULER", "LLM"] },
+        "id": { "type": "string" },
+        "display_name": { "type": ["string", "null"] }
+      }
+    },
+    "sourceRef": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["kind", "ref", "as_of"],
+      "properties": {
+        "kind": {
+          "type": "string",
+          "enum": ["LIVE_WS", "REST_SNAPSHOT", "ARCHIVE", "DERIVED", "REPLAY", "LLM", "PAPER"]
+        },
+        "ref": { "type": "string" },
+        "as_of": { "$ref": "#/$defs/timestamp" },
+        "version": { "type": ["string", "null"] },
+        "hash": { "type": ["string", "null"] }
+      }
+    },
+    "dataGap": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["gap_id", "data_type", "start", "end", "reason", "severity", "resolved"],
+      "properties": {
+        "gap_id": { "type": ["string", "null"] },
+        "data_type": { "$ref": "#/$defs/conditionDataType" },
+        "start": { "$ref": "#/$defs/timestamp" },
+        "end": { "$ref": "#/$defs/timestamp" },
+        "reason": { "type": "string" },
+        "severity": { "type": "string", "enum": ["INFO", "WARNING", "CRITICAL"] },
+        "resolved": { "type": "boolean" }
+      }
+    },
+    "dataQualitySummary": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["status", "reasons", "gaps", "last_event_at", "coverage_start"],
+      "properties": {
+        "status": { "$ref": "#/$defs/dataQuality" },
+        "reasons": { "type": "array", "items": { "type": "string" } },
+        "gaps": { "type": "array", "items": { "$ref": "#/$defs/dataGap" } },
+        "last_event_at": { "anyOf": [{ "$ref": "#/$defs/timestamp" }, { "type": "null" }] },
+        "coverage_start": {
+          "anyOf": [{ "$ref": "#/$defs/timestamp" }, { "type": "null" }],
+          "description": "Start of measured coverage. For liquidations this is the deployment time; there is no historical backfill."
+        }
+      }
+    },
+    "priceRange": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["low", "high"],
+      "properties": {
+        "low": { "$ref": "#/$defs/decimal" },
+        "high": { "$ref": "#/$defs/decimal" }
+      }
+    },
+    "warning": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["code", "message"],
+      "properties": {
+        "code": { "type": "string" },
+        "message": { "type": "string" },
+        "details": { "type": ["object", "null"] }
+      }
+    },
+    "errorDetail": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["field", "code", "message"],
+      "properties": {
+        "field": { "type": ["string", "null"] },
+        "code": { "type": ["string", "null"] },
+        "message": { "type": "string" }
+      }
+    },
+    "pagination": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["limit", "cursor", "has_next", "next_cursor", "total"],
+      "properties": {
+        "limit": { "type": "integer", "minimum": 1 },
+        "cursor": { "type": ["string", "null"] },
+        "has_next": { "type": "boolean" },
+        "next_cursor": { "type": ["string", "null"] },
+        "total": { "type": ["integer", "null"] }
+      }
+    }
+  }
+}

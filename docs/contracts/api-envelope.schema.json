@@ -1,0 +1,229 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://schemas.oft.local/v1/api-envelope.schema.json",
+  "title": "Local API request/response envelope",
+  "description": "The single envelope for REST requests and responses, CLI JSON output, and SSE event payloads where applicable. Error codes are a stable contract; see error-catalog.json.",
+  "oneOf": [
+    { "$ref": "#/$defs/apiRequest" },
+    { "$ref": "#/$defs/apiResponse" }
+  ],
+  "$defs": {
+    "errorCode": {
+      "type": "string",
+      "enum": [
+        "AUTH_REQUIRED",
+        "AUTH_INVALID",
+        "CSRF_INVALID",
+        "ORIGIN_FORBIDDEN",
+        "HOST_FORBIDDEN",
+        "NOT_FOUND",
+        "METHOD_NOT_ALLOWED",
+        "CONFLICT",
+        "VALIDATION_FAILED",
+        "SCHEMA_INVALID",
+        "UNSUPPORTED_FORMAT",
+        "IDEMPOTENCY_KEY_REQUIRED",
+        "IDEMPOTENCY_CONFLICT",
+        "RATE_LIMITED",
+        "INTERNAL_ERROR",
+        "NOT_IMPLEMENTED",
+        "STORAGE_UNAVAILABLE",
+        "STORAGE_CORRUPT",
+        "CONFIG_INVALID",
+        "DAEMON_NOT_RUNNING",
+        "CLOCK_DRIFT",
+        "UPSTREAM_TIMEOUT",
+        "UPSTREAM_UNAVAILABLE",
+        "BINANCE_AUTH_FAILED",
+        "BINANCE_RATE_LIMITED",
+        "BINANCE_IP_FORBIDDEN",
+        "BINANCE_TRADFI_AGREEMENT_REQUIRED",
+        "BINANCE_SYMBOL_NOT_TRADING",
+        "DATA_GAP",
+        "DATA_STALE",
+        "DATA_UNAVAILABLE",
+        "METRICS_INCOMPLETE",
+        "BACKFILL_CHECKSUM_MISMATCH",
+        "BACKFILL_ALREADY_RUNNING",
+        "BACKFILL_MANIFEST_STALE",
+        "LLM_PROVIDER_NOT_CONFIGURED",
+        "LLM_AUTH_FAILED",
+        "LLM_TIMEOUT",
+        "LLM_RATE_LIMITED",
+        "LLM_REFUSED",
+        "LLM_SCHEMA_INVALID",
+        "LLM_OUTPUT_TRUNCATED",
+        "PROMPT_VERSION_MISSING",
+        "PROMPT_VALIDATION_FAILED",
+        "LIVE_DISABLED",
+        "PAPER_GATE_NOT_MET",
+        "KILL_SWITCH_ACTIVE",
+        "RISK_BLOCKED",
+        "RISK_DATA_INCOMPLETE",
+        "ORDER_DUPLICATE",
+        "ORDER_REJECTED",
+        "ORDER_NOT_FOUND",
+        "POSITION_NOT_FOUND",
+        "POSITION_STATE_INVALID",
+        "EXCHANGE_ERROR",
+        "RECONCILIATION_REQUIRED",
+        "SCAN_ALREADY_RUNNING",
+        "TELEGRAM_NOT_CONFIGURED",
+        "TELEGRAM_DELIVERY_FAILED"
+      ]
+    },
+    "errorCategory": {
+      "type": "string",
+      "enum": [
+        "AUTH",
+        "VALIDATION",
+        "CONFLICT",
+        "DATA",
+        "LLM",
+        "RISK",
+        "EXECUTION",
+        "STORAGE",
+        "UPSTREAM",
+        "SYSTEM"
+      ]
+    },
+    "error": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "code",
+        "message",
+        "category",
+        "http_status",
+        "retryable",
+        "reference_id",
+        "details"
+      ],
+      "properties": {
+        "code": { "$ref": "#/$defs/errorCode" },
+        "message": { "type": "string" },
+        "category": { "$ref": "#/$defs/errorCategory" },
+        "http_status": { "type": "integer", "minimum": 100, "maximum": 599 },
+        "retryable": { "type": "boolean" },
+        "reference_id": { "type": "string" },
+        "details": {
+          "type": "array",
+          "items": { "$ref": "./common.schema.json#/$defs/errorDetail" }
+        }
+      }
+    },
+    "warning": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["code", "message", "details"],
+      "properties": {
+        "code": { "type": "string" },
+        "message": { "type": "string" },
+        "details": { "type": ["object", "null"] }
+      }
+    },
+    "meta": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "request_id",
+        "generated_at",
+        "duration_ms",
+        "provenance",
+        "data_quality",
+        "warnings",
+        "pagination",
+        "idempotent_replay"
+      ],
+      "properties": {
+        "request_id": { "type": "string" },
+        "generated_at": { "$ref": "./common.schema.json#/$defs/timestamp" },
+        "duration_ms": { "type": "integer", "minimum": 0 },
+        "provenance": {
+          "type": "string",
+          "enum": ["CALC", "LLM", "MIXED", "NONE"]
+        },
+        "data_quality": {
+          "anyOf": [{ "$ref": "./common.schema.json#/$defs/dataQuality" }, { "type": "null" }]
+        },
+        "warnings": { "type": "array", "items": { "$ref": "#/$defs/warning" } },
+        "pagination": {
+          "anyOf": [{ "$ref": "./common.schema.json#/$defs/pagination" }, { "type": "null" }]
+        },
+        "idempotent_replay": { "type": "boolean" }
+      }
+    },
+    "client": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["kind", "name", "version"],
+      "properties": {
+        "kind": { "type": "string", "enum": ["CLI", "WEB", "SYSTEM", "TELEGRAM"] },
+        "name": { "type": "string" },
+        "version": { "type": "string" }
+      }
+    },
+    "apiRequest": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["request_id", "idempotency_key", "command", "params", "client", "requested_at"],
+      "properties": {
+        "request_id": { "type": "string" },
+        "idempotency_key": { "type": ["string", "null"] },
+        "command": {
+          "type": "string",
+          "description": "Stable command name, e.g. scan.run, trigger.accept, settings.risk.set."
+        },
+        "params": { "type": "object", "additionalProperties": true },
+        "client": { "$ref": "#/$defs/client" },
+        "requested_at": { "$ref": "./common.schema.json#/$defs/timestamp" }
+      }
+    },
+    "apiResponse": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["ok", "data", "error", "meta"],
+      "properties": {
+        "ok": { "type": "boolean" },
+        "data": { "type": ["object", "array", "null"] },
+        "error": { "anyOf": [{ "$ref": "#/$defs/error" }, { "type": "null" }] },
+        "meta": { "$ref": "#/$defs/meta" }
+      },
+      "allOf": [
+        {
+          "if": { "properties": { "ok": { "const": true } }, "required": ["ok"] },
+          "then": { "properties": { "error": { "type": "null" } } },
+          "else": { "properties": { "data": { "type": "null" } } }
+        }
+      ]
+    },
+    "sseEvent": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["id", "type", "occurred_at", "sequence", "data"],
+      "properties": {
+        "id": { "type": "string" },
+        "type": {
+          "type": "string",
+          "enum": [
+            "scan.updated",
+            "scan.completed",
+            "report.created",
+            "opportunity.updated",
+            "trigger.created",
+            "decision.updated",
+            "position.updated",
+            "order.updated",
+            "fill.created",
+            "budget.warning",
+            "system.health",
+            "telegram.receipt"
+          ]
+        },
+        "occurred_at": { "$ref": "./common.schema.json#/$defs/timestamp" },
+        "sequence": { "type": "integer", "minimum": 0 },
+        "data": { "type": "object", "additionalProperties": true }
+      }
+    }
+  }
+}

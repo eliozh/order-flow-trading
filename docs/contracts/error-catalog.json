@@ -1,0 +1,490 @@
+{
+  "catalog_version": "1.0.0",
+  "description": "Stable local API error codes. Codes are part of the contract: a code's meaning and HTTP status may not change without a contract major version. `retryable` means the same request may succeed later without changing the payload; it never authorizes a blind order retry (see ADR-0006).",
+  "categories": [
+    "AUTH",
+    "VALIDATION",
+    "CONFLICT",
+    "DATA",
+    "LLM",
+    "RISK",
+    "EXECUTION",
+    "STORAGE",
+    "UPSTREAM",
+    "SYSTEM"
+  ],
+  "codes": [
+    {
+      "code": "AUTH_REQUIRED",
+      "httpStatus": 401,
+      "category": "AUTH",
+      "retryable": false,
+      "summary": "No local API credential was supplied.",
+      "userAction": "Use the CLI token or open the local UI from the served origin."
+    },
+    {
+      "code": "AUTH_INVALID",
+      "httpStatus": 401,
+      "category": "AUTH",
+      "retryable": false,
+      "summary": "The local API credential is invalid or expired.",
+      "userAction": "Restart the daemon to rotate the local token, then retry."
+    },
+    {
+      "code": "CSRF_INVALID",
+      "httpStatus": 403,
+      "category": "AUTH",
+      "retryable": false,
+      "summary": "The CSRF token is missing or does not match the session.",
+      "userAction": "Reload the UI from the local origin and retry."
+    },
+    {
+      "code": "ORIGIN_FORBIDDEN",
+      "httpStatus": 403,
+      "category": "AUTH",
+      "retryable": false,
+      "summary": "The request Origin/Sec-Fetch-Site does not match the served origin.",
+      "userAction": "Open the UI from 127.0.0.1 or localhost; do not proxy from another origin."
+    },
+    {
+      "code": "HOST_FORBIDDEN",
+      "httpStatus": 403,
+      "category": "AUTH",
+      "retryable": false,
+      "summary": "The Host header is not an allowed loopback host.",
+      "userAction": "Use 127.0.0.1:<port> or localhost:<port>."
+    },
+    {
+      "code": "NOT_FOUND",
+      "httpStatus": 404,
+      "category": "VALIDATION",
+      "retryable": false,
+      "summary": "The requested object or route does not exist.",
+      "userAction": "Check the identifier or route; list the collection to find the object."
+    },
+    {
+      "code": "METHOD_NOT_ALLOWED",
+      "httpStatus": 405,
+      "category": "VALIDATION",
+      "retryable": false,
+      "summary": "The HTTP method is not valid for this route.",
+      "userAction": "Use the documented method; see the API contract."
+    },
+    {
+      "code": "CONFLICT",
+      "httpStatus": 409,
+      "category": "CONFLICT",
+      "retryable": false,
+      "summary": "The request conflicts with the current state.",
+      "userAction": "Refresh the object and retry with the current version."
+    },
+    {
+      "code": "VALIDATION_FAILED",
+      "httpStatus": 422,
+      "category": "VALIDATION",
+      "retryable": false,
+      "summary": "One or more request fields failed validation.",
+      "userAction": "Fix the named fields and retry."
+    },
+    {
+      "code": "SCHEMA_INVALID",
+      "httpStatus": 422,
+      "category": "VALIDATION",
+      "retryable": false,
+      "summary": "The payload does not satisfy its JSON Schema.",
+      "userAction": "Fix the payload shape; never coerce an invalid object."
+    },
+    {
+      "code": "UNSUPPORTED_FORMAT",
+      "httpStatus": 400,
+      "category": "VALIDATION",
+      "retryable": false,
+      "summary": "The requested output format is not supported for this object.",
+      "userAction": "Use table, json, ndjson, csv, or lines as documented."
+    },
+    {
+      "code": "IDEMPOTENCY_KEY_REQUIRED",
+      "httpStatus": 400,
+      "category": "CONFLICT",
+      "retryable": false,
+      "summary": "A state-changing request was sent without an Idempotency-Key.",
+      "userAction": "Generate a unique key for the logical action and retry."
+    },
+    {
+      "code": "IDEMPOTENCY_CONFLICT",
+      "httpStatus": 409,
+      "category": "CONFLICT",
+      "retryable": false,
+      "summary": "The same idempotency key was used with a different request payload.",
+      "userAction": "Use a new key for a different action; retry the original payload with the original key."
+    },
+    {
+      "code": "RATE_LIMITED",
+      "httpStatus": 429,
+      "category": "SYSTEM",
+      "retryable": true,
+      "summary": "The local API or an internal limiter is throttling the request.",
+      "userAction": "Wait for Retry-After and retry."
+    },
+    {
+      "code": "INTERNAL_ERROR",
+      "httpStatus": 500,
+      "category": "SYSTEM",
+      "retryable": true,
+      "summary": "An unexpected internal error occurred.",
+      "userAction": "Retry once; if it persists, check the logs with the reference ID."
+    },
+    {
+      "code": "NOT_IMPLEMENTED",
+      "httpStatus": 501,
+      "category": "SYSTEM",
+      "retryable": false,
+      "summary": "The route or capability is not implemented in this version.",
+      "userAction": "Check the milestone and the CLI help."
+    },
+    {
+      "code": "STORAGE_UNAVAILABLE",
+      "httpStatus": 503,
+      "category": "STORAGE",
+      "retryable": true,
+      "summary": "SQLite or the Parquet catalog is unavailable.",
+      "userAction": "Check disk, permissions, and `oft doctor`; retry after recovery."
+    },
+    {
+      "code": "STORAGE_CORRUPT",
+      "httpStatus": 500,
+      "category": "STORAGE",
+      "retryable": false,
+      "summary": "Storage failed an integrity check.",
+      "userAction": "Stop trading; restore from a verified backup."
+    },
+    {
+      "code": "CONFIG_INVALID",
+      "httpStatus": 500,
+      "category": "SYSTEM",
+      "retryable": false,
+      "summary": "The configuration is missing, unreadable, or inconsistent.",
+      "userAction": "Run `oft doctor`; fix or restore config; do not silently reset."
+    },
+    {
+      "code": "DAEMON_NOT_RUNNING",
+      "httpStatus": 503,
+      "category": "SYSTEM",
+      "retryable": true,
+      "summary": "The daemon is not running, so the mutating command cannot execute.",
+      "userAction": "Start it with `oft daemon start`; status/doctor still work offline."
+    },
+    {
+      "code": "CLOCK_DRIFT",
+      "httpStatus": 409,
+      "category": "SYSTEM",
+      "retryable": true,
+      "summary": "The local clock differs from Binance server time beyond the allowed threshold.",
+      "userAction": "Sync the system clock; live ordering is blocked until it is within tolerance."
+    },
+    {
+      "code": "UPSTREAM_TIMEOUT",
+      "httpStatus": 504,
+      "category": "UPSTREAM",
+      "retryable": true,
+      "summary": "An upstream request timed out.",
+      "userAction": "Retry with backoff; check network."
+    },
+    {
+      "code": "UPSTREAM_UNAVAILABLE",
+      "httpStatus": 502,
+      "category": "UPSTREAM",
+      "retryable": true,
+      "summary": "An upstream service is unreachable or returned an invalid response.",
+      "userAction": "Retry with backoff; check the provider status."
+    },
+    {
+      "code": "BINANCE_AUTH_FAILED",
+      "httpStatus": 502,
+      "category": "UPSTREAM",
+      "retryable": false,
+      "summary": "Binance rejected the API key or signature.",
+      "userAction": "Re-enter/rotate the key in settings; verify futures permissions."
+    },
+    {
+      "code": "BINANCE_RATE_LIMITED",
+      "httpStatus": 429,
+      "category": "UPSTREAM",
+      "retryable": true,
+      "summary": "Binance returned 429 or 418; the request weight/order limit was exceeded.",
+      "userAction": "Stop retries, wait out the ban, and reduce concurrency."
+    },
+    {
+      "code": "BINANCE_IP_FORBIDDEN",
+      "httpStatus": 403,
+      "category": "UPSTREAM",
+      "retryable": false,
+      "summary": "The current IP is not allowed by the Binance key's IP allowlist.",
+      "userAction": "Add the machine's IP in Binance or remove the allowlist."
+    },
+    {
+      "code": "BINANCE_TRADFI_AGREEMENT_REQUIRED",
+      "httpStatus": 412,
+      "category": "UPSTREAM",
+      "retryable": false,
+      "summary": "The TradFi perpetuals agreement has not been signed for this account.",
+      "userAction": "Sign `POST /fapi/v1/stock/contract` with the user's key, then retry."
+    },
+    {
+      "code": "BINANCE_SYMBOL_NOT_TRADING",
+      "httpStatus": 409,
+      "category": "DATA",
+      "retryable": false,
+      "summary": "The symbol is not in TRADING status.",
+      "userAction": "Remove or replace the symbol; refresh the registry."
+    },
+    {
+      "code": "DATA_GAP",
+      "httpStatus": 409,
+      "category": "DATA",
+      "retryable": true,
+      "summary": "A required data window has a gap.",
+      "userAction": "Run or wait for backfill; the report will be marked PARTIAL until resolved."
+    },
+    {
+      "code": "DATA_STALE",
+      "httpStatus": 409,
+      "category": "DATA",
+      "retryable": true,
+      "summary": "Data is older than its freshness budget.",
+      "userAction": "Refresh the feed; stale marks block risk-dependent execution."
+    },
+    {
+      "code": "DATA_UNAVAILABLE",
+      "httpStatus": 503,
+      "category": "DATA",
+      "retryable": true,
+      "summary": "Required data does not exist or cannot be fetched.",
+      "userAction": "Check coverage; some data (e.g. USD-M historical liquidations) has no source."
+    },
+    {
+      "code": "METRICS_INCOMPLETE",
+      "httpStatus": 409,
+      "category": "DATA",
+      "retryable": true,
+      "summary": "One or more required metrics could not be computed.",
+      "userAction": "Inspect quality reasons; retry after data recovery."
+    },
+    {
+      "code": "BACKFILL_CHECKSUM_MISMATCH",
+      "httpStatus": 502,
+      "category": "DATA",
+      "retryable": true,
+      "summary": "A downloaded archive file failed SHA256 verification.",
+      "userAction": "Re-download the file; never convert an unverified archive."
+    },
+    {
+      "code": "BACKFILL_ALREADY_RUNNING",
+      "httpStatus": 409,
+      "category": "CONFLICT",
+      "retryable": true,
+      "summary": "A backfill is already running.",
+      "userAction": "Wait for it to finish or inspect its progress."
+    },
+    {
+      "code": "BACKFILL_MANIFEST_STALE",
+      "httpStatus": 409,
+      "category": "DATA",
+      "retryable": true,
+      "summary": "The local data manifest is older than the archive source or a correction was published.",
+      "userAction": "Re-check the archive changelog and refresh affected files."
+    },
+    {
+      "code": "LLM_PROVIDER_NOT_CONFIGURED",
+      "httpStatus": 412,
+      "category": "LLM",
+      "retryable": false,
+      "summary": "No LLM provider/key is configured for this role.",
+      "userAction": "Add a provider key in settings/onboarding."
+    },
+    {
+      "code": "LLM_AUTH_FAILED",
+      "httpStatus": 502,
+      "category": "LLM",
+      "retryable": false,
+      "summary": "The LLM provider rejected the API key.",
+      "userAction": "Replace or rotate the provider key."
+    },
+    {
+      "code": "LLM_TIMEOUT",
+      "httpStatus": 504,
+      "category": "LLM",
+      "retryable": true,
+      "summary": "The LLM call exceeded its timeout.",
+      "userAction": "Retry; the decision was not executed."
+    },
+    {
+      "code": "LLM_RATE_LIMITED",
+      "httpStatus": 429,
+      "category": "LLM",
+      "retryable": true,
+      "summary": "The LLM provider rate-limited the request.",
+      "userAction": "Wait/back off; reduce concurrency."
+    },
+    {
+      "code": "LLM_REFUSED",
+      "httpStatus": 422,
+      "category": "LLM",
+      "retryable": false,
+      "summary": "The model refused the request.",
+      "userAction": "Record the refusal; do not execute. Review the prompt or try another provider manually."
+    },
+    {
+      "code": "LLM_SCHEMA_INVALID",
+      "httpStatus": 422,
+      "category": "LLM",
+      "retryable": false,
+      "summary": "The model output failed schema or semantic validation after the repair attempt.",
+      "userAction": "No action was executed; inspect the failing fields and alert."
+    },
+    {
+      "code": "LLM_OUTPUT_TRUNCATED",
+      "httpStatus": 422,
+      "category": "LLM",
+      "retryable": false,
+      "summary": "The model output was truncated (incomplete status).",
+      "userAction": "Reduce the payload or raise the output budget; do not execute the partial object."
+    },
+    {
+      "code": "PROMPT_VERSION_MISSING",
+      "httpStatus": 409,
+      "category": "LLM",
+      "retryable": false,
+      "summary": "A decision references a prompt version that no longer exists.",
+      "userAction": "Exact replay is disabled; restore the version or accept a non-reproducible replay."
+    },
+    {
+      "code": "PROMPT_VALIDATION_FAILED",
+      "httpStatus": 422,
+      "category": "LLM",
+      "retryable": false,
+      "summary": "A prompt template is missing a required variable or has invalid syntax.",
+      "userAction": "Fix the named variable/syntax; nothing was saved."
+    },
+    {
+      "code": "LIVE_DISABLED",
+      "httpStatus": 403,
+      "category": "RISK",
+      "retryable": false,
+      "summary": "Live trading is not armed.",
+      "userAction": "Use Paper, or complete the 4-week gate and arm Live explicitly."
+    },
+    {
+      "code": "PAPER_GATE_NOT_MET",
+      "httpStatus": 412,
+      "category": "RISK",
+      "retryable": false,
+      "summary": "The required paper-trading duration has not been met (or was reset).",
+      "userAction": "Continue paper trading; the remaining duration is shown in settings."
+    },
+    {
+      "code": "KILL_SWITCH_ACTIVE",
+      "httpStatus": 423,
+      "category": "RISK",
+      "retryable": false,
+      "summary": "The kill switch blocks new orders and LLM-driven execution.",
+      "userAction": "Do not trade. Inspect state, then resume with `RESUME` if safe."
+    },
+    {
+      "code": "RISK_BLOCKED",
+      "httpStatus": 422,
+      "category": "RISK",
+      "retryable": false,
+      "summary": "The deterministic risk gate blocked the order.",
+      "userAction": "Inspect the binding cap; reduce size or adjust the plan. The LLM cannot override it."
+    },
+    {
+      "code": "RISK_DATA_INCOMPLETE",
+      "httpStatus": 409,
+      "category": "RISK",
+      "retryable": true,
+      "summary": "A required risk input (mark, bracket, balance, position) is missing or stale.",
+      "userAction": "Refresh/reconcile; conservative defaults apply and may block."
+    },
+    {
+      "code": "ORDER_DUPLICATE",
+      "httpStatus": 409,
+      "category": "EXECUTION",
+      "retryable": false,
+      "summary": "An order with the same deterministic client_order_id already exists.",
+      "userAction": "Do not resubmit; inspect the existing order and reconcile."
+    },
+    {
+      "code": "ORDER_REJECTED",
+      "httpStatus": 422,
+      "category": "EXECUTION",
+      "retryable": false,
+      "summary": "Binance rejected the order (filters, margin, permissions, or state).",
+      "userAction": "Read the exchange error; fix the intent; do not blind-retry."
+    },
+    {
+      "code": "ORDER_NOT_FOUND",
+      "httpStatus": 404,
+      "category": "EXECUTION",
+      "retryable": false,
+      "summary": "The order is not known locally or at the exchange.",
+      "userAction": "Reconcile before any resubmission."
+    },
+    {
+      "code": "POSITION_NOT_FOUND",
+      "httpStatus": 404,
+      "category": "EXECUTION",
+      "retryable": false,
+      "summary": "The position does not exist or is closed.",
+      "userAction": "Refresh positions; use the journal for closed trades."
+    },
+    {
+      "code": "POSITION_STATE_INVALID",
+      "httpStatus": 409,
+      "category": "EXECUTION",
+      "retryable": false,
+      "summary": "The requested action is invalid for the position state.",
+      "userAction": "Refresh state; use the allowed management actions."
+    },
+    {
+      "code": "EXCHANGE_ERROR",
+      "httpStatus": 502,
+      "category": "EXECUTION",
+      "retryable": true,
+      "summary": "Binance returned an unexpected error.",
+      "userAction": "Reconcile; retry only after the order state is known."
+    },
+    {
+      "code": "RECONCILIATION_REQUIRED",
+      "httpStatus": 409,
+      "category": "EXECUTION",
+      "retryable": true,
+      "summary": "Local and exchange state disagree or are unknown.",
+      "userAction": "Run reconciliation; new orders are blocked until it succeeds."
+    },
+    {
+      "code": "SCAN_ALREADY_RUNNING",
+      "httpStatus": 409,
+      "category": "CONFLICT",
+      "retryable": true,
+      "summary": "A scan is already running.",
+      "userAction": "Inspect the running scan; wait for completion."
+    },
+    {
+      "code": "TELEGRAM_NOT_CONFIGURED",
+      "httpStatus": 412,
+      "category": "SYSTEM",
+      "retryable": false,
+      "summary": "The Telegram bot token/chat is not configured.",
+      "userAction": "Configure Telegram in settings; alerts are disabled until then."
+    },
+    {
+      "code": "TELEGRAM_DELIVERY_FAILED",
+      "httpStatus": 502,
+      "category": "SYSTEM",
+      "retryable": true,
+      "summary": "A Telegram message could not be delivered.",
+      "userAction": "Check the token/chat/allowlist; retries are recorded with receipts."
+    }
+  ]
+}

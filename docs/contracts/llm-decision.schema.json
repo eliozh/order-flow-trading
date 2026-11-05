@@ -1,0 +1,142 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://schemas.oft.local/v1/llm-decision.schema.json",
+  "title": "Persisted LLM decision envelope",
+  "description": "The authoritative record of an LLM decision after code validation. The model-generated portion is defined by llm-output.schema.json; this envelope adds code-assigned identity, subject references, provenance, validation outcome, and persistence metadata. A provider never sees or fills the provenance block.",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "schema_version",
+    "decision_id",
+    "decision_type",
+    "role",
+    "subject",
+    "provenance",
+    "confidence",
+    "rationale",
+    "caveats",
+    "analysis",
+    "opportunity",
+    "entry_recheck",
+    "position_management",
+    "validation_status",
+    "validation_errors",
+    "rejected_reason",
+    "raw_output_hash",
+    "persisted_at"
+  ],
+  "properties": {
+    "schema_version": {
+      "type": "string",
+      "pattern": "^1\\.[0-9]+\\.[0-9]+$"
+    },
+    "decision_id": {
+      "type": "string",
+      "minLength": 1,
+      "maxLength": 64
+    },
+    "decision_type": {
+      "type": "string",
+      "enum": ["MARKET_ANALYSIS", "OPPORTUNITY_PROPOSAL", "ENTRY_RECHECK", "POSITION_MANAGEMENT"]
+    },
+    "role": {
+      "type": "string",
+      "enum": ["ANALYSIS", "ENTRY_RECHECK", "MANAGEMENT", "REVIEW"]
+    },
+    "subject": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "symbol",
+        "timeframe",
+        "as_of",
+        "scan_id",
+        "report_id",
+        "opportunity_id",
+        "trigger_id",
+        "position_id",
+        "environment"
+      ],
+      "properties": {
+        "symbol": {
+          "type": "string",
+          "pattern": "^[A-Z0-9]{2,24}$"
+        },
+        "timeframe": {
+          "type": "string",
+          "enum": ["1m", "5m", "15m", "1h", "4h", "8h", "1d"]
+        },
+        "as_of": {
+          "type": "string",
+          "format": "date-time"
+        },
+        "scan_id": { "type": ["string", "null"] },
+        "report_id": { "type": ["string", "null"] },
+        "opportunity_id": { "type": ["string", "null"] },
+        "trigger_id": { "type": ["string", "null"] },
+        "position_id": { "type": ["string", "null"] },
+        "environment": {
+          "type": "string",
+          "enum": ["PAPER", "LIVE"]
+        }
+      }
+    },
+    "provenance": {
+      "$ref": "./common.schema.json#/$defs/provenance"
+    },
+    "confidence": {
+      "type": "number",
+      "minimum": 0,
+      "maximum": 1
+    },
+    "rationale": {
+      "type": "string"
+    },
+    "caveats": {
+      "type": "array",
+      "items": { "type": "string" }
+    },
+    "analysis": {
+      "anyOf": [
+        { "$ref": "./llm-output.schema.json#/$defs/analysis" },
+        { "type": "null" }
+      ]
+    },
+    "opportunity": {
+      "anyOf": [
+        { "$ref": "./llm-output.schema.json#/$defs/opportunity" },
+        { "type": "null" }
+      ]
+    },
+    "entry_recheck": {
+      "anyOf": [
+        { "$ref": "./llm-output.schema.json#/$defs/entryRecheck" },
+        { "type": "null" }
+      ]
+    },
+    "position_management": {
+      "anyOf": [
+        { "$ref": "./llm-output.schema.json#/$defs/positionManagement" },
+        { "type": "null" }
+      ]
+    },
+    "validation_status": {
+      "type": "string",
+      "enum": ["VALID", "REPAIRED", "REJECTED"]
+    },
+    "validation_errors": {
+      "type": "array",
+      "items": { "$ref": "./common.schema.json#/$defs/errorDetail" }
+    },
+    "rejected_reason": {
+      "type": ["string", "null"]
+    },
+    "raw_output_hash": {
+      "type": "string"
+    },
+    "persisted_at": {
+      "type": "string",
+      "format": "date-time"
+    }
+  }
+}

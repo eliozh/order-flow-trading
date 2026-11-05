@@ -1,0 +1,361 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://schemas.oft.local/v1/orderflow-metrics.schema.json",
+  "title": "Computed order-flow metrics",
+  "description": "Deterministic metrics computed by code from Binance data. Every value carries a metric version and a data-quality assessment. Liquidation coverage is measured from deployment; there is no USD-M historical backfill.",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "schema_version",
+    "symbol",
+    "period",
+    "window",
+    "computed_at",
+    "metric_version",
+    "input_manifest_hash",
+    "data_quality",
+    "quality_reasons",
+    "cvd",
+    "footprint",
+    "volume_profile",
+    "open_interest",
+    "funding",
+    "liquidations",
+    "sources",
+    "gaps"
+  ],
+  "properties": {
+    "schema_version": { "type": "string", "pattern": "^1\\.[0-9]+\\.[0-9]+$" },
+    "symbol": { "$ref": "./common.schema.json#/$defs/symbol" },
+    "period": { "$ref": "./common.schema.json#/$defs/metricPeriod" },
+    "window": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["start", "end"],
+      "properties": {
+        "start": { "$ref": "./common.schema.json#/$defs/timestamp" },
+        "end": { "$ref": "./common.schema.json#/$defs/timestamp" }
+      }
+    },
+    "computed_at": { "$ref": "./common.schema.json#/$defs/timestamp" },
+    "metric_version": {
+      "type": "string",
+      "description": "Algorithm/parameter version. A change creates a new version and a new output path; it never rewrites existing metrics."
+    },
+    "input_manifest_hash": {
+      "type": "string",
+      "description": "Hash of the input manifest/row set used for this computation."
+    },
+    "data_quality": { "$ref": "./common.schema.json#/$defs/dataQuality" },
+    "quality_reasons": {
+      "type": "array",
+      "items": { "type": "string" }
+    },
+    "cvd": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["unit", "points", "summary", "divergence_flags"],
+      "properties": {
+        "unit": { "type": "string", "enum": ["BASE", "QUOTE"] },
+        "points": {
+          "type": "array",
+          "items": {
+            "type": "object",
+            "additionalProperties": false,
+            "required": [
+              "bar_start",
+              "bar_end",
+              "buy_volume",
+              "sell_volume",
+              "delta",
+              "cvd",
+              "taker_buy_ratio"
+            ],
+            "properties": {
+              "bar_start": { "$ref": "./common.schema.json#/$defs/timestamp" },
+              "bar_end": { "$ref": "./common.schema.json#/$defs/timestamp" },
+              "buy_volume": { "$ref": "./common.schema.json#/$defs/decimal" },
+              "sell_volume": { "$ref": "./common.schema.json#/$defs/decimal" },
+              "delta": { "$ref": "./common.schema.json#/$defs/decimal" },
+              "cvd": { "$ref": "./common.schema.json#/$defs/decimal" },
+              "taker_buy_ratio": { "type": ["number", "null"] }
+            }
+          }
+        },
+        "summary": {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["delta", "cvd_change", "buy_volume", "sell_volume"],
+          "properties": {
+            "delta": { "$ref": "./common.schema.json#/$defs/decimal" },
+            "cvd_change": { "$ref": "./common.schema.json#/$defs/decimal" },
+            "buy_volume": { "$ref": "./common.schema.json#/$defs/decimal" },
+            "sell_volume": { "$ref": "./common.schema.json#/$defs/decimal" }
+          }
+        },
+        "divergence_flags": {
+          "type": "array",
+          "items": {
+            "type": "object",
+            "additionalProperties": false,
+            "required": ["bar_start", "kind", "note"],
+            "properties": {
+              "bar_start": { "$ref": "./common.schema.json#/$defs/timestamp" },
+              "kind": { "type": "string", "enum": ["BULLISH", "BEARISH"] },
+              "note": { "type": "string" }
+            }
+          }
+        }
+      }
+    },
+    "footprint": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["price_bucket", "imbalance_threshold", "bars", "top_imbalances"],
+      "properties": {
+        "price_bucket": {
+          "$ref": "./common.schema.json#/$defs/decimal",
+          "description": "Price bucket size in quote units."
+        },
+        "imbalance_threshold": {
+          "type": "number",
+          "description": "Ratio threshold used to mark an imbalance, e.g. 3.0 for 3:1."
+        },
+        "bars": {
+          "type": "array",
+          "items": {
+            "type": "object",
+            "additionalProperties": false,
+            "required": ["bar_start", "bar_end", "cells"],
+            "properties": {
+              "bar_start": { "$ref": "./common.schema.json#/$defs/timestamp" },
+              "bar_end": { "$ref": "./common.schema.json#/$defs/timestamp" },
+              "cells": {
+                "type": "array",
+                "items": {
+                  "type": "object",
+                  "additionalProperties": false,
+                  "required": [
+                    "price",
+                    "bid_volume",
+                    "ask_volume",
+                    "delta",
+                    "total_volume",
+                    "imbalance_ratio",
+                    "is_stacked_imbalance"
+                  ],
+                  "properties": {
+                    "price": { "$ref": "./common.schema.json#/$defs/decimal" },
+                    "bid_volume": { "$ref": "./common.schema.json#/$defs/decimal" },
+                    "ask_volume": { "$ref": "./common.schema.json#/$defs/decimal" },
+                    "delta": { "$ref": "./common.schema.json#/$defs/decimal" },
+                    "total_volume": { "$ref": "./common.schema.json#/$defs/decimal" },
+                    "imbalance_ratio": { "type": ["number", "null"] },
+                    "is_stacked_imbalance": { "type": "boolean" }
+                  }
+                }
+              }
+            }
+          }
+        },
+        "top_imbalances": {
+          "type": "array",
+          "items": {
+            "type": "object",
+            "additionalProperties": false,
+            "required": ["bar_start", "price", "side", "ratio"],
+            "properties": {
+              "bar_start": { "$ref": "./common.schema.json#/$defs/timestamp" },
+              "price": { "$ref": "./common.schema.json#/$defs/decimal" },
+              "side": { "type": "string", "enum": ["BID", "ASK"] },
+              "ratio": { "type": "number" }
+            }
+          }
+        }
+      }
+    },
+    "volume_profile": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "window",
+        "bin_size",
+        "value_area_pct",
+        "poc",
+        "vah",
+        "val",
+        "bins",
+        "notes"
+      ],
+      "properties": {
+        "window": {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["start", "end"],
+          "properties": {
+            "start": { "$ref": "./common.schema.json#/$defs/timestamp" },
+            "end": { "$ref": "./common.schema.json#/$defs/timestamp" }
+          }
+        },
+        "bin_size": { "$ref": "./common.schema.json#/$defs/decimal" },
+        "value_area_pct": { "type": "number" },
+        "poc": { "$ref": "./common.schema.json#/$defs/decimal" },
+        "vah": { "$ref": "./common.schema.json#/$defs/decimal" },
+        "val": { "$ref": "./common.schema.json#/$defs/decimal" },
+        "bins": {
+          "type": "array",
+          "items": {
+            "type": "object",
+            "additionalProperties": false,
+            "required": [
+              "price_low",
+              "price_high",
+              "volume",
+              "buy_volume",
+              "sell_volume",
+              "is_poc",
+              "in_value_area"
+            ],
+            "properties": {
+              "price_low": { "$ref": "./common.schema.json#/$defs/decimal" },
+              "price_high": { "$ref": "./common.schema.json#/$defs/decimal" },
+              "volume": { "$ref": "./common.schema.json#/$defs/decimal" },
+              "buy_volume": { "$ref": "./common.schema.json#/$defs/decimal" },
+              "sell_volume": { "$ref": "./common.schema.json#/$defs/decimal" },
+              "is_poc": { "type": "boolean" },
+              "in_value_area": { "type": "boolean" }
+            }
+          }
+        },
+        "notes": { "type": "array", "items": { "type": "string" } }
+      }
+    },
+    "open_interest": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["unit", "sampling", "points", "delta_over_window", "last"],
+      "properties": {
+        "unit": { "type": "string", "enum": ["BASE", "QUOTE", "CONTRACTS"] },
+        "sampling": { "type": "string", "enum": ["REGULAR", "IRREGULAR_RESAMPLED"] },
+        "points": {
+          "type": "array",
+          "items": {
+            "type": "object",
+            "additionalProperties": false,
+            "required": [
+              "ts",
+              "open_interest",
+              "open_interest_value",
+              "long_short_ratio",
+              "taker_ratio"
+            ],
+            "properties": {
+              "ts": { "$ref": "./common.schema.json#/$defs/timestamp" },
+              "open_interest": { "$ref": "./common.schema.json#/$defs/decimal" },
+              "open_interest_value": { "$ref": "./common.schema.json#/$defs/money" },
+              "long_short_ratio": { "type": ["number", "null"] },
+              "taker_ratio": { "type": ["number", "null"] }
+            }
+          }
+        },
+        "delta_over_window": { "$ref": "./common.schema.json#/$defs/decimal" },
+        "last": {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["ts", "open_interest", "open_interest_value"],
+          "properties": {
+            "ts": { "$ref": "./common.schema.json#/$defs/timestamp" },
+            "open_interest": { "$ref": "./common.schema.json#/$defs/decimal" },
+            "open_interest_value": { "$ref": "./common.schema.json#/$defs/money" }
+          }
+        }
+      }
+    },
+    "funding": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "current_rate",
+        "next_funding_time",
+        "interval_hours",
+        "mark_price",
+        "index_price",
+        "history"
+      ],
+      "properties": {
+        "current_rate": { "$ref": "./common.schema.json#/$defs/decimal" },
+        "next_funding_time": { "$ref": "./common.schema.json#/$defs/timestamp" },
+        "interval_hours": { "type": "integer", "minimum": 1 },
+        "mark_price": { "$ref": "./common.schema.json#/$defs/decimal" },
+        "index_price": { "$ref": "./common.schema.json#/$defs/decimal" },
+        "history": {
+          "type": "array",
+          "items": {
+            "type": "object",
+            "additionalProperties": false,
+            "required": ["ts", "rate", "interval_hours"],
+            "properties": {
+              "ts": { "$ref": "./common.schema.json#/$defs/timestamp" },
+              "rate": { "$ref": "./common.schema.json#/$defs/decimal" },
+              "interval_hours": { "type": "integer", "minimum": 1 }
+            }
+          }
+        }
+      }
+    },
+    "liquidations": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "coverage",
+        "coverage_start",
+        "coverage_end",
+        "total_long_notional",
+        "total_short_notional",
+        "count",
+        "buckets",
+        "limitations"
+      ],
+      "properties": {
+        "coverage": { "type": "string", "enum": ["SINCE_DEPLOYMENT", "NONE", "PARTIAL"] },
+        "coverage_start": {
+          "anyOf": [{ "$ref": "./common.schema.json#/$defs/timestamp" }, { "type": "null" }]
+        },
+        "coverage_end": {
+          "anyOf": [{ "$ref": "./common.schema.json#/$defs/timestamp" }, { "type": "null" }]
+        },
+        "total_long_notional": { "$ref": "./common.schema.json#/$defs/money" },
+        "total_short_notional": { "$ref": "./common.schema.json#/$defs/money" },
+        "count": { "type": "integer", "minimum": 0 },
+        "buckets": {
+          "type": "array",
+          "items": {
+            "type": "object",
+            "additionalProperties": false,
+            "required": ["bucket_start", "bucket_end", "long_notional", "short_notional", "count"],
+            "properties": {
+              "bucket_start": { "$ref": "./common.schema.json#/$defs/timestamp" },
+              "bucket_end": { "$ref": "./common.schema.json#/$defs/timestamp" },
+              "long_notional": { "$ref": "./common.schema.json#/$defs/money" },
+              "short_notional": { "$ref": "./common.schema.json#/$defs/money" },
+              "count": { "type": "integer", "minimum": 0 }
+            }
+          }
+        },
+        "limitations": {
+          "type": "array",
+          "items": { "type": "string" },
+          "description": "Always includes the fact that the WS feed pushes only the largest liquidation per symbol per second and that no historical backfill exists."
+        }
+      }
+    },
+    "sources": {
+      "type": "array",
+      "items": { "$ref": "./common.schema.json#/$defs/sourceRef" }
+    },
+    "gaps": {
+      "type": "array",
+      "items": { "$ref": "./common.schema.json#/$defs/dataGap" }
+    }
+  }
+}

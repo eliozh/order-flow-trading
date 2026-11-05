@@ -1,0 +1,97 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://schemas.oft.local/v1/opportunity.schema.json",
+  "title": "Opportunity ledger entry",
+  "description": "A structured, code-managed opportunity. The LLM proposes; code validates the condition set, owns state transitions, and evaluates triggers. The opportunity is never actionable from the LLM's narrative alone.",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "schema_version",
+    "opportunity_id",
+    "symbol",
+    "side",
+    "state",
+    "created_at",
+    "updated_at",
+    "zone",
+    "entry_preference",
+    "trigger_conditions",
+    "invalidation_conditions",
+    "expires_at",
+    "thesis",
+    "confidence",
+    "risk_request",
+    "source",
+    "provenance",
+    "data_quality",
+    "state_history"
+  ],
+  "properties": {
+    "schema_version": { "type": "string", "pattern": "^1\\.[0-9]+\\.[0-9]+$" },
+    "opportunity_id": { "$ref": "./common.schema.json#/$defs/id" },
+    "symbol": { "$ref": "./common.schema.json#/$defs/symbol" },
+    "side": { "$ref": "./common.schema.json#/$defs/positionSide" },
+    "state": { "$ref": "./common.schema.json#/$defs/opportunityState" },
+    "created_at": { "$ref": "./common.schema.json#/$defs/timestamp" },
+    "updated_at": { "$ref": "./common.schema.json#/$defs/timestamp" },
+    "zone": { "$ref": "./common.schema.json#/$defs/priceRange" },
+    "entry_preference": { "type": "string", "enum": ["LIMIT", "MARKET", "STOP"] },
+    "trigger_conditions": {
+      "type": "array",
+      "items": { "$ref": "./common.schema.json#/$defs/condition" }
+    },
+    "invalidation_conditions": {
+      "type": "array",
+      "items": { "$ref": "./common.schema.json#/$defs/condition" }
+    },
+    "expires_at": { "$ref": "./common.schema.json#/$defs/timestamp" },
+    "thesis": {
+      "type": "string",
+      "description": "LLM rationale for the opportunity. Advisory prose; never a trigger."
+    },
+    "confidence": { "$ref": "./common.schema.json#/$defs/confidence" },
+    "risk_request": { "$ref": "./common.schema.json#/$defs/riskRequest" },
+    "source": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["scan_id", "report_id", "decision_id"],
+      "properties": {
+        "scan_id": { "$ref": "./common.schema.json#/$defs/id" },
+        "report_id": { "$ref": "./common.schema.json#/$defs/id" },
+        "decision_id": { "$ref": "./common.schema.json#/$defs/id" }
+      }
+    },
+    "provenance": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["llm", "calc_snapshot_id", "calc_snapshot_hash", "calc_metric_version"],
+      "properties": {
+        "llm": { "$ref": "./common.schema.json#/$defs/provenance" },
+        "calc_snapshot_id": { "$ref": "./common.schema.json#/$defs/id" },
+        "calc_snapshot_hash": { "type": "string" },
+        "calc_metric_version": { "type": "string" }
+      }
+    },
+    "data_quality": { "$ref": "./common.schema.json#/$defs/dataQualitySummary" },
+    "state_history": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": ["from_state", "to_state", "at", "reason_code", "note"],
+        "properties": {
+          "from_state": {
+            "anyOf": [
+              { "$ref": "./common.schema.json#/$defs/opportunityState" },
+              { "type": "null" }
+            ]
+          },
+          "to_state": { "$ref": "./common.schema.json#/$defs/opportunityState" },
+          "at": { "$ref": "./common.schema.json#/$defs/timestamp" },
+          "reason_code": { "type": "string" },
+          "note": { "type": "string" }
+        }
+      }
+    }
+  }
+}

@@ -1,0 +1,112 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://schemas.oft.local/v1/trigger-event.schema.json",
+  "title": "Trigger event",
+  "description": "A code-decided trigger. The trigger evaluator, not the LLM, decides that an opportunity's conditions are met. The event records the exact snapshot and condition results used, so the decision is reproducible.",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "schema_version",
+    "trigger_id",
+    "opportunity_id",
+    "symbol",
+    "side",
+    "environment",
+    "triggered_at",
+    "trigger_source",
+    "condition_results",
+    "snapshot",
+    "status",
+    "entry_decision_id",
+    "risk_verdict",
+    "human_action",
+    "idempotency_key",
+    "rejection_reason",
+    "created_order_id"
+  ],
+  "properties": {
+    "schema_version": { "type": "string", "pattern": "^1\\.[0-9]+\\.[0-9]+$" },
+    "trigger_id": { "$ref": "./common.schema.json#/$defs/id" },
+    "opportunity_id": { "$ref": "./common.schema.json#/$defs/id" },
+    "symbol": { "$ref": "./common.schema.json#/$defs/symbol" },
+    "side": { "$ref": "./common.schema.json#/$defs/positionSide" },
+    "environment": { "$ref": "./common.schema.json#/$defs/environment" },
+    "triggered_at": { "$ref": "./common.schema.json#/$defs/timestamp" },
+    "trigger_source": {
+      "type": "string",
+      "enum": ["CODE"],
+      "description": "Always CODE. The LLM cannot trigger an opportunity."
+    },
+    "condition_results": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": [
+          "condition_id",
+          "type",
+          "met",
+          "observed_value",
+          "threshold",
+          "evaluated_at",
+          "data_quality",
+          "evaluable",
+          "note"
+        ],
+        "properties": {
+          "condition_id": { "$ref": "./common.schema.json#/$defs/id" },
+          "type": { "$ref": "./common.schema.json#/$defs/conditionType" },
+          "met": { "type": "boolean" },
+          "observed_value": { "type": ["string", "null"] },
+          "threshold": { "type": ["string", "null"] },
+          "evaluated_at": { "$ref": "./common.schema.json#/$defs/timestamp" },
+          "data_quality": { "$ref": "./common.schema.json#/$defs/dataQuality" },
+          "evaluable": { "type": "boolean" },
+          "note": { "type": "string" }
+        }
+      }
+    },
+    "snapshot": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["market_snapshot_id", "snapshot_hash", "as_of", "data_quality"],
+      "properties": {
+        "market_snapshot_id": { "$ref": "./common.schema.json#/$defs/id" },
+        "snapshot_hash": { "type": "string" },
+        "as_of": { "$ref": "./common.schema.json#/$defs/timestamp" },
+        "data_quality": { "$ref": "./common.schema.json#/$defs/dataQuality" }
+      }
+    },
+    "status": { "$ref": "./common.schema.json#/$defs/triggerStatus" },
+    "entry_decision_id": {
+      "anyOf": [{ "$ref": "./common.schema.json#/$defs/id" }, { "type": "null" }],
+      "description": "The LLM entry re-check decision, when one has been obtained."
+    },
+    "risk_verdict": {
+      "anyOf": [
+        { "$ref": "./common.schema.json#/$defs/riskVerdict" },
+        { "type": "null" }
+      ]
+    },
+    "human_action": {
+      "type": ["object", "null"],
+      "additionalProperties": false,
+      "required": ["action", "actor", "at", "reason", "confirmation_token_used"],
+      "properties": {
+        "action": { "type": "string", "enum": ["ACCEPT", "REJECT"] },
+        "actor": { "$ref": "./common.schema.json#/$defs/actor" },
+        "at": { "$ref": "./common.schema.json#/$defs/timestamp" },
+        "reason": { "type": ["string", "null"] },
+        "confirmation_token_used": { "type": "boolean" }
+      }
+    },
+    "idempotency_key": {
+      "type": "string",
+      "description": "The API/CLI idempotency key for the human action. Combined with the order client_order_id, it prevents duplicate accepts."
+    },
+    "rejection_reason": { "type": ["string", "null"] },
+    "created_order_id": {
+      "anyOf": [{ "$ref": "./common.schema.json#/$defs/id" }, { "type": "null" }]
+    }
+  }
+}

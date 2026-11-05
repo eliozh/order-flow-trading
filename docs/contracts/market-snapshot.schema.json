@@ -1,0 +1,145 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://schemas.oft.local/v1/market-snapshot.schema.json",
+  "title": "Market data snapshot",
+  "description": "The bounded, code-built input sent to an LLM for a decision. It contains bars plus computed order-flow metrics, contract specifications, session state, and explicit data-quality/gap information. Raw trades are never sent.",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "schema_version",
+    "snapshot_id",
+    "symbol",
+    "timeframe",
+    "as_of",
+    "window",
+    "source_mode",
+    "data_quality",
+    "quality_reasons",
+    "last_price",
+    "mark_price",
+    "bars",
+    "orderflow",
+    "session",
+    "contract_specs",
+    "sources",
+    "gaps",
+    "snapshot_hash"
+  ],
+  "properties": {
+    "schema_version": { "type": "string", "pattern": "^1\\.[0-9]+\\.[0-9]+$" },
+    "snapshot_id": { "$ref": "./common.schema.json#/$defs/id" },
+    "symbol": { "$ref": "./common.schema.json#/$defs/symbol" },
+    "timeframe": { "$ref": "./common.schema.json#/$defs/metricPeriod" },
+    "as_of": { "$ref": "./common.schema.json#/$defs/timestamp" },
+    "window": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["start", "end"],
+      "properties": {
+        "start": { "$ref": "./common.schema.json#/$defs/timestamp" },
+        "end": { "$ref": "./common.schema.json#/$defs/timestamp" }
+      }
+    },
+    "source_mode": { "$ref": "./common.schema.json#/$defs/sourceMode" },
+    "data_quality": { "$ref": "./common.schema.json#/$defs/dataQuality" },
+    "quality_reasons": { "type": "array", "items": { "type": "string" } },
+    "last_price": { "$ref": "./common.schema.json#/$defs/decimal" },
+    "mark_price": { "$ref": "./common.schema.json#/$defs/decimal" },
+    "bars": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": [
+          "bar_start",
+          "bar_end",
+          "open",
+          "high",
+          "low",
+          "close",
+          "volume",
+          "quote_volume",
+          "trade_count",
+          "taker_buy_volume",
+          "delta",
+          "cvd",
+          "open_interest",
+          "funding_rate"
+        ],
+        "properties": {
+          "bar_start": { "$ref": "./common.schema.json#/$defs/timestamp" },
+          "bar_end": { "$ref": "./common.schema.json#/$defs/timestamp" },
+          "open": { "$ref": "./common.schema.json#/$defs/decimal" },
+          "high": { "$ref": "./common.schema.json#/$defs/decimal" },
+          "low": { "$ref": "./common.schema.json#/$defs/decimal" },
+          "close": { "$ref": "./common.schema.json#/$defs/decimal" },
+          "volume": { "$ref": "./common.schema.json#/$defs/decimal" },
+          "quote_volume": { "$ref": "./common.schema.json#/$defs/money" },
+          "trade_count": { "type": "integer", "minimum": 0 },
+          "taker_buy_volume": { "$ref": "./common.schema.json#/$defs/decimal" },
+          "delta": { "$ref": "./common.schema.json#/$defs/decimal" },
+          "cvd": { "$ref": "./common.schema.json#/$defs/decimal" },
+          "open_interest": {
+            "anyOf": [{ "$ref": "./common.schema.json#/$defs/decimal" }, { "type": "null" }]
+          },
+          "funding_rate": {
+            "anyOf": [{ "$ref": "./common.schema.json#/$defs/decimal" }, { "type": "null" }]
+          }
+        }
+      }
+    },
+    "orderflow": { "$ref": "./orderflow-metrics.schema.json" },
+    "session": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["underlying_session", "is_no_trading", "note"],
+      "properties": {
+        "underlying_session": {
+          "type": "string",
+          "enum": ["PRE_MARKET", "REGULAR", "AFTER_MARKET", "OVERNIGHT", "NO_TRADING", "UNKNOWN"]
+        },
+        "is_no_trading": {
+          "type": "boolean",
+          "description": "True when the underlying cash market is closed. This is a liquidity/regime flag, not a contract halt: the perpetual may still match."
+        },
+        "note": { "type": "string" }
+      }
+    },
+    "contract_specs": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "contract_type",
+        "underlying_type",
+        "tick_size",
+        "step_size",
+        "min_notional",
+        "price_precision",
+        "quantity_precision",
+        "onboard_date"
+      ],
+      "properties": {
+        "contract_type": { "type": "string", "enum": ["PERPETUAL", "TRADIFI_PERPETUAL"] },
+        "underlying_type": { "type": "string" },
+        "tick_size": { "$ref": "./common.schema.json#/$defs/decimal" },
+        "step_size": { "$ref": "./common.schema.json#/$defs/decimal" },
+        "min_notional": { "$ref": "./common.schema.json#/$defs/money" },
+        "price_precision": { "type": "integer", "minimum": 0 },
+        "quantity_precision": { "type": "integer", "minimum": 0 },
+        "onboard_date": { "$ref": "./common.schema.json#/$defs/timestamp" }
+      }
+    },
+    "sources": {
+      "type": "array",
+      "items": { "$ref": "./common.schema.json#/$defs/sourceRef" }
+    },
+    "gaps": {
+      "type": "array",
+      "items": { "$ref": "./common.schema.json#/$defs/dataGap" }
+    },
+    "snapshot_hash": {
+      "type": "string",
+      "description": "Hash of the normalized snapshot payload. Triggers and decisions reference this hash so a replay/report can prove which input was used."
+    }
+  }
+}

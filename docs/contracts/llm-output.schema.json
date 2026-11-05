@@ -1,0 +1,388 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://schemas.oft.local/v1/llm-output.schema.json",
+  "title": "LLM decision output (provider-facing)",
+  "description": "The only shape an LLM may generate. It contains judgment and proposals, never execution authority. Every object is closed and every property is required so OpenAI strict json_schema, Anthropic structured outputs, and DeepSeek strict tool calling can use the same schema. Provider adapters may strip keywords a provider cannot enforce, but must never add fields or relax additionalProperties.",
+  "$defs": {
+    "conditionType": {
+      "type": "string",
+      "enum": [
+        "PRICE_CROSS_ABOVE",
+        "PRICE_CROSS_BELOW",
+        "PRICE_INSIDE_ZONE",
+        "PRICE_TOUCH_ZONE",
+        "PRICE_OUTSIDE_ZONE",
+        "DELTA_ABOVE",
+        "DELTA_BELOW",
+        "CVD_ABOVE",
+        "CVD_BELOW",
+        "CVD_DIVERGENCE",
+        "OI_DELTA_ABOVE",
+        "OI_DELTA_BELOW",
+        "FUNDING_ABOVE",
+        "FUNDING_BELOW",
+        "LIQUIDATION_NOTIONAL_ABOVE",
+        "VOLUME_ABOVE",
+        "FOOTPRINT_IMBALANCE_ABOVE",
+        "SESSION_STATE",
+        "TIME_WINDOW"
+      ]
+    },
+    "conditionDataType": {
+      "type": "string",
+      "enum": [
+        "AGG_TRADES",
+        "TRADES",
+        "KLINE_1M",
+        "KLINE_1H",
+        "MARK_PRICE",
+        "METRICS_5M",
+        "OPEN_INTEREST",
+        "FUNDING",
+        "LIQUIDATIONS",
+        "VOLUME_PROFILE",
+        "FOOTPRINT",
+        "SESSION",
+        "CONTRACT_SPECS"
+      ]
+    },
+    "subject": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["symbol", "timeframe", "as_of"],
+      "properties": {
+        "symbol": { "type": "string", "description": "Binance symbol, e.g. BTCUSDT." },
+        "timeframe": {
+          "type": "string",
+          "enum": ["1m", "5m", "15m", "1h", "4h", "8h", "1d"]
+        },
+        "as_of": { "type": "string", "description": "ISO-8601 UTC decision time supplied by code." }
+      }
+    },
+    "triggerConditionDraft": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["draft_id", "type", "params", "window", "required_data", "description"],
+      "properties": {
+        "draft_id": { "type": "string", "description": "Model-local label, e.g. c1. Code assigns the final condition_id." },
+        "type": { "$ref": "#/$defs/conditionType" },
+        "params": {
+          "type": "object",
+          "additionalProperties": false,
+          "required": [
+            "price",
+            "price_low",
+            "price_high",
+            "threshold",
+            "unit",
+            "comparator",
+            "lookback_bars",
+            "session_states",
+            "note"
+          ],
+          "properties": {
+            "price": { "type": ["string", "null"] },
+            "price_low": { "type": ["string", "null"] },
+            "price_high": { "type": ["string", "null"] },
+            "threshold": { "type": ["string", "null"] },
+            "unit": { "type": ["string", "null"] },
+            "comparator": { "type": ["string", "null"] },
+            "lookback_bars": { "type": ["integer", "null"] },
+            "session_states": { "type": "array", "items": { "type": "string" } },
+            "note": { "type": ["string", "null"] }
+          },
+          "description": "Closed parameter set for every condition type. Use null for fields that do not apply. Code validates the required keys per type."
+        },
+        "window": {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["start", "end"],
+          "properties": {
+            "start": { "type": "string" },
+            "end": { "type": "string" }
+          }
+        },
+        "required_data": {
+          "type": "array",
+          "items": { "$ref": "#/$defs/conditionDataType" }
+        },
+        "description": { "type": "string" }
+      }
+    },
+    "invalidationConditionDraft": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["type", "description", "price", "threshold", "window_end"],
+      "properties": {
+        "type": {
+          "type": "string",
+          "enum": [
+            "PRICE_CROSS_ABOVE",
+            "PRICE_CROSS_BELOW",
+            "PRICE_OUTSIDE_ZONE",
+            "DELTA_ABOVE",
+            "DELTA_BELOW",
+            "OI_DELTA_ABOVE",
+            "OI_DELTA_BELOW",
+            "FUNDING_ABOVE",
+            "FUNDING_BELOW",
+            "TIME_EXPIRED",
+            "MANUAL"
+          ]
+        },
+        "description": { "type": "string" },
+        "price": { "type": ["string", "null"] },
+        "threshold": { "type": ["string", "null"] },
+        "window_end": { "type": ["string", "null"] }
+      }
+    },
+    "keyZone": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["role", "price_low", "price_high", "note"],
+      "properties": {
+        "role": {
+          "type": "string",
+          "enum": [
+            "SUPPORT",
+            "RESISTANCE",
+            "POC",
+            "VALUE_AREA_HIGH",
+            "VALUE_AREA_LOW",
+            "LIQUIDATION_ZONE",
+            "OTHER"
+          ]
+        },
+        "price_low": { "type": "string" },
+        "price_high": { "type": "string" },
+        "note": { "type": "string" }
+      }
+    },
+    "citedMetric": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["metric", "value", "unit", "as_of", "ref", "note"],
+      "properties": {
+        "metric": {
+          "type": "string",
+          "enum": [
+            "CVD",
+            "DELTA",
+            "FOOTPRINT_DELTA",
+            "FOOTPRINT_IMBALANCE",
+            "POC",
+            "VAH",
+            "VAL",
+            "OI_DELTA",
+            "OI",
+            "FUNDING",
+            "LIQUIDATION_NOTIONAL",
+            "VOLUME",
+            "LAST_PRICE",
+            "MARK_PRICE",
+            "SESSION_STATE"
+          ]
+        },
+        "value": { "type": ["string", "null"] },
+        "unit": { "type": "string" },
+        "as_of": { "type": ["string", "null"] },
+        "ref": { "type": ["string", "null"], "description": "Reference into the supplied CALC metric payload, e.g. cvd.points[12]." },
+        "note": { "type": "string" }
+      }
+    },
+    "analysis": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "market_structure",
+        "regime",
+        "absorption",
+        "exhaustion",
+        "key_zones",
+        "narrative",
+        "metrics_cited"
+      ],
+      "properties": {
+        "market_structure": { "type": "string" },
+        "regime": {
+          "type": "string",
+          "enum": ["TRENDING_UP", "TRENDING_DOWN", "RANGE", "TRANSITION", "UNKNOWN"]
+        },
+        "absorption": { "type": ["string", "null"] },
+        "exhaustion": { "type": ["string", "null"] },
+        "key_zones": { "type": "array", "items": { "$ref": "#/$defs/keyZone" } },
+        "narrative": { "type": "string" },
+        "metrics_cited": { "type": "array", "items": { "$ref": "#/$defs/citedMetric" } }
+      }
+    },
+    "riskRequest": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["entry_price", "stop_price", "take_profits", "risk_pct", "leverage", "max_notional_usd"],
+      "properties": {
+        "entry_price": { "type": "string" },
+        "stop_price": { "type": "string" },
+        "take_profits": { "type": "array", "items": { "type": "string" } },
+        "risk_pct": { "type": "number" },
+        "leverage": { "type": "number" },
+        "max_notional_usd": { "type": ["string", "null"] }
+      }
+    },
+    "opportunity": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "side",
+        "zone_low",
+        "zone_high",
+        "entry_preference",
+        "trigger_conditions",
+        "invalidation_conditions",
+        "expires_at",
+        "risk_request",
+        "thesis",
+        "data_needs"
+      ],
+      "properties": {
+        "side": { "type": "string", "enum": ["LONG", "SHORT"] },
+        "zone_low": { "type": "string" },
+        "zone_high": { "type": "string" },
+        "entry_preference": { "type": "string", "enum": ["LIMIT", "MARKET", "STOP"] },
+        "trigger_conditions": {
+          "type": "array",
+          "items": { "$ref": "#/$defs/triggerConditionDraft" }
+        },
+        "invalidation_conditions": {
+          "type": "array",
+          "items": { "$ref": "#/$defs/invalidationConditionDraft" }
+        },
+        "expires_at": { "type": "string" },
+        "risk_request": { "$ref": "#/$defs/riskRequest" },
+        "thesis": { "type": "string" },
+        "data_needs": {
+          "type": "array",
+          "items": { "$ref": "#/$defs/conditionDataType" }
+        }
+      }
+    },
+    "entryRecheck": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "decision",
+        "order_intent",
+        "recheck_conditions",
+        "reasons",
+        "invalidation_conditions",
+        "management_plan"
+      ],
+      "properties": {
+        "decision": { "type": "string", "enum": ["ENTER_LONG", "ENTER_SHORT", "NO_ENTRY"] },
+        "order_intent": {
+          "type": ["object", "null"],
+          "additionalProperties": false,
+          "required": [
+            "entry_type",
+            "entry_price",
+            "stop_price",
+            "take_profits",
+            "size_mode",
+            "risk_pct",
+            "quote_notional_usd",
+            "leverage"
+          ],
+          "properties": {
+            "entry_type": { "type": "string", "enum": ["MARKET", "LIMIT"] },
+            "entry_price": { "type": ["string", "null"] },
+            "stop_price": { "type": ["string", "null"] },
+            "take_profits": { "type": "array", "items": { "type": "string" } },
+            "size_mode": { "type": "string", "enum": ["RISK_PCT", "QUOTE_NOTIONAL"] },
+            "risk_pct": { "type": ["number", "null"] },
+            "quote_notional_usd": { "type": ["string", "null"] },
+            "leverage": { "type": ["number", "null"] }
+          }
+        },
+        "recheck_conditions": {
+          "type": "array",
+          "items": {
+            "type": "object",
+            "additionalProperties": false,
+            "required": ["condition_id", "met", "observed", "note"],
+            "properties": {
+              "condition_id": { "type": "string" },
+              "met": { "type": "boolean" },
+              "observed": { "type": ["string", "null"] },
+              "note": { "type": "string" }
+            }
+          }
+        },
+        "reasons": { "type": "array", "items": { "type": "string" } },
+        "invalidation_conditions": {
+          "type": "array",
+          "items": { "$ref": "#/$defs/invalidationConditionDraft" }
+        },
+        "management_plan": { "type": "string" }
+      }
+    },
+    "positionManagement": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "action",
+        "close_fraction",
+        "add_risk_pct",
+        "new_stop_price",
+        "new_targets",
+        "rationale",
+        "urgency"
+      ],
+      "properties": {
+        "action": { "type": "string", "enum": ["HOLD", "PARTIAL_CLOSE", "FULL_CLOSE", "ADD"] },
+        "close_fraction": { "type": ["number", "null"] },
+        "add_risk_pct": { "type": ["number", "null"] },
+        "new_stop_price": { "type": ["string", "null"] },
+        "new_targets": { "type": "array", "items": { "type": "string" } },
+        "rationale": { "type": "string" },
+        "urgency": { "type": "string", "enum": ["LOW", "MEDIUM", "HIGH"] }
+      }
+    }
+  },
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "decision_type",
+    "subject",
+    "confidence",
+    "rationale",
+    "caveats",
+    "analysis",
+    "opportunity",
+    "entry_recheck",
+    "position_management"
+  ],
+  "properties": {
+    "decision_type": {
+      "type": "string",
+      "enum": ["MARKET_ANALYSIS", "OPPORTUNITY_PROPOSAL", "ENTRY_RECHECK", "POSITION_MANAGEMENT"]
+    },
+    "subject": { "$ref": "#/$defs/subject" },
+    "confidence": {
+      "type": "number",
+      "description": "0.0-1.0. Semantic validation enforces the range; provider schemas may not."
+    },
+    "rationale": { "type": "string" },
+    "caveats": { "type": "array", "items": { "type": "string" } },
+    "analysis": {
+      "anyOf": [{ "$ref": "#/$defs/analysis" }, { "type": "null" }]
+    },
+    "opportunity": {
+      "anyOf": [{ "$ref": "#/$defs/opportunity" }, { "type": "null" }]
+    },
+    "entry_recheck": {
+      "anyOf": [{ "$ref": "#/$defs/entryRecheck" }, { "type": "null" }]
+    },
+    "position_management": {
+      "anyOf": [{ "$ref": "#/$defs/positionManagement" }, { "type": "null" }]
+    }
+  }
+}
