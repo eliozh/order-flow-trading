@@ -10,6 +10,8 @@ from oft.api.envelope import new_request_id, success_envelope
 
 router = APIRouter()
 
+_WATCHLIST_ROW_CAP = 2000
+
 
 def _registry(request: Request) -> Any:
     return request.app.state.container.symbol_registry
@@ -19,8 +21,10 @@ def _registry(request: Request) -> Any:
 def watchlist(request: Request) -> dict[str, Any]:
     """Group registry contracts by crypto/TradFi; no star state exists yet."""
     registry = _registry(request)
-    crypto = registry.list_symbols(tradifi=False)
-    tradfi = registry.list_symbols(tradifi=True)
+    # One bounded read instead of two full-table reads.
+    contracts = registry.list_symbols(limit=_WATCHLIST_ROW_CAP)
+    crypto = [contract for contract in contracts if not contract.tradifi]
+    tradfi = [contract for contract in contracts if contract.tradifi]
     return success_envelope(
         {
             "groups": [

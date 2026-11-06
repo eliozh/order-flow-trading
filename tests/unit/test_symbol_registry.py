@@ -5,6 +5,8 @@ from __future__ import annotations
 import asyncio
 import copy
 import json
+import threading
+from datetime import UTC, datetime
 from decimal import Decimal
 from pathlib import Path
 from typing import Any
@@ -12,7 +14,12 @@ from typing import Any
 import pytest
 
 from oft.adapters.binance_rest import BinanceRestClient, BinanceRestError, HttpResponse
-from oft.application.symbol_registry import ExchangeInfoParseError, parse_exchange_info
+from oft.application.symbol_registry import (
+    ExchangeInfoParseError,
+    SymbolIngestResult,
+    SymbolRegistry,
+    parse_exchange_info,
+)
 
 FIXTURE = Path(__file__).resolve().parents[1] / "fixtures" / "binance" / "exchange_info_sample.json"
 
@@ -111,7 +118,7 @@ def test_parse_rejects_a_malformed_payload(payload: Any) -> None:
     assert excinfo.value.code == "SCHEMA_INVALID"
 
 
-def test_parse_deduplicates_repeated_symbols_last_wins() -> None:
+def test_parse_rejects_duplicate_symbols_first_wins() -> None:
     payload = _payload()
     payload["symbols"].append(
         {
@@ -136,7 +143,8 @@ def test_parse_deduplicates_repeated_symbols_last_wins() -> None:
     contracts = [contract for contract in result.contracts if contract.symbol == "BTCUSDT"]
 
     assert len(contracts) == 1
-    assert contracts[0].tick_size == Decimal("0.50")
+    assert contracts[0].tick_size == Decimal("0.10")
+    assert any(item.symbol == "BTCUSDT" and "duplicate" in item.reason for item in result.rejected)
 
 
 def _btc_entry(payload: dict[str, Any]) -> dict[str, Any]:
@@ -165,6 +173,92 @@ def test_parse_accepts_an_onboard_date_inside_the_range() -> None:
 
     btc = next(contract for contract in result.contracts if contract.symbol == "BTCUSDT")
     assert btc.listed_date == "2019-09-08"
+
+
+@pytest.mark.parametrize(
+    ("field", "value"),
+    [("pricePrecision", 21), ("quantityPrecision", 2**63), ("pricePrecision", 10**18)],
+)
+def test_parse_rejects_out_of_range_precision(field: str, value: int) -> None:
+    payload = _payload()
+    entry = _btc_entry(payload)
+    entry["symbol"] = "PRECUSDT"
+    entry[field] = value
+    payload["symbols"].append(entry)
+
+    result = parse_exchange_info(payload)
+
+    assert "PRECUSDT" not in {contract.symbol for contract in result.contracts}
+    rejected = {item.symbol: item.reason for item in result.rejected}
+    assert field in rejected["PRECUSDT"]
+
+
+def test_parse_rejects_out_of_range_decimal_magnitude() -> None:
+    payload = _payload()
+    entry = _btc_entry(payload)
+    entry["symbol"] = "HUGEUSDT"
+    for item in entry["filters"]:
+        if item.get("filterType") == "PRICE_FILTER":
+            item["tickSize"] = "1E+50"
+    payload["symbols"].append(entry)
+
+    result = parse_exchange_info(payload)
+
+    assert "HUGEUSDT" not in {contract.symbol for contract in result.contracts}
+    assert any(item.symbol == "HUGEUSDT" for item in result.rejected)
+
+
+def test_unsupported_contract_is_skipped_not_rejected() -> None:
+    result = parse_exchange_info(_payload())
+
+    rejected = {item.symbol for item in result.rejected}
+    assert "BTCUSDT_261225" not in rejected
+    assert "BTCUSDT_261225" not in {contract.symbol for contract in result.contracts}
+
+
+def test_onboard_upper_bound_uses_the_injected_clock() -> None:
+    payload = _payload()
+    entry = _btc_entry(payload)
+    entry["symbol"] = "FUTUREUSDT"
+    entry["onboardDate"] = int(datetime(2025, 6, 1, tzinfo=UTC).timestamp() * 1000)
+    payload["symbols"].append(entry)
+
+    early = parse_exchange_info(payload, now=datetime(2025, 1, 1, tzinfo=UTC))
+    assert "FUTUREUSDT" not in {contract.symbol for contract in early.contracts}
+    assert any(item.symbol == "FUTUREUSDT" for item in early.rejected)
+
+    late = parse_exchange_info(payload, now=datetime(2025, 6, 2, tzinfo=UTC))
+    assert "FUTUREUSDT" in {contract.symbol for contract in late.contracts}
+
+
+def test_parser_enforces_the_symbol_row_cap() -> None:
+    with pytest.raises(ExchangeInfoParseError) as excinfo:
+        parse_exchange_info({"symbols": [{}, {}, {}]}, max_symbols=2)
+
+    assert excinfo.value.code == "SCHEMA_INVALID"
+
+
+def test_async_refresh_runs_parsing_and_writes_off_the_event_loop() -> None:
+    class _Source:
+        async def fetch_exchange_info(self) -> Any:
+            return type("Response", (), {"payload": {"symbols": []}})()
+
+    class _Store:
+        def upsert_symbols(self, contracts: Any, *, observed_at: str) -> Any:
+            raise AssertionError("patched refresh should not reach the store")
+
+    registry: Any = SymbolRegistry(_Store())
+    seen: dict[str, int] = {}
+
+    def fake_refresh(payload: Any) -> SymbolIngestResult:
+        seen["thread"] = threading.get_ident()
+        return SymbolIngestResult(inserted=0, updated=0, unchanged=0, total=0)
+
+    registry.refresh_from_payload = fake_refresh
+    result = asyncio.run(registry.refresh_from_exchange_info(_Source()))
+
+    assert result.total == 0
+    assert seen["thread"] != threading.get_ident()
 
 
 # ---------------------------------------------------------------------------
@@ -316,3 +410,21 @@ def test_client_exhausts_retries_on_server_errors() -> None:
 
     assert excinfo.value.code == "UPSTREAM_UNAVAILABLE"
     assert attempts["count"] == 3
+
+
+def test_parse_keeps_first_duplicate_filter_and_records_it() -> None:
+    payload = _payload()
+    entry = _btc_entry(payload)
+    entry["symbol"] = "DUPFILTERUSDT"
+    entry["filters"].append({"filterType": "PRICE_FILTER", "tickSize": "0.20"})
+    payload["symbols"].append(entry)
+
+    result = parse_exchange_info(payload)
+
+    contract = next((item for item in result.contracts if item.symbol == "DUPFILTERUSDT"), None)
+    assert contract is not None  # the symbol is still accepted
+    assert contract.tick_size == Decimal("0.10")  # first filter wins
+    assert any(
+        item.symbol == "DUPFILTERUSDT" and "duplicate PRICE_FILTER" in item.reason
+        for item in result.rejected
+    )

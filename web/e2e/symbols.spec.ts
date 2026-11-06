@@ -25,6 +25,17 @@ const SCREENS_DIR =
 const EXPECTED_CRYPTO = 2
 const EXPECTED_TRADFI = 1
 
+/** Mint a browser session from the daemon's one-time bootstrap file. */
+async function authenticate(page: Page): Promise<void> {
+  const file = process.env.OFT_E2E_SYMBOLS_BOOTSTRAP_FILE
+  if (!file) {
+    return
+  }
+  const secret = fs.readFileSync(file, 'utf8').trim()
+  const response = await page.request.get(`/?bootstrap=${encodeURIComponent(secret)}`)
+  expect(response.status()).toBe(200)
+}
+
 interface ObservedSymbolResponse {
   url: string
   status: number
@@ -115,6 +126,7 @@ async function gotoWithSymbolsResponse(
   page: Page,
   pathname: string,
 ): Promise<ObservedSymbolResponse> {
+  await authenticate(page)
   const responsePromise = page.waitForResponse((response) =>
     response.url().includes('/api/v1/symbols'),
   )
@@ -347,6 +359,12 @@ test.describe('slice 02 symbol registry journeys', () => {
     }
     await expect(page.locator('[contenteditable="true"]')).toHaveCount(0)
 
+    // Touch targets at the mobile breakpoint are at least 44px tall.
+    const searchBox = await page.getByLabel('Search symbols').boundingBox()
+    expect(searchBox?.height ?? 0).toBeGreaterThanOrEqual(44)
+    const rowLink = await page.getByRole('link', { name: 'BTCUSDT' }).boundingBox()
+    expect(rowLink?.height ?? 0).toBeGreaterThanOrEqual(44)
+
     await expectNoHorizontalScroll(page)
   })
 
@@ -474,6 +492,7 @@ test.describe('slice 02 symbol registry journeys', () => {
 
   test('captures /watchlist and /watchlist/BTCUSDT at 1440, 768, and 375', async ({ page }) => {
     fs.mkdirSync(SCREENS_DIR, { recursive: true })
+    await authenticate(page)
 
     const viewports = [
       { width: 1440, height: 900 },

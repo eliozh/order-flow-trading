@@ -1,5 +1,6 @@
 import { StatusBar } from './components/status-bar'
 import { useStatusBar } from './hooks/use-status-bar'
+import { resolveRoute } from './routes/route-match'
 import { SymbolInspectorPage } from './routes/symbol-inspector'
 import { SystemPage } from './routes/system'
 import { WatchlistPage } from './routes/watchlist'
@@ -13,33 +14,19 @@ function currentPath(): string {
   return window.location.pathname
 }
 
-function decodeSegment(segment: string): string {
-  try {
-    return decodeURIComponent(segment)
-  } catch {
-    return segment
-  }
-}
-
 export default function App() {
-  const path = currentPath()
-  const isSystem = path === '/' || path.startsWith('/system')
-  const symbolMatch = /^\/watchlist\/([^/]+)\/?$/.exec(path)
-  const isWatchlistSearch = path === '/watchlist/search' || path === '/watchlist/'
-  const inspectorSymbol =
-    symbolMatch !== null && !isWatchlistSearch ? decodeSegment(symbolMatch[1]) : null
-  const isWatchlist = path === '/watchlist' || path.startsWith('/watchlist/')
+  const route = resolveRoute(currentPath())
   const statusBar = useStatusBar()
 
   return (
     <div className="app-shell">
       <StatusBar {...statusBar} />
       <main className="app-main">
-        {inspectorSymbol !== null ? (
-          <SymbolInspectorPage symbol={inspectorSymbol} />
-        ) : isWatchlist ? (
+        {route.inspectorSymbol !== null ? (
+          <SymbolInspectorPage key={route.inspectorSymbol} symbol={route.inspectorSymbol} />
+        ) : route.isWatchlist ? (
           <WatchlistPage />
-        ) : isSystem ? (
+        ) : route.isSystem ? (
           <SystemPage />
         ) : (
           <section className="system-page">

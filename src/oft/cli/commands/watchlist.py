@@ -8,11 +8,13 @@ from typing import Annotated, Any
 import typer
 
 from oft.api.envelope import new_request_id, success_envelope
+from oft.api.errors import ERROR_CATALOG
 from oft.application.symbol_registry import SymbolRegistry
 from oft.bootstrap import build_container
 from oft.cli.commands.doctor import emit_error
 from oft.config import ConfigError, load_settings
 from oft.domain.symbols import SymbolContract
+from oft.ports.store import StoreUnavailableError
 
 watchlist_app = typer.Typer(
     help="Read-only symbol registry commands (star mutation is not implemented).",
@@ -128,7 +130,15 @@ def list_command(
         raise typer.Exit(code=2)
     registry = _open_registry(as_json)
     tradifi = None if group is None else group == "tradfi"
-    contracts = registry.list_symbols(tradifi=tradifi)
+    try:
+        contracts = registry.list_symbols(tradifi=tradifi)
+    except StoreUnavailableError:
+        emit_error(
+            "DATA_UNAVAILABLE",
+            ERROR_CATALOG["DATA_UNAVAILABLE"].message,
+            json_output=as_json,
+        )
+        raise typer.Exit(code=1) from None
     _emit(
         contracts,
         {"total": len(contracts), "group": group},
@@ -150,7 +160,15 @@ def search_command(
     """Search the registry by exact symbol or substring."""
     as_json = _resolve_output(format_, json_output)
     registry = _open_registry(as_json)
-    contracts = registry.list_symbols(query=query)
+    try:
+        contracts = registry.list_symbols(query=query)
+    except StoreUnavailableError:
+        emit_error(
+            "DATA_UNAVAILABLE",
+            ERROR_CATALOG["DATA_UNAVAILABLE"].message,
+            json_output=as_json,
+        )
+        raise typer.Exit(code=1) from None
     _emit(
         contracts,
         {"total": len(contracts), "query": query},
@@ -171,7 +189,15 @@ def groups_command(
     """Report Crypto vs TradFi counts."""
     as_json = _resolve_output(format_, json_output)
     registry = _open_registry(as_json)
-    counts = registry.group_counts()
+    try:
+        counts = registry.group_counts()
+    except StoreUnavailableError:
+        emit_error(
+            "DATA_UNAVAILABLE",
+            ERROR_CATALOG["DATA_UNAVAILABLE"].message,
+            json_output=as_json,
+        )
+        raise typer.Exit(code=1) from None
     if as_json:
         typer.echo(
             json.dumps(

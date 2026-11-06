@@ -1,5 +1,5 @@
-import { fireEvent, render, screen, within } from '@testing-library/react'
-import { describe, expect, it } from 'vitest'
+import { fireEvent, render, screen, waitFor, within } from '@testing-library/react'
+import { describe, expect, it, vi } from 'vitest'
 
 import type {
   ApiMeta,
@@ -98,6 +98,7 @@ describe('SymbolInspectorPage', () => {
     )
 
     expect(screen.getByRole('status')).toHaveTextContent('Loading symbol')
+    expect(screen.getByRole('heading', { name: 'Symbol BTCUSDT', level: 1 })).toBeInTheDocument()
   })
 
   it('renders contract type, tick/step, min notional, listing date, and coverage placeholders', async () => {
@@ -184,6 +185,39 @@ describe('SymbolInspectorPage', () => {
 
     expect(await screen.findByRole('alert')).toHaveTextContent('NOPEUSDT does not exist')
   })
+
+  it('keeps the page heading, focuses the alert, and offers retry/back on error', async () => {
+    let calls = 0
+    const fetcher = async (): Promise<SymbolDetailEnvelope> => {
+      calls += 1
+      throw new Error('daemon down')
+    }
+    render(<SymbolInspectorPage symbol="BTCUSDT" fetchSymbolFn={fetcher} isCompact={false} />)
+
+    const alert = await screen.findByRole('alert')
+    expect(screen.getByRole('heading', { name: 'Symbol BTCUSDT', level: 1 })).toBeInTheDocument()
+    expect(alert).toHaveFocus()
+
+    fireEvent.click(screen.getByRole('button', { name: 'Retry' }))
+    await waitFor(() => expect(calls).toBe(2))
+    expect(screen.getByRole('link', { name: 'Back to watchlist' })).toBeInTheDocument()
+  })
+
+  it('does not leave the previous contract on screen when the symbol changes', async () => {
+    const fetcher = async (symbol: string): Promise<SymbolDetailEnvelope> =>
+      symbol === 'BTCUSDT' ? detailEnvelope(btc) : detailEnvelope(xau)
+
+    const { rerender } = render(
+      <SymbolInspectorPage symbol="BTCUSDT" fetchSymbolFn={fetcher} isCompact={false} />,
+    )
+    expect(await screen.findByText('COIN')).toBeInTheDocument()
+
+    rerender(<SymbolInspectorPage symbol="XAUUSDT" fetchSymbolFn={fetcher} isCompact={false} />)
+
+    expect(await screen.findByText('COMMODITY')).toBeInTheDocument()
+    expect(screen.queryByText('COIN')).not.toBeInTheDocument()
+    expect(screen.getByRole('heading', { name: 'Symbol XAUUSDT', level: 1 })).toBeInTheDocument()
+  })
 })
 
 describe('WatchlistPage search', () => {
@@ -248,5 +282,55 @@ describe('WatchlistPage search', () => {
     render(<WatchlistPage fetchSymbolsFn={async () => listEnvelope([])} isCompact={false} />)
 
     expect(await screen.findByText(/No symbols in the registry/)).toBeInTheDocument()
+  })
+
+  it('uses a single live region and reports truncation with the server total', async () => {
+    const many = Array.from({ length: 500 }, (_, index) => ({
+      ...btc,
+      symbol: `SYM${String(index).padStart(4, '0')}USDT`,
+      base_asset: `SYM${index}`,
+    }))
+    render(
+      <WatchlistPage
+        fetchSymbolsFn={async () => ({
+          ...listEnvelope(many),
+          data: { items: many, total: 942, query: null, group: null },
+        })}
+        isCompact={false}
+      />,
+    )
+
+    expect(await screen.findByText('Showing first 500 of 942 symbols.')).toBeInTheDocument()
+    expect(screen.getAllByRole('status')).toHaveLength(1)
+    expect(screen.getByText('500 of 942 symbols')).toBeInTheDocument()
+  })
+
+  it('sends the debounced search term to the server', async () => {
+    const fetcher = vi.fn(async () => listEnvelope([xau]))
+    render(<WatchlistPage fetchSymbolsFn={fetcher} isCompact={false} />)
+    const search = await screen.findByLabelText('Search symbols')
+
+    fireEvent.change(search, { target: { value: 'xau' } })
+
+    await waitFor(() => expect(fetcher).toHaveBeenCalledWith({ q: 'xau' }))
+  })
+
+  it('renders a retryable error state', async () => {
+    let calls = 0
+    render(
+      <WatchlistPage
+        fetchSymbolsFn={async () => {
+          calls += 1
+          throw new Error('registry locked')
+        }}
+        isCompact={false}
+      />,
+    )
+
+    const alert = await screen.findByRole('alert')
+    expect(alert).toHaveTextContent('registry locked')
+    fireEvent.click(screen.getByRole('button', { name: 'Retry' }))
+    await waitFor(() => expect(calls).toBe(2))
+    expect(screen.getAllByRole('status')).toHaveLength(1)
   })
 })

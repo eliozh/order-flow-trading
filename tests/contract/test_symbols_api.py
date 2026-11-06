@@ -293,3 +293,80 @@ def test_cli_without_a_registry_reports_empty_not_an_error(
 
     assert result.exit_code == 0, result.output
     assert "No symbols" in result.stdout
+
+
+def test_offset_above_the_bound_is_validation_failed(settings: Settings) -> None:
+    app = create_app(settings)
+
+    with TestClient(app) as client:
+        response = client.get("/api/v1/symbols", params={"offset": 10_000_001}, headers=_auth(app))
+
+    assert response.status_code == 422
+    assert response.json()["error"]["code"] == "VALIDATION_FAILED"
+
+
+def test_overflow_from_the_store_maps_to_validation_failed(settings: Settings) -> None:
+    app = create_app(settings)
+
+    def boom(**_: object) -> object:
+        raise OverflowError("offset too large")
+
+    app.state.container.symbol_registry.list_symbols = boom  # type: ignore[method-assign]
+
+    with TestClient(app) as client:
+        response = client.get("/api/v1/symbols", headers=_auth(app))
+
+    assert response.status_code == 422
+    assert response.json()["error"]["code"] == "VALIDATION_FAILED"
+
+
+def test_watchlist_uses_one_bounded_query(settings: Settings) -> None:
+    app = create_app(settings)
+    registry = app.state.container.symbol_registry
+    calls: list[dict[str, Any]] = []
+    original = registry.list_symbols
+
+    def spy(**kwargs: Any) -> Any:
+        calls.append(kwargs)
+        return original(**kwargs)
+
+    registry.list_symbols = spy  # type: ignore[method-assign]
+
+    with TestClient(app) as client:
+        response = client.get("/api/v1/watchlist", headers=_auth(app))
+
+    assert response.status_code == 200
+    assert len(calls) == 1
+    assert calls[0]["limit"] == 2000
+
+
+_STORE_FAILURE_COMMANDS = [
+    ["watchlist", "list", "--format", "json"],
+    ["watchlist", "search", "BTCUSDT", "--format", "json"],
+    ["watchlist", "groups", "--format", "json"],
+]
+
+
+@pytest.mark.parametrize("command", _STORE_FAILURE_COMMANDS)
+def test_cli_store_failure_reports_data_unavailable(
+    monkeypatch: pytest.MonkeyPatch, command: list[str]
+) -> None:
+    import oft.cli.commands.watchlist as watchlist_module
+    from oft.ports.store import StoreUnavailableError
+
+    class _BoomRegistry:
+        def list_symbols(self, **_: Any) -> Any:
+            raise StoreUnavailableError("raw sqlite /secret/path")
+
+        def group_counts(self) -> Any:
+            raise StoreUnavailableError("raw sqlite /secret/path")
+
+    monkeypatch.setattr(watchlist_module, "_open_registry", lambda json_output: _BoomRegistry())
+
+    result = CliRunner().invoke(cli_app, command)
+
+    assert result.exit_code == 1, result.output
+    payload = json.loads(result.stdout)
+    assert payload["ok"] is False
+    assert payload["error"]["code"] == "DATA_UNAVAILABLE"
+    assert "secret" not in result.output

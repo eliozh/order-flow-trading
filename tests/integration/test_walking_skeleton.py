@@ -500,6 +500,13 @@ def _fake_dist(tmp_path: Path) -> Path:
     return dist
 
 
+def _mint_browser_session(client: TestClient, app: Any) -> None:
+    response = client.get(
+        "/", params={"bootstrap": app.state.browser_bootstrap}, follow_redirects=False
+    )
+    assert response.status_code == 302
+
+
 def test_security_headers_on_health_and_system(
     settings: Settings, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
@@ -507,6 +514,7 @@ def test_security_headers_on_health_and_system(
     app = create_app(settings)
 
     with TestClient(app) as client:
+        _mint_browser_session(client, app)
         for path in ("/health", "/system"):
             response = client.get(path)
             assert response.status_code == 200
@@ -528,6 +536,7 @@ def test_unknown_static_asset_returns_404_while_spa_routes_still_serve(
     app = create_app(settings)
 
     with TestClient(app) as client:
+        _mint_browser_session(client, app)
         missing = client.get("/favicon.ico")
         spa = client.get("/system")
         asset = client.get("/assets/app.js")

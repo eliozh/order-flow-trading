@@ -56,3 +56,6 @@ def test_api_maps_store_failure_to_data_unavailable(settings: Settings) -> None:
     body = response.json()
     assert body["ok"] is False
     assert body["error"]["code"] == "DATA_UNAVAILABLE"
+    # The raw sqlite text must stay in the log, never the response.
+    assert body["error"]["message"] == "Required data does not exist or cannot be fetched."
+    assert "locked" not in response.text

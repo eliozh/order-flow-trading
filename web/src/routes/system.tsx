@@ -8,6 +8,7 @@ import {
   type ReadinessData,
   type ReadinessEnvelope,
 } from '../api/status'
+import { useCompact } from '../hooks/use-compact'
 
 type SystemFetcher<T> = () => Promise<T>
 
@@ -22,30 +23,6 @@ interface ReadyState {
   health?: HealthData
   readiness?: ReadinessData
   message?: string
-}
-
-function detectCompact(): boolean {
-  if (typeof window === 'undefined' || typeof window.matchMedia !== 'function') {
-    return false
-  }
-  return window.matchMedia('(max-width: 767px)').matches
-}
-
-function useCompact(override?: boolean): boolean {
-  const [matches, setMatches] = useState<boolean>(() => detectCompact())
-
-  useEffect(() => {
-    if (typeof window === 'undefined' || typeof window.matchMedia !== 'function') {
-      return
-    }
-    const query = window.matchMedia('(max-width: 767px)')
-    const update = () => setMatches(query.matches)
-    update()
-    query.addEventListener('change', update)
-    return () => query.removeEventListener('change', update)
-  }, [])
-
-  return override ?? matches
 }
 
 function statusClass(status: string): string {

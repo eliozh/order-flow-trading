@@ -42,19 +42,24 @@ def list_symbols(
         Query(max_length=_MAX_CONTRACT_TYPE_LENGTH, description="exchangeInfo contractType."),
     ] = None,
     limit: Annotated[int, Query(ge=1, le=_MAX_LIMIT)] = _DEFAULT_LIMIT,
-    offset: Annotated[int, Query(ge=0)] = 0,
+    offset: Annotated[int, Query(ge=0, le=10_000_000)] = 0,
 ) -> dict[str, Any]:
     """List registry contracts with search, filter, and envelope pagination."""
     registry = _registry(request)
     tradifi = None if group is None else group == "tradfi"
-    items = registry.list_symbols(
-        query=q,
-        tradifi=tradifi,
-        contract_type=contract_type,
-        limit=limit,
-        offset=offset,
-    )
-    total = registry.count_symbols(query=q, tradifi=tradifi, contract_type=contract_type)
+    try:
+        items = registry.list_symbols(
+            query=q,
+            tradifi=tradifi,
+            contract_type=contract_type,
+            limit=limit,
+            offset=offset,
+        )
+        total = registry.count_symbols(query=q, tradifi=tradifi, contract_type=contract_type)
+    except OverflowError as exc:
+        raise ApiError(
+            "VALIDATION_FAILED", "Pagination offset is outside the supported range."
+        ) from exc
     returned = len(items)
     has_next = offset + returned < total
     pagination = {

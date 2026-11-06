@@ -198,3 +198,81 @@ def test_opt_in_live_exchange_info_smoke(settings: Settings) -> None:
 
     assert result.inserted > 0
     assert registry.get_symbol("BTCUSDT") is not None
+
+
+def test_like_search_escapes_metacharacters(settings: Settings) -> None:
+    registry = _registry(_store(settings), FIRST)
+    registry.refresh_from_fixture(FIXTURE)
+
+    assert registry.list_symbols(query="_") == ()
+    assert registry.list_symbols(query="%") == ()
+    assert [contract.symbol for contract in registry.list_symbols(query="btc")] == ["BTCUSDT"]
+
+
+def test_schema_version_indexes_and_check_constraints(settings: Settings) -> None:
+    _store(settings)
+    connection = sqlite3.connect(database_path(settings))
+    try:
+        versions = {row[0] for row in connection.execute("SELECT version FROM schema_migrations")}
+        indexes = {
+            row[0]
+            for row in connection.execute("SELECT name FROM sqlite_master WHERE type = 'index'")
+        }
+    finally:
+        connection.close()
+
+    assert versions == {1, 2}
+    assert {"symbols_tradifi_symbol", "symbols_contract_tradifi_symbol"} <= indexes
+
+
+@pytest.mark.parametrize(
+    ("symbol", "price_precision", "quantity_precision", "onboard_date", "tradifi"),
+    [
+        ("BADPRECUSDT", -1, 2, 1567900800000, 0),
+        ("BADTRADIFIUSDT", 2, 2, 1567900800000, 2),
+        ("BADDATEUSDT", 2, 2, 0, 0),
+    ],
+)
+def test_symbol_check_constraints_reject_invalid_rows(
+    settings: Settings,
+    symbol: str,
+    price_precision: int,
+    quantity_precision: int,
+    onboard_date: int,
+    tradifi: int,
+) -> None:
+    _store(settings)
+    connection = sqlite3.connect(database_path(settings))
+    try:
+        with pytest.raises(sqlite3.IntegrityError):
+            connection.execute(
+                """
+                INSERT INTO symbols (
+                    symbol, base_asset, quote_asset, contract_type, underlying_type,
+                    status, tick_size, step_size, min_qty, min_notional,
+                    price_precision, quantity_precision, onboard_date, tradifi, updated_at
+                ) VALUES (?, 'B', 'USDT', 'PERPETUAL', NULL, 'TRADING',
+                          '0.1', '0.1', '1', '5', ?, ?, ?, ?, 't')
+                """,
+                (symbol, price_precision, quantity_precision, onboard_date, tradifi),
+            )
+    finally:
+        connection.close()
+
+
+def test_symbol_write_errors_map_to_store_unavailable(
+    settings: Settings, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from oft.ports.store import StoreUnavailableError
+
+    store = _store(settings)
+
+    def boom() -> sqlite3.Connection:
+        raise sqlite3.OperationalError("disk I/O error")
+
+    monkeypatch.setattr(store, "_connect", boom)
+
+    with pytest.raises(StoreUnavailableError) as excinfo:
+        store.upsert_symbols((), observed_at="2026-11-06T00:00:00.000Z")
+
+    assert excinfo.value.code == "DATA_UNAVAILABLE"

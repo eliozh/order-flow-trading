@@ -15,11 +15,141 @@ from oft.config import Settings
 from oft.domain.symbols import SymbolContract
 from oft.ports.store import ManifestEntry, ScanRecord, StoreUnavailableError, SymbolUpsertResult
 
-_SCHEMA_VERSION = 1
+_SCHEMA_VERSION = 2
+
+
+def _like_pattern(query: str) -> str:
+    """Escape LIKE metacharacters so a literal ``_``/``%`` does not match all."""
+    escaped = query.strip().lower().replace("\\", "\\\\").replace("%", "\\%").replace("_", "\\_")
+    return f"%{escaped}%"
 
 
 def database_path(settings: Settings) -> Path:
     return settings.data_dir / "oft.db"
+
+
+_SYMBOLS_COLUMNS = (
+    "symbol",
+    "base_asset",
+    "quote_asset",
+    "contract_type",
+    "underlying_type",
+    "status",
+    "tick_size",
+    "step_size",
+    "min_qty",
+    "min_notional",
+    "price_precision",
+    "quantity_precision",
+    "onboard_date",
+    "tradifi",
+    "updated_at",
+)
+_SYMBOLS_DEFINITION = """
+    symbol TEXT PRIMARY KEY,
+    base_asset TEXT NOT NULL,
+    quote_asset TEXT NOT NULL,
+    contract_type TEXT NOT NULL,
+    underlying_type TEXT,
+    status TEXT NOT NULL,
+    tick_size TEXT NOT NULL,
+    step_size TEXT NOT NULL,
+    min_qty TEXT NOT NULL,
+    min_notional TEXT NOT NULL,
+    price_precision INTEGER NOT NULL,
+    quantity_precision INTEGER NOT NULL,
+    onboard_date INTEGER NOT NULL,
+    tradifi INTEGER NOT NULL,
+    updated_at TEXT NOT NULL,
+    CHECK (tradifi IN (0, 1)),
+    CHECK (price_precision >= 0 AND quantity_precision >= 0),
+    CHECK (onboard_date > 0)
+"""
+_SYMBOL_INDEXES = (
+    "symbols_contract_type",
+    "symbols_tradifi",
+    "symbols_tradifi_symbol",
+    "symbols_contract_tradifi_symbol",
+)
+_SCHEMA_SQL = f"""
+    CREATE TABLE IF NOT EXISTS schema_migrations (
+        version INTEGER PRIMARY KEY,
+        applied_at TEXT NOT NULL
+    );
+    CREATE TABLE IF NOT EXISTS scans (
+        scan_id TEXT PRIMARY KEY,
+        symbol TEXT NOT NULL,
+        period TEXT NOT NULL,
+        status TEXT NOT NULL,
+        trigger_source TEXT NOT NULL,
+        metrics_only INTEGER NOT NULL,
+        fixture_path TEXT NOT NULL,
+        started_at TEXT NOT NULL,
+        finished_at TEXT NOT NULL,
+        window_start TEXT NOT NULL,
+        window_end TEXT NOT NULL,
+        trade_count INTEGER NOT NULL,
+        buy_volume TEXT NOT NULL,
+        sell_volume TEXT NOT NULL,
+        delta TEXT NOT NULL,
+        cvd TEXT NOT NULL,
+        data_quality TEXT NOT NULL,
+        manifest_path TEXT NOT NULL,
+        parquet_rows INTEGER NOT NULL,
+        created_at TEXT NOT NULL
+    );
+    CREATE INDEX IF NOT EXISTS scans_created_at ON scans(created_at);
+    CREATE TABLE IF NOT EXISTS manifest (
+        path TEXT PRIMARY KEY,
+        data_type TEXT NOT NULL,
+        symbol TEXT NOT NULL,
+        date TEXT NOT NULL,
+        rows INTEGER NOT NULL,
+        bytes INTEGER NOT NULL,
+        checksum TEXT NOT NULL,
+        source TEXT NOT NULL,
+        created_at TEXT NOT NULL,
+        status TEXT NOT NULL
+    );
+    CREATE TABLE IF NOT EXISTS symbols ({_SYMBOLS_DEFINITION});
+    CREATE INDEX IF NOT EXISTS symbols_contract_type ON symbols(contract_type);
+    CREATE INDEX IF NOT EXISTS symbols_tradifi ON symbols(tradifi);
+    CREATE INDEX IF NOT EXISTS symbols_tradifi_symbol ON symbols(tradifi, symbol);
+    CREATE INDEX IF NOT EXISTS symbols_contract_tradifi_symbol
+        ON symbols(contract_type, tradifi, symbol);
+"""
+
+
+def _table_exists(connection: sqlite3.Connection, name: str) -> bool:
+    row = connection.execute(
+        "SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = ?", (name,)
+    ).fetchone()
+    return row is not None
+
+
+def _schema_version(connection: sqlite3.Connection) -> int:
+    if not _table_exists(connection, "schema_migrations"):
+        return 0
+    row = connection.execute("SELECT MAX(version) FROM schema_migrations").fetchone()
+    return int(row[0]) if row is not None and row[0] is not None else 0
+
+
+def _migrate_symbols_v2(connection: sqlite3.Connection) -> None:
+    """Rebuild the v1 symbols table so its CHECK constraints actually apply."""
+    columns = ", ".join(_SYMBOLS_COLUMNS)
+    connection.execute("BEGIN IMMEDIATE")
+    try:
+        for index in _SYMBOL_INDEXES:
+            connection.execute(f"DROP INDEX IF EXISTS {index}")
+        connection.execute("DROP TABLE IF EXISTS symbols_v1")
+        connection.execute("ALTER TABLE symbols RENAME TO symbols_v1")
+        connection.execute(f"CREATE TABLE symbols ({_SYMBOLS_DEFINITION})")
+        connection.execute(f"INSERT INTO symbols ({columns}) SELECT {columns} FROM symbols_v1")
+        connection.execute("DROP TABLE symbols_v1")
+        connection.execute("COMMIT")
+    except Exception:
+        connection.execute("ROLLBACK")
+        raise
 
 
 def initialize_database(settings: Settings) -> None:
@@ -33,72 +163,17 @@ def initialize_database(settings: Settings) -> None:
         connection.execute("PRAGMA foreign_keys=ON")
         connection.execute("PRAGMA busy_timeout=5000")
         connection.execute("PRAGMA synchronous=NORMAL")
+        if _schema_version(connection) < _SCHEMA_VERSION and _table_exists(connection, "symbols"):
+            _migrate_symbols_v2(connection)
         with connection:
-            connection.executescript(
-                """
-                CREATE TABLE IF NOT EXISTS schema_migrations (
-                    version INTEGER PRIMARY KEY,
-                    applied_at TEXT NOT NULL
-                );
-                CREATE TABLE IF NOT EXISTS scans (
-                    scan_id TEXT PRIMARY KEY,
-                    symbol TEXT NOT NULL,
-                    period TEXT NOT NULL,
-                    status TEXT NOT NULL,
-                    trigger_source TEXT NOT NULL,
-                    metrics_only INTEGER NOT NULL,
-                    fixture_path TEXT NOT NULL,
-                    started_at TEXT NOT NULL,
-                    finished_at TEXT NOT NULL,
-                    window_start TEXT NOT NULL,
-                    window_end TEXT NOT NULL,
-                    trade_count INTEGER NOT NULL,
-                    buy_volume TEXT NOT NULL,
-                    sell_volume TEXT NOT NULL,
-                    delta TEXT NOT NULL,
-                    cvd TEXT NOT NULL,
-                    data_quality TEXT NOT NULL,
-                    manifest_path TEXT NOT NULL,
-                    parquet_rows INTEGER NOT NULL,
-                    created_at TEXT NOT NULL
-                );
-                CREATE INDEX IF NOT EXISTS scans_created_at ON scans(created_at);
-                CREATE TABLE IF NOT EXISTS manifest (
-                    path TEXT PRIMARY KEY,
-                    data_type TEXT NOT NULL,
-                    symbol TEXT NOT NULL,
-                    date TEXT NOT NULL,
-                    rows INTEGER NOT NULL,
-                    bytes INTEGER NOT NULL,
-                    checksum TEXT NOT NULL,
-                    source TEXT NOT NULL,
-                    created_at TEXT NOT NULL,
-                    status TEXT NOT NULL
-                );
-                CREATE TABLE IF NOT EXISTS symbols (
-                    symbol TEXT PRIMARY KEY,
-                    base_asset TEXT NOT NULL,
-                    quote_asset TEXT NOT NULL,
-                    contract_type TEXT NOT NULL,
-                    underlying_type TEXT,
-                    status TEXT NOT NULL,
-                    tick_size TEXT NOT NULL,
-                    step_size TEXT NOT NULL,
-                    min_qty TEXT NOT NULL,
-                    min_notional TEXT NOT NULL,
-                    price_precision INTEGER NOT NULL,
-                    quantity_precision INTEGER NOT NULL,
-                    onboard_date INTEGER NOT NULL,
-                    tradifi INTEGER NOT NULL,
-                    updated_at TEXT NOT NULL
-                );
-                CREATE INDEX IF NOT EXISTS symbols_contract_type ON symbols(contract_type);
-                CREATE INDEX IF NOT EXISTS symbols_tradifi ON symbols(tradifi);
-                """
+            connection.executescript(_SCHEMA_SQL)
+            connection.execute(
+                "INSERT OR IGNORE INTO schema_migrations (version, applied_at) VALUES (?, ?)",
+                (1, "2026-11-06T00:00:00.000Z"),
             )
             connection.execute(
                 "INSERT OR IGNORE INTO schema_migrations (version, applied_at) VALUES (?, ?)",
-                (_SCHEMA_VERSION, "2026-11-06T00:00:00.000Z"),
+                (_SCHEMA_VERSION, "2026-11-06T12:00:00.000Z"),
             )
     finally:
         connection.close()
@@ -146,24 +221,7 @@ def _row_to_manifest(row: sqlite3.Row) -> ManifestEntry:
     )
 
 
-_SYMBOL_COLUMNS = (
-    "symbol",
-    "base_asset",
-    "quote_asset",
-    "contract_type",
-    "underlying_type",
-    "status",
-    "tick_size",
-    "step_size",
-    "min_qty",
-    "min_notional",
-    "price_precision",
-    "quantity_precision",
-    "onboard_date",
-    "tradifi",
-    "updated_at",
-)
-_SYMBOL_SPEC_COLUMNS = _SYMBOL_COLUMNS[:-1]
+_SYMBOL_SPEC_COLUMNS = _SYMBOLS_COLUMNS[:-1]
 
 
 def _row_to_symbol(row: sqlite3.Row) -> SymbolContract:
@@ -368,37 +426,41 @@ class SqliteStore:
     ) -> SymbolUpsertResult:
         """Insert or update contracts; ``updated_at`` moves only when the spec changed."""
         inserted = updated = unchanged = 0
-        with self._connect() as connection:
+        columns = ", ".join(_SYMBOLS_COLUMNS)
+        placeholders = ", ".join("?" for _ in _SYMBOLS_COLUMNS)
+        assignments = ", ".join(
+            f"{column} = excluded.{column}" for column in _SYMBOL_SPEC_COLUMNS[1:]
+        )
+        upsert_sql = (
+            f"INSERT INTO symbols ({columns}) VALUES ({placeholders}) "
+            f"ON CONFLICT(symbol) DO UPDATE SET {assignments}, "
+            "updated_at = excluded.updated_at"
+        )
+        connection = None
+        try:
+            connection = self._connect()
             for contract in contracts:
                 row = connection.execute(
                     "SELECT * FROM symbols WHERE symbol = ?", (contract.symbol,)
                 ).fetchone()
-                if row is None:
-                    placeholders = ", ".join("?" for _ in _SYMBOL_COLUMNS)
-                    columns = ", ".join(_SYMBOL_COLUMNS)
-                    connection.execute(
-                        f"INSERT INTO symbols ({columns}) VALUES ({placeholders})",
-                        (*_symbol_values(contract), observed_at),
-                    )
-                    inserted += 1
-                elif _row_to_symbol(row) == contract:
+                if row is not None and _row_to_symbol(row) == contract:
                     unchanged += 1
+                    continue
+                connection.execute(upsert_sql, (*_symbol_values(contract), observed_at))
+                if row is None:
+                    inserted += 1
                 else:
-                    connection.execute(
-                        """
-                        UPDATE symbols SET
-                            base_asset = ?, quote_asset = ?, contract_type = ?,
-                            underlying_type = ?, status = ?, tick_size = ?, step_size = ?,
-                            min_qty = ?, min_notional = ?, price_precision = ?,
-                            quantity_precision = ?, onboard_date = ?, tradifi = ?,
-                            updated_at = ?
-                        WHERE symbol = ?
-                        """,
-                        (*_symbol_values(contract)[1:], observed_at, contract.symbol),
-                    )
                     updated += 1
             total_row = connection.execute("SELECT COUNT(*) FROM symbols").fetchone()
             total = int(total_row[0]) if total_row is not None else 0
+            connection.commit()
+        except sqlite3.Error as exc:
+            if connection is not None:
+                connection.rollback()
+            raise StoreUnavailableError(f"symbol registry write failed: {exc}") from exc
+        finally:
+            if connection is not None:
+                connection.close()
         return SymbolUpsertResult(
             inserted=inserted, updated=updated, unchanged=unchanged, total=total
         )
@@ -413,8 +475,10 @@ class SqliteStore:
         clauses: list[str] = []
         params: list[object] = []
         if query:
-            pattern = f"%{query.strip().lower()}%"
-            clauses.append("(LOWER(symbol) LIKE ? OR LOWER(base_asset) LIKE ?)")
+            pattern = _like_pattern(query)
+            clauses.append(
+                "(LOWER(symbol) LIKE ? ESCAPE '\\' OR LOWER(base_asset) LIKE ? ESCAPE '\\')"
+            )
             params.extend([pattern, pattern])
         if tradifi is not None:
             clauses.append("tradifi = ?")

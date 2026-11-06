@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import asyncio
 import json
 import re
 from collections.abc import Mapping
@@ -24,10 +25,15 @@ from oft.ports.store import StorePort, SymbolUpsertResult
 _SYMBOL_PATTERN = re.compile(r"^[A-Z0-9]{2,24}$")
 _TRADING = "TRADING"
 _MIN_ONBOARD_MS = int(datetime(2017, 1, 1, tzinfo=UTC).timestamp() * 1000)
+_MAX_PRECISION = 20
+_MAX_DECIMAL_DIGITS = 30
+_MAX_DECIMAL_ADJUSTED = 18
+MAX_EXCHANGE_INFO_SYMBOLS = 5000
 
 
-def _max_onboard_ms() -> int:
-    return int((datetime.now(UTC) + timedelta(days=1)).timestamp() * 1000)
+def _max_onboard_ms(now: datetime | None = None) -> int:
+    reference = now or datetime.now(UTC)
+    return int((reference + timedelta(days=1)).timestamp() * 1000)
 
 
 class SymbolRegistryError(Exception):
@@ -101,26 +107,41 @@ def _required_int(entry: Mapping[str, Any], key: str) -> int:
     return value
 
 
-def _onboard_date(entry: Mapping[str, Any]) -> int:
+def _precision(entry: Mapping[str, Any], key: str) -> int:
+    value = _required_int(entry, key)
+    if value > _MAX_PRECISION:
+        raise _MalformedEntry(f"{key} is outside the supported 0..{_MAX_PRECISION} range")
+    return value
+
+
+def _onboard_date(entry: Mapping[str, Any], *, max_ms: int | None = None) -> int:
     """Bound the ms epoch so a bad onboardDate cannot crash serialization later."""
     value = _required_int(entry, "onboardDate")
-    if not _MIN_ONBOARD_MS <= value <= _max_onboard_ms():
+    upper = max_ms if max_ms is not None else _max_onboard_ms()
+    if not _MIN_ONBOARD_MS <= value <= upper:
         raise _MalformedEntry("onboardDate is outside the supported date range")
     return value
 
 
-def _filters(entry: Mapping[str, Any]) -> dict[str, Mapping[str, Any]]:
+def _filters(
+    entry: Mapping[str, Any],
+) -> tuple[dict[str, Mapping[str, Any]], tuple[str, ...]]:
     raw = entry.get("filters")
     if not isinstance(raw, list):
         raise _MalformedEntry("filters is missing or not an array")
     by_type: dict[str, Mapping[str, Any]] = {}
+    duplicates: list[str] = []
     for item in raw:
         if not isinstance(item, Mapping):
             raise _MalformedEntry("filters contains a non-object entry")
         filter_type = item.get("filterType")
         if isinstance(filter_type, str):
+            if filter_type in by_type:
+                # First occurrence wins; record the duplicate but keep the symbol.
+                duplicates.append(filter_type)
+                continue
             by_type[filter_type] = item
-    return by_type
+    return by_type, tuple(duplicates)
 
 
 def _filter_decimal(
@@ -142,23 +163,31 @@ def _filter_decimal(
         raise _MalformedEntry(f"{filter_type}.{field} is not a decimal") from exc
     if not value.is_finite() or value < 0 or (positive and value == 0):
         raise _MalformedEntry(f"{filter_type}.{field} is out of range")
+    if len(value.as_tuple().digits) > _MAX_DECIMAL_DIGITS or (
+        value.adjusted() > _MAX_DECIMAL_ADJUSTED
+    ):
+        raise _MalformedEntry(f"{filter_type}.{field} magnitude is out of range")
     return value
 
 
-def _parse_entry(entry: Any) -> SymbolContract:
+def _parse_entry(
+    entry: Any, *, max_onboard_ms: int | None = None
+) -> tuple[SymbolContract, tuple[str, ...]]:
     if not isinstance(entry, Mapping):
         raise _MalformedEntry("entry is not an object")
 
-    symbol = _required_str(entry, "symbol")
-    if _SYMBOL_PATTERN.fullmatch(symbol) is None:
-        raise _MalformedEntry(f"invalid symbol {symbol!r}")
-
+    # Skip out-of-scope contracts before symbol-shape validation: a delivered
+    # quarterly contract may carry characters we would reject as a registry key.
     contract_type = _required_str(entry, "contractType")
     status = _required_str(entry, "status")
     if contract_type not in ACCEPTED_CONTRACT_TYPES or status != _TRADING:
         raise _SkippedEntry
 
-    filters = _filters(entry)
+    symbol = _required_str(entry, "symbol")
+    if _SYMBOL_PATTERN.fullmatch(symbol) is None:
+        raise _MalformedEntry(f"invalid symbol {symbol!r}")
+
+    filters, duplicates = _filters(entry)
     tick_size = _filter_decimal(filters, "PRICE_FILTER", "tickSize", positive=True)
     step_size = _filter_decimal(filters, "LOT_SIZE", "stepSize", positive=True)
     min_qty = _filter_decimal(filters, "LOT_SIZE", "minQty", positive=True)
@@ -171,21 +200,24 @@ def _parse_entry(entry: Any) -> SymbolContract:
         else None
     )
 
-    return SymbolContract(
-        symbol=symbol,
-        base_asset=_required_str(entry, "baseAsset"),
-        quote_asset=_required_str(entry, "quoteAsset"),
-        contract_type=contract_type,
-        underlying_type=underlying_type,
-        status=status,
-        tick_size=tick_size,
-        step_size=step_size,
-        min_qty=min_qty,
-        min_notional=min_notional,
-        price_precision=_required_int(entry, "pricePrecision"),
-        quantity_precision=_required_int(entry, "quantityPrecision"),
-        onboard_date=_onboard_date(entry),
-        tradifi=contract_type == TRADIFI_CONTRACT_TYPE,
+    return (
+        SymbolContract(
+            symbol=symbol,
+            base_asset=_required_str(entry, "baseAsset"),
+            quote_asset=_required_str(entry, "quoteAsset"),
+            contract_type=contract_type,
+            underlying_type=underlying_type,
+            status=status,
+            tick_size=tick_size,
+            step_size=step_size,
+            min_qty=min_qty,
+            min_notional=min_notional,
+            price_precision=_precision(entry, "pricePrecision"),
+            quantity_precision=_precision(entry, "quantityPrecision"),
+            onboard_date=_onboard_date(entry, max_ms=max_onboard_ms),
+            tradifi=contract_type == TRADIFI_CONTRACT_TYPE,
+        ),
+        duplicates,
     )
 
 
@@ -193,13 +225,21 @@ class _SkippedEntry(Exception):
     """An entry is valid exchangeInfo but outside this registry's scope."""
 
 
-def parse_exchange_info(payload: Any) -> ParseResult:
+def parse_exchange_info(
+    payload: Any,
+    *,
+    now: datetime | None = None,
+    max_symbols: int = MAX_EXCHANGE_INFO_SYMBOLS,
+) -> ParseResult:
     """Parse an exchangeInfo payload, skipping unsupported and malformed entries."""
     if not isinstance(payload, Mapping):
         raise ExchangeInfoParseError("exchangeInfo payload must be a JSON object.")
     entries = payload.get("symbols")
     if not isinstance(entries, list):
         raise ExchangeInfoParseError("exchangeInfo payload has no symbols array.")
+    if len(entries) > max_symbols:
+        raise ExchangeInfoParseError(f"exchangeInfo exceeds the {max_symbols} symbol cap.")
+    max_onboard_ms = _max_onboard_ms(now)
 
     contracts: dict[str, SymbolContract] = {}
     rejected: list[RejectedSymbol] = []
@@ -207,7 +247,7 @@ def parse_exchange_info(payload: Any) -> ParseResult:
         symbol = entry.get("symbol") if isinstance(entry, Mapping) else None
         rejected_symbol = symbol if isinstance(symbol, str) else None
         try:
-            contract = _parse_entry(entry)
+            contract, duplicates = _parse_entry(entry, max_onboard_ms=max_onboard_ms)
         except _SkippedEntry:
             continue
         except _MalformedEntry as exc:
@@ -216,7 +256,16 @@ def parse_exchange_info(payload: Any) -> ParseResult:
         except (KeyError, TypeError, ValueError) as exc:
             rejected.append(RejectedSymbol(symbol=rejected_symbol, reason=str(exc)))
             continue
-        # Last occurrence wins; the table primary key guarantees no duplicates.
+        for filter_type in duplicates:
+            rejected.append(
+                RejectedSymbol(
+                    symbol=contract.symbol,
+                    reason=f"duplicate {filter_type} filter (first occurrence kept)",
+                )
+            )
+        if contract.symbol in contracts:
+            rejected.append(RejectedSymbol(symbol=contract.symbol, reason="duplicate symbol"))
+            continue
         contracts[contract.symbol] = contract
 
     return ParseResult(contracts=tuple(contracts.values()), rejected=tuple(rejected))
@@ -230,8 +279,9 @@ class SymbolRegistry:
         self._clock = clock or SystemClock()
 
     def refresh_from_payload(self, payload: Any) -> SymbolIngestResult:
-        parsed = parse_exchange_info(payload)
-        observed_at = utc_timestamp(self._clock.now())
+        now = self._clock.now()
+        parsed = parse_exchange_info(payload, now=now)
+        observed_at = utc_timestamp(now)
         upsert = self._store.upsert_symbols(parsed.contracts, observed_at=observed_at)
         return _ingest_result(upsert, parsed.rejected)
 
@@ -248,7 +298,8 @@ class SymbolRegistry:
 
     async def refresh_from_exchange_info(self, source: ExchangeInfoSource) -> SymbolIngestResult:
         response = await source.fetch_exchange_info()
-        return self.refresh_from_payload(response.payload)
+        # Parsing + the SQLite write are blocking; keep them off the event loop.
+        return await asyncio.to_thread(self.refresh_from_payload, response.payload)
 
     def list_symbols(
         self,
