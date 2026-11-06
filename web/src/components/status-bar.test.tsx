@@ -20,6 +20,15 @@ describe('StatusBar', () => {
     render(<StatusBar daemon="OFFLINE" readiness="UNKNOWN" />)
 
     expect(screen.getByText('OFFLINE')).toBeInTheDocument()
-    expect(screen.getByText('UNKNOWN')).toBeInTheDocument()
+    expect(screen.getAllByText('UNKNOWN').length).toBeGreaterThan(0)
+  })
+
+  it('never claims health with hardcoded defaults', () => {
+    render(<StatusBar />)
+
+    expect(screen.getByText('OFFLINE')).toBeInTheDocument()
+    expect(screen.getAllByText('UNKNOWN').length).toBeGreaterThan(0)
+    expect(screen.queryByText('UP')).not.toBeInTheDocument()
+    expect(screen.queryByText('READY')).not.toBeInTheDocument()
   })
 })

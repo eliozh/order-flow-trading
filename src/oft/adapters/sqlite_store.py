@@ -153,38 +153,47 @@ class SqliteStore:
 
     def save_scan(self, record: ScanRecord) -> None:
         with self._connect() as connection:
-            connection.execute(
-                """
-                INSERT INTO scans (
-                    scan_id, symbol, period, status, trigger_source, metrics_only,
-                    fixture_path, started_at, finished_at, window_start, window_end,
-                    trade_count, buy_volume, sell_volume, delta, cvd, data_quality,
-                    manifest_path, parquet_rows, created_at
-                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-                """,
-                (
-                    record.scan_id,
-                    record.symbol,
-                    record.period,
-                    record.status,
-                    record.trigger_source,
-                    int(record.metrics_only),
-                    record.fixture_path,
-                    record.started_at,
-                    record.finished_at,
-                    record.window_start,
-                    record.window_end,
-                    record.trade_count,
-                    record.buy_volume,
-                    record.sell_volume,
-                    record.delta,
-                    record.cvd,
-                    record.data_quality,
-                    record.manifest_path,
-                    record.parquet_rows,
-                    record.created_at,
-                ),
-            )
+            self._insert_scan(connection, record)
+
+    def _insert_scan(self, connection: sqlite3.Connection, record: ScanRecord) -> None:
+        connection.execute(
+            """
+            INSERT INTO scans (
+                scan_id, symbol, period, status, trigger_source, metrics_only,
+                fixture_path, started_at, finished_at, window_start, window_end,
+                trade_count, buy_volume, sell_volume, delta, cvd, data_quality,
+                manifest_path, parquet_rows, created_at
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            """,
+            (
+                record.scan_id,
+                record.symbol,
+                record.period,
+                record.status,
+                record.trigger_source,
+                int(record.metrics_only),
+                record.fixture_path,
+                record.started_at,
+                record.finished_at,
+                record.window_start,
+                record.window_end,
+                record.trade_count,
+                record.buy_volume,
+                record.sell_volume,
+                record.delta,
+                record.cvd,
+                record.data_quality,
+                record.manifest_path,
+                record.parquet_rows,
+                record.created_at,
+            ),
+        )
+
+    def save_scan_with_manifest(self, record: ScanRecord, entry: ManifestEntry) -> None:
+        """Persist the scan row and manifest row in one transaction (unit of work)."""
+        with self._connect() as connection:
+            self._insert_scan(connection, record)
+            self._insert_manifest(connection, entry)
 
     def get_scan(self, scan_id: str) -> ScanRecord | None:
         connection = self._connect_read_only()
@@ -222,26 +231,29 @@ class SqliteStore:
 
     def record_manifest(self, entry: ManifestEntry) -> None:
         with self._connect() as connection:
-            connection.execute(
-                """
-                INSERT INTO manifest (
-                    path, data_type, symbol, date, rows, bytes, checksum,
-                    source, created_at, status
-                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-                """,
-                (
-                    entry.path,
-                    entry.data_type,
-                    entry.symbol,
-                    entry.date,
-                    entry.rows,
-                    entry.bytes,
-                    entry.checksum,
-                    entry.source,
-                    entry.created_at,
-                    entry.status,
-                ),
-            )
+            self._insert_manifest(connection, entry)
+
+    def _insert_manifest(self, connection: sqlite3.Connection, entry: ManifestEntry) -> None:
+        connection.execute(
+            """
+            INSERT INTO manifest (
+                path, data_type, symbol, date, rows, bytes, checksum,
+                source, created_at, status
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            """,
+            (
+                entry.path,
+                entry.data_type,
+                entry.symbol,
+                entry.date,
+                entry.rows,
+                entry.bytes,
+                entry.checksum,
+                entry.source,
+                entry.created_at,
+                entry.status,
+            ),
+        )
 
     def list_manifest(self) -> tuple[ManifestEntry, ...]:
         connection = self._connect_read_only()

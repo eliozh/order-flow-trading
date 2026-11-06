@@ -13,7 +13,8 @@ npm --prefix web install
 # Dev API (loopback only, 127.0.0.1:7611)
 uv run oft serve
 
-# Dev web shell (proxies /api, /health, and /ready to 127.0.0.1:7611)
+# Dev web shell (proxies /api, /health, and /ready to 127.0.0.1:7611;
+# changeOrigin rewrites Host so the daemon's loopback Host allowlist accepts it)
 npm --prefix web run dev
 
 # CLI

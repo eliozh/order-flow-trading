@@ -50,3 +50,24 @@ def test_implemented_error_specs_match_the_catalog() -> None:
         assert spec.http_status == entry["httpStatus"], code
         assert spec.category == entry["category"], code
         assert spec.retryable == entry["retryable"], code
+
+
+def test_security_and_scan_codes_are_covered_in_both_directions() -> None:
+    """Emitted codes exist in the catalog, and the catalog matches their spec."""
+    catalog = {entry["code"]: entry for entry in _load("error-catalog.json")["codes"]}
+    envelope = set(_load("api-envelope.schema.json")["$defs"]["errorCode"]["enum"])
+
+    for code in ("HOST_FORBIDDEN", "SCAN_ALREADY_RUNNING"):
+        # implemented -> catalog -> envelope schema
+        assert code in ERROR_CATALOG
+        assert code in catalog
+        assert code in envelope
+        # catalog -> implemented spec (same values in both directions)
+        spec = ERROR_CATALOG[code]
+        entry = catalog[code]
+        assert (spec.http_status, spec.category, spec.retryable) == (
+            entry["httpStatus"],
+            entry["category"],
+            entry["retryable"],
+        )
+    assert set(ERROR_CATALOG) <= set(catalog)

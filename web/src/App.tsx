@@ -1,4 +1,5 @@
 import { StatusBar } from './components/status-bar'
+import { useStatusBar } from './hooks/use-status-bar'
 import { SystemPage } from './routes/system'
 import './styles/tokens.css'
 import './styles/app.css'
@@ -13,10 +14,11 @@ function currentPath(): string {
 export default function App() {
   const path = currentPath()
   const isSystem = path === '/' || path.startsWith('/system')
+  const statusBar = useStatusBar()
 
   return (
     <div className="app-shell">
-      <StatusBar />
+      <StatusBar {...statusBar} />
       <main className="app-main">
         {isSystem ? (
           <SystemPage />

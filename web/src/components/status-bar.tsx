@@ -7,9 +7,9 @@ interface StatusBarProps {
 
 export function StatusBar({
   env = 'PAPER',
-  daemon = 'UP',
-  version = '0.1.0',
-  readiness = 'READY',
+  daemon = 'OFFLINE',
+  version = 'UNKNOWN',
+  readiness = 'UNKNOWN',
 }: StatusBarProps) {
   const daemonOnline = daemon === 'UP'
 

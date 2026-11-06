@@ -7,10 +7,12 @@ export default defineConfig({
   plugins: [react()],
   server: {
     port: 5173,
+    // Rewrite the Host header to the daemon origin (127.0.0.1:7611); the API
+    // rejects foreign Host headers (HOST_FORBIDDEN / DNS rebinding).
     proxy: {
-      '/api': { target: apiTarget, changeOrigin: false },
-      '/health': { target: apiTarget, changeOrigin: false },
-      '/ready': { target: apiTarget, changeOrigin: false },
+      '/api': { target: apiTarget, changeOrigin: true },
+      '/health': { target: apiTarget, changeOrigin: true },
+      '/ready': { target: apiTarget, changeOrigin: true },
     },
   },
   test: {

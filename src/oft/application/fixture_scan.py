@@ -90,7 +90,6 @@ def run_fixture_scan(
 
     source = f"fixture:{Path(fixture_path).name}"
     manifest = container.parquet.write_agg_trades(trades, symbol=symbol, source=source)
-    container.store.record_manifest(manifest)
 
     finished = clock.now()
     created_at = utc_timestamp(finished)
@@ -116,7 +115,13 @@ def run_fixture_scan(
         parquet_rows=manifest.rows,
         created_at=created_at,
     )
-    container.store.save_scan(record)
+    try:
+        # The scan row and manifest row commit together; the part is immutable
+        # and removed if the unit of work fails so nothing is orphaned.
+        container.store.save_scan_with_manifest(record, manifest)
+    except Exception:
+        Path(manifest.path).unlink(missing_ok=True)
+        raise
     return record
 
 

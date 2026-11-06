@@ -32,6 +32,12 @@ ERROR_CATALOG: dict[str, ErrorSpec] = {
         False,
         "The request Origin/Sec-Fetch-Site does not match the served origin.",
     ),
+    "HOST_FORBIDDEN": ErrorSpec(
+        403,
+        "AUTH",
+        False,
+        "The Host header is not an allowed loopback host.",
+    ),
     "NOT_FOUND": ErrorSpec(
         404, "VALIDATION", False, "The requested object or route does not exist."
     ),
@@ -62,6 +68,12 @@ ERROR_CATALOG: dict[str, ErrorSpec] = {
         "SYSTEM",
         True,
         "The daemon is not running, so the mutating command cannot execute.",
+    ),
+    "SCAN_ALREADY_RUNNING": ErrorSpec(
+        409,
+        "CONFLICT",
+        True,
+        "A scan is already running.",
     ),
 }
 

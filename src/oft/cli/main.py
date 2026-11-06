@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from typing import Annotated
+from typing import Annotated, Any
 
 import typer
 
@@ -44,12 +44,13 @@ def serve(
 ) -> None:
     """Start the local API/UI daemon (127.0.0.1:7611 by default)."""
     try:
-        settings = load_settings()
+        base = load_settings()
     except ConfigError as exc:
         emit_error("CONFIG_INVALID", exc.message, json_output=False)
         raise typer.Exit(code=5) from exc
 
-    resolved_host = host or settings.host
+    resolved_host = host or base.host
+    resolved_port = port or base.port
     if resolved_host not in _LOOPBACK_HOSTS:
         if not allow_non_loopback:
             emit_error(
@@ -66,13 +67,26 @@ def serve(
             err=True,
         )
 
+    # CLI overrides must reach the app factory: create_app() must not reload the
+    # environment and silently fall back to the default host/port.
+    try:
+        settings = load_settings(host=resolved_host, port=resolved_port)
+    except ConfigError as exc:
+        emit_error("CONFIG_INVALID", exc.message, json_output=False)
+        raise typer.Exit(code=5) from exc
+
+    def app_factory() -> Any:
+        from oft.api.app import create_app
+
+        return create_app(settings)
+
     import uvicorn
 
     uvicorn.run(
-        "oft.api.app:create_app",
+        app_factory,
         factory=True,
-        host=resolved_host,
-        port=port or settings.port,
+        host=settings.host,
+        port=settings.port,
         log_level=settings.log_level.lower(),
     )
 

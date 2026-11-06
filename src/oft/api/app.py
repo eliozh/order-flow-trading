@@ -2,8 +2,10 @@
 
 from __future__ import annotations
 
+import threading
 from pathlib import Path
 from typing import Any
+from urllib.parse import urlsplit
 
 import structlog
 from fastapi import FastAPI, Request
@@ -35,6 +37,8 @@ logger = structlog.get_logger(__name__)
 
 _MUTATING_METHODS = frozenset({"POST", "PUT", "PATCH", "DELETE"})
 _COOKIE_PATHS = frozenset({"/health", "/ready", "/api/v1/status"})
+_LOOPBACK_HOSTS = frozenset({"127.0.0.1", "localhost", "::1"})
+_TEST_CLIENT_HOST = "testserver"
 _HTTP_ERRORS = {
     404: "NOT_FOUND",
     405: "METHOD_NOT_ALLOWED",
@@ -58,6 +62,30 @@ def _harden(response: Any) -> Any:
     return response
 
 
+def host_is_allowed(request: Request, settings: Settings) -> bool:
+    """Reject DNS-rebinding Host headers before any auth or routing work."""
+    raw_host = request.headers.get("host")
+    if not raw_host:
+        return False
+    try:
+        parsed = urlsplit(f"//{raw_host}")
+        host = parsed.hostname
+        port = parsed.port
+    except ValueError:
+        # e.g. ``127.0.0.1:notaport`` or a malformed IPv6 literal.
+        return False
+    if host is None:
+        return False
+    # The in-process TestClient sends ``testserver``; only exempt it under test.
+    if settings.env == "test" and host == _TEST_CLIENT_HOST:
+        return True
+    if host not in _LOOPBACK_HOSTS:
+        return False
+    if port is None:
+        return settings.port == 80
+    return port == settings.port
+
+
 def create_app(settings: Settings | None = None) -> FastAPI:
     """Create the local API application.
 
@@ -76,10 +104,13 @@ def create_app(settings: Settings | None = None) -> FastAPI:
     app.state.settings = resolved
     app.state.container = container
     app.state.api_token = ensure_api_token(resolved)
+    app.state.scan_lock = threading.Lock()
 
     @app.middleware("http")
     async def _security(request: Request, call_next: Any) -> Any:
         path = request.url.path
+        if not host_is_allowed(request, resolved):
+            return _harden(error_response("HOST_FORBIDDEN"))
         if path.startswith("/api/v1/"):
             if request.method in _MUTATING_METHODS:
                 origin = request.headers.get("origin")

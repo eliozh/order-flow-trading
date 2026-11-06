@@ -551,3 +551,102 @@ def test_log_redaction_masks_bearer_tokens(caplog: pytest.LogCaptureFixture) -> 
 
     assert event["authorization"] == "[REDACTED]"
     assert "abc123" not in str(event)
+
+
+def test_foreign_host_header_is_host_forbidden(settings: Settings) -> None:
+    app = create_app(settings)
+
+    with TestClient(app) as client:
+        rebound = client.get("/health", headers={"Host": "attacker.example"})
+        wrong_port = client.get("/health", headers={"Host": f"127.0.0.1:{settings.port + 1}"})
+
+    assert rebound.status_code == 403
+    assert rebound.json()["error"]["code"] == "HOST_FORBIDDEN"
+    assert wrong_port.status_code == 403
+    assert wrong_port.json()["error"]["code"] == "HOST_FORBIDDEN"
+
+
+def test_malformed_host_port_is_host_forbidden(settings: Settings) -> None:
+    app = create_app(settings)
+
+    with TestClient(app) as client:
+        response = client.get("/health", headers={"Host": "127.0.0.1:notaport"})
+
+    assert response.status_code == 403
+    assert response.json()["error"]["code"] == "HOST_FORBIDDEN"
+
+
+def test_loopback_host_with_configured_port_is_allowed(settings: Settings) -> None:
+    app = create_app(settings)
+
+    with TestClient(app) as client:
+        response = client.get("/health", headers={"Host": f"127.0.0.1:{settings.port}"})
+
+    assert response.status_code == 200
+
+
+def test_scan_rejects_when_another_scan_is_in_flight(settings: Settings) -> None:
+    app = create_app(settings)
+
+    with TestClient(app) as client:
+        acquired = app.state.scan_lock.acquire(blocking=False)
+        assert acquired
+        try:
+            response = client.post(
+                "/api/v1/scans",
+                json={
+                    "fixture_path": str(FIXTURE),
+                    "symbol": "BTCUSDT",
+                    "period": "4h",
+                    "metrics_only": True,
+                },
+                headers=_auth(app),
+            )
+        finally:
+            app.state.scan_lock.release()
+
+    assert response.status_code == 409
+    assert response.json()["error"]["code"] == "SCAN_ALREADY_RUNNING"
+
+
+def test_manifest_failure_cleans_up_orphan_part(
+    settings: Settings, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    import sqlite3
+
+    container = build_container(settings, initialize=True)
+
+    def fail(record: Any, entry: Any) -> None:
+        raise sqlite3.OperationalError("simulated manifest write failure")
+
+    monkeypatch.setattr(container.store, "save_scan_with_manifest", fail)
+
+    with pytest.raises(sqlite3.OperationalError):
+        run_fixture_scan(
+            container,
+            fixture_path=FIXTURE,
+            symbol="BTCUSDT",
+            period="4h",
+            metrics_only=True,
+        )
+
+    parts = list((settings.data_dir / "market" / "um" / "agg_trades").rglob("*.parquet"))
+    assert parts == []
+    assert container.store.list_manifest() == ()
+    assert container.store.latest_scan() is None
+
+
+def test_sequential_scans_publish_unique_parts(settings: Settings) -> None:
+    container = build_container(settings, initialize=True)
+
+    first = run_fixture_scan(
+        container, fixture_path=FIXTURE, symbol="BTCUSDT", period="4h", metrics_only=True
+    )
+    second = run_fixture_scan(
+        container, fixture_path=FIXTURE, symbol="BTCUSDT", period="4h", metrics_only=True
+    )
+
+    assert first.manifest_path != second.manifest_path
+    assert Path(first.manifest_path).is_file()
+    assert Path(second.manifest_path).is_file()
+    assert len(container.store.list_manifest()) == 2

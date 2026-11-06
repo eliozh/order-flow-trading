@@ -49,13 +49,19 @@ def create_scan(payload: ScanCreateRequest, request: Request) -> dict[str, Any]:
     """Run one fixture-backed metrics-only scan."""
     container = request.app.state.container
     fixture_path = _validated_fixture_path(payload.fixture_path, container.settings.fixtures_dir)
-    record = run_fixture_scan(
-        container,
-        fixture_path=fixture_path,
-        symbol=payload.symbol,
-        period=payload.period,
-        metrics_only=payload.metrics_only,
-    )
+    lock = request.app.state.scan_lock
+    if not lock.acquire(blocking=False):
+        raise ApiError("SCAN_ALREADY_RUNNING")
+    try:
+        record = run_fixture_scan(
+            container,
+            fixture_path=fixture_path,
+            symbol=payload.symbol,
+            period=payload.period,
+            metrics_only=payload.metrics_only,
+        )
+    finally:
+        lock.release()
     return success_envelope(
         asdict(record),
         request_id=new_request_id(),

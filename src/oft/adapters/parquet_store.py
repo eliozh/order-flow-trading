@@ -54,16 +54,6 @@ def _record_hash(trade: AggTrade) -> str:
     return hashlib.sha256(payload.encode("utf-8")).hexdigest()
 
 
-def _next_part_path(directory: Path) -> Path:
-    directory.mkdir(parents=True, exist_ok=True)
-    index = 0
-    while True:
-        candidate = directory / f"part-{index:04d}.parquet"
-        if not candidate.exists():
-            return candidate
-        index += 1
-
-
 class ParquetStore:
     """Writes one immutable part per fixture import and returns its manifest row."""
 
@@ -93,7 +83,9 @@ class ParquetStore:
             / f"symbol={symbol}"
             / f"date={date}"
         )
-        final_path = _next_part_path(directory)
+        directory.mkdir(parents=True, exist_ok=True)
+        # UUID names remove the check-then-create race between concurrent scans.
+        final_path = directory / f"part-{uuid.uuid4().hex}.parquet"
         temp_path = directory / f".{final_path.name}.{uuid.uuid4().hex}.tmp"
         ingested_at = utc_timestamp(datetime.now(UTC))
 

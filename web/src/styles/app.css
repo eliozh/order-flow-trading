@@ -516,7 +516,15 @@ code {
 }
 
 .value-up {
-  color: var(--oft-status-ok);
+  color: var(--oft-market-up);
+}
+
+.value-down {
+  color: var(--oft-market-down);
+}
+
+.value-flat {
+  color: var(--oft-text-secondary);
 }
 
 .visually-hidden {
@@ -537,7 +545,8 @@ code {
     padding: 0 8px;
   }
 
-  .statusbar .sb-item,
+  /* Keep the environment chip visible and announced at mobile widths. */
+  .statusbar .sb-item:not(.sb-env),
   .statusbar .sb-sep,
   .statusbar .sb-brand {
     display: none;

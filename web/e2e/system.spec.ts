@@ -135,6 +135,12 @@ test('shows health OK, readiness OK with named checks, version, data dir, and th
   await page.goto('/system')
   await waitForLoadedSystem(page)
 
+  // The status bar reflects the real /ready probe, not hardcoded health.
+  const statusbar = page.getByRole('region', { name: 'System status bar' })
+  await expect(statusbar).toContainText('UP')
+  await expect(statusbar).toContainText('READY')
+  await expect(statusbar).toContainText(readiness.version)
+
   await expect(statValue(page, 'Health')).toHaveText('OK')
   await expect(statValue(page, 'Readiness')).toHaveText('READY')
   await expect(statValue(page, 'Version')).toHaveText(readiness.version)
@@ -156,7 +162,8 @@ test('shows health OK, readiness OK with named checks, version, data dir, and th
   await expect(scanValue(page, 'Scan ID')).toHaveText(scan.scan_id)
   await expect(scanValue(page, 'Symbol')).toHaveText(`${scan.symbol} · ${scan.period}`)
   await expect(scanValue(page, 'Status')).toHaveText(scan.status)
-  await expect(scanValue(page, 'Delta')).toHaveText(scan.delta)
+  const deltaText = scan.delta.startsWith('-') ? `▼ ${scan.delta}` : `▲ +${scan.delta}`
+  await expect(scanValue(page, 'Delta')).toHaveText(deltaText)
   await expect(scanValue(page, 'CVD')).toHaveText(scan.cvd)
   await expect(scanValue(page, 'Trades')).toHaveText(String(scan.trade_count))
   await expect(scanValue(page, 'Buy / sell volume')).toHaveText(
@@ -181,6 +188,12 @@ test('at 375px the shell is read-only and has no page-level horizontal scroll', 
   const systemPage = page.locator('section.system-page')
   await expect(systemPage).toHaveAttribute('data-readonly', 'true')
   await expect(page.getByRole('note')).toContainText('Read-only at this width')
+
+  // The environment chip stays visible and in the accessibility tree at 375px.
+  const envChip = page.locator('.statusbar .sb-env')
+  await expect(envChip).toBeVisible()
+  await expect(envChip).toHaveText('PAPER')
+  await expect(page.getByRole('region', { name: 'System status bar' })).toContainText('PAPER')
 
   // No mutation controls in the page content (the global kill-switch chrome is
   // inert and lives outside <main>; it is asserted separately below).
@@ -267,6 +280,10 @@ test('renders a stable API error state when readiness is blocked', async ({ page
     'System status unavailable: Readiness request failed with HTTP 503',
   )
   expect(interceptedCode).toBe('DATA_UNAVAILABLE')
+  // The status bar must not claim health when the probe fails.
+  const statusbar = page.getByRole('region', { name: 'System status bar' })
+  await expect(statusbar).toContainText('OFFLINE')
+  await expect(statusbar).toContainText('UNKNOWN')
   // The shell remains usable and shows no scan/diagnostic panels on failure.
   await expect(page.getByRole('heading', { name: 'System status', level: 1 })).toBeHidden()
 })

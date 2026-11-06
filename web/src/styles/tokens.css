@@ -21,6 +21,10 @@
   --oft-status-danger: #ff6b6b;
   --oft-status-warn: #ffb020;
 
+  /* Semantic market colors (design-tokens market.up/down); never decorative. */
+  --oft-market-up: #35d07f;
+  --oft-market-down: #ff5d6a;
+
   --oft-font-mono:
     ui-monospace, 'SFMono-Regular', 'SF Mono', Menlo, Consolas, 'Liberation Mono', monospace;
   --oft-font-sans:

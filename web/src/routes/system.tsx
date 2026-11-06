@@ -58,6 +58,23 @@ function statusClass(status: string): string {
   return 'chip chip--danger'
 }
 
+interface DeltaPresentation {
+  text: string
+  className: string
+  accessible: string
+}
+
+function presentDelta(raw: string): DeltaPresentation {
+  const value = Number(raw)
+  if (Number.isFinite(value) && value > 0) {
+    return { text: `▲ +${raw}`, className: 'value-up', accessible: `positive ${raw}` }
+  }
+  if (Number.isFinite(value) && value < 0) {
+    return { text: `▼ ${raw}`, className: 'value-down', accessible: `negative ${raw}` }
+  }
+  return { text: raw, className: 'value-flat', accessible: `zero ${raw}` }
+}
+
 export function SystemPage({
   fetchHealthFn = fetchHealth,
   fetchReadinessFn = fetchReadiness,
@@ -122,6 +139,7 @@ export function SystemPage({
   }
 
   const scan = readiness.latest_scan
+  const delta = scan ? presentDelta(scan.delta) : null
 
   return (
     <section className="system-page" aria-labelledby="system-heading" data-readonly={compact}>
@@ -225,7 +243,9 @@ export function SystemPage({
               </div>
               <div>
                 <dt>Delta</dt>
-                <dd className="value-up">{scan.delta}</dd>
+                <dd className={delta?.className} aria-label={`Delta ${delta?.accessible}`}>
+                  {delta?.text}
+                </dd>
               </div>
               <div>
                 <dt>CVD</dt>

@@ -97,6 +97,39 @@ describe('SystemPage', () => {
     expect(screen.getByText('market_data')).toBeInTheDocument()
   })
 
+  it('renders a positive delta with an up arrow and accessible sign text', async () => {
+    render(
+      <SystemPage
+        fetchHealthFn={async () => healthEnvelope}
+        fetchReadinessFn={async () => readinessEnvelope}
+        isCompact={false}
+      />,
+    )
+
+    const delta = await screen.findByLabelText('Delta positive 1.50')
+    expect(delta).toHaveTextContent('▲ +1.50')
+  })
+
+  it('renders a negative delta with a down arrow and accessible sign text', async () => {
+    render(
+      <SystemPage
+        fetchHealthFn={async () => healthEnvelope}
+        fetchReadinessFn={async () => ({
+          ...readinessEnvelope,
+          data: readinessEnvelope.data && {
+            ...readinessEnvelope.data,
+            latest_scan: scan && { ...scan, delta: '-2.50' },
+          },
+        })}
+        isCompact={false}
+      />,
+    )
+
+    const delta = await screen.findByLabelText('Delta negative -2.50')
+    expect(delta).toHaveTextContent('▼ -2.50')
+    expect(delta).toHaveClass('value-down')
+  })
+
   it('renders an empty scan state when no fixture scan exists', async () => {
     render(
       <SystemPage

@@ -72,11 +72,18 @@ def token_matches(expected: str, presented: str) -> bool:
     return hmac.compare_digest(expected.encode("utf-8"), presented.encode("utf-8"))
 
 
+def _origin(host: str, port: int) -> str:
+    """Bracket IPv6 literals so the origin is a valid URL (``http://[::1]:port``)."""
+    if ":" in host:
+        return f"http://[{host}]:{port}"
+    return f"http://{host}:{port}"
+
+
 def allowed_origins(settings: Settings) -> frozenset[str]:
     hosts = {settings.host}
-    if settings.host in {"127.0.0.1", "localhost"}:
-        hosts.update({"127.0.0.1", "localhost"})
-    return frozenset(f"http://{host}:{settings.port}" for host in hosts)
+    if settings.host in {"127.0.0.1", "localhost", "::1"}:
+        hosts.update({"127.0.0.1", "localhost", "::1"})
+    return frozenset(_origin(host, settings.port) for host in hosts)
 
 
 def is_browser_request(request: Request) -> bool:
