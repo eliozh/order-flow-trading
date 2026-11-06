@@ -53,6 +53,10 @@ class ManifestEntry:
     source: str
     created_at: str
     status: str = "PUBLISHED"
+    metric_version: str | None = None
+    input_manifest_hash: str | None = None
+    window_start: str | None = None
+    window_end: str | None = None
 
 
 @dataclass(frozen=True)
@@ -142,6 +146,8 @@ class StorePort(Protocol):
     def upsert_manifest_entry(self, entry: ManifestEntry) -> None: ...
 
     def delete_manifest_entry(self, path: str) -> None: ...
+
+    def get_manifest_entry(self, path: str) -> ManifestEntry | None: ...
 
     def list_manifest(
         self, *, symbol: str | None = None, date: str | None = None

@@ -81,8 +81,9 @@ def test_compute_from_backfill_partitions_is_complete_and_exact(tmp_path: Path) 
     document = harness.service.compute(_request())
     payload = document.to_dict()
 
-    assert document.quality.data_quality.value == "COMPLETE"
-    assert document.quality.quality_reasons == ()
+    assert document.quality.data_quality.value == "PARTIAL"
+    assert "open_interest not measured in this slice" in document.quality.quality_reasons
+    assert "funding not measured in this slice" in document.quality.quality_reasons
     assert len(document.cvd.points) == 7
     assert document.cvd.summary.delta == Decimal("1.40")
     assert document.cvd.summary.cvd_change == Decimal("1.40")
@@ -105,7 +106,8 @@ def test_kline_cross_check_passes_exactly_on_the_one_week_fixture(tmp_path: Path
     klines = load_klines(harness.settings, _request())
 
     assert len(klines) == 7
-    assert document.quality.data_quality.value == "COMPLETE"
+    assert document.quality.data_quality.value == "PARTIAL"
+    assert not any("kline" in reason for reason in document.quality.quality_reasons)
     by_start = {kline.bar_start: kline for kline in klines}
     for point in document.cvd.points:
         kline = by_start[point.bar_start]
@@ -119,7 +121,7 @@ def test_tampered_kline_row_breaks_the_cross_check(tmp_path: Path) -> None:
     fixture = ROOT / "tests" / "fixtures" / "market" / "btcusdt_klines_4h.csv"
     lines = fixture.read_text(encoding="utf-8").splitlines()
     fields = lines[1].split(",")
-    fields[6] = "0.61"  # volume no longer equals buy + sell
+    fields[7] = "0.61"  # volume no longer equals buy + sell
     lines[1] = ",".join(fields)
     tampered = tmp_path / "tampered_klines.csv"
     tampered.write_text("\n".join(lines) + "\n", encoding="utf-8")
@@ -184,8 +186,9 @@ def test_persisted_rows_carry_metric_provenance(tmp_path: Path) -> None:
         assert row["metric_version"] == document.metric_version
         assert row["input_manifest_hash"] == document.input_manifest_hash
         assert row["computed_at"] is not None
-        assert row["data_quality"] == "COMPLETE"
-        assert row["quality_reasons"] == []
+        assert row["data_quality"] == "PARTIAL"
+        assert "open_interest not measured in this slice" in row["quality_reasons"]
+        assert "funding not measured in this slice" in row["quality_reasons"]
     assert {row["record_type"] for row in rows} == {"CVD_BAR", "VOLUME_PROFILE_BIN"}
     cvd_rows = [row for row in rows if row["record_type"] == "CVD_BAR"]
     assert all(isinstance(row["buy_volume"], str) for row in cvd_rows)
@@ -506,8 +509,11 @@ def test_orphan_metric_part_is_adopted(tmp_path: Path) -> None:
 def test_duplicate_parts_are_deduped_with_a_warning(tmp_path: Path) -> None:
     harness = _harness(tmp_path)
     persisted = harness.service.compute_and_persist(_request())
+    from dataclasses import replace
+
     duplicate = Path(persisted.entry.path).with_name("part-duplicate.parquet")
     shutil.copyfile(persisted.entry.path, duplicate)
+    harness.store.upsert_manifest_entry(replace(persisted.entry, path=str(duplicate)))
 
     with structlog.testing.capture_logs() as logs:
         rows = read_metrics(
@@ -648,39 +654,59 @@ def test_read_selects_one_run_and_ignores_partial_for_the_same_window(
     tmp_path: Path,
 ) -> None:
     harness = _harness(tmp_path)
-    complete = harness.service.compute_and_persist(_request())
-    shutil.rmtree(
-        harness.settings.data_dir
-        / "market"
-        / "um"
-        / "agg_trades"
-        / "symbol=BTCUSDT"
-        / "date=2026-10-04"
+    document = harness.service.compute(_request())
+    common = {
+        "symbol": "BTCUSDT",
+        "period": "4h",
+        "window_start": WINDOW_START,
+        "window_end": WINDOW_END,
+        "metric_version": document.metric_version,
+    }
+    harness.store.upsert_manifest_entry(
+        harness.parquet.write_metrics_part(
+            document.rows,
+            input_manifest_hash="c" * 64,
+            computed_at="2026-11-06T12:00:00.000Z",
+            data_quality="COMPLETE",
+            quality_reasons=(),
+            **common,
+        )
     )
-    partial_document = harness.service.compute(_request())
-    assert partial_document.quality.data_quality.value == "PARTIAL"
-    partial = harness.service.compute_and_persist(_request())
-    assert partial.entry.path != complete.entry.path
+    partial_rows = tuple(
+        row
+        for row in document.rows
+        if not (row.record_type == "CVD_BAR" and row.bar_start == WINDOW_START)
+    )
+    harness.store.upsert_manifest_entry(
+        harness.parquet.write_metrics_part(
+            partial_rows,
+            input_manifest_hash="d" * 64,
+            computed_at="2026-11-06T13:00:00.000Z",  # later, but PARTIAL loses
+            data_quality="PARTIAL",
+            quality_reasons=("missing agg_trades part 2026-10-04",),
+            **common,
+        )
+    )
 
     with structlog.testing.capture_logs() as logs:
         rows = read_metrics(
             harness.settings,
             symbol="BTCUSDT",
             period="4h",
-            metric_version=complete.document.metric_version,
+            metric_version=document.metric_version,
         )
 
     assert len(rows) == 28
-    assert {row["input_manifest_hash"] for row in rows} == {complete.document.input_manifest_hash}
+    assert {row["input_manifest_hash"] for row in rows} == {"c" * 64}
     assert {row["data_quality"] for row in rows} == {"COMPLETE"}
     cvd_rows = [row for row in rows if row["record_type"] == "CVD_BAR"]
     assert [row["cvd"] for row in cvd_rows] == [
-        decimal_str(point.cvd) for point in complete.document.cvd.points
+        decimal_str(point.cvd) for point in document.cvd.points
     ]
     selected = [event for event in logs if event["event"] == "metrics_run_selected"]
     assert selected
-    assert selected[0]["selected_run"] == complete.document.input_manifest_hash
-    assert partial.document.input_manifest_hash in selected[0]["discarded_runs"]
+    assert selected[0]["selected_run"] == "c" * 64
+    assert "d" * 64 in selected[0]["discarded_runs"]
 
 
 def test_read_prefers_the_latest_complete_run_on_a_provenance_tiebreak(
@@ -697,17 +723,21 @@ def test_read_prefers_the_latest_complete_run_on_a_provenance_tiebreak(
         "data_quality": "COMPLETE",
         "quality_reasons": (),
     }
-    harness.parquet.write_metrics_part(
-        document.rows,
-        input_manifest_hash="a" * 64,
-        computed_at="2026-11-06T12:00:00.000Z",
-        **common,
+    harness.store.upsert_manifest_entry(
+        harness.parquet.write_metrics_part(
+            document.rows,
+            input_manifest_hash="a" * 64,
+            computed_at="2026-11-06T12:00:00.000Z",
+            **common,
+        )
     )
-    harness.parquet.write_metrics_part(
-        document.rows,
-        input_manifest_hash="b" * 64,
-        computed_at="2026-11-06T13:00:00.000Z",
-        **common,
+    harness.store.upsert_manifest_entry(
+        harness.parquet.write_metrics_part(
+            document.rows,
+            input_manifest_hash="b" * 64,
+            computed_at="2026-11-06T13:00:00.000Z",
+            **common,
+        )
     )
 
     rows = read_metrics(
@@ -720,3 +750,308 @@ def test_read_prefers_the_latest_complete_run_on_a_provenance_tiebreak(
     assert len(rows) == 28
     assert {row["input_manifest_hash"] for row in rows} == {"b" * 64}
     assert {row["computed_at"] for row in rows} == {"2026-11-06T13:00:00.000Z"}
+
+
+def test_real_clock_rerun_reuses_the_same_part(tmp_path: Path) -> None:
+    harness = _harness(tmp_path)
+    first = harness.service.compute_and_persist(_request())
+    later = MetricService(
+        settings=harness.settings,
+        store=harness.store,
+        parquet=harness.parquet,
+        clock=FixedClock(NOW + timedelta(hours=2)),
+    )
+    second = later.compute_and_persist(_request())
+
+    assert second.entry.path == first.entry.path
+    assert Path(first.entry.path).read_bytes() == Path(second.entry.path).read_bytes()
+    rows = read_metrics(
+        harness.settings,
+        symbol="BTCUSDT",
+        period="4h",
+        metric_version=first.document.metric_version,
+    )
+    assert len(rows) == 28
+    manifest = [
+        entry
+        for entry in harness.store.list_manifest()
+        if entry.data_type == "metrics" and entry.path == first.entry.path
+    ]
+    assert len(manifest) == 1
+
+
+@pytest.mark.parametrize("period", ["1h", "8h", "1d"])
+def test_kline_cross_check_is_period_keyed(tmp_path: Path, period: str) -> None:
+    harness = _harness(tmp_path)
+
+    document = harness.service.compute(_request(period=period))
+
+    assert document.quality.data_quality.value == "PARTIAL"
+    assert any(
+        "missing kline" in reason and period in reason
+        for reason in document.quality.quality_reasons
+    )
+
+
+def test_orphan_agg_trade_part_is_not_read_by_the_metric_core(tmp_path: Path) -> None:
+    from oft.domain.events import AggTrade
+
+    harness = _harness(tmp_path)
+    orphan = AggTrade(
+        symbol="BTCUSDT",
+        agg_trade_id=1,  # duplicate of a manifest-registered row
+        price=Decimal("70000.00"),
+        quantity=Decimal("9.99"),
+        first_trade_id=1,
+        last_trade_id=1,
+        transact_time=datetime(2026, 10, 1, 0, 0, tzinfo=UTC),
+        is_buyer_maker=False,
+    )
+    harness.parquet.write_agg_trades((orphan,), symbol="BTCUSDT", source="archive:orphan")
+
+    document = harness.service.compute(_request())
+
+    assert document.quality.data_quality.value == "PARTIAL"
+    assert len(document.cvd.points) == 7
+    assert document.cvd.summary.delta == Decimal("1.40")
+
+
+def test_metrics_manifest_rows_carry_version_hash_and_window(tmp_path: Path) -> None:
+    harness = _harness(tmp_path)
+    persisted = harness.service.compute_and_persist(_request())
+
+    entry = persisted.entry
+    assert entry.metric_version == persisted.document.metric_version
+    assert entry.input_manifest_hash == persisted.document.input_manifest_hash
+    assert entry.window_start == "2026-10-01T00:00:00.000Z"
+    assert entry.window_end == "2026-10-08T00:00:00.000Z"
+    row = next(item for item in harness.store.list_manifest() if item.path == entry.path)
+    assert row.metric_version == entry.metric_version
+    assert row.input_manifest_hash == entry.input_manifest_hash
+    assert row.window_start == entry.window_start
+    assert row.window_end == entry.window_end
+
+
+def test_read_metrics_pushes_the_window_filter_down(tmp_path: Path) -> None:
+    harness = _harness(tmp_path)
+    full = harness.service.compute_and_persist(_request())
+    short_end = WINDOW_START + timedelta(days=3)
+    harness.service.compute_and_persist(_request(window_end=short_end))
+
+    rows = read_metrics(
+        harness.settings,
+        symbol="BTCUSDT",
+        period="4h",
+        metric_version=full.document.metric_version,
+        window_start=WINDOW_START,
+        window_end=short_end,
+    )
+
+    assert len(rows) == 24  # 3 CVD bars + 21 volume-profile bins
+    assert {row["window_end"] for row in rows} == {datetime(2026, 10, 4, tzinfo=UTC)}
+
+
+def test_conflicting_rows_in_one_run_raise_instead_of_silently_dropping(
+    tmp_path: Path,
+) -> None:
+    from dataclasses import replace
+
+    harness = _harness(tmp_path)
+    first = harness.service.compute_and_persist(_request())
+    rows = list(first.document.rows)
+    rows[0] = replace(rows[0], delta=(rows[0].delta or Decimal("0")) + Decimal("1"))
+    harness.store.upsert_manifest_entry(
+        harness.parquet.write_metrics_part(
+            rows,
+            symbol="BTCUSDT",
+            period="4h",
+            window_start=WINDOW_START,
+            window_end=WINDOW_END,
+            metric_version=first.document.metric_version,
+            input_manifest_hash=first.document.input_manifest_hash,
+            computed_at=first.document.computed_at,
+            data_quality="COMPLETE",
+            quality_reasons=(),
+        )
+    )
+
+    with pytest.raises(ValueError, match="conflicting"):
+        read_metrics(
+            harness.settings,
+            symbol="BTCUSDT",
+            period="4h",
+            metric_version=first.document.metric_version,
+        )
+
+
+def test_unavailable_metrics_root_does_not_erase_manifest_rows(tmp_path: Path) -> None:
+    harness = _harness(tmp_path)
+    first = harness.service.compute_and_persist(_request())
+    root = harness.settings.data_dir / "metrics" / "orderflow"
+    moved = harness.settings.data_dir / "metrics-away"
+    root.rename(moved)
+    try:
+        fresh = MetricService(
+            settings=harness.settings,
+            store=harness.store,
+            parquet=harness.parquet,
+            clock=FixedClock(NOW),
+        )
+        fresh.compute_and_persist(_request())
+        assert any(entry.path == first.entry.path for entry in harness.store.list_manifest())
+    finally:
+        if not root.exists() and moved.exists():
+            moved.rename(root)
+
+
+def test_unreadable_manifest_keeps_the_published_part(tmp_path: Path) -> None:
+    from oft.ports.store import StoreUnavailableError
+
+    harness = _harness(tmp_path)
+    first = harness.service.compute_and_persist(_request())
+
+    def fail_upsert(_entry: object) -> None:
+        raise StoreUnavailableError("manifest db unavailable")
+
+    def fail_get(_path: str) -> object:
+        raise StoreUnavailableError("manifest db unavailable")
+
+    harness.store.upsert_manifest_entry = fail_upsert  # type: ignore[method-assign]
+    harness.store.get_manifest_entry = fail_get  # type: ignore[method-assign]
+    later = MetricService(
+        settings=harness.settings,
+        store=harness.store,
+        parquet=harness.parquet,
+        clock=FixedClock(NOW + timedelta(hours=1)),
+    )
+
+    with pytest.raises(StoreUnavailableError):
+        later.compute_and_persist(_request())
+
+    assert Path(first.entry.path).is_file()
+
+
+def test_missing_part_directory_is_drift_and_keeps_the_manifest_row(tmp_path: Path) -> None:
+    harness = _harness(tmp_path)
+    first = harness.service.compute_and_persist(_request())
+    shutil.rmtree(Path(first.entry.path).parent)
+
+    later = MetricService(
+        settings=harness.settings,
+        store=harness.store,
+        parquet=harness.parquet,
+        clock=FixedClock(NOW + timedelta(hours=1)),
+    )
+    with structlog.testing.capture_logs() as logs:
+        later.compute_and_persist(_request())
+
+    rows = [
+        entry
+        for entry in harness.store.list_manifest()
+        if entry.data_type == "metrics" and entry.path == first.entry.path
+    ]
+    assert len(rows) == 1  # drift: manifest row preserved, never silently deleted
+    assert any(event["event"] == "metrics_manifest_drift" for event in logs)
+
+
+def test_missing_window_persists_a_zero_row_part(tmp_path: Path) -> None:
+    harness = _harness(tmp_path, backfill=False)
+
+    persisted = harness.service.compute_and_persist(_request())
+
+    assert persisted.document.quality.data_quality.value == "MISSING"
+    assert persisted.entry.rows == 0
+    assert Path(persisted.entry.path).is_file()
+    assert (
+        read_metrics(
+            harness.settings,
+            symbol="BTCUSDT",
+            period="4h",
+            metric_version=persisted.document.metric_version,
+        )
+        == ()
+    )
+
+
+def test_kline_fixture_without_a_period_column_is_a_schema_error(
+    tmp_path: Path,
+) -> None:
+    fixture = ROOT / "tests" / "fixtures" / "market" / "btcusdt_klines_4h.csv"
+    lines = fixture.read_text(encoding="utf-8").splitlines()
+    header = lines[0].split(",")
+    period_index = header.index("period")
+    header.pop(period_index)
+    rewritten = [",".join(header)]
+    for line in lines[1:]:
+        fields = line.split(",")
+        fields.pop(period_index)
+        rewritten.append(",".join(fields))
+    broken = tmp_path / "klines_without_period.csv"
+    broken.write_text("\n".join(rewritten) + "\n", encoding="utf-8")
+
+    harness = _harness(tmp_path)
+    settings = harness.settings.model_copy(update={"klines_fixture": broken})
+    service = MetricService(
+        settings=settings,
+        store=harness.store,
+        parquet=harness.parquet,
+        clock=FixedClock(NOW),
+    )
+
+    with pytest.raises(ValueError, match="period"):
+        service.compute(_request())
+
+
+def test_sole_orphan_part_does_not_produce_a_false_complete_quality(
+    tmp_path: Path,
+) -> None:
+    harness = _harness(tmp_path)
+    for entry in harness.store.list_manifest(symbol="BTCUSDT", date="2026-10-02"):
+        harness.store.delete_manifest_entry(entry.path)
+
+    document = harness.service.compute(_request())
+
+    assert document.quality.data_quality.value == "PARTIAL"
+    assert any("2026-10-02" in reason for reason in document.quality.quality_reasons)
+    assert len(document.cvd.points) == 6
+
+
+def test_unmeasured_open_interest_and_funding_are_marked(tmp_path: Path) -> None:
+    harness = _harness(tmp_path)
+
+    document = harness.service.compute(_request())
+
+    assert "open_interest not measured in this slice" in document.quality.quality_reasons
+    assert "funding not measured in this slice" in document.quality.quality_reasons
+    payload = document.to_dict()
+    assert payload["open_interest"] is not None
+    assert payload["funding"] is not None
+
+
+def test_unregistered_part_does_not_shadow_a_published_run(tmp_path: Path) -> None:
+    harness = _harness(tmp_path)
+    published = harness.service.compute_and_persist(_request())
+    # A later, unregistered part with a different provenance hash.
+    harness.parquet.write_metrics_part(
+        published.document.rows,
+        symbol="BTCUSDT",
+        period="4h",
+        window_start=WINDOW_START,
+        window_end=WINDOW_END,
+        metric_version=published.document.metric_version,
+        input_manifest_hash="e" * 64,
+        computed_at="2026-11-07T12:00:00.000Z",
+        data_quality="COMPLETE",
+        quality_reasons=(),
+    )
+
+    rows = read_metrics(
+        harness.settings,
+        symbol="BTCUSDT",
+        period="4h",
+        metric_version=published.document.metric_version,
+        store=harness.store,
+    )
+
+    assert len(rows) == 28
+    assert {row["input_manifest_hash"] for row in rows} == {published.document.input_manifest_hash}

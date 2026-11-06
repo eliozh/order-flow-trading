@@ -66,9 +66,14 @@ def _value_area(
     for right, volume in enumerate(volumes):
         running += volume
         while left <= right and running >= target:
-            candidate = (left, right)
-            if best is None or _better_value_area(candidate, best, poc_index):
-                best = candidate
+            # Semantic constraint (recorded in metric_version): the value area
+            # is the smallest contiguous range that reaches the threshold AND
+            # contains the POC. A smaller/higher-volume range that excludes the
+            # POC is never acceptable.
+            if left <= poc_index <= right:
+                candidate = (left, right)
+                if best is None or _better_value_area(candidate, best, poc_index):
+                    best = candidate
             running -= volumes[left]
             left += 1
     if best is None:  # pragma: no cover - target is <= total by construction

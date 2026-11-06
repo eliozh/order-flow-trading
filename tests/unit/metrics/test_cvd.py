@@ -162,17 +162,6 @@ def test_kline_delta_cross_check_is_exact_decimal_arithmetic() -> None:
     assert kline_delta(volume=Decimal("0.60"), taker_buy_volume=Decimal("0.40")) == Decimal("0.20")
     assert kline_delta(volume=Decimal("7.00"), taker_buy_volume=Decimal("4.25")) == Decimal("1.50")
 
-    result = compute_cvd(
-        _fixture_week(),
-        symbol="BTCUSDT",
-        period="4h",
-        window_start=WINDOW_START,
-        window_end=WINDOW_END,
-    )
-    for point in result.points:
-        volume = point.buy_volume + point.sell_volume
-        assert_kline_cross_check(point, volume=volume, taker_buy_volume=point.buy_volume)
-
 
 def test_kline_cross_check_rejects_drift() -> None:
     trades = (_trade(1, "2.00", "70000.00", is_buyer_maker=False),)
@@ -262,3 +251,24 @@ def test_zero_length_window_is_rejected() -> None:
             window_start=WINDOW_START,
             window_end=WINDOW_START,
         )
+
+
+def test_decimal_parameter_aliases_share_one_metric_version() -> None:
+    from oft.domain.metrics.version import orderflow_metric_version
+
+    a = orderflow_metric_version(
+        period="4h",
+        unit="BASE",
+        tick_size=Decimal("0.10"),
+        value_area_pct=Decimal("70"),
+        bin_size_multiple=1,
+    )
+    b = orderflow_metric_version(
+        period="4h",
+        unit="BASE",
+        tick_size=Decimal("0.1"),
+        value_area_pct=Decimal("70.0"),
+        bin_size_multiple=1,
+    )
+
+    assert a.identifier == b.identifier

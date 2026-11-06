@@ -313,3 +313,47 @@ def test_value_area_prefers_the_lowest_start_on_equal_length_ties() -> None:
     assert areas[2:] == [False, False]
     assert profile.val == Decimal("1")
     assert profile.vah == Decimal("3")
+
+
+def test_poc_is_always_inside_the_value_area_for_skewed_volume() -> None:
+    # POC is a single dominant bin; the value area must include it.
+    trades = (
+        _trade(1, "1", "1.00", is_buyer_maker=False),
+        _trade(2, "1", "2.00", is_buyer_maker=False),
+        _trade(3, "10", "3.00", is_buyer_maker=False),
+        _trade(4, "1", "4.00", is_buyer_maker=False),
+        _trade(5, "1", "5.00", is_buyer_maker=False),
+    )
+
+    profile = compute_volume_profile(
+        trades,
+        symbol="BTCUSDT",
+        window_start=WINDOW_START,
+        window_end=WINDOW_END,
+        tick_size=Decimal("1"),
+    )
+
+    poc_bin = next(bin_ for bin_ in profile.bins if bin_.is_poc)
+    assert poc_bin.in_value_area
+
+
+def test_value_area_includes_the_poc_even_when_an_outside_block_reaches_target() -> None:
+    # Equal bins: an outside block [1..3] also reaches 75% of the total, but the
+    # POC (bin 0) is a hard semantic constraint and must be in the value area.
+    trades = tuple(
+        _trade(index + 1, "10", f"{index + 1}.00", is_buyer_maker=False) for index in range(4)
+    )
+
+    profile = compute_volume_profile(
+        trades,
+        symbol="BTCUSDT",
+        window_start=WINDOW_START,
+        window_end=WINDOW_END,
+        tick_size=Decimal("1"),
+    )
+
+    poc = next(bin_ for bin_ in profile.bins if bin_.is_poc)
+    assert poc.in_value_area
+    # The lower-start containing range [0,2] wins; an outside [1,3] block is
+    # never selected even though it also reaches the threshold.
+    assert [bin_.in_value_area for bin_ in profile.bins] == [True, True, True, False]

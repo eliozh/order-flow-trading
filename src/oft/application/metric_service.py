@@ -11,12 +11,16 @@ from __future__ import annotations
 import csv
 import hashlib
 import json
+import os
+import re
 from collections.abc import Sequence
 from dataclasses import dataclass
 from datetime import UTC, date, datetime, timedelta
 from decimal import Decimal
 from pathlib import Path
 from typing import Protocol, cast
+
+import structlog
 
 from oft.adapters.parquet_store import recover_orphan_metric_parts
 from oft.config import Settings
@@ -44,6 +48,7 @@ from oft.ports.store import ManifestEntry, StorePort, StoreUnavailableError
 
 SCHEMA_VERSION = "1.0.0"
 _EPOCH = datetime(1970, 1, 1, tzinfo=UTC)
+_SYMBOL_PATTERN = re.compile(r"^[A-Z0-9]{2,24}$")
 
 
 class MetricsWriterPort(Protocol):
@@ -92,10 +97,18 @@ def load_klines(settings: Settings, request: MetricRequest) -> tuple[KlineBar, .
     if not path.is_file():
         return ()
     rows: list[KlineBar] = []
+    required = {"symbol", "period", "bar_start", "volume", "taker_buy_volume"}
     try:
         with path.open(newline="", encoding="utf-8") as handle:
-            for row in csv.DictReader(handle):
+            reader = csv.DictReader(handle)
+            fieldnames = set(reader.fieldnames or ())
+            missing = required - fieldnames
+            if missing:
+                raise ValueError(f"kline fixture is missing columns: {', '.join(sorted(missing))}")
+            for row in reader:
                 if row.get("symbol") != request.symbol:
+                    continue
+                if row.get("period") != request.period:
                     continue
                 rows.append(
                     KlineBar(
@@ -109,11 +122,15 @@ def load_klines(settings: Settings, request: MetricRequest) -> tuple[KlineBar, .
     return tuple(rows)
 
 
-def _kline_cross_check_reasons(klines: Sequence[KlineBar], cvd: CvdResult) -> tuple[str, ...]:
+def _kline_cross_check_reasons(
+    klines: Sequence[KlineBar], cvd: CvdResult, period: str
+) -> tuple[str, ...]:
     if not cvd.points:
         return ()
     if not klines:
-        return ("missing kline cross-check input",)
+        # No kline rows for this period: do not cross-check a differently
+        # keyed fixture (that caused false 1h/8h/1d failures).
+        return (f"missing kline cross-check input for period {period}",)
     by_start = {bar.bar_start: bar for bar in klines}
     reasons: list[str] = []
     for point in cvd.points:
@@ -144,6 +161,8 @@ class MetricRequest:
     unit: Unit = "BASE"
 
     def __post_init__(self) -> None:
+        if _SYMBOL_PATTERN.fullmatch(self.symbol) is None:
+            raise ValueError("symbol must match ^[A-Z0-9]{2,24}$")
         if not isinstance(self.tick_size, Decimal):
             raise TypeError("tick_size must be a Decimal")
         if not isinstance(self.value_area_pct, Decimal):
@@ -215,26 +234,50 @@ def _agg_trades_root(settings: Settings, symbol: str) -> Path:
     return settings.data_dir / "market" / "um" / "agg_trades" / f"symbol={symbol}"
 
 
-def _present_days(settings: Settings, request: MetricRequest) -> set[date]:
+def _present_days(
+    settings: Settings, request: MetricRequest, store: StorePort | None = None
+) -> set[date]:
     root = _agg_trades_root(settings, request.symbol)
+    allowed: set[str] | None = None
+    if store is not None:
+        allowed = {entry.path for entry in store.list_manifest() if entry.data_type == "agg_trades"}
     present: set[date] = set()
     for day in _expected_days(request):
         directory = root / f"date={day.isoformat()}"
-        if directory.is_dir() and any(directory.glob("*.parquet")):
+        if not directory.is_dir():
+            continue
+        parts = tuple(directory.glob("*.parquet"))
+        if allowed is not None:
+            parts = tuple(path for path in parts if str(path) in allowed)
+        if parts:
             present.add(day)
     return present
 
 
-def load_agg_trades(settings: Settings, request: MetricRequest) -> tuple[AggTrade, ...]:
-    """Read the published agg_trades parts intersecting the request window."""
+def load_agg_trades(
+    settings: Settings, request: MetricRequest, store: StorePort | None = None
+) -> tuple[AggTrade, ...]:
+    """Read the published agg_trades parts intersecting the request window.
+
+    When a store is available only manifest-registered parts are used, so a
+    crash-orphaned part can never inject duplicate ids into the metric core.
+    """
     root = _agg_trades_root(settings, request.symbol)
+    allowed: set[str] | None = None
+    if store is not None:
+        allowed = {entry.path for entry in store.list_manifest() if entry.data_type == "agg_trades"}
     parts: list[str] = []
     for day in sorted(_expected_days(request)):
         directory = root / f"date={day.isoformat()}"
         if directory.is_dir():
-            parts.extend(str(path) for path in sorted(directory.glob("*.parquet")))
+            parts.extend(
+                str(path)
+                for path in sorted(directory.glob("*.parquet"))
+                if allowed is None or str(path) in allowed
+            )
     if not parts:
         return ()
+    import pyarrow as pa
     import pyarrow.dataset as dataset
 
     try:
@@ -250,7 +293,7 @@ def load_agg_trades(settings: Settings, request: MetricRequest) -> tuple[AggTrad
                 "symbol",
             ]
         )
-    except (OSError, ValueError) as exc:
+    except (OSError, ValueError, pa.ArrowException) as exc:
         raise StoreUnavailableError(
             f"cannot read agg_trades parts for {request.symbol}: {exc}"
         ) from exc
@@ -279,11 +322,14 @@ def load_agg_trades(settings: Settings, request: MetricRequest) -> tuple[AggTrad
 
 
 def _quality(
-    settings: Settings, request: MetricRequest, trades: Sequence[AggTrade]
+    settings: Settings,
+    request: MetricRequest,
+    trades: Sequence[AggTrade],
+    store: StorePort | None = None,
 ) -> MetricQuality:
     if not trades:
         return MetricQuality.missing("no aggTrade rows in the requested window")
-    missing = sorted(_expected_days(request) - _present_days(settings, request))
+    missing = sorted(_expected_days(request) - _present_days(settings, request, store))
     if missing:
         return MetricQuality.partial(
             tuple(f"missing agg_trades part {day.isoformat()}" for day in missing)
@@ -511,7 +557,7 @@ class MetricService:
         if request.unit != "BASE":
             raise ValueError("metric engine v1 supports BASE-unit CVD only")
         version = self._version(request)
-        trades = load_agg_trades(self._settings, request)
+        trades = load_agg_trades(self._settings, request, self._store)
         cvd = compute_cvd(
             trades,
             symbol=request.symbol,
@@ -530,11 +576,20 @@ class MetricService:
             value_area_pct=request.value_area_pct,
         )
         input_hash = input_manifest_hash(trades, request)
-        quality = _quality(self._settings, request, trades)
+        quality = _quality(self._settings, request, trades, self._store)
         klines = load_klines(self._settings, request)
-        cross_reasons = _kline_cross_check_reasons(klines, cvd)
-        if quality.data_quality.value != "MISSING" and cross_reasons:
-            quality = MetricQuality.partial((*quality.quality_reasons, *cross_reasons))
+        cross_reasons = _kline_cross_check_reasons(klines, cvd, request.period)
+        if quality.data_quality.value != "MISSING":
+            # OI/funding are not measured in this slice; never present their
+            # schema placeholders as measured zeroes.
+            quality = MetricQuality.partial(
+                (
+                    *quality.quality_reasons,
+                    *cross_reasons,
+                    "open_interest not measured in this slice",
+                    "funding not measured in this slice",
+                )
+            )
         computed_at = utc_timestamp(self._clock.now())
         gaps = self._store.list_data_gaps(symbol=request.symbol, data_type="aggTrades")
         payload = _document_payload(
@@ -567,15 +622,29 @@ class MetricService:
         """
         if self._reconciled:
             return
+        root = self._settings.data_dir / "metrics" / "orderflow"
+        if not root.is_dir() or not os.access(root, os.R_OK | os.X_OK):
+            # A transiently unavailable metrics mount must not erase manifest rows.
+            self._reconciled = True
+            return
         known: set[str] = set()
         for entry in self._store.list_manifest():
             if entry.data_type != "metrics":
                 continue
-            if Path(entry.path).is_file():
+            path = Path(entry.path)
+            if path.is_file():
                 known.add(entry.path)
-            else:
+            elif path.parent.is_dir():
+                # The date directory is readable and the part is definitively
+                # absent; this is a real missing-file row.
                 self._store.delete_manifest_entry(entry.path)
-        for entry in recover_orphan_metric_parts(self._settings, known):
+            else:
+                # Parent directory missing/unreadable: treat as drift, keep the
+                # manifest row rather than deleting it during a transient fault.
+                structlog.get_logger(__name__).warning("metrics_manifest_drift", path=entry.path)
+        for entry in recover_orphan_metric_parts(
+            self._settings, known, now=utc_timestamp(self._clock.now())
+        ):
             self._store.upsert_manifest_entry(entry)
         self._reconciled = True
 
@@ -597,10 +666,13 @@ class MetricService:
         try:
             self._store.upsert_manifest_entry(entry)
         except Exception:
-            # Never delete a part still referenced by a published manifest row;
-            # content addressing means an existing path is an idempotent reuse.
-            referenced = {row.path for row in self._store.list_manifest()}
-            if entry.path not in referenced:
+            # Only delete when the manifest explicitly says this path is
+            # unreferenced. An unreadable DB leaves the part for adoption.
+            try:
+                referenced = self._store.get_manifest_entry(entry.path) is not None
+            except StoreUnavailableError:
+                referenced = True
+            if not referenced:
                 Path(entry.path).unlink(missing_ok=True)
             raise
         return PersistedMetric(document=document, entry=entry)

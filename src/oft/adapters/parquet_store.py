@@ -8,7 +8,7 @@ import re
 import uuid
 from collections.abc import Callable
 from datetime import UTC, datetime
-from decimal import Decimal
+from decimal import Decimal, InvalidOperation
 from pathlib import Path
 from typing import TYPE_CHECKING, cast
 
@@ -20,14 +20,13 @@ from oft.config import Settings
 from oft.domain.events import AggTrade
 from oft.domain.metrics.types import MetricRow, decimal_str
 from oft.domain.time import utc_timestamp
-from oft.ports.store import ManifestEntry, StoreUnavailableError
+from oft.ports.store import ManifestEntry, StorePort, StoreUnavailableError
 
 if TYPE_CHECKING:
     import duckdb
 
 _LAYOUT = ("market", "metrics", "footprint", "liquidations")
 METRICS_DATA_TYPE = "metrics"
-_VERSION_TOKEN = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]*$")
 
 
 def ensure_layout(settings: Settings) -> tuple[Path, ...]:
@@ -87,17 +86,58 @@ def metrics_parts(
 
 
 def read_metrics(
-    settings: Settings, *, symbol: str, period: str, metric_version: str
+    settings: Settings,
+    *,
+    symbol: str,
+    period: str,
+    metric_version: str,
+    window_start: datetime | None = None,
+    window_end: datetime | None = None,
+    store: StorePort | None = None,
 ) -> tuple[dict[str, object], ...]:
-    """Read every row for one metric version in deterministic order."""
+    """Read every row for one metric version in deterministic order.
+
+    Only manifest-registered metrics parts participate; an unregistered
+    (orphaned) part can never shadow a published run. Optional window bounds
+    are pushed down into the Arrow dataset scan.
+    """
     parts = metrics_parts(settings, symbol=symbol, period=period, metric_version=metric_version)
+    if store is None:
+        from oft.adapters.sqlite_store import SqliteStore
+
+        store = SqliteStore(settings)
+    registered = {
+        entry.path
+        for entry in store.list_manifest()
+        if entry.data_type == METRICS_DATA_TYPE and entry.status in {"PUBLISHED", "COMPLETE"}
+    }
+    parts = tuple(path for path in parts if str(path) in registered)
     if not parts:
         return ()
     import pyarrow.dataset as dataset
 
+    filters = []
+    if window_start is not None:
+        filters.append(
+            dataset.field("window_start")
+            >= pa.scalar(window_start.astimezone(UTC), type=pa.timestamp("ms", tz="UTC"))
+        )
+    if window_end is not None:
+        filters.append(
+            dataset.field("window_end")
+            <= pa.scalar(window_end.astimezone(UTC), type=pa.timestamp("ms", tz="UTC"))
+        )
+    filter_expr = None
+    if filters:
+        filter_expr = filters[0]
+        for extra in filters[1:]:
+            filter_expr = filter_expr & extra
+
     try:
-        table = dataset.dataset([str(path) for path in parts], format="parquet").to_table()
-    except (OSError, ValueError) as exc:
+        table = dataset.dataset([str(path) for path in parts], format="parquet").to_table(
+            filter=filter_expr
+        )
+    except (OSError, ValueError, pa.ArrowException) as exc:
         raise StoreUnavailableError(f"cannot read metrics parts for {symbol}: {exc}") from exc
     rows = cast("list[dict[str, object]]", table.to_pylist())
 
@@ -128,7 +168,7 @@ def read_metrics(
                 ),
                 "",
             )
-            complete_rank = 1 if quality == "COMPLETE" else 0
+            complete_rank = {"COMPLETE": 2, "PARTIAL": 1, "MISSING": 0}.get(quality, 0)
             latest = max(str(item.get("computed_at") or "") for item in run_rows)
             scored.append(((complete_rank, latest, run_key), run_key))
         chosen_run = max(scored)[1]
@@ -148,7 +188,7 @@ def read_metrics(
     def _price_key(value: object) -> Decimal:
         try:
             return Decimal(str(value))
-        except Exception:
+        except InvalidOperation:
             return Decimal("-Infinity")
 
     rows.sort(
@@ -161,7 +201,12 @@ def read_metrics(
         )
     )
     unique: list[dict[str, object]] = []
-    seen: set[tuple[object, ...]] = set()
+    seen: dict[tuple[object, ...], dict[str, object]] = {}
+    duplicate_count = 0
+
+    def comparable(row: dict[str, object]) -> dict[str, object]:
+        return {key: value for key, value in row.items() if key != "computed_at"}
+
     for row in rows:
         key = (
             row.get("record_type"),
@@ -173,16 +218,20 @@ def read_metrics(
             row.get("price_low"),
         )
         if key in seen:
-            structlog.get_logger(__name__).warning(
-                "metrics_duplicate_logical_row",
-                symbol=symbol,
-                period=period,
-                metric_version=metric_version,
-                record_type=row.get("record_type"),
-            )
+            if comparable(seen[key]) != comparable(row):
+                raise ValueError(f"conflicting metrics rows for {key} in version {metric_version}")
+            duplicate_count += 1
             continue
-        seen.add(key)
+        seen[key] = row
         unique.append(row)
+    if duplicate_count:
+        structlog.get_logger(__name__).warning(
+            "metrics_duplicate_logical_row",
+            symbol=symbol,
+            period=period,
+            metric_version=metric_version,
+            duplicates=duplicate_count,
+        )
     return tuple(unique)
 
 
@@ -229,18 +278,21 @@ def _utc_or_none(value: datetime | None) -> datetime | None:
 
 
 def _publish_table(
-    table: pa.Table, directory: Path, *, name_prefix: str | None = None
+    table: pa.Table,
+    directory: Path,
+    *,
+    name_prefix: str,
+    stem_hash: str,
 ) -> tuple[Path, str, int]:
     """Write a Parquet table via temp -> fsync -> content-addressed rename."""
     temp_path = directory / f".part-{uuid.uuid4().hex}.tmp"
+    final_path = directory / f"part-{name_prefix}-{stem_hash[:16]}.parquet"
     checksum = ""
     try:
         pq.write_table(table, temp_path, compression="snappy")
         with temp_path.open("rb") as handle:
             os.fsync(handle.fileno())
         checksum = hashlib.sha256(temp_path.read_bytes()).hexdigest()
-        stem = f"{name_prefix}-{checksum[:16]}" if name_prefix else uuid.uuid4().hex
-        final_path = directory / f"part-{stem}.parquet"
         os.replace(temp_path, final_path)
         _fsync_dir(directory)
     finally:
@@ -286,7 +338,7 @@ def recover_orphan_parts(settings: Settings, known_paths: set[str]) -> tuple[Man
 
 
 def recover_orphan_metric_parts(
-    settings: Settings, known_paths: set[str]
+    settings: Settings, known_paths: set[str], *, now: str
 ) -> tuple[ManifestEntry, ...]:
     """Adopt published metrics parts that never reached the manifest table."""
     root = settings.data_dir / "metrics" / "orderflow"
@@ -316,7 +368,7 @@ def recover_orphan_metric_parts(
                 bytes=path.stat().st_size,
                 checksum=checksum,
                 source=f"metrics:{version}",
-                created_at=utc_timestamp(datetime.now(UTC)),
+                created_at=now,
             )
         )
     return tuple(recovered)
@@ -366,7 +418,7 @@ class ParquetStore:
             return set()
         try:
             table = dataset.dataset(parts, format="parquet").to_table(columns=["agg_trade_id"])
-        except (OSError, ValueError) as exc:
+        except (OSError, ValueError, pa.ArrowException) as exc:
             raise StoreUnavailableError(
                 f"cannot read existing agg_trade parts for {symbol}: {exc}"
             ) from exc
@@ -437,9 +489,11 @@ class ParquetStore:
         data_quality: str,
         quality_reasons: tuple[str, ...],
     ) -> ManifestEntry:
-        """Publish one immutable long-format metrics part with full provenance."""
-        if not rows:
-            raise ValueError("cannot write an empty metrics part")
+        """Publish one immutable long-format metrics part with full provenance.
+
+        An empty (MISSING) window is persisted as a zero-row part so schedules
+        crossing data gaps do not fail; readers simply return no rows.
+        """
         directory = (
             metrics_root(
                 self._settings,
@@ -499,16 +553,26 @@ class ParquetStore:
                 "quality_reasons": pa.array([reasons for _ in rows], type=pa.list_(pa.string())),
             }
         )
-        final_path, checksum, size = _publish_table(
-            table,
-            directory,
-            # Content-addressed: full window + content hash. Identical inputs
-            # reuse the same immutable path; different inputs never overwrite.
-            name_prefix=(
-                f"{window_start.astimezone(UTC):%Y%m%dT%H%M%S}-"
-                f"{window_end.astimezone(UTC):%Y%m%dT%H%M%S}"
-            ),
+        # Identity excludes runtime metadata (computed_at): the same inputs,
+        # algorithm/params, version, and window always map to one immutable part.
+        identity = table.drop_columns(["computed_at"])
+        sink = pa.BufferOutputStream()
+        pq.write_table(identity, sink, compression="snappy")
+        identity_hash = hashlib.sha256(sink.getvalue().to_pybytes()).hexdigest()
+        prefix = (
+            f"{window_start.astimezone(UTC):%Y%m%dT%H%M%S}-"
+            f"{window_end.astimezone(UTC):%Y%m%dT%H%M%S}"
         )
+        candidate = directory / f"part-{prefix}-{identity_hash[:16]}.parquet"
+        if candidate.is_file():
+            # Reuse the already-published immutable part (keeps its computed_at).
+            final_path = candidate
+            checksum = hashlib.sha256(candidate.read_bytes()).hexdigest()
+            size = candidate.stat().st_size
+        else:
+            final_path, checksum, size = _publish_table(
+                table, directory, name_prefix=prefix, stem_hash=identity_hash
+            )
         return ManifestEntry(
             path=str(final_path),
             data_type=METRICS_DATA_TYPE,
@@ -519,6 +583,10 @@ class ParquetStore:
             checksum=checksum,
             source=f"metrics:{metric_version}",
             created_at=computed_at,
+            metric_version=metric_version,
+            input_manifest_hash=input_manifest_hash,
+            window_start=utc_timestamp(window_start),
+            window_end=utc_timestamp(window_end),
         )
 
     def _write_part(

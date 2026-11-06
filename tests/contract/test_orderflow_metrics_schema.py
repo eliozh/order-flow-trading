@@ -98,8 +98,9 @@ def test_output_validates_against_the_orderflow_metrics_schema(
     assert payload["metric_version"] == document.metric_version
     assert payload["input_manifest_hash"] == document.input_manifest_hash
     assert payload["computed_at"] == "2026-11-06T12:00:00.000Z"
-    assert payload["data_quality"] == "COMPLETE"
-    assert payload["quality_reasons"] == []
+    assert payload["data_quality"] == "PARTIAL"
+    assert "open_interest not measured in this slice" in payload["quality_reasons"]
+    assert "funding not measured in this slice" in payload["quality_reasons"]
 
 
 def test_every_decimal_field_is_a_json_string(document: MetricDocument) -> None:

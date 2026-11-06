@@ -17,7 +17,7 @@ from decimal import Decimal
 from pathlib import Path
 
 from oft.domain.metrics.delta import parse_period
-from oft.domain.metrics.types import Unit, decimal_str
+from oft.domain.metrics.types import Unit
 
 _ALGORITHM_PATTERN = re.compile(r"^[a-z][a-z0-9_]*$")
 RATIO_PRECISION = 8
@@ -25,17 +25,25 @@ RATIO_ROUNDING = "ROUND_HALF_EVEN"
 POC_TIEBREAK = "LOWEST_PRICE"
 POC_PRICE_RULE = "BIN_LOW"
 VALUE_AREA_RULE = "MIN_CONTIGUOUS_BINS"
-_ALGORITHM_SOURCE_FILES = ("cvd.py", "volume_profile.py", "types.py", "delta.py")
+_ALGORITHM_SOURCE_FILES = (
+    "cvd.py",
+    "volume_profile.py",
+    "types.py",
+    "delta.py",
+    "metric_service.py",
+)
 
 
 def _algorithm_source_digest() -> str:
     """Hash the algorithm implementation so code edits change the version."""
     digest = hashlib.sha256()
     here = Path(__file__).resolve().parent
+    application = here.parents[1] / "application" / "metric_service.py"
     for name in _ALGORITHM_SOURCE_FILES:
         digest.update(name.encode("utf-8"))
         digest.update(b"\0")
-        digest.update((here / name).read_bytes())
+        path = application if name == "metric_service.py" else here / name
+        digest.update(path.read_bytes())
         digest.update(b"\0")
     return digest.hexdigest()
 
@@ -45,7 +53,8 @@ ALGORITHM_SOURCE_DIGEST = _algorithm_source_digest()
 
 def _canonical_value(value: object) -> str:
     if isinstance(value, Decimal):
-        return decimal_str(value)
+        # Normalize so 0.10/0.1 and 70/70.0 are the same parameter value.
+        return format(value.normalize(), "f")
     if isinstance(value, bool):
         return "true" if value else "false"
     if isinstance(value, int):
