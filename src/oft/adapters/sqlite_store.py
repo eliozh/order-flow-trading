@@ -1154,12 +1154,14 @@ class SqliteStore:
                     placeholders = ", ".join("?" for _ in paths)
                     connection.execute(
                         f"DELETE FROM manifest WHERE symbol = ? AND date = ? "
+                        f"AND (source LIKE 'archive:%' OR source = 'recovered:orphan') "
                         f"AND path NOT IN ({placeholders})",
                         (row.symbol, row.date, *paths),
                     )
                 else:
                     connection.execute(
-                        "DELETE FROM manifest WHERE symbol = ? AND date = ?",
+                        "DELETE FROM manifest WHERE symbol = ? AND date = ? "
+                        "AND (source LIKE 'archive:%' OR source = 'recovered:orphan')",
                         (row.symbol, row.date),
                     )
             self._resolve_gaps_for_day(

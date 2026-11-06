@@ -513,12 +513,17 @@ class BackfillService:
                 error_code=None,
             )
             if corrected:
+                # Only archive-derived parts may be replaced; never touch
+                # live/scan parts for the same symbol+date.
                 new_paths = {entry.path for entry in entries}
-                for old in day_parts:
-                    if old.path not in new_paths:
-                        path = Path(old.path)
-                        path.unlink(missing_ok=True)
-                        _fsync_directory(path.parent)
+                old_archive_parts = tuple(
+                    entry
+                    for entry in day_parts
+                    if entry.path not in new_paths
+                    and (entry.source.startswith("archive:") or entry.source == "recovered:orphan")
+                )
+            else:
+                old_archive_parts = ()
             # Parts + gap resolve + COMPLETE in one transaction, COMPLETE last.
             self._store.commit_backfill_file(
                 row=row,
@@ -527,6 +532,20 @@ class BackfillService:
                 owner=owner,
                 replace_date=corrected,
             )
+            # Old parts are deleted only after the replacement transaction
+            # committed; a failed commit leaves them and their manifest rows.
+            for old in old_archive_parts:
+                path = Path(old.path)
+                try:
+                    path.unlink(missing_ok=True)
+                except OSError as exc:  # pragma: no cover - defensive cleanup
+                    structlog.get_logger(__name__).warning(
+                        "backfill_old_part_unlink_failed",
+                        path=path.name,
+                        error=str(exc),
+                    )
+                else:
+                    _fsync_directory(path.parent)
             return row
         except Exception:
             # Downgrade/remove manifest rows first, then delete published parts.

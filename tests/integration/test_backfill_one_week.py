@@ -559,3 +559,92 @@ def test_upstream_checksum_correction_replaces_the_day_part(tmp_path: Path) -> N
     assert len({row["agg_trade_id"] for row in rows}) == EXPECTED_UNIQUE_ROWS
     manifest = retry.store.get_backfill_manifest("aggTrades/BTCUSDT/2026-10-02")
     assert manifest is not None and manifest.rows > 0
+
+
+def test_correction_never_deletes_live_or_scan_parts(tmp_path: Path) -> None:
+    from decimal import Decimal
+
+    from oft.domain.events import AggTrade
+
+    harness = _harness(tmp_path)
+    harness.service.run(symbol="BTCUSDT", data_type="aggTrades", start=START, end=END)
+    live_trade = AggTrade(
+        symbol="BTCUSDT",
+        agg_trade_id=999999,
+        price=Decimal("123.45"),
+        quantity=Decimal("1"),
+        first_trade_id=999999,
+        last_trade_id=999999,
+        transact_time=datetime(2026, 10, 2, 12, 0, tzinfo=UTC),
+        is_buyer_maker=False,
+    )
+    live_entry = harness.parquet.write_agg_trades_batch(
+        (live_trade,), symbol="BTCUSDT", source="fixture:live.csv", allow_duplicate_ids=True
+    )[0]
+    harness.store.record_manifest(live_entry)
+    assert Path(live_entry.path).is_file()
+    old_archive_paths = {
+        entry.path
+        for entry in harness.store.list_manifest(symbol="BTCUSDT", date="2026-10-02")
+        if entry.source.startswith("archive:")
+    }
+    assert old_archive_paths
+
+    corrected = _corrected_archive(tmp_path, "2026-10-02")
+    retry = _harness(tmp_path, FixtureArchiveSource(corrected))
+    result = retry.service.run(symbol="BTCUSDT", data_type="aggTrades", start=START, end=END)
+
+    assert result.run.status == "COMPLETE"
+    assert Path(live_entry.path).is_file()
+    live_rows = [
+        entry
+        for entry in retry.store.list_manifest(symbol="BTCUSDT", date="2026-10-02")
+        if entry.source == "fixture:live.csv"
+    ]
+    assert len(live_rows) == 1 and live_rows[0].path == live_entry.path
+    archive_rows = [
+        entry
+        for entry in retry.store.list_manifest(symbol="BTCUSDT", date="2026-10-02")
+        if entry.source.startswith("archive:")
+    ]
+    assert len(archive_rows) == 1 and Path(archive_rows[0].path).is_file()
+    assert all(not Path(path).exists() for path in old_archive_paths)
+    rows = _all_rows(retry.settings)
+    assert len(rows) == EXPECTED_UNIQUE_ROWS + 1
+    assert 999999 in {row["agg_trade_id"] for row in rows}
+    assert len({row["agg_trade_id"] for row in rows}) == EXPECTED_UNIQUE_ROWS + 1
+
+
+def test_corrected_commit_failure_keeps_old_parts_and_manifest(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from oft.ports.store import StoreUnavailableError
+
+    harness = _harness(tmp_path)
+    harness.service.run(symbol="BTCUSDT", data_type="aggTrades", start=START, end=END)
+    key = "aggTrades/BTCUSDT/2026-10-02"
+    old_parts = {
+        str(path) for path in _partitions(harness.settings) if "date=2026-10-02" in str(path)
+    }
+    old_row = harness.store.get_backfill_manifest(key)
+    assert old_row is not None
+
+    corrected = _corrected_archive(tmp_path, "2026-10-02")
+    retry = _harness(tmp_path, FixtureArchiveSource(corrected))
+    original = retry.store.commit_backfill_file
+
+    def fail_on_replace(**kwargs: object) -> None:
+        if kwargs.get("replace_date"):
+            raise StoreUnavailableError("simulated commit failure")
+        return original(**kwargs)  # type: ignore[arg-type]
+
+    monkeypatch.setattr(retry.store, "commit_backfill_file", fail_on_replace)
+
+    with pytest.raises(StoreUnavailableError):
+        retry.service.run(symbol="BTCUSDT", data_type="aggTrades", start=START, end=END)
+
+    assert old_parts <= {str(path) for path in _partitions(retry.settings)}
+    row = retry.store.get_backfill_manifest(key)
+    assert row is not None
+    assert row.status == "COMPLETE"
+    assert row.checksum == old_row.checksum
