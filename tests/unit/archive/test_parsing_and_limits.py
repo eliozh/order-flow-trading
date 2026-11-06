@@ -96,3 +96,22 @@ def test_fixture_source_rejects_a_path_outside_the_fixtures_dir(tmp_path: Path) 
 
     with pytest.raises(UnsafeArchiveError):
         source._local(file)
+
+
+@pytest.mark.parametrize(
+    "failure", [NotImplementedError("compression 99"), EOFError("truncated deflate")]
+)
+def test_zip_entry_read_failures_are_wrapped(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, failure: Exception
+) -> None:
+    archive = tmp_path / "entry-error.zip"
+    with zipfile.ZipFile(archive, "w") as handle:
+        handle.writestr("a.csv", "x")
+
+    def boom(self, info, *args, **kwargs):  # type: ignore[no-untyped-def]
+        raise failure
+
+    monkeypatch.setattr(zipfile.ZipFile, "open", boom)
+
+    with pytest.raises(UnsafeArchiveError):
+        extract_zip_safely(archive, workspace=tmp_path)

@@ -5,6 +5,8 @@ from __future__ import annotations
 from datetime import UTC, datetime
 from pathlib import Path
 
+import pytest
+
 from oft.adapters.sqlite_store import SqliteStore
 from oft.config import Settings
 from oft.domain.time import utc_timestamp
@@ -83,3 +85,36 @@ def test_heavyweight_run_lease_requires_the_owner(tmp_path: Path) -> None:
         is True
     )
     assert store.save_backfill_run(_record("BF-OWNED", started), owner="owner-b") is False
+
+
+def test_commit_is_owner_scoped(tmp_path: Path) -> None:
+    from oft.ports.store import BackfillManifestRow, LeaseLostError
+
+    settings = Settings(env="test", port=8765, data_dir=tmp_path / "data")
+    store = SqliteStore(settings)
+    store.initialize()
+    started = utc_timestamp(datetime.now(UTC))
+    assert store.start_backfill_run(_record("BF-OWNED", started), owner="owner-a") is True
+    row = BackfillManifestRow(
+        file_key="aggTrades/BTCUSDT/2026-10-01",
+        run_id="BF-OWNED",
+        data_type="aggTrades",
+        symbol="BTCUSDT",
+        date="2026-10-01",
+        source_url="u",
+        checksum="c",
+        checksum_verified=True,
+        status="COMPLETE",
+        bytes=1,
+        rows=1,
+        downloaded_at=started,
+        verified_at=started,
+        error_code=None,
+    )
+
+    with pytest.raises(LeaseLostError):
+        store.commit_backfill_file(row=row, entries=(), resolved_at=started, owner="owner-b")
+    assert store.get_backfill_manifest(row.file_key) is None
+
+    store.commit_backfill_file(row=row, entries=(), resolved_at=started, owner="owner-a")
+    assert store.get_backfill_manifest(row.file_key) is not None

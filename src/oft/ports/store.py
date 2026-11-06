@@ -19,6 +19,16 @@ class StoreUnavailableError(Exception):
         self.message = message
 
 
+class LeaseLostError(Exception):
+    """Another run owns the lease; the current worker must stop publishing."""
+
+    code = "BACKFILL_ALREADY_RUNNING"
+
+    def __init__(self, message: str = "backfill lease lost") -> None:
+        super().__init__(message)
+        self.message = message
+
+
 @dataclass(frozen=True)
 class SymbolUpsertResult:
     """Row counts from one idempotent symbol-registry ingest."""
@@ -129,10 +139,11 @@ class StorePort(Protocol):
 
     def record_manifest(self, entry: ManifestEntry) -> None: ...
 
+    def delete_manifest_entry(self, path: str) -> None: ...
+
     def list_manifest(
         self, *, symbol: str | None = None, date: str | None = None
     ) -> tuple[ManifestEntry, ...]: ...
-
     def integrity_check(self) -> bool: ...
 
     def upsert_symbols(
@@ -201,6 +212,8 @@ class StorePort(Protocol):
         row: BackfillManifestRow,
         entries: tuple[ManifestEntry, ...],
         resolved_at: str,
+        owner: str | None = None,
+        replace_date: bool = False,
     ) -> None: ...
 
     def discard_backfill_file(
@@ -209,6 +222,8 @@ class StorePort(Protocol):
         file_key: str,
         entries: tuple[ManifestEntry, ...],
         error_code: str,
+        owner: str | None = None,
+        run_id: str | None = None,
     ) -> None: ...
 
     def upsert_data_gap(self, gap: DataGap) -> None: ...

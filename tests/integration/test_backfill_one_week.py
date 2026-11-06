@@ -429,10 +429,10 @@ def test_concurrent_second_run_does_not_change_the_first_owner(
     release = threading.Event()
     original = harness.service._process_file
 
-    def slow(run, file, owner):  # type: ignore[no-untyped-def]
+    def slow(run, file, owner, existing=None):  # type: ignore[no-untyped-def]
         started.set()
         release.wait(timeout=5)
-        return original(run, file, owner)
+        return original(run, file, owner, existing)
 
     monkeypatch.setattr(harness.service, "_process_file", slow)
     results: dict[str, object] = {}
@@ -471,3 +471,91 @@ def test_offline_retry_skips_verified_parts_and_stays_complete(tmp_path: Path) -
     assert result.run.status == "COMPLETE"
     assert result.run.files_verified == 7
     assert offline.opened == []  # nothing was re-downloaded
+
+
+def _drop_part_manifest_rows(settings: Settings, day: str) -> None:
+    import sqlite3
+
+    from oft.adapters.sqlite_store import database_path
+
+    connection = sqlite3.connect(database_path(settings))
+    try:
+        connection.execute("DELETE FROM manifest WHERE symbol = 'BTCUSDT' AND date = ?", (day,))
+        connection.execute(
+            "DELETE FROM backfill_manifest WHERE file_key = ?",
+            (f"aggTrades/BTCUSDT/{day}",),
+        )
+        connection.commit()
+    finally:
+        connection.close()
+
+
+def test_crash_between_publish_and_commit_is_reconciled(tmp_path: Path) -> None:
+    harness = _harness(tmp_path)
+    harness.service.run(symbol="BTCUSDT", data_type="aggTrades", start=START, end=END)
+    _drop_part_manifest_rows(harness.settings, "2026-10-02")
+
+    recording = _RecordingSource(ARCHIVE)
+    retry = _harness(tmp_path, recording)
+    result = retry.service.run(symbol="BTCUSDT", data_type="aggTrades", start=START, end=END)
+
+    assert result.run.status == "COMPLETE"
+    assert date(2026, 10, 2) not in recording.opened  # adopted, never re-downloaded
+    day_parts = [path for path in _partitions(retry.settings) if "date=2026-10-02" in str(path)]
+    assert len(day_parts) == 1
+    entry = next(entry for entry in retry.store.list_manifest(symbol="BTCUSDT", date="2026-10-02"))
+    assert entry.source == "recovered:orphan"
+    manifest = retry.store.get_backfill_manifest("aggTrades/BTCUSDT/2026-10-02")
+    assert manifest is not None and manifest.rows > 0
+    assert len(_all_rows(retry.settings)) == EXPECTED_UNIQUE_ROWS
+
+
+def _corrected_archive(base: Path, day: str) -> Path:
+    import hashlib
+    import zipfile
+
+    copied = base / "corrected"
+    shutil.copytree(ARCHIVE, copied)
+    zip_path = copied / f"btcusdt_agg-trades_{day}.zip"
+    with zipfile.ZipFile(zip_path) as archive:
+        entries = {name: archive.read(name) for name in archive.namelist()}
+    for name, data in list(entries.items()):
+        if name.endswith(".csv"):
+            lines = data.decode("utf-8").splitlines()
+            fields = lines[1].split(",")
+            fields[1] = "999.99"  # corrected price, same agg_trade_id
+            lines[1] = ",".join(fields)
+            entries[name] = ("\n".join(lines) + "\n").encode("utf-8")
+    with zipfile.ZipFile(zip_path, "w", zipfile.ZIP_DEFLATED) as archive:
+        for name, data in entries.items():
+            archive.writestr(name, data)
+    digest = hashlib.sha256(zip_path.read_bytes()).hexdigest()
+    (copied / f"{zip_path.name}.CHECKSUM").write_text(
+        f"{digest}  {zip_path.name}\n", encoding="utf-8"
+    )
+    return copied
+
+
+def test_upstream_checksum_correction_replaces_the_day_part(tmp_path: Path) -> None:
+    harness = _harness(tmp_path)
+    harness.service.run(symbol="BTCUSDT", data_type="aggTrades", start=START, end=END)
+    old_parts = {
+        str(path) for path in _partitions(harness.settings) if "date=2026-10-02" in str(path)
+    }
+    assert old_parts
+
+    corrected = _corrected_archive(tmp_path, "2026-10-02")
+    retry = _harness(tmp_path, FixtureArchiveSource(corrected))
+    result = retry.service.run(symbol="BTCUSDT", data_type="aggTrades", start=START, end=END)
+
+    assert result.run.status == "COMPLETE"
+    new_parts = {
+        str(path) for path in _partitions(retry.settings) if "date=2026-10-02" in str(path)
+    }
+    assert len(new_parts) == 1
+    assert new_parts.isdisjoint(old_parts)
+    rows = _all_rows(retry.settings)
+    assert len(rows) == EXPECTED_UNIQUE_ROWS
+    assert len({row["agg_trade_id"] for row in rows}) == EXPECTED_UNIQUE_ROWS
+    manifest = retry.store.get_backfill_manifest("aggTrades/BTCUSDT/2026-10-02")
+    assert manifest is not None and manifest.rows > 0

@@ -310,7 +310,7 @@ def extract_zip_safely(
                     raise UnsafeArchiveError(
                         f"duplicate archive entry rejected: {info.filename!r}"
                     ) from exc
-                except (zipfile.BadZipFile, zlib.error) as exc:
+                except (zipfile.BadZipFile, zlib.error, NotImplementedError, EOFError) as exc:
                     raise UnsafeArchiveError(
                         f"archive entry could not be read: {info.filename!r}"
                     ) from exc

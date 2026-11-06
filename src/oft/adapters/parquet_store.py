@@ -5,6 +5,7 @@ from __future__ import annotations
 import hashlib
 import os
 import uuid
+from collections.abc import Callable
 from datetime import UTC, datetime
 from pathlib import Path
 from typing import TYPE_CHECKING
@@ -65,6 +66,42 @@ def _fsync_dir(path: Path) -> None:
         os.close(descriptor)
 
 
+def recover_orphan_parts(settings: Settings, known_paths: set[str]) -> tuple[ManifestEntry, ...]:
+    """Adopt published parts that were never recorded in the manifest table.
+
+    Covers a crash between part publication and the manifest transaction; the
+    adopted rows keep dedupe/resume working instead of re-downloading forever.
+    """
+    root = settings.data_dir / "market" / "um" / "agg_trades"
+    if not root.is_dir():
+        return ()
+    recovered: list[ManifestEntry] = []
+    for path in sorted(root.glob("symbol=*/date=*/*.parquet")):
+        if str(path) in known_paths:
+            continue
+        symbol = path.parent.parent.name.split("=", 1)[1]
+        day = path.parent.name.split("=", 1)[1]
+        try:
+            rows = pq.ParquetFile(path).metadata.num_rows
+            checksum = hashlib.sha256(path.read_bytes()).hexdigest()
+        except (OSError, ValueError) as exc:
+            raise StoreUnavailableError(f"cannot reconcile orphan part {path}: {exc}") from exc
+        recovered.append(
+            ManifestEntry(
+                path=str(path),
+                data_type="agg_trades",
+                symbol=symbol,
+                date=day,
+                rows=rows,
+                bytes=path.stat().st_size,
+                checksum=checksum,
+                source="recovered:orphan",
+                created_at=utc_timestamp(datetime.now(UTC)),
+            )
+        )
+    return tuple(recovered)
+
+
 class ParquetStore:
     """Writes one immutable part per fixture import and returns its manifest row."""
 
@@ -123,17 +160,20 @@ class ParquetStore:
         *,
         symbol: str,
         source: str,
+        allow_duplicate_ids: bool = False,
+        on_progress: Callable[[int], None] | None = None,
     ) -> tuple[ManifestEntry, ...]:
         """Dedupe by ``agg_trade_id`` and publish one part per UTC date.
 
         Deduplication is scoped to the batch's date partitions, so re-running
         the same archive range cannot duplicate rows without scanning the whole
-        symbol history.
+        symbol history. A corrected upstream file (new checksum, same ids) sets
+        ``allow_duplicate_ids`` so the replacement rows are actually written.
         """
         if not trades:
             return ()
         batch_dates = {trade.transact_time.astimezone(UTC).date().isoformat() for trade in trades}
-        seen = self._existing_agg_trade_ids(symbol, batch_dates)
+        seen = set() if allow_duplicate_ids else self._existing_agg_trade_ids(symbol, batch_dates)
         unique: list[AggTrade] = []
         for trade in trades:
             if trade.agg_trade_id in seen:
@@ -152,6 +192,8 @@ class ParquetStore:
                 published.append(
                     self._write_part(groups[day], symbol=symbol, date=day, source=source)
                 )
+                if on_progress is not None:
+                    on_progress(len(published))
         except Exception:
             # Never leave a partially published multi-date batch behind.
             for entry in published:

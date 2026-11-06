@@ -29,6 +29,7 @@ from oft.adapters.archive import (
     stream_to_file,
     verify_checksum,
 )
+from oft.adapters.parquet_store import recover_orphan_parts
 from oft.application.gap_detection import SUPPORTED_DATA_TYPES, detect_backfill_gaps
 from oft.config import Settings
 from oft.domain.events import AggTrade
@@ -81,6 +82,8 @@ class ParquetWriterPort(Protocol):
         *,
         symbol: str,
         source: str,
+        allow_duplicate_ids: bool = False,
+        on_progress: Callable[[int], None] | None = None,
     ) -> tuple[ManifestEntry, ...]: ...
 
 
@@ -227,7 +230,7 @@ class BackfillService:
         )
         if not self._store.start_backfill_run(record, owner=owner, now=started_at):
             raise BackfillAlreadyRunning("A backfill is already running.")
-        self._cleanup_stale_temp_files()
+        self._reconcile_storage()
 
         processed = 0
         verified = 0
@@ -260,7 +263,7 @@ class BackfillService:
                         reason="checksum or published part validation failed; reprocessing",
                     )
                 try:
-                    row = self._process_file(record, file, owner)
+                    row = self._process_file(record, file, owner, existing)
                 except ChecksumMismatchError as exc:
                     failed += 1
                     self._record_failure(record, file, exc.code)
@@ -435,9 +438,18 @@ class BackfillService:
         return final_path, final_path.stat().st_size, expected
 
     def _process_file(
-        self, run: BackfillRunRecord, file: ArchiveFile, owner: str
+        self,
+        run: BackfillRunRecord,
+        file: ArchiveFile,
+        owner: str,
+        existing: BackfillManifestRow | None = None,
     ) -> BackfillManifestRow:
         zip_path, size, expected = self._download(file, run, owner)
+        # A changed upstream checksum means the archive was corrected: the same
+        # agg_trade_ids must be rewritten (and the old day parts replaced).
+        corrected = (
+            existing is not None and bool(existing.checksum) and existing.checksum != expected
+        )
         extraction = extract_zip_safely(
             zip_path,
             workspace=self._work_dir(),
@@ -457,9 +469,32 @@ class BackfillService:
                         on_progress=self._progress_callback(run, owner),
                     )
                 )
+            self._heartbeat(run, owner)  # dedupe/publish can also be long
             entries = self._parquet.write_agg_trades_batch(
-                trades, symbol=file.symbol, source=f"archive:{file.url}"
+                trades,
+                symbol=file.symbol,
+                source=f"archive:{file.url}",
+                allow_duplicate_ids=corrected,
+                on_progress=self._progress_callback(run, owner),
             )
+            self._heartbeat(run, owner)
+            day_parts = tuple(
+                entry
+                for entry in self._store.list_manifest(
+                    symbol=file.symbol, date=file.date.isoformat()
+                )
+                if Path(entry.path).is_file()
+            )
+            row_rows = sum(entry.rows for entry in entries)
+            if not corrected:
+                # A manifest-bypassed rerun can be fully deduped; the day's
+                # adopted/existing parts still prove the data is durable.
+                row_rows = row_rows or sum(entry.rows for entry in day_parts)
+            if row_rows == 0:
+                raise ArchiveError(
+                    f"archive produced no durable rows for {file.date.isoformat()}; "
+                    "refusing to mark it COMPLETE"
+                )
             now = utc_timestamp(self._clock.now())
             row = BackfillManifestRow(
                 file_key=file_key(file.data_type, file.symbol, file.date),
@@ -472,13 +507,26 @@ class BackfillService:
                 checksum_verified=True,
                 status="COMPLETE",
                 bytes=size,
-                rows=sum(entry.rows for entry in entries),
+                rows=row_rows,
                 downloaded_at=now,
                 verified_at=now,
                 error_code=None,
             )
+            if corrected:
+                new_paths = {entry.path for entry in entries}
+                for old in day_parts:
+                    if old.path not in new_paths:
+                        path = Path(old.path)
+                        path.unlink(missing_ok=True)
+                        _fsync_directory(path.parent)
             # Parts + gap resolve + COMPLETE in one transaction, COMPLETE last.
-            self._store.commit_backfill_file(row=row, entries=entries, resolved_at=now)
+            self._store.commit_backfill_file(
+                row=row,
+                entries=entries,
+                resolved_at=now,
+                owner=owner,
+                replace_date=corrected,
+            )
             return row
         except Exception:
             # Downgrade/remove manifest rows first, then delete published parts.
@@ -487,6 +535,8 @@ class BackfillService:
                     file_key=file_key(file.data_type, file.symbol, file.date),
                     entries=entries,
                     error_code="DATA_UNAVAILABLE",
+                    owner=owner,
+                    run_id=run.run_id,
                 )
             finally:
                 for entry in entries:
@@ -531,6 +581,18 @@ class BackfillService:
             return False
         parts = self._store.list_manifest(symbol=file.symbol, date=file.date.isoformat())
         return bool(parts) and all(Path(entry.path).is_file() for entry in parts)
+
+    def _reconcile_storage(self) -> None:
+        """Clean crash leftovers and adopt/repair part-manifest inconsistencies."""
+        self._cleanup_stale_temp_files()
+        known: set[str] = set()
+        for entry in self._store.list_manifest():
+            if Path(entry.path).is_file():
+                known.add(entry.path)
+            else:
+                self._store.delete_manifest_entry(entry.path)
+        for entry in recover_orphan_parts(self._settings, known):
+            self._store.record_manifest(entry)
 
     def _cleanup_stale_temp_files(self) -> None:
         raw_root = self._settings.data_dir / "raw"

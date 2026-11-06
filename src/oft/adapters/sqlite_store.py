@@ -20,6 +20,7 @@ from oft.domain.time import utc_timestamp
 from oft.ports.store import (
     BackfillManifestRow,
     BackfillRunRecord,
+    LeaseLostError,
     ManifestEntry,
     ScanRecord,
     StoreUnavailableError,
@@ -655,6 +656,10 @@ class SqliteStore:
             ),
         )
 
+    def delete_manifest_entry(self, path: str) -> None:
+        with closing(self._connect()) as connection, connection:
+            connection.execute("DELETE FROM manifest WHERE path = ?", (path,))
+
     def list_manifest(
         self, *, symbol: str | None = None, date: str | None = None
     ) -> tuple[ManifestEntry, ...]:
@@ -1119,18 +1124,44 @@ class SqliteStore:
         row: BackfillManifestRow,
         entries: tuple[ManifestEntry, ...],
         resolved_at: str,
+        owner: str | None = None,
+        replace_date: bool = False,
     ) -> None:
         """Unit of work: part manifest + gap resolve + COMPLETE row, COMPLETE last.
 
         The COMPLETE row must never survive without its published parts; a
         failure rolls the whole transaction back so the caller can delete the
-        parts and retry safely.
+        parts and retry safely. When ``owner`` is supplied the run must still be
+        ``RUNNING`` under that owner, otherwise ``LeaseLostError`` aborts.
         """
         connection = self._connect()
         try:
             connection.execute("BEGIN IMMEDIATE")
+            if owner is not None:
+                cursor = connection.execute(
+                    "UPDATE backfill_runs SET updated_at = ? "
+                    "WHERE run_id = ? AND status = 'RUNNING' AND owner = ?",
+                    (resolved_at, row.run_id, owner),
+                )
+                if cursor.rowcount == 0:
+                    connection.rollback()
+                    raise LeaseLostError()
             for entry in entries:
                 self._insert_part_manifest(connection, entry)
+            if replace_date:
+                paths = [entry.path for entry in entries]
+                if paths:
+                    placeholders = ", ".join("?" for _ in paths)
+                    connection.execute(
+                        f"DELETE FROM manifest WHERE symbol = ? AND date = ? "
+                        f"AND path NOT IN ({placeholders})",
+                        (row.symbol, row.date, *paths),
+                    )
+                else:
+                    connection.execute(
+                        "DELETE FROM manifest WHERE symbol = ? AND date = ?",
+                        (row.symbol, row.date),
+                    )
             self._resolve_gaps_for_day(
                 connection,
                 symbol=row.symbol,
@@ -1152,21 +1183,42 @@ class SqliteStore:
         file_key: str,
         entries: tuple[ManifestEntry, ...],
         error_code: str,
+        owner: str | None = None,
+        run_id: str | None = None,
     ) -> None:
         """Downgrade a published COMPLETE row and drop its part rows before cleanup."""
         connection = self._connect()
         try:
             connection.execute("BEGIN IMMEDIATE")
+            if owner is not None and run_id is not None:
+                cursor = connection.execute(
+                    "UPDATE backfill_runs SET updated_at = ? "
+                    "WHERE run_id = ? AND status = 'RUNNING' AND owner = ?",
+                    (utc_timestamp(datetime.now(UTC)), run_id, owner),
+                )
+                if cursor.rowcount == 0:
+                    connection.rollback()
+                    raise LeaseLostError()
             for entry in entries:
                 connection.execute("DELETE FROM manifest WHERE path = ?", (entry.path,))
-            connection.execute(
-                """
-                UPDATE backfill_manifest SET
-                    status = 'FAILED', checksum_verified = 0, error_code = ?
-                WHERE file_key = ? AND status = 'COMPLETE'
-                """,
-                (error_code, file_key),
-            )
+            if run_id is None:
+                connection.execute(
+                    """
+                    UPDATE backfill_manifest SET
+                        status = 'FAILED', checksum_verified = 0, error_code = ?
+                    WHERE file_key = ? AND status = 'COMPLETE'
+                    """,
+                    (error_code, file_key),
+                )
+            else:
+                connection.execute(
+                    """
+                    UPDATE backfill_manifest SET
+                        status = 'FAILED', checksum_verified = 0, error_code = ?
+                    WHERE file_key = ? AND run_id = ? AND status = 'COMPLETE'
+                    """,
+                    (error_code, file_key, run_id),
+                )
             connection.commit()
         except sqlite3.Error as exc:
             connection.rollback()
