@@ -591,7 +591,16 @@ class MetricService:
                 )
             )
         computed_at = utc_timestamp(self._clock.now())
-        gaps = self._store.list_data_gaps(symbol=request.symbol, data_type="aggTrades")
+        start_day = request.window_start.astimezone(UTC).date().isoformat()
+        last_day = (
+            (request.window_end - timedelta(microseconds=1)).astimezone(UTC).date().isoformat()
+        )
+        gaps = self._store.list_data_gaps(
+            symbol=request.symbol,
+            data_type="aggTrades",
+            start=start_day,
+            end=last_day,
+        )
         payload = _document_payload(
             settings=self._settings,
             request=request,

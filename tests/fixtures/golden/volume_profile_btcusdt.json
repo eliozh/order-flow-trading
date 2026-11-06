@@ -1,6 +1,6 @@
 {
   "input_manifest_hash": "8e14b5c1930b7607e568f65c3f53c895874774866cd044f15762f3ec0b93c0dc",
-  "metric_version": "orderflow_metrics.v1.801bf086c70213df",
+  "metric_version": "orderflow_metrics.v1.10ec812f75851aa2",
   "period": "4h",
   "symbol": "BTCUSDT",
   "volume_profile": {

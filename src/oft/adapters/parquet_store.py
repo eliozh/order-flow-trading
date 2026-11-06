@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import hashlib
+import json
 import os
 import re
 import uuid
@@ -106,6 +107,9 @@ def read_metrics(
         from oft.adapters.sqlite_store import SqliteStore
 
         store = SqliteStore(settings)
+    store_path = getattr(store, "path", None)
+    if store_path is not None and not Path(store_path).exists():
+        raise StoreUnavailableError("manifest database is unreadable")
     registered = {
         entry.path
         for entry in store.list_manifest()
@@ -133,56 +137,83 @@ def read_metrics(
         for extra in filters[1:]:
             filter_expr = filter_expr & extra
 
+    def content_digest(rows: list[dict[str, object]]) -> str:
+        payload = [
+            {key: value for key, value in sorted(row.items()) if key != "computed_at"}
+            for row in rows
+        ]
+        return hashlib.sha256(
+            json.dumps(payload, sort_keys=True, default=str).encode("utf-8")
+        ).hexdigest()
+
+    candidates: dict[tuple[object, ...], list[dict[str, object]]] = {}
     try:
-        table = dataset.dataset([str(path) for path in parts], format="parquet").to_table(
-            filter=filter_expr
-        )
-    except (OSError, ValueError, pa.ArrowException) as exc:
-        raise StoreUnavailableError(f"cannot read metrics parts for {symbol}: {exc}") from exc
-    rows = cast("list[dict[str, object]]", table.to_pylist())
-
-    # A logical document (version + symbol + period + full window) must be read
-    # from exactly one run/provenance set. Mixing COMPLETE and PARTIAL runs
-    # would produce inconsistent quality stamps and CVD sequences.
-    document_runs: dict[tuple[object, ...], dict[str, list[dict[str, object]]]] = {}
-    for row in rows:
-        document_key = (
-            row.get("metric_version"),
-            row.get("symbol"),
-            row.get("period"),
-            row.get("window_start"),
-            row.get("window_end"),
-        )
-        run_key = str(row.get("input_manifest_hash") or "")
-        document_runs.setdefault(document_key, {}).setdefault(run_key, []).append(row)
-
-    selected: list[dict[str, object]] = []
-    for doc_key, runs in document_runs.items():
-        scored: list[tuple[tuple[int, str, str], str]] = []
-        for run_key, run_rows in runs.items():
+        for path in parts:
+            table = dataset.dataset([str(path)], format="parquet").to_table(filter=filter_expr)
+            part_rows = cast("list[dict[str, object]]", table.to_pylist())
+            if not part_rows:
+                continue
+            document_key = (
+                part_rows[0].get("metric_version"),
+                part_rows[0].get("symbol"),
+                part_rows[0].get("period"),
+                part_rows[0].get("window_start"),
+                part_rows[0].get("window_end"),
+            )
             quality = next(
                 (
                     str(item.get("data_quality"))
-                    for item in run_rows
+                    for item in part_rows
                     if item.get("data_quality") is not None
                 ),
                 "",
             )
-            complete_rank = {"COMPLETE": 2, "PARTIAL": 1, "MISSING": 0}.get(quality, 0)
-            latest = max(str(item.get("computed_at") or "") for item in run_rows)
-            scored.append(((complete_rank, latest, run_key), run_key))
-        chosen_run = max(scored)[1]
-        discarded = [key for key in runs if key != chosen_run]
+            candidates.setdefault(document_key, []).append(
+                {
+                    "path": str(path),
+                    "rows": part_rows,
+                    "rank": {"COMPLETE": 2, "PARTIAL": 1, "MISSING": 0}.get(quality, 0),
+                    "computed": max(str(item.get("computed_at") or "") for item in part_rows),
+                    "hash": content_digest(part_rows),
+                }
+            )
+    except (OSError, ValueError, pa.ArrowException) as exc:
+        raise StoreUnavailableError(f"cannot read metrics parts for {symbol}: {exc}") from exc
+
+    # One part per logical document. Only an exact tie on quality + computed_at
+    # with different content is ambiguous and therefore an explicit error.
+    selected: list[dict[str, object]] = []
+    for doc_key, options in candidates.items():
+        best = max(
+            options,
+            key=lambda option: (
+                cast("int", option["rank"]),
+                str(option["computed"]),
+                str(option["hash"]),
+            ),
+        )
+        for other in options:
+            if other is best:
+                continue
+            if (
+                other["rank"] == best["rank"]
+                and other["computed"] == best["computed"]
+                and other["hash"] != best["hash"]
+            ):
+                raise ValueError(
+                    f"conflicting metrics parts for {doc_key}: {best['path']} vs {other['path']}"
+                )
+        discarded = [str(option["path"]) for option in options if option is not best]
         if discarded:
             structlog.get_logger(__name__).warning(
                 "metrics_run_selected",
-                selected_run=chosen_run,
+                selected_run=best["path"],
                 discarded_runs=discarded,
                 metric_version=doc_key[0],
                 window_start=str(doc_key[3]),
                 window_end=str(doc_key[4]),
             )
-        selected.extend(runs[chosen_run])
+        selected.extend(cast("list[dict[str, object]]", best["rows"]))
     rows = selected
 
     def _price_key(value: object) -> Decimal:
@@ -293,7 +324,14 @@ def _publish_table(
         with temp_path.open("rb") as handle:
             os.fsync(handle.fileno())
         checksum = hashlib.sha256(temp_path.read_bytes()).hexdigest()
-        os.replace(temp_path, final_path)
+        try:
+            os.link(temp_path, final_path)
+        except FileExistsError:
+            existing = hashlib.sha256(final_path.read_bytes()).hexdigest()
+            if existing != checksum:
+                raise StoreUnavailableError(
+                    f"metrics part changed concurrently: {final_path.name}"
+                ) from None
         _fsync_dir(directory)
     finally:
         if temp_path.exists():
@@ -354,10 +392,14 @@ def recover_orphan_metric_parts(
         try:
             rows = pq.ParquetFile(path).metadata.num_rows
             checksum = hashlib.sha256(path.read_bytes()).hexdigest()
-        except (OSError, ValueError) as exc:
+            first = pq.read_table(path).slice(0, 1).to_pylist()
+        except (OSError, ValueError, pa.ArrowException) as exc:
             raise StoreUnavailableError(
                 f"cannot reconcile orphan metrics part {path}: {exc}"
             ) from exc
+        record = first[0] if first else {}
+        window_start = record.get("window_start")
+        window_end = record.get("window_end")
         recovered.append(
             ManifestEntry(
                 path=str(path),
@@ -369,6 +411,18 @@ def recover_orphan_metric_parts(
                 checksum=checksum,
                 source=f"metrics:{version}",
                 created_at=now,
+                metric_version=str(record.get("metric_version") or version),
+                input_manifest_hash=(
+                    str(record["input_manifest_hash"])
+                    if record.get("input_manifest_hash") is not None
+                    else None
+                ),
+                window_start=(
+                    utc_timestamp(window_start) if isinstance(window_start, datetime) else None
+                ),
+                window_end=(
+                    utc_timestamp(window_end) if isinstance(window_end, datetime) else None
+                ),
             )
         )
     return tuple(recovered)

@@ -524,7 +524,7 @@ def test_duplicate_parts_are_deduped_with_a_warning(tmp_path: Path) -> None:
         )
 
     assert len(rows) == 28
-    assert any(entry["event"] == "metrics_duplicate_logical_row" for entry in logs)
+    assert any(entry["event"] == "metrics_run_selected" for entry in logs)
 
 
 def test_metric_version_includes_the_algorithm_source_digest(
@@ -662,31 +662,29 @@ def test_read_selects_one_run_and_ignores_partial_for_the_same_window(
         "window_end": WINDOW_END,
         "metric_version": document.metric_version,
     }
-    harness.store.upsert_manifest_entry(
-        harness.parquet.write_metrics_part(
-            document.rows,
-            input_manifest_hash="c" * 64,
-            computed_at="2026-11-06T12:00:00.000Z",
-            data_quality="COMPLETE",
-            quality_reasons=(),
-            **common,
-        )
+    complete_entry = harness.parquet.write_metrics_part(
+        document.rows,
+        input_manifest_hash="c" * 64,
+        computed_at="2026-11-06T12:00:00.000Z",
+        data_quality="COMPLETE",
+        quality_reasons=(),
+        **common,
     )
+    harness.store.upsert_manifest_entry(complete_entry)
     partial_rows = tuple(
         row
         for row in document.rows
         if not (row.record_type == "CVD_BAR" and row.bar_start == WINDOW_START)
     )
-    harness.store.upsert_manifest_entry(
-        harness.parquet.write_metrics_part(
-            partial_rows,
-            input_manifest_hash="d" * 64,
-            computed_at="2026-11-06T13:00:00.000Z",  # later, but PARTIAL loses
-            data_quality="PARTIAL",
-            quality_reasons=("missing agg_trades part 2026-10-04",),
-            **common,
-        )
+    partial_entry = harness.parquet.write_metrics_part(
+        partial_rows,
+        input_manifest_hash="d" * 64,
+        computed_at="2026-11-06T13:00:00.000Z",  # later, but PARTIAL loses
+        data_quality="PARTIAL",
+        quality_reasons=("missing agg_trades part 2026-10-04",),
+        **common,
     )
+    harness.store.upsert_manifest_entry(partial_entry)
 
     with structlog.testing.capture_logs() as logs:
         rows = read_metrics(
@@ -705,8 +703,8 @@ def test_read_selects_one_run_and_ignores_partial_for_the_same_window(
     ]
     selected = [event for event in logs if event["event"] == "metrics_run_selected"]
     assert selected
-    assert selected[0]["selected_run"] == "c" * 64
-    assert "d" * 64 in selected[0]["discarded_runs"]
+    assert selected[0]["selected_run"] == complete_entry.path
+    assert partial_entry.path in selected[0]["discarded_runs"]
 
 
 def test_read_prefers_the_latest_complete_run_on_a_provenance_tiebreak(
@@ -870,7 +868,7 @@ def test_conflicting_rows_in_one_run_raise_instead_of_silently_dropping(
             metric_version=first.document.metric_version,
             input_manifest_hash=first.document.input_manifest_hash,
             computed_at=first.document.computed_at,
-            data_quality="COMPLETE",
+            data_quality=first.document.quality.data_quality.value,
             quality_reasons=(),
         )
     )
@@ -1055,3 +1053,87 @@ def test_unregistered_part_does_not_shadow_a_published_run(tmp_path: Path) -> No
 
     assert len(rows) == 28
     assert {row["input_manifest_hash"] for row in rows} == {published.document.input_manifest_hash}
+
+
+def test_same_input_hash_but_different_quality_inputs_does_not_conflict(
+    tmp_path: Path,
+) -> None:
+    harness = _harness(tmp_path)
+    document = harness.service.compute(_request())
+    common = {
+        "symbol": "BTCUSDT",
+        "period": "4h",
+        "window_start": WINDOW_START,
+        "window_end": WINDOW_END,
+        "metric_version": document.metric_version,
+        "input_manifest_hash": document.input_manifest_hash,
+        "data_quality": "PARTIAL",
+    }
+    harness.store.upsert_manifest_entry(
+        harness.parquet.write_metrics_part(
+            document.rows,
+            computed_at="2026-11-06T12:00:00.000Z",
+            quality_reasons=("kline fixture clean",),
+            **common,
+        )
+    )
+    harness.store.upsert_manifest_entry(
+        harness.parquet.write_metrics_part(
+            document.rows,
+            computed_at="2026-11-06T13:00:00.000Z",
+            quality_reasons=("missing kline cross-check input for period 4h",),
+            **common,
+        )
+    )
+
+    rows = read_metrics(
+        harness.settings,
+        symbol="BTCUSDT",
+        period="4h",
+        metric_version=document.metric_version,
+        store=harness.store,
+    )
+
+    assert len(rows) == 28  # one part selected, no permanent conflict
+    assert {row["quality_reasons"][0] for row in rows} == {
+        "missing kline cross-check input for period 4h"
+    }
+
+
+def test_gaps_are_filtered_to_the_request_window(tmp_path: Path) -> None:
+    from oft.domain.data_quality import DataGap, GapSeverity
+
+    harness = _harness(tmp_path)
+    harness.store.upsert_data_gap(
+        DataGap(
+            gap_id="GAP-BTCUSDT-aggTrades-2026-11-30",
+            symbol="BTCUSDT",
+            data_type="aggTrades",
+            start="2026-11-30T00:00:00.000Z",
+            end="2026-11-30T23:59:59.999Z",
+            reason="ARCHIVE_FILE_MISSING",
+            severity=GapSeverity.CRITICAL,
+            detected_at="2026-11-06T12:00:00.000Z",
+            source="BACKFILL",
+        )
+    )
+
+    document = harness.service.compute(_request())
+
+    assert document.to_dict()["gaps"] == []
+
+
+def test_read_metrics_requires_a_readable_manifest_database(tmp_path: Path) -> None:
+    from oft.config import Settings as _Settings
+    from oft.ports.store import StoreUnavailableError
+
+    settings = _Settings(env="test", port=8765, data_dir=tmp_path / "data")
+    settings.data_dir.mkdir(parents=True)
+
+    with pytest.raises(StoreUnavailableError):
+        read_metrics(
+            settings,
+            symbol="BTCUSDT",
+            period="4h",
+            metric_version="orderflow_metrics.v1.801bf086c70213df",
+        )

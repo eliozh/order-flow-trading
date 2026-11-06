@@ -731,13 +731,18 @@ class SqliteStore:
             clauses.append("date = ?")
             params.append(date)
         where = f" WHERE {' AND '.join(clauses)}" if clauses else ""
-        connection = self._connect_read_only()
+        try:
+            connection = self._connect_read_only()
+        except sqlite3.Error as exc:
+            raise StoreUnavailableError(f"manifest database is unreadable: {exc}") from exc
         if connection is None:
             return ()
         try:
             rows = connection.execute(
                 f"SELECT * FROM manifest{where} ORDER BY created_at, path", params
             ).fetchall()
+        except sqlite3.Error as exc:
+            raise StoreUnavailableError(f"manifest read failed: {exc}") from exc
         finally:
             connection.close()
         return tuple(_row_to_manifest(row) for row in rows)
