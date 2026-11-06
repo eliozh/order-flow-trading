@@ -27,6 +27,6 @@
     "total_long_notional": "81600.00000000",
     "total_short_notional": "96000.00000000"
   },
-  "metric_version": "orderflow_metrics.v1.a5f1756b83629ccf",
+  "metric_version": "orderflow_metrics.v1.d99ac42fd01dd47b",
   "symbol": "BTCUSDT"
 }

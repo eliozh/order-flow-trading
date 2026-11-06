@@ -36,6 +36,7 @@ from oft.config import Settings
 from oft.domain.events import AggTrade
 from oft.domain.metrics.funding import FundingSample, compute_funding
 from oft.domain.metrics.liquidations import (
+    LiquidationEvent,
     LiquidationRecorder,
     compute_liquidations,
     load_liquidation_events,
@@ -248,7 +249,8 @@ def test_btcusdt_complete_document_has_all_six_groups_and_validates(
 
     _validate(validator, payload)
     assert payload["symbol"] == "BTCUSDT"
-    assert payload["data_quality"] == "COMPLETE"
+    assert payload["data_quality"] == "PARTIAL"
+    assert "span" in " ".join(payload["quality_reasons"])
     assert payload["open_interest"]["sampling"] == "REGULAR"
     assert payload["open_interest"]["delta_over_window"] == "20.0"
     assert payload["funding"]["current_rate"] == "0.00030000"
@@ -614,3 +616,132 @@ def test_persisted_part_bytes_are_stable(tmp_path: Path) -> None:
         persisted.footprint_entry.checksum
         == hashlib.sha256(Path(persisted.footprint_entry.path).read_bytes()).hexdigest()
     )
+
+
+def test_metric_request_rejects_naive_or_inverted_windows(tmp_path: Path) -> None:
+    from oft.application.metric_service import MetricRequest
+
+    with pytest.raises(ValueError, match="timezone"):
+        MetricRequest(
+            symbol="BTCUSDT",
+            period="4h",
+            window_start=datetime(2026, 10, 1),
+            window_end=datetime(2026, 10, 2),
+            tick_size=Decimal("0.10"),
+        )
+    with pytest.raises(ValueError, match="after"):
+        MetricRequest(
+            symbol="BTCUSDT",
+            period="4h",
+            window_start=WINDOW_START,
+            window_end=WINDOW_START,
+            tick_size=Decimal("0.10"),
+        )
+
+
+def _liq_event(quantity: str, *, seq: int | None = None) -> LiquidationEvent:
+    received = NOW + timedelta(minutes=1)
+    return LiquidationEvent(
+        received_at=received,
+        trade_time=received,
+        symbol="BTCUSDT",
+        side="SELL",
+        price=Decimal("100.00"),
+        average_price=Decimal("100.00"),
+        quantity=Decimal(quantity),
+        source_seq=seq,
+    )
+
+
+def test_read_liquidations_dedupes_on_original_quantity_column(tmp_path: Path) -> None:
+    harness = _harness(tmp_path, backfill=False)
+    version = orderflow_metric_version(
+        period="4h",
+        unit="BASE",
+        tick_size=Decimal("0.10"),
+        value_area_pct=Decimal("70"),
+        bin_size_multiple=1,
+    ).identifier
+    events = (_liq_event("1"), _liq_event("5"))  # both source_seq=None
+
+    harness.service.persist_liquidation_events(
+        events,
+        symbol="BTCUSDT",
+        window_start=NOW,
+        window_end=NOW + timedelta(hours=1),
+        metric_version=version,
+    )
+    rows = read_liquidations(
+        harness.settings, symbol="BTCUSDT", metric_version=version, store=harness.store
+    )
+
+    assert len(rows) == 2
+    assert {row["original_quantity"] for row in rows} == {"1", "5"}
+
+
+def test_liquidation_part_identity_is_order_independent(tmp_path: Path) -> None:
+    harness = _harness(tmp_path, backfill=False)
+    version = orderflow_metric_version(
+        period="4h",
+        unit="BASE",
+        tick_size=Decimal("0.10"),
+        value_area_pct=Decimal("70"),
+        bin_size_multiple=1,
+    ).identifier
+    events = [_liq_event("1", seq=2), _liq_event("5", seq=1)]
+    common = {
+        "symbol": "BTCUSDT",
+        "window_start": NOW,
+        "window_end": NOW + timedelta(hours=1),
+        "metric_version": version,
+        "input_manifest_hash": "a" * 64,
+        "computed_at": "2026-11-06T12:00:00.000Z",
+        "data_quality": "COMPLETE",
+        "quality_reasons": (),
+    }
+    first = harness.parquet.write_liquidation_part(events, **common)
+    second = harness.parquet.write_liquidation_part(list(reversed(events)), **common)
+
+    assert first.path == second.path
+
+
+def test_input_hash_treats_empty_metric_inputs_like_none(tmp_path: Path) -> None:
+    harness = _harness(tmp_path)
+    without = harness.service.compute(_request())
+    with_empty = harness.service.compute(_request(), inputs=MetricInputs())
+
+    assert without.input_manifest_hash == with_empty.input_manifest_hash
+
+
+def test_write_liquidation_part_validates_before_creating_directories(
+    tmp_path: Path,
+) -> None:
+    harness = _harness(tmp_path, backfill=False)
+    event = _liq_event("1")
+
+    with pytest.raises(ValueError, match="timezone"):
+        harness.parquet.write_liquidation_part(
+            (event,),
+            symbol="BTCUSDT",
+            window_start=datetime(2026, 10, 1),
+            window_end=datetime(2026, 10, 2),
+            metric_version="x",
+            input_manifest_hash="a" * 64,
+            computed_at="2026-11-06T12:00:00.000Z",
+            data_quality="COMPLETE",
+            quality_reasons=(),
+        )
+    assert not list((harness.settings.data_dir / "liquidations").rglob("*.parquet"))
+
+    with pytest.raises(ValueError, match="symbol"):
+        harness.parquet.write_liquidation_part(
+            (event,),
+            symbol="ETHUSDT",
+            window_start=NOW,
+            window_end=NOW + timedelta(hours=1),
+            metric_version="x",
+            input_manifest_hash="a" * 64,
+            computed_at="2026-11-06T12:00:00.000Z",
+            data_quality="COMPLETE",
+            quality_reasons=(),
+        )

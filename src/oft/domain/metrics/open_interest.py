@@ -92,6 +92,12 @@ def _validate_sample(sample: OpenInterestSample) -> None:
         raise ValueError("open_interest must be a finite non-negative decimal")
     if not sample.open_interest_value.is_finite() or sample.open_interest_value < 0:
         raise ValueError("open_interest_value must be a finite non-negative decimal")
+    for name, value in (
+        ("long_short_ratio", sample.long_short_ratio),
+        ("taker_ratio", sample.taker_ratio),
+    ):
+        if value is not None and (not value.is_finite() or value < 0):
+            raise ValueError(f"{name} must be a finite non-negative decimal")
 
 
 def _point(
@@ -173,19 +179,32 @@ def compute_open_interest(
     first = selected[0]
     last = selected[-1]
     delta = last.open_interest - first.open_interest
+    spans_window = (
+        first.ts == window_start
+        and last.ts + target_interval >= window_end
+        and last.ts < window_end
+    )
     if regular:
         points = tuple(_point(sample, estimated=False) for sample in selected)
-        quality = MetricQuality.complete()
+        if spans_window:
+            quality = MetricQuality.complete()
+        else:
+            quality = MetricQuality.partial(
+                ("open_interest samples do not span the requested window",)
+            )
         sampling: Sampling = "REGULAR"
     else:
         points = _resampled_points(selected, target_interval)
         minutes = int(target_interval.total_seconds() // 60)
+        reasons = [
+            "open_interest source timestamps are irregular; "
+            f"resampled to {minutes}m and ESTIMATED (not measured)"
+        ]
+        if not spans_window:
+            reasons.append("open_interest samples do not span the requested window")
         quality = MetricQuality(
             data_quality=DataQuality.ESTIMATED,
-            quality_reasons=(
-                "open_interest source timestamps are irregular; "
-                f"resampled to {minutes}m and ESTIMATED (not measured)",
-            ),
+            quality_reasons=tuple(reasons),
         )
         sampling = "IRREGULAR_RESAMPLED"
 

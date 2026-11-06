@@ -20,7 +20,7 @@ import structlog
 from oft.config import Settings
 from oft.domain.events import AggTrade
 from oft.domain.metrics.footprint import FootprintResult
-from oft.domain.metrics.liquidations import LiquidationEvent
+from oft.domain.metrics.liquidations import LiquidationEvent, liquidation_sort_key
 from oft.domain.metrics.types import MetricRow, decimal_str
 from oft.domain.time import utc_timestamp
 from oft.ports.store import ManifestEntry, StorePort, StoreUnavailableError
@@ -413,8 +413,18 @@ def read_liquidations(
             row.get("side"),
             row.get("source_seq"),
             row.get("price"),
+            _first_present(row, "original_quantity", "quantity"),
+            row.get("average_price"),
+            row.get("last_fill_quantity"),
         ),
     )
+
+
+def _first_present(row: dict[str, object], *names: str) -> object:
+    for name in names:
+        if name in row and row[name] is not None:
+            return row[name]
+    return None
 
 
 def _unique_rows(
@@ -919,6 +929,17 @@ class ParquetStore:
         quality_reasons: tuple[str, ...],
     ) -> ManifestEntry:
         """Publish one immutable liquidation event part (ADR-0002 layout)."""
+        if window_start.tzinfo is None or window_end.tzinfo is None:
+            raise ValueError("liquidation window bounds must be timezone-aware")
+        if window_end <= window_start:
+            raise ValueError("window_end must be after window_start")
+        ordered_events = sorted(events, key=liquidation_sort_key)
+        for event in ordered_events:
+            if event.symbol != symbol:
+                raise ValueError(f"liquidation symbol {event.symbol!r} does not match {symbol!r}")
+            if not (window_start <= event.received_at < window_end):
+                raise ValueError("liquidation event is outside the requested window")
+        events = ordered_events
         directory = (
             liquidations_root(self._settings, symbol=symbol, metric_version=metric_version)
             / f"date={window_start.astimezone(UTC).date().isoformat()}"

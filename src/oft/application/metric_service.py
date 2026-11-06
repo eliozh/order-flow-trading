@@ -244,6 +244,10 @@ class MetricRequest:
     def __post_init__(self) -> None:
         if _SYMBOL_PATTERN.fullmatch(self.symbol) is None:
             raise ValueError("symbol must match ^[A-Z0-9]{2,24}$")
+        if self.window_start.tzinfo is None or self.window_end.tzinfo is None:
+            raise ValueError("window bounds must be timezone-aware")
+        if self.window_end <= self.window_start:
+            raise ValueError("window_end must be after window_start")
         if not isinstance(self.tick_size, Decimal):
             raise TypeError("tick_size must be a Decimal")
         if not isinstance(self.value_area_pct, Decimal):
@@ -316,7 +320,10 @@ def input_manifest_hash(
                 f"{_epoch_millis(trade.transact_time)}|{int(trade.is_buyer_maker)}\n"
             ).encode()
         )
-    if inputs is not None:
+    if inputs is not None and any(
+        section is not None
+        for section in (inputs.open_interest, inputs.funding, inputs.liquidations)
+    ):
         digest.update(b"\0inputs\0")
         digest.update(
             contract_json(
@@ -867,8 +874,7 @@ class MetricService:
                 quality_reasons=document.quality.quality_reasons,
             )
             entries.append(footprint_entry)
-            for entry in entries:
-                self._store.upsert_manifest_entry(entry)
+            self._store.upsert_manifest_entries(tuple(entries))
         except Exception:
             self._cleanup_unreferenced(entries)
             raise
@@ -890,6 +896,15 @@ class MetricService:
         quality_reasons: tuple[str, ...] = (),
     ) -> ManifestEntry:
         """Publish a content-addressed liquidation event part and manifest row."""
+        if window_start.tzinfo is None or window_end.tzinfo is None:
+            raise ValueError("window bounds must be timezone-aware")
+        if window_end <= window_start:
+            raise ValueError("window_end must be after window_start")
+        for event in events:
+            if event.symbol != symbol:
+                raise ValueError(f"liquidation symbol {event.symbol!r} does not match {symbol!r}")
+            if not (window_start <= event.received_at < window_end):
+                raise ValueError("liquidation event is outside the requested window")
         computed_at = utc_timestamp(self._clock.now())
         entry = self._parquet.write_liquidation_part(
             events,

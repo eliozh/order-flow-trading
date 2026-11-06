@@ -10,7 +10,6 @@ from __future__ import annotations
 
 import csv
 import re
-from collections.abc import Sequence
 from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
 from decimal import Decimal, InvalidOperation
@@ -201,6 +200,3 @@ class OiFundingService:
 
     def funding(self, *, as_of: datetime) -> FundingResult:
         return compute_funding(self._data.funding, as_of=as_of)
-
-    def samples(self) -> Sequence[OpenInterestSample]:
-        return self._data.open_interest

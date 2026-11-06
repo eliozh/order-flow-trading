@@ -52,7 +52,8 @@ def test_regular_five_minute_sampling_is_measured_and_keeps_the_delta() -> None:
     result = _compute(samples)
 
     assert result.sampling == "REGULAR"
-    assert result.quality.data_quality == DataQuality.COMPLETE
+    assert result.quality.data_quality == DataQuality.PARTIAL
+    assert "span" in " ".join(result.quality.quality_reasons)
     assert result.delta_over_window == Decimal("2.0")
     assert len(result.points) == 3
     assert [point.ts for point in result.points] == [
@@ -123,7 +124,8 @@ def test_regular_sampling_accepts_a_single_measured_point() -> None:
     result = _compute((_sample(0, "100.0"),))
 
     assert result.sampling == "REGULAR"
-    assert result.quality.data_quality == DataQuality.COMPLETE
+    assert result.quality.data_quality == DataQuality.PARTIAL
+    assert "span" in " ".join(result.quality.quality_reasons)
     assert result.delta_over_window == Decimal("0")
     assert result.last is not None
     assert result.last.open_interest == Decimal("100.0")
@@ -193,3 +195,18 @@ def test_oi_funding_service_rejects_missing_and_malformed_fixtures(tmp_path: Pat
     malformed.write_text("symbol,record_type\n", encoding="utf-8")
     with pytest.raises(ValueError, match="missing columns"):
         load_metrics_fixture(malformed)
+
+
+def test_regular_sampling_complete_only_when_samples_span_the_window() -> None:
+    samples = tuple(_sample(minute, "100.0") for minute in range(0, 4 * 60, 5))
+
+    result = _compute(samples)
+
+    assert result.sampling == "REGULAR"
+    assert result.quality.data_quality == DataQuality.COMPLETE
+    assert result.quality.quality_reasons == ()
+
+
+def test_negative_optional_ratio_is_rejected() -> None:
+    with pytest.raises(ValueError, match="long_short_ratio"):
+        _compute((_sample(0, "100.0", long_short_ratio="-1"),))

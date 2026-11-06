@@ -146,6 +146,48 @@ class LiquidationResult:
         }
 
 
+def liquidation_sort_key(event: LiquidationEvent) -> tuple[object, ...]:
+    """Canonical event order shared by hashing and part publication."""
+    return (
+        event.received_at,
+        event.trade_time,
+        event.source_seq if event.source_seq is not None else -1,
+        event.side,
+        event.price,
+        event.quantity,
+        event.last_fill_quantity if event.last_fill_quantity is not None else Decimal("0"),
+    )
+
+
+def _event_key(event: LiquidationEvent) -> tuple[object, ...]:
+    """Deduplication identity: source sequence when present, else full event."""
+    if event.source_seq is not None:
+        return ("seq", event.source_seq)
+    return (
+        "event",
+        event.received_at,
+        event.trade_time,
+        event.symbol,
+        event.side,
+        event.price,
+        event.average_price,
+        event.quantity,
+        event.last_fill_quantity,
+    )
+
+
+def _dedupe_events(events: Sequence[LiquidationEvent]) -> list[LiquidationEvent]:
+    seen: set[tuple[object, ...]] = set()
+    unique: list[LiquidationEvent] = []
+    for event in events:
+        key = _event_key(event)
+        if key in seen:
+            continue
+        seen.add(key)
+        unique.append(event)
+    return unique
+
+
 def compute_liquidations(
     events: Sequence[LiquidationEvent],
     *,
@@ -173,6 +215,8 @@ def compute_liquidations(
     if coverage_start is not None and coverage_start.tzinfo is None:
         raise ValueError("coverage_start must be timezone-aware")
 
+    events = tuple(_dedupe_events(events))
+
     if coverage_start is None:
         if events:
             raise ValueError("coverage_start is required when liquidations exist")
@@ -190,6 +234,8 @@ def compute_liquidations(
     for event in events:
         if event.symbol != symbol:
             raise ValueError(f"liquidation symbol {event.symbol!r} does not match {symbol!r}")
+        if event.received_at < coverage_start:
+            raise ValueError("liquidation event predates coverage start (since deployment)")
         if window_start is not None and event.received_at < window_start:
             continue
         if window_end is not None and event.received_at >= window_end:
@@ -241,21 +287,17 @@ def liquidation_input_hash(events: Sequence[LiquidationEvent], symbol: str) -> s
     """Deterministic hash of the recorded liquidation row set."""
     digest = hashlib.sha256()
     digest.update(f"{symbol}\n".encode())
-    ordered = sorted(
-        events,
-        key=lambda event: (
-            event.received_at,
-            event.trade_time,
-            event.source_seq if event.source_seq is not None else -1,
-        ),
-    )
+    ordered = sorted(events, key=liquidation_sort_key)
     for event in ordered:
+        last_fill = (
+            decimal_str(event.last_fill_quantity) if event.last_fill_quantity is not None else ""
+        )
         digest.update(
             (
                 f"{utc_timestamp(event.received_at)}|{utc_timestamp(event.trade_time)}|"
                 f"{event.side}|{decimal_str(event.price)}|"
                 f"{decimal_str(event.average_price)}|{decimal_str(event.quantity)}|"
-                f"{event.source_seq}\n"
+                f"{last_fill}|{event.source_seq}\n"
             ).encode()
         )
     return digest.hexdigest()
@@ -347,7 +389,7 @@ def load_liquidation_events(path: Path) -> tuple[LiquidationEvent, ...]:
             )
         except (ValueError, TypeError, KeyError, json.JSONDecodeError) as exc:
             raise ValueError(f"invalid liquidation fixture row {number}: {exc}") from exc
-    return tuple(events)
+    return tuple(_dedupe_events(events))
 
 
 class LiquidationRecorder:
@@ -382,19 +424,8 @@ class LiquidationRecorder:
         return self._coverage_start
 
     def record(self, event: LiquidationEvent) -> bool:
-        """Record one event; duplicate source sequence numbers are ignored."""
-        key: object = (
-            event.source_seq
-            if event.source_seq is not None
-            else (
-                event.received_at,
-                event.trade_time,
-                event.symbol,
-                event.side,
-                event.price,
-                event.quantity,
-            )
-        )
+        """Record one event; duplicate identities are ignored."""
+        key = _event_key(event)
         if key in self._seen:
             return False
         self.start()

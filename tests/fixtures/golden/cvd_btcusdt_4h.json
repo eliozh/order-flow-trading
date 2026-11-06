@@ -75,7 +75,7 @@
     "unit": "BASE"
   },
   "input_manifest_hash": "8e14b5c1930b7607e568f65c3f53c895874774866cd044f15762f3ec0b93c0dc",
-  "metric_version": "orderflow_metrics.v1.a5f1756b83629ccf",
+  "metric_version": "orderflow_metrics.v1.d99ac42fd01dd47b",
   "period": "4h",
   "symbol": "BTCUSDT",
   "window": {

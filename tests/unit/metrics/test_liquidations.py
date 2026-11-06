@@ -263,3 +263,81 @@ def test_application_facade_opens_a_recorded_recorder(tmp_path: Path) -> None:
     assert summary.coverage_start == NOW
     assert summary.count == 1
     assert summary.total_long_notional == Decimal("48000")
+
+
+def test_none_source_seq_events_with_different_details_are_not_merged() -> None:
+    first = _event(1, "SELL", quantity="0.50")
+    second = LiquidationEvent(
+        received_at=first.received_at,
+        trade_time=first.trade_time,
+        symbol="BTCUSDT",
+        side="SELL",
+        price=Decimal("96000.00"),
+        average_price=Decimal("96000.00"),
+        quantity=Decimal("0.75"),
+        source_seq=None,
+    )
+    duplicate = LiquidationEvent(
+        received_at=first.received_at,
+        trade_time=first.trade_time,
+        symbol="BTCUSDT",
+        side="SELL",
+        price=Decimal("96000.00"),
+        average_price=Decimal("96000.00"),
+        quantity=Decimal("0.75"),
+        source_seq=None,
+    )
+
+    result = compute_liquidations((first, second, duplicate), symbol="BTCUSDT", coverage_start=NOW)
+
+    assert result.count == 2
+    assert result.total_long_notional == Decimal("120000")
+
+
+def test_events_before_coverage_start_are_rejected() -> None:
+    early = LiquidationEvent(
+        received_at=NOW - timedelta(seconds=1),
+        trade_time=NOW - timedelta(seconds=2),
+        symbol="BTCUSDT",
+        side="SELL",
+        price=Decimal("96000.00"),
+        average_price=Decimal("96000.00"),
+        quantity=Decimal("0.50"),
+        source_seq=1,
+    )
+
+    with pytest.raises(ValueError, match="coverage start"):
+        compute_liquidations((early,), symbol="BTCUSDT", coverage_start=NOW)
+
+
+def test_persist_rejects_wrong_symbol_before_writing() -> None:
+    from oft.application.metric_service import MetricService
+    from oft.config import Settings
+
+    writes: list[object] = []
+
+    class _FakeParquet:
+        def write_liquidation_part(self, *args: object, **kwargs: object) -> object:
+            writes.append((args, kwargs))
+            raise AssertionError("must not write")
+
+    class _FakeStore:
+        pass
+
+    service = MetricService(
+        settings=Settings(env="test", port=8765, data_dir=Path("/tmp/oft-unused")),
+        store=_FakeStore(),  # type: ignore[arg-type]
+        parquet=_FakeParquet(),  # type: ignore[arg-type]
+        clock=FixedClock(NOW),
+    )
+    event = _event(1, "SELL")
+
+    with pytest.raises(ValueError, match="symbol"):
+        service.persist_liquidation_events(
+            (event,),
+            symbol="ETHUSDT",
+            window_start=NOW,
+            window_end=NOW + timedelta(hours=1),
+            metric_version="orderflow_metrics.v1.aca82a5196e7e4cc",
+        )
+    assert writes == []
