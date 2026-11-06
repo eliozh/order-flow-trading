@@ -5,6 +5,7 @@ from __future__ import annotations
 from dataclasses import dataclass
 from typing import Protocol
 
+from oft.domain.data_quality import DataGap
 from oft.domain.symbols import SymbolContract
 
 
@@ -70,6 +71,47 @@ class ScanRecord:
     created_at: str
 
 
+@dataclass(frozen=True)
+class BackfillRunRecord:
+    """One orchestrator-visible backfill run."""
+
+    run_id: str
+    symbol: str
+    data_type: str
+    start_date: str
+    end_date: str
+    status: str
+    started_at: str
+    finished_at: str | None
+    estimated_bytes: int
+    processed_bytes: int
+    files_total: int
+    files_verified: int
+    files_failed: int
+    error_code: str | None
+    message: str | None
+
+
+@dataclass(frozen=True)
+class BackfillManifestRow:
+    """Per-file backfill state: URL, checksum, bytes, rows, status, verified_at."""
+
+    file_key: str
+    run_id: str | None
+    data_type: str
+    symbol: str
+    date: str
+    source_url: str
+    checksum: str
+    checksum_verified: bool
+    status: str
+    bytes: int
+    rows: int
+    downloaded_at: str | None
+    verified_at: str | None
+    error_code: str | None
+
+
 class StorePort(Protocol):
     """Persistence contract shared by the API and CLI diagnostics."""
 
@@ -114,3 +156,45 @@ class StorePort(Protocol):
     ) -> int: ...
 
     def get_symbol(self, symbol: str) -> SymbolContract | None: ...
+
+    # -- Backfill state --------------------------------------------------
+
+    def start_backfill_run(self, record: BackfillRunRecord) -> bool: ...
+
+    def touch_backfill_run(self, run_id: str, *, updated_at: str) -> None: ...
+
+    def save_backfill_run(self, record: BackfillRunRecord) -> None: ...
+
+    def get_backfill_run(self, run_id: str) -> BackfillRunRecord | None: ...
+
+    def latest_backfill_run(self) -> BackfillRunRecord | None: ...
+
+    def list_backfill_runs(self, limit: int = 50) -> tuple[BackfillRunRecord, ...]: ...
+
+    def upsert_backfill_manifest(self, row: BackfillManifestRow) -> None: ...
+
+    def get_backfill_manifest(self, file_key: str) -> BackfillManifestRow | None: ...
+
+    def list_backfill_manifest(
+        self,
+        *,
+        symbol: str | None = None,
+        data_type: str | None = None,
+        run_id: str | None = None,
+    ) -> tuple[BackfillManifestRow, ...]: ...
+
+    def upsert_data_gap(self, gap: DataGap) -> None: ...
+
+    def resolve_data_gaps_for_date(
+        self,
+        *,
+        symbol: str,
+        data_type: str,
+        day: str,
+        resolved_at: str,
+        resolution: str = "BACKFILL_RESOLVED",
+    ) -> None: ...
+
+    def list_data_gaps(
+        self, *, symbol: str | None = None, data_type: str | None = None
+    ) -> tuple[DataGap, ...]: ...

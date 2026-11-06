@@ -58,6 +58,7 @@ class Settings(BaseSettings):
     )
     fixtures_dir: Path = DEFAULT_FIXTURES_DIR
     exchange_info_fixture: Path = DEFAULT_EXCHANGE_INFO_FIXTURE
+    archive_fixture_dir: Path | None = None
     log_level: str = "INFO"
 
     api_token: SecretStr | None = None
@@ -80,6 +81,11 @@ class Settings(BaseSettings):
     @classmethod
     def _expand_paths(cls, value: Path) -> Path:
         return value.expanduser()
+
+    @field_validator("archive_fixture_dir")
+    @classmethod
+    def _expand_optional_path(cls, value: Path | None) -> Path | None:
+        return value.expanduser() if value is not None else None
 
     @field_validator(
         "api_token",

@@ -80,4 +80,62 @@ def test_v1_database_upgrades_to_v2_with_effective_checks(tmp_path: Path) -> Non
     finally:
         connection.close()
 
-    assert versions == {1, 2}
+    assert versions == {1, 2, 3}
+
+
+_V2_BACKFILL = """
+CREATE TABLE schema_migrations (
+    version INTEGER PRIMARY KEY,
+    applied_at TEXT NOT NULL
+);
+INSERT INTO schema_migrations (version, applied_at) VALUES (1, 't1');
+INSERT INTO schema_migrations (version, applied_at) VALUES (2, 't2');
+CREATE TABLE backfill_runs (
+    run_id TEXT PRIMARY KEY,
+    symbol TEXT NOT NULL,
+    data_type TEXT NOT NULL,
+    start_date TEXT NOT NULL,
+    end_date TEXT NOT NULL,
+    status TEXT NOT NULL,
+    started_at TEXT NOT NULL,
+    finished_at TEXT,
+    estimated_bytes INTEGER NOT NULL,
+    processed_bytes INTEGER NOT NULL,
+    files_total INTEGER NOT NULL,
+    files_verified INTEGER NOT NULL,
+    files_failed INTEGER NOT NULL,
+    error_code TEXT,
+    message TEXT
+);
+INSERT INTO backfill_runs VALUES (
+    'BF-1', 'BTCUSDT', 'aggTrades', '2026-10-01', '2026-10-07', 'RUNNING',
+    '2026-11-06T00:00:00.000Z', NULL, 0, 0, 7, 0, 0, NULL, NULL
+);
+"""
+
+
+def test_v2_database_gains_the_backfill_heartbeat_column(tmp_path: Path) -> None:
+    settings = Settings(env="test", port=8765, data_dir=tmp_path / "data")
+    settings.data_dir.mkdir(parents=True)
+    connection = sqlite3.connect(database_path(settings))
+    try:
+        connection.executescript(_V2_BACKFILL)
+        connection.commit()
+    finally:
+        connection.close()
+
+    SqliteStore(settings).initialize()
+
+    connection = sqlite3.connect(database_path(settings))
+    try:
+        columns = {row[1] for row in connection.execute("PRAGMA table_info(backfill_runs)")}
+        updated_at = connection.execute(
+            "SELECT updated_at FROM backfill_runs WHERE run_id = 'BF-1'"
+        ).fetchone()[0]
+        versions = {row[0] for row in connection.execute("SELECT version FROM schema_migrations")}
+    finally:
+        connection.close()
+
+    assert "updated_at" in columns
+    assert updated_at == "2026-11-06T00:00:00.000Z"
+    assert versions == {1, 2, 3}

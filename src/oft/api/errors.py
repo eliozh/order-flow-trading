@@ -75,6 +75,18 @@ ERROR_CATALOG: dict[str, ErrorSpec] = {
         True,
         "A scan is already running.",
     ),
+    "BACKFILL_CHECKSUM_MISMATCH": ErrorSpec(
+        502,
+        "DATA",
+        True,
+        "A downloaded archive file failed SHA256 verification.",
+    ),
+    "BACKFILL_ALREADY_RUNNING": ErrorSpec(
+        409,
+        "CONFLICT",
+        True,
+        "A backfill is already running.",
+    ),
 }
 
 

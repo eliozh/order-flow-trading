@@ -78,3 +78,12 @@ class ApiClient:
 
     def get_scan(self, scan_id: str) -> dict[str, Any]:
         return self._request("GET", f"/api/v1/scans/{scan_id}")
+
+    def create_backfill(self, payload: dict[str, Any]) -> dict[str, Any]:
+        return self._request("POST", "/api/v1/backfill", payload)
+
+    def get_backfill(self, run_id: str) -> dict[str, Any]:
+        return self._request("GET", f"/api/v1/backfill/{run_id}")
+
+    def get_latest_backfill(self) -> dict[str, Any]:
+        return self._request("GET", "/api/v1/backfill/latest")

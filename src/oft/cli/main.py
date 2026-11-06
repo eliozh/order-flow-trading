@@ -6,6 +6,7 @@ from typing import Annotated, Any
 
 import typer
 
+from oft.cli.commands.backfill import backfill_app
 from oft.cli.commands.doctor import doctor_command, emit_error
 from oft.cli.commands.open import open_command
 from oft.cli.commands.scan import scan_app
@@ -30,6 +31,7 @@ app.command(name="doctor")(doctor_command)
 app.command(name="open")(open_command)
 app.add_typer(scan_app, name="scan")
 app.add_typer(watchlist_app, name="watchlist")
+app.add_typer(backfill_app, name="backfill")
 
 _LOOPBACK_HOSTS = frozenset({"127.0.0.1", "localhost", "::1"})
 

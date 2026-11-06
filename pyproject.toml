@@ -41,7 +41,10 @@ minversion = "8.0"
 addopts = "-q"
 testpaths = ["tests"]
 pythonpath = ["src"]
-markers = ["fixture_large: tests that require externally downloaded fixtures"]
+markers = [
+  "fixture_large: tests that require externally downloaded fixtures",
+  "live_smoke: opt-in tests that hit the public archive (set OFT_LIVE_SMOKE=1)",
+]
 
 [tool.coverage.run]
 source = ["oft"]
