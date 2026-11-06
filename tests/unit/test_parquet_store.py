@@ -89,3 +89,23 @@ def test_multi_date_publish_failure_removes_already_published_parts(
         store.write_agg_trades_batch((_trade(1, 5), _trade(2, 6)), symbol="BTCUSDT", source="test")
 
     assert _parts(settings) == []
+
+
+def test_concurrent_content_addressed_write_never_overwrites_different_content(
+    tmp_path: Path,
+) -> None:
+    import pyarrow as pa
+
+    from oft.adapters.parquet_store import _publish_table
+    from oft.ports.store import StoreUnavailableError
+
+    settings = Settings(env="test", port=8765, data_dir=tmp_path / "data")
+    directory = settings.data_dir / "metrics" / "orderflow"
+    directory.mkdir(parents=True)
+    table = pa.table({"value": pa.array([1], pa.int64())})
+    existing = directory / "part-prefix-hash.parquet"
+    existing.write_bytes(b"different content")
+
+    with pytest.raises(StoreUnavailableError, match="concurrently"):
+        _publish_table(table, directory, name_prefix="prefix", stem_hash="hash")
+    assert existing.read_bytes() == b"different content"

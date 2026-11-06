@@ -27,7 +27,7 @@ from oft.ports.store import (
     SymbolUpsertResult,
 )
 
-_SCHEMA_VERSION = 5
+_SCHEMA_VERSION = 6
 STALE_RUNNING_SECONDS = 15 * 60
 _BACKFILL_RUN_STATUSES = ("RUNNING", "COMPLETE", "PARTIAL", "FAILED", "BLOCKED", "STALE")
 _BACKFILL_RUNS_DEFINITION = """
@@ -177,7 +177,11 @@ _SCHEMA_SQL = f"""
         checksum TEXT NOT NULL,
         source TEXT NOT NULL,
         created_at TEXT NOT NULL,
-        status TEXT NOT NULL
+        status TEXT NOT NULL,
+        metric_version TEXT,
+        input_manifest_hash TEXT,
+        window_start TEXT,
+        window_end TEXT
     );
     CREATE TABLE IF NOT EXISTS symbols ({_SYMBOLS_DEFINITION});
     CREATE INDEX IF NOT EXISTS symbols_contract_type ON symbols(contract_type);
@@ -337,6 +341,23 @@ def _migrate_checks_v5(connection: sqlite3.Connection) -> None:
         connection.execute("PRAGMA foreign_keys=ON")
 
 
+def _migrate_manifest_v6(connection: sqlite3.Connection) -> None:
+    """Add nullable metrics provenance columns to the manifest table."""
+    columns = {row[1] for row in connection.execute("PRAGMA table_info(manifest)")}
+    needed = ("metric_version", "input_manifest_hash", "window_start", "window_end")
+    missing = [name for name in needed if name not in columns]
+    if not missing:
+        return
+    connection.execute("BEGIN IMMEDIATE")
+    try:
+        for name in missing:
+            connection.execute(f"ALTER TABLE manifest ADD COLUMN {name} TEXT")
+        connection.execute("COMMIT")
+    except Exception:
+        connection.execute("ROLLBACK")
+        raise
+
+
 def initialize_database(settings: Settings) -> None:
     """Create the data directory and the walking-skeleton schema."""
     settings.data_dir.mkdir(parents=True, exist_ok=True)
@@ -356,6 +377,8 @@ def initialize_database(settings: Settings) -> None:
             _table_exists(connection, "backfill_manifest") or _table_exists(connection, "data_gaps")
         ):
             _migrate_checks_v5(connection)
+        if _schema_version(connection) < 6 and _table_exists(connection, "manifest"):
+            _migrate_manifest_v6(connection)
         with connection:
             connection.executescript(_SCHEMA_SQL)
             connection.execute(
@@ -373,6 +396,10 @@ def initialize_database(settings: Settings) -> None:
             connection.execute(
                 "INSERT OR IGNORE INTO schema_migrations (version, applied_at) VALUES (?, ?)",
                 (4, "2026-11-06T16:00:00.000Z"),
+            )
+            connection.execute(
+                "INSERT OR IGNORE INTO schema_migrations (version, applied_at) VALUES (?, ?)",
+                (5, "2026-11-06T17:00:00.000Z"),
             )
             connection.execute(
                 "INSERT OR IGNORE INTO schema_migrations (version, applied_at) VALUES (?, ?)",
@@ -421,6 +448,10 @@ def _row_to_manifest(row: sqlite3.Row) -> ManifestEntry:
         source=row["source"],
         created_at=row["created_at"],
         status=row["status"],
+        metric_version=row["metric_version"],
+        input_manifest_hash=row["input_manifest_hash"],
+        window_start=row["window_start"],
+        window_end=row["window_end"],
     )
 
 
@@ -631,16 +662,27 @@ class SqliteStore:
         return tuple(_row_to_scan(row) for row in rows)
 
     def record_manifest(self, entry: ManifestEntry) -> None:
+        # Scans/backfills are append-only: a duplicate path is a real conflict.
         with closing(self._connect()) as connection, connection:
             self._insert_manifest(connection, entry)
 
-    def _insert_manifest(self, connection: sqlite3.Connection, entry: ManifestEntry) -> None:
+    def upsert_manifest_entry(self, entry: ManifestEntry) -> None:
+        """Metrics-only idempotent manifest write (re-persist same content)."""
+        with closing(self._connect()) as connection, connection:
+            self._insert_manifest(connection, entry, upsert=True)
+
+    def _insert_manifest(
+        self, connection: sqlite3.Connection, entry: ManifestEntry, *, upsert: bool = False
+    ) -> None:
+        conflict = "ON CONFLICT(path) DO NOTHING" if upsert else ""
         connection.execute(
-            """
+            f"""
             INSERT INTO manifest (
                 path, data_type, symbol, date, rows, bytes, checksum,
-                source, created_at, status
-            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                source, created_at, status, metric_version, input_manifest_hash,
+                window_start, window_end
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            {conflict}
             """,
             (
                 entry.path,
@@ -653,12 +695,29 @@ class SqliteStore:
                 entry.source,
                 entry.created_at,
                 entry.status,
+                entry.metric_version,
+                entry.input_manifest_hash,
+                entry.window_start,
+                entry.window_end,
             ),
         )
 
     def delete_manifest_entry(self, path: str) -> None:
         with closing(self._connect()) as connection, connection:
             connection.execute("DELETE FROM manifest WHERE path = ?", (path,))
+
+    def get_manifest_entry(self, path: str) -> ManifestEntry | None:
+        """Return one manifest row; raises when the DB itself is unreadable."""
+        connection = self._connect_read_only()
+        if connection is None:
+            raise StoreUnavailableError("manifest database is unreadable")
+        try:
+            row = connection.execute("SELECT * FROM manifest WHERE path = ?", (path,)).fetchone()
+        except sqlite3.Error as exc:
+            raise StoreUnavailableError(f"manifest lookup failed: {exc}") from exc
+        finally:
+            connection.close()
+        return _row_to_manifest(row) if row is not None else None
 
     def list_manifest(
         self, *, symbol: str | None = None, date: str | None = None
@@ -672,13 +731,18 @@ class SqliteStore:
             clauses.append("date = ?")
             params.append(date)
         where = f" WHERE {' AND '.join(clauses)}" if clauses else ""
-        connection = self._connect_read_only()
+        try:
+            connection = self._connect_read_only()
+        except sqlite3.Error as exc:
+            raise StoreUnavailableError(f"manifest database is unreadable: {exc}") from exc
         if connection is None:
             return ()
         try:
             rows = connection.execute(
                 f"SELECT * FROM manifest{where} ORDER BY created_at, path", params
             ).fetchall()
+        except sqlite3.Error as exc:
+            raise StoreUnavailableError(f"manifest read failed: {exc}") from exc
         finally:
             connection.close()
         return tuple(_row_to_manifest(row) for row in rows)

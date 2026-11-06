@@ -59,3 +59,26 @@ def test_api_maps_store_failure_to_data_unavailable(settings: Settings) -> None:
     # The raw sqlite text must stay in the log, never the response.
     assert body["error"]["message"] == "Required data does not exist or cannot be fetched."
     assert "locked" not in response.text
+
+
+def test_list_manifest_maps_a_corrupt_database(tmp_path: Path) -> None:
+    store = _corrupt_store(tmp_path)
+
+    with pytest.raises(StoreUnavailableError):
+        store.list_manifest()
+
+
+def test_list_manifest_maps_an_unreadable_database(tmp_path: Path) -> None:
+    import os
+
+    if os.geteuid() == 0:
+        pytest.skip("chmod 000 is not enforced for root")
+    settings = Settings(env="test", port=8765, data_dir=tmp_path / "data")
+    store = SqliteStore(settings)
+    store.initialize()
+    store.path.chmod(0o000)
+    try:
+        with pytest.raises(StoreUnavailableError):
+            store.list_manifest()
+    finally:
+        store.path.chmod(0o600)
