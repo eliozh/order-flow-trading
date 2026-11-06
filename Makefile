@@ -5,7 +5,7 @@ install:
 	npm --prefix web install
 
 serve:
-	uv run uvicorn oft.api.app:create_app --factory --host 127.0.0.1 --port 8080
+	uv run uvicorn oft.api.app:create_app --factory --host 127.0.0.1 --port 7611
 
 test:
 	uv run pytest

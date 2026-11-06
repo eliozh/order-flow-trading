@@ -1,0 +1,109 @@
+"""Stable API error codes and envelope responses (ADR-0003)."""
+
+from __future__ import annotations
+
+from dataclasses import dataclass
+from typing import Any
+
+from fastapi.responses import JSONResponse
+
+from oft.api.envelope import error_envelope, new_request_id
+
+
+@dataclass(frozen=True)
+class ErrorSpec:
+    http_status: int
+    category: str
+    retryable: bool
+    message: str
+
+
+ERROR_CATALOG: dict[str, ErrorSpec] = {
+    "AUTH_REQUIRED": ErrorSpec(401, "AUTH", False, "No local API credential was supplied."),
+    "AUTH_INVALID": ErrorSpec(
+        401, "AUTH", False, "The local API credential is invalid or expired."
+    ),
+    "CSRF_INVALID": ErrorSpec(
+        403, "AUTH", False, "The CSRF token is missing or does not match the session."
+    ),
+    "ORIGIN_FORBIDDEN": ErrorSpec(
+        403,
+        "AUTH",
+        False,
+        "The request Origin/Sec-Fetch-Site does not match the served origin.",
+    ),
+    "NOT_FOUND": ErrorSpec(
+        404, "VALIDATION", False, "The requested object or route does not exist."
+    ),
+    "METHOD_NOT_ALLOWED": ErrorSpec(
+        405, "VALIDATION", False, "The HTTP method is not valid for this route."
+    ),
+    "VALIDATION_FAILED": ErrorSpec(
+        422, "VALIDATION", False, "One or more request fields failed validation."
+    ),
+    "CONFIG_INVALID": ErrorSpec(
+        500, "SYSTEM", False, "The configuration is missing, unreadable, or inconsistent."
+    ),
+    "DATA_UNAVAILABLE": ErrorSpec(
+        503, "DATA", True, "Required data does not exist or cannot be fetched."
+    ),
+    "STORAGE_UNAVAILABLE": ErrorSpec(
+        503, "STORAGE", True, "SQLite or the Parquet catalog is unavailable."
+    ),
+    "INTERNAL_ERROR": ErrorSpec(500, "SYSTEM", True, "An unexpected internal error occurred."),
+    "CLOCK_DRIFT": ErrorSpec(
+        409,
+        "SYSTEM",
+        True,
+        "The local clock differs from Binance server time beyond the allowed threshold.",
+    ),
+    "DAEMON_NOT_RUNNING": ErrorSpec(
+        503,
+        "SYSTEM",
+        True,
+        "The daemon is not running, so the mutating command cannot execute.",
+    ),
+}
+
+
+class ApiError(Exception):
+    """Raise inside a route to emit a catalog error envelope."""
+
+    def __init__(
+        self,
+        code: str,
+        message: str | None = None,
+        *,
+        details: list[dict[str, Any]] | None = None,
+    ) -> None:
+        spec = ERROR_CATALOG[code]
+        super().__init__(message or spec.message)
+        self.code = code
+        self.message = message or spec.message
+        self.details = details or []
+
+
+def error_response(
+    code: str,
+    *,
+    message: str | None = None,
+    details: list[dict[str, Any]] | None = None,
+    request_id: str | None = None,
+    headers: dict[str, str] | None = None,
+) -> JSONResponse:
+    spec = ERROR_CATALOG[code]
+    resolved_request_id = request_id or new_request_id()
+    return JSONResponse(
+        status_code=spec.http_status,
+        content=error_envelope(
+            code=code,
+            message=message or spec.message,
+            http_status=spec.http_status,
+            category=spec.category,
+            retryable=spec.retryable,
+            reference_id=resolved_request_id,
+            request_id=resolved_request_id,
+            details=details,
+        ),
+        headers=headers,
+    )

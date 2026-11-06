@@ -10,10 +10,10 @@ a React/TypeScript/Vite client under `web/`.
 uv sync
 npm --prefix web install
 
-# Dev API (loopback only)
-uv run uvicorn oft.api.app:create_app --factory --reload --host 127.0.0.1 --port 8080
+# Dev API (loopback only, 127.0.0.1:7611)
+uv run oft serve
 
-# Dev web shell (proxies /api and /health to 127.0.0.1:8080)
+# Dev web shell (proxies /api, /health, and /ready to 127.0.0.1:7611)
 npm --prefix web run dev
 
 # CLI
