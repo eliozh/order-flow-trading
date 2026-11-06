@@ -32,6 +32,7 @@ from oft.api.auth import (
 )
 from oft.api.envelope import new_request_id
 from oft.api.errors import ApiError, error_response
+from oft.api.routes.data import router as data_router
 from oft.api.routes.scans import router as scans_router
 from oft.api.routes.symbols import router as symbols_router
 from oft.api.routes.system import router as system_router
@@ -209,6 +210,7 @@ def create_app(settings: Settings | None = None) -> FastAPI:
     app.include_router(scans_router)
     app.include_router(symbols_router)
     app.include_router(watchlist_router)
+    app.include_router(data_router)
 
     @app.exception_handler(ApiError)
     async def _api_error(_request: Request, exc: ApiError) -> JSONResponse:

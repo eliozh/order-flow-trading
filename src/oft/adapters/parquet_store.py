@@ -5,6 +5,7 @@ from __future__ import annotations
 import hashlib
 import os
 import uuid
+from collections.abc import Callable
 from datetime import UTC, datetime
 from pathlib import Path
 from typing import TYPE_CHECKING
@@ -15,7 +16,7 @@ import pyarrow.parquet as pq
 from oft.config import Settings
 from oft.domain.events import AggTrade
 from oft.domain.time import utc_timestamp
-from oft.ports.store import ManifestEntry
+from oft.ports.store import ManifestEntry, StoreUnavailableError
 
 if TYPE_CHECKING:
     import duckdb
@@ -54,6 +55,53 @@ def _record_hash(trade: AggTrade) -> str:
     return hashlib.sha256(payload.encode("utf-8")).hexdigest()
 
 
+def _fsync_dir(path: Path) -> None:
+    try:
+        descriptor = os.open(path, os.O_RDONLY)
+    except OSError:
+        return
+    try:
+        os.fsync(descriptor)
+    finally:
+        os.close(descriptor)
+
+
+def recover_orphan_parts(settings: Settings, known_paths: set[str]) -> tuple[ManifestEntry, ...]:
+    """Adopt published parts that were never recorded in the manifest table.
+
+    Covers a crash between part publication and the manifest transaction; the
+    adopted rows keep dedupe/resume working instead of re-downloading forever.
+    """
+    root = settings.data_dir / "market" / "um" / "agg_trades"
+    if not root.is_dir():
+        return ()
+    recovered: list[ManifestEntry] = []
+    for path in sorted(root.glob("symbol=*/date=*/*.parquet")):
+        if str(path) in known_paths:
+            continue
+        symbol = path.parent.parent.name.split("=", 1)[1]
+        day = path.parent.name.split("=", 1)[1]
+        try:
+            rows = pq.ParquetFile(path).metadata.num_rows
+            checksum = hashlib.sha256(path.read_bytes()).hexdigest()
+        except (OSError, ValueError) as exc:
+            raise StoreUnavailableError(f"cannot reconcile orphan part {path}: {exc}") from exc
+        recovered.append(
+            ManifestEntry(
+                path=str(path),
+                data_type="agg_trades",
+                symbol=symbol,
+                date=day,
+                rows=rows,
+                bytes=path.stat().st_size,
+                checksum=checksum,
+                source="recovered:orphan",
+                created_at=utc_timestamp(datetime.now(UTC)),
+            )
+        )
+    return tuple(recovered)
+
+
 class ParquetStore:
     """Writes one immutable part per fixture import and returns its manifest row."""
 
@@ -72,9 +120,97 @@ class ParquetStore:
     ) -> ManifestEntry:
         if not trades:
             raise ValueError("cannot write an empty agg_trades part")
-
         first = trades[0]
         date = first.transact_time.astimezone(UTC).date().isoformat()
+        return self._write_part(trades, symbol=symbol, date=date, source=source)
+
+    def _existing_agg_trade_ids(self, symbol: str, dates: set[str]) -> set[int]:
+        """Ids already published for this symbol, limited to the batch date range.
+
+        A read failure must fail closed: silently treating an unreadable part as
+        empty would disable dedupe and duplicate every row on a re-run. Empty or
+        non-Parquet directories are not read failures.
+        """
+        root = self._settings.data_dir / "market" / "um" / "agg_trades" / f"symbol={symbol}"
+        if not root.is_dir():
+            return set()
+        import pyarrow.dataset as dataset
+
+        parts: list[str] = []
+        for day in sorted(dates):
+            directory = root / f"date={day}"
+            if not directory.is_dir():
+                continue
+            parts.extend(str(path) for path in directory.glob("*.parquet") if path.is_file())
+        if not parts:
+            return set()
+        try:
+            table = dataset.dataset(parts, format="parquet").to_table(columns=["agg_trade_id"])
+        except (OSError, ValueError) as exc:
+            raise StoreUnavailableError(
+                f"cannot read existing agg_trade parts for {symbol}: {exc}"
+            ) from exc
+        return {
+            int(value) for value in table.column("agg_trade_id").to_pylist() if value is not None
+        }
+
+    def write_agg_trades_batch(
+        self,
+        trades: tuple[AggTrade, ...] | list[AggTrade],
+        *,
+        symbol: str,
+        source: str,
+        allow_duplicate_ids: bool = False,
+        on_progress: Callable[[int], None] | None = None,
+    ) -> tuple[ManifestEntry, ...]:
+        """Dedupe by ``agg_trade_id`` and publish one part per UTC date.
+
+        Deduplication is scoped to the batch's date partitions, so re-running
+        the same archive range cannot duplicate rows without scanning the whole
+        symbol history. A corrected upstream file (new checksum, same ids) sets
+        ``allow_duplicate_ids`` so the replacement rows are actually written.
+        """
+        if not trades:
+            return ()
+        batch_dates = {trade.transact_time.astimezone(UTC).date().isoformat() for trade in trades}
+        seen = set() if allow_duplicate_ids else self._existing_agg_trade_ids(symbol, batch_dates)
+        unique: list[AggTrade] = []
+        for trade in trades:
+            if trade.agg_trade_id in seen:
+                continue
+            seen.add(trade.agg_trade_id)
+            unique.append(trade)
+        if not unique:
+            return ()
+        groups: dict[str, list[AggTrade]] = {}
+        for trade in unique:
+            day = trade.transact_time.astimezone(UTC).date().isoformat()
+            groups.setdefault(day, []).append(trade)
+        published: list[ManifestEntry] = []
+        try:
+            for day in sorted(groups):
+                published.append(
+                    self._write_part(groups[day], symbol=symbol, date=day, source=source)
+                )
+                if on_progress is not None:
+                    on_progress(len(published))
+        except Exception:
+            # Never leave a partially published multi-date batch behind.
+            for entry in published:
+                path = Path(entry.path)
+                path.unlink(missing_ok=True)
+                _fsync_dir(path.parent)
+            raise
+        return tuple(published)
+
+    def _write_part(
+        self,
+        trades: tuple[AggTrade, ...] | list[AggTrade],
+        *,
+        symbol: str,
+        date: str,
+        source: str,
+    ) -> ManifestEntry:
         directory = (
             self._settings.data_dir
             / "market"
@@ -88,6 +224,7 @@ class ParquetStore:
         final_path = directory / f"part-{uuid.uuid4().hex}.parquet"
         temp_path = directory / f".{final_path.name}.{uuid.uuid4().hex}.tmp"
         ingested_at = utc_timestamp(datetime.now(UTC))
+        ingested_at_dt = datetime.now(UTC)
 
         table = pa.table(
             {
@@ -104,7 +241,7 @@ class ParquetStore:
                 "symbol": pa.array([t.symbol for t in trades], pa.string()),
                 "source": pa.array([source for _ in trades], pa.string()),
                 "ingested_at": pa.array(
-                    [datetime.now(UTC) for _ in trades],
+                    [ingested_at_dt for _ in trades],
                     pa.timestamp("ms", tz="UTC"),
                 ),
                 "record_hash": pa.array([_record_hash(t) for t in trades], pa.string()),
@@ -117,6 +254,7 @@ class ParquetStore:
                 os.fsync(handle.fileno())
             checksum = hashlib.sha256(temp_path.read_bytes()).hexdigest()
             os.replace(temp_path, final_path)
+            _fsync_dir(directory)
         finally:
             if temp_path.exists():
                 temp_path.unlink()

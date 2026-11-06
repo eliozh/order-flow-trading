@@ -4,13 +4,20 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 
+from oft.adapters.archive import (
+    FixtureArchiveSource,
+    HttpsArchiveSource,
+    UnconfiguredArchiveSource,
+)
 from oft.adapters.fixture_market_data import FixtureMarketData
 from oft.adapters.parquet_store import ParquetStore
 from oft.adapters.sqlite_store import SqliteStore
+from oft.application.backfill_service import BackfillService
 from oft.application.status import StatusReport, build_status
 from oft.application.symbol_registry import SymbolRegistry
 from oft.clock import SystemClock
 from oft.config import Settings, load_settings
+from oft.ports.archive import ArchiveSourcePort
 from oft.ports.clock import ClockPort
 from oft.ports.market_data import MarketDataPort
 from oft.ports.store import StorePort
@@ -24,6 +31,8 @@ class AppContainer:
     store: StorePort
     parquet: ParquetStore
     symbol_registry: SymbolRegistry
+    archive: ArchiveSourcePort
+    backfill: BackfillService
 
 
 def _seed_symbol_registry(registry: SymbolRegistry, settings: Settings) -> None:
@@ -46,6 +55,23 @@ def build_container(settings: Settings | None = None, *, initialize: bool = Fals
     parquet = ParquetStore(resolved)
     clock = SystemClock()
     symbol_registry = SymbolRegistry(store, clock=clock)
+    if resolved.archive_fixture_dir is not None:
+        archive: ArchiveSourcePort = FixtureArchiveSource(resolved.archive_fixture_dir)
+    elif resolved.env == "test":
+        # Never fall back to the network in a test environment.
+        archive = UnconfiguredArchiveSource(
+            "OFT_ENV=test requires OFT_ARCHIVE_FIXTURE_DIR; "
+            "HTTPS archive access is disabled in tests"
+        )
+    else:
+        archive = HttpsArchiveSource()
+    backfill = BackfillService(
+        settings=resolved,
+        archive=archive,
+        parquet=parquet,
+        store=store,
+        clock=clock,
+    )
     if initialize:
         resolved.data_dir.mkdir(parents=True, exist_ok=True, mode=0o700)
         # ``exist_ok=True`` does not tighten a pre-created directory.
@@ -60,6 +86,8 @@ def build_container(settings: Settings | None = None, *, initialize: bool = Fals
         store=store,
         parquet=parquet,
         symbol_registry=symbol_registry,
+        archive=archive,
+        backfill=backfill,
     )
 
 
