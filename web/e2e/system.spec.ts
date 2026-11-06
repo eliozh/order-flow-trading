@@ -15,11 +15,23 @@ import { expect, test, type Page } from '@playwright/test'
  */
 
 const SCREENS_DIR =
+  process.env.OFT_E2E_SYSTEM_SCREENS_DIR ??
   process.env.OFT_E2E_SCREENS_DIR ??
   path.resolve(process.cwd(), '..', '.claude', 'ecc-workflow', 'screens', 'e2e')
 
 const GOLDEN_DELTA = '1.50'
 const EXPECTED_CHECKS = ['config', 'storage.sqlite', 'storage.parquet', 'clock', 'market_data']
+
+/** Mint a browser session from the daemon's one-time bootstrap file. */
+async function authenticate(page: Page): Promise<void> {
+  const file = process.env.OFT_E2E_SYSTEM_BOOTSTRAP_FILE
+  if (!file) {
+    return
+  }
+  const secret = fs.readFileSync(file, 'utf8').trim()
+  const response = await page.request.get(`/?bootstrap=${encodeURIComponent(secret)}`)
+  expect(response.status()).toBe(200)
+}
 
 interface ReadyCheck {
   name: string
@@ -94,6 +106,7 @@ test('loads /system with no console or page errors', async ({ page }) => {
     pageErrors.push(error.message)
   })
 
+  await authenticate(page)
   await page.goto('/system')
   await waitForLoadedSystem(page)
 
@@ -133,6 +146,7 @@ test('shows health OK, readiness OK with named checks, version, data dir, and th
     expect(readiness.data_dir).toBe(process.env.OFT_E2E_DATA_DIR)
   }
 
+  await authenticate(page)
   await page.goto('/system')
   await waitForLoadedSystem(page)
 
@@ -184,6 +198,7 @@ test('at 375px the shell is read-only and has no page-level horizontal scroll', 
   page,
 }) => {
   await page.setViewportSize({ width: 375, height: 812 })
+  await authenticate(page)
   await page.goto('/system')
   await waitForLoadedSystem(page)
 
@@ -277,6 +292,7 @@ test('renders a stable API error state when readiness is blocked', async ({ page
     })
   })
 
+  await authenticate(page)
   await page.goto('/system')
 
   const alert = page.getByRole('alert')
@@ -303,6 +319,7 @@ test('captures the /system shell at 1440, 768, and 375', async ({ page }) => {
 
   for (const viewport of viewports) {
     await page.setViewportSize({ width: viewport.width, height: viewport.height })
+    await authenticate(page)
     await page.goto('/system')
     await waitForLoadedSystem(page)
     await page.screenshot({

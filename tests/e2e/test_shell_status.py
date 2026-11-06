@@ -70,6 +70,10 @@ def test_built_shell_serves_the_system_route(settings: Settings) -> None:
 
     app = create_app(settings)
     with TestClient(app) as client:
+        session = client.get(
+            "/", params={"bootstrap": app.state.browser_bootstrap}, follow_redirects=False
+        )
+        assert session.status_code == 302
         response = client.get("/system")
 
     assert response.status_code == 200

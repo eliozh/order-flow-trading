@@ -110,6 +110,7 @@ def test_serve_applies_cli_port_to_the_app_settings(monkeypatch, tmp_path: Path)
     assert result.exit_code == 0, result.output
     assert captured["port"] == 9999
     assert captured["host"] == "127.0.0.1"
+    assert captured["access_log"] is False
     factory = captured["app"]
     assert callable(factory)
     resolved_app = factory()
@@ -123,3 +124,26 @@ def test_allowed_origins_brackets_ipv6_loopback() -> None:
     origins = allowed_origins(Settings(env="test", host="::1", port=7612))
 
     assert "http://[::1]:7612" in origins
+
+
+def test_open_prints_the_bootstrap_url(monkeypatch, tmp_path: Path) -> None:
+    from oft.api.auth import write_browser_bootstrap
+
+    settings = _configure_cli(monkeypatch, tmp_path)
+    secret = write_browser_bootstrap(settings)
+
+    result = CliRunner().invoke(app, ["open", "--no-open"])
+
+    assert result.exit_code == 0, result.output
+    assert "?bootstrap=" in result.stdout
+    assert secret in result.stdout
+    assert f"127.0.0.1:{settings.port}" in result.stdout
+
+
+def test_open_without_a_daemon_reports_an_error(monkeypatch, tmp_path: Path) -> None:
+    _configure_cli(monkeypatch, tmp_path)
+
+    result = CliRunner().invoke(app, ["open", "--no-open"])
+
+    assert result.exit_code == 1
+    assert "oft serve" in _combined_output(result)

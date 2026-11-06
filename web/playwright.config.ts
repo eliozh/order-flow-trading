@@ -1,13 +1,17 @@
 import { defineConfig, devices } from '@playwright/test'
 
-const baseURL = process.env.OFT_E2E_BASE_URL ?? 'http://127.0.0.1:7622'
-const screensDir = process.env.OFT_E2E_SCREENS_DIR ?? '../.claude/ecc-workflow/screens/e2e'
+const systemBaseURL = process.env.OFT_E2E_BASE_URL ?? 'http://127.0.0.1:7622'
+const symbolsBaseURL = process.env.OFT_E2E_SYMBOLS_BASE_URL ?? 'http://127.0.0.1:7632'
+const screensDir = process.env.OFT_E2E_SCREENS_DIR ?? '../.claude/ecc-workflow/screens/e2e02'
+const reportDir = process.env.OFT_E2E_REPORT_DIR ?? `${screensDir}/report`
 
 /**
- * Chromium-only E2E config for the walking-skeleton `/system` journey.
+ * Chromium-only E2E config for the walking-skeleton `/system` journey and the
+ * slice-02 read-only symbol registry journeys.
  *
- * The daemon is started by `e2e/run-e2e.sh` (temporary data dir, fixture scan
- * already run) so the suite itself is read-only. Run it with:
+ * Both daemons are started by `e2e/run-e2e.sh` (temporary data dirs, fixture
+ * scan and exchangeInfo seed already applied) so the suites are read-only.
+ * Run them with:
  *
  *   npm --prefix web run test:e2e
  */
@@ -22,19 +26,24 @@ export default defineConfig({
   outputDir: `${screensDir}/artifacts`,
   reporter: [
     ['list'],
-    ['junit', { outputFile: `${screensDir}/report/junit.xml` }],
-    ['html', { outputFolder: `${screensDir}/report/html`, open: 'never' }],
+    ['junit', { outputFile: `${reportDir}/junit.xml` }],
+    ['html', { outputFolder: `${reportDir}/html`, open: 'never' }],
   ],
   use: {
-    baseURL,
     trace: 'retain-on-failure',
     screenshot: 'only-on-failure',
     video: 'retain-on-failure',
   },
   projects: [
     {
-      name: 'chromium',
-      use: { ...devices['Desktop Chrome'] },
+      name: 'system',
+      testMatch: /system\.spec\.ts/,
+      use: { ...devices['Desktop Chrome'], baseURL: systemBaseURL },
+    },
+    {
+      name: 'symbols',
+      testMatch: /symbols\.spec\.ts/,
+      use: { ...devices['Desktop Chrome'], baseURL: symbolsBaseURL },
     },
   ],
 })

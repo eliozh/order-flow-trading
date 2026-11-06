@@ -43,20 +43,23 @@ def success_envelope(
     duration_ms: int = 0,
     provenance: str = "CALC",
     data_quality: str | None = "COMPLETE",
+    pagination: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
     """Build an ``ok: true`` envelope."""
     timestamp = generated_at or utc_timestamp(datetime.now(UTC))
+    meta = _meta(
+        request_id=request_id,
+        generated_at=timestamp,
+        duration_ms=duration_ms,
+        provenance=provenance,
+        data_quality=data_quality,
+    )
+    meta["pagination"] = pagination
     return {
         "ok": True,
         "data": data,
         "error": None,
-        "meta": _meta(
-            request_id=request_id,
-            generated_at=timestamp,
-            duration_ms=duration_ms,
-            provenance=provenance,
-            data_quality=data_quality,
-        ),
+        "meta": meta,
     }
 
 

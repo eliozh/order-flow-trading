@@ -1,0 +1,151 @@
+{
+  "timezone": "UTC",
+  "serverTime": 1762401600000,
+  "rateLimits": [
+    { "rateLimitType": "REQUEST_WEIGHT", "interval": "MINUTE", "intervalNum": 1, "limit": 2400 }
+  ],
+  "symbols": [
+    {
+      "symbol": "BTCUSDT",
+      "pair": "BTCUSDT",
+      "contractType": "PERPETUAL",
+      "deliveryDate": 4133404800000,
+      "onboardDate": 1567900800000,
+      "status": "TRADING",
+      "baseAsset": "BTC",
+      "quoteAsset": "USDT",
+      "marginAsset": "USDT",
+      "underlyingType": "COIN",
+      "underlyingSubType": ["Layer-1"],
+      "pricePrecision": 2,
+      "quantityPrecision": 3,
+      "filters": [
+        { "filterType": "PRICE_FILTER", "minPrice": "556.80", "maxPrice": "4529764", "tickSize": "0.10" },
+        { "filterType": "LOT_SIZE", "minQty": "0.001", "maxQty": "1000", "stepSize": "0.001" },
+        { "filterType": "MIN_NOTIONAL", "notional": "5.00" }
+      ]
+    },
+    {
+      "symbol": "ETHUSDT",
+      "pair": "ETHUSDT",
+      "contractType": "PERPETUAL",
+      "deliveryDate": 4133404800000,
+      "onboardDate": 1567900800000,
+      "status": "TRADING",
+      "baseAsset": "ETH",
+      "quoteAsset": "USDT",
+      "marginAsset": "USDT",
+      "underlyingType": "COIN",
+      "underlyingSubType": ["Layer-1"],
+      "pricePrecision": 2,
+      "quantityPrecision": 3,
+      "filters": [
+        { "filterType": "PRICE_FILTER", "minPrice": "39.86", "maxPrice": "306177", "tickSize": "0.01" },
+        { "filterType": "LOT_SIZE", "minQty": "0.001", "maxQty": "10000", "stepSize": "0.001" },
+        { "filterType": "MIN_NOTIONAL", "notional": "5.00" }
+      ]
+    },
+    {
+      "symbol": "XAUUSDT",
+      "pair": "XAUUSDT",
+      "contractType": "TRADIFI_PERPETUAL",
+      "deliveryDate": 4133404800000,
+      "onboardDate": 1765411200000,
+      "status": "TRADING",
+      "baseAsset": "XAU",
+      "quoteAsset": "USDT",
+      "marginAsset": "USDT",
+      "underlyingType": "COMMODITY",
+      "underlyingSubType": ["Precious Metals"],
+      "pricePrecision": 2,
+      "quantityPrecision": 2,
+      "filters": [
+        { "filterType": "PRICE_FILTER", "minPrice": "100.00", "maxPrice": "10000.00", "tickSize": "0.01" },
+        { "filterType": "LOT_SIZE", "minQty": "0.01", "maxQty": "1000", "stepSize": "0.01" },
+        { "filterType": "MIN_NOTIONAL", "notional": "5.00" }
+      ]
+    },
+    {
+      "symbol": "FTTUSDT",
+      "pair": "FTTUSDT",
+      "contractType": "PERPETUAL",
+      "deliveryDate": 4133404800000,
+      "onboardDate": 1614556800000,
+      "status": "SETTLING",
+      "baseAsset": "FTT",
+      "quoteAsset": "USDT",
+      "marginAsset": "USDT",
+      "underlyingType": "COIN",
+      "pricePrecision": 4,
+      "quantityPrecision": 1,
+      "filters": [
+        { "filterType": "PRICE_FILTER", "minPrice": "0.0001", "maxPrice": "1000", "tickSize": "0.0001" },
+        { "filterType": "LOT_SIZE", "minQty": "0.1", "maxQty": "100000", "stepSize": "0.1" },
+        { "filterType": "MIN_NOTIONAL", "notional": "5.00" }
+      ]
+    },
+    {
+      "symbol": "BTCUSDT_261225",
+      "pair": "BTCUSDT",
+      "contractType": "CURRENT_QUARTER",
+      "deliveryDate": 1798675200000,
+      "onboardDate": 1765411200000,
+      "status": "TRADING",
+      "baseAsset": "BTC",
+      "quoteAsset": "USDT",
+      "marginAsset": "USDT",
+      "underlyingType": "COIN",
+      "pricePrecision": 1,
+      "quantityPrecision": 3,
+      "filters": [
+        { "filterType": "PRICE_FILTER", "minPrice": "556.8", "maxPrice": "4529764", "tickSize": "0.10" },
+        { "filterType": "LOT_SIZE", "minQty": "0.001", "maxQty": "1000", "stepSize": "0.001" },
+        { "filterType": "MIN_NOTIONAL", "notional": "5.00" }
+      ]
+    },
+    {
+      "symbol": "BROKENUSDT",
+      "pair": "BROKENUSDT",
+      "contractType": "PERPETUAL",
+      "onboardDate": 1567900800000,
+      "status": "TRADING",
+      "baseAsset": "BROKEN",
+      "quoteAsset": "USDT",
+      "pricePrecision": 2,
+      "quantityPrecision": 3,
+      "filters": []
+    },
+    {
+      "symbol": "BADTICKUSDT",
+      "pair": "BADTICKUSDT",
+      "contractType": "PERPETUAL",
+      "onboardDate": 1567900800000,
+      "status": "TRADING",
+      "baseAsset": "BADTICK",
+      "quoteAsset": "USDT",
+      "pricePrecision": 2,
+      "quantityPrecision": 3,
+      "filters": [
+        { "filterType": "PRICE_FILTER", "tickSize": "not-a-decimal" },
+        { "filterType": "LOT_SIZE", "minQty": "0.001", "stepSize": "0.001" },
+        { "filterType": "MIN_NOTIONAL", "notional": "5.00" }
+      ]
+    },
+    {
+      "symbol": "NODATEUSDT",
+      "pair": "NODATEUSDT",
+      "contractType": "PERPETUAL",
+      "status": "TRADING",
+      "baseAsset": "NODATE",
+      "quoteAsset": "USDT",
+      "pricePrecision": 2,
+      "quantityPrecision": 3,
+      "filters": [
+        { "filterType": "PRICE_FILTER", "tickSize": "0.10" },
+        { "filterType": "LOT_SIZE", "minQty": "0.001", "stepSize": "0.001" },
+        { "filterType": "MIN_NOTIONAL", "notional": "5.00" }
+      ]
+    },
+    "not-an-object"
+  ]
+}

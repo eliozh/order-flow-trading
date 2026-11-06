@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import hmac
 import threading
 from pathlib import Path
 from typing import Any
@@ -10,13 +11,16 @@ from urllib.parse import urlsplit
 import structlog
 from fastapi import FastAPI, Request
 from fastapi.exceptions import RequestValidationError
-from fastapi.responses import FileResponse, JSONResponse
+from fastapi.responses import FileResponse, HTMLResponse, JSONResponse, RedirectResponse
 from starlette.exceptions import HTTPException as StarletteHTTPException
 
 from oft import __version__
 from oft.adapters.fixture_market_data import FixtureDataError
 from oft.api.auth import (
     CSRF_COOKIE,
+    SESSION_COOKIE,
+    SESSION_TTL_SECONDS,
+    SessionStore,
     allowed_origins,
     csrf_matches,
     ensure_api_token,
@@ -24,19 +28,24 @@ from oft.api.auth import (
     is_browser_request,
     new_csrf_token,
     token_matches,
+    write_browser_bootstrap,
 )
 from oft.api.envelope import new_request_id
 from oft.api.errors import ApiError, error_response
 from oft.api.routes.scans import router as scans_router
+from oft.api.routes.symbols import router as symbols_router
 from oft.api.routes.system import router as system_router
+from oft.api.routes.watchlist import router as watchlist_router
 from oft.bootstrap import build_container
 from oft.config import ConfigError, Settings, load_settings
 from oft.logging import configure_logging
+from oft.ports.store import StoreUnavailableError
 
 logger = structlog.get_logger(__name__)
 
 _MUTATING_METHODS = frozenset({"POST", "PUT", "PATCH", "DELETE"})
 _COOKIE_PATHS = frozenset({"/health", "/ready", "/api/v1/status"})
+_SPA_ENTRY_PATHS = frozenset({"/", "/system", "/system/", "/watchlist", "/watchlist/search"})
 _LOOPBACK_HOSTS = frozenset({"127.0.0.1", "localhost", "::1"})
 _TEST_CLIENT_HOST = "testserver"
 _HTTP_ERRORS = {
@@ -53,6 +62,16 @@ _SECURITY_HEADERS = {
     "X-Content-Type-Options": "nosniff",
     "Referrer-Policy": "no-referrer",
 }
+_AUTH_PROMPT_HTML = (
+    '<!doctype html><html lang="en"><head><meta charset="utf-8">'
+    "<title>Order Flow Trading — authentication required</title></head>"
+    "<body><main><h1>Authentication required</h1>"
+    "<p>Run <code>oft open</code> in your terminal to authenticate this browser.</p>"
+    "</main></body></html>"
+)
+
+
+_BOOTSTRAP_READY_MESSAGE = "bootstrap ready — run `oft open`"
 
 
 def _harden(response: Any) -> Any:
@@ -89,6 +108,11 @@ def host_is_allowed(request: Request, settings: Settings) -> bool:
     return port == settings.port
 
 
+def _is_spa_entry(path: str) -> bool:
+    """Client-rendered entry routes that may establish a browser session."""
+    return path in _SPA_ENTRY_PATHS or path.startswith("/watchlist/")
+
+
 def create_app(settings: Settings | None = None) -> FastAPI:
     """Create the local API application.
 
@@ -108,12 +132,45 @@ def create_app(settings: Settings | None = None) -> FastAPI:
     app.state.container = container
     app.state.api_token = ensure_api_token(resolved)
     app.state.scan_lock = threading.Lock()
+    app.state.sessions = SessionStore()
+    app.state.browser_bootstrap = write_browser_bootstrap(resolved)
+    logger.info("browser_bootstrap_ready", detail=_BOOTSTRAP_READY_MESSAGE)
 
     @app.middleware("http")
     async def _security(request: Request, call_next: Any) -> Any:
         path = request.url.path
         if not host_is_allowed(request, resolved):
             return _harden(error_response("HOST_FORBIDDEN"))
+
+        if request.method == "GET" and path == "/":
+            presented_bootstrap = request.query_params.get("bootstrap")
+            expected = app.state.browser_bootstrap
+            if (
+                presented_bootstrap is not None
+                and expected is not None
+                and hmac.compare_digest(
+                    expected.encode("utf-8"), presented_bootstrap.encode("utf-8")
+                )
+            ):
+                # Single-use bootstrap: rotate immediately after minting a session.
+                app.state.browser_bootstrap = write_browser_bootstrap(resolved)
+                logger.info("browser_bootstrap_ready", detail=_BOOTSTRAP_READY_MESSAGE)
+                response = RedirectResponse("/", status_code=302)
+                response.set_cookie(
+                    SESSION_COOKIE,
+                    app.state.sessions.create(),
+                    httponly=True,
+                    samesite="strict",
+                    secure=request.url.scheme == "https",
+                    path="/",
+                    max_age=SESSION_TTL_SECONDS,
+                )
+                return _harden(response)
+
+        session_valid = app.state.sessions.is_valid(request.cookies.get(SESSION_COOKIE))
+        if request.method == "GET" and _is_spa_entry(path) and not session_valid:
+            return _harden(HTMLResponse(_AUTH_PROMPT_HTML, status_code=401))
+
         if path.startswith("/api/v1/"):
             if request.method in _MUTATING_METHODS:
                 origin = request.headers.get("origin")
@@ -126,13 +183,14 @@ def create_app(settings: Settings | None = None) -> FastAPI:
                     return _harden(error_response("CSRF_INVALID"))
 
             presented = extract_bearer(request.headers.get("authorization"))
-            if presented is None:
+            if presented is not None:
+                if not token_matches(app.state.api_token, presented):
+                    return _harden(
+                        error_response("AUTH_INVALID", headers={"WWW-Authenticate": "Bearer"})
+                    )
+            elif not session_valid:
                 return _harden(
                     error_response("AUTH_REQUIRED", headers={"WWW-Authenticate": "Bearer"})
-                )
-            if not token_matches(app.state.api_token, presented):
-                return _harden(
-                    error_response("AUTH_INVALID", headers={"WWW-Authenticate": "Bearer"})
                 )
 
         response = await call_next(request)
@@ -149,6 +207,8 @@ def create_app(settings: Settings | None = None) -> FastAPI:
 
     app.include_router(system_router)
     app.include_router(scans_router)
+    app.include_router(symbols_router)
+    app.include_router(watchlist_router)
 
     @app.exception_handler(ApiError)
     async def _api_error(_request: Request, exc: ApiError) -> JSONResponse:
@@ -176,6 +236,12 @@ def create_app(settings: Settings | None = None) -> FastAPI:
     @app.exception_handler(ConfigError)
     async def _config_error(_request: Request, exc: ConfigError) -> JSONResponse:
         return error_response(exc.code, message=exc.message)
+
+    @app.exception_handler(StoreUnavailableError)
+    async def _store_error(_request: Request, exc: StoreUnavailableError) -> JSONResponse:
+        # Keep raw sqlite/OS text out of the client; it goes to the daemon log only.
+        logger.warning("store_unavailable", error=exc.message)
+        return error_response(exc.code)
 
     @app.exception_handler(StarletteHTTPException)
     async def _http_error(_request: Request, exc: StarletteHTTPException) -> JSONResponse:
