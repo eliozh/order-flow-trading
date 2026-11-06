@@ -28,12 +28,14 @@ _BLOCKED_CODES = frozenset(
     {
         "BACKFILL_ALREADY_RUNNING",
         "BACKFILL_CHECKSUM_MISMATCH",
-        "VALIDATION_FAILED",
-        "DATA_UNAVAILABLE",
         "UNSAFE_ARCHIVE",
         "DAEMON_NOT_RUNNING",
     }
 )
+_RUNTIME_CODES = frozenset(
+    {"DATA_UNAVAILABLE", "STORAGE_UNAVAILABLE", "INTERNAL_ERROR", "NOT_FOUND"}
+)
+_USAGE_CODES = frozenset({"VALIDATION_FAILED"})
 
 
 def exit_code_for_status(status: str) -> int:
@@ -51,9 +53,13 @@ def exit_code_for_status(status: str) -> int:
 def exit_code_for_error(code: str) -> int:
     if code in _CONFIG_CODES:
         return _EXIT_CONFIG
+    if code in _USAGE_CODES:
+        return 2
     if code in _BLOCKED_CODES:
         return _EXIT_BLOCKED
-    return _EXIT_BLOCKED
+    if code in _RUNTIME_CODES:
+        return 1
+    return 1
 
 
 def _settings_or_exit(json_output: bool) -> Any:
@@ -163,7 +169,8 @@ def run(
         "confirm": yes,
     }
     try:
-        envelope = ApiClient.from_settings(settings).create_backfill(payload)
+        # A backfill downloads many archives; the 2s default would abort it.
+        envelope = ApiClient.from_settings(settings, timeout=None).create_backfill(payload)
     except ApiClientError as exc:
         _emit_error_and_exit(exc.code, exc.message, json_output)
 

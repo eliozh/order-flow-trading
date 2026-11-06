@@ -129,7 +129,9 @@ class StorePort(Protocol):
 
     def record_manifest(self, entry: ManifestEntry) -> None: ...
 
-    def list_manifest(self) -> tuple[ManifestEntry, ...]: ...
+    def list_manifest(
+        self, *, symbol: str | None = None, date: str | None = None
+    ) -> tuple[ManifestEntry, ...]: ...
 
     def integrity_check(self) -> bool: ...
 
@@ -159,11 +161,19 @@ class StorePort(Protocol):
 
     # -- Backfill state --------------------------------------------------
 
-    def start_backfill_run(self, record: BackfillRunRecord) -> bool: ...
+    def start_backfill_run(
+        self,
+        record: BackfillRunRecord,
+        *,
+        owner: str | None = None,
+        now: str | None = None,
+    ) -> bool: ...
 
-    def touch_backfill_run(self, run_id: str, *, updated_at: str) -> None: ...
+    def touch_backfill_run(
+        self, run_id: str, *, updated_at: str, owner: str | None = None
+    ) -> bool: ...
 
-    def save_backfill_run(self, record: BackfillRunRecord) -> None: ...
+    def save_backfill_run(self, record: BackfillRunRecord, *, owner: str | None = None) -> bool: ...
 
     def get_backfill_run(self, run_id: str) -> BackfillRunRecord | None: ...
 
@@ -181,7 +191,25 @@ class StorePort(Protocol):
         symbol: str | None = None,
         data_type: str | None = None,
         run_id: str | None = None,
+        start: str | None = None,
+        end: str | None = None,
     ) -> tuple[BackfillManifestRow, ...]: ...
+
+    def commit_backfill_file(
+        self,
+        *,
+        row: BackfillManifestRow,
+        entries: tuple[ManifestEntry, ...],
+        resolved_at: str,
+    ) -> None: ...
+
+    def discard_backfill_file(
+        self,
+        *,
+        file_key: str,
+        entries: tuple[ManifestEntry, ...],
+        error_code: str,
+    ) -> None: ...
 
     def upsert_data_gap(self, gap: DataGap) -> None: ...
 
@@ -196,5 +224,10 @@ class StorePort(Protocol):
     ) -> None: ...
 
     def list_data_gaps(
-        self, *, symbol: str | None = None, data_type: str | None = None
+        self,
+        *,
+        symbol: str | None = None,
+        data_type: str | None = None,
+        start: str | None = None,
+        end: str | None = None,
     ) -> tuple[DataGap, ...]: ...

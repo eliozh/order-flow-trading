@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import shutil
+import threading
 from dataclasses import dataclass
 from datetime import UTC, date, datetime
 from pathlib import Path
@@ -219,7 +220,9 @@ def test_mid_stream_truncation_is_a_retryable_file_failure(
 
     import oft.application.backfill_service as backfill_module
 
-    def broken_stream(stream: object, path: Path, *, max_bytes: int) -> int:
+    def broken_stream(
+        stream: object, path: Path, *, max_bytes: int, on_progress: object = None
+    ) -> int:
         raise http.client.IncompleteRead(b"partial body")
 
     monkeypatch.setattr(backfill_module, "stream_to_file", broken_stream)
@@ -310,3 +313,161 @@ def test_retry_resolves_gaps_and_reports_complete(tmp_path: Path) -> None:
         clock=FixedClock(NOW),
     )
     assert quality.quality.status is DataQuality.COMPLETE
+
+
+def test_each_published_part_is_recorded_in_the_manifest(tmp_path: Path) -> None:
+    harness = _harness(tmp_path)
+    harness.service.run(symbol="BTCUSDT", data_type="aggTrades", start=START, end=END)
+
+    parts = {str(path) for path in _partitions(harness.settings)}
+    entries = harness.store.list_manifest(symbol="BTCUSDT")
+    assert {entry.path for entry in entries} == parts
+    assert all(entry.checksum and entry.rows > 0 and entry.bytes > 0 for entry in entries)
+    assert all(entry.source.startswith("archive:") for entry in entries)
+
+
+def test_commit_failure_never_leaves_a_complete_row_without_parts(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from oft.ports.store import StoreUnavailableError
+
+    harness = _harness(tmp_path)
+    original = harness.store.commit_backfill_file
+    calls = {"count": 0}
+
+    def flaky(**kwargs: object) -> None:
+        calls["count"] += 1
+        if calls["count"] == 1:
+            raise StoreUnavailableError("simulated commit failure")
+        return original(**kwargs)  # type: ignore[arg-type]
+
+    monkeypatch.setattr(harness.store, "commit_backfill_file", flaky)
+
+    with pytest.raises(StoreUnavailableError):
+        harness.service.run(symbol="BTCUSDT", data_type="aggTrades", start=START, end=END)
+
+    row = harness.store.get_backfill_manifest("aggTrades/BTCUSDT/2026-10-01")
+    assert row is None or row.status != "COMPLETE"
+    assert not any("date=2026-10-01" in str(path) for path in _partitions(harness.settings))
+
+    final = harness.service.run(symbol="BTCUSDT", data_type="aggTrades", start=START, end=END)
+    assert final.run.status == "COMPLETE"
+    assert len(_partitions(harness.settings)) == 7
+
+
+def test_resume_reprocesses_when_a_published_part_is_missing(tmp_path: Path) -> None:
+    harness = _harness(tmp_path)
+    harness.service.run(symbol="BTCUSDT", data_type="aggTrades", start=START, end=END)
+    part = next(path for path in _partitions(harness.settings) if "date=2026-10-01" in str(path))
+    part.unlink()
+
+    result = harness.service.run(symbol="BTCUSDT", data_type="aggTrades", start=START, end=END)
+
+    assert result.run.status == "COMPLETE"
+    assert any("date=2026-10-01" in str(path) for path in _partitions(harness.settings))
+    assert len(_all_rows(harness.settings)) == EXPECTED_UNIQUE_ROWS
+
+
+def test_lease_loss_aborts_the_run(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    from oft.application.backfill_service import BackfillError
+
+    harness = _harness(tmp_path)
+    monkeypatch.setattr(harness.store, "touch_backfill_run", lambda *args, **kwargs: False)
+
+    with pytest.raises(BackfillError):
+        harness.service.run(symbol="BTCUSDT", data_type="aggTrades", start=START, end=END)
+
+    run = harness.store.latest_backfill_run()
+    assert run is not None and run.status != "COMPLETE"
+
+
+def test_progress_heartbeats_during_file_processing(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    harness = _harness(tmp_path)
+    calls: list[str] = []
+    monkeypatch.setattr(
+        harness.store,
+        "touch_backfill_run",
+        lambda run_id, **kwargs: (calls.append(run_id), True)[1],
+    )
+    harness.service._progress_interval_seconds = 0.0
+
+    result = harness.service.run(symbol="BTCUSDT", data_type="aggTrades", start=START, end=END)
+
+    assert result.run.status == "COMPLETE"
+    assert len(calls) > 7  # in-flight chunks, not just one per file
+
+
+class _StaleChecksumSource(_RecordingSource):
+    def read_checksum(self, file):  # type: ignore[no-untyped-def]
+        if file.date == date(2026, 10, 2):
+            return f"{'a' * 64}  {file.filename}\n"
+        return super().read_checksum(file)
+
+
+def test_resume_revalidates_the_remote_checksum_and_reprocesses(tmp_path: Path) -> None:
+    harness = _harness(tmp_path)
+    harness.service.run(symbol="BTCUSDT", data_type="aggTrades", start=START, end=END)
+
+    stale = _harness(tmp_path, _StaleChecksumSource(ARCHIVE))
+    with structlog.testing.capture_logs() as logs, pytest.raises(ChecksumMismatchError):
+        stale.service.run(symbol="BTCUSDT", data_type="aggTrades", start=START, end=END)
+
+    events = {entry["event"] for entry in logs}
+    assert "backfill_manifest_stale" in events
+    assert "backfill_checksum_mismatch" in events
+
+
+def test_concurrent_second_run_does_not_change_the_first_owner(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from oft.application.backfill_service import BackfillAlreadyRunning
+
+    harness = _harness(tmp_path)
+    started = threading.Event()
+    release = threading.Event()
+    original = harness.service._process_file
+
+    def slow(run, file, owner):  # type: ignore[no-untyped-def]
+        started.set()
+        release.wait(timeout=5)
+        return original(run, file, owner)
+
+    monkeypatch.setattr(harness.service, "_process_file", slow)
+    results: dict[str, object] = {}
+
+    def first_run() -> None:
+        results["result"] = harness.service.run(
+            symbol="BTCUSDT", data_type="aggTrades", start=START, end=END
+        )
+
+    thread = threading.Thread(target=first_run)
+    thread.start()
+    assert started.wait(timeout=5)
+
+    with pytest.raises(BackfillAlreadyRunning):
+        harness.service.run(symbol="BTCUSDT", data_type="aggTrades", start=START, end=END)
+
+    release.set()
+    thread.join(timeout=10)
+    assert not thread.is_alive()
+    assert results["result"].run.status == "COMPLETE"  # type: ignore[union-attr]
+
+
+class _OfflineSource(_RecordingSource):
+    def read_checksum(self, file):  # type: ignore[no-untyped-def]
+        raise DownloadError("network is offline")
+
+
+def test_offline_retry_skips_verified_parts_and_stays_complete(tmp_path: Path) -> None:
+    harness = _harness(tmp_path)
+    harness.service.run(symbol="BTCUSDT", data_type="aggTrades", start=START, end=END)
+
+    offline = _OfflineSource(ARCHIVE)
+    retry = _harness(tmp_path, offline)
+    result = retry.service.run(symbol="BTCUSDT", data_type="aggTrades", start=START, end=END)
+
+    assert result.run.status == "COMPLETE"
+    assert result.run.files_verified == 7
+    assert offline.opened == []  # nothing was re-downloaded

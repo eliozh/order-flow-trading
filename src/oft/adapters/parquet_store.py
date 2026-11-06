@@ -54,6 +54,17 @@ def _record_hash(trade: AggTrade) -> str:
     return hashlib.sha256(payload.encode("utf-8")).hexdigest()
 
 
+def _fsync_dir(path: Path) -> None:
+    try:
+        descriptor = os.open(path, os.O_RDONLY)
+    except OSError:
+        return
+    try:
+        os.fsync(descriptor)
+    finally:
+        os.close(descriptor)
+
+
 class ParquetStore:
     """Writes one immutable part per fixture import and returns its manifest row."""
 
@@ -76,21 +87,28 @@ class ParquetStore:
         date = first.transact_time.astimezone(UTC).date().isoformat()
         return self._write_part(trades, symbol=symbol, date=date, source=source)
 
-    def _existing_agg_trade_ids(self, symbol: str) -> set[int]:
-        """Every id already published for this symbol, across every date part.
+    def _existing_agg_trade_ids(self, symbol: str, dates: set[str]) -> set[int]:
+        """Ids already published for this symbol, limited to the batch date range.
 
         A read failure must fail closed: silently treating an unreadable part as
-        empty would disable dedupe and duplicate every row on a re-run.
+        empty would disable dedupe and duplicate every row on a re-run. Empty or
+        non-Parquet directories are not read failures.
         """
         root = self._settings.data_dir / "market" / "um" / "agg_trades" / f"symbol={symbol}"
         if not root.is_dir():
             return set()
         import pyarrow.dataset as dataset
 
+        parts: list[str] = []
+        for day in sorted(dates):
+            directory = root / f"date={day}"
+            if not directory.is_dir():
+                continue
+            parts.extend(str(path) for path in directory.glob("*.parquet") if path.is_file())
+        if not parts:
+            return set()
         try:
-            table = dataset.dataset(str(root), format="parquet", partitioning="hive").to_table(
-                columns=["agg_trade_id"]
-            )
+            table = dataset.dataset(parts, format="parquet").to_table(columns=["agg_trade_id"])
         except (OSError, ValueError) as exc:
             raise StoreUnavailableError(
                 f"cannot read existing agg_trade parts for {symbol}: {exc}"
@@ -108,12 +126,14 @@ class ParquetStore:
     ) -> tuple[ManifestEntry, ...]:
         """Dedupe by ``agg_trade_id`` and publish one part per UTC date.
 
-        Deduplication is global for the symbol, so re-running the same archive
-        range cannot duplicate rows even if the manifest is bypassed.
+        Deduplication is scoped to the batch's date partitions, so re-running
+        the same archive range cannot duplicate rows without scanning the whole
+        symbol history.
         """
         if not trades:
             return ()
-        seen = self._existing_agg_trade_ids(symbol)
+        batch_dates = {trade.transact_time.astimezone(UTC).date().isoformat() for trade in trades}
+        seen = self._existing_agg_trade_ids(symbol, batch_dates)
         unique: list[AggTrade] = []
         for trade in trades:
             if trade.agg_trade_id in seen:
@@ -135,7 +155,9 @@ class ParquetStore:
         except Exception:
             # Never leave a partially published multi-date batch behind.
             for entry in published:
-                Path(entry.path).unlink(missing_ok=True)
+                path = Path(entry.path)
+                path.unlink(missing_ok=True)
+                _fsync_dir(path.parent)
             raise
         return tuple(published)
 
@@ -190,6 +212,7 @@ class ParquetStore:
                 os.fsync(handle.fileno())
             checksum = hashlib.sha256(temp_path.read_bytes()).hexdigest()
             os.replace(temp_path, final_path)
+            _fsync_dir(directory)
         finally:
             if temp_path.exists():
                 temp_path.unlink()

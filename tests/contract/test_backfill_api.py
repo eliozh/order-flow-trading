@@ -8,6 +8,7 @@ import socket
 import threading
 import time
 from collections.abc import Iterator
+from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any
 
@@ -22,7 +23,9 @@ from typer.testing import CliRunner
 from oft.api.app import create_app
 from oft.api.envelope import success_envelope
 from oft.cli.api_client import ApiClientError
+from oft.cli.commands.backfill import exit_code_for_error
 from oft.config import Settings
+from oft.domain.time import utc_timestamp
 from oft.ports.store import BackfillRunRecord
 
 ROOT = Path(__file__).resolve().parents[2]
@@ -138,7 +141,7 @@ def test_running_backfill_returns_conflict(tmp_path: Path, validator: Draft20201
             start_date="2026-10-01",
             end_date="2026-10-07",
             status="RUNNING",
-            started_at="2026-11-06T12:00:00.000Z",
+            started_at=utc_timestamp(datetime.now(UTC)),
             finished_at=None,
             estimated_bytes=1,
             processed_bytes=0,
@@ -280,7 +283,7 @@ class _FakeApiClient:
     error: Exception | None = None
 
     @classmethod
-    def from_settings(cls, settings: Settings) -> _FakeApiClient:
+    def from_settings(cls, settings: Settings, **kwargs: Any) -> _FakeApiClient:
         return cls()
 
     def create_backfill(self, payload: dict[str, Any]) -> dict[str, Any]:
@@ -464,3 +467,78 @@ def test_resolved_gaps_do_not_degrade_backfill_or_data_quality(
     assert status.json()["data"]["run"]["status"] == "COMPLETE"
     assert quality.json()["meta"]["data_quality"] == "COMPLETE"
     assert quality.json()["data"]["status"] == "COMPLETE"
+
+
+def test_runtime_error_exit_codes_match_adr_0003() -> None:
+    assert exit_code_for_error("DATA_UNAVAILABLE") == 1
+    assert exit_code_for_error("INTERNAL_ERROR") == 1
+    assert exit_code_for_error("VALIDATION_FAILED") == 2
+    assert exit_code_for_error("BACKFILL_ALREADY_RUNNING") == 4
+    assert exit_code_for_error("CONFIG_INVALID") == 5
+
+
+def test_data_quality_rejects_unsupported_data_type(tmp_path: Path) -> None:
+    app = create_app(_settings(tmp_path))
+
+    with TestClient(app) as client:
+        response = client.get(
+            "/api/v1/data/quality",
+            params={"symbol": "BTCUSDT", "data_type": "klines"},
+            headers=_auth(app),
+        )
+
+    assert response.status_code == 422
+    assert response.json()["error"]["code"] == "VALIDATION_FAILED"
+
+
+def test_data_quality_probe_does_not_persist_gaps(tmp_path: Path) -> None:
+    app = create_app(_settings(tmp_path))
+    params = {"symbol": "BTCUSDT", "start": "2026-10-01", "end": "2026-10-07"}
+
+    with TestClient(app) as client:
+        response = client.get("/api/v1/data/quality", params=params, headers=_auth(app))
+
+    assert response.status_code == 200
+    body = response.json()
+    assert body["data"]["status"] == "PARTIAL"
+    assert len(body["data"]["gaps"]) == 7
+    assert body["data"]["detected_at"]
+    assert body["data"]["run_id"] is None
+    assert app.state.container.store.list_data_gaps(symbol="BTCUSDT") == ()
+
+
+def test_estimate_is_stamped_estimated_not_complete(
+    tmp_path: Path, validator: Draft202012Validator
+) -> None:
+    app = create_app(_settings(tmp_path))
+
+    with TestClient(app) as client:
+        response = client.post("/api/v1/backfill", json=_payload(confirm=False), headers=_auth(app))
+
+    body = response.json()
+    _validate(validator, body)
+    assert body["meta"]["data_quality"] == "ESTIMATED"
+
+
+def test_unsupported_data_type_fails_before_creating_a_run(tmp_path: Path) -> None:
+    app = create_app(_settings(tmp_path))
+    payload = _payload(confirm=True)
+    payload["data_type"] = "trades"
+
+    with TestClient(app) as client:
+        response = client.post("/api/v1/backfill", json=payload, headers=_auth(app))
+
+    assert response.status_code == 422
+    assert response.json()["error"]["code"] == "VALIDATION_FAILED"
+    assert app.state.container.store.list_backfill_runs() == ()
+
+
+def test_test_environment_without_a_fixture_never_uses_https(tmp_path: Path) -> None:
+    settings = Settings(env="test", port=8765, data_dir=tmp_path / "data")
+    app = create_app(settings)
+
+    with TestClient(app) as client:
+        response = client.post("/api/v1/backfill", json=_payload(confirm=False), headers=_auth(app))
+
+    assert response.status_code == 503
+    assert response.json()["error"]["code"] == "DATA_UNAVAILABLE"

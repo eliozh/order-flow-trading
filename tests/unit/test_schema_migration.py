@@ -80,7 +80,7 @@ def test_v1_database_upgrades_to_v2_with_effective_checks(tmp_path: Path) -> Non
     finally:
         connection.close()
 
-    assert versions == {1, 2, 3}
+    assert versions == {1, 2, 3, 4, 5}
 
 
 _V2_BACKFILL = """
@@ -138,4 +138,48 @@ def test_v2_database_gains_the_backfill_heartbeat_column(tmp_path: Path) -> None
 
     assert "updated_at" in columns
     assert updated_at == "2026-11-06T00:00:00.000Z"
-    assert versions == {1, 2, 3}
+    assert versions == {1, 2, 3, 4, 5}
+
+
+def test_v5_checks_indexes_and_foreign_keys(tmp_path: Path) -> None:
+    settings = Settings(env="test", port=8765, data_dir=tmp_path / "data")
+    SqliteStore(settings).initialize()
+    connection = sqlite3.connect(database_path(settings))
+    connection.execute("PRAGMA foreign_keys=ON")
+    try:
+        indexes = {
+            row[0]
+            for row in connection.execute("SELECT name FROM sqlite_master WHERE type = 'index'")
+        }
+        assert "manifest_symbol_date" in indexes
+        with pytest.raises(sqlite3.IntegrityError):
+            connection.execute(
+                """
+                INSERT INTO backfill_manifest (
+                    file_key, run_id, data_type, symbol, date, source_url, checksum,
+                    checksum_verified, status, bytes, rows
+                ) VALUES ('k', NULL, 'aggTrades', 'BTCUSDT', '2026-10-01', 'u', 'c',
+                          1, 'BOGUS', 1, 1)
+                """
+            )
+        with pytest.raises(sqlite3.IntegrityError):
+            connection.execute(
+                """
+                INSERT INTO backfill_manifest (
+                    file_key, run_id, data_type, symbol, date, source_url, checksum,
+                    checksum_verified, status, bytes, rows
+                ) VALUES ('k2', 'MISSING-RUN', 'aggTrades', 'BTCUSDT', '2026-10-01',
+                          'u', 'c', 1, 'COMPLETE', 1, 1)
+                """
+            )
+        with pytest.raises(sqlite3.IntegrityError):
+            connection.execute(
+                """
+                INSERT INTO data_gaps (
+                    gap_id, symbol, data_type, gap_start, gap_end, reason, severity,
+                    detected_at, source
+                ) VALUES ('g', 'BTCUSDT', 'aggTrades', 's', 'e', 'r', 'BOGUS', 't', 'BACKFILL')
+                """
+            )
+    finally:
+        connection.close()

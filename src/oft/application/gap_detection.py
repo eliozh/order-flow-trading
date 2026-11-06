@@ -5,11 +5,11 @@ from __future__ import annotations
 from collections.abc import Iterable, Mapping
 from dataclasses import dataclass
 from datetime import date, timedelta
+from pathlib import Path
 
 from oft.config import Settings
 from oft.domain.data_quality import (
     DataGap,
-    DataQuality,
     GapSeverity,
     QualityResult,
     quality_for,
@@ -21,6 +21,27 @@ from oft.ports.store import StorePort
 MISSING_FILE_REASON = "ARCHIVE_FILE_MISSING"
 INSUFFICIENT_BARS_REASON = "INSUFFICIENT_BARS"
 GAP_SOURCE = "BACKFILL"
+
+# Archive ``data_type`` -> Parquet layout under the data directory.
+_LAYOUT_BY_DATA_TYPE = {"aggTrades": ("um", "agg_trades")}
+SUPPORTED_DATA_TYPES = frozenset(_LAYOUT_BY_DATA_TYPE)
+
+
+class UnsupportedDataTypeError(Exception):
+    """This data type has no Parquet layout; surfaced as VALIDATION_FAILED."""
+
+    code = "VALIDATION_FAILED"
+
+    def __init__(self, data_type: str) -> None:
+        super().__init__(f"unsupported data_type for quality checks: {data_type}")
+        self.message = str(self)
+
+
+def _partition_root(settings: Settings, symbol: str, data_type: str) -> Path:
+    layout = _LAYOUT_BY_DATA_TYPE.get(data_type)
+    if layout is None:
+        raise UnsupportedDataTypeError(data_type)
+    return settings.data_dir / "market" / layout[0] / layout[1] / f"symbol={symbol}"
 
 
 @dataclass(frozen=True)
@@ -135,8 +156,8 @@ def detect_daily_gaps(
     )
 
 
-def _partition_dates(settings: Settings, symbol: str) -> set[date]:
-    root = settings.data_dir / "market" / "um" / "agg_trades" / f"symbol={symbol}"
+def _partition_dates(settings: Settings, symbol: str, data_type: str) -> set[date]:
+    root = _partition_root(settings, symbol, data_type)
     if not root.is_dir():
         return set()
     present: set[date] = set()
@@ -150,11 +171,11 @@ def _partition_dates(settings: Settings, symbol: str) -> set[date]:
     return present
 
 
-def _row_counts(settings: Settings, symbol: str) -> dict[date | str, int]:
+def _row_counts(settings: Settings, symbol: str, data_type: str) -> dict[date | str, int]:
     import pyarrow.parquet as parquet
 
     counts: dict[date | str, int] = {}
-    root = settings.data_dir / "market" / "um" / "agg_trades" / f"symbol={symbol}"
+    root = _partition_root(settings, symbol, data_type)
     for partition in root.glob("date=*"):
         parts = [path for path in partition.glob("*.parquet") if path.is_file()]
         if not parts:
@@ -163,7 +184,7 @@ def _row_counts(settings: Settings, symbol: str) -> dict[date | str, int]:
             day = date.fromisoformat(partition.name.split("=", 1)[1])
         except ValueError:
             continue
-        counts[day] = sum(parquet.read_table(part).num_rows for part in parts)
+        counts[day] = sum(parquet.ParquetFile(part).metadata.num_rows for part in parts)
     return counts
 
 
@@ -179,15 +200,16 @@ def detect_backfill_gaps(
     expected_bars_per_day: int | None = None,
     bars_by_date: Mapping[date | str, int] | None = None,
     run_id: str | None = None,
+    persist: bool = True,
 ) -> GapDetectionResult:
     """Detect gaps from published Parquet partitions and persist them.
 
     Gap IDs are deterministic, so re-running detection updates the same rows
-    instead of creating duplicates.
+    instead of creating duplicates. ``persist=False`` makes a read-only probe.
     """
-    present = _partition_dates(settings, symbol)
+    present = _partition_dates(settings, symbol, data_type)
     if expected_bars_per_day is not None and bars_by_date is None:
-        bars_by_date = _row_counts(settings, symbol)
+        bars_by_date = _row_counts(settings, symbol, data_type)
     result = detect_daily_gaps(
         symbol=symbol,
         data_type=data_type,
@@ -199,19 +221,17 @@ def detect_backfill_gaps(
         bars_by_date=bars_by_date,
         run_id=run_id,
     )
-    for gap in result.quality.gaps:
-        store.upsert_data_gap(gap)
+    if persist:
+        for gap in result.quality.gaps:
+            store.upsert_data_gap(gap)
     return result
 
 
 __all__ = [
     "GapDetectionResult",
+    "SUPPORTED_DATA_TYPES",
+    "UnsupportedDataTypeError",
     "detect_backfill_gaps",
     "detect_daily_gaps",
     "expected_dates",
 ]
-
-
-def quality_status(result: GapDetectionResult) -> DataQuality:
-    """Small helper for callers that only need the stamp."""
-    return result.quality.status

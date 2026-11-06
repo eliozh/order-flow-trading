@@ -231,7 +231,7 @@ def test_transient_http_errors_are_retried_with_backoff() -> None:
 
     with source.open(file) as stream:
         assert stream.read() == b"payload"
-    assert sleeps == [0.25]
+    assert 0.25 <= sleeps[0] < 0.3125
 
 
 def test_exhausted_retries_raise_download_error() -> None:
@@ -249,7 +249,8 @@ def test_exhausted_retries_raise_download_error() -> None:
 
     with pytest.raises(DownloadError):
         source.open(file)
-    assert sleeps == [0.5, 1.0]
+    assert 0.5 <= sleeps[0] < 0.625
+    assert 1.0 <= sleeps[1] < 1.25
 
 
 def test_fixture_source_round_trips_a_committed_archive(tmp_path: Path) -> None:
@@ -308,3 +309,28 @@ def test_live_download_one_day_archive() -> None:
     )[0]
     checksum = source.read_checksum(file)
     assert len(parse_checksum_text(checksum)[0]) == 64
+
+
+def test_retry_after_header_is_respected() -> None:
+    file = _source({}).list_daily(
+        symbol="BTCUSDT", data_type="aggTrades", start=date(2026, 10, 1), end=date(2026, 10, 1)
+    )[0]
+    sleeps: list[float] = []
+    responses: dict[tuple[str, str], Any] = {("GET", file.url): _FakeResponse(b"payload")}
+    opener = _FakeOpener(responses)
+    attempts = {"count": 0}
+
+    def throttled(request: Any, timeout: float | None = None) -> Any:
+        attempts["count"] += 1
+        if attempts["count"] == 1:
+            raise urllib.error.HTTPError(
+                request.full_url, 429, "slow down", {"Retry-After": "2"}, None
+            )
+        return opener(request, timeout)
+
+    source = HttpsArchiveSource(opener=throttled, sleep=sleeps.append, backoff_seconds=0.1)
+
+    with source.open(file) as stream:
+        assert stream.read() == b"payload"
+
+    assert sleeps[0] >= 2.0

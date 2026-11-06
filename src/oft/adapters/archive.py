@@ -11,7 +11,10 @@ from __future__ import annotations
 
 import csv
 import hashlib
+import hmac
+import http.client
 import os
+import random
 import re
 import shutil
 import stat
@@ -20,6 +23,7 @@ import time
 import urllib.error
 import urllib.request
 import zipfile
+import zlib
 from collections.abc import Callable, Mapping
 from dataclasses import dataclass
 from datetime import UTC, date, datetime, timedelta
@@ -134,7 +138,7 @@ def verify_checksum(path: Path, expected: str) -> str:
     """Verify ``path`` against a checksum line or bare digest; return the digest."""
     expected_digest = _expected_digest(expected)
     actual = sha256_file(path)
-    if actual != expected_digest:
+    if not hmac.compare_digest(actual, expected_digest):
         raise ChecksumMismatchError(
             f"archive CHECKSUM mismatch for {path.name}: expected {expected_digest}, got {actual}",
             expected=expected_digest,
@@ -153,6 +157,9 @@ class ExtractionLimits:
     max_entries: int = 1000
     max_uncompressed_bytes: int = 512 * 1024 * 1024
     max_expansion_ratio: float = 200.0
+    max_directories: int = 100
+    max_path_depth: int = 8
+    max_component_length: int = 255
 
 
 @dataclass(frozen=True)
@@ -165,7 +172,7 @@ class ExtractionResult:
     uncompressed_bytes: int
 
 
-def _validate_entry(info: zipfile.ZipInfo, directory: Path) -> Path:
+def _validate_entry(info: zipfile.ZipInfo, directory: Path, policy: ExtractionLimits) -> Path:
     if info.is_dir():
         raise UnsafeArchiveError(f"non-file archive entry rejected: {info.filename!r}")
     if info.flag_bits & 0x1:
@@ -185,10 +192,59 @@ def _validate_entry(info: zipfile.ZipInfo, directory: Path) -> Path:
         raise UnsafeArchiveError(f"absolute archive path rejected: {name!r}")
     if any(part in {"..", ".", ""} for part in relative.parts):
         raise UnsafeArchiveError(f"path traversal rejected: {name!r}")
+    if len(relative.parts) > policy.max_path_depth:
+        raise UnsafeArchiveError(f"archive path is too deep: {name!r}")
+    if any(len(part) > policy.max_component_length for part in relative.parts):
+        raise UnsafeArchiveError(f"archive path component is too long: {name!r}")
     destination = directory / relative
     if not destination.resolve().is_relative_to(directory.resolve()):
         raise UnsafeArchiveError(f"path escapes the extraction root: {name!r}")
     return destination
+
+
+def _ensure_parents(
+    destination: Path,
+    directory: Path,
+    created: set[Path],
+    policy: ExtractionLimits,
+) -> None:
+    missing: list[Path] = []
+    parent = destination.parent
+    while parent != directory and parent != parent.parent:
+        if parent.exists():
+            if not parent.is_dir():
+                raise UnsafeArchiveError(
+                    f"archive entry conflicts with a file: {destination.name!r}"
+                )
+            break
+        missing.append(parent)
+        parent = parent.parent
+    for path in reversed(missing):
+        try:
+            path.mkdir()
+        except FileExistsError:
+            if not path.is_dir():
+                raise UnsafeArchiveError(
+                    f"archive entry conflicts with a file: {destination.name!r}"
+                ) from None
+        created.add(path)
+    if len(created) > policy.max_directories:
+        raise UnsafeArchiveError(f"archive exceeds the {policy.max_directories} directory budget")
+
+
+def _zip_eocd_entry_count(zip_path: Path) -> int | None:
+    """Read the EOCD entry count before parsing the central directory."""
+    try:
+        size = zip_path.stat().st_size
+        with zip_path.open("rb") as handle:
+            handle.seek(max(0, size - 65_557))
+            tail = handle.read()
+    except OSError:
+        return None
+    offset = tail.rfind(b"PK\x05\x06")
+    if offset < 0 or offset + 10 > len(tail):
+        return None
+    return int.from_bytes(tail[offset + 10 : offset + 12], "little")
 
 
 def extract_zip_safely(
@@ -196,6 +252,7 @@ def extract_zip_safely(
     *,
     workspace: Path,
     limits: ExtractionLimits | None = None,
+    on_progress: Callable[[int], None] | None = None,
 ) -> ExtractionResult:
     """Stream a ZIP into a new empty directory under ``workspace``.
 
@@ -205,13 +262,17 @@ def extract_zip_safely(
     policy = limits or ExtractionLimits()
     if not workspace.is_dir():
         raise UnsafeArchiveError(f"extraction workspace is not a directory: {workspace}")
+    declared_entries = _zip_eocd_entry_count(zip_path)
+    if declared_entries is not None and declared_entries > policy.max_entries:
+        raise UnsafeArchiveError(f"archive exceeds the {policy.max_entries} entry limit")
     directory = Path(tempfile.mkdtemp(prefix="oft-extract-", dir=workspace))
     extracted: list[Path] = []
+    created_dirs: set[Path] = set()
     total_written = 0
     try:
         try:
             archive = zipfile.ZipFile(zip_path)
-        except zipfile.BadZipFile as exc:
+        except (zipfile.BadZipFile, OSError) as exc:
             raise UnsafeArchiveError(f"archive is not a valid ZIP file: {zip_path.name}") from exc
         with archive:
             entries = archive.infolist()
@@ -230,8 +291,8 @@ def extract_zip_safely(
                     f"({declared / archive_bytes:.1f} > {policy.max_expansion_ratio})"
                 )
             for info in entries:
-                destination = _validate_entry(info, directory)
-                destination.parent.mkdir(parents=True, exist_ok=True)
+                destination = _validate_entry(info, directory, policy)
+                _ensure_parents(destination, directory, created_dirs, policy)
                 written = 0
                 try:
                     with archive.open(info) as source, destination.open("xb") as target:
@@ -243,9 +304,19 @@ def extract_zip_safely(
                                     "archive exceeded the uncompressed size limit while streaming"
                                 )
                             target.write(chunk)
+                            if on_progress is not None:
+                                on_progress(total_written)
                 except FileExistsError as exc:
                     raise UnsafeArchiveError(
                         f"duplicate archive entry rejected: {info.filename!r}"
+                    ) from exc
+                except (zipfile.BadZipFile, zlib.error) as exc:
+                    raise UnsafeArchiveError(
+                        f"archive entry could not be read: {info.filename!r}"
+                    ) from exc
+                except (IsADirectoryError, NotADirectoryError) as exc:
+                    raise UnsafeArchiveError(
+                        f"archive entry conflicts with a directory: {info.filename!r}"
                     ) from exc
                 extracted.append(destination)
     except Exception:
@@ -278,7 +349,9 @@ def _parse_ms(raw: str) -> datetime:
     )
 
 
-def extract_agg_trade_csv(path: Path, *, symbol: str) -> tuple[AggTrade, ...]:
+def extract_agg_trade_csv(
+    path: Path, *, symbol: str, on_progress: Callable[[int], None] | None = None
+) -> tuple[AggTrade, ...]:
     """Parse one extracted ``aggTrades`` CSV into normalized events."""
     trades: list[AggTrade] = []
     try:
@@ -292,6 +365,8 @@ def extract_agg_trade_csv(path: Path, *, symbol: str) -> tuple[AggTrade, ...]:
                 )
             for line_number, row in enumerate(reader, start=2):
                 try:
+                    if None in row or any(row.get(column) is None for column in _AGG_TRADE_COLUMNS):
+                        raise ValueError("row is shorter than the header")
                     trades.append(
                         AggTrade(
                             symbol=symbol,
@@ -304,11 +379,20 @@ def extract_agg_trade_csv(path: Path, *, symbol: str) -> tuple[AggTrade, ...]:
                             is_buyer_maker=_parse_bool(row["is_buyer_maker"]),
                         )
                     )
-                except (KeyError, ValueError, InvalidOperation) as exc:
+                except (
+                    KeyError,
+                    ValueError,
+                    InvalidOperation,
+                    TypeError,
+                    AttributeError,
+                    OverflowError,
+                ) as exc:
                     raise ArchiveError(
                         f"invalid aggTrade row at line {line_number}: {exc}"
                     ) from exc
-    except OSError as exc:
+                if on_progress is not None and line_number % 10_000 == 0:
+                    on_progress(line_number)
+    except (OSError, UnicodeDecodeError, csv.Error) as exc:
         raise ArchiveError(f"cannot read extracted CSV {path}: {exc}") from exc
     if not trades:
         raise ArchiveError(f"aggTrades CSV {path.name} contains no rows")
@@ -398,6 +482,7 @@ class HttpsArchiveSource:
     def _request(self, url: str, *, method: str = "GET") -> Any:
         last_error: Exception | None = None
         for attempt in range(1, self._max_attempts + 1):
+            retry_after: float | None = None
             request = urllib.request.Request(url, method=method, headers={"User-Agent": USER_AGENT})
             try:
                 return self._opener(request, timeout=self._timeout)
@@ -408,16 +493,28 @@ class HttpsArchiveSource:
                     raise DownloadError(
                         f"archive request failed with HTTP {exc.code}: {url}"
                     ) from exc
-            except (urllib.error.URLError, TimeoutError, OSError) as exc:
+                raw_retry_after = (
+                    _header(dict(exc.headers.items()), "Retry-After") if exc.headers else None
+                )
+                if raw_retry_after and raw_retry_after.strip().isdigit():
+                    retry_after = float(raw_retry_after.strip())
+            except (urllib.error.URLError, TimeoutError, OSError, http.client.HTTPException) as exc:
                 last_error = exc
             if attempt < self._max_attempts:
-                self._sleep(self._backoff_seconds * (2 ** (attempt - 1)))
+                delay = self._backoff_seconds * (2 ** (attempt - 1))
+                delay += random.uniform(0.0, self._backoff_seconds * 0.25)
+                if retry_after is not None:
+                    delay = max(delay, retry_after)
+                self._sleep(delay)
         raise DownloadError(f"archive request failed after retries: {url}") from last_error
 
     def read_checksum(self, file: ArchiveFile) -> str:
         response = self._request(file.checksum_url)
         try:
-            body = response.read(MAX_CHECKSUM_BYTES + 1)
+            try:
+                body = response.read(MAX_CHECKSUM_BYTES + 1)
+            except (http.client.HTTPException, OSError) as exc:
+                raise DownloadError(f"checksum download failed: {file.checksum_url}") from exc
         finally:
             response.close()
         if len(body) > MAX_CHECKSUM_BYTES:
@@ -471,15 +568,22 @@ class FixtureArchiveSource:
         )
 
     def _local(self, file: ArchiveFile) -> Path:
-        canonical = self._fixtures_dir / file.filename
-        if canonical.exists():
-            return canonical
+        root = self._fixtures_dir.resolve()
+        canonical = (root / file.filename).resolve()
         # Committed fixtures use the lower-case ``symbol_type_date`` convention
         # from the slice brief; map the canonical archive name onto it.
         snake_type = re.sub(r"(?<!^)(?=[A-Z])", "-", file.data_type).lower()
-        return self._fixtures_dir / (
-            f"{file.symbol.lower()}_{snake_type}_{file.date.isoformat()}.zip"
-        )
+        fallback = (
+            root / f"{file.symbol.lower()}_{snake_type}_{file.date.isoformat()}.zip"
+        ).resolve()
+        for candidate in (canonical, fallback):
+            if not candidate.is_relative_to(root):
+                raise UnsafeArchiveError(
+                    f"fixture path escapes the fixtures directory: {candidate.name}"
+                )
+            if candidate.exists():
+                return candidate
+        return fallback
 
     def read_checksum(self, file: ArchiveFile) -> str:
         local = self._local(file)
@@ -505,21 +609,52 @@ class FixtureArchiveSource:
 
 
 # Kept for adapters that need to copy a stream to disk without buffering.
+class UnconfiguredArchiveSource:
+    """Explicit failure when a test environment has no fixture archive."""
+
+    def __init__(self, message: str) -> None:
+        self._message = message
+
+    def list_daily(
+        self, *, symbol: str, data_type: str, start: date, end: date
+    ) -> tuple[ArchiveFile, ...]:
+        raise DownloadError(self._message)
+
+    def read_checksum(self, file: ArchiveFile) -> str:
+        raise DownloadError(self._message)
+
+    def expected_size(self, file: ArchiveFile) -> int | None:
+        raise DownloadError(self._message)
+
+    def open(self, file: ArchiveFile) -> ArchiveStream:
+        raise DownloadError(self._message)
+
+
 def stream_to_file(
     stream: Any,
     destination: Path,
     *,
     chunk_size: int = _CHUNK_SIZE,
     max_bytes: int | None = None,
+    on_progress: Callable[[int], None] | None = None,
 ) -> int:
-    """Stream ``stream`` into ``destination`` and return bytes written."""
+    """Stream ``stream`` into a new file (0600, no-follow) and return bytes written."""
+    flags = os.O_WRONLY | os.O_CREAT | os.O_EXCL
+    if hasattr(os, "O_NOFOLLOW"):
+        flags |= os.O_NOFOLLOW
+    try:
+        descriptor = os.open(destination, flags, 0o600)
+    except FileExistsError as exc:
+        raise DownloadError(f"temporary download already exists: {destination.name}") from exc
     written = 0
-    with destination.open("wb") as handle:
+    with os.fdopen(descriptor, "wb") as handle:
         while chunk := stream.read(chunk_size):
             written += len(chunk)
             if max_bytes is not None and written > max_bytes:
                 raise DownloadError(f"download exceeded the {max_bytes} byte cap while streaming")
             handle.write(chunk)
+            if on_progress is not None:
+                on_progress(written)
         handle.flush()
         os.fsync(handle.fileno())
     return written

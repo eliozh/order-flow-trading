@@ -61,3 +61,25 @@ def test_heartbeat_prevents_a_long_run_from_being_stolen(tmp_path: Path) -> None
     assert store.start_backfill_run(_record("BF-NEW", fresh_started)) is False
     long_run = store.get_backfill_run("BF-LONG")
     assert long_run is not None and long_run.status == "RUNNING"
+
+
+def test_heavyweight_run_lease_requires_the_owner(tmp_path: Path) -> None:
+    settings = Settings(env="test", port=8765, data_dir=tmp_path / "data")
+    store = SqliteStore(settings)
+    store.initialize()
+    started = utc_timestamp(datetime.now(UTC))
+
+    assert store.start_backfill_run(_record("BF-OWNED", started), owner="owner-a") is True
+    assert (
+        store.touch_backfill_run(
+            "BF-OWNED", updated_at=utc_timestamp(datetime.now(UTC)), owner="owner-b"
+        )
+        is False
+    )
+    assert (
+        store.touch_backfill_run(
+            "BF-OWNED", updated_at=utc_timestamp(datetime.now(UTC)), owner="owner-a"
+        )
+        is True
+    )
+    assert store.save_backfill_run(_record("BF-OWNED", started), owner="owner-b") is False

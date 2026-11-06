@@ -27,13 +27,13 @@ class ApiClientError(Exception):
 class ApiClient:
     """Minimal JSON client using only the standard library."""
 
-    def __init__(self, base_url: str, token: str | None, *, timeout: float = 2.0) -> None:
+    def __init__(self, base_url: str, token: str | None, *, timeout: float | None = 2.0) -> None:
         self._base_url = base_url.rstrip("/")
         self._token = token
         self._timeout = timeout
 
     @classmethod
-    def from_settings(cls, settings: Settings, *, timeout: float = 2.0) -> ApiClient:
+    def from_settings(cls, settings: Settings, *, timeout: float | None = 2.0) -> ApiClient:
         token = os.environ.get("OFT_API_TOKEN") or read_api_token(settings)
         # ``_origin`` brackets IPv6 literals (``http://[::1]:port``); a bare
         # ``::1`` would make urllib emit an unparseable Host header.

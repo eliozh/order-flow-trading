@@ -4,7 +4,11 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 
-from oft.adapters.archive import FixtureArchiveSource, HttpsArchiveSource
+from oft.adapters.archive import (
+    FixtureArchiveSource,
+    HttpsArchiveSource,
+    UnconfiguredArchiveSource,
+)
 from oft.adapters.fixture_market_data import FixtureMarketData
 from oft.adapters.parquet_store import ParquetStore
 from oft.adapters.sqlite_store import SqliteStore
@@ -53,6 +57,12 @@ def build_container(settings: Settings | None = None, *, initialize: bool = Fals
     symbol_registry = SymbolRegistry(store, clock=clock)
     if resolved.archive_fixture_dir is not None:
         archive: ArchiveSourcePort = FixtureArchiveSource(resolved.archive_fixture_dir)
+    elif resolved.env == "test":
+        # Never fall back to the network in a test environment.
+        archive = UnconfiguredArchiveSource(
+            "OFT_ENV=test requires OFT_ARCHIVE_FIXTURE_DIR; "
+            "HTTPS archive access is disabled in tests"
+        )
     else:
         archive = HttpsArchiveSource()
     backfill = BackfillService(

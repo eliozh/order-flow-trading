@@ -6,6 +6,7 @@ from dataclasses import asdict
 from datetime import date, timedelta
 from typing import Annotated, Any
 
+import structlog
 from fastapi import APIRouter, Query, Request, Response
 from pydantic import BaseModel, ConfigDict, Field, model_validator
 
@@ -18,12 +19,13 @@ from oft.application.backfill_service import (
     BackfillValidationError,
     SizeEstimate,
 )
-from oft.application.gap_detection import detect_backfill_gaps
+from oft.application.gap_detection import UnsupportedDataTypeError, detect_backfill_gaps
 from oft.domain.time import utc_timestamp
 from oft.ports.archive import ArchiveError, ChecksumMismatchError, UnsafeArchiveError
 from oft.ports.store import BackfillManifestRow, BackfillRunRecord
 
 router = APIRouter()
+logger = structlog.get_logger(__name__)
 
 _DEFAULT_DATA_TYPE = "aggTrades"
 
@@ -59,7 +61,12 @@ def _file_payload(row: BackfillManifestRow) -> dict[str, Any]:
 
 
 def _quality(container: Any, run: BackfillRunRecord) -> str:
-    gaps = container.store.list_data_gaps(symbol=run.symbol, data_type=run.data_type)
+    gaps = container.store.list_data_gaps(
+        symbol=run.symbol,
+        data_type=run.data_type,
+        start=run.start_date,
+        end=run.end_date,
+    )
     unresolved = [gap for gap in gaps if gap.resolved_at is None]
     if unresolved and run.status == "COMPLETE":
         return "PARTIAL"
@@ -88,14 +95,18 @@ def _gap_payload(gap: Any) -> dict[str, Any]:
 
 
 def _status_data(container: Any, run: BackfillRunRecord) -> dict[str, Any]:
-    files = tuple(
-        row
-        for row in container.store.list_backfill_manifest(
-            symbol=run.symbol, data_type=run.data_type
-        )
-        if run.start_date <= row.date <= run.end_date
+    files = container.store.list_backfill_manifest(
+        symbol=run.symbol,
+        data_type=run.data_type,
+        start=run.start_date,
+        end=run.end_date,
     )
-    gaps = container.store.list_data_gaps(symbol=run.symbol, data_type=run.data_type)
+    gaps = container.store.list_data_gaps(
+        symbol=run.symbol,
+        data_type=run.data_type,
+        start=run.start_date,
+        end=run.end_date,
+    )
     return {
         "run": _run_payload(run),
         "files": [_file_payload(row) for row in files],
@@ -140,7 +151,7 @@ def create_backfill(
                     "files": [],
                 },
                 request_id=new_request_id(),
-                data_quality="COMPLETE" if estimate.files else "MISSING",
+                data_quality="ESTIMATED" if estimate.files else "MISSING",
             )
         result = service.run(
             symbol=payload.symbol,
@@ -157,7 +168,9 @@ def create_backfill(
     except BackfillValidationError as exc:
         raise ApiError("VALIDATION_FAILED", str(exc)) from exc
     except ArchiveError as exc:
-        raise ApiError("DATA_UNAVAILABLE", str(exc)) from exc
+        # Keep filesystem/upstream detail in the log, not the client envelope.
+        logger.warning("backfill_archive_failed", error=str(exc))
+        raise ApiError("DATA_UNAVAILABLE") from exc
 
     response.status_code = 201
     return success_envelope(
@@ -207,8 +220,13 @@ def data_quality(
     ] = _DEFAULT_DATA_TYPE,
     start: date | None = None,
     end: date | None = None,
+    expected_bars_per_day: Annotated[int | None, Query(ge=1, le=10_000_000)] = None,
 ) -> dict[str, Any]:
-    """Detect and return the data-quality window for a symbol (ADR-0003)."""
+    """Read-only quality probe for a symbol window (ADR-0003).
+
+    Detection never persists gaps here; the payload carries the detection
+    provenance instead (``detected_at``, ``run_id=None``).
+    """
     container = request.app.state.container
     clock = container.clock
     resolved_end = end or clock.now().date()
@@ -220,15 +238,21 @@ def data_quality(
             "VALIDATION_FAILED",
             f"range exceeds the {MAX_BACKFILL_DAYS}-day limit",
         )
-    result = detect_backfill_gaps(
-        container.settings,
-        container.store,
-        symbol=symbol,
-        data_type=data_type,
-        start=resolved_start,
-        end=resolved_end,
-        clock=clock,
-    )
+    try:
+        result = detect_backfill_gaps(
+            container.settings,
+            container.store,
+            symbol=symbol,
+            data_type=data_type,
+            start=resolved_start,
+            end=resolved_end,
+            clock=clock,
+            expected_bars_per_day=expected_bars_per_day,
+            persist=False,
+        )
+    except UnsupportedDataTypeError as exc:
+        raise ApiError("VALIDATION_FAILED", exc.message) from exc
+    detected_at = utc_timestamp(clock.now())
     return success_envelope(
         {
             "symbol": symbol,
@@ -240,9 +264,11 @@ def data_quality(
             "status": result.quality.status.value,
             "reasons": list(result.quality.reasons),
             "gaps": [_gap_payload(gap) for gap in result.quality.gaps],
+            "detected_at": detected_at,
+            "run_id": None,
         },
         request_id=new_request_id(),
-        generated_at=utc_timestamp(clock.now()),
+        generated_at=detected_at,
         provenance="CALC",
         data_quality=result.quality.status.value,
     )
