@@ -60,3 +60,66 @@ def test_cli_and_domain_share_the_same_symbols(monkeypatch, tmp_path: Path) -> N
         item.symbol for item in domain.universe.symbols
     ]
     assert cli["universe"]["count"] == domain.universe.count
+
+
+def _combined_output(result) -> str:
+    return result.output + (getattr(result, "stderr", "") or "")
+
+
+def test_serve_rejects_non_loopback_host_without_override(monkeypatch, tmp_path: Path) -> None:
+    _configure_cli(monkeypatch, tmp_path)
+
+    result = CliRunner().invoke(app, ["serve", "--host", "0.0.0.0"])
+
+    assert result.exit_code == 5, result.output
+    assert "non-loopback" in _combined_output(result).lower()
+
+
+def test_serve_warns_and_runs_with_allow_non_loopback(monkeypatch, tmp_path: Path) -> None:
+    _configure_cli(monkeypatch, tmp_path)
+    captured: dict[str, object] = {}
+
+    import uvicorn
+
+    monkeypatch.setattr(uvicorn, "run", lambda *args, **kwargs: captured.update(kwargs))
+
+    result = CliRunner().invoke(app, ["serve", "--host", "0.0.0.0", "--allow-non-loopback"])
+
+    assert result.exit_code == 0, result.output
+    assert captured["host"] == "0.0.0.0"
+    assert "warning" in _combined_output(result).lower()
+    assert "non-loopback" in _combined_output(result).lower()
+
+
+def test_serve_applies_cli_port_to_the_app_settings(monkeypatch, tmp_path: Path) -> None:
+    _configure_cli(monkeypatch, tmp_path)
+    captured: dict[str, object] = {}
+
+    import uvicorn
+
+    from oft.api.auth import allowed_origins
+
+    def fake_run(*args: object, **kwargs: object) -> None:
+        captured["app"] = args[0] if args else kwargs.get("app")
+        captured.update(kwargs)
+
+    monkeypatch.setattr(uvicorn, "run", fake_run)
+
+    result = CliRunner().invoke(app, ["serve", "--port", "9999"])
+
+    assert result.exit_code == 0, result.output
+    assert captured["port"] == 9999
+    assert captured["host"] == "127.0.0.1"
+    factory = captured["app"]
+    assert callable(factory)
+    resolved_app = factory()
+    assert resolved_app.state.settings.port == 9999
+    assert "http://127.0.0.1:9999" in allowed_origins(resolved_app.state.settings)
+
+
+def test_allowed_origins_brackets_ipv6_loopback() -> None:
+    from oft.api.auth import allowed_origins
+
+    origins = allowed_origins(Settings(env="test", host="::1", port=7612))
+
+    assert "http://[::1]:7612" in origins

@@ -6,8 +6,13 @@ from enum import StrEnum
 from pathlib import Path
 from typing import Any
 
-from pydantic import Field, SecretStr, field_validator
+from pydantic import AliasChoices, Field, SecretStr, ValidationError, field_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
+
+DEFAULT_HOST = "127.0.0.1"
+DEFAULT_PORT = 7611
+CONFIG_INVALID = "CONFIG_INVALID"
+DEFAULT_FIXTURES_DIR = Path(__file__).resolve().parents[2] / "tests" / "fixtures" / "market"
 
 
 class Environment(StrEnum):
@@ -34,12 +39,17 @@ class Settings(BaseSettings):
         env_file=".env",
         env_file_encoding="utf-8",
         extra="ignore",
+        populate_by_name=True,
     )
 
     env: Environment = Environment.PAPER
-    host: str = "127.0.0.1"
-    port: int = Field(default=8080, ge=1, le=65535)
-    data_dir: Path = Path("./data")
+    host: str = DEFAULT_HOST
+    port: int = Field(default=DEFAULT_PORT, ge=1, le=65535)
+    data_dir: Path = Field(
+        default=Path("./data"),
+        validation_alias=AliasChoices("OFT_DATA_DIR", "OFT_DATA"),
+    )
+    fixtures_dir: Path = DEFAULT_FIXTURES_DIR
     log_level: str = "INFO"
 
     api_token: SecretStr | None = None
@@ -58,9 +68,9 @@ class Settings(BaseSettings):
             raise ValueError(f"log_level must be one of {sorted(_VALID_LOG_LEVELS)}")
         return level
 
-    @field_validator("data_dir")
+    @field_validator("data_dir", "fixtures_dir")
     @classmethod
-    def _expand_data_dir(cls, value: Path) -> Path:
+    def _expand_paths(cls, value: Path) -> Path:
         return value.expanduser()
 
     @field_validator(
@@ -79,6 +89,23 @@ class Settings(BaseSettings):
         return value
 
 
+class ConfigError(Exception):
+    """Configuration failed validation; surfaced as ``CONFIG_INVALID``."""
+
+    code = CONFIG_INVALID
+
+    def __init__(self, message: str) -> None:
+        super().__init__(message)
+        self.message = message
+
+
 def load_settings(**overrides: Any) -> Settings:
-    """Load settings from the environment, applying explicit overrides last."""
-    return Settings(**overrides)
+    """Load settings from the environment, applying explicit overrides last.
+
+    Invalid settings are wrapped so every entry point can report the stable
+    ``CONFIG_INVALID`` code instead of leaking a traceback.
+    """
+    try:
+        return Settings(**overrides)
+    except ValidationError as exc:
+        raise ConfigError(str(exc)) from exc

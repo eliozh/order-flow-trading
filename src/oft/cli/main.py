@@ -2,16 +2,14 @@
 
 from __future__ import annotations
 
-import json
 from typing import Annotated, Any
 
 import typer
 
-from oft.api.envelope import new_request_id, success_envelope
-from oft.application.status import StatusReport
-from oft.bootstrap import get_status
-from oft.cli.output import render_status_table
-from oft.config import load_settings
+from oft.cli.commands.doctor import doctor_command, emit_error
+from oft.cli.commands.scan import scan_app
+from oft.cli.commands.status import status_command
+from oft.config import ConfigError, load_settings
 
 app = typer.Typer(
     help="Order Flow Trading local CLI.",
@@ -20,34 +18,77 @@ app = typer.Typer(
 )
 
 
-def _status_envelope(report: StatusReport) -> dict[str, Any]:
-    return success_envelope(
-        report.model_dump(mode="json"),
-        request_id=new_request_id(),
-        generated_at=report.generated_at,
-        provenance="CALC",
-        data_quality="COMPLETE",
-    )
-
-
 @app.callback()
 def _root() -> None:
     """Order Flow Trading local CLI."""
 
 
+app.command(name="status")(status_command)
+app.command(name="doctor")(doctor_command)
+app.add_typer(scan_app, name="scan")
+
+_LOOPBACK_HOSTS = frozenset({"127.0.0.1", "localhost", "::1"})
+
+
 @app.command()
-def status(
-    json_output: Annotated[
+def serve(
+    host: Annotated[str | None, typer.Option("--host", help="Loopback bind address.")] = None,
+    port: Annotated[int | None, typer.Option("--port", help="API port.")] = None,
+    allow_non_loopback: Annotated[
         bool,
-        typer.Option("--json", help="Emit the API envelope as JSON."),
+        typer.Option(
+            "--allow-non-loopback",
+            help="Permit a non-loopback bind (unsupported for shared use).",
+        ),
     ] = False,
 ) -> None:
-    """Show daemon-independent system status."""
-    report = get_status(load_settings())
-    if json_output:
-        typer.echo(json.dumps(_status_envelope(report), indent=2))
-    else:
-        typer.echo(render_status_table(report))
+    """Start the local API/UI daemon (127.0.0.1:7611 by default)."""
+    try:
+        base = load_settings()
+    except ConfigError as exc:
+        emit_error("CONFIG_INVALID", exc.message, json_output=False)
+        raise typer.Exit(code=5) from exc
+
+    resolved_host = host or base.host
+    resolved_port = port or base.port
+    if resolved_host not in _LOOPBACK_HOSTS:
+        if not allow_non_loopback:
+            emit_error(
+                "CONFIG_INVALID",
+                f"refusing non-loopback --host {resolved_host}; the daemon is "
+                "loopback-only. Pass --allow-non-loopback to override (unsupported "
+                "for shared use).",
+                json_output=False,
+            )
+            raise typer.Exit(code=5)
+        typer.echo(
+            f"warning: binding to non-loopback host {resolved_host}; this deployment "
+            "is unsupported and exposes the local API beyond 127.0.0.1",
+            err=True,
+        )
+
+    # CLI overrides must reach the app factory: create_app() must not reload the
+    # environment and silently fall back to the default host/port.
+    try:
+        settings = load_settings(host=resolved_host, port=resolved_port)
+    except ConfigError as exc:
+        emit_error("CONFIG_INVALID", exc.message, json_output=False)
+        raise typer.Exit(code=5) from exc
+
+    def app_factory() -> Any:
+        from oft.api.app import create_app
+
+        return create_app(settings)
+
+    import uvicorn
+
+    uvicorn.run(
+        app_factory,
+        factory=True,
+        host=settings.host,
+        port=settings.port,
+        log_level=settings.log_level.lower(),
+    )
 
 
 def main() -> None:
