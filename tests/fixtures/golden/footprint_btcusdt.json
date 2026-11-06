@@ -238,7 +238,7 @@
     "top_imbalances": []
   },
   "input_manifest_hash": "8e14b5c1930b7607e568f65c3f53c895874774866cd044f15762f3ec0b93c0dc",
-  "metric_version": "orderflow_metrics.v1.d99ac42fd01dd47b",
+  "metric_version": "orderflow_metrics.v1.43ce93c50025f2d5",
   "period": "4h",
   "symbol": "BTCUSDT",
   "window": {

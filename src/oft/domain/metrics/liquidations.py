@@ -152,7 +152,9 @@ def liquidation_sort_key(event: LiquidationEvent) -> tuple[object, ...]:
         event.received_at,
         event.trade_time,
         event.source_seq if event.source_seq is not None else -1,
+        event.symbol,
         event.side,
+        event.average_price,
         event.price,
         event.quantity,
         event.last_fill_quantity if event.last_fill_quantity is not None else Decimal("0"),
@@ -212,6 +214,8 @@ def compute_liquidations(
     for bound in (window_start, window_end):
         if bound is not None and bound.tzinfo is None:
             raise ValueError("window bounds must be timezone-aware")
+    if window_start is not None and window_end is not None and window_end <= window_start:
+        raise ValueError("window_end must be after window_start")
     if coverage_start is not None and coverage_start.tzinfo is None:
         raise ValueError("coverage_start must be timezone-aware")
 

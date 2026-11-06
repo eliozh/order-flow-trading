@@ -341,3 +341,56 @@ def test_persist_rejects_wrong_symbol_before_writing() -> None:
             metric_version="orderflow_metrics.v1.aca82a5196e7e4cc",
         )
     assert writes == []
+
+
+def test_inverted_window_is_rejected_by_compute_and_recorder() -> None:
+    event = _event(1, "SELL")
+    recorder = LiquidationRecorder(clock=FixedClock(NOW))
+    recorder.record(event)
+
+    with pytest.raises(ValueError, match="after"):
+        compute_liquidations(
+            (event,),
+            symbol="BTCUSDT",
+            coverage_start=NOW,
+            window_start=NOW + timedelta(hours=1),
+            window_end=NOW,
+        )
+    with pytest.raises(ValueError, match="after"):
+        recorder.summary(
+            window_start=NOW + timedelta(hours=1),
+            window_end=NOW,
+        )
+
+
+def test_liquidation_sort_key_covers_all_event_fields() -> None:
+    from oft.domain.metrics.liquidations import liquidation_input_hash, liquidation_sort_key
+
+    first = LiquidationEvent(
+        received_at=NOW,
+        trade_time=NOW,
+        symbol="BTCUSDT",
+        side="SELL",
+        price=Decimal("100.00"),
+        average_price=Decimal("100.50"),
+        quantity=Decimal("1"),
+        source_seq=None,
+    )
+    second = LiquidationEvent(
+        received_at=NOW,
+        trade_time=NOW,
+        symbol="BTCUSDT",
+        side="BUY",
+        price=Decimal("100.00"),
+        average_price=Decimal("100.25"),
+        quantity=Decimal("2"),
+        source_seq=None,
+    )
+
+    forward = liquidation_input_hash((first, second), "BTCUSDT")
+    reverse = liquidation_input_hash((second, first), "BTCUSDT")
+
+    assert forward == reverse
+    assert sorted((first, second), key=liquidation_sort_key) == sorted(
+        (second, first), key=liquidation_sort_key
+    )
