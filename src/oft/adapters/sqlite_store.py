@@ -631,16 +631,34 @@ class SqliteStore:
         return tuple(_row_to_scan(row) for row in rows)
 
     def record_manifest(self, entry: ManifestEntry) -> None:
+        # Scans/backfills are append-only: a duplicate path is a real conflict.
         with closing(self._connect()) as connection, connection:
             self._insert_manifest(connection, entry)
 
-    def _insert_manifest(self, connection: sqlite3.Connection, entry: ManifestEntry) -> None:
+    def upsert_manifest_entry(self, entry: ManifestEntry) -> None:
+        """Metrics-only idempotent manifest write (re-persist same content)."""
+        with closing(self._connect()) as connection, connection:
+            self._insert_manifest(connection, entry, upsert=True)
+
+    def _insert_manifest(
+        self, connection: sqlite3.Connection, entry: ManifestEntry, *, upsert: bool = False
+    ) -> None:
+        conflict = (
+            "ON CONFLICT(path) DO UPDATE SET "
+            "data_type = excluded.data_type, symbol = excluded.symbol, "
+            "date = excluded.date, rows = excluded.rows, bytes = excluded.bytes, "
+            "checksum = excluded.checksum, source = excluded.source, "
+            "created_at = excluded.created_at, status = excluded.status"
+            if upsert
+            else ""
+        )
         connection.execute(
-            """
+            f"""
             INSERT INTO manifest (
                 path, data_type, symbol, date, rows, bytes, checksum,
                 source, created_at, status
             ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            {conflict}
             """,
             (
                 entry.path,

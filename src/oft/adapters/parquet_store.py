@@ -4,17 +4,21 @@ from __future__ import annotations
 
 import hashlib
 import os
+import re
 import uuid
 from collections.abc import Callable
 from datetime import UTC, datetime
+from decimal import Decimal
 from pathlib import Path
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, cast
 
 import pyarrow as pa
 import pyarrow.parquet as pq
+import structlog
 
 from oft.config import Settings
 from oft.domain.events import AggTrade
+from oft.domain.metrics.types import MetricRow, decimal_str
 from oft.domain.time import utc_timestamp
 from oft.ports.store import ManifestEntry, StoreUnavailableError
 
@@ -22,6 +26,8 @@ if TYPE_CHECKING:
     import duckdb
 
 _LAYOUT = ("market", "metrics", "footprint", "liquidations")
+METRICS_DATA_TYPE = "metrics"
+_VERSION_TOKEN = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]*$")
 
 
 def ensure_layout(settings: Settings) -> tuple[Path, ...]:
@@ -30,6 +36,154 @@ def ensure_layout(settings: Settings) -> tuple[Path, ...]:
     for root in roots:
         root.mkdir(parents=True, exist_ok=True)
     return roots
+
+
+_VERSION_TOKEN = re.compile(r"^[a-z][a-z0-9_]*\.v[0-9]+\.[0-9a-f]{16}$")
+_SYMBOL_PATTERN = re.compile(r"^[A-Z0-9]{2,24}$")
+
+
+def _validate_metric_path(symbol: str, period: str) -> None:
+    if _SYMBOL_PATTERN.fullmatch(symbol) is None:
+        raise ValueError("symbol contains unsafe path characters")
+    from oft.domain.metrics.delta import parse_period
+
+    parse_period(period)
+
+
+def metrics_root(settings: Settings, *, symbol: str, period: str, metric_version: str) -> Path:
+    """Return the versioned directory for one symbol/period metric version."""
+    _validate_metric_path(symbol, period)
+    if _VERSION_TOKEN.fullmatch(metric_version) is None:
+        raise ValueError("metric_version contains unsafe path characters")
+    return (
+        settings.data_dir
+        / "metrics"
+        / "orderflow"
+        / f"symbol={symbol}"
+        / f"period={period}"
+        / f"metric_version={metric_version}"
+    )
+
+
+def metrics_parts(
+    settings: Settings,
+    *,
+    symbol: str,
+    period: str,
+    metric_version: str | None = None,
+) -> tuple[Path, ...]:
+    """List published metrics parts, optionally filtered to one version."""
+    _validate_metric_path(symbol, period)
+    root = settings.data_dir / "metrics" / "orderflow" / f"symbol={symbol}" / f"period={period}"
+    if not root.is_dir():
+        return ()
+    if metric_version is None:
+        pattern = "metric_version=*/date=*/*.parquet"
+    else:
+        if _VERSION_TOKEN.fullmatch(metric_version) is None:
+            raise ValueError("metric_version contains unsafe path characters")
+        pattern = f"metric_version={metric_version}/date=*/*.parquet"
+    return tuple(sorted(root.glob(pattern)))
+
+
+def read_metrics(
+    settings: Settings, *, symbol: str, period: str, metric_version: str
+) -> tuple[dict[str, object], ...]:
+    """Read every row for one metric version in deterministic order."""
+    parts = metrics_parts(settings, symbol=symbol, period=period, metric_version=metric_version)
+    if not parts:
+        return ()
+    import pyarrow.dataset as dataset
+
+    try:
+        table = dataset.dataset([str(path) for path in parts], format="parquet").to_table()
+    except (OSError, ValueError) as exc:
+        raise StoreUnavailableError(f"cannot read metrics parts for {symbol}: {exc}") from exc
+    rows = cast("list[dict[str, object]]", table.to_pylist())
+
+    # A logical document (version + symbol + period + full window) must be read
+    # from exactly one run/provenance set. Mixing COMPLETE and PARTIAL runs
+    # would produce inconsistent quality stamps and CVD sequences.
+    document_runs: dict[tuple[object, ...], dict[str, list[dict[str, object]]]] = {}
+    for row in rows:
+        document_key = (
+            row.get("metric_version"),
+            row.get("symbol"),
+            row.get("period"),
+            row.get("window_start"),
+            row.get("window_end"),
+        )
+        run_key = str(row.get("input_manifest_hash") or "")
+        document_runs.setdefault(document_key, {}).setdefault(run_key, []).append(row)
+
+    selected: list[dict[str, object]] = []
+    for doc_key, runs in document_runs.items():
+        scored: list[tuple[tuple[int, str, str], str]] = []
+        for run_key, run_rows in runs.items():
+            quality = next(
+                (
+                    str(item.get("data_quality"))
+                    for item in run_rows
+                    if item.get("data_quality") is not None
+                ),
+                "",
+            )
+            complete_rank = 1 if quality == "COMPLETE" else 0
+            latest = max(str(item.get("computed_at") or "") for item in run_rows)
+            scored.append(((complete_rank, latest, run_key), run_key))
+        chosen_run = max(scored)[1]
+        discarded = [key for key in runs if key != chosen_run]
+        if discarded:
+            structlog.get_logger(__name__).warning(
+                "metrics_run_selected",
+                selected_run=chosen_run,
+                discarded_runs=discarded,
+                metric_version=doc_key[0],
+                window_start=str(doc_key[3]),
+                window_end=str(doc_key[4]),
+            )
+        selected.extend(runs[chosen_run])
+    rows = selected
+
+    def _price_key(value: object) -> Decimal:
+        try:
+            return Decimal(str(value))
+        except Exception:
+            return Decimal("-Infinity")
+
+    rows.sort(
+        key=lambda row: (
+            str(row.get("window_start")),
+            str(row.get("window_end")),
+            str(row.get("record_type")),
+            str(row.get("bar_start")),
+            _price_key(row.get("price_low")),
+        )
+    )
+    unique: list[dict[str, object]] = []
+    seen: set[tuple[object, ...]] = set()
+    for row in rows:
+        key = (
+            row.get("record_type"),
+            row.get("metric_version"),
+            row.get("symbol"),
+            row.get("window_start"),
+            row.get("window_end"),
+            row.get("bar_start"),
+            row.get("price_low"),
+        )
+        if key in seen:
+            structlog.get_logger(__name__).warning(
+                "metrics_duplicate_logical_row",
+                symbol=symbol,
+                period=period,
+                metric_version=metric_version,
+                record_type=row.get("record_type"),
+            )
+            continue
+        seen.add(key)
+        unique.append(row)
+    return tuple(unique)
 
 
 def open_duckdb_catalog(settings: Settings) -> duckdb.DuckDBPyConnection:
@@ -66,6 +220,35 @@ def _fsync_dir(path: Path) -> None:
         os.close(descriptor)
 
 
+def _optional_decimal(value: Decimal | None) -> str | None:
+    return None if value is None else decimal_str(value)
+
+
+def _utc_or_none(value: datetime | None) -> datetime | None:
+    return None if value is None else value.astimezone(UTC)
+
+
+def _publish_table(
+    table: pa.Table, directory: Path, *, name_prefix: str | None = None
+) -> tuple[Path, str, int]:
+    """Write a Parquet table via temp -> fsync -> content-addressed rename."""
+    temp_path = directory / f".part-{uuid.uuid4().hex}.tmp"
+    checksum = ""
+    try:
+        pq.write_table(table, temp_path, compression="snappy")
+        with temp_path.open("rb") as handle:
+            os.fsync(handle.fileno())
+        checksum = hashlib.sha256(temp_path.read_bytes()).hexdigest()
+        stem = f"{name_prefix}-{checksum[:16]}" if name_prefix else uuid.uuid4().hex
+        final_path = directory / f"part-{stem}.parquet"
+        os.replace(temp_path, final_path)
+        _fsync_dir(directory)
+    finally:
+        if temp_path.exists():
+            temp_path.unlink()
+    return final_path, checksum, final_path.stat().st_size
+
+
 def recover_orphan_parts(settings: Settings, known_paths: set[str]) -> tuple[ManifestEntry, ...]:
     """Adopt published parts that were never recorded in the manifest table.
 
@@ -96,6 +279,43 @@ def recover_orphan_parts(settings: Settings, known_paths: set[str]) -> tuple[Man
                 bytes=path.stat().st_size,
                 checksum=checksum,
                 source="recovered:orphan",
+                created_at=utc_timestamp(datetime.now(UTC)),
+            )
+        )
+    return tuple(recovered)
+
+
+def recover_orphan_metric_parts(
+    settings: Settings, known_paths: set[str]
+) -> tuple[ManifestEntry, ...]:
+    """Adopt published metrics parts that never reached the manifest table."""
+    root = settings.data_dir / "metrics" / "orderflow"
+    if not root.is_dir():
+        return ()
+    recovered: list[ManifestEntry] = []
+    for path in sorted(root.glob("symbol=*/period=*/metric_version=*/date=*/*.parquet")):
+        if str(path) in known_paths:
+            continue
+        version = path.parent.parent.name.split("=", 1)[1]
+        symbol = path.parent.parent.parent.parent.name.split("=", 1)[1]
+        day = path.parent.name.split("=", 1)[1]
+        try:
+            rows = pq.ParquetFile(path).metadata.num_rows
+            checksum = hashlib.sha256(path.read_bytes()).hexdigest()
+        except (OSError, ValueError) as exc:
+            raise StoreUnavailableError(
+                f"cannot reconcile orphan metrics part {path}: {exc}"
+            ) from exc
+        recovered.append(
+            ManifestEntry(
+                path=str(path),
+                data_type="metrics",
+                symbol=symbol,
+                date=day,
+                rows=rows,
+                bytes=path.stat().st_size,
+                checksum=checksum,
+                source=f"metrics:{version}",
                 created_at=utc_timestamp(datetime.now(UTC)),
             )
         )
@@ -202,6 +422,104 @@ class ParquetStore:
                 _fsync_dir(path.parent)
             raise
         return tuple(published)
+
+    def write_metrics_part(
+        self,
+        rows: tuple[MetricRow, ...] | list[MetricRow],
+        *,
+        symbol: str,
+        period: str,
+        window_start: datetime,
+        window_end: datetime,
+        metric_version: str,
+        input_manifest_hash: str,
+        computed_at: str,
+        data_quality: str,
+        quality_reasons: tuple[str, ...],
+    ) -> ManifestEntry:
+        """Publish one immutable long-format metrics part with full provenance."""
+        if not rows:
+            raise ValueError("cannot write an empty metrics part")
+        directory = (
+            metrics_root(
+                self._settings,
+                symbol=symbol,
+                period=period,
+                metric_version=metric_version,
+            )
+            / f"date={window_start.astimezone(UTC).date().isoformat()}"
+        )
+        directory.mkdir(parents=True, exist_ok=True)
+        reasons = list(quality_reasons)
+        table = pa.table(
+            {
+                "record_type": pa.array([row.record_type for row in rows], pa.string()),
+                "symbol": pa.array([symbol for _ in rows], pa.string()),
+                "period": pa.array([period for _ in rows], pa.string()),
+                "window_start": pa.array(
+                    [window_start.astimezone(UTC) for _ in rows],
+                    pa.timestamp("ms", tz="UTC"),
+                ),
+                "window_end": pa.array(
+                    [window_end.astimezone(UTC) for _ in rows],
+                    pa.timestamp("ms", tz="UTC"),
+                ),
+                "bar_start": pa.array(
+                    [_utc_or_none(row.bar_start) for row in rows],
+                    pa.timestamp("ms", tz="UTC"),
+                ),
+                "bar_end": pa.array(
+                    [_utc_or_none(row.bar_end) for row in rows],
+                    pa.timestamp("ms", tz="UTC"),
+                ),
+                "buy_volume": pa.array(
+                    [_optional_decimal(row.buy_volume) for row in rows], pa.string()
+                ),
+                "sell_volume": pa.array(
+                    [_optional_decimal(row.sell_volume) for row in rows], pa.string()
+                ),
+                "delta": pa.array([_optional_decimal(row.delta) for row in rows], pa.string()),
+                "cvd": pa.array([_optional_decimal(row.cvd) for row in rows], pa.string()),
+                "taker_buy_ratio": pa.array(
+                    [_optional_decimal(row.taker_buy_ratio) for row in rows], pa.string()
+                ),
+                "price_low": pa.array(
+                    [_optional_decimal(row.price_low) for row in rows], pa.string()
+                ),
+                "price_high": pa.array(
+                    [_optional_decimal(row.price_high) for row in rows], pa.string()
+                ),
+                "volume": pa.array([_optional_decimal(row.volume) for row in rows], pa.string()),
+                "is_poc": pa.array([row.is_poc for row in rows], pa.bool_()),
+                "in_value_area": pa.array([row.in_value_area for row in rows], pa.bool_()),
+                "metric_version": pa.array([metric_version for _ in rows], pa.string()),
+                "input_manifest_hash": pa.array([input_manifest_hash for _ in rows], pa.string()),
+                "computed_at": pa.array([computed_at for _ in rows], pa.string()),
+                "data_quality": pa.array([data_quality for _ in rows], pa.string()),
+                "quality_reasons": pa.array([reasons for _ in rows], type=pa.list_(pa.string())),
+            }
+        )
+        final_path, checksum, size = _publish_table(
+            table,
+            directory,
+            # Content-addressed: full window + content hash. Identical inputs
+            # reuse the same immutable path; different inputs never overwrite.
+            name_prefix=(
+                f"{window_start.astimezone(UTC):%Y%m%dT%H%M%S}-"
+                f"{window_end.astimezone(UTC):%Y%m%dT%H%M%S}"
+            ),
+        )
+        return ManifestEntry(
+            path=str(final_path),
+            data_type=METRICS_DATA_TYPE,
+            symbol=symbol,
+            date=window_start.astimezone(UTC).date().isoformat(),
+            rows=len(rows),
+            bytes=size,
+            checksum=checksum,
+            source=f"metrics:{metric_version}",
+            created_at=computed_at,
+        )
 
     def _write_part(
         self,
