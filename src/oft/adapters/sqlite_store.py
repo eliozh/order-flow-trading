@@ -671,6 +671,12 @@ class SqliteStore:
         with closing(self._connect()) as connection, connection:
             self._insert_manifest(connection, entry, upsert=True)
 
+    def upsert_manifest_entries(self, entries: tuple[ManifestEntry, ...]) -> None:
+        """Publish metrics + footprint manifest rows in one transaction."""
+        with closing(self._connect()) as connection, connection:
+            for entry in entries:
+                self._insert_manifest(connection, entry, upsert=True)
+
     def _insert_manifest(
         self, connection: sqlite3.Connection, entry: ManifestEntry, *, upsert: bool = False
     ) -> None:

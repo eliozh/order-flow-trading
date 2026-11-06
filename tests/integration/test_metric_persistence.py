@@ -253,13 +253,13 @@ def test_manifest_insert_failure_removes_the_published_part(
 ) -> None:
     harness = _harness(tmp_path)
     captured: dict[str, str] = {}
-    original = harness.store.upsert_manifest_entry
+    original = harness.store.upsert_manifest_entries
 
-    def fail(entry: object) -> None:
-        captured["path"] = entry.path  # type: ignore[attr-defined]
+    def fail(entries: object) -> None:
+        captured["path"] = entries[0].path  # type: ignore[index]
         raise RuntimeError("simulated manifest insert failure")
 
-    monkeypatch.setattr(harness.store, "upsert_manifest_entry", fail)
+    monkeypatch.setattr(harness.store, "upsert_manifest_entries", fail)
 
     with pytest.raises(RuntimeError, match="manifest"):
         harness.service.compute_and_persist(_request(value_area_pct=Decimal("68")))
@@ -267,7 +267,7 @@ def test_manifest_insert_failure_removes_the_published_part(
     assert captured["path"]
     assert not Path(captured["path"]).exists()
 
-    monkeypatch.setattr(harness.store, "upsert_manifest_entry", original)
+    monkeypatch.setattr(harness.store, "upsert_manifest_entries", original)
     assert not metrics_parts(harness.settings, symbol="BTCUSDT", period="4h")
 
 
@@ -574,10 +574,10 @@ def test_repeated_manifest_failure_keeps_the_published_part(tmp_path: Path) -> N
     first = harness.service.compute_and_persist(_request())
     first_bytes = Path(first.entry.path).read_bytes()
 
-    def fail(_entry: object) -> None:
+    def fail(_entries: object) -> None:
         raise RuntimeError("manifest unavailable")
 
-    harness.store.upsert_manifest_entry = fail  # type: ignore[method-assign]
+    harness.store.upsert_manifest_entries = fail  # type: ignore[method-assign]
 
     with pytest.raises(RuntimeError, match="manifest"):
         harness.service.compute_and_persist(_request())
@@ -908,13 +908,13 @@ def test_unreadable_manifest_keeps_the_published_part(tmp_path: Path) -> None:
     harness = _harness(tmp_path)
     first = harness.service.compute_and_persist(_request())
 
-    def fail_upsert(_entry: object) -> None:
+    def fail_upsert(_entries: object) -> None:
         raise StoreUnavailableError("manifest db unavailable")
 
     def fail_get(_path: str) -> object:
         raise StoreUnavailableError("manifest db unavailable")
 
-    harness.store.upsert_manifest_entry = fail_upsert  # type: ignore[method-assign]
+    harness.store.upsert_manifest_entries = fail_upsert  # type: ignore[method-assign]
     harness.store.get_manifest_entry = fail_get  # type: ignore[method-assign]
     later = MetricService(
         settings=harness.settings,

@@ -28,9 +28,17 @@ VALUE_AREA_RULE = "MIN_CONTIGUOUS_BINS"
 _ALGORITHM_SOURCE_FILES = (
     "cvd.py",
     "volume_profile.py",
+    "footprint.py",
+    "open_interest.py",
+    "funding.py",
+    "liquidations.py",
     "types.py",
     "delta.py",
+)
+_APPLICATION_SOURCE_FILES = (
     "metric_service.py",
+    "oi_funding_service.py",
+    "liquidation_recorder.py",
 )
 
 
@@ -38,12 +46,16 @@ def _algorithm_source_digest() -> str:
     """Hash the algorithm implementation so code edits change the version."""
     digest = hashlib.sha256()
     here = Path(__file__).resolve().parent
-    application = here.parents[1] / "application" / "metric_service.py"
+    application = here.parents[1] / "application"
     for name in _ALGORITHM_SOURCE_FILES:
-        digest.update(name.encode("utf-8"))
+        digest.update(f"domain/{name}".encode())
         digest.update(b"\0")
-        path = application if name == "metric_service.py" else here / name
-        digest.update(path.read_bytes())
+        digest.update((here / name).read_bytes())
+        digest.update(b"\0")
+    for name in _APPLICATION_SOURCE_FILES:
+        digest.update(f"application/{name}".encode())
+        digest.update(b"\0")
+        digest.update((application / name).read_bytes())
         digest.update(b"\0")
     return digest.hexdigest()
 
@@ -122,8 +134,16 @@ def orderflow_metric_version(
     bin_size_multiple: int,
     cvd_algorithm_version: int = 1,
     volume_profile_algorithm_version: int = 1,
+    footprint_algorithm_version: int = 1,
+    footprint_imbalance_threshold: Decimal = Decimal("3"),
+    footprint_stacked_min_levels: int = 3,
+    footprint_top_imbalances: int = 10,
+    open_interest_algorithm_version: int = 1,
+    funding_algorithm_version: int = 1,
+    liquidation_algorithm_version: int = 1,
+    liquidation_bucket_seconds: int = 60,
 ) -> MetricVersion:
-    """Version the combined CVD + volume-profile document."""
+    """Version the complete order-flow document (all six metric groups)."""
     parse_period(period)
     if unit not in ("BASE", "QUOTE"):
         raise ValueError("unit must be BASE or QUOTE")
@@ -133,6 +153,18 @@ def orderflow_metric_version(
         raise ValueError("value_area_pct must be in (0, 100]")
     if bin_size_multiple < 1:
         raise ValueError("bin_size_multiple must be >= 1")
+    if (
+        not isinstance(footprint_imbalance_threshold, Decimal)
+        or not footprint_imbalance_threshold.is_finite()
+        or footprint_imbalance_threshold <= 1
+    ):
+        raise ValueError("footprint_imbalance_threshold must be greater than 1")
+    if footprint_stacked_min_levels < 2:
+        raise ValueError("footprint_stacked_min_levels must be >= 2")
+    if footprint_top_imbalances < 0:
+        raise ValueError("footprint_top_imbalances must be >= 0")
+    if liquidation_bucket_seconds < 1:
+        raise ValueError("liquidation_bucket_seconds must be >= 1")
     parameters: dict[str, object] = {
         "algorithm_source_sha256": ALGORITHM_SOURCE_DIGEST,
         "cvd_algorithm": "cvd",
@@ -141,6 +173,27 @@ def orderflow_metric_version(
         "cvd_ratio_precision": RATIO_PRECISION,
         "cvd_ratio_rounding": RATIO_ROUNDING,
         "cvd_taker_mapping": "IS_BUYER_MAKER_FALSE_IS_BUY",
+        "funding_algorithm": "funding",
+        "funding_algorithm_version": funding_algorithm_version,
+        "funding_interval_rule": "FOUR_OR_EIGHT_HOURS_EXPLICIT",
+        "footprint_algorithm": "footprint",
+        "footprint_algorithm_version": footprint_algorithm_version,
+        "footprint_bucket_multiple": bin_size_multiple,
+        "footprint_bucket_rule": "TICK_SIZE_MULTIPLE",
+        "footprint_imbalance_rule": "DOMINANT_OVER_OPPOSITE",
+        "footprint_imbalance_threshold": footprint_imbalance_threshold,
+        "footprint_ratio_precision": RATIO_PRECISION,
+        "footprint_stacked_min_levels": footprint_stacked_min_levels,
+        "footprint_top_imbalances": footprint_top_imbalances,
+        "liquidation_algorithm": "liquidations",
+        "liquidation_algorithm_version": liquidation_algorithm_version,
+        "liquidation_bucket_seconds": liquidation_bucket_seconds,
+        "liquidation_coverage_rule": "SINCE_DEPLOYMENT_NO_HISTORICAL_BACKFILL",
+        "liquidation_side_mapping": "SELL_IS_LONG_BUY_IS_SHORT",
+        "open_interest_algorithm": "open_interest",
+        "open_interest_algorithm_version": open_interest_algorithm_version,
+        "open_interest_resample_interval": "5m",
+        "open_interest_sampling_rule": "EXACT_TARGET_INTERVAL_ELSE_FORWARD_FILL_ESTIMATED",
         "period": period,
         "unit": unit,
         "volume_profile_algorithm": "volume_profile",

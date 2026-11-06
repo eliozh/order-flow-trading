@@ -7,7 +7,7 @@ import json
 import os
 import re
 import uuid
-from collections.abc import Callable
+from collections.abc import Callable, Sequence
 from datetime import UTC, datetime
 from decimal import Decimal, InvalidOperation
 from pathlib import Path
@@ -19,6 +19,8 @@ import structlog
 
 from oft.config import Settings
 from oft.domain.events import AggTrade
+from oft.domain.metrics.footprint import FootprintResult
+from oft.domain.metrics.liquidations import LiquidationEvent, liquidation_sort_key
 from oft.domain.metrics.types import MetricRow, decimal_str
 from oft.domain.time import utc_timestamp
 from oft.ports.store import ManifestEntry, StorePort, StoreUnavailableError
@@ -28,6 +30,8 @@ if TYPE_CHECKING:
 
 _LAYOUT = ("market", "metrics", "footprint", "liquidations")
 METRICS_DATA_TYPE = "metrics"
+FOOTPRINT_DATA_TYPE = "footprint"
+LIQUIDATIONS_DATA_TYPE = "liquidations"
 
 
 def ensure_layout(settings: Settings) -> tuple[Path, ...]:
@@ -263,6 +267,179 @@ def read_metrics(
             metric_version=metric_version,
             duplicates=duplicate_count,
         )
+    return tuple(unique)
+
+
+def footprint_root(settings: Settings, *, symbol: str, period: str, metric_version: str) -> Path:
+    """Versioned footprint directory following the ADR-0002 hive layout."""
+    _validate_metric_path(symbol, period)
+    if _VERSION_TOKEN.fullmatch(metric_version) is None:
+        raise ValueError("metric_version contains unsafe path characters")
+    return (
+        settings.data_dir
+        / "footprint"
+        / f"symbol={symbol}"
+        / f"period={period}"
+        / f"metric_version={metric_version}"
+    )
+
+
+def footprint_parts(
+    settings: Settings, *, symbol: str, period: str, metric_version: str
+) -> tuple[Path, ...]:
+    root = footprint_root(settings, symbol=symbol, period=period, metric_version=metric_version)
+    if not root.is_dir():
+        return ()
+    return tuple(sorted(root.glob("date=*/*.parquet")))
+
+
+def liquidations_root(settings: Settings, *, symbol: str, metric_version: str) -> Path:
+    """Versioned liquidation directory; liquidations have no period dimension."""
+    if _SYMBOL_PATTERN.fullmatch(symbol) is None:
+        raise ValueError("symbol contains unsafe path characters")
+    if _VERSION_TOKEN.fullmatch(metric_version) is None:
+        raise ValueError("metric_version contains unsafe path characters")
+    return (
+        settings.data_dir / "liquidations" / f"symbol={symbol}" / f"metric_version={metric_version}"
+    )
+
+
+def liquidation_parts(settings: Settings, *, symbol: str, metric_version: str) -> tuple[Path, ...]:
+    root = liquidations_root(settings, symbol=symbol, metric_version=metric_version)
+    if not root.is_dir():
+        return ()
+    return tuple(sorted(root.glob("date=*/*.parquet")))
+
+
+def _registered_parts(
+    settings: Settings,
+    store: StorePort | None,
+    data_type: str,
+    parts: tuple[Path, ...],
+) -> tuple[Path, ...]:
+    if store is None:
+        from oft.adapters.sqlite_store import SqliteStore
+
+        store = SqliteStore(settings)
+    store_path = getattr(store, "path", None)
+    if store_path is not None and not Path(store_path).exists():
+        raise StoreUnavailableError("manifest database is unreadable")
+    registered = {
+        entry.path
+        for entry in store.list_manifest()
+        if entry.data_type == data_type and entry.status in {"PUBLISHED", "COMPLETE"}
+    }
+    return tuple(path for path in parts if str(path) in registered)
+
+
+def read_footprint(
+    settings: Settings,
+    *,
+    symbol: str,
+    period: str,
+    metric_version: str,
+    store: StorePort | None = None,
+) -> tuple[dict[str, object], ...]:
+    """Read manifest-registered footprint rows in deterministic price order."""
+    parts = _registered_parts(
+        settings,
+        store,
+        FOOTPRINT_DATA_TYPE,
+        footprint_parts(settings, symbol=symbol, period=period, metric_version=metric_version),
+    )
+    if not parts:
+        return ()
+    import pyarrow.dataset as dataset
+
+    try:
+        table = dataset.dataset([str(path) for path in parts], format="parquet").to_table()
+    except (OSError, ValueError, pa.ArrowException) as exc:
+        raise StoreUnavailableError(f"cannot read footprint parts for {symbol}: {exc}") from exc
+    rows = cast("list[dict[str, object]]", table.to_pylist())
+    rows.sort(
+        key=lambda row: (
+            str(row.get("window_start")),
+            str(row.get("bar_start")),
+            Decimal(str(row.get("price", "0"))),
+        )
+    )
+    return _unique_rows(
+        rows,
+        key=lambda row: (
+            row.get("metric_version"),
+            row.get("window_start"),
+            row.get("bar_start"),
+            row.get("price"),
+        ),
+    )
+
+
+def read_liquidations(
+    settings: Settings,
+    *,
+    symbol: str,
+    metric_version: str,
+    store: StorePort | None = None,
+) -> tuple[dict[str, object], ...]:
+    """Read manifest-registered liquidation event rows in event order."""
+    parts = _registered_parts(
+        settings,
+        store,
+        LIQUIDATIONS_DATA_TYPE,
+        liquidation_parts(settings, symbol=symbol, metric_version=metric_version),
+    )
+    if not parts:
+        return ()
+    import pyarrow.dataset as dataset
+
+    try:
+        table = dataset.dataset([str(path) for path in parts], format="parquet").to_table()
+    except (OSError, ValueError, pa.ArrowException) as exc:
+        raise StoreUnavailableError(f"cannot read liquidation parts for {symbol}: {exc}") from exc
+    rows = cast("list[dict[str, object]]", table.to_pylist())
+    rows.sort(
+        key=lambda row: (
+            str(row.get("received_at")),
+            str(row.get("trade_time")),
+            str(row.get("source_seq")),
+        )
+    )
+    return _unique_rows(
+        rows,
+        key=lambda row: (
+            row.get("metric_version"),
+            row.get("received_at"),
+            row.get("trade_time"),
+            row.get("side"),
+            row.get("source_seq"),
+            row.get("price"),
+            _first_present(row, "original_quantity", "quantity"),
+            row.get("average_price"),
+            row.get("last_fill_quantity"),
+        ),
+    )
+
+
+def _first_present(row: dict[str, object], *names: str) -> object:
+    for name in names:
+        if name in row and row[name] is not None:
+            return row[name]
+    return None
+
+
+def _unique_rows(
+    rows: list[dict[str, object]],
+    *,
+    key: Callable[[dict[str, object]], tuple[object, ...]],
+) -> tuple[dict[str, object], ...]:
+    unique: list[dict[str, object]] = []
+    seen: set[tuple[object, ...]] = set()
+    for row in rows:
+        row_key = key(row)
+        if row_key in seen:
+            continue
+        seen.add(row_key)
+        unique.append(row)
     return tuple(unique)
 
 
@@ -642,6 +819,217 @@ class ParquetStore:
             window_start=utc_timestamp(window_start),
             window_end=utc_timestamp(window_end),
         )
+
+    def write_footprint_part(
+        self,
+        footprint: FootprintResult,
+        *,
+        symbol: str,
+        period: str,
+        window_start: datetime,
+        window_end: datetime,
+        metric_version: str,
+        input_manifest_hash: str,
+        computed_at: str,
+        data_quality: str,
+        quality_reasons: tuple[str, ...],
+    ) -> ManifestEntry:
+        """Publish one immutable long-format footprint part (ADR-0002 layout)."""
+        directory = (
+            footprint_root(
+                self._settings,
+                symbol=symbol,
+                period=period,
+                metric_version=metric_version,
+            )
+            / f"date={window_start.astimezone(UTC).date().isoformat()}"
+        )
+        directory.mkdir(parents=True, exist_ok=True)
+        rows = [(bar, cell) for bar in footprint.bars for cell in bar.cells]
+        reasons = list(quality_reasons)
+        table = pa.table(
+            {
+                "record_type": pa.array(["FOOTPRINT_CELL" for _ in rows], pa.string()),
+                "symbol": pa.array([symbol for _ in rows], pa.string()),
+                "period": pa.array([period for _ in rows], pa.string()),
+                "window_start": pa.array(
+                    [window_start.astimezone(UTC) for _ in rows],
+                    pa.timestamp("ms", tz="UTC"),
+                ),
+                "window_end": pa.array(
+                    [window_end.astimezone(UTC) for _ in rows],
+                    pa.timestamp("ms", tz="UTC"),
+                ),
+                "bar_start": pa.array(
+                    [bar.bar_start.astimezone(UTC) for bar, _ in rows],
+                    pa.timestamp("ms", tz="UTC"),
+                ),
+                "bar_end": pa.array(
+                    [bar.bar_end.astimezone(UTC) for bar, _ in rows],
+                    pa.timestamp("ms", tz="UTC"),
+                ),
+                "price": pa.array([decimal_str(cell.price) for _, cell in rows], pa.string()),
+                "bid_volume": pa.array(
+                    [decimal_str(cell.bid_volume) for _, cell in rows], pa.string()
+                ),
+                "ask_volume": pa.array(
+                    [decimal_str(cell.ask_volume) for _, cell in rows], pa.string()
+                ),
+                "delta": pa.array([decimal_str(cell.delta) for _, cell in rows], pa.string()),
+                "total_volume": pa.array(
+                    [decimal_str(cell.total_volume) for _, cell in rows], pa.string()
+                ),
+                "imbalance_ratio": pa.array(
+                    [_optional_decimal(cell.imbalance_ratio) for _, cell in rows],
+                    pa.string(),
+                ),
+                "is_stacked_imbalance": pa.array(
+                    [cell.is_stacked_imbalance for _, cell in rows], pa.bool_()
+                ),
+                "metric_version": pa.array([metric_version for _ in rows], pa.string()),
+                "input_manifest_hash": pa.array([input_manifest_hash for _ in rows], pa.string()),
+                "computed_at": pa.array([computed_at for _ in rows], pa.string()),
+                "data_quality": pa.array([data_quality for _ in rows], pa.string()),
+                "quality_reasons": pa.array([reasons for _ in rows], type=pa.list_(pa.string())),
+            }
+        )
+        final_path, checksum, size = self._publish_content_addressed(
+            table,
+            directory,
+            window_start=window_start,
+            window_end=window_end,
+        )
+        return ManifestEntry(
+            path=str(final_path),
+            data_type=FOOTPRINT_DATA_TYPE,
+            symbol=symbol,
+            date=window_start.astimezone(UTC).date().isoformat(),
+            rows=len(rows),
+            bytes=size,
+            checksum=checksum,
+            source=f"footprint:{metric_version}",
+            created_at=computed_at,
+            metric_version=metric_version,
+            input_manifest_hash=input_manifest_hash,
+            window_start=utc_timestamp(window_start),
+            window_end=utc_timestamp(window_end),
+        )
+
+    def write_liquidation_part(
+        self,
+        events: Sequence[LiquidationEvent],
+        *,
+        symbol: str,
+        window_start: datetime,
+        window_end: datetime,
+        metric_version: str,
+        input_manifest_hash: str,
+        computed_at: str,
+        data_quality: str,
+        quality_reasons: tuple[str, ...],
+    ) -> ManifestEntry:
+        """Publish one immutable liquidation event part (ADR-0002 layout)."""
+        if window_start.tzinfo is None or window_end.tzinfo is None:
+            raise ValueError("liquidation window bounds must be timezone-aware")
+        if window_end <= window_start:
+            raise ValueError("window_end must be after window_start")
+        ordered_events = sorted(events, key=liquidation_sort_key)
+        for event in ordered_events:
+            if event.symbol != symbol:
+                raise ValueError(f"liquidation symbol {event.symbol!r} does not match {symbol!r}")
+            if not (window_start <= event.received_at < window_end):
+                raise ValueError("liquidation event is outside the requested window")
+        events = ordered_events
+        directory = (
+            liquidations_root(self._settings, symbol=symbol, metric_version=metric_version)
+            / f"date={window_start.astimezone(UTC).date().isoformat()}"
+        )
+        directory.mkdir(parents=True, exist_ok=True)
+        reasons = list(quality_reasons)
+        table = pa.table(
+            {
+                "received_at": pa.array(
+                    [event.received_at.astimezone(UTC) for event in events],
+                    pa.timestamp("ms", tz="UTC"),
+                ),
+                "trade_time": pa.array(
+                    [event.trade_time.astimezone(UTC) for event in events],
+                    pa.timestamp("ms", tz="UTC"),
+                ),
+                "symbol": pa.array([event.symbol for event in events], pa.string()),
+                "side": pa.array([event.side for event in events], pa.string()),
+                "order_type": pa.array([event.order_type for event in events], pa.string()),
+                "time_in_force": pa.array([event.time_in_force for event in events], pa.string()),
+                "original_quantity": pa.array(
+                    [decimal_str(event.quantity) for event in events], pa.string()
+                ),
+                "price": pa.array([decimal_str(event.price) for event in events], pa.string()),
+                "average_price": pa.array(
+                    [decimal_str(event.average_price) for event in events], pa.string()
+                ),
+                "order_status": pa.array([event.order_status for event in events], pa.string()),
+                "last_fill_quantity": pa.array(
+                    [_optional_decimal(event.last_fill_quantity) for event in events],
+                    pa.string(),
+                ),
+                "accumulated_fill_quantity": pa.array(
+                    [decimal_str(event.quantity) for event in events], pa.string()
+                ),
+                "source_seq": pa.array([event.source_seq for event in events], pa.int64()),
+                "metric_version": pa.array([metric_version for _ in events], pa.string()),
+                "input_manifest_hash": pa.array([input_manifest_hash for _ in events], pa.string()),
+                "computed_at": pa.array([computed_at for _ in events], pa.string()),
+                "data_quality": pa.array([data_quality for _ in events], pa.string()),
+                "quality_reasons": pa.array([reasons for _ in events], type=pa.list_(pa.string())),
+            }
+        )
+        final_path, checksum, size = self._publish_content_addressed(
+            table,
+            directory,
+            window_start=window_start,
+            window_end=window_end,
+        )
+        return ManifestEntry(
+            path=str(final_path),
+            data_type=LIQUIDATIONS_DATA_TYPE,
+            symbol=symbol,
+            date=window_start.astimezone(UTC).date().isoformat(),
+            rows=len(events),
+            bytes=size,
+            checksum=checksum,
+            source=f"liquidations:{metric_version}",
+            created_at=computed_at,
+            metric_version=metric_version,
+            input_manifest_hash=input_manifest_hash,
+            window_start=utc_timestamp(window_start),
+            window_end=utc_timestamp(window_end),
+        )
+
+    def _publish_content_addressed(
+        self,
+        table: pa.Table,
+        directory: Path,
+        *,
+        window_start: datetime,
+        window_end: datetime,
+    ) -> tuple[Path, str, int]:
+        """Publish a part whose identity excludes runtime-only ``computed_at``."""
+        identity = table.drop_columns(["computed_at"])
+        sink = pa.BufferOutputStream()
+        pq.write_table(identity, sink, compression="snappy")
+        identity_hash = hashlib.sha256(sink.getvalue().to_pybytes()).hexdigest()
+        prefix = (
+            f"{window_start.astimezone(UTC):%Y%m%dT%H%M%S}-"
+            f"{window_end.astimezone(UTC):%Y%m%dT%H%M%S}"
+        )
+        candidate = directory / f"part-{prefix}-{identity_hash[:16]}.parquet"
+        if candidate.is_file():
+            return (
+                candidate,
+                hashlib.sha256(candidate.read_bytes()).hexdigest(),
+                candidate.stat().st_size,
+            )
+        return _publish_table(table, directory, name_prefix=prefix, stem_hash=identity_hash)
 
     def _write_part(
         self,
