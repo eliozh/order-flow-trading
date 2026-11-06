@@ -24,9 +24,24 @@ import structlog
 
 from oft.adapters.parquet_store import recover_orphan_metric_parts
 from oft.config import Settings
-from oft.domain.data_quality import DataGap
+from oft.domain.data_quality import DataGap, DataQuality
 from oft.domain.events import AggTrade
 from oft.domain.metrics.cvd import assert_kline_cross_check, compute_cvd
+from oft.domain.metrics.footprint import (
+    DEFAULT_IMBALANCE_THRESHOLD,
+    DEFAULT_STACKED_MIN_LEVELS,
+    DEFAULT_TOP_IMBALANCES,
+    FootprintResult,
+    compute_footprint,
+)
+from oft.domain.metrics.funding import FundingResult
+from oft.domain.metrics.liquidations import (
+    LIMITATIONS,
+    LiquidationEvent,
+    LiquidationResult,
+    liquidation_input_hash,
+)
+from oft.domain.metrics.open_interest import OpenInterestResult
 from oft.domain.metrics.types import (
     CvdResult,
     MetricQuality,
@@ -52,7 +67,7 @@ _SYMBOL_PATTERN = re.compile(r"^[A-Z0-9]{2,24}$")
 
 
 class MetricsWriterPort(Protocol):
-    """Publishes one immutable metrics Parquet part."""
+    """Publishes immutable metrics, footprint, and liquidation Parquet parts."""
 
     def write_metrics_part(
         self,
@@ -68,6 +83,72 @@ class MetricsWriterPort(Protocol):
         data_quality: str,
         quality_reasons: tuple[str, ...],
     ) -> ManifestEntry: ...
+
+    def write_footprint_part(
+        self,
+        footprint: FootprintResult,
+        *,
+        symbol: str,
+        period: str,
+        window_start: datetime,
+        window_end: datetime,
+        metric_version: str,
+        input_manifest_hash: str,
+        computed_at: str,
+        data_quality: str,
+        quality_reasons: tuple[str, ...],
+    ) -> ManifestEntry: ...
+
+    def write_liquidation_part(
+        self,
+        events: Sequence[LiquidationEvent],
+        *,
+        symbol: str,
+        window_start: datetime,
+        window_end: datetime,
+        metric_version: str,
+        input_manifest_hash: str,
+        computed_at: str,
+        data_quality: str,
+        quality_reasons: tuple[str, ...],
+    ) -> ManifestEntry: ...
+
+
+@dataclass(frozen=True)
+class MetricInputs:
+    """Measured inputs that are not derivable from the aggTrade row set.
+
+    ``None`` means the section was not measured for this document; the service
+    then emits its deterministic placeholder and a PARTIAL/MISSING reason.
+    """
+
+    open_interest: OpenInterestResult | None = None
+    funding: FundingResult | None = None
+    liquidations: LiquidationResult | None = None
+
+
+_QUALITY_RANK: dict[DataQuality, int] = {
+    DataQuality.COMPLETE: 0,
+    DataQuality.PARTIAL: 1,
+    DataQuality.ESTIMATED: 2,
+    DataQuality.STALE: 3,
+    DataQuality.MISSING: 4,
+}
+
+
+def _merge_quality(*qualities: MetricQuality) -> MetricQuality:
+    """Merge section quality; the most severe stamp wins, reasons are deduped."""
+    present = tuple(quality for quality in qualities if quality is not None)
+    if not present:
+        return MetricQuality.complete()
+    status = max(
+        (quality.data_quality for quality in present),
+        key=lambda value: _QUALITY_RANK[value],
+    )
+    reasons: list[str] = []
+    for quality in present:
+        reasons.extend(quality.quality_reasons)
+    return MetricQuality(data_quality=status, quality_reasons=tuple(dict.fromkeys(reasons)))
 
 
 @dataclass(frozen=True)
@@ -181,7 +262,11 @@ class MetricDocument:
     computed_at: str
     quality: MetricQuality
     cvd: CvdResult
+    footprint: FootprintResult
     volume_profile: VolumeProfile
+    open_interest: OpenInterestResult | None
+    funding: FundingResult | None
+    liquidations: LiquidationResult | None
     rows: tuple[MetricRow, ...]
     json_text: str
 
@@ -192,10 +277,11 @@ class MetricDocument:
 
 @dataclass(frozen=True)
 class PersistedMetric:
-    """A document and the immutable part/manifest row that stores it."""
+    """A document and the immutable parts/manifest rows that store it."""
 
     document: MetricDocument
     entry: ManifestEntry
+    footprint_entry: ManifestEntry | None = None
 
 
 def _epoch_millis(value: datetime) -> int:
@@ -204,8 +290,17 @@ def _epoch_millis(value: datetime) -> int:
     return delta.days * 86_400_000 + delta.seconds * 1_000 + delta.microseconds // 1_000
 
 
-def input_manifest_hash(trades: Sequence[AggTrade], request: MetricRequest) -> str:
-    """Hash the canonical row set that produced the metric document."""
+def input_manifest_hash(
+    trades: Sequence[AggTrade],
+    request: MetricRequest,
+    inputs: MetricInputs | None = None,
+) -> str:
+    """Hash the canonical row set that produced the metric document.
+
+    The two-argument form is byte-identical to the slice-04 hash so existing
+    goldens and persisted documents keep their provenance. Measured v2 inputs
+    extend the hash deterministically when they are supplied.
+    """
     digest = hashlib.sha256()
     digest.update(
         (
@@ -219,6 +314,29 @@ def input_manifest_hash(trades: Sequence[AggTrade], request: MetricRequest) -> s
             (
                 f"{trade.agg_trade_id}|{decimal_str(trade.price)}|{decimal_str(trade.quantity)}|"
                 f"{_epoch_millis(trade.transact_time)}|{int(trade.is_buyer_maker)}\n"
+            ).encode()
+        )
+    if inputs is not None:
+        digest.update(b"\0inputs\0")
+        digest.update(
+            contract_json(
+                {
+                    "open_interest": (
+                        inputs.open_interest.to_contract()
+                        if inputs.open_interest is not None and inputs.open_interest.points
+                        else None
+                    ),
+                    "funding": (
+                        inputs.funding.to_contract()
+                        if inputs.funding is not None and inputs.funding.current_rate is not None
+                        else None
+                    ),
+                    "liquidations": (
+                        inputs.liquidations.to_contract()
+                        if inputs.liquidations is not None
+                        else None
+                    ),
+                }
             ).encode()
         )
     return digest.hexdigest()
@@ -465,10 +583,53 @@ def _document_payload(
     computed_at: str,
     quality: MetricQuality,
     cvd: CvdResult,
+    footprint: FootprintResult,
     profile: VolumeProfile,
+    inputs: MetricInputs,
     gaps: Sequence[DataGap],
 ) -> dict[str, object]:
     window = MetricWindow(request.window_start, request.window_end)
+    open_interest = (
+        inputs.open_interest.to_contract()
+        if inputs.open_interest is not None and inputs.open_interest.points
+        else {
+            "unit": "BASE",
+            "sampling": "REGULAR",
+            "points": [],
+            "delta_over_window": "0",
+            "last": {
+                "ts": utc_timestamp(window.end),
+                "open_interest": "0",
+                "open_interest_value": "0",
+            },
+        }
+    )
+    funding = (
+        inputs.funding.to_contract()
+        if inputs.funding is not None and inputs.funding.current_rate is not None
+        else {
+            "current_rate": "0",
+            "next_funding_time": utc_timestamp(window.end),
+            "interval_hours": 8,
+            "mark_price": "0",
+            "index_price": "0",
+            "history": [],
+        }
+    )
+    liquidations = (
+        inputs.liquidations.to_contract()
+        if inputs.liquidations is not None
+        else {
+            "coverage": "NONE",
+            "coverage_start": None,
+            "coverage_end": None,
+            "total_long_notional": "0",
+            "total_short_notional": "0",
+            "count": 0,
+            "buckets": [],
+            "limitations": list(LIMITATIONS),
+        }
+    )
     return {
         "schema_version": SCHEMA_VERSION,
         "symbol": request.symbol,
@@ -483,44 +644,11 @@ def _document_payload(
         "data_quality": quality.data_quality.value,
         "quality_reasons": list(quality.quality_reasons),
         "cvd": _cvd_payload(cvd),
-        "footprint": {
-            "price_bucket": decimal_str(profile.bin_size),
-            "imbalance_threshold": Decimal("3"),
-            "bars": [],
-            "top_imbalances": [],
-        },
+        "footprint": footprint.to_contract(),
         "volume_profile": _volume_profile_payload(profile),
-        "open_interest": {
-            "unit": "BASE",
-            "sampling": "REGULAR",
-            "points": [],
-            "delta_over_window": "0",
-            "last": {
-                "ts": utc_timestamp(window.end),
-                "open_interest": "0",
-                "open_interest_value": "0",
-            },
-        },
-        "funding": {
-            "current_rate": "0",
-            "next_funding_time": utc_timestamp(window.end),
-            "interval_hours": 8,
-            "mark_price": "0",
-            "index_price": "0",
-            "history": [],
-        },
-        "liquidations": {
-            "coverage": "NONE",
-            "coverage_start": None,
-            "coverage_end": None,
-            "total_long_notional": "0",
-            "total_short_notional": "0",
-            "count": 0,
-            "buckets": [],
-            "limitations": [
-                "No historical USD-M liquidation backfill exists; coverage starts at deployment."
-            ],
-        },
+        "open_interest": open_interest,
+        "funding": funding,
+        "liquidations": liquidations,
         "sources": [_source_ref(settings, request, version.identifier, input_hash, computed_at)],
         "gaps": _gap_payload(gaps),
     }
@@ -550,13 +678,22 @@ class MetricService:
             tick_size=request.tick_size,
             value_area_pct=request.value_area_pct,
             bin_size_multiple=request.bin_size_multiple,
+            footprint_imbalance_threshold=DEFAULT_IMBALANCE_THRESHOLD,
+            footprint_stacked_min_levels=DEFAULT_STACKED_MIN_LEVELS,
+            footprint_top_imbalances=DEFAULT_TOP_IMBALANCES,
         )
 
-    def compute(self, request: MetricRequest) -> MetricDocument:
+    def compute(
+        self,
+        request: MetricRequest,
+        *,
+        inputs: MetricInputs | None = None,
+    ) -> MetricDocument:
         MetricWindow(request.window_start, request.window_end)
         if request.unit != "BASE":
             raise ValueError("metric engine v1 supports BASE-unit CVD only")
         version = self._version(request)
+        resolved = inputs if inputs is not None else MetricInputs()
         trades = load_agg_trades(self._settings, request, self._store)
         cvd = compute_cvd(
             trades,
@@ -565,6 +702,18 @@ class MetricService:
             window_start=request.window_start,
             window_end=request.window_end,
             unit=request.unit,
+        )
+        footprint = compute_footprint(
+            trades,
+            symbol=request.symbol,
+            period=request.period,
+            window_start=request.window_start,
+            window_end=request.window_end,
+            tick_size=request.tick_size,
+            bucket_multiple=request.bin_size_multiple,
+            imbalance_threshold=DEFAULT_IMBALANCE_THRESHOLD,
+            stacked_min_levels=DEFAULT_STACKED_MIN_LEVELS,
+            top_imbalances=DEFAULT_TOP_IMBALANCES,
         )
         profile = compute_volume_profile(
             trades,
@@ -575,21 +724,29 @@ class MetricService:
             bin_size_multiple=request.bin_size_multiple,
             value_area_pct=request.value_area_pct,
         )
-        input_hash = input_manifest_hash(trades, request)
-        quality = _quality(self._settings, request, trades, self._store)
+        input_hash = input_manifest_hash(trades, request, inputs)
+        base_quality = _quality(self._settings, request, trades, self._store)
         klines = load_klines(self._settings, request)
         cross_reasons = _kline_cross_check_reasons(klines, cvd, request.period)
-        if quality.data_quality.value != "MISSING":
-            # OI/funding are not measured in this slice; never present their
-            # schema placeholders as measured zeroes.
-            quality = MetricQuality.partial(
-                (
-                    *quality.quality_reasons,
-                    *cross_reasons,
-                    "open_interest not measured in this slice",
-                    "funding not measured in this slice",
-                )
+        if base_quality.data_quality != DataQuality.MISSING:
+            base_quality = MetricQuality(
+                data_quality=base_quality.data_quality,
+                quality_reasons=(*base_quality.quality_reasons, *cross_reasons),
             )
+        contributions: list[MetricQuality] = [base_quality]
+        if resolved.open_interest is not None:
+            contributions.append(resolved.open_interest.quality)
+        elif base_quality.data_quality != DataQuality.MISSING:
+            # Not measured for this document; never present the placeholder as
+            # a measured zero.
+            contributions.append(
+                MetricQuality.partial(("open_interest not measured in this slice",))
+            )
+        if resolved.funding is not None:
+            contributions.append(resolved.funding.quality)
+        elif base_quality.data_quality != DataQuality.MISSING:
+            contributions.append(MetricQuality.partial(("funding not measured in this slice",)))
+        quality = _merge_quality(*contributions)
         computed_at = utc_timestamp(self._clock.now())
         start_day = request.window_start.astimezone(UTC).date().isoformat()
         last_day = (
@@ -609,7 +766,9 @@ class MetricService:
             computed_at=computed_at,
             quality=quality,
             cvd=cvd,
+            footprint=footprint,
             profile=profile,
+            inputs=resolved,
             gaps=gaps,
         )
         return MetricDocument(
@@ -619,7 +778,11 @@ class MetricService:
             computed_at=computed_at,
             quality=quality,
             cvd=cvd,
+            footprint=footprint,
             volume_profile=profile,
+            open_interest=resolved.open_interest,
+            funding=resolved.funding,
+            liquidations=resolved.liquidations,
             rows=_metric_rows(cvd, profile),
             json_text=contract_json(payload),
         )
@@ -657,24 +820,8 @@ class MetricService:
             self._store.upsert_manifest_entry(entry)
         self._reconciled = True
 
-    def compute_and_persist(self, request: MetricRequest) -> PersistedMetric:
-        document = self.compute(request)
-        self._reconcile_metric_parts()
-        entry = self._parquet.write_metrics_part(
-            document.rows,
-            symbol=request.symbol,
-            period=request.period,
-            window_start=request.window_start,
-            window_end=request.window_end,
-            metric_version=document.metric_version,
-            input_manifest_hash=document.input_manifest_hash,
-            computed_at=document.computed_at,
-            data_quality=document.quality.data_quality.value,
-            quality_reasons=document.quality.quality_reasons,
-        )
-        try:
-            self._store.upsert_manifest_entry(entry)
-        except Exception:
+    def _cleanup_unreferenced(self, entries: Sequence[ManifestEntry]) -> None:
+        for entry in entries:
             # Only delete when the manifest explicitly says this path is
             # unreferenced. An unreadable DB leaves the part for adoption.
             try:
@@ -683,5 +830,81 @@ class MetricService:
                 referenced = True
             if not referenced:
                 Path(entry.path).unlink(missing_ok=True)
+
+    def compute_and_persist(
+        self,
+        request: MetricRequest,
+        *,
+        inputs: MetricInputs | None = None,
+    ) -> PersistedMetric:
+        document = self.compute(request, inputs=inputs)
+        self._reconcile_metric_parts()
+        entries: list[ManifestEntry] = []
+        try:
+            metrics_entry = self._parquet.write_metrics_part(
+                document.rows,
+                symbol=request.symbol,
+                period=request.period,
+                window_start=request.window_start,
+                window_end=request.window_end,
+                metric_version=document.metric_version,
+                input_manifest_hash=document.input_manifest_hash,
+                computed_at=document.computed_at,
+                data_quality=document.quality.data_quality.value,
+                quality_reasons=document.quality.quality_reasons,
+            )
+            entries.append(metrics_entry)
+            footprint_entry = self._parquet.write_footprint_part(
+                document.footprint,
+                symbol=request.symbol,
+                period=request.period,
+                window_start=request.window_start,
+                window_end=request.window_end,
+                metric_version=document.metric_version,
+                input_manifest_hash=document.input_manifest_hash,
+                computed_at=document.computed_at,
+                data_quality=document.quality.data_quality.value,
+                quality_reasons=document.quality.quality_reasons,
+            )
+            entries.append(footprint_entry)
+            for entry in entries:
+                self._store.upsert_manifest_entry(entry)
+        except Exception:
+            self._cleanup_unreferenced(entries)
             raise
-        return PersistedMetric(document=document, entry=entry)
+        return PersistedMetric(
+            document=document,
+            entry=metrics_entry,
+            footprint_entry=footprint_entry,
+        )
+
+    def persist_liquidation_events(
+        self,
+        events: Sequence[LiquidationEvent],
+        *,
+        symbol: str,
+        window_start: datetime,
+        window_end: datetime,
+        metric_version: str,
+        data_quality: str = "COMPLETE",
+        quality_reasons: tuple[str, ...] = (),
+    ) -> ManifestEntry:
+        """Publish a content-addressed liquidation event part and manifest row."""
+        computed_at = utc_timestamp(self._clock.now())
+        entry = self._parquet.write_liquidation_part(
+            events,
+            symbol=symbol,
+            window_start=window_start,
+            window_end=window_end,
+            metric_version=metric_version,
+            input_manifest_hash=liquidation_input_hash(events, symbol),
+            computed_at=computed_at,
+            data_quality=data_quality,
+            quality_reasons=quality_reasons,
+        )
+        try:
+            self._store.upsert_manifest_entry(entry)
+        except Exception:
+            self._cleanup_unreferenced((entry,))
+            raise
+        return entry

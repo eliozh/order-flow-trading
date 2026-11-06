@@ -43,3 +43,37 @@ CLI. Decimal arithmetic is used end to end; values are never floats.
 - Columns: `symbol,bar_start,open,high,low,close,volume,taker_buy_volume,close_time`.
 - Cross-check identity: `delta = 2 * taker_buy_volume - volume` per bar
   (0.20 = 2*0.40 - 0.60). Tampering one row must fail the metric cross-check.
+
+## `xauusdt_metrics_sample.csv`
+
+- Source: synthetic sample shaped like the public Binance USD-M `metrics`
+  (`openInterest`, `sumOpenInterestValue`, long/short and taker ratios) and
+  funding/mark-price endpoints. **Not** an official archive file.
+- Created: 2026-11-06.
+- Symbol: XAUUSDT (TradFi perpetual). Window: 2026-10-01T00:00:00Z to
+  2026-10-01T04:00:00Z.
+- Columns: `symbol,record_type,ts,open_interest,open_interest_value,`
+  `long_short_ratio,taker_ratio,funding_rate,mark_price,index_price,`
+  `funding_interval_hours`.
+- `record_type=OPEN_INTEREST` timestamps are deliberately irregular
+  (00:00, 00:05, 00:11, 00:15, 00:22), matching the documented TradFi irregular
+  sampling. The metric core resamples them to 5m, stamps the section
+  `IRREGULAR_RESAMPLED` and the document `ESTIMATED`, and marks synthesized
+  points as estimates. Interpolation is never presented as measured.
+- `record_type=FUNDING` rows use an 8h interval. A missing funding period is
+  reported `MISSING`; it is never inserted as a zero rate.
+
+## `liquidations_btcusdt.jsonl`
+
+- Source: **recorded/live-shaped public `forceOrder` events** (normalized to
+  the ADR-0002 liquidation columns), not an archive download. Historical
+  USDⓈ-M liquidation data does not exist; no test depends on it.
+- Created: 2026-11-06.
+- Symbol: BTCUSDT. Event window: 2026-10-01T00:01:05Z to 00:02:45Z.
+- Side mapping: `side=SELL` means a long position was liquidated;
+  `side=BUY` means a short position was liquidated.
+- Coverage is labelled **since deployment** (`coverage_start` is the recorder's
+  injected deployment time). `limitations` always states that the WS feed
+  pushes only the largest liquidation per symbol per second and that no
+  historical backfill exists.
+- Decimal fields are JSON strings so binary floats never enter the metric path.

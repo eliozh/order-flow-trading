@@ -1,0 +1,23 @@
+{
+  "funding": {
+    "current_rate": "0.00030000",
+    "history": [
+      {
+        "interval_hours": 8,
+        "rate": "0.00010000",
+        "ts": "2026-10-01T00:00:00.000Z"
+      },
+      {
+        "interval_hours": 8,
+        "rate": "0.00030000",
+        "ts": "2026-10-01T08:00:00.000Z"
+      }
+    ],
+    "index_price": "70101.00",
+    "interval_hours": 8,
+    "mark_price": "70100.00",
+    "next_funding_time": "2026-10-01T16:00:00.000Z"
+  },
+  "metric_version": "orderflow_metrics.v1.a5f1756b83629ccf",
+  "symbol": "BTCUSDT"
+}

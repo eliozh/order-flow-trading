@@ -1,0 +1,248 @@
+{
+  "footprint": {
+    "bars": [
+      {
+        "bar_end": "2026-10-01T04:00:00.000Z",
+        "bar_start": "2026-10-01T00:00:00.000Z",
+        "cells": [
+          {
+            "ask_volume": "0.10",
+            "bid_volume": "0",
+            "delta": "0.10",
+            "imbalance_ratio": null,
+            "is_stacked_imbalance": false,
+            "price": "70000.00",
+            "total_volume": "0.10"
+          },
+          {
+            "ask_volume": "0",
+            "bid_volume": "0.20",
+            "delta": "-0.20",
+            "imbalance_ratio": null,
+            "is_stacked_imbalance": false,
+            "price": "70001.00",
+            "total_volume": "0.20"
+          },
+          {
+            "ask_volume": "0.30",
+            "bid_volume": "0",
+            "delta": "0.30",
+            "imbalance_ratio": null,
+            "is_stacked_imbalance": false,
+            "price": "70002.00",
+            "total_volume": "0.30"
+          }
+        ]
+      },
+      {
+        "bar_end": "2026-10-02T04:00:00.000Z",
+        "bar_start": "2026-10-02T00:00:00.000Z",
+        "cells": [
+          {
+            "ask_volume": "0.10",
+            "bid_volume": "0",
+            "delta": "0.10",
+            "imbalance_ratio": null,
+            "is_stacked_imbalance": false,
+            "price": "70000.00",
+            "total_volume": "0.10"
+          },
+          {
+            "ask_volume": "0",
+            "bid_volume": "0.20",
+            "delta": "-0.20",
+            "imbalance_ratio": null,
+            "is_stacked_imbalance": false,
+            "price": "70001.00",
+            "total_volume": "0.20"
+          },
+          {
+            "ask_volume": "0.30",
+            "bid_volume": "0",
+            "delta": "0.30",
+            "imbalance_ratio": null,
+            "is_stacked_imbalance": false,
+            "price": "70002.00",
+            "total_volume": "0.30"
+          }
+        ]
+      },
+      {
+        "bar_end": "2026-10-03T04:00:00.000Z",
+        "bar_start": "2026-10-03T00:00:00.000Z",
+        "cells": [
+          {
+            "ask_volume": "0.10",
+            "bid_volume": "0",
+            "delta": "0.10",
+            "imbalance_ratio": null,
+            "is_stacked_imbalance": false,
+            "price": "70000.00",
+            "total_volume": "0.10"
+          },
+          {
+            "ask_volume": "0",
+            "bid_volume": "0.20",
+            "delta": "-0.20",
+            "imbalance_ratio": null,
+            "is_stacked_imbalance": false,
+            "price": "70001.00",
+            "total_volume": "0.20"
+          },
+          {
+            "ask_volume": "0.30",
+            "bid_volume": "0",
+            "delta": "0.30",
+            "imbalance_ratio": null,
+            "is_stacked_imbalance": false,
+            "price": "70002.00",
+            "total_volume": "0.30"
+          }
+        ]
+      },
+      {
+        "bar_end": "2026-10-04T04:00:00.000Z",
+        "bar_start": "2026-10-04T00:00:00.000Z",
+        "cells": [
+          {
+            "ask_volume": "0.10",
+            "bid_volume": "0",
+            "delta": "0.10",
+            "imbalance_ratio": null,
+            "is_stacked_imbalance": false,
+            "price": "70000.00",
+            "total_volume": "0.10"
+          },
+          {
+            "ask_volume": "0",
+            "bid_volume": "0.20",
+            "delta": "-0.20",
+            "imbalance_ratio": null,
+            "is_stacked_imbalance": false,
+            "price": "70001.00",
+            "total_volume": "0.20"
+          },
+          {
+            "ask_volume": "0.30",
+            "bid_volume": "0",
+            "delta": "0.30",
+            "imbalance_ratio": null,
+            "is_stacked_imbalance": false,
+            "price": "70002.00",
+            "total_volume": "0.30"
+          }
+        ]
+      },
+      {
+        "bar_end": "2026-10-05T04:00:00.000Z",
+        "bar_start": "2026-10-05T00:00:00.000Z",
+        "cells": [
+          {
+            "ask_volume": "0.10",
+            "bid_volume": "0",
+            "delta": "0.10",
+            "imbalance_ratio": null,
+            "is_stacked_imbalance": false,
+            "price": "70000.00",
+            "total_volume": "0.10"
+          },
+          {
+            "ask_volume": "0",
+            "bid_volume": "0.20",
+            "delta": "-0.20",
+            "imbalance_ratio": null,
+            "is_stacked_imbalance": false,
+            "price": "70001.00",
+            "total_volume": "0.20"
+          },
+          {
+            "ask_volume": "0.30",
+            "bid_volume": "0",
+            "delta": "0.30",
+            "imbalance_ratio": null,
+            "is_stacked_imbalance": false,
+            "price": "70002.00",
+            "total_volume": "0.30"
+          }
+        ]
+      },
+      {
+        "bar_end": "2026-10-06T04:00:00.000Z",
+        "bar_start": "2026-10-06T00:00:00.000Z",
+        "cells": [
+          {
+            "ask_volume": "0.10",
+            "bid_volume": "0",
+            "delta": "0.10",
+            "imbalance_ratio": null,
+            "is_stacked_imbalance": false,
+            "price": "70000.00",
+            "total_volume": "0.10"
+          },
+          {
+            "ask_volume": "0",
+            "bid_volume": "0.20",
+            "delta": "-0.20",
+            "imbalance_ratio": null,
+            "is_stacked_imbalance": false,
+            "price": "70001.00",
+            "total_volume": "0.20"
+          },
+          {
+            "ask_volume": "0.30",
+            "bid_volume": "0",
+            "delta": "0.30",
+            "imbalance_ratio": null,
+            "is_stacked_imbalance": false,
+            "price": "70002.00",
+            "total_volume": "0.30"
+          }
+        ]
+      },
+      {
+        "bar_end": "2026-10-07T04:00:00.000Z",
+        "bar_start": "2026-10-07T00:00:00.000Z",
+        "cells": [
+          {
+            "ask_volume": "0.10",
+            "bid_volume": "0",
+            "delta": "0.10",
+            "imbalance_ratio": null,
+            "is_stacked_imbalance": false,
+            "price": "70000.00",
+            "total_volume": "0.10"
+          },
+          {
+            "ask_volume": "0",
+            "bid_volume": "0.20",
+            "delta": "-0.20",
+            "imbalance_ratio": null,
+            "is_stacked_imbalance": false,
+            "price": "70001.00",
+            "total_volume": "0.20"
+          },
+          {
+            "ask_volume": "0.30",
+            "bid_volume": "0",
+            "delta": "0.30",
+            "imbalance_ratio": null,
+            "is_stacked_imbalance": false,
+            "price": "70002.00",
+            "total_volume": "0.30"
+          }
+        ]
+      }
+    ],
+    "imbalance_threshold": 3,
+    "price_bucket": "0.10",
+    "top_imbalances": []
+  },
+  "input_manifest_hash": "8e14b5c1930b7607e568f65c3f53c895874774866cd044f15762f3ec0b93c0dc",
+  "metric_version": "orderflow_metrics.v1.a5f1756b83629ccf",
+  "period": "4h",
+  "symbol": "BTCUSDT",
+  "window": {
+    "end": "2026-10-08T00:00:00.000Z",
+    "start": "2026-10-01T00:00:00.000Z"
+  }
+}
