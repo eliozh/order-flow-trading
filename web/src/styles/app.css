@@ -435,6 +435,14 @@ code {
   font-size: 12px;
 }
 
+/* Horizontal scroll lives inside the panel so the page itself never overflows. */
+.table-wrap {
+  max-width: 100%;
+  min-width: 0;
+  overflow-x: auto;
+  overscroll-behavior-x: contain;
+}
+
 .data-table th,
 .data-table td {
   height: 32px;

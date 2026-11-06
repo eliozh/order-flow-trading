@@ -5,6 +5,7 @@ from __future__ import annotations
 import hmac
 import os
 import secrets
+import time
 from pathlib import Path
 
 from fastapi import Request
@@ -13,8 +14,34 @@ from oft.config import Settings
 
 CSRF_COOKIE = "oft_csrf"
 CSRF_HEADER = "X-CSRF-Token"
+SESSION_COOKIE = "oft_session"
+SESSION_TTL_SECONDS = 12 * 60 * 60
 TOKEN_FILE = Path("run") / "api-token"
 _BEARER_PREFIX = "bearer "
+
+
+class SessionStore:
+    """In-memory browser sessions; a daemon restart invalidates every session."""
+
+    def __init__(self, ttl_seconds: int = SESSION_TTL_SECONDS) -> None:
+        self._ttl = ttl_seconds
+        self._sessions: dict[str, float] = {}
+
+    def create(self) -> str:
+        session_id = secrets.token_urlsafe(32)
+        self._sessions[session_id] = time.monotonic() + self._ttl
+        return session_id
+
+    def is_valid(self, session_id: str | None) -> bool:
+        if not session_id:
+            return False
+        expires_at = self._sessions.get(session_id)
+        if expires_at is None:
+            return False
+        if expires_at <= time.monotonic():
+            self._sessions.pop(session_id, None)
+            return False
+        return True
 
 
 def _token_path(settings: Settings) -> Path:

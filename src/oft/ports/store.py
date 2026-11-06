@@ -5,6 +5,28 @@ from __future__ import annotations
 from dataclasses import dataclass
 from typing import Protocol
 
+from oft.domain.symbols import SymbolContract
+
+
+class StoreUnavailableError(Exception):
+    """A store read failed; surfaced as the catalog ``DATA_UNAVAILABLE`` code."""
+
+    code = "DATA_UNAVAILABLE"
+
+    def __init__(self, message: str) -> None:
+        super().__init__(message)
+        self.message = message
+
+
+@dataclass(frozen=True)
+class SymbolUpsertResult:
+    """Row counts from one idempotent symbol-registry ingest."""
+
+    inserted: int
+    updated: int
+    unchanged: int
+    total: int
+
 
 @dataclass(frozen=True)
 class ManifestEntry:
@@ -68,3 +90,27 @@ class StorePort(Protocol):
     def list_manifest(self) -> tuple[ManifestEntry, ...]: ...
 
     def integrity_check(self) -> bool: ...
+
+    def upsert_symbols(
+        self, contracts: tuple[SymbolContract, ...], *, observed_at: str
+    ) -> SymbolUpsertResult: ...
+
+    def list_symbols(
+        self,
+        *,
+        query: str | None = None,
+        tradifi: bool | None = None,
+        contract_type: str | None = None,
+        limit: int | None = None,
+        offset: int = 0,
+    ) -> tuple[SymbolContract, ...]: ...
+
+    def count_symbols(
+        self,
+        *,
+        query: str | None = None,
+        tradifi: bool | None = None,
+        contract_type: str | None = None,
+    ) -> int: ...
+
+    def get_symbol(self, symbol: str) -> SymbolContract | None: ...

@@ -6,11 +6,14 @@ The daemon is the only writer. Diagnostic commands open the database with
 
 from __future__ import annotations
 
+import os
 import sqlite3
+from decimal import Decimal
 from pathlib import Path
 
 from oft.config import Settings
-from oft.ports.store import ManifestEntry, ScanRecord
+from oft.domain.symbols import SymbolContract
+from oft.ports.store import ManifestEntry, ScanRecord, StoreUnavailableError, SymbolUpsertResult
 
 _SCHEMA_VERSION = 1
 
@@ -22,7 +25,9 @@ def database_path(settings: Settings) -> Path:
 def initialize_database(settings: Settings) -> None:
     """Create the data directory and the walking-skeleton schema."""
     settings.data_dir.mkdir(parents=True, exist_ok=True)
-    connection = sqlite3.connect(database_path(settings))
+    settings.data_dir.chmod(0o700)
+    db_path = database_path(settings)
+    connection = sqlite3.connect(db_path)
     try:
         connection.execute("PRAGMA journal_mode=WAL")
         connection.execute("PRAGMA foreign_keys=ON")
@@ -70,6 +75,25 @@ def initialize_database(settings: Settings) -> None:
                     created_at TEXT NOT NULL,
                     status TEXT NOT NULL
                 );
+                CREATE TABLE IF NOT EXISTS symbols (
+                    symbol TEXT PRIMARY KEY,
+                    base_asset TEXT NOT NULL,
+                    quote_asset TEXT NOT NULL,
+                    contract_type TEXT NOT NULL,
+                    underlying_type TEXT,
+                    status TEXT NOT NULL,
+                    tick_size TEXT NOT NULL,
+                    step_size TEXT NOT NULL,
+                    min_qty TEXT NOT NULL,
+                    min_notional TEXT NOT NULL,
+                    price_precision INTEGER NOT NULL,
+                    quantity_precision INTEGER NOT NULL,
+                    onboard_date INTEGER NOT NULL,
+                    tradifi INTEGER NOT NULL,
+                    updated_at TEXT NOT NULL
+                );
+                CREATE INDEX IF NOT EXISTS symbols_contract_type ON symbols(contract_type);
+                CREATE INDEX IF NOT EXISTS symbols_tradifi ON symbols(tradifi);
                 """
             )
             connection.execute(
@@ -78,6 +102,8 @@ def initialize_database(settings: Settings) -> None:
             )
     finally:
         connection.close()
+        # The DB may hold a trading journal; never leave it group/world readable.
+        os.chmod(db_path, 0o600)
 
 
 def _row_to_scan(row: sqlite3.Row) -> ScanRecord:
@@ -117,6 +143,64 @@ def _row_to_manifest(row: sqlite3.Row) -> ManifestEntry:
         source=row["source"],
         created_at=row["created_at"],
         status=row["status"],
+    )
+
+
+_SYMBOL_COLUMNS = (
+    "symbol",
+    "base_asset",
+    "quote_asset",
+    "contract_type",
+    "underlying_type",
+    "status",
+    "tick_size",
+    "step_size",
+    "min_qty",
+    "min_notional",
+    "price_precision",
+    "quantity_precision",
+    "onboard_date",
+    "tradifi",
+    "updated_at",
+)
+_SYMBOL_SPEC_COLUMNS = _SYMBOL_COLUMNS[:-1]
+
+
+def _row_to_symbol(row: sqlite3.Row) -> SymbolContract:
+    return SymbolContract(
+        symbol=row["symbol"],
+        base_asset=row["base_asset"],
+        quote_asset=row["quote_asset"],
+        contract_type=row["contract_type"],
+        underlying_type=row["underlying_type"],
+        status=row["status"],
+        tick_size=Decimal(row["tick_size"]),
+        step_size=Decimal(row["step_size"]),
+        min_qty=Decimal(row["min_qty"]),
+        min_notional=Decimal(row["min_notional"]),
+        price_precision=row["price_precision"],
+        quantity_precision=row["quantity_precision"],
+        onboard_date=row["onboard_date"],
+        tradifi=bool(row["tradifi"]),
+    )
+
+
+def _symbol_values(contract: SymbolContract) -> tuple[object, ...]:
+    return (
+        contract.symbol,
+        contract.base_asset,
+        contract.quote_asset,
+        contract.contract_type,
+        contract.underlying_type,
+        contract.status,
+        str(contract.tick_size),
+        str(contract.step_size),
+        str(contract.min_qty),
+        str(contract.min_notional),
+        contract.price_precision,
+        contract.quantity_precision,
+        contract.onboard_date,
+        int(contract.tradifi),
     )
 
 
@@ -276,3 +360,132 @@ class SqliteStore:
         finally:
             connection.close()
         return bool(row is not None and row[0] == "ok")
+
+    # -- Symbol registry -------------------------------------------------
+
+    def upsert_symbols(
+        self, contracts: tuple[SymbolContract, ...], *, observed_at: str
+    ) -> SymbolUpsertResult:
+        """Insert or update contracts; ``updated_at`` moves only when the spec changed."""
+        inserted = updated = unchanged = 0
+        with self._connect() as connection:
+            for contract in contracts:
+                row = connection.execute(
+                    "SELECT * FROM symbols WHERE symbol = ?", (contract.symbol,)
+                ).fetchone()
+                if row is None:
+                    placeholders = ", ".join("?" for _ in _SYMBOL_COLUMNS)
+                    columns = ", ".join(_SYMBOL_COLUMNS)
+                    connection.execute(
+                        f"INSERT INTO symbols ({columns}) VALUES ({placeholders})",
+                        (*_symbol_values(contract), observed_at),
+                    )
+                    inserted += 1
+                elif _row_to_symbol(row) == contract:
+                    unchanged += 1
+                else:
+                    connection.execute(
+                        """
+                        UPDATE symbols SET
+                            base_asset = ?, quote_asset = ?, contract_type = ?,
+                            underlying_type = ?, status = ?, tick_size = ?, step_size = ?,
+                            min_qty = ?, min_notional = ?, price_precision = ?,
+                            quantity_precision = ?, onboard_date = ?, tradifi = ?,
+                            updated_at = ?
+                        WHERE symbol = ?
+                        """,
+                        (*_symbol_values(contract)[1:], observed_at, contract.symbol),
+                    )
+                    updated += 1
+            total_row = connection.execute("SELECT COUNT(*) FROM symbols").fetchone()
+            total = int(total_row[0]) if total_row is not None else 0
+        return SymbolUpsertResult(
+            inserted=inserted, updated=updated, unchanged=unchanged, total=total
+        )
+
+    def _symbol_query(
+        self,
+        *,
+        query: str | None,
+        tradifi: bool | None,
+        contract_type: str | None,
+    ) -> tuple[str, list[object]]:
+        clauses: list[str] = []
+        params: list[object] = []
+        if query:
+            pattern = f"%{query.strip().lower()}%"
+            clauses.append("(LOWER(symbol) LIKE ? OR LOWER(base_asset) LIKE ?)")
+            params.extend([pattern, pattern])
+        if tradifi is not None:
+            clauses.append("tradifi = ?")
+            params.append(int(tradifi))
+        if contract_type:
+            clauses.append("contract_type = ?")
+            params.append(contract_type)
+        where = f" WHERE {' AND '.join(clauses)}" if clauses else ""
+        return where, params
+
+    def list_symbols(
+        self,
+        *,
+        query: str | None = None,
+        tradifi: bool | None = None,
+        contract_type: str | None = None,
+        limit: int | None = None,
+        offset: int = 0,
+    ) -> tuple[SymbolContract, ...]:
+        connection = self._connect_read_only()
+        if connection is None:
+            return ()
+        where, params = self._symbol_query(
+            query=query, tradifi=tradifi, contract_type=contract_type
+        )
+        if query:
+            order = " ORDER BY CASE WHEN symbol = ? THEN 0 ELSE 1 END, tradifi ASC, symbol ASC"
+            params.append(query.strip().upper())
+        else:
+            order = " ORDER BY tradifi ASC, symbol ASC"
+        sql = f"SELECT * FROM symbols{where}{order}"
+        if limit is not None:
+            sql += " LIMIT ? OFFSET ?"
+            params.extend([limit, offset])
+        try:
+            rows = connection.execute(sql, params).fetchall()
+        except sqlite3.Error as exc:
+            raise StoreUnavailableError(f"symbol registry read failed: {exc}") from exc
+        finally:
+            connection.close()
+        return tuple(_row_to_symbol(row) for row in rows)
+
+    def count_symbols(
+        self,
+        *,
+        query: str | None = None,
+        tradifi: bool | None = None,
+        contract_type: str | None = None,
+    ) -> int:
+        connection = self._connect_read_only()
+        if connection is None:
+            return 0
+        where, params = self._symbol_query(
+            query=query, tradifi=tradifi, contract_type=contract_type
+        )
+        try:
+            row = connection.execute(f"SELECT COUNT(*) FROM symbols{where}", params).fetchone()
+        except sqlite3.Error as exc:
+            raise StoreUnavailableError(f"symbol registry count failed: {exc}") from exc
+        finally:
+            connection.close()
+        return int(row[0]) if row is not None else 0
+
+    def get_symbol(self, symbol: str) -> SymbolContract | None:
+        connection = self._connect_read_only()
+        if connection is None:
+            return None
+        try:
+            row = connection.execute("SELECT * FROM symbols WHERE symbol = ?", (symbol,)).fetchone()
+        except sqlite3.Error as exc:
+            raise StoreUnavailableError(f"symbol lookup failed: {exc}") from exc
+        finally:
+            connection.close()
+        return _row_to_symbol(row) if row is not None else None

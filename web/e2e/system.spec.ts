@@ -15,6 +15,7 @@ import { expect, test, type Page } from '@playwright/test'
  */
 
 const SCREENS_DIR =
+  process.env.OFT_E2E_SYSTEM_SCREENS_DIR ??
   process.env.OFT_E2E_SCREENS_DIR ??
   path.resolve(process.cwd(), '..', '.claude', 'ecc-workflow', 'screens', 'e2e')
 

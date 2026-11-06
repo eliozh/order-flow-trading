@@ -13,6 +13,13 @@ DEFAULT_HOST = "127.0.0.1"
 DEFAULT_PORT = 7611
 CONFIG_INVALID = "CONFIG_INVALID"
 DEFAULT_FIXTURES_DIR = Path(__file__).resolve().parents[2] / "tests" / "fixtures" / "market"
+DEFAULT_EXCHANGE_INFO_FIXTURE = (
+    Path(__file__).resolve().parents[2]
+    / "tests"
+    / "fixtures"
+    / "binance"
+    / "exchange_info_sample.json"
+)
 
 
 class Environment(StrEnum):
@@ -50,6 +57,7 @@ class Settings(BaseSettings):
         validation_alias=AliasChoices("OFT_DATA_DIR", "OFT_DATA"),
     )
     fixtures_dir: Path = DEFAULT_FIXTURES_DIR
+    exchange_info_fixture: Path = DEFAULT_EXCHANGE_INFO_FIXTURE
     log_level: str = "INFO"
 
     api_token: SecretStr | None = None
@@ -68,7 +76,7 @@ class Settings(BaseSettings):
             raise ValueError(f"log_level must be one of {sorted(_VALID_LOG_LEVELS)}")
         return level
 
-    @field_validator("data_dir", "fixtures_dir")
+    @field_validator("data_dir", "fixtures_dir", "exchange_info_fixture")
     @classmethod
     def _expand_paths(cls, value: Path) -> Path:
         return value.expanduser()

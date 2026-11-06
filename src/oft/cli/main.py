@@ -9,6 +9,7 @@ import typer
 from oft.cli.commands.doctor import doctor_command, emit_error
 from oft.cli.commands.scan import scan_app
 from oft.cli.commands.status import status_command
+from oft.cli.commands.watchlist import watchlist_app
 from oft.config import ConfigError, load_settings
 
 app = typer.Typer(
@@ -26,6 +27,7 @@ def _root() -> None:
 app.command(name="status")(status_command)
 app.command(name="doctor")(doctor_command)
 app.add_typer(scan_app, name="scan")
+app.add_typer(watchlist_app, name="watchlist")
 
 _LOOPBACK_HOSTS = frozenset({"127.0.0.1", "localhost", "::1"})
 
