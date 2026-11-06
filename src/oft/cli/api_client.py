@@ -8,7 +8,7 @@ import urllib.error
 import urllib.request
 from typing import Any, cast
 
-from oft.api.auth import read_api_token
+from oft.api.auth import _origin, read_api_token
 from oft.config import Settings
 
 _JSON_HEADERS = {"Accept": "application/json", "Content-Type": "application/json"}
@@ -35,7 +35,9 @@ class ApiClient:
     @classmethod
     def from_settings(cls, settings: Settings, *, timeout: float = 2.0) -> ApiClient:
         token = os.environ.get("OFT_API_TOKEN") or read_api_token(settings)
-        return cls(f"http://{settings.host}:{settings.port}", token, timeout=timeout)
+        # ``_origin`` brackets IPv6 literals (``http://[::1]:port``); a bare
+        # ``::1`` would make urllib emit an unparseable Host header.
+        return cls(_origin(settings.host, settings.port), token, timeout=timeout)
 
     def _request(
         self,

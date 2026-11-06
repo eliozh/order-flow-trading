@@ -79,7 +79,10 @@ def host_is_allowed(request: Request, settings: Settings) -> bool:
     # The in-process TestClient sends ``testserver``; only exempt it under test.
     if settings.env == "test" and host == _TEST_CLIENT_HOST:
         return True
-    if host not in _LOOPBACK_HOSTS:
+    # Allow loopback names plus the explicitly configured bind host; the latter
+    # makes `--allow-non-loopback` usable without opening the door to arbitrary
+    # DNS-rebinding hosts.
+    if host not in _LOOPBACK_HOSTS and host != settings.host:
         return False
     if port is None:
         return settings.port == 80

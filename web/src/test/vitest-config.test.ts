@@ -21,7 +21,11 @@ describe('vitest configuration', () => {
     expect(proxy).toBeDefined()
     for (const [path, options] of Object.entries(proxy ?? {})) {
       expect(options.changeOrigin, `${path} must rewrite Host`).toBe(true)
-      expect(options.target).toContain('127.0.0.1:7611')
+      const target = new URL(options.target ?? '')
+      expect(
+        ['127.0.0.1', 'localhost', '[::1]'].includes(target.hostname),
+        `${path} target must be a loopback address`,
+      ).toBe(true)
     }
   })
 })

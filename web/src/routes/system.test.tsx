@@ -50,6 +50,7 @@ const readinessEnvelope: ReadinessEnvelope = {
   data: {
     status: 'ready',
     version: '0.1.0',
+    env: 'paper',
     data_dir: '/tmp/data',
     checked_at: '2026-11-06T04:00:01.000Z',
     checks: [

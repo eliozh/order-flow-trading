@@ -473,6 +473,7 @@ def test_ready_labels_each_failed_check_group(
         return ReadinessReport(
             status="not_ready",
             version="0.1.0",
+            env=resolved.env.value,
             data_dir=str(resolved.data_dir),
             checked_at="2026-11-06T00:00:00.000Z",
             checks=checks,
@@ -574,6 +575,39 @@ def test_malformed_host_port_is_host_forbidden(settings: Settings) -> None:
 
     assert response.status_code == 403
     assert response.json()["error"]["code"] == "HOST_FORBIDDEN"
+
+
+def test_configured_non_loopback_bind_host_is_allowed(tmp_path: Path) -> None:
+    settings = Settings(env="test", host="0.0.0.0", port=8766, data_dir=tmp_path / "data")
+    app = create_app(settings)
+
+    with TestClient(app) as client:
+        allowed = client.get("/health", headers={"Host": "0.0.0.0:8766"})
+        foreign = client.get("/health", headers={"Host": "evil.example:8766"})
+
+    assert allowed.status_code == 200
+    assert foreign.status_code == 403
+    assert foreign.json()["error"]["code"] == "HOST_FORBIDDEN"
+
+
+def test_ready_reports_the_configured_environment(settings: Settings) -> None:
+    app = create_app(settings)
+
+    with TestClient(app) as client:
+        response = client.get("/ready")
+
+    assert response.status_code == 200
+    assert response.json()["data"]["env"] == "test"
+
+
+def test_api_client_brackets_ipv6_host(live_ipv6_daemon: Settings) -> None:
+    from oft.cli.api_client import ApiClient
+
+    envelope = ApiClient.from_settings(live_ipv6_daemon)._request("GET", "/ready")
+
+    assert envelope["ok"] is True
+    assert envelope["data"]["status"] == "ready"
+    assert envelope["data"]["env"] == "test"
 
 
 def test_loopback_host_with_configured_port_is_allowed(settings: Settings) -> None:

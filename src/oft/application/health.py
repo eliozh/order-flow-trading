@@ -42,6 +42,7 @@ class DaemonProbe:
 class ReadinessReport:
     status: Literal["ready", "not_ready"]
     version: str
+    env: str
     data_dir: str
     checked_at: str
     checks: tuple[CheckResult, ...]
@@ -128,6 +129,7 @@ def build_readiness(
     return ReadinessReport(
         status="ready" if ready else "not_ready",
         version=__version__,
+        env=settings.env.value,
         data_dir=str(settings.data_dir),
         checked_at=utc_timestamp(now),
         checks=tuple(checks),

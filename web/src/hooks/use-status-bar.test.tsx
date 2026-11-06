@@ -2,6 +2,7 @@ import { renderHook, waitFor } from '@testing-library/react'
 import { describe, expect, it, vi } from 'vitest'
 
 import type { ReadinessEnvelope } from '../api/status'
+import { ReadinessError } from '../api/status'
 import { OFFLINE_STATUS, useStatusBar } from './use-status-bar'
 
 const meta = {
@@ -15,12 +16,13 @@ const meta = {
   idempotent_replay: false,
 }
 
-function readiness(status: 'ready' | 'not_ready'): ReadinessEnvelope {
+function readiness(status: 'ready' | 'not_ready', env = 'paper'): ReadinessEnvelope {
   return {
     ok: status === 'ready',
     data: {
       status,
       version: '0.9.3',
+      env,
       data_dir: '/tmp/data',
       checked_at: '2026-11-06T00:00:00.000Z',
       checks: [],
@@ -40,8 +42,22 @@ describe('useStatusBar', () => {
     expect(result.current.version).toBe('0.9.3')
   })
 
-  it('reports UP/NOT_READY when the daemon answers but is not ready', async () => {
-    const { result } = renderHook(() => useStatusBar(async () => readiness('not_ready')))
+  it('reports the served environment instead of hardcoding PAPER', async () => {
+    const { result } = renderHook(() => useStatusBar(async () => readiness('ready', 'live')))
+
+    await waitFor(() => expect(result.current.env).toBe('LIVE'))
+  })
+
+  it('maps a real 503 readiness envelope to UP/NOT_READY', async () => {
+    const fetcher = vi
+      .fn()
+      .mockRejectedValue(
+        new ReadinessError(
+          'Required data does not exist or cannot be fetched.',
+          'DATA_UNAVAILABLE',
+        ),
+      )
+    const { result } = renderHook(() => useStatusBar(fetcher))
 
     await waitFor(() => expect(result.current.readiness).toBe('NOT_READY'))
     expect(result.current.daemon).toBe('UP')

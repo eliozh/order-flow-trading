@@ -45,6 +45,7 @@ interface ScanRecord {
 interface ReadinessData {
   status: string
   version: string
+  env: string
   data_dir: string
   checked_at: string
   checks: ReadyCheck[]
@@ -140,6 +141,7 @@ test('shows health OK, readiness OK with named checks, version, data dir, and th
   await expect(statusbar).toContainText('UP')
   await expect(statusbar).toContainText('READY')
   await expect(statusbar).toContainText(readiness.version)
+  await expect(statusbar).toContainText(readiness.env.toUpperCase())
 
   await expect(statValue(page, 'Health')).toHaveText('OK')
   await expect(statValue(page, 'Readiness')).toHaveText('READY')
@@ -190,10 +192,12 @@ test('at 375px the shell is read-only and has no page-level horizontal scroll', 
   await expect(page.getByRole('note')).toContainText('Read-only at this width')
 
   // The environment chip stays visible and in the accessibility tree at 375px.
+  const readiness = await fetchReadiness(page)
+  const envLabel = readiness.env.toUpperCase()
   const envChip = page.locator('.statusbar .sb-env')
   await expect(envChip).toBeVisible()
-  await expect(envChip).toHaveText('PAPER')
-  await expect(page.getByRole('region', { name: 'System status bar' })).toContainText('PAPER')
+  await expect(envChip).toHaveText(envLabel)
+  await expect(page.getByRole('region', { name: 'System status bar' })).toContainText(envLabel)
 
   // No mutation controls in the page content (the global kill-switch chrome is
   // inert and lives outside <main>; it is asserted separately below).
@@ -277,13 +281,13 @@ test('renders a stable API error state when readiness is blocked', async ({ page
 
   const alert = page.getByRole('alert')
   await expect(alert).toHaveText(
-    'System status unavailable: Readiness request failed with HTTP 503',
+    'System status unavailable: Required data does not exist or cannot be fetched.',
   )
   expect(interceptedCode).toBe('DATA_UNAVAILABLE')
-  // The status bar must not claim health when the probe fails.
+  // The daemon answered (it served the page), so the bar shows UP/NOT_READY.
   const statusbar = page.getByRole('region', { name: 'System status bar' })
-  await expect(statusbar).toContainText('OFFLINE')
-  await expect(statusbar).toContainText('UNKNOWN')
+  await expect(statusbar).toContainText('UP')
+  await expect(statusbar).toContainText('NOT_READY')
   // The shell remains usable and shows no scan/diagnostic panels on failure.
   await expect(page.getByRole('heading', { name: 'System status', level: 1 })).toBeHidden()
 })

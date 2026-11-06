@@ -1,17 +1,19 @@
 import { useEffect, useRef, useState } from 'react'
 
-import { fetchReadiness, type ReadinessEnvelope } from '../api/status'
+import { fetchReadiness, ReadinessError, type ReadinessEnvelope } from '../api/status'
 
 export interface StatusBarState {
   daemon: 'UP' | 'OFFLINE'
   version: string
   readiness: 'READY' | 'NOT_READY' | 'UNKNOWN'
+  env: string
 }
 
 export const OFFLINE_STATUS: StatusBarState = {
   daemon: 'OFFLINE',
   version: 'UNKNOWN',
   readiness: 'UNKNOWN',
+  env: 'UNKNOWN',
 }
 
 type ReadinessFetcher = () => Promise<ReadinessEnvelope>
@@ -38,12 +40,24 @@ export function useStatusBar(fetcher: ReadinessFetcher = fetchReadiness): Status
           daemon: 'UP',
           version: data?.version ?? 'UNKNOWN',
           readiness: data?.status === 'ready' ? 'READY' : 'NOT_READY',
+          env: (data?.env ?? 'UNKNOWN').toUpperCase(),
         })
       })
-      .catch(() => {
-        if (active) {
-          setState(OFFLINE_STATUS)
+      .catch((error: unknown) => {
+        if (!active) {
+          return
         }
+        if (error instanceof ReadinessError) {
+          // The daemon answered but readiness failed: it is up, not offline.
+          setState({
+            daemon: 'UP',
+            version: 'UNKNOWN',
+            readiness: 'NOT_READY',
+            env: 'UNKNOWN',
+          })
+          return
+        }
+        setState(OFFLINE_STATUS)
       })
     return () => {
       active = false

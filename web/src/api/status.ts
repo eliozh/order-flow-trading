@@ -91,6 +91,7 @@ export interface ScanRecordData {
 export interface ReadinessData {
   status: 'ready' | 'not_ready'
   version: string
+  env: string
   data_dir: string
   checked_at: string
   checks: ReadyCheck[]
@@ -113,6 +114,17 @@ export interface ReadinessEnvelope {
 
 function envelopeError(envelope: { ok: boolean; error: ApiError | null }, fallback: string): Error {
   return new Error(envelope.error?.message ?? fallback)
+}
+
+/** The daemon answered `/ready` but readiness is not OK (non-2xx envelope). */
+export class ReadinessError extends Error {
+  readonly code: string | undefined
+
+  constructor(message: string, code?: string) {
+    super(message)
+    this.name = 'ReadinessError'
+    this.code = code
+  }
 }
 
 export async function fetchStatus(): Promise<StatusEnvelope> {
@@ -143,12 +155,25 @@ export async function fetchHealth(): Promise<HealthEnvelope> {
 
 export async function fetchReadiness(): Promise<ReadinessEnvelope> {
   const response = await fetch('/ready', { headers: { Accept: 'application/json' } })
-  if (!response.ok) {
-    throw new Error(`Readiness request failed with HTTP ${response.status}`)
+  let envelope: ReadinessEnvelope | null = null
+  try {
+    envelope = (await response.json()) as ReadinessEnvelope
+  } catch {
+    envelope = null
   }
-  const envelope = (await response.json()) as ReadinessEnvelope
-  if (!envelope.ok || envelope.data === null) {
-    throw envelopeError(envelope, 'Readiness check returned an error')
+  if (!response.ok) {
+    // A 503 still proves the daemon answered; surface it as a typed error so
+    // the caller can render NOT_READY instead of OFFLINE.
+    throw new ReadinessError(
+      envelope?.error?.message ?? `Readiness request failed with HTTP ${response.status}`,
+      envelope?.error?.code,
+    )
+  }
+  if (!envelope || !envelope.ok || envelope.data === null) {
+    throw new ReadinessError(
+      envelope?.error?.message ?? 'Readiness check returned an error',
+      envelope?.error?.code,
+    )
   }
   return envelope
 }
