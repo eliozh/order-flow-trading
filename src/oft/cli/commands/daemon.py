@@ -59,11 +59,48 @@ def process_alive(pid: int) -> bool:
     return True
 
 
+def _process_start_time(pid: int) -> str | None:
+    try:
+        stat = Path(f"/proc/{pid}/stat").read_text(encoding="utf-8")
+    except OSError:
+        return None
+    fields = stat.rsplit(")", 1)[-1].split()
+    return fields[19] if len(fields) > 19 else None
+
+
+def pid_meta_path(settings: Settings) -> Path:
+    return settings.data_dir / "run" / "daemon.pid.json"
+
+
+def pid_matches(settings: Settings, pid: int) -> bool:
+    """Verify the PID still names the daemon we started (start-time fence)."""
+    if not process_alive(pid):
+        return False
+    try:
+        import json
+
+        meta = json.loads(pid_meta_path(settings).read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        return True
+    expected = meta.get("start_time")
+    current = _process_start_time(pid)
+    return expected is None or current is None or expected == current
+
+
 def write_pid(settings: Settings) -> None:
     path = pid_path(settings)
     path.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
-    path.write_text(str(os.getpid()), encoding="utf-8")
+    pid = os.getpid()
+    path.write_text(str(pid), encoding="utf-8")
     path.chmod(0o600)
+    import json
+
+    meta = pid_meta_path(settings)
+    meta.write_text(
+        json.dumps({"pid": pid, "start_time": _process_start_time(pid)}),
+        encoding="utf-8",
+    )
+    meta.chmod(0o600)
 
 
 def _settings_or_exit(json_output: bool) -> Settings:
@@ -160,7 +197,7 @@ def daemon_start(
 
     settings = _resolve_serve_settings(host, port, allow_non_loopback)
     pid = read_pid(settings)
-    if pid is not None and process_alive(pid):
+    if pid is not None and pid_matches(settings, pid):
         emit_error(
             "DAEMON_ALREADY_RUNNING",
             f"daemon already running with pid {pid}",
@@ -197,17 +234,27 @@ def _start_scheduler(
         period = scheduler.state.period_at(resolved.clock.now())
         return runner.run_window(window, period=period)
 
+    ledger = JobLedger(store=resolved.store, clock=resolved.clock)
+
+    def _record_missed(window: datetime) -> None:
+        ledger.record_missed(
+            "scan",
+            utc_timestamp(window),
+            reason="scheduled fire missed its boundary",
+        )
+
     scheduler = ScanDaemonScheduler(
         clock=resolved.clock,
         state=state,
         job=_run_due,
         state_path=schedule_state_path(settings),
+        on_missed=_record_missed,
     )
     holder["scheduler"] = scheduler
+    write_pid(settings)
     if settings.env != "test":
         _catch_up_on_start(resolved, state)
     scheduler.start()
-    write_pid(settings)
     return scheduler
 
 
@@ -220,7 +267,7 @@ def _catch_up_on_start(container: Any, state: ScheduleState) -> None:
     for run in ledger.reconstruct("scan").running:
         if run.lease_expires_at > now:
             ledger.heartbeat(run.run_id, owner=run.lease_owner)
-            runner.resume(run.run_id, period=state.period)
+            runner.resume(run.run_id, period=state.period_at(container.clock.now()))
             continue
         reclaimed = ledger.claim(
             "scan",
@@ -229,7 +276,7 @@ def _catch_up_on_start(container: Any, state: ScheduleState) -> None:
             run_id=run.run_id,
         )
         if reclaimed.claimed and reclaimed.reclaimed:
-            runner.resume(run.run_id, period=state.period)
+            runner.resume(run.run_id, period=state.period_at(container.clock.now()))
 
     scheduled = [
         run
@@ -241,11 +288,22 @@ def _catch_up_on_start(container: Any, state: ScheduleState) -> None:
         if scheduled
         else None
     )
+    period = state.period_at(container.clock.now())
     plan = ledger.catch_up(
-        period=state.period, now=container.clock.now(), last_attempted_window_start=last
+        period=period, now=container.clock.now(), last_attempted_window_start=last
     )
     if plan.run_window is not None:
-        runner.run_window(plan.run_window, period=state.period)
+        runner.run_window(plan.run_window, period=period)
+        last = plan.run_window
+    # A slow catch-up can cross a boundary. Re-plan at the finishing clock so
+    # the newly due window is run now instead of being skipped until the next
+    # future boundary.
+    period = state.period_at(container.clock.now())
+    final_plan = ledger.catch_up(
+        period=period, now=container.clock.now(), last_attempted_window_start=last
+    )
+    if final_plan.run_window is not None:
+        runner.run_window(final_plan.run_window, period=period)
 
 
 @daemon_app.command("stop")
@@ -255,7 +313,7 @@ def daemon_stop(
     """Signal the daemon to stop; safe when it is already offline."""
     settings = _settings_or_exit(json_output)
     pid = read_pid(settings)
-    if pid is None or not process_alive(pid):
+    if pid is None or not pid_matches(settings, pid):
         if json_output:
             typer.echo(json.dumps({"ok": True, "data": {"state": "NOT_RUNNING"}}, indent=2))
         else:

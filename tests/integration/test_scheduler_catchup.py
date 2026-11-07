@@ -226,16 +226,20 @@ def test_fresh_database_catch_up_runs_only_the_latest_due_window(
 
     settings = _settings(tmp_path)
     container = build_container(settings, initialize=True)
-    calls: list[object] = []
+    fixed = datetime(2026, 11, 7, 13, 5, tzinfo=UTC)
+    monkeypatch.setattr(container.clock, "now", lambda: fixed)
+    windows: list[datetime] = []
     monkeypatch.setattr(
         daemon_module.ScheduledScanRunner,
         "run_window",
-        lambda self, window, period="4h": calls.append(window),
+        lambda self, window, period="4h": windows.append(window),
     )
 
     daemon_module._catch_up_on_start(container, ScheduleState(period="4h"))
 
-    assert len(calls) == 1
+    from oft.application.scheduler import align_to_boundary
+
+    assert windows == [align_to_boundary(fixed, "4h")]
 
 
 def test_daemon_start_refuses_a_live_pid(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
@@ -250,3 +254,18 @@ def test_daemon_start_refuses_a_live_pid(tmp_path: Path, monkeypatch: pytest.Mon
 
     assert result.exit_code == 1
     assert "already running" in result.output
+
+
+def test_pid_identity_rejects_a_reused_pid(tmp_path: Path) -> None:
+    import json
+    import os
+
+    from oft.cli.commands.daemon import pid_matches, pid_meta_path, write_pid
+
+    settings = _settings(tmp_path)
+    write_pid(settings)
+    meta = json.loads(pid_meta_path(settings).read_text(encoding="utf-8"))
+    meta["start_time"] = "different-process"
+    pid_meta_path(settings).write_text(json.dumps(meta), encoding="utf-8")
+
+    assert pid_matches(settings, os.getpid()) is False

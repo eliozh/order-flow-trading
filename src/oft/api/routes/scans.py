@@ -30,7 +30,7 @@ from oft.application.scan_service import (
 )
 from oft.config import Environment
 from oft.domain.time import utc_timestamp
-from oft.ports.store import IdempotencyRecord
+from oft.ports.store import IdempotencyRecord, ScanSymbolRecord
 
 router = APIRouter()
 
@@ -173,6 +173,18 @@ def _run_metrics_scan(request: Request, payload: ScanCreateRequest) -> dict[str,
             details=_scan_error_details(conflict),
         )
     assert claim.run is not None
+    container.store.upsert_scan_symbol(
+        ScanSymbolRecord(
+            scan_id=scan_id,
+            symbol=payload.symbol,
+            stage="DATA",
+            started_at=utc_timestamp(container.clock.now()),
+            finished_at=None,
+            error_code=None,
+            report_id=None,
+            data_quality=None,
+        )
+    )
     heartbeat_stop = threading.Event()
 
     def _heartbeat() -> None:
@@ -216,6 +228,18 @@ def _run_metrics_scan(request: Request, payload: ScanCreateRequest) -> dict[str,
         )
         raise
     else:
+        container.store.upsert_scan_symbol(
+            ScanSymbolRecord(
+                scan_id=scan_id,
+                symbol=payload.symbol,
+                stage="DONE",
+                started_at=utc_timestamp(container.clock.now()),
+                finished_at=run.scan.finished_at,
+                error_code=None,
+                report_id=run.report.report_id,
+                data_quality=run.report.data_quality,
+            )
+        )
         ledger.finish(claim.run.run_id, "DONE", owner=claim.run.lease_owner)
     finally:
         heartbeat_stop.set()

@@ -187,7 +187,10 @@ class ScheduleState:
             _require_aware(self.effective_from)
         if self.jitter_seconds_max < 0:
             raise ValueError("jitter_seconds_max must be >= 0")
-        if self.jitter_seconds_max >= PERIOD_HOURS[self.period] * 3600:
+        periods = [self.period]
+        if self.pending_period is not None:
+            periods.append(self.pending_period)
+        if self.jitter_seconds_max >= min(PERIOD_HOURS[item] for item in periods) * 3600:
             raise ValueError("jitter_seconds_max must be less than the scan period")
 
     def period_at(self, instant: datetime) -> str:
@@ -319,11 +322,14 @@ class ScanDaemonScheduler:
         job: Callable[[datetime], Any],
         timezone: str = "UTC",
         state_path: Any | None = None,
+        on_missed: Callable[[datetime], None] | None = None,
     ) -> None:
         self._clock = clock
         self._state = state
         self._job = job
         self._state_path = state_path
+        self._on_missed = on_missed
+        self._due_window: datetime | None = None
         self._scheduler = BackgroundScheduler(timezone=timezone)
 
     @property
@@ -353,6 +359,8 @@ class ScanDaemonScheduler:
 
     def _schedule_next(self) -> None:
         fire_at = self._state.next_run(self._clock.now())
+        period = self._state.period_at(fire_at)
+        self._due_window = align_to_boundary(fire_at, period)
         self._scheduler.add_job(
             self._fire,
             trigger=DateTrigger(run_date=fire_at, timezone="UTC"),
@@ -365,7 +373,16 @@ class ScanDaemonScheduler:
 
     def _fire(self) -> None:
         now = self._clock.now()
-        window = align_to_boundary(now, self._state.period_at(now))
+        current = align_to_boundary(now, self._state.period_at(now))
+        window = self._due_window or current
+        if window < current:
+            step = timedelta(hours=PERIOD_HOURS[self._state.period_at(window)])
+            skipped = window
+            while skipped < current:
+                if self._on_missed is not None:
+                    self._on_missed(skipped)
+                skipped += step
+            window = current
         try:
             self._job(window)
         finally:

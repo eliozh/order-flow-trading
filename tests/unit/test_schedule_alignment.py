@@ -266,3 +266,39 @@ def test_pending_period_change_is_persisted_and_reloaded(tmp_path) -> None:  # t
 
     save_schedule_state(path, ScheduleState(period="8h"))
     assert load_schedule_state(path, default=ScheduleState(period="4h")).period == "8h"
+
+
+def test_jitter_uses_the_shorter_of_active_and_pending_periods() -> None:
+    with pytest.raises(ValueError, match="less than the scan period"):
+        ScheduleState(
+            period="8h",
+            pending_period="4h",
+            effective_from=DAY + timedelta(hours=8),
+            jitter_seconds_max=8 * 3600,
+        )
+
+
+def test_fire_records_skipped_windows_and_runs_the_latest_due_window() -> None:
+    from oft.application.scheduler import ScanDaemonScheduler
+
+    class LateClock:
+        instant = DAY.replace(hour=12, minute=5)
+
+        def now(self) -> datetime:
+            return self.instant
+
+    clock = LateClock()
+    jobs: list[datetime] = []
+    missed: list[datetime] = []
+    scheduler = ScanDaemonScheduler(
+        clock=clock,  # type: ignore[arg-type]
+        state=ScheduleState(period="4h"),
+        job=jobs.append,
+        on_missed=missed.append,
+    )
+    scheduler._due_window = DAY.replace(hour=8)
+    scheduler._fire()
+
+    assert jobs == [DAY.replace(hour=12)]
+    assert missed == [DAY.replace(hour=8)]
+    scheduler.shutdown()

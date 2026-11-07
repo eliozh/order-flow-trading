@@ -824,3 +824,50 @@ def test_scan_longer_than_the_lease_keeps_the_key_reserved(
     assert len(calls) == 1
     assert sorted(response.status_code for response in responses) == [201, 409]
     assert len(reports) == 1
+
+
+def test_manual_scan_records_scan_symbols_for_restart_resume(tmp_path: Path) -> None:
+    harness = _harness(tmp_path)
+    try:
+        response = _post(harness, key="scan-symbol-row")
+        scan_id = response.json()["data"]["scan"]["scan_id"]
+        symbols = harness.container.store.list_scan_symbols(scan_id)
+    finally:
+        harness.close()
+
+    assert [(item.symbol, item.stage) for item in symbols] == [("BTCUSDT", "DONE")]
+
+
+def test_manual_scan_heartbeats_during_a_slow_run(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    import time
+
+    import oft.api.routes.scans as scans_routes
+    from oft.application.scan_service import ScanService
+
+    harness = _harness(tmp_path)
+    original_run = ScanService.run
+    beats: list[str] = []
+    from oft.application.jobs import JobLedger
+
+    original_heartbeat = JobLedger.heartbeat
+
+    def counting(self: JobLedger, run_id: str, *, owner: str, lease_seconds: int = 900) -> bool:
+        beats.append(run_id)
+        return original_heartbeat(self, run_id, owner=owner, lease_seconds=lease_seconds)
+
+    def slow(self: ScanService, request: object, *, scan_id: str | None = None) -> object:
+        time.sleep(0.03)
+        return original_run(self, request, scan_id=scan_id)
+
+    monkeypatch.setattr(scans_routes, "_SCAN_HEARTBEAT_SECONDS", 0.001)
+    monkeypatch.setattr(JobLedger, "heartbeat", counting)
+    monkeypatch.setattr(ScanService, "run", slow)
+    try:
+        response = _post(harness, key="manual-heartbeat")
+    finally:
+        harness.close()
+
+    assert response.status_code == 201
+    assert beats

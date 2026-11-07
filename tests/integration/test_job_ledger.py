@@ -438,3 +438,136 @@ def test_scheduled_runner_marks_scans_as_scheduled(
     assert outcome.claimed is True
     assert len(captured) == 1
     assert captured[0].trigger_source == "SCHEDULED"  # type: ignore[union-attr]
+
+
+def test_catch_up_replans_after_crossing_a_boundary(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from types import SimpleNamespace
+
+    from oft.application.scheduler import ScheduleState, align_to_boundary
+    from oft.cli.commands import daemon as daemon_module
+
+    store = _store(tmp_path)
+    start = NOW.replace(hour=7, minute=58, second=0)
+    end = NOW.replace(hour=8, minute=2, second=0)
+
+    class StepClock:
+        def __init__(self) -> None:
+            self.calls = 0
+
+        def now(self) -> datetime:
+            self.calls += 1
+            return start if self.calls <= 4 else end
+
+    clock = StepClock()
+    ledger = JobLedger(store=store, clock=clock)  # type: ignore[arg-type]
+    last = ledger.claim("scan", utc_timestamp(NOW.replace(hour=4)), owner="old", lease_seconds=900)
+    assert last.run is not None
+    ledger.finish(last.run.run_id, "DONE")
+
+    container = SimpleNamespace(store=store, clock=clock, scan_lock=None)
+    windows: list[datetime] = []
+    monkeypatch.setattr(
+        daemon_module.ScheduledScanRunner,
+        "run_window",
+        lambda self, window, period="4h": windows.append(window),
+    )
+
+    daemon_module._catch_up_on_start(container, ScheduleState(period="4h"))  # type: ignore[arg-type]
+
+    assert windows == [align_to_boundary(end, "4h")]
+
+
+def test_resume_without_checkpoints_reruns_the_scheduled_window(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from types import SimpleNamespace
+
+    from oft.application.jobs import ScheduledScanOutcome
+    from oft.bootstrap import build_container
+
+    settings = Settings(env="test", port=8765, data_dir=tmp_path / "data")
+    container = build_container(settings, initialize=True)
+    ledger = JobLedger(store=container.store, clock=FixedClock(NOW))
+    claim = ledger.claim("scan", utc_timestamp(WINDOW), owner="crashed", trigger_source="SCHEDULED")
+    assert claim.claimed and claim.run is not None
+    monkeypatch.setattr(
+        container.store,
+        "list_starred",
+        lambda: (SimpleNamespace(symbol="BTCUSDT"),),
+    )
+    captured: list[tuple[str, ...]] = []
+
+    def fake_execute(
+        self: ScheduledScanRunner,
+        run: object,
+        symbols: tuple[str, ...],
+        *,
+        period: str,
+        trigger_source: str = "SCHEDULED",
+    ) -> ScheduledScanOutcome:
+        captured.append(symbols)
+        return ScheduledScanOutcome(run=None, claimed=True)
+
+    monkeypatch.setattr(ScheduledScanRunner, "_execute", fake_execute)
+    runner = ScheduledScanRunner(container=container, clock=FixedClock(NOW))
+
+    outcome = runner.resume(claim.run.run_id, period="4h")
+
+    assert outcome.claimed is True
+    assert captured == [("BTCUSDT",)]
+    assert container.store.get_job_run(claim.run.run_id).status == "DONE"  # type: ignore[union-attr]
+
+
+def test_resume_manual_run_without_checkpoints_is_failed_not_done(tmp_path: Path) -> None:
+    from oft.bootstrap import build_container
+
+    settings = Settings(env="test", port=8765, data_dir=tmp_path / "data")
+    container = build_container(settings, initialize=True)
+    ledger = JobLedger(store=container.store, clock=FixedClock(NOW))
+    claim = ledger.claim_scan(trigger_source="MANUAL", owner="manual-owner", run_id="SCAN-1")
+    assert claim.claimed and claim.run is not None
+
+    runner = ScheduledScanRunner(container=container, clock=FixedClock(NOW))
+    outcome = runner.resume(claim.run.run_id, period="4h")
+
+    assert outcome.claimed is False
+    assert container.store.get_job_run(claim.run.run_id).status == "FAILED"  # type: ignore[union-attr]
+    assert container.store.get_job_run(claim.run.run_id).error_code == "MANUAL_RUN_INTERRUPTED"  # type: ignore[union-attr]
+
+
+def test_reclaimed_run_losing_the_lock_keeps_its_audit_row(tmp_path: Path) -> None:
+    from oft.bootstrap import build_container
+
+    settings = Settings(env="test", port=8765, data_dir=tmp_path / "data")
+    container = build_container(settings, initialize=True)
+    early = JobLedger(store=container.store, clock=FixedClock(NOW))
+    claim = early.claim(
+        "scan", utc_timestamp(WINDOW), owner="crashed", trigger_source="SCHEDULED", lease_seconds=10
+    )
+    assert claim.claimed and claim.run is not None
+    container.store.upsert_scan_symbol(
+        ScanSymbolRecord(
+            scan_id=claim.run.run_id,
+            symbol="BTCUSDT",
+            stage="DATA",
+            started_at=utc_timestamp(NOW),
+            finished_at=None,
+            error_code=None,
+            report_id=None,
+            data_quality=None,
+        )
+    )
+    later = JobLedger(store=container.store, clock=FixedClock(NOW + timedelta(seconds=60)))
+    assert later.acquire_scan_lock("other-owner")
+
+    runner = ScheduledScanRunner(container=container, clock=FixedClock(NOW + timedelta(seconds=60)))
+    outcome = runner.run_window(WINDOW, period="4h")
+
+    assert outcome.claimed is False
+    run = container.store.get_job_run(claim.run.run_id)
+    assert run is not None
+    assert run.status == "FAILED"
+    assert run.error_code == "SCAN_ALREADY_RUNNING"
+    assert container.store.list_scan_symbols(claim.run.run_id)

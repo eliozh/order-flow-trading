@@ -353,9 +353,20 @@ class ScheduledScanRunner:
             return ScheduledScanOutcome(run=claim.run, claimed=False, reason=claim.reason)
         run = claim.run
         if not self._ledger.acquire_scan_lock(run.lease_owner):
-            # Defer, do not burn the window: remove the provisional run so the
-            # next scheduler tick can claim the same window again.
-            self._container.store.delete_job_run(run.run_id)
+            if claim.reclaimed:
+                # Preserve another owner's run row and checkpoints for audit;
+                # mark it failed so it is visible instead of silently dropped.
+                self._ledger.finish(
+                    run.run_id,
+                    FAILED,
+                    error_code="SCAN_ALREADY_RUNNING",
+                    message="reclaimed run could not acquire the scan lock",
+                    owner=run.lease_owner,
+                )
+            else:
+                # Fresh provisional run: remove it so the next tick can claim
+                # the same window again.
+                self._container.store.delete_job_run(run.run_id)
             return ScheduledScanOutcome(run=None, claimed=False, reason="scan_locked")
         stop = threading.Event()
         beat = threading.Thread(
@@ -404,6 +415,11 @@ class ScheduledScanRunner:
             return ScheduledScanOutcome(run=run, claimed=False, reason="not_running")
         if not self._ledger.acquire_scan_lock(run.lease_owner):
             return ScheduledScanOutcome(run=run, claimed=False, reason="scan_locked")
+        rechecked = self._container.store.get_job_run(run_id)
+        if rechecked is None or rechecked.status != RUNNING:
+            self._ledger.release_scan_lock(run.lease_owner)
+            return ScheduledScanOutcome(run=rechecked, claimed=False, reason="not_running")
+        run = rechecked
         stop = threading.Event()
         beat = threading.Thread(
             target=self._heartbeat_loop,
@@ -417,6 +433,28 @@ class ScheduledScanRunner:
                 for item in self._container.store.list_scan_symbols(run_id)
                 if item.stage not in _TERMINAL_SCAN_STAGES
             )
+            if not pending:
+                if "#manual-" in run.window_start:
+                    self._ledger.finish(
+                        run.run_id,
+                        FAILED,
+                        error_code="MANUAL_RUN_INTERRUPTED",
+                        message="manual scan had no checkpoint to resume",
+                        owner=run.lease_owner,
+                    )
+                    return ScheduledScanOutcome(run=run, claimed=False, reason="no_checkpoint")
+                pending = tuple(
+                    contract.symbol for contract in self._container.store.list_starred()
+                )
+                if not pending:
+                    self._ledger.finish(
+                        run.run_id,
+                        FAILED,
+                        error_code="NO_STARRED_SYMBOLS",
+                        message="no checkpoint and no starred symbols to resume",
+                        owner=run.lease_owner,
+                    )
+                    return ScheduledScanOutcome(run=run, claimed=False, reason="no_checkpoint")
             outcome = self._execute(run, pending, period=period, trigger_source=run.trigger_source)
             self._ledger.finish(
                 run.run_id,
