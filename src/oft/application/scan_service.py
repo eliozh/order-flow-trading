@@ -24,6 +24,7 @@ from typing import Any, Protocol, cast
 import structlog
 
 from oft.adapters.parquet_store import read_liquidations
+from oft.application.analysis_service import AnalysisService
 from oft.application.metric_service import MetricInputs, MetricRequest, MetricService
 from oft.application.resampling_service import BarResampleRequest, ResamplingService
 from oft.config import Settings
@@ -40,6 +41,7 @@ from oft.domain.metrics.types import decimal_str
 from oft.domain.metrics.version import MetricVersion, orderflow_metric_version
 from oft.domain.time import utc_timestamp
 from oft.ports.clock import ClockPort
+from oft.ports.llm import LLMPort
 from oft.ports.store import ReportRecord, ScanRecord, StorePort, StoreUnavailableError
 
 logger = structlog.get_logger(__name__)
@@ -50,6 +52,13 @@ SNAPSHOT_SCHEMA_VERSION = "1.0.0"
 LLM_DISABLED_REASON = (
     "LLM not configured. This build produces metrics-only CALC reports; "
     "no narrative, decision, or LLM call was generated."
+)
+LLM_PROVIDER_NOT_CONFIGURED_REASON = (
+    "LLM_PROVIDER_NOT_CONFIGURED: no provider is configured, so this report is "
+    "CALC-only. Configure a provider to enable narrative analysis."
+)
+LLM_PROVIDER_UNAVAILABLE_REASON = (
+    "LLM provider is configured but this build only ships the deterministic stub."
 )
 
 
@@ -103,18 +112,24 @@ class ScanContainer(Protocol):
     @property
     def parquet(self) -> Any: ...
 
+    @property
+    def llm_provider(self) -> LLMPort | None: ...
+
+    def provider_for(self, requested: str | None = None) -> LLMPort | None: ...
+
 
 @dataclass(frozen=True)
 class ScanRequest:
-    """Inputs for one manual metrics-only scan."""
+    """Inputs for one manual scan (CALC-only or stub-LLM enabled)."""
 
     symbol: str
     period: str = "4h"
     source: str = "backfill"
-    metrics_only: bool = True
+    metrics_only: bool = False
     start: date | None = None
     end: date | None = None
     trigger_source: str = "MANUAL"
+    provider: str | None = None
 
     def __post_init__(self) -> None:
         if _SYMBOL_PATTERN.fullmatch(self.symbol) is None:
@@ -123,8 +138,6 @@ class ScanRequest:
             raise ScanValidationError(
                 f"unsupported source {self.source!r}; supported: {sorted(SUPPORTED_SOURCES)}"
             )
-        if not self.metrics_only:
-            raise ScanValidationError("only metrics-only scans are supported in this slice")
         if self.start is not None and self.end is not None and self.end < self.start:
             raise ScanValidationError("end must be on or after start")
 
@@ -372,8 +385,20 @@ def _report_id(symbol: str, now: datetime) -> str:
     return f"RPT-{symbol}-{now:%Y%m%d-%H%M%S}-{uuid.uuid4().hex[:8].upper()}"
 
 
-def _snapshot_id(symbol: str, now: datetime) -> str:
-    return f"SNAP-{symbol}-{now:%Y%m%d%H%M%S}-{uuid.uuid4().hex[:8].upper()}"
+def _snapshot_id(
+    symbol: str,
+    now: datetime,
+    *,
+    window_start: str = "",
+    window_end: str = "",
+) -> str:
+    """Deterministic snapshot id: the same window and clock always match."""
+    digest = (
+        hashlib.sha256(f"{symbol}:{now:%Y%m%d%H%M%S}:{window_start}:{window_end}".encode())
+        .hexdigest()[:8]
+        .upper()
+    )
+    return f"SNAP-{symbol}-{now:%Y%m%d%H%M%S}-{digest}"
 
 
 def _summary_values(document: Any) -> dict[str, str]:
@@ -488,7 +513,12 @@ class ScanService:
 
             # REPORT: freeze snapshot + metrics and store a CALC-only report.
             finished = clock.now()
-            snapshot_id = _snapshot_id(request.symbol, finished)
+            snapshot_id = _snapshot_id(
+                request.symbol,
+                finished,
+                window_start=utc_timestamp(window_start),
+                window_end=utc_timestamp(window_end),
+            )
             snapshot = build_market_snapshot(
                 document=document,
                 bars=_snapshot_bars(persisted_bars.run.result.bars, document),
@@ -498,18 +528,30 @@ class ScanService:
             manifest_entries = [persisted_bars.entry, persisted_metric.entry]
             if persisted_metric.footprint_entry is not None:
                 manifest_entries.append(persisted_metric.footprint_entry)
+            report_id = _report_id(request.symbol, finished)
+            llm_state, decision_id, narrative_ref, opportunity_ids = self._llm_stage(
+                request=request,
+                container=container,
+                document=document,
+                snapshot=snapshot,
+                scan_id=scan.scan_id,
+                report_id=report_id,
+            )
+            if opportunity_ids:
+                llm_state = {**llm_state, "opportunity_ids": list(opportunity_ids)}
             report = ReportRecord(
-                report_id=_report_id(request.symbol, finished),
+                report_id=report_id,
                 scan_id=scan.scan_id,
                 symbol=request.symbol,
                 timeframe=request.period,
                 generated_at=utc_timestamp(finished),
                 metrics_manifest_json=json.dumps([asdict(entry) for entry in manifest_entries]),
-                llm_decision_id=None,
-                narrative_ref=None,
+                llm_decision_id=decision_id,
+                narrative_ref=narrative_ref,
                 data_quality=document.quality.data_quality.value,
                 snapshot_json=json.dumps(snapshot),
                 metrics_json=document.json_text,
+                llm_json=json.dumps(llm_state),
             )
             summary = _summary_values(document)
             completed = replace(
@@ -543,6 +585,54 @@ class ScanService:
                 store.update_scan(failed)
             raise
 
+    def _llm_stage(
+        self,
+        *,
+        request: ScanRequest,
+        container: ScanContainer,
+        document: Any,
+        snapshot: dict[str, object],
+        scan_id: str,
+        report_id: str,
+    ) -> tuple[dict[str, Any], str | None, str | None, tuple[str, ...]]:
+        """Run the optional LLM stage; never fail the scan when it is unavailable."""
+        provider_name = (request.provider or container.settings.llm_provider or "").strip()
+        if request.metrics_only:
+            return {"configured": False, "reason": LLM_DISABLED_REASON}, None, None, ()
+        if not provider_name:
+            return (
+                {"configured": False, "reason": LLM_PROVIDER_NOT_CONFIGURED_REASON},
+                None,
+                None,
+                (),
+            )
+        if provider_name != "stub":
+            return (
+                {"configured": False, "reason": LLM_PROVIDER_UNAVAILABLE_REASON},
+                None,
+                None,
+                (),
+            )
+        provider = container.provider_for(provider_name)
+        if provider is None:
+            return (
+                {"configured": False, "reason": LLM_PROVIDER_NOT_CONFIGURED_REASON},
+                None,
+                None,
+                (),
+            )
+        service = AnalysisService(store=container.store, clock=container.clock, provider=provider)
+        outcome = service.analyze(
+            symbol=request.symbol,
+            timeframe=request.period,
+            metrics=json.loads(document.json_text),
+            snapshot=snapshot,
+            scan_id=scan_id,
+            report_id=report_id,
+        )
+        narrative_ref = f"inline:{outcome.decision_id}"
+        return outcome.llm_state, outcome.decision_id, narrative_ref, outcome.opportunity_ids
+
 
 def _public_manifest_entries(value: object) -> object:
     if not isinstance(value, list):
@@ -573,6 +663,18 @@ def public_scan_payload(record: ScanRecord) -> dict[str, object]:
     return payload
 
 
+def _llm_state(report: ReportRecord) -> dict[str, Any]:
+    if not report.llm_json:
+        return {"configured": False, "reason": LLM_DISABLED_REASON}
+    try:
+        value = json.loads(report.llm_json)
+    except json.JSONDecodeError:
+        return {"configured": False, "reason": LLM_DISABLED_REASON}
+    return (
+        value if isinstance(value, dict) else {"configured": False, "reason": LLM_DISABLED_REASON}
+    )
+
+
 def report_payload(report: ReportRecord) -> dict[str, object]:
     """Render one stored report for the API and CLI (identical sections)."""
     return {
@@ -584,10 +686,7 @@ def report_payload(report: ReportRecord) -> dict[str, object]:
         "data_quality": report.data_quality,
         "llm_decision_id": report.llm_decision_id,
         "narrative_ref": report.narrative_ref,
-        "llm": {
-            "configured": False,
-            "reason": LLM_DISABLED_REASON,
-        },
+        "llm": _llm_state(report),
         "metrics_manifest": _public_manifest_entries(json.loads(report.metrics_manifest_json)),
         "snapshot": json.loads(report.snapshot_json),
         "metrics": json.loads(report.metrics_json),
@@ -596,6 +695,7 @@ def report_payload(report: ReportRecord) -> dict[str, object]:
 
 def report_summary(report: ReportRecord) -> dict[str, object]:
     """Compact report row used by ``GET /api/v1/reports`` and the scans payload."""
+    llm = _llm_state(report)
     return {
         "report_id": report.report_id,
         "scan_id": report.scan_id,
@@ -605,6 +705,11 @@ def report_summary(report: ReportRecord) -> dict[str, object]:
         "data_quality": report.data_quality,
         "llm_decision_id": report.llm_decision_id,
         "narrative_ref": report.narrative_ref,
+        "llm": {
+            "configured": llm.get("configured", False),
+            "validation_status": llm.get("validation_status"),
+            "opportunity_ids": llm.get("opportunity_ids", []),
+        },
     }
 
 

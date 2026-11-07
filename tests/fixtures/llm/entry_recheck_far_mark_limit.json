@@ -1,0 +1,38 @@
+{
+  "decision_type": "ENTRY_RECHECK",
+  "subject": {
+    "symbol": "BTCUSDT",
+    "timeframe": "4h",
+    "as_of": "2026-11-06T12:05:00.000Z"
+  },
+  "confidence": 0.61,
+  "rationale": "Adversarial intent: a LIMIT entry with an advisory price far from the mark.",
+  "caveats": [],
+  "analysis": null,
+  "opportunity": null,
+  "entry_recheck": {
+    "decision": "ENTER_LONG",
+    "order_intent": {
+      "entry_type": "LIMIT",
+      "entry_price": "2.00",
+      "stop_price": "1.00",
+      "take_profits": ["3.00"],
+      "size_mode": "RISK_PCT",
+      "risk_pct": 0.8,
+      "quote_notional_usd": null,
+      "leverage": 2.0
+    },
+    "recheck_conditions": [
+      {
+        "condition_id": "C-1",
+        "met": true,
+        "observed": "70002.00",
+        "note": "zone still touched"
+      }
+    ],
+    "reasons": ["trigger confirmed"],
+    "invalidation_conditions": [],
+    "management_plan": "Move the stop to break-even after the first target."
+  },
+  "position_management": null
+}

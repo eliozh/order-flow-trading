@@ -74,3 +74,43 @@ def test_measured_sections_render_the_api_values() -> None:
     assert f"{len(metrics['footprint']['bars'])} bars" in output
     assert f"{metrics['liquidations']['count']} events" in output
     assert metrics["liquidations"]["coverage"] in output
+
+
+def test_configured_llm_renders_calc_first_then_the_llm_band() -> None:
+    data = _payload(measured=True)
+    data["llm"] = {
+        "configured": True,
+        "provider": "stub",
+        "model": "fixture",
+        "validation_status": "VALID",
+        "decision_type": "OPPORTUNITY_PROPOSAL",
+        "confidence": 0.72,
+        "narrative": "Range high retest with positive delta.",
+        "reason": None,
+        "opportunity_ids": ["OPP-BTCUSDT-1"],
+    }
+
+    output = render_report_table(data)
+
+    assert "CALC" in output
+    assert output.index("CALC") < output.index("LLM ›")
+    assert "Range high retest with positive delta." in output
+    assert "OPP-BTCUSDT-1" in output
+    assert "confidence 0.72" in output
+
+
+def test_rejected_narrative_renders_the_explicit_rejection_without_prose() -> None:
+    data = _payload(measured=True)
+    data["llm"] = {
+        "configured": True,
+        "validation_status": "REJECTED",
+        "reason": "STOP_SIDE: a LONG stop must be below the entry",
+        "narrative": None,
+        "opportunity_ids": [],
+    }
+
+    output = render_report_table(data)
+
+    assert "LLM rejected — STOP_SIDE" in output
+    assert "No narrative, opportunity, or order was created" in output
+    assert "LLM ›" not in output

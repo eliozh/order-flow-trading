@@ -1,0 +1,29 @@
+{
+  "decision_type": "ENTRY_RECHECK",
+  "subject": {
+    "symbol": "BTCUSDT",
+    "timeframe": "4h",
+    "as_of": "2026-11-06T12:05:00.000Z"
+  },
+  "confidence": 0.22,
+  "rationale": "The touch failed to hold; the setup is no longer valid.",
+  "caveats": [],
+  "analysis": null,
+  "opportunity": null,
+  "entry_recheck": {
+    "decision": "NO_ENTRY",
+    "order_intent": null,
+    "recheck_conditions": [
+      {
+        "condition_id": "C-1",
+        "met": false,
+        "observed": "69800.00",
+        "note": "price rejected away from the zone"
+      }
+    ],
+    "reasons": ["no entry"],
+    "invalidation_conditions": [],
+    "management_plan": ""
+  },
+  "position_management": null
+}

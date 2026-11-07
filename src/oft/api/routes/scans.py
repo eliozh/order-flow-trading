@@ -213,6 +213,7 @@ def _run_metrics_scan(request: Request, payload: ScanCreateRequest) -> dict[str,
                 metrics_only=payload.metrics_only,
                 start=payload.start,
                 end=payload.end,
+                provider=payload.provider,
             ),
             scan_id=scan_id,
         )

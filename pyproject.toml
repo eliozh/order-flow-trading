@@ -121,6 +121,27 @@ forbidden_modules = [
   "openai",
 ]
 
+# Slice 11 security negative: adapters must never reach the execution/broker
+# layer or a Binance adapter. import-linter 2.16 only supports whole-segment
+# wildcards (`oft.adapters.llm_*` is rejected as an invalid expression), so
+# `oft.adapters.**` is used to cover `oft.adapters.llm_stub` and any future
+# `oft.adapters.llm_<provider>` adapter. This is deliberately stricter than
+# LLM-only: no adapter may import the execution layer or a Binance adapter.
+[[tool.importlinter.contracts]]
+name = "Adapters never import execution or Binance modules"
+type = "forbidden"
+source_modules = ["oft.adapters.**"]
+forbidden_modules = [
+  "oft.application.execution_gateway",
+  "oft.application.paper_broker",
+  "oft.application.entry_service",
+  "oft.adapters.binance_rest",
+  "oft.adapters.binance_ws",
+  # The project vendors no Binance SDK; listed so a future import fails closed.
+  "binance",
+  "binance_connector",
+]
+
 # No LLM/execution modules exist in milestone 1. This contract fails closed on
 # the provider/execution SDKs that would introduce them; adding an `oft.llm`,
 # `oft.execution`, or `oft.broker` package requires extending this contract.

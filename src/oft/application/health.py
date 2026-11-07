@@ -216,11 +216,11 @@ def _stale_jobs_check(store: StorePort, clock: ClockPort) -> CheckResult:
 
 
 def _audit_chain_check() -> CheckResult:
-    """Milestone-1 placeholder: the hash chain is not implemented yet."""
+    """The append-only hash chain is implemented; the doctor does not verify it."""
     return CheckResult(
         "audit.chain",
         "unknown",
-        "audit_events hash chain is not implemented in milestone 1",
+        "audit_events hash chain is not verified by the doctor",
     )
 
 

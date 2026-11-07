@@ -3,7 +3,7 @@
 * No wall-clock call may appear in ``oft.domain`` or ``oft.application``;
   time is injected through ``ClockPort`` (ADR-0011).
 * ``oft doctor`` reports DB integrity, disk, clock, manifest orphans, stale
-  job runs, and an audit-chain placeholder, and never echoes a secret.
+  job runs, and an unverified audit-chain check, and never echoes a secret.
 """
 
 from __future__ import annotations
@@ -243,7 +243,7 @@ def test_doctor_reports_every_required_section(tmp_path: Path) -> None:
     assert checks["manifest.orphans"].status == "ok"
     assert checks["jobs.stale"].status == "ok"
     assert checks["audit.chain"].status == "unknown"
-    assert "not implemented" in checks["audit.chain"].detail.lower()
+    assert "not verified" in checks["audit.chain"].detail.lower()
     assert report.status == "READY"
 
 

@@ -32,10 +32,13 @@ from oft.api.auth import (
 from oft.api.envelope import new_request_id
 from oft.api.errors import ApiError, error_response
 from oft.api.routes.data import router as data_router
+from oft.api.routes.opportunities import router as opportunities_router
+from oft.api.routes.paper import router as paper_router
 from oft.api.routes.reports import router as reports_router
 from oft.api.routes.scans import router as scans_router
 from oft.api.routes.symbols import router as symbols_router
 from oft.api.routes.system import router as system_router
+from oft.api.routes.triggers import router as triggers_router
 from oft.api.routes.watchlist import router as watchlist_router
 from oft.bootstrap import build_container
 from oft.config import ConfigError, Settings, load_settings
@@ -218,6 +221,9 @@ def create_app(settings: Settings | None = None) -> FastAPI:
     app.include_router(reports_router)
     app.include_router(symbols_router)
     app.include_router(watchlist_router)
+    app.include_router(opportunities_router)
+    app.include_router(triggers_router)
+    app.include_router(paper_router)
     app.include_router(data_router)
 
     @app.exception_handler(ApiError)
