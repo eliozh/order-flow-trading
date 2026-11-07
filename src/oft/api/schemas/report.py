@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+from datetime import date
 from typing import Literal
 
 from pydantic import BaseModel, ConfigDict, Field
@@ -16,6 +17,8 @@ class ScanCreateRequest(BaseModel):
     period: Literal["1m", "5m", "15m", "1h", "4h", "8h", "1d"] = "4h"
     source: Literal["backfill"] = "backfill"
     metrics_only: bool = True
+    start: date | None = None
+    end: date | None = None
     fixture_path: str | None = Field(default=None, min_length=1)
 
 

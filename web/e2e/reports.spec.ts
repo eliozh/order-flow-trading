@@ -267,6 +267,34 @@ async function expectChartLabelsReadable(page: Page): Promise<void> {
   expect(report.paneOverlap, 'pane labels must not overlap').toBe(false)
 }
 
+/** Each price label must sit on its grid line within 2.5 CSS px. */
+async function expectPriceLabelsAligned(page: Page): Promise<void> {
+  const pairs = [
+    ['price-label-max', 'grid-price-top'],
+    ['price-label-mid', 'grid-price-mid'],
+    ['price-label-min', 'grid-price-bottom'],
+  ] as const
+  for (const [labelTestId, lineTestId] of pairs) {
+    const label = page.getByTestId(labelTestId)
+    const line = page.getByTestId(lineTestId)
+    await expect(label).toBeVisible()
+    await expect(line).toBeAttached()
+    const labelBox = await label.boundingBox()
+    const lineBox = await line.boundingBox()
+    expect(labelBox, `${labelTestId} bounding box`).not.toBeNull()
+    expect(lineBox, `${lineTestId} bounding box`).not.toBeNull()
+    if (labelBox === null || lineBox === null) {
+      continue
+    }
+    const labelCenter = labelBox.y + labelBox.height / 2
+    const lineCenter = lineBox.y + lineBox.height / 2
+    expect(
+      Math.abs(labelCenter - lineCenter),
+      `${labelTestId} center vs ${lineTestId}`,
+    ).toBeLessThanOrEqual(2.5)
+  }
+}
+
 async function fetchReport(page: Page, reportId: string): Promise<ReportData> {
   const response = await page.request.get(`/api/v1/reports/${encodeURIComponent(reportId)}`)
   expect(response.status()).toBe(200)
@@ -319,6 +347,25 @@ test('renders the metrics-only CALC report with CVD, VP, footprint, OI, funding,
   await expect(page.getByTestId('chart-volume-profile')).toBeVisible()
   await expect(page.getByRole('region', { name: /Footprint for selected bar/i })).toBeVisible()
   await expect(page.getByRole('note', { name: /Provenance CALC/i }).first()).toBeVisible()
+  await expectPriceLabelsAligned(page)
+
+  // Price labels track the rendered SVG gridlines, not the unscaled viewBox.
+  for (const [labelId, lineId] of [
+    ['price-label-max', 'grid-price-top'],
+    ['price-label-mid', 'grid-price-mid'],
+    ['price-label-min', 'grid-price-bottom'],
+  ] as const) {
+    const label = page.getByTestId(labelId)
+    await expect(label).toBeVisible()
+    const labelBox = await label.boundingBox()
+    const lineBox = await page.getByTestId(lineId).boundingBox()
+    expect(labelBox, labelId).toBeTruthy()
+    expect(lineBox, lineId).toBeTruthy()
+    const labelCenter = (labelBox?.y ?? 0) + (labelBox?.height ?? 0) / 2
+    expect(Math.abs(labelCenter - (lineBox?.y ?? 0)), `${labelId} alignment`).toBeLessThanOrEqual(
+      2.5,
+    )
+  }
 
   await expect(calcRow(page, 'CVD (window)')).toContainText(
     signed(report.metrics.cvd.summary.cvd_change),
@@ -602,6 +649,38 @@ test('/scans/:id shows the DATA -> METRICS -> REPORT metrics-only detail', async
   expectClean(diagnostics)
 })
 
+test('/reports lists CALC reports with quality and detail links', async ({ page }) => {
+  expect(REPORT_ID, 'OFT_E2E_REPORT_ID is required').toBeTruthy()
+  const diagnostics = collectDiagnostics(page)
+  await authenticate(page)
+  await page.goto('/reports')
+
+  await expect(page.getByRole('heading', { level: 1 })).toHaveText('CALC reports')
+  const table = page.getByRole('region', { name: 'Reports table' })
+  await expect(table).toBeVisible()
+
+  const row = table.locator('tbody tr').filter({ hasText: REPORT_ID as string })
+  await expect(row).toContainText(SYMBOL)
+  await expect(row).toContainText('4h')
+  await expect(row).toContainText('PARTIAL')
+  await expect(row.locator('a', { hasText: REPORT_ID as string })).toHaveAttribute(
+    'href',
+    `/reports/${REPORT_ID as string}`,
+  )
+
+  if (MISSING_REPORT_ID) {
+    const missingRow = table.locator('tbody tr').filter({ hasText: MISSING_REPORT_ID })
+    await expect(missingRow).toContainText('MISSING')
+    await expect(missingRow.locator('a', { hasText: MISSING_REPORT_ID })).toHaveAttribute(
+      'href',
+      `/reports/${MISSING_REPORT_ID}`,
+    )
+  }
+
+  expect(await page.locator('main input, main select, main textarea, main form').count()).toBe(0)
+  expectClean(diagnostics)
+})
+
 test('is read-only, keyboard operable, and overflow-free at 1440, 768, and 375', async ({
   page,
 }) => {
@@ -620,6 +699,7 @@ test('is read-only, keyboard operable, and overflow-free at 1440, 768, and 375',
     await page.goto(reportPath(REPORT_ID as string))
     await expect(page.getByRole('figure', { name: /BTCUSDT 4h chart/i })).toBeVisible()
     await expectChartLabelsReadable(page)
+    await expectPriceLabelsAligned(page)
 
     if (viewport.width <= 768) {
       await expect(page.locator('section.system-page')).toHaveAttribute('data-readonly', 'true')
@@ -662,6 +742,7 @@ test('is read-only, keyboard operable, and overflow-free at 1440, 768, and 375',
       page.getByRole('table', { name: 'Volume profile data table' }),
     )
     await expectChartLabelsReadable(page)
+    await expectPriceLabelsAligned(page)
 
     const widths = await page.evaluate(() => ({
       document: document.documentElement.scrollWidth,
@@ -679,4 +760,21 @@ test('is read-only, keyboard operable, and overflow-free at 1440, 768, and 375',
     })
     expectClean(diagnostics)
   }
+})
+
+test('/reports lists CALC reports and links to the frozen detail', async ({ page }) => {
+  expect(REPORT_ID, 'OFT_E2E_REPORT_ID is required').toBeTruthy()
+  const diagnostics = collectDiagnostics(page)
+  await authenticate(page)
+  await page.goto('/reports')
+
+  await expect(page.getByRole('heading', { name: /CALC reports/i })).toBeVisible()
+  const table = page.getByRole('table', { name: /CALC report list/i })
+  const row = table.locator('tbody tr').filter({ hasText: REPORT_ID as string })
+  await expect(row).toContainText(SYMBOL)
+  await expect(row.locator('a', { hasText: REPORT_ID as string })).toHaveAttribute(
+    'href',
+    `/reports/${REPORT_ID as string}`,
+  )
+  expectClean(diagnostics)
 })

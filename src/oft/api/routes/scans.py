@@ -4,6 +4,8 @@ from __future__ import annotations
 
 import hashlib
 import json
+import threading
+from contextlib import suppress
 from datetime import timedelta
 from pathlib import Path
 from typing import Any
@@ -30,6 +32,8 @@ from oft.ports.store import IdempotencyRecord
 router = APIRouter()
 
 _IDEMPOTENCY_TTL = timedelta(hours=24)
+_IDEMPOTENCY_LEASE = timedelta(seconds=30)
+_IDEMPOTENCY_HEARTBEAT = timedelta(seconds=10)
 
 
 def _validated_fixture_path(raw: str, fixtures_dir: Path) -> str:
@@ -83,6 +87,7 @@ def _idempotency_record(
     request_hash: str,
     status: int,
     response_json: str,
+    ttl: timedelta | None = None,
 ) -> IdempotencyRecord:
     container = request.app.state.container
     now = container.clock.now()
@@ -93,7 +98,7 @@ def _idempotency_record(
         response_status=status,
         response_json=response_json,
         created_at=utc_timestamp(now),
-        expires_at=utc_timestamp(now + _IDEMPOTENCY_TTL),
+        expires_at=utc_timestamp(now + (ttl if ttl is not None else _IDEMPOTENCY_TTL)),
     )
 
 
@@ -147,6 +152,8 @@ def _run_metrics_scan(request: Request, payload: ScanCreateRequest) -> dict[str,
                 period=payload.period,
                 source=payload.source,
                 metrics_only=payload.metrics_only,
+                start=payload.start,
+                end=payload.end,
             )
         )
     except ScanError as exc:
@@ -200,13 +207,16 @@ def create_scan(
         request_hash=request_hash,
         status=0,
         response_json="",
+        ttl=_IDEMPOTENCY_LEASE,
     )
     if not container.store.reserve_idempotency(reservation):
         existing = container.store.get_idempotency(scope=scoped_key, key=key)
-        if existing is not None and existing.expires_at <= now:
-            container.store.delete_idempotency(scope=scoped_key, key=key)
-            if container.store.reserve_idempotency(reservation):
-                existing = None
+        if (
+            existing is not None
+            and existing.expires_at <= now
+            and container.store.reserve_idempotency(reservation)
+        ):
+            existing = None
         if existing is not None:
             if existing.request_hash != request_hash:
                 raise ApiError("IDEMPOTENCY_CONFLICT")
@@ -217,11 +227,28 @@ def create_scan(
                 "A request with this Idempotency-Key is still running.",
             )
 
+    stop_heartbeat = threading.Event()
+
+    def heartbeat() -> None:
+        while not stop_heartbeat.wait(_IDEMPOTENCY_HEARTBEAT.total_seconds()):
+            with suppress(Exception):
+                container.store.renew_idempotency(
+                    scope=scoped_key,
+                    key=key,
+                    expires_at=utc_timestamp(container.clock.now() + _IDEMPOTENCY_LEASE),
+                )
+
+    beat = threading.Thread(target=heartbeat, daemon=True)
+    beat.start()
     try:
         envelope = _run_metrics_scan(request, payload)
     except BaseException:
+        stop_heartbeat.set()
+        beat.join(timeout=1)
         container.store.delete_idempotency(scope=scoped_key, key=key)
         raise
+    stop_heartbeat.set()
+    beat.join(timeout=1)
     _complete_idempotency(request, key=key, request_hash=request_hash, envelope=envelope)
     return JSONResponse(status_code=201, content=envelope)
 
@@ -234,7 +261,6 @@ def list_scans(
 ) -> dict[str, Any]:
     """List recent scans (newest first) for ``oft scan history``."""
     container = request.app.state.container
-    container.store.fail_stale_scans(now=utc_timestamp(container.clock.now()))
     records = container.store.list_scans(limit=limit, offset=offset)
     total = container.store.count_scans()
     items = [public_scan_payload(record) for record in records]
@@ -260,7 +286,6 @@ def read_scan(
     scan_id: str = PathParam(min_length=1, max_length=128, pattern=r"^[A-Za-z0-9._:-]+$"),
 ) -> dict[str, Any]:
     container = request.app.state.container
-    container.store.fail_stale_scans(now=utc_timestamp(container.clock.now()))
     record = get_scan(container, scan_id)
     if record is None:
         raise ApiError("NOT_FOUND", f"Scan {scan_id} does not exist.")

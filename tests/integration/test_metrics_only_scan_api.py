@@ -580,6 +580,7 @@ def test_stale_running_scan_is_failed_on_read(tmp_path: Path) -> None:
             report_id=None,
         )
         harness.container.store.save_scan(stale)
+        assert _post(harness, key="stale-trigger").status_code == 201
         response = harness.client.get("/api/v1/scans/SCAN-STALE", headers=harness.auth)
     finally:
         harness.close()
@@ -695,3 +696,131 @@ def test_api_does_not_expose_absolute_manifest_paths(tmp_path: Path) -> None:
         assert "/" not in entry["path"]
     assert not report["metrics"]["sources"][0]["ref"].startswith("/")
     assert str(tmp_path) not in report["metrics"]["sources"][0]["ref"]
+
+
+def test_scan_start_end_window_limits_the_snapshot(tmp_path: Path) -> None:
+    harness = _harness(tmp_path)
+    try:
+        response = _post(
+            harness,
+            key="windowed",
+            payload={
+                **SCAN_PAYLOAD,
+                "start": "2026-10-02",
+                "end": "2026-10-02",
+            },
+        )
+        report_id = response.json()["data"]["report_id"]
+        report = harness.client.get(f"/api/v1/reports/{report_id}", headers=harness.auth).json()[
+            "data"
+        ]
+    finally:
+        harness.close()
+
+    assert response.status_code == 201
+    assert report["snapshot"]["window"] == {
+        "start": "2026-10-02T00:00:00.000Z",
+        "end": "2026-10-03T00:00:00.000Z",
+    }
+    assert report["snapshot"]["bars"]
+    assert all(bar["bar_start"].startswith("2026-10-02") for bar in report["snapshot"]["bars"])
+
+
+def test_expired_idempotency_reservation_is_taken_over_atomically(tmp_path: Path) -> None:
+    from oft.ports.store import IdempotencyRecord
+
+    harness = _harness(tmp_path, backfill=False)
+    try:
+        stale = IdempotencyRecord(
+            scope="test:POST:/api/v1/scans",
+            key="lease",
+            request_hash="old",
+            response_status=0,
+            response_json="",
+            created_at="2000-01-01T00:00:00.000Z",
+            expires_at="2000-01-01T00:00:30.000Z",
+        )
+        assert harness.container.store.reserve_idempotency(stale) is True
+        takeover = IdempotencyRecord(
+            scope="test:POST:/api/v1/scans",
+            key="lease",
+            request_hash="new",
+            response_status=0,
+            response_json="",
+            created_at="2026-11-06T12:00:00.000Z",
+            expires_at="2026-11-06T12:00:30.000Z",
+        )
+        assert harness.container.store.reserve_idempotency(takeover) is True
+        stored = harness.container.store.get_idempotency(
+            scope="test:POST:/api/v1/scans", key="lease"
+        )
+    finally:
+        harness.close()
+
+    assert stored is not None
+    assert stored.request_hash == "new"
+
+
+def test_crashed_reservation_lease_expires_and_allows_retry(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    import oft.api.routes.scans as scans_routes
+
+    harness = _harness(tmp_path)
+    monkeypatch.setattr(scans_routes, "_IDEMPOTENCY_LEASE", timedelta(seconds=-1))
+
+    def fail_complete(*args: Any, **kwargs: Any) -> None:
+        raise RuntimeError("completion write failed")
+
+    original_complete = harness.container.store.complete_idempotency
+    monkeypatch.setattr(harness.container.store, "complete_idempotency", fail_complete)
+    try:
+        with pytest.raises(RuntimeError):
+            _post(harness, key="crashed-lease")
+        monkeypatch.setattr(harness.container.store, "complete_idempotency", original_complete)
+        retry = _post(harness, key="crashed-lease")
+    finally:
+        harness.close()
+
+    assert retry.status_code == 201
+    assert retry.json()["meta"]["idempotent_replay"] is False
+
+
+def test_scan_longer_than_the_lease_keeps_the_key_reserved(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    import threading
+    import time
+    from concurrent.futures import ThreadPoolExecutor
+
+    import oft.api.routes.scans as scans_routes
+
+    monkeypatch.setattr(scans_routes, "_IDEMPOTENCY_LEASE", timedelta(seconds=0.05))
+    monkeypatch.setattr(scans_routes, "_IDEMPOTENCY_HEARTBEAT", timedelta(seconds=0.01))
+    original = scans_routes._run_metrics_scan
+    started = threading.Event()
+    calls: list[int] = []
+
+    def slow_run(request: Any, payload: Any) -> Any:
+        calls.append(1)
+        if len(calls) == 1:
+            started.set()
+            time.sleep(0.3)
+        return original(request, payload)
+
+    monkeypatch.setattr(scans_routes, "_run_metrics_scan", slow_run)
+    harness = _harness(tmp_path)
+    try:
+        with ThreadPoolExecutor(max_workers=2) as pool:
+            first = pool.submit(_post, harness, key="long-lease")
+            assert started.wait(timeout=5)
+            time.sleep(0.12)
+            second = pool.submit(_post, harness, key="long-lease")
+            responses = [first.result(), second.result()]
+        reports = harness.container.store.list_reports()
+    finally:
+        harness.close()
+
+    assert len(calls) == 1
+    assert sorted(response.status_code for response in responses) == [201, 409]
+    assert len(reports) == 1

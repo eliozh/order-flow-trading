@@ -1039,12 +1039,19 @@ class SqliteStore:
         """Atomically reserve a key; False means the key already exists."""
         try:
             with closing(self._connect()) as connection, connection:
-                connection.execute(
+                cursor = connection.execute(
                     """
                     INSERT INTO idempotency_keys (
                         scope, key, request_hash, response_status, response_json,
                         created_at, expires_at
                     ) VALUES (?, ?, ?, ?, ?, ?, ?)
+                    ON CONFLICT(scope, key) DO UPDATE SET
+                        request_hash = excluded.request_hash,
+                        response_status = excluded.response_status,
+                        response_json = excluded.response_json,
+                        created_at = excluded.created_at,
+                        expires_at = excluded.expires_at
+                    WHERE idempotency_keys.expires_at <= excluded.created_at
                     """,
                     (
                         record.scope,
@@ -1058,7 +1065,16 @@ class SqliteStore:
                 )
         except sqlite3.IntegrityError:
             return False
-        return True
+        return cursor.rowcount == 1
+
+    def renew_idempotency(self, *, scope: str, key: str, expires_at: str) -> None:
+        """Extend an in-flight reservation lease without touching its payload."""
+        with closing(self._connect()) as connection, connection:
+            connection.execute(
+                "UPDATE idempotency_keys SET expires_at = ? "
+                "WHERE scope = ? AND key = ? AND response_json = ''",
+                (expires_at, scope, key),
+            )
 
     def complete_idempotency(self, record: IdempotencyRecord) -> None:
         with closing(self._connect()) as connection, connection:

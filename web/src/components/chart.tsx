@@ -37,10 +37,12 @@ function numeric(value: string | null): number {
 }
 
 function priceRange(bars: SnapshotBar[]): { min: number; max: number } {
-  const lows = bars.map((bar) => numeric(bar.low))
-  const highs = bars.map((bar) => numeric(bar.high))
-  const min = Math.min(...lows)
-  const max = Math.max(...highs)
+  let min = Number.POSITIVE_INFINITY
+  let max = Number.NEGATIVE_INFINITY
+  for (const bar of bars) {
+    min = Math.min(min, numeric(bar.low))
+    max = Math.max(max, numeric(bar.high))
+  }
   const pad = Math.max((max - min) * 0.08, 0.01)
   return { min: min - pad, max: max + pad }
 }
@@ -111,15 +113,20 @@ export function Chart({
   const candleWidth = Math.max(slot * 0.55, 3)
   const selectedBar = bars.find((bar) => bar.bar_start === selected) ?? bars[bars.length - 1]
   const footprint = metrics.footprint.bars.find((bar) => bar.bar_start === selectedBar.bar_start)
-  const cvdValues = bars.map((bar) => numeric(bar.cvd))
-  const cvdMin = Math.min(0, ...cvdValues)
-  const cvdMax = Math.max(0, ...cvdValues)
+  let cvdMin = 0
+  let cvdMax = 0
+  let maxVolume = 0.000001
+  for (const bar of bars) {
+    const cvd = numeric(bar.cvd)
+    cvdMin = Math.min(cvdMin, cvd)
+    cvdMax = Math.max(cvdMax, cvd)
+    maxVolume = Math.max(maxVolume, numeric(bar.volume))
+  }
   const cvdSpan = cvdMax - cvdMin || 1
-  const maxVolume = Math.max(...bars.map((bar) => numeric(bar.volume)), 0.000001)
-  const maxProfileVolume = Math.max(
-    ...metrics.volume_profile.bins.map((bin) => numeric(bin.volume)),
-    0.000001,
-  )
+  let maxProfileVolume = 0.000001
+  for (const bin of metrics.volume_profile.bins) {
+    maxProfileVolume = Math.max(maxProfileVolume, numeric(bin.volume))
+  }
 
   function selectBar(barStart: string) {
     setInternalSelection(barStart)
@@ -193,17 +200,39 @@ export function Chart({
           aria-label={`${symbol} ${timeframe} price chart`}
           aria-describedby={showTable ? tableId : undefined}
         >
-          <div className="chart-axis-labels" data-testid="chart-axis-labels" aria-hidden="true">
-            <span>{range.max.toFixed(2)}</span>
-            <span>{((range.max + range.min) / 2).toFixed(2)}</span>
-            <span>{range.min.toFixed(2)}</span>
-          </div>
           <div className="chart-pane-labels" aria-hidden="true">
             <span>Price</span>
             <span>Volume</span>
             <span>CVD</span>
             <span data-testid="cvd-zero-label">0</span>
             <span>POC {metrics.volume_profile.poc}</span>
+          </div>
+          <div className="chart-canvas">
+          <div className="chart-axis-labels" data-testid="chart-axis-labels" aria-hidden="true">
+            <span
+              data-testid="price-label-max"
+              style={{ top: `${(PRICE_TOP / HEIGHT) * 100}%`, transform: 'translateY(-50%)' }}
+            >
+              {range.max.toFixed(2)}
+            </span>
+            <span
+              data-testid="price-label-mid"
+              style={{
+                top: `${((PRICE_TOP + PRICE_HEIGHT / 2) / HEIGHT) * 100}%`,
+                transform: 'translateY(-50%)',
+              }}
+            >
+              {((range.max + range.min) / 2).toFixed(2)}
+            </span>
+            <span
+              data-testid="price-label-min"
+              style={{
+                top: `${((PRICE_TOP + PRICE_HEIGHT) / HEIGHT) * 100}%`,
+                transform: 'translateY(-50%)',
+              }}
+            >
+              {range.min.toFixed(2)}
+            </span>
           </div>
           <svg
             className="chart-svg"
@@ -214,8 +243,22 @@ export function Chart({
             data-testid="chart-plot"
           >
             <g className="chart-grid">
-              <line x1={PADDING} y1={PRICE_TOP} x2={WIDTH - PADDING} y2={PRICE_TOP} />
               <line
+                data-testid="grid-price-top"
+                x1={PADDING}
+                y1={PRICE_TOP}
+                x2={WIDTH - PADDING}
+                y2={PRICE_TOP}
+              />
+              <line
+                data-testid="grid-price-mid"
+                x1={PADDING}
+                y1={PRICE_TOP + PRICE_HEIGHT / 2}
+                x2={WIDTH - PADDING}
+                y2={PRICE_TOP + PRICE_HEIGHT / 2}
+              />
+              <line
+                data-testid="grid-price-bottom"
                 x1={PADDING}
                 y1={PRICE_TOP + PRICE_HEIGHT}
                 x2={WIDTH - PADDING}
@@ -304,6 +347,7 @@ export function Chart({
               />
             </g>
           </svg>
+          </div>
         </div>
 
         <FootprintDock
@@ -346,7 +390,7 @@ export function Chart({
           <span className="swatch swatch--down" aria-hidden="true" /> down
         </span>
         <span>POC</span>
-        <span>POC solid · VAH/VAL value area</span>
+        <span>POC highlighted bin · value-area bins in table</span>
       </div>
 
       {showTable && (

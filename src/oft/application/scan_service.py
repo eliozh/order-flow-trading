@@ -16,7 +16,7 @@ import threading
 import uuid
 from contextlib import suppress
 from dataclasses import asdict, dataclass, replace
-from datetime import UTC, datetime, timedelta
+from datetime import UTC, date, datetime, timedelta
 from decimal import Decimal
 from pathlib import Path
 from typing import Any, Protocol, cast
@@ -104,6 +104,8 @@ class ScanRequest:
     period: str = "4h"
     source: str = "backfill"
     metrics_only: bool = True
+    start: date | None = None
+    end: date | None = None
 
     def __post_init__(self) -> None:
         if _SYMBOL_PATTERN.fullmatch(self.symbol) is None:
@@ -114,6 +116,8 @@ class ScanRequest:
             )
         if not self.metrics_only:
             raise ScanValidationError("only metrics-only scans are supported in this slice")
+        if self.start is not None and self.end is not None and self.end < self.start:
+            raise ScanValidationError("end must be on or after start")
 
 
 @dataclass(frozen=True)
@@ -124,7 +128,12 @@ class ScanRun:
     report: ReportRecord
 
 
-def _window_from_manifest(store: StorePort, symbol: str) -> tuple[datetime, datetime] | None:
+def _window_from_manifest(
+    store: StorePort,
+    symbol: str,
+    start: date | None = None,
+    end: date | None = None,
+) -> tuple[datetime, datetime] | None:
     days = sorted(
         {
             entry.date
@@ -134,9 +143,20 @@ def _window_from_manifest(store: StorePort, symbol: str) -> tuple[datetime, date
     )
     if not days:
         return None
-    start = datetime.fromisoformat(days[0]).replace(tzinfo=UTC)
-    end = datetime.fromisoformat(days[-1]).replace(tzinfo=UTC) + timedelta(days=1)
-    return start, end
+    first_day = (
+        max(date.fromisoformat(days[0]), start)
+        if start is not None
+        else date.fromisoformat(days[0])
+    )
+    last_day = (
+        min(date.fromisoformat(days[-1]), end) if end is not None else date.fromisoformat(days[-1])
+    )
+    if last_day < first_day:
+        return None
+    return (
+        datetime.combine(first_day, datetime.min.time(), tzinfo=UTC),
+        datetime.combine(last_day + timedelta(days=1), datetime.min.time(), tzinfo=UTC),
+    )
 
 
 def _metric_version(request: MetricRequest) -> MetricVersion:
@@ -217,11 +237,21 @@ def _snapshot_bars(
 ) -> list[dict[str, object]]:
     points = {point.bar_start: point for point in document.cvd.points}
     oi_points = tuple(document.open_interest.points) if document.open_interest else ()
-    funding_rate = (
-        document.funding.current_rate
-        if document.funding is not None and document.funding.current_rate is not None
-        else None
+    funding_points = (
+        sorted(document.funding.history, key=lambda point: point.ts)
+        if document.funding is not None
+        else []
     )
+
+    def funding_at(bar_end: datetime) -> Decimal | None:
+        selected: Decimal | None = None
+        for point in funding_points:
+            if point.ts <= bar_end:
+                selected = point.rate
+            else:
+                break
+        return selected
+
     bars: list[dict[str, object]] = []
     for bar in resample_bars:
         point = points.get(bar.bar_start)
@@ -235,6 +265,7 @@ def _snapshot_bars(
                 f"bars and metrics disagree at {utc_timestamp(bar.bar_start)}"
             )
         open_interest = _open_interest_at(oi_points, bar.bar_end)
+        funding_rate = funding_at(bar.bar_end)
         bars.append(
             {
                 "bar_start": utc_timestamp(bar.bar_start),
@@ -374,7 +405,7 @@ class ScanService:
         clock = container.clock
         started = clock.now()
         store.fail_stale_scans(now=utc_timestamp(started))
-        window = _window_from_manifest(store, request.symbol)
+        window = _window_from_manifest(store, request.symbol, request.start, request.end)
         if window is None:
             raise ScanDataUnavailable(
                 f"No published agg_trades exist for {request.symbol}; complete a backfill first."

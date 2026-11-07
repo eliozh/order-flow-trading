@@ -10,6 +10,14 @@ The approved design (DESIGN.md, G2 preview) is a dark, dense, keyboard-operable 
 
 Research fixes the charting constraint: TradingView **Advanced Charts is not licensed for private/open-source personal use**; only **Lightweight Charts (Apache-2.0)** is viable. Lightweight Charts has no built-in footprint, volume profile, or DOM ladder; those must be custom series/primitives/overlays.
 
+## Implementation note (slice 08)
+
+The slice-08 report surface currently renders an accessible inline SVG chart with a semantic
+data-table equivalent instead of Lightweight Charts. `lightweight-charts` remains pinned in
+`web/package.json` for the planned migration, but is not imported yet. Migrating the chart is
+follow-up work; the SVG implementation preserves keyboard navigation, the data-table fallback,
+and the ADR's accessibility contract.
+
 ## Decision
 
 Use a **React 19 + TypeScript + Vite** single-page application, served as static assets by the FastAPI daemon.

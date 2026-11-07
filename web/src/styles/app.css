@@ -788,7 +788,6 @@ code {
 }
 
 .chart-plot {
-  position: relative;
   min-width: 0;
   padding: var(--oft-space-2);
   background: var(--oft-bg-canvas);
@@ -942,17 +941,24 @@ code {
   word-break: normal;
 }
 
+.chart-canvas {
+  position: relative;
+  width: 100%;
+}
+
 .chart-axis-labels {
   position: absolute;
-  top: 18px;
-  right: 16px;
-  display: flex;
-  height: 210px;
-  flex-direction: column;
-  justify-content: space-between;
+  inset: 0;
   pointer-events: none;
   color: var(--oft-text-secondary);
   font: 11px var(--oft-font-mono);
+}
+
+.chart-axis-labels span {
+  position: absolute;
+  right: 4px;
+  line-height: 1;
+  background: var(--oft-bg-canvas);
 }
 
 .chart-pane-labels {
