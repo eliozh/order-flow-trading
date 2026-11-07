@@ -1,4 +1,4 @@
-import { useId, useState } from 'react'
+import { useEffect, useId, useState } from 'react'
 import type { KeyboardEvent } from 'react'
 
 import type { MetricsDocument, SnapshotBar } from '../api/reports'
@@ -66,9 +66,27 @@ export function Chart({
 }: ChartProps) {
   const plotId = useId()
   const tableId = `${plotId}-table`
+  const summaryId = `${plotId}-summary`
   const [internalSelection, setInternalSelection] = useState<string | undefined>(undefined)
   const [showTable, setShowTable] = useState(false)
+  const [announcement, setAnnouncement] = useState('')
   const selected = selectedBarStart ?? internalSelection ?? bars[bars.length - 1]?.bar_start
+
+  useEffect(() => {
+    if (!selected) {
+      return
+    }
+    const timer = setTimeout(() => {
+      const bar = bars.find((candidate) => candidate.bar_start === selected)
+      if (bar) {
+        setAnnouncement(
+          `${symbol} ${timeframe}. ${bars.length} bars. Selected ${utcLabel(bar.bar_start)} UTC, ` +
+            `close ${bar.close}, delta ${signedText(bar.delta)}.`,
+        )
+      }
+    }, 500)
+    return () => clearTimeout(timer)
+  }, [bars, selected, symbol, timeframe])
 
   if (quality === 'MISSING' || bars.length === 0) {
     return (
@@ -130,7 +148,16 @@ export function Chart({
   }
 
   return (
-    <figure className="chart-frame" aria-label={`${symbol} ${timeframe} chart`}>
+    <figure
+      className="chart-frame"
+      aria-label={`${symbol} ${timeframe} chart`}
+      aria-describedby={summaryId}
+    >
+      <figcaption id={summaryId} className="visually-hidden">
+        Candlestick chart with {bars.length} bars. Price range {range.min.toFixed(2)} to{' '}
+        {range.max.toFixed(2)}. Volume, CVD, volume profile, and footprint are shown; the data
+        table carries the same values.
+      </figcaption>
       <div className="chart-head">
         <span className="chart-symbol">{symbol}</span>
         <span className="mono-muted">{timeframe} · UTC</span>
@@ -138,13 +165,12 @@ export function Chart({
         <DataQualityBadge status={quality} reasons={qualityReasons} />
         <span className="grow" />
         <span className="mono-muted">
-          last {selectedBar.close} · {signedText(selectedBar.delta)}
+          last {selectedBar.close} · Δ {signedText(selectedBar.delta)}
         </span>
       </div>
 
       <p className="visually-hidden" aria-live="polite">
-        {symbol} {timeframe} chart with {bars.length} bars. Selected{' '}
-        {utcLabel(selectedBar.bar_start)} UTC.
+        {announcement}
       </p>
 
       <div className="chart-toolbar">
@@ -163,11 +189,22 @@ export function Chart({
       <div className="chart-body">
         <div
           className="chart-plot"
-          tabIndex={0}
           role="img"
           aria-label={`${symbol} ${timeframe} price chart`}
           aria-describedby={showTable ? tableId : undefined}
         >
+          <div className="chart-axis-labels" data-testid="chart-axis-labels" aria-hidden="true">
+            <span>{range.max.toFixed(2)}</span>
+            <span>{((range.max + range.min) / 2).toFixed(2)}</span>
+            <span>{range.min.toFixed(2)}</span>
+          </div>
+          <div className="chart-pane-labels" aria-hidden="true">
+            <span>Price</span>
+            <span>Volume</span>
+            <span>CVD</span>
+            <span data-testid="cvd-zero-label">0</span>
+            <span>POC {metrics.volume_profile.poc}</span>
+          </div>
           <svg
             className="chart-svg"
             viewBox={`0 0 ${WIDTH} ${HEIGHT}`}
@@ -229,9 +266,6 @@ export function Chart({
                   />
                 )
               })}
-              <text className="chart-label" x={PADDING + 116} y={PRICE_TOP + 10}>
-                POC {metrics.volume_profile.poc}
-              </text>
             </g>
             <g data-testid="chart-volume">
               {bars.map((bar, index) => {
@@ -249,9 +283,6 @@ export function Chart({
                   />
                 )
               })}
-              <text className="chart-label" x={PADDING} y={VOLUME_TOP - 4}>
-                Volume
-              </text>
             </g>
             <g data-testid="chart-cvd">
               <line
@@ -271,9 +302,6 @@ export function Chart({
                   })
                   .join(' ')}
               />
-              <text className="chart-label" x={PADDING} y={CVD_TOP - 4}>
-                CVD
-              </text>
             </g>
           </svg>
         </div>
@@ -310,18 +338,26 @@ export function Chart({
         })}
       </div>
 
-      <div className="chart-legend" aria-hidden="true">
+      <div className="chart-legend">
         <span>
-          <span className="swatch swatch--up" /> up
+          <span className="swatch swatch--up" aria-hidden="true" /> up
         </span>
         <span>
-          <span className="swatch swatch--down" /> down
+          <span className="swatch swatch--down" aria-hidden="true" /> down
         </span>
         <span>POC</span>
         <span>POC solid · VAH/VAL value area</span>
       </div>
 
       {showTable && (
+        <div
+          className="table-wrap chart-table-wrap"
+          role="region"
+          aria-label="Chart data table"
+          // Scrollable regions need a focus stop so keyboard users can pan them.
+          // eslint-disable-next-line jsx-a11y/no-noninteractive-tabindex
+          tabIndex={0}
+        >
         <table className="data-table chart-table" id={tableId} aria-label="Chart data table">
           <caption className="visually-hidden">
             Chart data table with the same values drawn in the chart ({plotId}).
@@ -361,6 +397,32 @@ export function Chart({
             ))}
           </tbody>
         </table>
+        <table className="data-table chart-vp-table" aria-label="Volume profile data table">
+          <caption className="visually-hidden">
+            Volume profile bins with price range, volume, POC, and value-area membership.
+          </caption>
+          <thead>
+            <tr>
+              <th scope="col">Price low</th>
+              <th scope="col">Price high</th>
+              <th scope="col">Volume</th>
+              <th scope="col">POC</th>
+              <th scope="col">Value area</th>
+            </tr>
+          </thead>
+          <tbody>
+            {metrics.volume_profile.bins.map((bin) => (
+              <tr key={`vp-row-${bin.price_low}-${bin.price_high}`}>
+                <td className="mono">{bin.price_low}</td>
+                <td className="mono">{bin.price_high}</td>
+                <td className="mono">{bin.volume}</td>
+                <td>{bin.is_poc ? 'POC' : '—'}</td>
+                <td>{bin.in_value_area ? 'yes' : 'no'}</td>
+              </tr>
+            ))}
+          </tbody>
+        </table>
+        </div>
       )}
     </figure>
   )

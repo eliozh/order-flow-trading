@@ -52,6 +52,14 @@ interface FootprintBar {
   cells: FootprintCell[]
 }
 
+interface VolumeBin {
+  price_low: string
+  price_high: string
+  volume: string
+  is_poc: boolean
+  in_value_area: boolean
+}
+
 interface ReportData {
   report_id: string
   scan_id: string
@@ -72,7 +80,7 @@ interface ReportData {
       val: string
       value_area_pct: number
       bin_size: string
-      bins: unknown[]
+      bins: VolumeBin[]
     }
     footprint: { bars: FootprintBar[] }
     open_interest: { delta_over_window: string; sampling: string; points: unknown[] }
@@ -152,6 +160,111 @@ function signed(value: string): string {
 
 function footprintTotal(bar: FootprintBar): string {
   return bar.cells.reduce((sum, cell) => sum + Number(cell.total_volume), 0).toFixed(2)
+}
+
+async function openDataTables(page: Page): Promise<void> {
+  const toggle = page.getByRole('button', { name: /view data table/i })
+  if ((await toggle.getAttribute('aria-expanded')) !== 'true') {
+    await toggle.click()
+  }
+  await expect(page.getByRole('table', { name: 'Chart data table' })).toBeVisible()
+  await expect(page.getByRole('table', { name: 'Volume profile data table' })).toBeVisible()
+}
+
+/**
+ * A cell must not break words per character (the 375px regression). Space
+ * wrapping is allowed: line boxes may not exceed the number of whitespace runs.
+ */
+async function expectNoPerCharacterWrap(page: Page, table: Locator): Promise<void> {
+  const offenders = await table.locator('tbody td, tbody th').evaluateAll((nodes) =>
+    nodes
+      .map((node) => {
+        const element = node as HTMLElement
+        const style = getComputedStyle(element)
+        const range = document.createRange()
+        range.selectNodeContents(element)
+        const tops = new Set(Array.from(range.getClientRects()).map((rect) => Math.round(rect.top)))
+        const text = (element.textContent ?? '').trim()
+        const spaces = (text.match(/\s+/g) ?? []).length
+        return {
+          text: text.slice(0, 40),
+          lines: tops.size,
+          allowed: spaces + 1,
+          wordBreak: style.wordBreak,
+          overflowWrap: style.overflowWrap,
+        }
+      })
+      .filter(
+        (cell) =>
+          cell.lines > cell.allowed ||
+          cell.wordBreak === 'break-all' ||
+          cell.overflowWrap === 'anywhere',
+      ),
+  )
+  expect(offenders, 'table text must not wrap per character').toEqual([])
+}
+
+/** Axis and pane labels must be visible, legible, unclipped, and non-overlapping. */
+async function expectChartLabelsReadable(page: Page): Promise<void> {
+  const axis = page.getByTestId('chart-axis-labels')
+  await expect(axis).toBeVisible()
+  const axisSpans = axis.locator('span')
+  await expect(axisSpans).toHaveCount(3)
+  for (let index = 0; index < 3; index += 1) {
+    await expect(axisSpans.nth(index)).toBeVisible()
+    expect((await axisSpans.nth(index).innerText()).trim()).toMatch(/^\d+\.\d{2}$/)
+  }
+  const paneLabels = page.locator('.chart-pane-labels span')
+  await expect(paneLabels.filter({ hasText: /^Price$/ })).toHaveCount(1)
+  await expect(paneLabels.filter({ hasText: /^Volume$/ })).toHaveCount(1)
+  await expect(paneLabels.filter({ hasText: /^CVD$/ })).toHaveCount(1)
+  await expect(paneLabels.filter({ hasText: /^POC / })).toHaveCount(1)
+
+  const report = await page.evaluate(() => {
+    function rectsFor(selector: string) {
+      const labels = Array.from(document.querySelectorAll<HTMLElement>(selector))
+      return labels.map((label) => {
+        const rect = label.getBoundingClientRect()
+        return {
+          text: (label.textContent ?? '').trim(),
+          fontSize: Number.parseFloat(getComputedStyle(label).fontSize),
+          width: rect.width,
+          height: rect.height,
+          left: rect.left,
+          right: rect.right,
+          top: rect.top,
+          bottom: rect.bottom,
+          clipped: label.scrollWidth > label.clientWidth + 1,
+        }
+      })
+    }
+    function overlaps(rects: ReturnType<typeof rectsFor>): boolean {
+      for (let i = 0; i < rects.length; i += 1) {
+        for (let j = i + 1; j < rects.length; j += 1) {
+          const a = rects[i]
+          const b = rects[j]
+          if (a.left < b.right && b.left < a.right && a.top < b.bottom && b.top < a.bottom) {
+            return true
+          }
+        }
+      }
+      return false
+    }
+    const axis = rectsFor('.chart-axis-labels span')
+    const pane = rectsFor('.chart-pane-labels span')
+    return { rects: [...axis, ...pane], axisOverlap: overlaps(axis), paneOverlap: overlaps(pane) }
+  })
+
+  expect(report.rects.length).toBeGreaterThanOrEqual(8)
+  for (const label of report.rects) {
+    expect(label.text.length, 'chart label text').toBeGreaterThan(0)
+    expect(label.fontSize, `font size for ${label.text}`).toBeGreaterThanOrEqual(10)
+    expect(label.width, `width for ${label.text}`).toBeGreaterThan(0)
+    expect(label.height, `height for ${label.text}`).toBeGreaterThan(0)
+    expect(label.clipped, `clipped label ${label.text}`).toBe(false)
+  }
+  expect(report.axisOverlap, 'axis labels must not overlap').toBe(false)
+  expect(report.paneOverlap, 'pane labels must not overlap').toBe(false)
 }
 
 async function fetchReport(page: Page, reportId: string): Promise<ReportData> {
@@ -318,7 +431,8 @@ test('data-table alternative carries exactly the chart values', async ({ page })
   await page.goto(reportPath(REPORT_ID as string))
   const report = await fetchReport(page, REPORT_ID as string)
 
-  await page.getByRole('button', { name: /view data table/i }).click()
+  await openDataTables(page)
+  await expect(page.getByRole('region', { name: /chart data table/i })).toBeVisible()
   const table = page.getByRole('table', { name: /chart data table/i })
   const rows = table.locator('tbody tr')
   await expect(rows).toHaveCount(report.snapshot.bars.length)
@@ -333,7 +447,26 @@ test('data-table alternative carries exactly the chart values', async ({ page })
     await expect(cells.nth(5)).toHaveText(bar.volume)
     await expect(cells.nth(6)).toHaveText(signed(bar.delta))
     await expect(cells.nth(7)).toHaveText(signed(bar.cvd))
+    await expect(cells.nth(8)).toHaveText(Number(bar.close) >= Number(bar.open) ? 'up' : 'down')
   }
+
+  const vpTable = page.getByRole('table', { name: 'Volume profile data table' })
+  const vpRows = vpTable.locator('tbody tr')
+  await expect(vpRows).toHaveCount(report.metrics.volume_profile.bins.length)
+  for (const [index, bin] of report.metrics.volume_profile.bins.entries()) {
+    const cells = vpRows.nth(index).locator('td')
+    await expect(cells.nth(0)).toHaveText(bin.price_low)
+    await expect(cells.nth(1)).toHaveText(bin.price_high)
+    await expect(cells.nth(2)).toHaveText(bin.volume)
+    await expect(cells.nth(3)).toHaveText(bin.is_poc ? 'POC' : '—')
+    await expect(cells.nth(4)).toHaveText(bin.in_value_area ? 'yes' : 'no')
+  }
+
+  const overflow = await page.evaluate(() => ({
+    document: document.documentElement.scrollWidth,
+    viewport: window.innerWidth,
+  }))
+  expect(overflow.document).toBeLessThanOrEqual(overflow.viewport)
 })
 
 test('the chart is keyboard operable with continuous focus and drives the footprint dock', async ({
@@ -486,6 +619,7 @@ test('is read-only, keyboard operable, and overflow-free at 1440, 768, and 375',
     await authenticate(page)
     await page.goto(reportPath(REPORT_ID as string))
     await expect(page.getByRole('figure', { name: /BTCUSDT 4h chart/i })).toBeVisible()
+    await expectChartLabelsReadable(page)
 
     if (viewport.width <= 768) {
       await expect(page.locator('section.system-page')).toHaveAttribute('data-readonly', 'true')
@@ -496,17 +630,38 @@ test('is read-only, keyboard operable, and overflow-free at 1440, 768, and 375',
         await page.locator('main input, main select, main textarea, main form').count(),
         'read-only at 375: no inputs or forms',
       ).toBe(0)
+      const target = await page.locator('.chart-bars button').first().boundingBox()
+      expect(target?.height ?? 0).toBeGreaterThanOrEqual(44)
     }
 
-    // Keyboard navigation keeps working at every width.
+    // Keyboard navigation keeps working at every width, with focus following
+    // the selection across consecutive key presses.
     const pressed = page.locator('.chart-bars button[aria-pressed="true"]')
     await expect(pressed).toHaveCount(1)
-    const before = (await pressed.textContent()) ?? ''
     await pressed.focus()
-    await page.keyboard.press('ArrowLeft')
-    const after = page.locator('.chart-bars button[aria-pressed="true"]')
-    await expect(after).toHaveCount(1)
-    await expect(after).not.toHaveText(before)
+    for (let step = 0; step < 2; step += 1) {
+      const before = (await pressed.textContent()) ?? ''
+      await page.keyboard.press('ArrowLeft')
+      const after = page.locator('.chart-bars button[aria-pressed="true"]')
+      await expect(after).toHaveCount(1)
+      await expect(after).not.toHaveText(before)
+      await expect(after).toBeFocused()
+    }
+
+    // Baseline screenshot with the chart, before the tables expand.
+    await page.screenshot({ path: path.join(SCREENS_DIR, viewport.name), fullPage: true })
+
+    // Open both data tables at every width; the page itself must not scroll
+    // horizontally and table text must not wrap per character.
+    await openDataTables(page)
+    const calcTable = page.getByRole('region', { name: 'CALC metrics table' }).locator('table')
+    await expectNoPerCharacterWrap(page, calcTable)
+    await expectNoPerCharacterWrap(page, page.getByRole('table', { name: 'Chart data table' }))
+    await expectNoPerCharacterWrap(
+      page,
+      page.getByRole('table', { name: 'Volume profile data table' }),
+    )
+    await expectChartLabelsReadable(page)
 
     const widths = await page.evaluate(() => ({
       document: document.documentElement.scrollWidth,
@@ -519,7 +674,7 @@ test('is read-only, keyboard operable, and overflow-free at 1440, 768, and 375',
     expect(widths.body, `body overflow at ${viewport.width}`).toBeLessThanOrEqual(widths.viewport)
 
     await page.screenshot({
-      path: path.join(SCREENS_DIR, viewport.name),
+      path: path.join(SCREENS_DIR, viewport.name.replace('.png', '-tables.png')),
       fullPage: true,
     })
     expectClean(diagnostics)

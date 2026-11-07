@@ -456,6 +456,7 @@ def test_rapid_sequential_scans_create_distinct_reports(tmp_path: Path) -> None:
         first = _post(harness, key="rapid-1")
         second = _post(harness, key="rapid-2")
         reports = harness.container.store.list_reports()
+        page = harness.client.get("/api/v1/scans?limit=1&offset=0", headers=harness.auth).json()
     finally:
         harness.close()
 
@@ -463,6 +464,9 @@ def test_rapid_sequential_scans_create_distinct_reports(tmp_path: Path) -> None:
     assert second.status_code == 201
     assert first.json()["data"]["report_id"] != second.json()["data"]["report_id"]
     assert len(reports) == 2
+    assert page["data"]["total"] == 2
+    assert page["meta"]["pagination"]["has_next"] is True
+    assert page["meta"]["pagination"]["next_cursor"] == "1"
 
 
 def test_expired_idempotency_key_runs_again(
@@ -530,3 +534,164 @@ def test_fixture_debug_path_is_allowed_with_the_flag_in_tests(tmp_path: Path) ->
 
     assert response.status_code == 201
     assert response.json()["data"]["data_quality"]
+
+
+def test_snapshot_ids_are_unique_within_the_same_second() -> None:
+    from oft.application.scan_service import _snapshot_id
+
+    instant = datetime(2026, 11, 6, 12, 0, 0, tzinfo=UTC)
+    ids = {_snapshot_id("BTCUSDT", instant) for _ in range(100)}
+    assert len(ids) == 100
+    assert all(snapshot_id.startswith("SNAP-BTCUSDT-") for snapshot_id in ids)
+
+
+def test_reports_pagination_reports_offset_total_and_next_cursor(tmp_path: Path) -> None:
+    harness = _harness(tmp_path)
+    try:
+        assert _post(harness, key="page-1").status_code == 201
+        assert _post(harness, key="page-2").status_code == 201
+        first = harness.client.get("/api/v1/reports?limit=1&offset=0", headers=harness.auth).json()
+        second = harness.client.get("/api/v1/reports?limit=1&offset=1", headers=harness.auth).json()
+    finally:
+        harness.close()
+
+    assert first["data"]["total"] == 2
+    assert first["meta"]["pagination"]["total"] == 2
+    assert first["meta"]["pagination"]["has_next"] is True
+    assert first["meta"]["pagination"]["next_cursor"] == "1"
+    assert second["meta"]["pagination"]["has_next"] is False
+    assert second["meta"]["pagination"]["next_cursor"] is None
+    assert len(second["data"]["items"]) == 1
+
+
+def test_stale_running_scan_is_failed_on_read(tmp_path: Path) -> None:
+    from dataclasses import replace
+
+    harness = _harness(tmp_path)
+    try:
+        assert _post(harness, key="stale-source").status_code == 201
+        record = harness.container.store.list_scans(limit=1)[0]
+        stale = replace(
+            record,
+            scan_id="SCAN-STALE",
+            status="RUNNING",
+            started_at="2000-01-01T00:00:00.000Z",
+            finished_at="",
+            report_id=None,
+        )
+        harness.container.store.save_scan(stale)
+        response = harness.client.get("/api/v1/scans/SCAN-STALE", headers=harness.auth)
+    finally:
+        harness.close()
+
+    assert response.status_code == 200
+    data = response.json()["data"]
+    assert data["status"] == "FAILED"
+    assert data["error_code"] == "SCAN_STALE"
+    assert "exceeded" in data["error_message"]
+
+
+def test_report_and_scan_are_written_atomically(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    harness = _harness(tmp_path)
+    try:
+
+        def fail(*args: Any, **kwargs: Any) -> None:
+            raise RuntimeError("report insert failed")
+
+        monkeypatch.setattr(harness.container.store, "_insert_report", fail)
+        with pytest.raises(RuntimeError):
+            _post(harness, key="atomic-failure")
+        reports = harness.container.store.list_reports()
+        scans = harness.container.store.list_scans()
+    finally:
+        harness.close()
+
+    assert reports == ()
+    assert len(scans) == 1
+    assert scans[0].status == "FAILED"
+    assert scans[0].error_code == "SCAN_FAILED"
+    assert "report insert failed" in (scans[0].error_message or "")
+
+
+def test_liquidation_read_failure_becomes_partial_not_silently_empty(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    import oft.application.scan_service as scan_service_module
+    from oft.ports.store import StoreUnavailableError
+
+    def fail(*args: Any, **kwargs: Any) -> Any:
+        raise StoreUnavailableError("liquidation parquet unreadable")
+
+    monkeypatch.setattr(scan_service_module, "read_liquidations", fail)
+    harness = _harness(tmp_path)
+    try:
+        response = _post(harness, key="liquidation-read-failure")
+        report_id = response.json()["data"]["report_id"]
+        report = harness.client.get(f"/api/v1/reports/{report_id}", headers=harness.auth).json()[
+            "data"
+        ]
+    finally:
+        harness.close()
+
+    assert response.status_code == 201
+    metrics = report["metrics"]
+    assert "liquidations unreadable; treated as MISSING" in metrics["quality_reasons"]
+
+
+def test_report_path_parameters_are_length_and_charset_bounded(tmp_path: Path) -> None:
+    harness = _harness(tmp_path)
+    try:
+        too_long = harness.client.get(f"/api/v1/reports/{'A' * 129}", headers=harness.auth)
+        bad_chars = harness.client.get("/api/v1/reports/%3Cscript%3E", headers=harness.auth)
+    finally:
+        harness.close()
+
+    assert too_long.status_code == 422
+    assert bad_chars.status_code == 422
+
+
+def test_csp_includes_object_src_none(tmp_path: Path) -> None:
+    harness = _harness(tmp_path, backfill=False)
+    try:
+        response = harness.client.get("/health")
+    finally:
+        harness.close()
+
+    assert "object-src 'none'" in response.headers["content-security-policy"]
+
+
+def test_same_key_concurrent_requests_run_at_most_once(tmp_path: Path) -> None:
+    from concurrent.futures import ThreadPoolExecutor
+
+    harness = _harness(tmp_path)
+    try:
+        with ThreadPoolExecutor(max_workers=2) as pool:
+            responses = list(pool.map(lambda _: _post(harness, key="concurrent-key"), range(2)))
+        reports = harness.container.store.list_reports()
+    finally:
+        harness.close()
+
+    assert sorted(response.status_code for response in responses) == [201, 409]
+    assert len(reports) == 1
+
+
+def test_api_does_not_expose_absolute_manifest_paths(tmp_path: Path) -> None:
+    harness = _harness(tmp_path)
+    try:
+        response = _post(harness, key="opaque-paths")
+        scan_id = response.json()["data"]["scan"]["scan_id"]
+        report_id = response.json()["data"]["report_id"]
+        scan = harness.client.get(f"/api/v1/scans/{scan_id}", headers=harness.auth).json()["data"]
+        report = harness.client.get(f"/api/v1/reports/{report_id}", headers=harness.auth).json()[
+            "data"
+        ]
+    finally:
+        harness.close()
+
+    assert "/" not in scan["manifest_path"]
+    for entry in report["metrics_manifest"]:
+        assert "/" not in entry["path"]
+    assert not report["metrics"]["sources"][0]["ref"].startswith("/")
+    assert str(tmp_path) not in report["metrics"]["sources"][0]["ref"]

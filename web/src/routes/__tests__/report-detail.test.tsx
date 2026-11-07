@@ -64,6 +64,15 @@ function metrics(measured: boolean): MetricsDocument {
               imbalance_ratio: null,
               is_stacked_imbalance: false,
             },
+            {
+              price: '70001.00',
+              bid_volume: '0.20',
+              ask_volume: '0',
+              delta: '-0.20',
+              total_volume: '0.20',
+              imbalance_ratio: null,
+              is_stacked_imbalance: false,
+            },
           ],
         },
       ],
@@ -156,7 +165,24 @@ function report(measured: boolean): ReportData {
       quality_reasons: document.quality_reasons,
       last_price: '70000.00',
       mark_price: '70000.00',
-      bars: [],
+      bars: [
+        {
+          bar_start: '2026-10-01T00:00:00.000Z',
+          bar_end: '2026-10-01T04:00:00.000Z',
+          open: '70000.00',
+          high: '70002.00',
+          low: '69999.00',
+          close: '70002.00',
+          volume: '0.60',
+          quote_volume: '42000.00',
+          trade_count: 3,
+          taker_buy_volume: '0.40',
+          delta: '0.20',
+          cvd: '0.20',
+          open_interest: null,
+          funding_rate: null,
+        },
+      ],
       orderflow: document,
       session: { underlying_session: 'CRYPTO', is_no_trading: false, note: '' },
       contract_specs: {},
@@ -195,6 +221,9 @@ describe('ReportDetail unmeasured sections', () => {
     await renderReport(false)
 
     expect(within(row('OI Δ')).getByText('not measured')).toBeInTheDocument()
+    expect(within(row('OI Δ')).getByText(/MISSING · no measured open-interest/)).toHaveClass(
+      'calc-note',
+    )
     const funding = within(row('Funding'))
     expect(funding.getByText('not measured')).toBeInTheDocument()
     expect(funding.queryByText(/next .* UTC/)).not.toBeInTheDocument()
@@ -205,8 +234,45 @@ describe('ReportDetail unmeasured sections', () => {
     await renderReport(true)
 
     expect(within(row('OI Δ')).getByText('2')).toBeInTheDocument()
+    expect(screen.getByRole('table', { name: /deterministic metric summary/i })).toHaveClass(
+      'calc-table',
+    )
+    expect(within(row('Footprint (selected bar)')).getByText(/2 cells · 0.30/)).toBeInTheDocument()
     const funding = within(row('Funding'))
     expect(funding.getByText('0.0001')).toBeInTheDocument()
     expect(funding.getByText(/next 2026-10-01 08:00 UTC/)).toBeInTheDocument()
+  })
+})
+
+describe('ReportDetail loading and error states', () => {
+  it('announces loading while the report request is pending', () => {
+    render(
+      <ReportDetailPage
+        reportId="RPT-PENDING"
+        fetchReportFn={() => new Promise<ReportEnvelope>(() => undefined)}
+      />,
+    )
+    expect(screen.getByRole('status')).toHaveTextContent(/Loading report RPT-PENDING/)
+  })
+
+  it('shows an alert when the report is empty or the request fails', async () => {
+    const { unmount } = render(
+      <ReportDetailPage
+        reportId="RPT-EMPTY"
+        fetchReportFn={async () => ({ ...envelope(false), data: null })}
+      />,
+    )
+    expect(await screen.findByRole('alert')).toHaveTextContent(/Report unavailable/)
+    unmount()
+
+    render(
+      <ReportDetailPage
+        reportId="RPT-ERROR"
+        fetchReportFn={async () => {
+          throw new Error('network down')
+        }}
+      />,
+    )
+    expect(await screen.findByRole('alert')).toHaveTextContent(/network down/)
   })
 })

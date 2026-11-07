@@ -58,7 +58,7 @@ _HTTP_ERRORS = {
 _SECURITY_HEADERS = {
     "Content-Security-Policy": (
         "default-src 'self'; script-src 'self'; style-src 'self'; "
-        "img-src 'self' data:; connect-src 'self'; frame-ancestors 'none'; "
+        "img-src 'self' data:; connect-src 'self'; frame-ancestors 'none'; object-src 'none'; "
         "base-uri 'self'; form-action 'self'"
     ),
     "X-Frame-Options": "DENY",

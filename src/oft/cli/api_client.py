@@ -7,6 +7,7 @@ import os
 import urllib.error
 import urllib.request
 from typing import Any, cast
+from urllib.parse import quote
 
 from oft.api.auth import _origin, read_api_token
 from oft.config import Settings
@@ -90,22 +91,22 @@ class ApiClient:
         return self._request("GET", f"/api/v1/scans?limit={limit}")
 
     def get_scan(self, scan_id: str) -> dict[str, Any]:
-        return self._request("GET", f"/api/v1/scans/{scan_id}")
+        return self._request("GET", f"/api/v1/scans/{quote(scan_id, safe='')}")
 
     def list_reports(self, limit: int = 20, scan_id: str | None = None) -> dict[str, Any]:
         query = f"?limit={limit}"
         if scan_id:
-            query += f"&scan_id={scan_id}"
+            query += f"&scan_id={quote(scan_id, safe='')}"
         return self._request("GET", f"/api/v1/reports{query}")
 
     def get_report(self, report_id: str) -> dict[str, Any]:
-        return self._request("GET", f"/api/v1/reports/{report_id}")
+        return self._request("GET", f"/api/v1/reports/{quote(report_id, safe='')}")
 
     def create_backfill(self, payload: dict[str, Any]) -> dict[str, Any]:
         return self._request("POST", "/api/v1/backfill", payload)
 
     def get_backfill(self, run_id: str) -> dict[str, Any]:
-        return self._request("GET", f"/api/v1/backfill/{run_id}")
+        return self._request("GET", f"/api/v1/backfill/{quote(run_id, safe='')}")
 
     def get_latest_backfill(self) -> dict[str, Any]:
         return self._request("GET", "/api/v1/backfill/latest")

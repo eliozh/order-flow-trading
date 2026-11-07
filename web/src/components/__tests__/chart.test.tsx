@@ -1,4 +1,4 @@
-import { fireEvent, render, screen, within } from '@testing-library/react'
+import { act, fireEvent, render, screen, within } from '@testing-library/react'
 import { describe, expect, it, vi } from 'vitest'
 
 import { Chart } from '../chart'
@@ -349,6 +349,45 @@ describe('Chart accessibility and alignment', () => {
       'id',
       tableId,
     )
+  })
+
+  it('labels panes in fixed CSS px, exposes the zero line, and tab-stops only the table', () => {
+    renderChart()
+    const plot = screen.getByRole('img', { name: /price chart/i })
+    expect(plot).not.toHaveAttribute('tabindex')
+    expect(screen.getByTestId('chart-axis-labels')).toBeInTheDocument()
+    expect(screen.getByTestId('cvd-zero-label')).toHaveTextContent('0')
+    expect(screen.getByRole('figure')).toHaveAccessibleDescription(/Candlestick chart with 2 bars/i)
+  })
+
+  it('puts the chart table and VP bins behind a labelled scrollable region', () => {
+    renderChart()
+    fireEvent.click(screen.getByRole('button', { name: /view data table/i }))
+
+    const region = screen.getByRole('region', { name: /chart data table/i })
+    expect(region).toHaveAttribute('tabindex', '0')
+    expect(within(region).getByRole('table', { name: /chart data table/i })).toBeInTheDocument()
+    const vpTable = within(region).getByRole('table', { name: /volume profile data table/i })
+    expect(within(vpTable).getAllByText('POC').length).toBeGreaterThan(0)
+    expect(within(vpTable).getByText('70000.00')).toBeInTheDocument()
+  })
+
+  it('debounces the polite live-region announcement by 500ms', () => {
+    vi.useFakeTimers()
+    try {
+      renderThreeBars()
+      const live = document.querySelector('[aria-live="polite"]') as HTMLElement
+      act(() => vi.advanceTimersByTime(500))
+      expect(live).toHaveTextContent(/Selected 2026-10-03 00:00 UTC/)
+
+      const third = screen.getByRole('button', { name: /2026-10-03 00:00/i })
+      fireEvent.keyDown(third, { key: 'ArrowLeft' })
+      expect(live).not.toHaveTextContent(/Selected 2026-10-02 00:00 UTC/)
+      act(() => vi.advanceTimersByTime(500))
+      expect(live).toHaveTextContent(/Selected 2026-10-02 00:00 UTC/)
+    } finally {
+      vi.useRealTimers()
+    }
   })
 
   it('aligns volume-profile bins to the price axis instead of row order', () => {

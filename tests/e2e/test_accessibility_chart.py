@@ -102,3 +102,5 @@ def test_vp_bin_alpha_meets_the_design_contrast_floor() -> None:
     match = re.search(r"\.vp-bin\s*\{[^}]*opacity:\s*([0-9.]+)", css)
     assert match is not None
     assert float(match.group(1)) >= 0.65
+    values = [float(value) for value in re.findall(r"opacity:\s*([0-9.]+)", css)]
+    assert values and min(values) >= 0.65

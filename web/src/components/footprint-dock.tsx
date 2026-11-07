@@ -28,7 +28,7 @@ function heatClass(value: string, max: number): string {
 export function FootprintDock({ bar, timeframe, selectedLabel }: FootprintDockProps) {
   if (!bar) {
     return (
-      <section className="footprint" role="region" aria-label="Footprint for selected bar">
+      <section className="footprint" aria-label="Footprint for selected bar">
         <h3>Footprint</h3>
         <p className="panel-foot">Select a bar to inspect its footprint.</p>
       </section>
@@ -43,7 +43,7 @@ export function FootprintDock({ bar, timeframe, selectedLabel }: FootprintDockPr
   return (
     <section
       className="footprint"
-      role="region"
+     
       aria-label={`Footprint for selected bar, ${label}`}
     >
       <div className="footprint-head">

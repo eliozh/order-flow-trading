@@ -50,8 +50,6 @@ def _section_lines(metrics: dict[str, Any]) -> list[str]:
     gaps = metrics.get("gaps") or []
 
     latest_delta = points[-1]["delta"] if points else "0"
-    if latest_delta == "0":
-        latest_delta = "0"
     fp_bars = footprint.get("bars") or []
     fp_cells = sum(len(bar.get("cells") or []) for bar in fp_bars)
     liq_count = liquidations.get("count", 0)

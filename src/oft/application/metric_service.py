@@ -125,6 +125,7 @@ class MetricInputs:
     open_interest: OpenInterestResult | None = None
     funding: FundingResult | None = None
     liquidations: LiquidationResult | None = None
+    liquidation_unavailable: bool = False
 
 
 _QUALITY_RANK: dict[DataQuality, int] = {
@@ -557,7 +558,7 @@ def _source_ref(
 ) -> dict[str, object]:
     return {
         "kind": "ARCHIVE",
-        "ref": str(_agg_trades_root(settings, request.symbol)),
+        "ref": str(_agg_trades_root(settings, request.symbol).relative_to(settings.data_dir)),
         "as_of": computed_at,
         "version": version,
         "hash": input_hash,
@@ -753,6 +754,10 @@ class MetricService:
             contributions.append(resolved.funding.quality)
         elif base_quality.data_quality != DataQuality.MISSING:
             contributions.append(MetricQuality.partial(("funding not measured in this slice",)))
+        if resolved.liquidation_unavailable:
+            contributions.append(
+                MetricQuality.partial(("liquidations unreadable; treated as MISSING",))
+            )
         quality = _merge_quality(*contributions)
         computed_at = utc_timestamp(self._clock.now())
         start_day = request.window_start.astimezone(UTC).date().isoformat()

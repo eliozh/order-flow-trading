@@ -29,7 +29,7 @@ from oft.ports.store import (
     SymbolUpsertResult,
 )
 
-_SCHEMA_VERSION = 8
+_SCHEMA_VERSION = 9
 STALE_RUNNING_SECONDS = 15 * 60
 _BACKFILL_RUN_STATUSES = ("RUNNING", "COMPLETE", "PARTIAL", "FAILED", "BLOCKED", "STALE")
 _BACKFILL_RUNS_DEFINITION = """
@@ -172,7 +172,9 @@ _SCHEMA_SQL = f"""
         created_at TEXT NOT NULL,
         report_id TEXT,
         source_mode TEXT NOT NULL DEFAULT 'FIXTURE',
-        metrics_manifest_json TEXT
+        metrics_manifest_json TEXT,
+        error_code TEXT,
+        error_message TEXT
     );
     CREATE INDEX IF NOT EXISTS scans_created_at ON scans(created_at);
     CREATE TABLE IF NOT EXISTS reports (
@@ -456,6 +458,23 @@ def _migrate_reports_v9(connection: sqlite3.Connection) -> None:
         raise
 
 
+def _migrate_scans_v9(connection: sqlite3.Connection) -> None:
+    """Add explicit failure diagnostics to the scans table."""
+    columns = {row[1] for row in connection.execute("PRAGMA table_info(scans)")}
+    needed = (("error_code", "TEXT"), ("error_message", "TEXT"))
+    missing = [(name, kind) for name, kind in needed if name not in columns]
+    if not missing:
+        return
+    connection.execute("BEGIN IMMEDIATE")
+    try:
+        for name, kind in missing:
+            connection.execute(f"ALTER TABLE scans ADD COLUMN {name} {kind}")
+        connection.execute("COMMIT")
+    except Exception:
+        connection.execute("ROLLBACK")
+        raise
+
+
 def initialize_database(settings: Settings) -> None:
     """Create the data directory and the walking-skeleton schema."""
     settings.data_dir.mkdir(parents=True, exist_ok=True)
@@ -481,6 +500,8 @@ def initialize_database(settings: Settings) -> None:
             _migrate_symbols_v7(connection)
         if _schema_version(connection) < 8 and _table_exists(connection, "manifest"):
             _migrate_manifest_v8(connection)
+        if _schema_version(connection) < 9 and _table_exists(connection, "scans"):
+            _migrate_scans_v9(connection)
         # Report linkage is additive; keep the recorded schema version stable so
         # older migration expectations remain valid while the columns land.
         if _table_exists(connection, "scans"):
@@ -517,7 +538,11 @@ def initialize_database(settings: Settings) -> None:
             )
             connection.execute(
                 "INSERT OR IGNORE INTO schema_migrations (version, applied_at) VALUES (?, ?)",
-                (_SCHEMA_VERSION, "2026-11-06T19:00:00.000Z"),
+                (8, "2026-11-06T19:00:00.000Z"),
+            )
+            connection.execute(
+                "INSERT OR IGNORE INTO schema_migrations (version, applied_at) VALUES (?, ?)",
+                (_SCHEMA_VERSION, "2026-11-06T20:00:00.000Z"),
             )
     finally:
         connection.close()
@@ -553,6 +578,8 @@ def _row_to_scan(row: sqlite3.Row) -> ScanRecord:
         metrics_manifest_json=(
             row["metrics_manifest_json"] if "metrics_manifest_json" in keys else None
         ),
+        error_code=row["error_code"] if "error_code" in keys else None,
+        error_message=row["error_message"] if "error_message" in keys else None,
     )
 
 
@@ -748,8 +775,8 @@ class SqliteStore:
                 fixture_path, started_at, finished_at, window_start, window_end,
                 trade_count, buy_volume, sell_volume, delta, cvd, data_quality,
                 manifest_path, parquet_rows, created_at, report_id, source_mode,
-                metrics_manifest_json
-            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                metrics_manifest_json, error_code, error_message
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             """,
             (
                 record.scan_id,
@@ -775,6 +802,8 @@ class SqliteStore:
                 record.report_id,
                 record.source_mode,
                 record.metrics_manifest_json,
+                record.error_code,
+                record.error_message,
             ),
         )
 
@@ -787,7 +816,7 @@ class SqliteStore:
                     status = ?, finished_at = ?, data_quality = ?, report_id = ?,
                     trade_count = ?, buy_volume = ?, sell_volume = ?, delta = ?,
                     cvd = ?, manifest_path = ?, parquet_rows = ?,
-                    metrics_manifest_json = ?
+                    metrics_manifest_json = ?, error_code = ?, error_message = ?
                 WHERE scan_id = ?
                 """,
                 (
@@ -803,6 +832,8 @@ class SqliteStore:
                     record.manifest_path,
                     record.parquet_rows,
                     record.metrics_manifest_json,
+                    record.error_code,
+                    record.error_message,
                     record.scan_id,
                 ),
             )
@@ -835,44 +866,115 @@ class SqliteStore:
             connection.close()
         return _row_to_scan(row) if row is not None else None
 
-    def list_scans(self, limit: int = 20) -> tuple[ScanRecord, ...]:
+    def list_scans(self, limit: int = 20, offset: int = 0) -> tuple[ScanRecord, ...]:
         connection = self._connect_read_only()
         if connection is None:
             return ()
         try:
             rows = connection.execute(
-                "SELECT * FROM scans ORDER BY created_at DESC, scan_id DESC LIMIT ?", (limit,)
+                "SELECT * FROM scans ORDER BY created_at DESC, scan_id DESC LIMIT ? OFFSET ?",
+                (limit, offset),
             ).fetchall()
         finally:
             connection.close()
         return tuple(_row_to_scan(row) for row in rows)
 
+    def count_scans(self) -> int:
+        connection = self._connect_read_only()
+        if connection is None:
+            return 0
+        try:
+            row = connection.execute("SELECT COUNT(*) FROM scans").fetchone()
+        finally:
+            connection.close()
+        return int(row[0]) if row is not None else 0
+
     # -- Reports ---------------------------------------------------------
 
     def save_report(self, record: ReportRecord) -> None:
         with closing(self._connect()) as connection, connection:
-            connection.execute(
+            self._insert_report(connection, record)
+
+    def _insert_report(self, connection: sqlite3.Connection, record: ReportRecord) -> None:
+        connection.execute(
+            """
+            INSERT INTO reports (
+                report_id, scan_id, symbol, timeframe, generated_at,
+                metrics_manifest_json, llm_decision_id, narrative_ref,
+                data_quality, snapshot_json, metrics_json
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            """,
+            (
+                record.report_id,
+                record.scan_id,
+                record.symbol,
+                record.timeframe,
+                record.generated_at,
+                record.metrics_manifest_json,
+                record.llm_decision_id,
+                record.narrative_ref,
+                record.data_quality,
+                record.snapshot_json,
+                record.metrics_json,
+            ),
+        )
+
+    def save_report_and_complete_scan(self, report: ReportRecord, scan: ScanRecord) -> None:
+        """Insert the report and finish the scan in one transaction.
+
+        A failure in either statement rolls both back, so a report can never be
+        committed without the matching DONE scan row.
+        """
+        with closing(self._connect()) as connection, connection:
+            self._insert_report(connection, report)
+            cursor = connection.execute(
                 """
-                INSERT INTO reports (
-                    report_id, scan_id, symbol, timeframe, generated_at,
-                    metrics_manifest_json, llm_decision_id, narrative_ref,
-                    data_quality, snapshot_json, metrics_json
-                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                UPDATE scans SET
+                    status = ?, finished_at = ?, data_quality = ?, report_id = ?,
+                    trade_count = ?, buy_volume = ?, sell_volume = ?, delta = ?,
+                    cvd = ?, manifest_path = ?, parquet_rows = ?,
+                    metrics_manifest_json = ?, error_code = ?, error_message = ?
+                WHERE scan_id = ?
                 """,
                 (
-                    record.report_id,
-                    record.scan_id,
-                    record.symbol,
-                    record.timeframe,
-                    record.generated_at,
-                    record.metrics_manifest_json,
-                    record.llm_decision_id,
-                    record.narrative_ref,
-                    record.data_quality,
-                    record.snapshot_json,
-                    record.metrics_json,
+                    scan.status,
+                    scan.finished_at,
+                    scan.data_quality,
+                    scan.report_id,
+                    scan.trade_count,
+                    scan.buy_volume,
+                    scan.sell_volume,
+                    scan.delta,
+                    scan.cvd,
+                    scan.manifest_path,
+                    scan.parquet_rows,
+                    scan.metrics_manifest_json,
+                    scan.error_code,
+                    scan.error_message,
+                    scan.scan_id,
                 ),
             )
+            if cursor.rowcount != 1:
+                raise StoreUnavailableError(
+                    f"scan {scan.scan_id} disappeared before report completion"
+                )
+
+    def fail_stale_scans(self, *, now: str, older_than_seconds: int = 900) -> int:
+        """Mark RUNNING scans older than the lease window as FAILED."""
+        now_dt = datetime.fromisoformat(now.replace("Z", "+00:00"))
+        stale_before = utc_timestamp(now_dt - timedelta(seconds=older_than_seconds))
+        with closing(self._connect()) as connection, connection:
+            cursor = connection.execute(
+                """
+                UPDATE scans SET
+                    status = 'FAILED', finished_at = ?, data_quality = 'MISSING',
+                    error_code = 'SCAN_STALE',
+                    error_message = 'scan exceeded the RUNNING lease and was failed'
+                WHERE status = 'RUNNING' AND started_at < ?
+                """,
+                (now, stale_before),
+            )
+        return cursor.rowcount
 
     def get_report(self, report_id: str) -> ReportRecord | None:
         connection = self._connect_read_only()
@@ -887,21 +989,36 @@ class SqliteStore:
         return _row_to_report(row) if row is not None else None
 
     def list_reports(
-        self, *, scan_id: str | None = None, limit: int = 20
+        self, *, scan_id: str | None = None, limit: int = 20, offset: int = 0
     ) -> tuple[ReportRecord, ...]:
         connection = self._connect_read_only()
         if connection is None:
             return ()
         where = " WHERE scan_id = ?" if scan_id is not None else ""
-        params: tuple[object, ...] = (scan_id, limit) if scan_id is not None else (limit,)
+        params: tuple[object, ...] = (
+            (scan_id, limit, offset) if scan_id is not None else (limit, offset)
+        )
         try:
             rows = connection.execute(
-                f"SELECT * FROM reports{where} ORDER BY generated_at DESC, report_id DESC LIMIT ?",
+                f"SELECT * FROM reports{where} "
+                "ORDER BY generated_at DESC, report_id DESC LIMIT ? OFFSET ?",
                 params,
             ).fetchall()
         finally:
             connection.close()
         return tuple(_row_to_report(row) for row in rows)
+
+    def count_reports(self, *, scan_id: str | None = None) -> int:
+        connection = self._connect_read_only()
+        if connection is None:
+            return 0
+        where = " WHERE scan_id = ?" if scan_id is not None else ""
+        params: tuple[object, ...] = (scan_id,) if scan_id is not None else ()
+        try:
+            row = connection.execute(f"SELECT COUNT(*) FROM reports{where}", params).fetchone()
+        finally:
+            connection.close()
+        return int(row[0]) if row is not None else 0
 
     # -- Idempotency -----------------------------------------------------
 
@@ -917,6 +1034,64 @@ class SqliteStore:
         finally:
             connection.close()
         return _row_to_idempotency(row) if row is not None else None
+
+    def reserve_idempotency(self, record: IdempotencyRecord) -> bool:
+        """Atomically reserve a key; False means the key already exists."""
+        try:
+            with closing(self._connect()) as connection, connection:
+                connection.execute(
+                    """
+                    INSERT INTO idempotency_keys (
+                        scope, key, request_hash, response_status, response_json,
+                        created_at, expires_at
+                    ) VALUES (?, ?, ?, ?, ?, ?, ?)
+                    """,
+                    (
+                        record.scope,
+                        record.key,
+                        record.request_hash,
+                        record.response_status,
+                        record.response_json,
+                        record.created_at,
+                        record.expires_at,
+                    ),
+                )
+        except sqlite3.IntegrityError:
+            return False
+        return True
+
+    def complete_idempotency(self, record: IdempotencyRecord) -> None:
+        with closing(self._connect()) as connection, connection:
+            connection.execute(
+                """
+                UPDATE idempotency_keys SET
+                    request_hash = ?, response_status = ?, response_json = ?,
+                    created_at = ?, expires_at = ?
+                WHERE scope = ? AND key = ?
+                """,
+                (
+                    record.request_hash,
+                    record.response_status,
+                    record.response_json,
+                    record.created_at,
+                    record.expires_at,
+                    record.scope,
+                    record.key,
+                ),
+            )
+
+    def delete_idempotency(self, *, scope: str, key: str) -> None:
+        with closing(self._connect()) as connection, connection:
+            connection.execute(
+                "DELETE FROM idempotency_keys WHERE scope = ? AND key = ?", (scope, key)
+            )
+
+    def purge_expired_idempotency(self, *, now: str) -> int:
+        with closing(self._connect()) as connection, connection:
+            cursor = connection.execute(
+                "DELETE FROM idempotency_keys WHERE expires_at <= ?", (now,)
+            )
+        return cursor.rowcount
 
     def save_idempotency(self, record: IdempotencyRecord) -> None:
         with closing(self._connect()) as connection, connection:

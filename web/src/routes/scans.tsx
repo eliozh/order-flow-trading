@@ -95,6 +95,7 @@ export function ScansPage({ fetchScansFn = fetchScans, isCompact }: ScansPagePro
             <h2 id="scan-table-heading">Scans ({load.total})</h2>
             <span className="mono-muted">newest first</span>
           </div>
+          {/* eslint-disable-next-line jsx-a11y/no-noninteractive-tabindex -- scrollable table */}
           <div className="table-wrap" role="region" aria-label="Scans table" tabIndex={0}>
             <table className="data-table">
               <caption className="visually-hidden">Scan history, newest first</caption>

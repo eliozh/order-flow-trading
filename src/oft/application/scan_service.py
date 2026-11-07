@@ -18,7 +18,10 @@ from contextlib import suppress
 from dataclasses import asdict, dataclass, replace
 from datetime import UTC, datetime, timedelta
 from decimal import Decimal
+from pathlib import Path
 from typing import Any, Protocol, cast
+
+import structlog
 
 from oft.adapters.parquet_store import read_liquidations
 from oft.application.metric_service import MetricInputs, MetricRequest, MetricService
@@ -37,7 +40,9 @@ from oft.domain.metrics.types import decimal_str
 from oft.domain.metrics.version import MetricVersion, orderflow_metric_version
 from oft.domain.time import utc_timestamp
 from oft.ports.clock import ClockPort
-from oft.ports.store import ReportRecord, ScanRecord, StorePort
+from oft.ports.store import ReportRecord, ScanRecord, StorePort, StoreUnavailableError
+
+logger = structlog.get_logger(__name__)
 
 _SYMBOL_PATTERN = re.compile(r"^[A-Z0-9]{2,24}$")
 SUPPORTED_SOURCES = frozenset({"backfill"})
@@ -157,8 +162,9 @@ def measured_liquidation_inputs(container: ScanContainer, request: MetricRequest
             metric_version=version.identifier,
             store=container.store,
         )
-    except Exception:  # noqa: BLE001 - unreadable optional inputs become PARTIAL
-        rows = ()
+    except StoreUnavailableError as exc:
+        logger.warning("liquidations_unreadable", symbol=request.symbol, error=str(exc))
+        return MetricInputs(liquidation_unavailable=True)
     if not rows:
         return MetricInputs(
             liquidations=compute_liquidations((), symbol=request.symbol, coverage_start=None)
@@ -326,6 +332,10 @@ def _report_id(symbol: str, now: datetime) -> str:
     return f"RPT-{symbol}-{now:%Y%m%d-%H%M%S}-{uuid.uuid4().hex[:8].upper()}"
 
 
+def _snapshot_id(symbol: str, now: datetime) -> str:
+    return f"SNAP-{symbol}-{now:%Y%m%d%H%M%S}-{uuid.uuid4().hex[:8].upper()}"
+
+
 def _summary_values(document: Any) -> dict[str, str]:
     summary = document.cvd.summary
     return {
@@ -363,6 +373,7 @@ class ScanService:
         store = container.store
         clock = container.clock
         started = clock.now()
+        store.fail_stale_scans(now=utc_timestamp(started))
         window = _window_from_manifest(store, request.symbol)
         if window is None:
             raise ScanDataUnavailable(
@@ -437,7 +448,7 @@ class ScanService:
 
             # REPORT: freeze snapshot + metrics and store a CALC-only report.
             finished = clock.now()
-            snapshot_id = f"SNAP-{request.symbol}-{finished:%Y%m%d%H%M%S}"
+            snapshot_id = _snapshot_id(request.symbol, finished)
             snapshot = build_market_snapshot(
                 document=document,
                 bars=_snapshot_bars(persisted_bars.run.result.bars, document),
@@ -460,7 +471,6 @@ class ScanService:
                 snapshot_json=json.dumps(snapshot),
                 metrics_json=document.json_text,
             )
-            store.save_report(report)
             summary = _summary_values(document)
             completed = replace(
                 scan,
@@ -477,19 +487,50 @@ class ScanService:
                 report_id=report.report_id,
                 metrics_manifest_json=report.metrics_manifest_json,
             )
-            store.update_scan(completed)
+            store.save_report_and_complete_scan(report, completed)
             return ScanRun(scan=completed, report=report)
-        except Exception:
+        except Exception as exc:
             failed = replace(
                 scan,
                 status="FAILED",
                 finished_at=utc_timestamp(clock.now()),
                 data_quality="MISSING",
+                error_code=str(getattr(exc, "code", "SCAN_FAILED")),
+                error_message=str(exc),
             )
             with suppress(Exception):
                 # Preserve the original failure if the status update also fails.
                 store.update_scan(failed)
             raise
+
+
+def _public_manifest_entries(value: object) -> object:
+    if not isinstance(value, list):
+        return value
+    entries: list[object] = []
+    for item in value:
+        if isinstance(item, dict):
+            public = dict(item)
+            if isinstance(public.get("path"), str):
+                public["path"] = Path(public["path"]).name
+            entries.append(public)
+        else:
+            entries.append(item)
+    return entries
+
+
+def public_scan_payload(record: ScanRecord) -> dict[str, object]:
+    """Scan JSON for API/CLI without exposing daemon-absolute filesystem paths."""
+    payload = asdict(record)
+    if payload.get("manifest_path"):
+        payload["manifest_path"] = Path(str(payload["manifest_path"])).name
+    manifest_json = payload.get("metrics_manifest_json")
+    if isinstance(manifest_json, str) and manifest_json:
+        with suppress(json.JSONDecodeError):
+            payload["metrics_manifest_json"] = json.dumps(
+                _public_manifest_entries(json.loads(manifest_json))
+            )
+    return payload
 
 
 def report_payload(report: ReportRecord) -> dict[str, object]:
@@ -507,7 +548,7 @@ def report_payload(report: ReportRecord) -> dict[str, object]:
             "configured": False,
             "reason": LLM_DISABLED_REASON,
         },
-        "metrics_manifest": json.loads(report.metrics_manifest_json),
+        "metrics_manifest": _public_manifest_entries(json.loads(report.metrics_manifest_json)),
         "snapshot": json.loads(report.snapshot_json),
         "metrics": json.loads(report.metrics_json),
     }

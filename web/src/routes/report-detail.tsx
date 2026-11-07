@@ -7,6 +7,7 @@ import {
   type ReportData,
   type ReportEnvelope,
 } from '../api/reports'
+import { addDecimals } from '../api/decimal'
 import { Chart } from '../components/chart'
 import { DataQualityBadge } from '../components/data-quality'
 import { ProvenanceStamp } from '../components/provenance'
@@ -29,8 +30,7 @@ function footprintTotal(report: ReportData, barStart: string | undefined): strin
   if (!bar) {
     return '—'
   }
-  const total = bar.cells.reduce((sum, cell) => sum + Number(cell.total_volume), 0)
-  return total.toFixed(2)
+  return addDecimals(bar.cells.map((cell) => cell.total_volume))
 }
 
 export function ReportDetailPage({
@@ -194,8 +194,9 @@ export function ReportDetailPage({
           <h2 id="calc-heading">CALC · deterministic metrics</h2>
           <span className="mono-muted">{metrics.metric_version}</span>
         </div>
+        {/* eslint-disable-next-line jsx-a11y/no-noninteractive-tabindex -- scrollable table */}
         <div className="table-wrap" role="region" aria-label="CALC metrics table" tabIndex={0}>
-          <table className="data-table">
+          <table className="data-table calc-table">
             <caption className="visually-hidden">Deterministic metric summary</caption>
             <thead>
               <tr>
@@ -210,7 +211,7 @@ export function ReportDetailPage({
                 <tr key={row.label}>
                   <th scope="row">{row.label}</th>
                   <td className="mono">{row.value}</td>
-                  <td className="panel-foot">{row.note}</td>
+                  <td className="calc-note">{row.note}</td>
                   <td className="mono">{report.data_quality}</td>
                 </tr>
               ))}

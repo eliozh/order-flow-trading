@@ -101,6 +101,7 @@ export function ReportsPage({ fetchReportsFn = fetchReports, isCompact }: Report
             <h2 id="report-table-heading">Reports ({load.total})</h2>
             <span className="mono-muted">newest first</span>
           </div>
+          {/* eslint-disable-next-line jsx-a11y/no-noninteractive-tabindex -- scrollable table */}
           <div className="table-wrap" role="region" aria-label="Reports table" tabIndex={0}>
             <table className="data-table">
               <caption className="visually-hidden">CALC report list, newest first</caption>
