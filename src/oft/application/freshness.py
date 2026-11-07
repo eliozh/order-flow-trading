@@ -8,10 +8,13 @@ order and does not import the risk or trigger domains.
 
 from __future__ import annotations
 
+import json
 from collections.abc import Mapping
 from dataclasses import dataclass
 from datetime import datetime, timedelta
 from enum import StrEnum
+from pathlib import Path
+from typing import Any
 
 import structlog
 
@@ -280,6 +283,141 @@ class FreshnessGuard:
         )
 
 
+LIVE_SCAN_STREAMS: tuple[str, ...] = (KLINE_1M_STREAM, MARK_STREAM)
+_LIVE_CONNECTION_STATES = frozenset({"SUBSCRIBED"})
+WS_STATE_FILENAME = "ws_state.json"
+
+
+@dataclass(frozen=True)
+class LiveSourceVerdict:
+    """Whether persisted live input may drive an LLM report right now."""
+
+    fresh: bool
+    reason: str | None
+    streams: tuple[str, ...]
+    status: FreshnessStatus
+    checked_at: datetime
+
+
+def _parse_instant(value: object) -> datetime | None:
+    if not isinstance(value, str) or not value:
+        return None
+    try:
+        parsed = datetime.fromisoformat(value.replace("Z", "+00:00"))
+    except ValueError:
+        return None
+    if parsed.tzinfo is None:
+        return None
+    return parsed
+
+
+def evaluate_live_source(
+    freshness: Mapping[str, Mapping[str, object]] | None,
+    *,
+    now: datetime,
+    connection_state: str | None = None,
+    streams: tuple[str, ...] = LIVE_SCAN_STREAMS,
+) -> LiveSourceVerdict:
+    """Evaluate the persisted live freshness stamps against a strict budget.
+
+    Missing stamps, a disconnected feed, and expired deadlines all fail closed:
+    stale live input may still produce a CALC report, but it can never drive a
+    narrative or a trigger. The returned reason is always explicit.
+    """
+    if not freshness:
+        return LiveSourceVerdict(
+            fresh=False,
+            reason="live ingestion state is unavailable; the LLM stage is skipped",
+            streams=streams,
+            status=FreshnessStatus.UNKNOWN,
+            checked_at=now,
+        )
+    if connection_state is None:
+        return LiveSourceVerdict(
+            fresh=False,
+            reason="live ingestion connection state is unavailable; the LLM stage is skipped",
+            streams=streams,
+            status=FreshnessStatus.UNKNOWN,
+            checked_at=now,
+        )
+    if connection_state not in _LIVE_CONNECTION_STATES:
+        return LiveSourceVerdict(
+            fresh=False,
+            reason=f"live feed is {connection_state}; the LLM stage is skipped",
+            streams=streams,
+            status=FreshnessStatus.STALE,
+            checked_at=now,
+        )
+    for stream in streams:
+        record = freshness.get(stream)
+        if not isinstance(record, Mapping):
+            return LiveSourceVerdict(
+                fresh=False,
+                reason=f"{stream} freshness is missing; the LLM stage is skipped",
+                streams=streams,
+                status=FreshnessStatus.UNKNOWN,
+                checked_at=now,
+            )
+        deadline = _parse_instant(record.get("deadline"))
+        if deadline is None:
+            return LiveSourceVerdict(
+                fresh=False,
+                reason=f"{stream} freshness deadline is unreadable; the LLM stage is skipped",
+                streams=streams,
+                status=FreshnessStatus.UNKNOWN,
+                checked_at=now,
+            )
+        if now > deadline:
+            budget = record.get("budget_seconds")
+            budget_text = f"{budget:g}s" if isinstance(budget, (int, float)) else "its"
+            return LiveSourceVerdict(
+                fresh=False,
+                reason=(
+                    f"{stream} is stale: no update within {budget_text} budget "
+                    f"(deadline {utc_timestamp(deadline)}); the LLM stage is skipped"
+                ),
+                streams=streams,
+                status=FreshnessStatus.STALE,
+                checked_at=now,
+            )
+    return LiveSourceVerdict(
+        fresh=True,
+        reason=None,
+        streams=streams,
+        status=FreshnessStatus.FRESH,
+        checked_at=now,
+    )
+
+
+def read_live_source_state(
+    settings: Any,
+) -> tuple[str | None, Mapping[str, Mapping[str, object]] | None]:
+    """Read the daemon-independent ``ws_state.json`` written by live ingestion."""
+    path = Path(settings.data_dir) / "run" / WS_STATE_FILENAME
+    try:
+        document = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError):
+        return None, None
+    if not isinstance(document, dict):
+        return None, None
+    connection_state = document.get("connection_state")
+    freshness = document.get("freshness")
+    return (
+        str(connection_state) if connection_state is not None else None,
+        freshness if isinstance(freshness, dict) else None,
+    )
+
+
+def check_live_source(settings: Any, clock: ClockPort) -> LiveSourceVerdict:
+    """Combine the persisted live state with the injected clock."""
+    connection_state, freshness = read_live_source_state(settings)
+    return evaluate_live_source(
+        freshness,
+        now=clock.now(),
+        connection_state=connection_state,
+    )
+
+
 __all__ = [
     "AGG_TRADES_STREAM",
     "BAR_15M_STREAM",
@@ -292,8 +430,10 @@ __all__ = [
     "DEFAULT_BUDGETS",
     "DEFAULT_MAX_CLOCK_SKEW_SECONDS",
     "KLINE_1M_STREAM",
+    "LIVE_SCAN_STREAMS",
     "MARK_STREAM",
     "METRICS_STREAM",
+    "WS_STATE_FILENAME",
     "ClockSkew",
     "ClockSkewDetector",
     "ClockSkewStatus",
@@ -301,5 +441,9 @@ __all__ = [
     "FreshnessGuard",
     "FreshnessStamp",
     "FreshnessStatus",
+    "LiveSourceVerdict",
     "budget_for",
+    "check_live_source",
+    "evaluate_live_source",
+    "read_live_source_state",
 ]

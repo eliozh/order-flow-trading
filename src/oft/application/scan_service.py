@@ -14,10 +14,11 @@ import json
 import re
 import threading
 import uuid
+from collections.abc import Callable, Mapping
 from contextlib import suppress
-from dataclasses import asdict, dataclass, replace
+from dataclasses import asdict, dataclass, field, replace
 from datetime import UTC, date, datetime, timedelta
-from decimal import Decimal
+from decimal import Decimal, InvalidOperation
 from pathlib import Path
 from typing import Any, Protocol, cast
 
@@ -25,6 +26,7 @@ import structlog
 
 from oft.adapters.parquet_store import read_liquidations
 from oft.application.analysis_service import AnalysisService
+from oft.application.freshness import check_live_source
 from oft.application.metric_service import MetricInputs, MetricRequest, MetricService
 from oft.application.resampling_service import BarResampleRequest, ResamplingService
 from oft.config import Settings
@@ -39,6 +41,7 @@ from oft.domain.metrics.liquidations import (
 )
 from oft.domain.metrics.types import decimal_str
 from oft.domain.metrics.version import MetricVersion, orderflow_metric_version
+from oft.domain.resampling import SourceMode
 from oft.domain.time import utc_timestamp
 from oft.ports.clock import ClockPort
 from oft.ports.llm import LLMPort
@@ -47,7 +50,10 @@ from oft.ports.store import ReportRecord, ScanRecord, StorePort, StoreUnavailabl
 logger = structlog.get_logger(__name__)
 
 _SYMBOL_PATTERN = re.compile(r"^[A-Z0-9]{2,24}$")
-SUPPORTED_SOURCES = frozenset({"backfill"})
+SUPPORTED_SOURCES = frozenset({"backfill", "live"})
+SCAN_STAGES = ("QUEUED", "DATA", "METRICS", "LLM", "REPORT", "DONE")
+TERMINAL_STAGES = frozenset({"DONE", "DEGRADED", "FAILED"})
+WINDOW_LOOKBACK_DAYS = 7
 SNAPSHOT_SCHEMA_VERSION = "1.0.0"
 LLM_DISABLED_REASON = (
     "LLM not configured. This build produces metrics-only CALC reports; "
@@ -130,6 +136,7 @@ class ScanRequest:
     end: date | None = None
     trigger_source: str = "MANUAL"
     provider: str | None = None
+    batch_id: str | None = None
 
     def __post_init__(self) -> None:
         if _SYMBOL_PATTERN.fullmatch(self.symbol) is None:
@@ -144,10 +151,15 @@ class ScanRequest:
 
 @dataclass(frozen=True)
 class ScanRun:
-    """A completed scan and the CALC-only report it produced."""
+    """A completed scan and the CALC/LLM report it produced."""
 
     scan: ScanRecord
     report: ReportRecord
+    llm_state: dict[str, Any] = field(default_factory=dict)
+    symbol_stage: str = "DONE"
+    llm_tokens: int = 0
+    cost_usd: str = "0"
+    cost_unpriced: bool = False
 
 
 def _window_from_manifest(
@@ -179,6 +191,23 @@ def _window_from_manifest(
         datetime.combine(first_day, datetime.min.time(), tzinfo=UTC),
         datetime.combine(last_day + timedelta(days=1), datetime.min.time(), tzinfo=UTC),
     )
+
+
+def _data_unavailable_message(store: StorePort, request: ScanRequest) -> str:
+    """Explain a missing data window with the exact recorded gap when known."""
+    gaps = store.list_data_gaps(symbol=request.symbol, data_type="agg_trades")
+    if gaps:
+        gap = gaps[0]
+        return (
+            f"Data gap {gap.gap_id}: {gap.start} -> {gap.end} ({gap.reason}); "
+            f"no agg_trades are available for {request.symbol}."
+        )
+    if request.start is not None or request.end is not None:
+        return (
+            f"No published agg_trades exist for {request.symbol} in the requested window "
+            f"{request.start or '...'} -> {request.end or '...'}; complete a backfill first."
+        )
+    return f"No published agg_trades exist for {request.symbol}; complete a backfill first."
 
 
 def _metric_version(request: MetricRequest) -> MetricVersion:
@@ -320,6 +349,7 @@ def build_market_snapshot(
     bars: list[dict[str, object]],
     contract: Any,
     snapshot_id: str,
+    source_mode: str = "BACKFILL",
 ) -> dict[str, object]:
     """Freeze the bounded, code-built snapshot that embeds the metric document."""
     metrics_payload = json.loads(document.json_text)
@@ -355,7 +385,7 @@ def build_market_snapshot(
         "timeframe": period,
         "as_of": metrics_payload["computed_at"],
         "window": metrics_payload["window"],
-        "source_mode": "BACKFILL",
+        "source_mode": source_mode,
         "data_quality": metrics_payload["data_quality"],
         "quality_reasons": quality_reasons,
         "last_price": last_close,
@@ -411,6 +441,70 @@ def _summary_values(document: Any) -> dict[str, str]:
     }
 
 
+def _window_policy(
+    *,
+    period: str,
+    window_start: datetime,
+    window_end: datetime,
+    requested: bool,
+) -> dict[str, object]:
+    """Record the main/period window and the 3-7 day structure lookback."""
+    lookback_start = window_start - timedelta(days=WINDOW_LOOKBACK_DAYS)
+    return {
+        "main_window": {
+            "start": utc_timestamp(window_start),
+            "end": utc_timestamp(window_end),
+            "period": period,
+        },
+        "main_window_source": "REQUESTED" if requested else "MANIFEST",
+        "lookback_days": WINDOW_LOOKBACK_DAYS,
+        "lookback_window": {
+            "start": utc_timestamp(lookback_start),
+            "end": utc_timestamp(window_end),
+        },
+        "note": (
+            "The main window matches the scan period; volume profile and market "
+            "structure use up to a 7-day lookback."
+        ),
+    }
+
+
+def _llm_totals(llm_state: Mapping[str, object]) -> tuple[int, str, bool]:
+    """Return ``(tokens, cost_usd, unpriced)`` from one report's LLM band."""
+    if not bool(llm_state.get("configured")):
+        return 0, "0", False
+    usage = llm_state.get("usage")
+    tokens = 0
+    if isinstance(usage, Mapping):
+        value = usage.get("total_tokens")
+        if isinstance(value, int):
+            tokens = value
+    cost = llm_state.get("cost")
+    amount = "0"
+    unpriced = True
+    if isinstance(cost, Mapping):
+        raw_amount = cost.get("amount_usd")
+        if raw_amount is not None:
+            amount = str(raw_amount)
+        unpriced = bool(cost.get("unpriced", True))
+    return tokens, amount, unpriced
+
+
+def scan_symbol_stage(llm_state: Mapping[str, object]) -> str:
+    """A symbol is DEGRADED only when a configured LLM call was rejected."""
+    if not bool(llm_state.get("configured")):
+        return "DONE"
+    status = llm_state.get("validation_status")
+    return "DONE" if status in {"VALID", "REPAIRED"} else "DEGRADED"
+
+
+def scan_llm_status(llm_state: Mapping[str, object]) -> str | None:
+    if not bool(llm_state.get("configured")):
+        return None
+    status = llm_state.get("validation_status")
+    return str(status) if status is not None else None
+
+
 class ScanService:
     """Run one manual metrics-only scan serially under the daemon scan lock."""
 
@@ -420,10 +514,16 @@ class ScanService:
         container: ScanContainer,
         lock: threading.Lock | None = None,
         inputs: MetricInputs | None = None,
+        on_stage: Callable[[str], None] | None = None,
     ) -> None:
         self._container = container
         self._lock = lock or threading.Lock()
         self._inputs = inputs
+        self._on_stage = on_stage
+
+    def _stage(self, name: str) -> None:
+        if self._on_stage is not None:
+            self._on_stage(name)
 
     def run(self, request: ScanRequest, *, scan_id: str | None = None) -> ScanRun:
         if not self._lock.acquire(blocking=False):
@@ -441,21 +541,21 @@ class ScanService:
         store.fail_stale_scans(now=utc_timestamp(started))
         window = _window_from_manifest(store, request.symbol, request.start, request.end)
         if window is None:
-            raise ScanDataUnavailable(
-                f"No published agg_trades exist for {request.symbol}; complete a backfill first."
-            )
+            raise ScanDataUnavailable(_data_unavailable_message(store, request))
         window_start, window_end = window
         contract = store.get_symbol(request.symbol)
         if contract is None:
             raise ScanValidationError(f"Symbol {request.symbol} is not in the symbol registry.")
         tick_size = contract.tick_size
+        source_mode: SourceMode = "LIVE" if request.source == "live" else "BACKFILL"
+        resolved_scan_id = scan_id or _scan_id(started)
         scan = ScanRecord(
-            scan_id=scan_id or _scan_id(started),
+            scan_id=resolved_scan_id,
             symbol=request.symbol,
             period=request.period,
             status="RUNNING",
             trigger_source=request.trigger_source,
-            metrics_only=True,
+            metrics_only=request.metrics_only,
             fixture_path="",
             started_at=utc_timestamp(started),
             finished_at="",
@@ -470,11 +570,13 @@ class ScanService:
             manifest_path="",
             parquet_rows=0,
             created_at=utc_timestamp(started),
-            source_mode="BACKFILL",
+            source_mode=source_mode,
+            batch_id=request.batch_id or resolved_scan_id,
         )
         store.save_scan(scan)
         try:
             # DATA: resample persisted agg_trades into immutable UTC bars.
+            self._stage("DATA")
             resampling = ResamplingService(
                 settings=container.settings,
                 store=store,
@@ -487,11 +589,12 @@ class ScanService:
                     period=request.period,
                     window_start=window_start,
                     window_end=window_end,
-                    source_mode="BACKFILL",
+                    source_mode=source_mode,
                 )
             )
 
             # METRICS: compute the versioned document + footprint parts.
+            self._stage("METRICS")
             metric_request = MetricRequest(
                 symbol=request.symbol,
                 period=request.period,
@@ -512,6 +615,7 @@ class ScanService:
             document = persisted_metric.document
 
             # REPORT: freeze snapshot + metrics and store a CALC-only report.
+            self._stage("LLM")
             finished = clock.now()
             snapshot_id = _snapshot_id(
                 request.symbol,
@@ -519,11 +623,18 @@ class ScanService:
                 window_start=utc_timestamp(window_start),
                 window_end=utc_timestamp(window_end),
             )
+            policy = _window_policy(
+                period=request.period,
+                window_start=window_start,
+                window_end=window_end,
+                requested=request.start is not None or request.end is not None,
+            )
             snapshot = build_market_snapshot(
                 document=document,
                 bars=_snapshot_bars(persisted_bars.run.result.bars, document),
                 contract=contract,
                 snapshot_id=snapshot_id,
+                source_mode=source_mode,
             )
             manifest_entries = [persisted_bars.entry, persisted_metric.entry]
             if persisted_metric.footprint_entry is not None:
@@ -537,8 +648,11 @@ class ScanService:
                 scan_id=scan.scan_id,
                 report_id=report_id,
             )
+            self._stage("REPORT")
             if opportunity_ids:
                 llm_state = {**llm_state, "opportunity_ids": list(opportunity_ids)}
+            tokens, cost_usd, cost_unpriced = _llm_totals(llm_state)
+            symbol_stage = scan_symbol_stage(llm_state)
             report = ReportRecord(
                 report_id=report_id,
                 scan_id=scan.scan_id,
@@ -552,6 +666,7 @@ class ScanService:
                 snapshot_json=json.dumps(snapshot),
                 metrics_json=document.json_text,
                 llm_json=json.dumps(llm_state),
+                window_policy_json=json.dumps(policy),
             )
             summary = _summary_values(document)
             completed = replace(
@@ -568,9 +683,22 @@ class ScanService:
                 parquet_rows=persisted_bars.entry.rows,
                 report_id=report.report_id,
                 metrics_manifest_json=report.metrics_manifest_json,
+                llm_configured=bool(llm_state.get("configured")),
+                llm_status=scan_llm_status(llm_state),
+                llm_tokens=tokens,
+                cost_usd=cost_usd,
+                cost_unpriced=cost_unpriced,
             )
             store.save_report_and_complete_scan(report, completed)
-            return ScanRun(scan=completed, report=report)
+            return ScanRun(
+                scan=completed,
+                report=report,
+                llm_state=llm_state,
+                symbol_stage=symbol_stage,
+                llm_tokens=tokens,
+                cost_usd=cost_usd,
+                cost_unpriced=cost_unpriced,
+            )
         except Exception as exc:
             failed = replace(
                 scan,
@@ -599,6 +727,18 @@ class ScanService:
         provider_name = (request.provider or container.settings.llm_provider or "").strip()
         if request.metrics_only:
             return {"configured": False, "reason": LLM_DISABLED_REASON}, None, None, ()
+        if request.source == "live":
+            verdict = check_live_source(container.settings, container.clock)
+            if not verdict.fresh:
+                return (
+                    {
+                        "configured": False,
+                        "reason": f"LIVE_DATA_STALE: {verdict.reason}",
+                    },
+                    None,
+                    None,
+                    (),
+                )
         if not provider_name:
             return (
                 {"configured": False, "reason": LLM_PROVIDER_NOT_CONFIGURED_REASON},
@@ -622,16 +762,57 @@ class ScanService:
                 (),
             )
         service = AnalysisService(store=container.store, clock=container.clock, provider=provider)
-        outcome = service.analyze(
-            symbol=request.symbol,
-            timeframe=request.period,
-            metrics=json.loads(document.json_text),
-            snapshot=snapshot,
-            scan_id=scan_id,
-            report_id=report_id,
+        try:
+            outcome = service.analyze(
+                symbol=request.symbol,
+                timeframe=request.period,
+                metrics=json.loads(document.json_text),
+                snapshot=snapshot,
+                scan_id=scan_id,
+                report_id=report_id,
+            )
+        except Exception as exc:  # noqa: BLE001 - degrade, never abort the batch
+            logger.warning(
+                "scan_llm_stage_failed",
+                symbol=request.symbol,
+                scan_id=scan_id,
+                error=type(exc).__name__,
+            )
+            return (
+                {
+                    "configured": True,
+                    "provider": provider_name,
+                    "validation_status": "REJECTED",
+                    "reason": f"LLM_STAGE_FAILED: {exc}",
+                    "opportunity_ids": [],
+                },
+                None,
+                None,
+                (),
+            )
+        tokens = 0
+        for call in outcome.calls:
+            with suppress(json.JSONDecodeError, TypeError, ValueError):
+                usage = json.loads(call.usage_json)
+                if isinstance(usage, dict) and isinstance(usage.get("total_tokens"), int):
+                    tokens += int(usage["total_tokens"])
+        cost_total = Decimal("0")
+        for entry in outcome.budget:
+            try:
+                cost_total += Decimal(str(entry.record.cost_usd))
+            except InvalidOperation:
+                continue
+        unpriced = (
+            any(entry.record.unpriced for entry in outcome.budget) if outcome.budget else True
         )
+        llm_state = dict(outcome.llm_state)
+        llm_state["usage"] = {"total_tokens": tokens}
+        cost_state = dict(llm_state.get("cost") or {})
+        cost_state["amount_usd"] = format(cost_total, "f")
+        cost_state["unpriced"] = unpriced
+        llm_state["cost"] = cost_state
         narrative_ref = f"inline:{outcome.decision_id}"
-        return outcome.llm_state, outcome.decision_id, narrative_ref, outcome.opportunity_ids
+        return llm_state, outcome.decision_id, narrative_ref, outcome.opportunity_ids
 
 
 def _public_manifest_entries(value: object) -> object:
@@ -660,6 +841,9 @@ def public_scan_payload(record: ScanRecord) -> dict[str, object]:
             payload["metrics_manifest_json"] = json.dumps(
                 _public_manifest_entries(json.loads(manifest_json))
             )
+    degraded = payload.get("status") == "DONE" and payload.get("llm_status") == "REJECTED"
+    payload["degraded"] = degraded
+    payload["symbol_stage"] = "DEGRADED" if degraded else payload.get("status")
     return payload
 
 
@@ -675,8 +859,33 @@ def _llm_state(report: ReportRecord) -> dict[str, Any]:
     )
 
 
+def _report_window_policy(report: ReportRecord, snapshot: dict[str, Any]) -> Any:
+    if report.window_policy_json:
+        with suppress(json.JSONDecodeError):
+            value = json.loads(report.window_policy_json)
+            if isinstance(value, dict):
+                return value
+    window = snapshot.get("window")
+    if isinstance(window, dict) and window.get("start") and window.get("end"):
+        try:
+            start = datetime.fromisoformat(str(window["start"]).replace("Z", "+00:00"))
+            end = datetime.fromisoformat(str(window["end"]).replace("Z", "+00:00"))
+        except ValueError:
+            return None
+        return _window_policy(
+            period=str(report.timeframe),
+            window_start=start,
+            window_end=end,
+            requested=False,
+        )
+    return None
+
+
 def report_payload(report: ReportRecord) -> dict[str, object]:
     """Render one stored report for the API and CLI (identical sections)."""
+    snapshot = json.loads(report.snapshot_json)
+    llm = _llm_state(report)
+    tokens, cost_usd, cost_unpriced = _llm_totals(llm)
     return {
         "report_id": report.report_id,
         "scan_id": report.scan_id,
@@ -686,9 +895,18 @@ def report_payload(report: ReportRecord) -> dict[str, object]:
         "data_quality": report.data_quality,
         "llm_decision_id": report.llm_decision_id,
         "narrative_ref": report.narrative_ref,
-        "llm": _llm_state(report),
+        "llm": llm,
+        "llm_stage": scan_symbol_stage(llm),
+        "llm_tokens": tokens,
+        "cost_usd": cost_usd,
+        "cost_unpriced": cost_unpriced,
+        "window_policy": _report_window_policy(report, snapshot),
+        "delivery": {
+            "configured": False,
+            "reason": "TELEGRAM_NOT_CONFIGURED: Telegram delivery is not configured in this build.",
+        },
         "metrics_manifest": _public_manifest_entries(json.loads(report.metrics_manifest_json)),
-        "snapshot": json.loads(report.snapshot_json),
+        "snapshot": snapshot,
         "metrics": json.loads(report.metrics_json),
     }
 
@@ -696,6 +914,7 @@ def report_payload(report: ReportRecord) -> dict[str, object]:
 def report_summary(report: ReportRecord) -> dict[str, object]:
     """Compact report row used by ``GET /api/v1/reports`` and the scans payload."""
     llm = _llm_state(report)
+    tokens, cost_usd, cost_unpriced = _llm_totals(llm)
     return {
         "report_id": report.report_id,
         "scan_id": report.scan_id,
@@ -705,6 +924,10 @@ def report_summary(report: ReportRecord) -> dict[str, object]:
         "data_quality": report.data_quality,
         "llm_decision_id": report.llm_decision_id,
         "narrative_ref": report.narrative_ref,
+        "llm_stage": scan_symbol_stage(llm),
+        "llm_tokens": tokens,
+        "cost_usd": cost_usd,
+        "cost_unpriced": cost_unpriced,
         "llm": {
             "configured": llm.get("configured", False),
             "validation_status": llm.get("validation_status"),
@@ -715,6 +938,9 @@ def report_summary(report: ReportRecord) -> dict[str, object]:
 
 __all__ = [
     "LLM_DISABLED_REASON",
+    "SCAN_STAGES",
+    "SUPPORTED_SOURCES",
+    "TERMINAL_STAGES",
     "ScanAlreadyRunning",
     "ScanContainer",
     "ScanDataUnavailable",
@@ -726,6 +952,9 @@ __all__ = [
     "ScanValidationError",
     "build_market_snapshot",
     "measured_liquidation_inputs",
+    "public_scan_payload",
     "report_payload",
     "report_summary",
+    "scan_llm_status",
+    "scan_symbol_stage",
 ]

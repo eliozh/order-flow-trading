@@ -2,6 +2,34 @@ import type { ApiError, ApiMeta } from './status'
 
 export type { ApiError, ApiMeta }
 
+export interface ScanSymbolRow {
+  symbol: string
+  stage: string
+  report_id: string | null
+  data_quality: string | null
+  error_code: string | null
+  error_message: string | null
+  llm_status: string | null
+  llm_tokens: number
+  cost_usd: string
+  cost_unpriced: boolean
+  data_stage?: string
+  metrics_stage?: string
+  llm_stage?: string
+  report_stage?: string
+}
+
+export interface ReportLink {
+  symbol: string
+  report_id: string
+  href: string
+}
+
+export interface DeliveryState {
+  configured: boolean
+  reason: string
+}
+
 export interface ScanData {
   scan_id: string
   symbol: string
@@ -26,6 +54,25 @@ export interface ScanData {
   report_id: string | null
   source_mode: string
   metrics_manifest_json: string | null
+  batch_id?: string | null
+  llm_configured?: boolean
+  llm_status?: string | null
+  llm_tokens?: number
+  cost_usd?: string
+  cost_unpriced?: boolean
+  error_code?: string | null
+  error_message?: string | null
+  degraded?: boolean
+  symbol_stage?: string | null
+  symbols?: ScanSymbolRow[]
+  symbols_total?: number
+  symbols_completed?: number
+  symbols_degraded?: number
+  symbols_failed?: number
+  total_tokens?: number
+  total_cost_usd?: string
+  report_links?: ReportLink[]
+  delivery?: DeliveryState
 }
 
 export interface ScanListData {
@@ -93,4 +140,54 @@ export async function fetchScan(scanId: string): Promise<ScanEnvelope> {
 
 export async function fetchScans(limit = 50): Promise<ScanListEnvelope> {
   return getEnvelope<ScanListData>(`/api/v1/scans?limit=${limit}`)
+}
+
+function readCookie(name: string): string | null {
+  if (typeof document === 'undefined') {
+    return null
+  }
+  const match = document.cookie
+    .split(';')
+    .map((part) => part.trim())
+    .find((part) => part.startsWith(`${name}=`))
+  return match ? decodeURIComponent(match.slice(name.length + 1)) : null
+}
+
+function idempotencyKey(): string {
+  if (typeof crypto !== 'undefined' && typeof crypto.randomUUID === 'function') {
+    return `web-${crypto.randomUUID()}`
+  }
+  return `web-${Date.now()}-${Math.random().toString(16).slice(2)}`
+}
+
+/** Trigger one manual starred-symbol batch from the /scans schedule card. */
+export async function triggerScan(): Promise<ScanEnvelope> {
+  const csrf = readCookie('oft_csrf')
+  const headers: Record<string, string> = {
+    Accept: 'application/json',
+    'Content-Type': 'application/json',
+    'Idempotency-Key': idempotencyKey(),
+  }
+  if (csrf) {
+    headers['X-CSRF-Token'] = csrf
+  }
+  const response = await fetch('/api/v1/scans', {
+    method: 'POST',
+    headers,
+    credentials: 'same-origin',
+    body: JSON.stringify({ period: '4h', source: 'backfill', metrics_only: false }),
+  })
+  let envelope: ScanEnvelope | null = null
+  try {
+    envelope = (await response.json()) as ScanEnvelope
+  } catch {
+    envelope = null
+  }
+  if (!response.ok || !envelope || !envelope.ok || envelope.data === null) {
+    throw new ScanApiError(
+      envelope?.error?.message ?? `Scan request failed with HTTP ${response.status}`,
+      envelope?.error?.code,
+    )
+  }
+  return envelope
 }

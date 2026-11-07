@@ -31,6 +31,11 @@ ARCHIVE_FIXTURE_DIR="$ROOT/tests/fixtures/archive"
 SYSTEM_DATA_DIR="$(mktemp -d -t oft-e2e-system-XXXXXX)"
 SYMBOLS_DATA_DIR="$(mktemp -d -t oft-e2e-symbols-XXXXXX)"
 REPORTS_DATA_DIR="$(mktemp -d -t oft-e2e-reports-XXXXXX)"
+# Slice 12: a writable copy of the deterministic LLM fixtures. The ANALYSIS
+# fixture is flipped to a schema-invalid payload later so the batch DEGRADED
+# path is exercised by a real daemon, never by a live provider.
+LLM_FIXTURES_DIR="$(mktemp -d -t oft-e2e-llm-XXXXXX)"
+cp "$ROOT"/tests/fixtures/llm/*.json "$LLM_FIXTURES_DIR"/
 SYSTEM_LOG="$SYSTEM_DATA_DIR/daemon.log"
 SYMBOLS_LOG="$SYMBOLS_DATA_DIR/daemon.log"
 REPORTS_LOG="$REPORTS_DATA_DIR/daemon.log"
@@ -62,6 +67,8 @@ OFT_DATA_DIR="$REPORTS_DATA_DIR" \
   OFT_LOG_LEVEL="WARNING" \
   OFT_EXCHANGE_INFO_FIXTURE="$EXCHANGE_INFO_FIXTURE" \
   OFT_ARCHIVE_FIXTURE_DIR="$ARCHIVE_FIXTURE_DIR" \
+  OFT_LLM_PROVIDER="stub" \
+  OFT_LLM_FIXTURES_DIR="$LLM_FIXTURES_DIR" \
   setsid uv run oft serve --port "$REPORTS_PORT" >"$REPORTS_LOG" 2>&1 &
 REPORTS_PID=$!
 
@@ -72,6 +79,7 @@ cleanup() {
       wait "$pid" 2>/dev/null || true
     fi
   done
+  rm -rf "$LLM_FIXTURES_DIR"
 }
 trap cleanup EXIT INT TERM
 
@@ -228,6 +236,89 @@ if ! curl -fsS -H "Authorization: Bearer $REPORTS_TOKEN" \
   exit 1
 fi
 
+# Slice 12: starred-symbol batch scan through the real daemon and the
+# deterministic stub provider (no live credential, no network). BTCUSDT has a
+# week of recorded aggTrades; XAUUSDT is registry-only and must fail without
+# aborting the batch.
+star_symbol() {
+  curl -fsS -X PATCH \
+    -H "Authorization: Bearer $REPORTS_TOKEN" \
+    -H "Content-Type: application/json" \
+    -d '{"starred":true}' \
+    "$REPORTS_BASE_URL/api/v1/symbols/$1/star" >/dev/null
+}
+star_symbol BTCUSDT
+star_symbol XAUUSDT
+
+BATCH_JSON="$(curl -fsS -X POST \
+  -H "Authorization: Bearer $REPORTS_TOKEN" \
+  -H "Content-Type: application/json" \
+  -H "Idempotency-Key: e2e-batch-valid" \
+  -d '{"period":"4h","source":"backfill","metrics_only":false,"provider":"stub"}' \
+  "$REPORTS_BASE_URL/api/v1/scans")"
+BATCH_ID="$(printf '%s' "$BATCH_JSON" | jq -r '.data.scan_id // empty')"
+if [ -z "$BATCH_ID" ]; then
+  echo "E2E valid batch scan did not return a batch id" >&2
+  printf '%s\n' "$BATCH_JSON" >&2
+  cat "$REPORTS_LOG" >&2
+  exit 1
+fi
+if ! printf '%s' "$BATCH_JSON" | jq -e '
+  .ok == true and
+  .data.status == "PARTIAL" and
+  .data.trigger_source == "MANUAL" and
+  .data.period == "4h" and
+  .data.symbols_total == 2 and
+  .data.symbols_completed == 1 and
+  .data.symbols_failed == 1 and
+  .data.symbols_degraded == 0 and
+  ([.data.symbols[] | select(.symbol == "BTCUSDT") | .stage] | .[0] == "DONE") and
+  ([.data.symbols[] | select(.symbol == "BTCUSDT") | .llm_status] | .[0] | IN("VALID", "REPAIRED")) and
+  ([.data.symbols[] | select(.symbol == "BTCUSDT") | .report_id] | .[0] != null) and
+  ([.data.symbols[] | select(.symbol == "XAUUSDT") | .stage] | .[0] == "FAILED") and
+  ([.data.symbols[] | select(.symbol == "XAUUSDT") | .report_id] | .[0] == null) and
+  (.data.report_links | length) == 1 and
+  .data.delivery.configured == false' >/dev/null; then
+  echo "E2E valid batch scan did not produce the expected per-symbol outcome" >&2
+  printf '%s\n' "$BATCH_JSON" >&2
+  cat "$REPORTS_LOG" >&2
+  exit 1
+fi
+
+# Flip the ANALYSIS fixture to a schema-invalid payload: the next batch must
+# mark the data-bearing symbol DEGRADED with a CALC-only report and continue.
+cp "$ROOT/tests/fixtures/llm/invalid_schema.json" \
+  "$LLM_FIXTURES_DIR/opportunity_valid.json"
+BATCH_DEGRADED_JSON="$(curl -fsS -X POST \
+  -H "Authorization: Bearer $REPORTS_TOKEN" \
+  -H "Content-Type: application/json" \
+  -H "Idempotency-Key: e2e-batch-degraded" \
+  -d '{"period":"4h","source":"backfill","metrics_only":false,"provider":"stub"}' \
+  "$REPORTS_BASE_URL/api/v1/scans")"
+BATCH_DEGRADED_ID="$(printf '%s' "$BATCH_DEGRADED_JSON" | jq -r '.data.scan_id // empty')"
+if [ -z "$BATCH_DEGRADED_ID" ]; then
+  echo "E2E degraded batch scan did not return a batch id" >&2
+  printf '%s\n' "$BATCH_DEGRADED_JSON" >&2
+  cat "$REPORTS_LOG" >&2
+  exit 1
+fi
+if ! printf '%s' "$BATCH_DEGRADED_JSON" | jq -e '
+  .ok == true and
+  .data.status == "PARTIAL" and
+  .data.symbols_total == 2 and
+  .data.symbols_completed == 0 and
+  .data.symbols_degraded == 1 and
+  .data.symbols_failed == 1 and
+  ([.data.symbols[] | select(.symbol == "BTCUSDT") | .stage] | .[0] == "DEGRADED") and
+  ([.data.symbols[] | select(.symbol == "BTCUSDT") | .llm_status] | .[0] == "REJECTED") and
+  ([.data.symbols[] | select(.symbol == "BTCUSDT") | .report_id] | .[0] != null) and
+  ([.data.symbols[] | select(.symbol == "XAUUSDT") | .stage] | .[0] == "FAILED")' >/dev/null; then
+  echo "E2E degraded batch scan did not produce the expected per-symbol outcome" >&2
+  printf '%s\n' "$BATCH_DEGRADED_JSON" >&2
+  cat "$REPORTS_LOG" >&2
+  exit 1
+fi
+
 # Slice 08 fixtures: MISSING and hostile-symbol reports. They are written to the
 # real SQLite store through the project's own store port (no browser route
 # interception) so the daemon serves them exactly like a scan-produced report.
@@ -299,6 +390,8 @@ export OFT_E2E_REPORT_ID="$REPORT_ID"
 export OFT_E2E_REPORT_SCAN_ID="$REPORT_SCAN_ID"
 export OFT_E2E_SECOND_REPORT_ID="$SECOND_REPORT_ID"
 export OFT_E2E_SECOND_SCAN_ID="$SECOND_SCAN_ID"
+export OFT_E2E_BATCH_ID="$BATCH_ID"
+export OFT_E2E_BATCH_DEGRADED_ID="$BATCH_DEGRADED_ID"
 export OFT_E2E_MISSING_REPORT_ID="$MISSING_REPORT_ID"
 export OFT_E2E_HOSTILE_REPORT_ID="$HOSTILE_REPORT_ID"
 export OFT_E2E_DATA_DIR="$SYSTEM_DATA_DIR"

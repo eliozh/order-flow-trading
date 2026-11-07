@@ -312,7 +312,7 @@ def test_unsupported_source_is_validation_failed(tmp_path: Path) -> None:
         response = _post(
             harness,
             key="idem-source",
-            payload={**SCAN_PAYLOAD, "source": "live"},
+            payload={**SCAN_PAYLOAD, "source": "bogus"},
         )
     finally:
         harness.close()

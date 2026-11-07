@@ -80,7 +80,7 @@ def test_v1_database_upgrades_to_v2_with_effective_checks(tmp_path: Path) -> Non
     finally:
         connection.close()
 
-    assert versions == {1, 2, 3, 4, 5, 6, 7, 8, 9, 10}
+    assert versions == {1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11}
 
 
 _V2_BACKFILL = """
@@ -138,7 +138,7 @@ def test_v2_database_gains_the_backfill_heartbeat_column(tmp_path: Path) -> None
 
     assert "updated_at" in columns
     assert updated_at == "2026-11-06T00:00:00.000Z"
-    assert versions == {1, 2, 3, 4, 5, 6, 7, 8, 9, 10}
+    assert versions == {1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11}
 
 
 def test_v5_checks_indexes_and_foreign_keys(tmp_path: Path) -> None:
@@ -235,7 +235,7 @@ def test_v5_database_migrates_manifest_metrics_columns(tmp_path: Path) -> None:
 
     assert {"metric_version", "input_manifest_hash", "window_start", "window_end"} <= columns
     assert legacy == ("/tmp/legacy.parquet", None, None)
-    assert versions == {1, 2, 3, 4, 5, 6, 7, 8, 9, 10}
+    assert versions == {1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11}
 
 
 def test_v6_database_migrates_starred_columns(tmp_path: Path) -> None:
@@ -294,7 +294,7 @@ def test_v6_database_migrates_starred_columns(tmp_path: Path) -> None:
 
     assert {"starred", "starred_at"} <= columns
     assert row == ("BTCUSDT", 0, None)
-    assert versions == {1, 2, 3, 4, 5, 6, 7, 8, 9, 10}
+    assert versions == {1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11}
 
 
 def test_manifest_run_metadata_columns_are_added_idempotently(tmp_path: Path) -> None:
@@ -311,4 +311,4 @@ def test_manifest_run_metadata_columns_are_added_idempotently(tmp_path: Path) ->
         connection.close()
 
     assert {"run_id", "last_n", "recomputed_from", "parent_run_id"} <= columns
-    assert versions == {1, 2, 3, 4, 5, 6, 7, 8, 9, 10}
+    assert versions == {1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11}

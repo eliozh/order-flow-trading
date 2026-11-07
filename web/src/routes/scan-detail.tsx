@@ -1,6 +1,6 @@
 import { useEffect, useState } from 'react'
 
-import { fetchScan, type ScanData, type ScanEnvelope } from '../api/scans'
+import { fetchScan, type ScanData, type ScanEnvelope, type ScanSymbolRow } from '../api/scans'
 import { DataQualityBadge } from '../components/data-quality'
 import { ProvenanceStamp } from '../components/provenance'
 import { useCompact } from '../hooks/use-compact'
@@ -17,31 +17,174 @@ interface ScanState {
   message?: string
 }
 
-type StageState = 'DONE' | 'RUNNING' | 'PENDING' | 'FAILED'
+type StageState = 'DONE' | 'RUNNING' | 'PENDING' | 'FAILED' | 'SKIPPED'
 
-function stages(scan: ScanData): { name: string; state: StageState; detail: string }[] {
-  const failed = scan.status === 'FAILED'
-  const running = scan.status === 'RUNNING'
-  const dataDone = scan.trade_count > 0
-  const metricsDone = Boolean(scan.metrics_manifest_json)
-  const reportDone = Boolean(scan.report_id)
+const CHIP_CLASS: Record<StageState, string> = {
+  DONE: 'chip chip--ok',
+  RUNNING: 'chip',
+  PENDING: 'chip',
+  FAILED: 'chip chip--danger',
+  SKIPPED: 'chip chip--warn',
+}
+
+const LLM_CHIP: Record<string, string> = {
+  VALID: 'chip chip--ok',
+  REPAIRED: 'chip chip--ok',
+  REJECTED: 'chip chip--danger',
+}
+
+function symbolRows(scan: ScanData): ScanSymbolRow[] {
+  if (scan.symbols && scan.symbols.length > 0) {
+    return scan.symbols
+  }
   return [
     {
+      symbol: scan.symbol,
+      stage: scan.symbol_stage ?? scan.status,
+      report_id: scan.report_id,
+      data_quality: scan.data_quality,
+      error_code: scan.error_code ?? null,
+      error_message: scan.error_message ?? null,
+      llm_status: scan.llm_status ?? null,
+      llm_tokens: scan.llm_tokens ?? 0,
+      cost_usd: scan.cost_usd ?? '0',
+      cost_unpriced: scan.cost_unpriced ?? true,
+    },
+  ]
+}
+
+function stages(scan: ScanData): { name: string; state: StageState; detail: string }[] {
+  const rows = symbolRows(scan)
+  const failed = scan.status === 'FAILED'
+  const running = scan.status === 'RUNNING'
+  const anyReport = rows.some((row) => Boolean(row.report_id))
+  const anyLlm = rows.some((row) => Boolean(row.llm_status))
+  const anyRejected = rows.some((row) => row.llm_status === 'REJECTED')
+  const dataFailed = rows.some(
+    (row) => row.stage === 'FAILED' && row.error_code === 'DATA_UNAVAILABLE',
+  )
+  const terminal = rows.every((row) => ['DONE', 'DEGRADED', 'FAILED'].includes(row.stage))
+  return [
+    {
+      name: 'QUEUED',
+      state: terminal ? 'DONE' : running ? 'RUNNING' : 'PENDING',
+      detail: `${rows.length} symbol${rows.length === 1 ? '' : 's'} in this run`,
+    },
+    {
       name: 'DATA',
-      state: dataDone ? 'DONE' : failed ? 'FAILED' : running ? 'RUNNING' : 'PENDING',
-      detail: `${scan.trade_count} trades in ${scan.period} bars`,
+      state: dataFailed ? 'FAILED' : terminal ? 'DONE' : running ? 'RUNNING' : 'PENDING',
+      detail: dataFailed
+        ? 'one symbol has a data gap'
+        : 'persisted aggTrades resampled to UTC bars',
     },
     {
       name: 'METRICS',
-      state: metricsDone ? 'DONE' : failed ? 'FAILED' : dataDone ? 'RUNNING' : 'PENDING',
-      detail: metricsDone ? 'metric manifest recorded' : 'awaiting metric manifest',
+      state: failed && !terminal ? 'FAILED' : terminal ? 'DONE' : 'PENDING',
+      detail: 'versioned order-flow document and snapshot',
+    },
+    {
+      name: 'LLM',
+      state: anyRejected ? 'FAILED' : anyLlm ? 'DONE' : running ? 'RUNNING' : 'SKIPPED',
+      detail: anyRejected
+        ? 'narrative rejected; CALC-only report kept'
+        : anyLlm
+          ? 'schema-validated narrative'
+          : 'not configured for this run',
     },
     {
       name: 'REPORT',
-      state: reportDone ? 'DONE' : failed ? 'FAILED' : metricsDone ? 'RUNNING' : 'PENDING',
-      detail: reportDone ? `report ${scan.report_id}` : 'no CALC report yet',
+      state: anyReport ? 'DONE' : failed ? 'FAILED' : running ? 'RUNNING' : 'PENDING',
+      detail: anyReport ? 'at least one report link available' : 'no report yet',
     },
   ]
+}
+
+function symbolStageClass(stage: string): string {
+  if (stage === 'DONE') {
+    return 'chip chip--ok'
+  }
+  if (stage === 'DEGRADED' || stage === 'PARTIAL') {
+    return 'chip chip--warn'
+  }
+  if (stage === 'FAILED') {
+    return 'chip chip--danger'
+  }
+  return 'chip'
+}
+
+interface StageFlags {
+  data: string
+  metrics: string
+  llm: string
+  report: string
+}
+
+/** Per-symbol DATA/METRICS/LLM/REPORT cells (payload first, then derived). */
+function symbolStageFlags(row: ScanSymbolRow): StageFlags {
+  if (row.data_stage && row.metrics_stage && row.llm_stage && row.report_stage) {
+    return {
+      data: row.data_stage,
+      metrics: row.metrics_stage,
+      llm: row.llm_stage,
+      report: row.report_stage,
+    }
+  }
+  const flags: StageFlags = {
+    data: 'PENDING',
+    metrics: 'PENDING',
+    llm: 'PENDING',
+    report: 'PENDING',
+  }
+  if (row.stage === 'DATA') {
+    flags.data = 'RUNNING'
+  } else if (row.stage === 'METRICS') {
+    flags.data = 'DONE'
+    flags.metrics = 'RUNNING'
+  } else if (row.stage === 'LLM') {
+    flags.data = 'DONE'
+    flags.metrics = 'DONE'
+    flags.llm = 'RUNNING'
+  } else if (row.stage === 'REPORT') {
+    flags.data = 'DONE'
+    flags.metrics = 'DONE'
+    flags.llm = 'DONE'
+    flags.report = 'RUNNING'
+  } else if (row.stage === 'DONE' || row.stage === 'DEGRADED') {
+    flags.data = 'DONE'
+    flags.metrics = 'DONE'
+    flags.llm =
+      row.llm_status === 'VALID' || row.llm_status === 'REPAIRED'
+        ? 'DONE'
+        : row.llm_status === 'REJECTED'
+          ? 'FAILED'
+          : 'SKIPPED'
+    flags.report = row.report_id ? 'DONE' : 'SKIPPED'
+  } else if (row.stage === 'FAILED') {
+    if (row.error_code === 'DATA_UNAVAILABLE') {
+      flags.data = 'FAILED'
+    } else {
+      flags.data = 'DONE'
+      flags.metrics = 'FAILED'
+    }
+  }
+  return flags
+}
+
+function StageCell({ value }: { value: string }) {
+  if (value === 'DONE') {
+    return <span className="value-up">✓ done</span>
+  }
+  if (value === 'RUNNING') {
+    return <span className="mono-muted">› running</span>
+  }
+  if (value === 'FAILED') {
+    return <span className="value-down">✕ failed</span>
+  }
+  return <span className="mono-muted">—</span>
+}
+
+function batches(scan: ScanData): number {
+  return scan.batch_id && scan.batch_id !== scan.scan_id ? 1 : 0
 }
 
 export function ScanDetailPage({
@@ -100,6 +243,10 @@ export function ScanDetailPage({
   }
 
   const scan = load.scan
+  const rows = symbolRows(scan)
+  const totalTokens = scan.total_tokens ?? scan.llm_tokens ?? 0
+  const totalCost = scan.total_cost_usd ?? scan.cost_usd ?? '0'
+  const stageRows = batches(scan) > 0 || rows.length > 0 ? rows : []
   return (
     <section
       className="system-page scan-page"
@@ -134,6 +281,26 @@ export function ScanDetailPage({
           <dd>{scan.status}</dd>
         </div>
         <div>
+          <dt>Symbols</dt>
+          <dd className="mono">
+            {scan.symbols_completed ?? rows.filter((row) => row.stage === 'DONE').length}/
+            {scan.symbols_total ?? rows.length}
+            {(scan.symbols_degraded ?? 0) > 0 ? ` · ${scan.symbols_degraded} degraded` : ''}
+            {(scan.symbols_failed ?? 0) > 0 ? ` · ${scan.symbols_failed} failed` : ''}
+          </dd>
+        </div>
+        <div>
+          <dt>Cost</dt>
+          <dd className="mono">
+            ${totalCost}
+            {scan.cost_unpriced && <span className="mono-muted"> · unpriced</span>}
+          </dd>
+        </div>
+        <div>
+          <dt>Tokens</dt>
+          <dd className="mono">{totalTokens}</dd>
+        </div>
+        <div>
           <dt>Window</dt>
           <dd className="mono">
             {scan.window_start} → {scan.window_end}
@@ -152,14 +319,6 @@ export function ScanDetailPage({
           <dd className="mono">{scan.trade_count}</dd>
         </div>
         <div>
-          <dt>Delta</dt>
-          <dd className="mono">{scan.delta}</dd>
-        </div>
-        <div>
-          <dt>CVD</dt>
-          <dd className="mono">{scan.cvd}</dd>
-        </div>
-        <div>
           <dt>Report</dt>
           <dd className="mono">
             {scan.report_id ? (
@@ -176,21 +335,128 @@ export function ScanDetailPage({
       <section className="panel" aria-labelledby="stages-heading">
         <div className="panel-head">
           <h2 id="stages-heading">Stages</h2>
-          <span className="mono-muted">DATA → METRICS → REPORT</span>
+          <span className="mono-muted">QUEUED → DATA → METRICS → LLM → REPORT → DONE</span>
         </div>
         <ol className="stage-list" aria-label="Named scan stages">
           {stages(scan).map((stage) => (
             <li key={stage.name} className={`stage stage--${stage.state.toLowerCase()}`}>
               <span className="stage-name">{stage.name}</span>
-              <span className="chip">{stage.state}</span>
+              <span className={CHIP_CLASS[stage.state]}>{stage.state}</span>
               <span className="panel-foot">{stage.detail}</span>
             </li>
           ))}
         </ol>
-        <p className="panel-foot" role="status">
-          No LLM stage exists in this metrics-only slice.
-        </p>
+        {scan.metrics_only && !scan.llm_configured && (
+          <p className="panel-foot" role="status">
+            No LLM stage exists in this metrics-only slice.
+          </p>
+        )}
       </section>
+
+      {stageRows.length > 1 && (
+        <section className="panel" aria-labelledby="symbols-heading">
+          <div className="panel-head">
+            <h2 id="symbols-heading">Per-symbol results</h2>
+            <span className="mono-muted">{stageRows.length} symbols</span>
+          </div>
+          {/* eslint-disable-next-line jsx-a11y/no-noninteractive-tabindex -- scrollable table */}
+          <div className="table-wrap" role="region" aria-label="Per-symbol results" tabIndex={0}>
+            <table className="data-table">
+              <caption className="visually-hidden">Per-symbol scan stages</caption>
+              <thead>
+                <tr>
+                  <th scope="col">Symbol</th>
+                  <th scope="col">DATA</th>
+                  <th scope="col">METRICS</th>
+                  <th scope="col">LLM</th>
+                  <th scope="col">REPORT</th>
+                  <th scope="col">State</th>
+                  <th scope="col">Quality</th>
+                  {!compact && <th scope="col">Cost</th>}
+                  <th scope="col">Result</th>
+                </tr>
+              </thead>
+              <tbody>
+                {stageRows.map((row) => {
+                  const flags = symbolStageFlags(row)
+                  return (
+                    <tr key={row.symbol}>
+                      <td className="mono">{row.symbol}</td>
+                      <td>
+                        <StageCell value={flags.data} />
+                      </td>
+                      <td>
+                        <StageCell value={flags.metrics} />
+                      </td>
+                      <td>
+                        <StageCell value={flags.llm} />
+                        {row.llm_status && (
+                          <span className={`${LLM_CHIP[row.llm_status] ?? 'chip'} llm-status`}>
+                            {row.llm_status}
+                          </span>
+                        )}
+                      </td>
+                      <td>
+                        <StageCell value={flags.report} />
+                      </td>
+                      <td>
+                        <span className={symbolStageClass(row.stage)}>{row.stage}</span>
+                      </td>
+                      <td>
+                        {row.data_quality ? (
+                          <DataQualityBadge status={row.data_quality} />
+                        ) : (
+                          <span className="mono-muted">—</span>
+                        )}
+                      </td>
+                      {!compact && (
+                        <td className="mono">
+                          ${row.cost_usd}
+                          {row.cost_unpriced && <span className="mono-muted"> unpriced</span>}
+                        </td>
+                      )}
+                      <td>
+                        {row.report_id ? (
+                          <a
+                            className="rowlink mono"
+                            href={`/reports/${encodeURIComponent(row.report_id)}`}
+                          >
+                            {row.report_id}
+                          </a>
+                        ) : row.error_message ? (
+                          <span className="quality-reason">{row.error_message}</span>
+                        ) : (
+                          <span className="mono-muted">—</span>
+                        )}
+                      </td>
+                    </tr>
+                  )
+                })}
+              </tbody>
+            </table>
+          </div>
+          <p className="panel-foot">
+            Telegram:{' '}
+            {scan.delivery?.configured
+              ? 'delivered'
+              : (scan.delivery?.reason ?? 'Telegram is not configured in this build.')}
+          </p>
+          {scan.report_links && scan.report_links.length > 0 && (
+            <p className="panel-foot">
+              Report links:{' '}
+              {scan.report_links.map((link) => (
+                <a key={link.report_id} className="rowlink mono" href={link.href}>
+                  {link.report_id}
+                </a>
+              ))}
+            </p>
+          )}
+        </section>
+      )}
+
+      <p className="panel-foot" role="status">
+        Stages update in place while a scan runs; no fabricated percentage is shown.
+      </p>
     </section>
   )
 }
