@@ -185,6 +185,7 @@ class AnalysisService:
             )
             self._store.save_llm_call(call_record)
             calls.append(call_record)
+            estimate = self._provider.estimate_cost(attempt_request, request.model)
             budgets.append(
                 self._budget.record_call(
                     call_id=call_id,
@@ -192,6 +193,10 @@ class AnalysisService:
                     role=LLMRole.ANALYSIS.value,
                     result=result,
                     occurred_at=now,
+                    unpriced=estimate.unpriced,
+                    cost_usd=estimate.amount_usd,
+                    price_version=estimate.price_version,
+                    usage=result.usage,
                 )
             )
             return result

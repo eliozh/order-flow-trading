@@ -194,6 +194,7 @@ class JobRunRecord:
     metrics_only: bool = False
     provider: str | None = None
     symbol: str | None = None
+    period: str | None = None
 
 
 @dataclass(frozen=True)

@@ -258,10 +258,12 @@ def _batch_children(container: Any, run_id: str) -> tuple[ScanRecord, ...]:
     return children
 
 
-def _batch_period(children: tuple[ScanRecord, ...]) -> str:
+def _batch_period(children: tuple[ScanRecord, ...], run: Any) -> str:
     if children:
         return str(children[0].period)
-    return "4h"
+    # A batch with no surviving child (for example, every symbol failed) still
+    # reports the period it was requested with.
+    return str(getattr(run, "period", None) or "4h")
 
 
 def _batch_source_mode(children: tuple[ScanRecord, ...]) -> str:
@@ -302,7 +304,7 @@ def _batch_scan_payload(
     """Render a batch job run with its per-symbol stages and cost totals."""
     rows = container.store.list_scan_symbols(run.run_id)
     children = _batch_children(container, run.run_id)
-    resolved_period = period or _batch_period(children)
+    resolved_period = period or _batch_period(children, run)
     status = _batch_status(rows, running=run.status == "RUNNING")
     completed = sum(1 for row in rows if row.stage == "DONE")
     degraded = sum(1 for row in rows if row.stage == "DEGRADED")

@@ -2,7 +2,8 @@
 
 from __future__ import annotations
 
-from dataclasses import dataclass
+import json
+from dataclasses import dataclass, replace
 from datetime import UTC, date, datetime, timedelta
 from decimal import Decimal
 from pathlib import Path
@@ -10,6 +11,7 @@ from typing import Any
 
 from fastapi.testclient import TestClient
 
+import oft.application.jobs as jobs_module
 import oft.bootstrap as bootstrap
 from oft.adapters.llm_stub import LLMStub
 from oft.api.app import create_app
@@ -19,7 +21,7 @@ from oft.clock import FixedClock
 from oft.config import Settings
 from oft.domain.events import AggTrade
 from oft.domain.time import utc_timestamp
-from oft.ports.llm import LLMRole
+from oft.ports.llm import CostEstimate, LLMRole, LLMUsage
 from oft.ports.store import ScanRecord, ScanSymbolRecord
 
 ROOT = Path(__file__).resolve().parents[2]
@@ -582,3 +584,316 @@ def test_unsupported_source_is_still_rejected_as_validation_failed(tmp_path: Pat
 
     assert response.status_code == 422
     assert response.json()["error"]["code"] == "VALIDATION_FAILED"
+
+
+def _failed_row(
+    scan_id: str, symbol: str, error_code: str = "DATA_UNAVAILABLE"
+) -> ScanSymbolRecord:
+    return ScanSymbolRecord(
+        scan_id=scan_id,
+        symbol=symbol,
+        stage="FAILED",
+        started_at=utc_timestamp(NOW),
+        finished_at=utc_timestamp(NOW),
+        error_code=error_code,
+        error_message="exact gap window",
+        report_id=None,
+        data_quality=None,
+    )
+
+
+def test_one_raising_symbol_is_isolated_and_the_job_is_partial(
+    tmp_path: Path, monkeypatch: Any
+) -> None:
+    real_service = jobs_module.ScanService
+
+    class FlakyScanService(real_service):  # type: ignore[misc, valid-type]
+        def run(self, request: Any, *, scan_id: str | None = None) -> Any:
+            if request.symbol == "ETHUSDT":
+                raise RuntimeError("symbol exploded")
+            return super().run(request, scan_id=scan_id)
+
+    monkeypatch.setattr(jobs_module, "ScanService", FlakyScanService)
+    harness = _harness(_seed(tmp_path))
+    try:
+        response = harness.post_batch("batch-one-raises")
+        data = response.json()["data"]
+        batch_id = data["scan_id"]
+        job = harness.container.store.get_job_run(batch_id)
+        rows = {row.symbol: row for row in harness.container.store.list_scan_symbols(batch_id)}
+    finally:
+        harness.client.close()
+
+    assert response.status_code == 201, response.text
+    assert data["status"] == "PARTIAL"
+    assert data["symbols_completed"] == 1
+    assert data["symbols_failed"] == 1
+    assert rows["BTCUSDT"].stage == "DONE"
+    assert rows["ETHUSDT"].stage == "FAILED"
+    assert rows["ETHUSDT"].error_code == "SCAN_FAILED"
+    assert job is not None
+    assert job.status == "PARTIAL"
+
+
+def test_a_batch_where_every_symbol_fails_is_persisted_failed(
+    tmp_path: Path, monkeypatch: Any
+) -> None:
+    class ExplodingScanService:
+        def __init__(self, **kwargs: object) -> None:
+            pass
+
+        def run(self, request: Any, *, scan_id: str | None = None) -> Any:
+            raise RuntimeError("all symbols exploded")
+
+    monkeypatch.setattr(jobs_module, "ScanService", ExplodingScanService)
+    harness = _harness(_seed(tmp_path))
+    try:
+        response = harness.client.post(
+            "/api/v1/scans",
+            json={**BATCH_PAYLOAD, "period": "1h"},
+            headers={**harness.auth, "Idempotency-Key": "batch-all-fail"},
+        )
+        data = response.json()["data"]
+        batch_id = data["scan_id"]
+        detail = harness.client.get(f"/api/v1/scans/{batch_id}", headers=harness.auth)
+        job = harness.container.store.get_job_run(batch_id)
+    finally:
+        harness.client.close()
+
+    assert response.status_code == 201, response.text
+    assert data["status"] == "FAILED"
+    assert data["symbols_completed"] == 0
+    assert data["symbols_failed"] == 2
+    assert job is not None
+    assert job.status == "FAILED"
+    # No child scan exists, so the batch period comes from the persisted run.
+    assert job.period == "1h"
+    assert detail.json()["data"]["period"] == "1h"
+
+
+def test_resume_with_all_rows_failed_finishes_the_job_failed(tmp_path: Path) -> None:
+    settings = _seed(tmp_path)
+    container = build_container(settings, initialize=True)
+    ledger = JobLedger(store=container.store, clock=FixedClock(NOW))
+    claim = ledger.claim_scan(
+        trigger_source="MANUAL", owner="manual-owner", run_id="SCAN-ALL-FAILED"
+    )
+    assert claim.claimed and claim.run is not None
+    run_id = claim.run.run_id
+    for symbol in ("BTCUSDT", "ETHUSDT"):
+        container.store.upsert_scan_symbol(_failed_row(run_id, symbol))
+
+    later = FixedClock(NOW + timedelta(seconds=60))
+    outcome = ScheduledScanRunner(container=container, clock=later).resume(run_id, period="4h")
+
+    assert outcome.claimed is True
+    assert outcome.scans == ()
+    assert container.store.get_job_run(run_id).status == "FAILED"  # type: ignore[union-attr]
+
+
+def test_resume_with_mixed_terminal_rows_finishes_the_job_partial(tmp_path: Path) -> None:
+    settings = _seed(tmp_path)
+    container = build_container(settings, initialize=True)
+    ledger = JobLedger(store=container.store, clock=FixedClock(NOW))
+    claim = ledger.claim_scan(
+        trigger_source="MANUAL", owner="manual-owner", run_id="SCAN-MIXED-FAILED"
+    )
+    assert claim.claimed and claim.run is not None
+    run_id = claim.run.run_id
+    container.store.upsert_scan_symbol(_done_row(run_id, "BTCUSDT"))
+    container.store.upsert_scan_symbol(_failed_row(run_id, "ETHUSDT"))
+
+    later = FixedClock(NOW + timedelta(seconds=60))
+    outcome = ScheduledScanRunner(container=container, clock=later).resume(run_id, period="4h")
+
+    assert outcome.claimed is True
+    assert outcome.scans == ()
+    assert container.store.get_job_run(run_id).status == "PARTIAL"  # type: ignore[union-attr]
+
+
+def test_resume_merges_a_prior_failed_row_into_the_job_status(tmp_path: Path) -> None:
+    """A prior owner's FAILED row must downgrade a resumed run from DONE to PARTIAL."""
+    settings = _seed(tmp_path)
+    container = build_container(settings, initialize=True)
+    ledger = JobLedger(store=container.store, clock=FixedClock(NOW))
+    claim = ledger.claim_scan(
+        trigger_source="MANUAL", owner="manual-owner", run_id="SCAN-PROBE-PARTIAL"
+    )
+    assert claim.claimed and claim.run is not None
+    run_id = claim.run.run_id
+    # Probe: BTCUSDT was checkpointed FAILED by the prior owner; ETHUSDT has no row.
+    container.store.upsert_scan_symbol(_failed_row(run_id, "BTCUSDT"))
+
+    later = FixedClock(NOW + timedelta(seconds=60))
+    outcome = ScheduledScanRunner(container=container, clock=later).resume(run_id, period="4h")
+
+    assert outcome.claimed is True
+    assert [scan.symbol for scan in outcome.scans] == ["ETHUSDT"]
+    assert outcome.failed_symbols == ()
+    persisted = container.store.get_job_run(run_id)
+    assert persisted is not None and persisted.status == "PARTIAL"
+    stages = {row.symbol: row.stage for row in container.store.list_scan_symbols(run_id)}
+    assert stages == {"BTCUSDT": "FAILED", "ETHUSDT": "DONE"}
+
+
+def test_resume_with_every_terminal_row_done_persists_done(tmp_path: Path) -> None:
+    settings = _seed(tmp_path)
+    container = build_container(settings, initialize=True)
+    ledger = JobLedger(store=container.store, clock=FixedClock(NOW))
+    claim = ledger.claim_scan(
+        trigger_source="MANUAL", owner="manual-owner", run_id="SCAN-PROBE-DONE"
+    )
+    assert claim.claimed and claim.run is not None
+    run_id = claim.run.run_id
+    container.store.upsert_scan_symbol(_done_row(run_id, "BTCUSDT"))
+
+    later = FixedClock(NOW + timedelta(seconds=60))
+    outcome = ScheduledScanRunner(container=container, clock=later).resume(run_id, period="4h")
+
+    assert outcome.claimed is True
+    assert [scan.symbol for scan in outcome.scans] == ["ETHUSDT"]
+    persisted = container.store.get_job_run(run_id)
+    assert persisted is not None and persisted.status == "DONE"
+
+
+def test_resume_where_the_resumed_symbol_also_fails_persists_failed(
+    tmp_path: Path, monkeypatch: Any
+) -> None:
+    class ExplodingScanService:
+        def __init__(self, **kwargs: object) -> None:
+            pass
+
+        def run(self, request: Any, *, scan_id: str | None = None) -> Any:
+            raise RuntimeError("resumed symbol exploded")
+
+    monkeypatch.setattr(jobs_module, "ScanService", ExplodingScanService)
+    settings = _seed(tmp_path)
+    container = build_container(settings, initialize=True)
+    ledger = JobLedger(store=container.store, clock=FixedClock(NOW))
+    claim = ledger.claim_scan(
+        trigger_source="MANUAL", owner="manual-owner", run_id="SCAN-PROBE-FAILED"
+    )
+    assert claim.claimed and claim.run is not None
+    run_id = claim.run.run_id
+    container.store.upsert_scan_symbol(_failed_row(run_id, "BTCUSDT"))
+
+    later = FixedClock(NOW + timedelta(seconds=60))
+    outcome = ScheduledScanRunner(container=container, clock=later).resume(run_id, period="4h")
+
+    assert outcome.claimed is True
+    assert outcome.scans == ()
+    assert outcome.failed_symbols == ("ETHUSDT",)
+    persisted = container.store.get_job_run(run_id)
+    assert persisted is not None and persisted.status == "FAILED"
+
+
+def test_interrupted_one_hour_batch_resumes_with_its_persisted_period(tmp_path: Path) -> None:
+    settings = _seed(tmp_path)
+    container = build_container(settings, initialize=True)
+    ledger = JobLedger(store=container.store, clock=FixedClock(NOW))
+    claim = ledger.claim_scan(
+        trigger_source="MANUAL",
+        owner="manual-owner",
+        run_id="SCAN-INTERRUPTED-1H",
+        period="1h",
+    )
+    assert claim.claimed and claim.run is not None
+    run_id = claim.run.run_id
+    persisted = container.store.get_job_run(run_id)
+    assert persisted is not None and persisted.period == "1h"
+    container.store.upsert_scan_symbol(_non_terminal_row(run_id, "BTCUSDT", "METRICS"))
+
+    # The scheduler restarts with a different active period; the interrupted
+    # run must still finish the window it started with.
+    later = FixedClock(NOW + timedelta(seconds=60))
+    outcome = ScheduledScanRunner(container=container, clock=later).resume(run_id, period="4h")
+
+    assert outcome.claimed is True
+    assert {scan.period for scan in outcome.scans} == {"1h"}
+    reports = container.store.list_reports()
+    assert reports and {report.timeframe for report in reports} == {"1h"}
+
+    harness = _harness(settings)
+    try:
+        detail = harness.client.get(f"/api/v1/scans/{run_id}", headers=harness.auth)
+    finally:
+        harness.client.close()
+
+    assert detail.status_code == 200, detail.text
+    assert detail.json()["data"]["period"] == "1h"
+
+
+def test_provider_exception_degrades_only_that_symbol_and_keeps_the_report(
+    tmp_path: Path, monkeypatch: Any
+) -> None:
+    valid_stub = LLMStub(fixtures_dir=FIXTURES)
+
+    class RaisingForEth:
+        def capabilities(self) -> Any:
+            return valid_stub.capabilities()
+
+        def complete(self, request: Any) -> Any:
+            if "ETHUSDT" in request.user_prompt:
+                raise RuntimeError("provider unavailable")
+            return valid_stub.complete(request)
+
+        def estimate_cost(self, request: Any, model: str) -> Any:
+            return valid_stub.estimate_cost(request, model)
+
+    monkeypatch.setattr(
+        bootstrap, "resolve_llm_provider", lambda settings, requested=None: RaisingForEth()
+    )
+    harness = _harness(_seed(tmp_path))
+    try:
+        response = harness.post_batch("batch-provider-raises")
+        data = response.json()["data"]
+        rows = {row["symbol"]: row for row in data["symbols"]}
+        report = harness.container.store.get_report(rows["ETHUSDT"]["report_id"])
+    finally:
+        harness.client.close()
+
+    assert response.status_code == 201, response.text
+    assert data["status"] == "PARTIAL"
+    assert rows["BTCUSDT"]["stage"] == "DONE"
+    assert rows["ETHUSDT"]["stage"] == "DEGRADED"
+    assert rows["ETHUSDT"]["llm_status"] == "REJECTED"
+    assert report is not None
+    llm = json.loads(report.llm_json or "{}")
+    assert str(llm.get("reason", "")).startswith("LLM_STAGE_FAILED")
+
+
+def test_batch_aggregates_priced_usage_tokens_and_cost(tmp_path: Path, monkeypatch: Any) -> None:
+    valid_stub = LLMStub(fixtures_dir=FIXTURES)
+
+    class PricedProvider:
+        def capabilities(self) -> Any:
+            return valid_stub.capabilities()
+
+        def complete(self, request: Any) -> Any:
+            base = valid_stub.complete(request)
+            return replace(
+                base,
+                provider="priced",
+                model="priced-test",
+                usage=LLMUsage(input_tokens=100, output_tokens=50),
+            )
+
+        def estimate_cost(self, request: Any, model: str) -> Any:
+            return CostEstimate(amount_usd="0.0015", price_version="test/v1", unpriced=False)
+
+    monkeypatch.setattr(
+        bootstrap, "resolve_llm_provider", lambda settings, requested=None: PricedProvider()
+    )
+    harness = _harness(_seed(tmp_path))
+    try:
+        response = harness.post_batch("batch-priced-usage")
+        data = response.json()["data"]
+    finally:
+        harness.client.close()
+
+    assert response.status_code == 201, response.text
+    assert data["total_tokens"] == 300
+    assert Decimal(data["total_cost_usd"]) == Decimal("0.0030")
+    assert data["cost_unpriced"] is False
+    assert [row["llm_tokens"] for row in data["symbols"]] == [150, 150]
+    assert all(row["cost_unpriced"] is False for row in data["symbols"])

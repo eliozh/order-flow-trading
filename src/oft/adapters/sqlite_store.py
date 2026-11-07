@@ -46,7 +46,7 @@ from oft.ports.store import (
     TriggerEventRecord,
 )
 
-_SCHEMA_VERSION = 13
+_SCHEMA_VERSION = 14
 STALE_RUNNING_SECONDS = 15 * 60
 _BACKFILL_RUN_STATUSES = ("RUNNING", "COMPLETE", "PARTIAL", "FAILED", "BLOCKED", "STALE")
 _BACKFILL_RUNS_DEFINITION = """
@@ -109,7 +109,7 @@ _JOB_RUNS_DEFINITION = """
     job_type TEXT NOT NULL,
     window_start TEXT NOT NULL,
     status TEXT NOT NULL CHECK (
-        status IN ('RUNNING','DONE','FAILED','MISSED','SKIPPED')
+        status IN ('RUNNING','PARTIAL','DONE','FAILED','MISSED','SKIPPED')
     ),
     trigger_source TEXT NOT NULL,
     started_at TEXT NOT NULL,
@@ -123,6 +123,7 @@ _JOB_RUNS_DEFINITION = """
     metrics_only INTEGER NOT NULL DEFAULT 0,
     provider TEXT,
     symbol TEXT,
+    period TEXT,
     UNIQUE (job_type, window_start)
 """
 
@@ -854,6 +855,67 @@ def _migrate_job_runs_v13(connection: sqlite3.Connection) -> None:
         raise
 
 
+def _migrate_job_runs_v14(connection: sqlite3.Connection) -> None:
+    """Add the persisted scan period and the ``PARTIAL`` batch status (v14).
+
+    SQLite cannot widen a CHECK constraint with ``ALTER TABLE``, so the table is
+    recreated and copied when the old definition is detected. The migration is
+    idempotent: a table that already has the period column and the wider status
+    check is left untouched.
+    """
+    row = connection.execute(
+        "SELECT sql FROM sqlite_master WHERE type = 'table' AND name = 'job_runs'"
+    ).fetchone()
+    if row is None or row[0] is None:
+        return
+    definition = str(row[0])
+    columns = {item[1] for item in connection.execute("PRAGMA table_info(job_runs)")}
+    needs_rebuild = "'PARTIAL'" not in definition
+    needs_period = "period" not in columns
+    if not needs_rebuild and not needs_period:
+        return
+    connection.execute("BEGIN IMMEDIATE")
+    try:
+        if needs_rebuild:
+            connection.execute("ALTER TABLE job_runs RENAME TO job_runs_v13")
+            connection.execute(f"CREATE TABLE job_runs ({_JOB_RUNS_DEFINITION})")
+            copied = [
+                name
+                for name in (
+                    "run_id",
+                    "job_type",
+                    "window_start",
+                    "status",
+                    "trigger_source",
+                    "started_at",
+                    "finished_at",
+                    "error_code",
+                    "message",
+                    "lease_owner",
+                    "lease_expires_at",
+                    "heartbeat_at",
+                    "source",
+                    "metrics_only",
+                    "provider",
+                    "symbol",
+                    "period",
+                )
+                if name in columns
+            ]
+            if copied:
+                column_list = ", ".join(copied)
+                connection.execute(
+                    f"INSERT INTO job_runs ({column_list}) SELECT {column_list} FROM job_runs_v13"
+                )
+            connection.execute("DROP TABLE job_runs_v13")
+        else:
+            connection.execute("ALTER TABLE job_runs ADD COLUMN period TEXT")
+        connection.execute("COMMIT")
+    except Exception:
+        connection.execute("ROLLBACK")
+        raise
+
+
 def initialize_database(settings: Settings) -> None:
     """Create the data directory and the walking-skeleton schema."""
     settings.data_dir.mkdir(parents=True, exist_ok=True)
@@ -895,6 +957,7 @@ def initialize_database(settings: Settings) -> None:
         if _table_exists(connection, "job_runs"):
             _migrate_job_runs_v12(connection)
             _migrate_job_runs_v13(connection)
+            _migrate_job_runs_v14(connection)
         with connection:
             connection.executescript(_SCHEMA_SQL)
             connection.execute(
@@ -947,7 +1010,11 @@ def initialize_database(settings: Settings) -> None:
             )
             connection.execute(
                 "INSERT OR IGNORE INTO schema_migrations (version, applied_at) VALUES (?, ?)",
-                (_SCHEMA_VERSION, "2026-11-08T15:00:00.000Z"),
+                (13, "2026-11-08T15:00:00.000Z"),
+            )
+            connection.execute(
+                "INSERT OR IGNORE INTO schema_migrations (version, applied_at) VALUES (?, ?)",
+                (_SCHEMA_VERSION, "2026-11-08T16:00:00.000Z"),
             )
     finally:
         connection.close()
@@ -1165,6 +1232,7 @@ def _row_to_job_run(row: sqlite3.Row) -> JobRunRecord:
         metrics_only=(bool(row["metrics_only"]) if "metrics_only" in keys else False),
         provider=row["provider"] if "provider" in keys else None,
         symbol=row["symbol"] if "symbol" in keys else None,
+        period=row["period"] if "period" in keys else None,
     )
 
 
@@ -2496,7 +2564,8 @@ class SqliteStore:
                         UPDATE job_runs SET
                             status = 'RUNNING', trigger_source = ?, started_at = ?,
                             finished_at = NULL, error_code = NULL, message = NULL,
-                            lease_owner = ?, lease_expires_at = ?, heartbeat_at = ?
+                            lease_owner = ?, lease_expires_at = ?, heartbeat_at = ?,
+                            period = COALESCE(period, ?)
                         WHERE run_id = ?
                         """,
                         (
@@ -2505,6 +2574,7 @@ class SqliteStore:
                             record.lease_owner,
                             record.lease_expires_at,
                             record.heartbeat_at,
+                            record.period,
                             existing.run_id,
                         ),
                     )
@@ -2522,8 +2592,8 @@ class SqliteStore:
                         run_id, job_type, window_start, status, trigger_source,
                         started_at, finished_at, error_code, message, lease_owner,
                         lease_expires_at, heartbeat_at, source, metrics_only, provider,
-                        symbol
-                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                        symbol, period
+                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                     """,
                     (
                         record.run_id,
@@ -2542,6 +2612,7 @@ class SqliteStore:
                         int(record.metrics_only),
                         record.provider,
                         record.symbol,
+                        record.period,
                     ),
                 )
                 connection.commit()

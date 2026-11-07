@@ -42,6 +42,7 @@ HEARTBEAT_SECONDS = 300
 RUNNING = "RUNNING"
 DONE = "DONE"
 FAILED = "FAILED"
+PARTIAL = "PARTIAL"
 MISSED = "MISSED"
 _TERMINAL_SCAN_STAGES = frozenset({"DONE", "DEGRADED", "FAILED"})
 
@@ -127,6 +128,52 @@ def _pending_symbols(
     return tuple(symbol for symbol in starred if symbol not in terminal)
 
 
+def _outcome_status(outcome: ScheduledScanOutcome) -> str:
+    """Persist ``PARTIAL`` when only some symbols succeeded, ``FAILED`` otherwise."""
+    if not outcome.failed_symbols:
+        return DONE
+    return PARTIAL if outcome.scans else FAILED
+
+
+def _rows_status(rows: tuple[ScanSymbolRecord, ...]) -> str:
+    """Derive a run status from terminal checkpoint rows only.
+
+    Matches ``_batch_status`` semantics: ``DONE`` when every terminal row
+    finished cleanly, ``FAILED`` when nothing succeeded, and ``PARTIAL`` for
+    mixed or degraded outcomes.
+    """
+    terminal = tuple(row for row in rows if row.stage in _TERMINAL_SCAN_STAGES)
+    if not terminal:
+        return FAILED
+    if all(row.stage == DONE for row in terminal):
+        return DONE
+    if all(row.stage == FAILED for row in terminal):
+        return FAILED
+    return PARTIAL
+
+
+def _merged_status(
+    outcome: ScheduledScanOutcome,
+    rows: tuple[ScanSymbolRecord, ...],
+) -> str:
+    """Merge this pass's outcome with every terminal checkpoint row for the run.
+
+    ``run_window`` and ``resume`` only execute pending symbols, so the in-pass
+    outcome alone hides a prior owner's terminal ``FAILED`` or ``DEGRADED``
+    checkpoints. With no terminal rows there is nothing to merge; the pass's
+    own outcome is authoritative.
+    """
+    if not any(row.stage in _TERMINAL_SCAN_STAGES for row in rows):
+        return _outcome_status(outcome)
+    outcome_status = _outcome_status(outcome)
+    rows_status = _rows_status(rows)
+    if outcome_status == DONE and rows_status == DONE:
+        return DONE
+    if outcome_status == FAILED and rows_status == FAILED:
+        return FAILED
+    return PARTIAL
+
+
 class JobLedger:
     """Application-level wrapper around the SQLite job tables."""
 
@@ -154,6 +201,7 @@ class JobLedger:
         metrics_only: bool = False,
         provider: str | None = None,
         symbol: str | None = None,
+        period: str | None = None,
     ) -> JobClaim:
         """Claim ``(job_type, window_start)`` once; reclaim only a stale lease."""
         now = self._now()
@@ -175,6 +223,7 @@ class JobLedger:
             metrics_only=metrics_only,
             provider=provider,
             symbol=symbol,
+            period=period,
         )
         claimed, run, reclaimed = self._store.claim_job_run(record)
         if claimed:
@@ -306,6 +355,7 @@ class JobLedger:
         metrics_only: bool = False,
         provider: str | None = None,
         symbol: str | None = None,
+        period: str | None = None,
     ) -> JobClaim:
         """Claim the single active scan slot shared by manual and scheduled runs.
 
@@ -339,6 +389,7 @@ class JobLedger:
             metrics_only=metrics_only,
             provider=provider,
             symbol=symbol,
+            period=period,
         )
         if not claim.claimed:
             self.release_scan_lock(lease_owner)
@@ -388,6 +439,7 @@ class ScheduledScanRunner:
             SCAN_JOB_TYPE,
             utc_timestamp(window_start),
             trigger_source=trigger_source,
+            period=period,
         )
         if not claim.claimed or claim.run is None:
             return ScheduledScanOutcome(run=claim.run, claimed=False, reason=claim.reason)
@@ -418,16 +470,16 @@ class ScheduledScanRunner:
         try:
             symbols = tuple(contract.symbol for contract in self._container.store.list_starred())
             if claim.reclaimed:
-                # Resume a reclaimed run from its persisted checkpoints. Compute
-                # pending from the persisted scope: a single-symbol run never
-                # fans out to the starred universe; a batch runs starred minus
-                # terminal rows so a crash during symbol k still finishes it.
+                # Resume a reclaimed run from its persisted checkpoints: the
+                # current starred symbols minus terminal checkpoint rows. A
+                # single-symbol run resumes only its persisted symbol, never the
+                # whole starred universe.
                 rows = self._container.store.list_scan_symbols(run.run_id)
                 symbols = _pending_symbols(run, rows, symbols)
             outcome = self._execute(
                 run,
                 symbols,
-                period=period,
+                period=run.period or period,
                 trigger_source=run.trigger_source,
                 source=run.source,
                 metrics_only=run.metrics_only,
@@ -435,7 +487,7 @@ class ScheduledScanRunner:
             )
             self._ledger.finish(
                 run.run_id,
-                DONE if (not outcome.failed_symbols or outcome.scans) else FAILED,
+                _merged_status(outcome, self._container.store.list_scan_symbols(run.run_id)),
                 owner=run.lease_owner,
             )
             return outcome
@@ -480,7 +532,7 @@ class ScheduledScanRunner:
                 # even if the crash happened before its checkpoint row landed.
                 pending = _pending_symbols(run, rows, starred)
                 if not pending:
-                    self._ledger.finish(run.run_id, DONE, owner=run.lease_owner)
+                    self._ledger.finish(run.run_id, _rows_status(rows), owner=run.lease_owner)
                     return ScheduledScanOutcome(
                         run=run,
                         claimed=True,
@@ -513,7 +565,7 @@ class ScheduledScanRunner:
                 # fully terminal batch must not re-run completed symbols.
                 pending = _pending_symbols(run, rows, starred)
                 if not pending:
-                    self._ledger.finish(run.run_id, DONE, owner=run.lease_owner)
+                    self._ledger.finish(run.run_id, _rows_status(rows), owner=run.lease_owner)
                     return ScheduledScanOutcome(
                         run=run,
                         claimed=True,
@@ -523,7 +575,7 @@ class ScheduledScanRunner:
             outcome = self._execute(
                 run,
                 pending,
-                period=period,
+                period=run.period or period,
                 trigger_source=run.trigger_source,
                 source=run.source,
                 metrics_only=run.metrics_only,
@@ -531,7 +583,7 @@ class ScheduledScanRunner:
             )
             self._ledger.finish(
                 run.run_id,
-                DONE if (not outcome.failed_symbols or outcome.scans) else FAILED,
+                _merged_status(outcome, self._container.store.list_scan_symbols(run.run_id)),
                 owner=run.lease_owner,
             )
             return outcome
@@ -601,6 +653,7 @@ class ScheduledScanRunner:
             source=source,
             metrics_only=metrics_only,
             provider=provider,
+            period=period,
         )
         if not claim.claimed or claim.run is None:
             raise ScanAlreadyRunning(running_scan_id=claim.running_scan_id)
@@ -631,7 +684,7 @@ class ScheduledScanRunner:
             outcome = self._execute(
                 run,
                 symbols,
-                period=period,
+                period=run.period or period,
                 trigger_source="MANUAL",
                 source=source,
                 metrics_only=metrics_only,
@@ -639,7 +692,7 @@ class ScheduledScanRunner:
             )
             self._ledger.finish(
                 run.run_id,
-                DONE if (not outcome.failed_symbols or outcome.scans) else FAILED,
+                _outcome_status(outcome),
                 owner=run.lease_owner,
             )
             return outcome
@@ -811,6 +864,7 @@ __all__ = [
     "JobClaim",
     "JobLedger",
     "MISSED",
+    "PARTIAL",
     "RestartState",
     "RUNNING",
     "SCAN_JOB_TYPE",

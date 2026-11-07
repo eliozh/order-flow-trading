@@ -1,10 +1,11 @@
-"""Manual metrics-only scan: ``DATA -> METRICS -> REPORT`` (no LLM).
+"""One scan: ``DATA -> METRICS -> LLM (optional) -> REPORT``.
 
 The service is the single writer for the read path introduced by slice 08. It
 resamples the persisted ``agg_trades`` window into UTC bars, computes the
 versioned order-flow document, freezes a ``market-snapshot`` that embeds that
-document, and stores a CALC-only report. No ``llm_calls`` row, narrative, or
-credential is ever created here.
+document, and stores a CALC report. When a provider is configured the optional
+LLM stage persists ``llm_calls``/decisions and embeds the narrative and LLM
+state in the report; without a provider the report stays CALC-only.
 """
 
 from __future__ import annotations
@@ -506,7 +507,7 @@ def scan_llm_status(llm_state: Mapping[str, object]) -> str | None:
 
 
 class ScanService:
-    """Run one manual metrics-only scan serially under the daemon scan lock."""
+    """Run one scan serially under the daemon scan lock."""
 
     def __init__(
         self,
@@ -614,7 +615,8 @@ class ScanService:
             persisted_metric = metrics_service.compute_and_persist(metric_request, inputs=inputs)
             document = persisted_metric.document
 
-            # REPORT: freeze snapshot + metrics and store a CALC-only report.
+            # LLM (optional): analyze the snapshot, then freeze the report with
+            # whatever CALC + LLM state was produced.
             self._stage("LLM")
             finished = clock.now()
             snapshot_id = _snapshot_id(
