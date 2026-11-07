@@ -167,7 +167,7 @@ class ApiClient:
     # -- Paper and kill switch -------------------------------------------
 
     def paper_balance(self) -> dict[str, Any]:
-        return self._request("GET", "/api/v1/paper/balance")
+        return self._request("GET", "/api/v1/paper/account")
 
     def paper_orders(self, limit: int = 100) -> dict[str, Any]:
         return self._request("GET", f"/api/v1/paper/orders?limit={limit}")
@@ -179,10 +179,10 @@ class ApiClient:
         return self._request("GET", "/api/v1/paper/equity")
 
     def kill_status(self) -> dict[str, Any]:
-        return self._request("GET", "/api/v1/kill")
+        return self._request("GET", "/api/v1/kill-switch")
 
     def set_kill_switch(self, *, active: bool, token: str | None = None) -> dict[str, Any]:
-        payload: dict[str, Any] = {"active": active}
-        if token is not None:
-            payload["token"] = token
-        return self._request("POST", "/api/v1/kill", payload)
+        if active:
+            return self._request("POST", "/api/v1/kill-switch")
+        query = f"?token={quote(token, safe='')}" if token is not None else ""
+        return self._request("DELETE", f"/api/v1/kill-switch{query}")

@@ -399,6 +399,14 @@ class AuditEventDraft:
     created_at: str
 
 
+@dataclass(frozen=True)
+class OmsCommit:
+    """The account row and audit event written with one paper fill."""
+
+    account: PaperAccountRecord
+    audit: AuditEventRecord | None
+
+
 class StorePort(Protocol):
     """Persistence contract shared by the API and CLI diagnostics."""
 
@@ -647,7 +655,9 @@ class StorePort(Protocol):
 
     # -- Opportunity ledger ----------------------------------------------
 
-    def save_opportunity(self, record: OpportunityRecord) -> None: ...
+    def save_opportunity(
+        self, record: OpportunityRecord, event: OpportunityEventRecord | None = None
+    ) -> None: ...
 
     def transition_opportunity(
         self, record: OpportunityRecord, event: OpportunityEventRecord
@@ -676,8 +686,10 @@ class StorePort(Protocol):
     def get_trigger_by_idempotency(self, idempotency_key: str) -> TriggerEventRecord | None: ...
 
     def list_trigger_events(
-        self, *, opportunity_id: str | None = None, limit: int = 100
+        self, *, opportunity_id: str | None = None, limit: int = 100, offset: int = 0
     ) -> tuple[TriggerEventRecord, ...]: ...
+
+    def count_trigger_events(self, *, opportunity_id: str | None = None) -> int: ...
 
     def save_risk_verdict(self, record: RiskVerdictRecord) -> None: ...
 
@@ -692,8 +704,9 @@ class StorePort(Protocol):
         fill: FillRecord,
         position: PositionRecord,
         account: PaperAccountRecord,
+        balance_delta: str = "0",
         audit: AuditEventDraft | None = None,
-    ) -> AuditEventRecord | None: ...
+    ) -> OmsCommit: ...
 
     def get_order(self, order_id: str) -> OrderRecord | None: ...
 
@@ -701,15 +714,21 @@ class StorePort(Protocol):
 
     def get_order_by_client_order_id(self, client_order_id: str) -> OrderRecord | None: ...
 
-    def list_orders(self, *, limit: int = 100) -> tuple[OrderRecord, ...]: ...
+    def list_orders(self, *, limit: int = 100, offset: int = 0) -> tuple[OrderRecord, ...]: ...
 
-    def list_fills(self, *, limit: int = 100) -> tuple[FillRecord, ...]: ...
+    def count_orders(self) -> int: ...
+
+    def list_fills(self, *, limit: int = 100, offset: int = 0) -> tuple[FillRecord, ...]: ...
+
+    def count_fills(self) -> int: ...
 
     def get_fill_by_order_id(self, order_id: str) -> FillRecord | None: ...
 
     def list_positions(
-        self, *, state: str | None = None, limit: int = 100
+        self, *, state: str | None = None, limit: int = 100, offset: int = 0
     ) -> tuple[PositionRecord, ...]: ...
+
+    def count_positions(self, *, state: str | None = None) -> int: ...
 
     def get_position(self, position_id: str) -> PositionRecord | None: ...
 

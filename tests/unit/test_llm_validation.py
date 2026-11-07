@@ -10,7 +10,7 @@ import pytest
 
 from oft.adapters.sqlite_store import SqliteStore
 from oft.application.analysis_service import AnalysisService
-from oft.application.llm_validation import validate_output
+from oft.application.llm_validation import MAX_RAW_OUTPUT_CHARS, validate_output
 from oft.clock import FixedClock
 from oft.config import Settings
 from oft.ports.llm import CostEstimate, LLMRequest, LLMResult, LLMUsage, ProviderCapabilities
@@ -57,7 +57,6 @@ def test_refusal_is_rejected() -> None:
 
 def test_truncated_output_is_rejected() -> None:
     outcome = validate_output(_text("truncated.json"), role="ANALYSIS")
-
     assert outcome.status == "REJECTED"
     assert outcome.output is None
 
@@ -74,6 +73,15 @@ def test_empty_body_is_rejected_as_truncated() -> None:
 
     assert outcome.status == "REJECTED"
     assert outcome.errors[0].code == "LLM_OUTPUT_TRUNCATED"
+
+
+def test_oversized_body_is_rejected_before_parsing() -> None:
+    outcome = validate_output("x" * (MAX_RAW_OUTPUT_CHARS + 1), role="ANALYSIS")
+
+    assert outcome.status == "REJECTED"
+    assert outcome.output is None
+    assert outcome.errors[0].code == "LLM_SCHEMA_INVALID"
+    assert "exceeds" in outcome.errors[0].message
 
 
 def test_provider_supplied_provenance_is_rejected_as_an_unknown_field() -> None:

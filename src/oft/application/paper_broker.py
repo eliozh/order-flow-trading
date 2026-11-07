@@ -141,8 +141,9 @@ class PaperBroker:
         quote_quantity = _quantize(fill_price * intent.quantity)
         fee = _quantize(quote_quantity * self._taker_fee)
         account = self.account()
-        balance_before = Decimal(account.balance)
-        balance_after = _quantize(balance_before - quote_quantity - fee)
+        # The store applies this delta to the balance it reads inside the write
+        # transaction, so concurrent fills cannot overwrite each other.
+        balance_delta = str(-(quote_quantity + fee))
 
         digest = intent.hash()
         client_id = client_order_id(intent.environment, intent.symbol, intent.purpose, digest)
@@ -204,14 +205,15 @@ class PaperBroker:
             environment=account.environment,
             currency=account.currency,
             initial_balance=account.initial_balance,
-            balance=str(balance_after),
+            balance=account.balance,
             updated_at=now,
         )
-        self._store.save_order_fill_position(
+        commit = self._store.save_order_fill_position(
             order=_order_record(order),
             fill=_fill_record(fill),
             position=_position_record(position),
             account=updated_account,
+            balance_delta=balance_delta,
             audit=(
                 None
                 if audit_actor is None
@@ -230,7 +232,7 @@ class PaperBroker:
                 )
             ),
         )
-        return BrokerResult(order=order, fill=fill, position=position, account=updated_account)
+        return BrokerResult(order=order, fill=fill, position=position, account=commit.account)
 
 
 def _filled_status() -> Any:

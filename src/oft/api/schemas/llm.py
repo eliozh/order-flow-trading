@@ -4,7 +4,7 @@ from __future__ import annotations
 
 from typing import Any
 
-from pydantic import BaseModel, ConfigDict
+from pydantic import BaseModel, ConfigDict, Field
 
 
 class LLMState(BaseModel):
@@ -20,6 +20,6 @@ class LLMState(BaseModel):
     confidence: float | None = None
     narrative: str | None = None
     rationale: str | None = None
-    opportunity_ids: list[str] = []
+    opportunity_ids: list[str] = Field(default_factory=list)
     reason: str | None = None
     cost: dict[str, Any] | None = None

@@ -24,7 +24,12 @@ from oft.domain.oms import OrderSide, OrderType, PositionSide
 from oft.domain.risk import DEFAULT_CAPS, RiskRequest, verdict_inputs_hash
 from oft.domain.time import utc_timestamp
 from oft.ports.llm import LLMRole
-from oft.ports.store import DecisionRecord, RiskVerdictRecord, TriggerEventRecord
+from oft.ports.store import (
+    DecisionRecord,
+    OpportunityRecord,
+    RiskVerdictRecord,
+    TriggerEventRecord,
+)
 
 ROOT = Path(__file__).resolve().parents[2]
 ARCHIVE = ROOT / "tests" / "fixtures" / "archive"
@@ -47,7 +52,7 @@ def _settings(tmp_path: Path) -> Settings:
 
 def _container_and_trigger(tmp_path: Path):
     settings = _settings(tmp_path)
-    container = build_container(settings, initialize=True)
+    container = build_container(settings, initialize=True, clock=FixedClock(NOW))
     backfill = container.backfill.run(symbol="BTCUSDT", data_type="aggTrades", start=START, end=END)
     assert backfill.run.status == "COMPLETE"
     ScanService(container=container, lock=container.scan_lock).run(
@@ -123,6 +128,17 @@ def test_cross_trigger_idempotency_key_is_a_conflict(tmp_path: Path) -> None:
     container, trigger_a = _container_and_trigger(tmp_path)
     service = _entry(container)
     service.accept(trigger_a, idempotency_key="shared-key")
+    stamp = utc_timestamp(container.clock.now())
+    container.store.save_opportunity(
+        OpportunityRecord(
+            opportunity_id="OPP-OTHER",
+            symbol="BTCUSDT",
+            state="OPEN",
+            created_at=stamp,
+            updated_at=stamp,
+            payload_json=json.dumps({"opportunity_id": "OPP-OTHER"}),
+        )
+    )
     container.store.save_trigger_event(
         TriggerEventRecord(
             trigger_id="TRG-OTHER",
@@ -215,7 +231,7 @@ def test_limit_entry_type_is_rejected_and_creates_no_order(tmp_path: Path) -> No
 
 def test_stale_report_mark_blocks_the_entry(tmp_path: Path) -> None:
     settings = _settings(tmp_path)
-    container = build_container(settings, initialize=True)
+    container = build_container(settings, initialize=True, clock=FixedClock(NOW))
     container.backfill.run(symbol="BTCUSDT", data_type="aggTrades", start=START, end=END)
     container = replace(container, clock=FixedClock(NOW))
     ScanService(container=container, lock=container.scan_lock).run(

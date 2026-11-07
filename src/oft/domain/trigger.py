@@ -143,6 +143,7 @@ def evaluate_condition(
 def evaluate_trigger(
     conditions: Iterable[Any],
     *,
+    symbol: str | None = None,
     last_price: Decimal,
     snapshot_as_of: str,
     now: str,
@@ -154,7 +155,7 @@ def evaluate_trigger(
     condition_list = tuple(conditions)
     snapshot_payload = {
         "snapshot_id": snapshot_id,
-        "symbol": getattr(condition_list[0], "symbol", None) if condition_list else None,
+        "symbol": symbol,
         "last_price": str(last_price),
         "as_of": snapshot_as_of,
     }

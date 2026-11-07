@@ -133,7 +133,7 @@ def test_order_fill_position_and_audit_commit_together(tmp_path: Path) -> None:
     store.initialize()
     order, fill, position, account = _oms("1")
 
-    record = store.save_order_fill_position(
+    commit = store.save_order_fill_position(
         order=order,
         fill=fill,
         position=position,
@@ -141,9 +141,10 @@ def test_order_fill_position_and_audit_commit_together(tmp_path: Path) -> None:
         audit=_audit("1"),
     )
 
-    assert record is not None
-    assert record.seq == 1
-    assert record.event_type == "ORDER_FILLED"
+    assert commit.audit is not None
+    assert commit.audit.seq == 1
+    assert commit.audit.event_type == "ORDER_FILLED"
+    assert commit.account.balance == "10000.00000000"
     assert store.get_order(order.order_id) is not None
     assert store.get_fill_by_order_id(order.order_id) is not None
     assert len(store.list_audit_events()) == 1
@@ -162,3 +163,32 @@ def test_order_fill_position_and_audit_commit_together(tmp_path: Path) -> None:
     assert len(audit_events) == 1
     assert audit_events[0].seq == 1
     assert len(store.list_orders()) == 1
+
+
+def test_balance_delta_is_applied_inside_the_write_transaction(tmp_path: Path) -> None:
+    settings = Settings(env="test", port=8765, data_dir=tmp_path / "data")
+    store = SqliteStore(settings)
+    store.initialize()
+
+    # Both calls carry the same stale absolute balance; only the in-transaction
+    # delta application can keep both debits.
+    order_one, fill_one, position_one, account = _oms("1")
+    store.save_order_fill_position(
+        order=order_one,
+        fill=fill_one,
+        position=position_one,
+        account=account,
+        balance_delta="-700.00",
+    )
+    order_two, fill_two, position_two, _ = _oms("2")
+    store.save_order_fill_position(
+        order=order_two,
+        fill=fill_two,
+        position=position_two,
+        account=account,
+        balance_delta="-700.00",
+    )
+
+    stored = store.get_paper_account("ACC-PAPER")
+    assert stored is not None
+    assert stored.balance == "8600.00000000"

@@ -99,52 +99,87 @@ forbidden_modules = [
 ]
 
 [[tool.importlinter.contracts]]
-name = "API never imports a broker, execution, or LLM module"
+name = "API never imports adapters or provider SDKs directly"
 type = "forbidden"
+# Application services may read adapters today; the API boundary is about
+# direct coupling. Indirect chains through the application layer are allowed,
+# a direct adapter/provider import is not.
+allow_indirect_imports = true
 source_modules = ["oft.api"]
-# Explicitly accepted read-model path: /system -> health/status ->
-# ingestion_supervisor -> binance_ws for the WS state file only. These edge
-# ignores keep direct API imports of the forbidden modules detectable.
 ignore_imports = [
-  "oft.api.routes.system -> oft.application.health",
-  "oft.api.routes.system -> oft.application.status",
-  "oft.application.health -> oft.application.ingestion_supervisor",
-  "oft.application.status -> oft.application.ingestion_supervisor",
-  "oft.application.ingestion_supervisor -> oft.adapters.binance_ws",
+  "oft.api.app -> oft.adapters.fixture_market_data",
 ]
 forbidden_modules = [
-  "oft.adapters.binance_rest",
-  "oft.adapters.binance_ws",
-  "oft.application.ingestion_supervisor",
+  "oft.adapters",
   "anthropic",
   "ccxt",
+  "cohere",
+  "google",
+  "groq",
+  "langchain",
+  "litellm",
+  "llama_index",
+  "mistralai",
+  "ollama",
+  "openai",
+]
+
+# The execution/broker path is the last line of defense (ADR-0006): it must not
+# reach a provider SDK or an adapter directly. Read models stay in application.
+[[tool.importlinter.contracts]]
+name = "Execution path never imports adapters or provider SDKs"
+type = "forbidden"
+source_modules = [
+  "oft.application.entry_service",
+  "oft.application.execution_gateway",
+  "oft.application.paper_broker",
+]
+forbidden_modules = [
+  "oft.adapters",
+  "anthropic",
+  "ccxt",
+  "cohere",
+  "google",
+  "groq",
+  "langchain",
+  "litellm",
+  "llama_index",
+  "mistralai",
+  "ollama",
   "openai",
 ]
 
 # Slice 11 security negative: adapters must never reach the execution/broker
-# layer or a Binance adapter. import-linter 2.16 only supports whole-segment
-# wildcards (`oft.adapters.llm_*` is rejected as an invalid expression), so
-# `oft.adapters.**` is used to cover `oft.adapters.llm_stub` and any future
-# `oft.adapters.llm_<provider>` adapter. This is deliberately stricter than
-# LLM-only: no adapter may import the execution layer or a Binance adapter.
+# layer or a provider. The application ban is fail-closed for future
+# `oft.application.execution`/`broker` modules; the only sanctioned edges are
+# the shared rate-limiter value objects.
 [[tool.importlinter.contracts]]
-name = "Adapters never import execution or Binance modules"
+name = "Adapters never import execution or provider modules"
 type = "forbidden"
 source_modules = ["oft.adapters.**"]
+ignore_imports = [
+  "oft.adapters.binance_rest -> oft.application.rate_limiter",
+  "oft.adapters.binance_ws -> oft.application.rate_limiter",
+]
 forbidden_modules = [
-  "oft.application.execution_gateway",
-  "oft.application.paper_broker",
-  "oft.application.entry_service",
-  "oft.adapters.binance_rest",
-  "oft.adapters.binance_ws",
-  # The project vendors no Binance SDK; listed so a future import fails closed.
+  "oft.application",
+  "anthropic",
+  "ccxt",
+  "cohere",
+  "google",
+  "groq",
+  "langchain",
+  "litellm",
+  "llama_index",
+  "mistralai",
+  "ollama",
+  "openai",
   "binance",
   "binance_connector",
 ]
 
-# No LLM/execution modules exist in milestone 1. This contract fails closed on
-# the provider/execution SDKs that would introduce them; adding an `oft.llm`,
-# `oft.execution`, or `oft.broker` package requires extending this contract.
+# The provider boundary is a denylist of every LLM SDK the project may add; the
+# list is intentionally broad so a new adapter import fails closed.
 [[tool.importlinter.contracts]]
 name = "No LLM, execution, or broker provider imports exist yet"
 type = "forbidden"
@@ -152,6 +187,14 @@ source_modules = ["oft"]
 forbidden_modules = [
   "anthropic",
   "ccxt",
+  "cohere",
+  "google",
+  "groq",
+  "langchain",
+  "litellm",
+  "llama_index",
+  "mistralai",
+  "ollama",
   "openai",
 ]
 

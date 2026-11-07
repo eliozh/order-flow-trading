@@ -258,7 +258,7 @@ def test_stub_scan_to_paper_entry_is_identical_across_cli_and_api(
         assert [item["fill_id"] for item in api_fills["data"]["items"]] == [fill["fill_id"]]
 
         cli_balance = _json(runner.invoke(cli_app, ["paper", "balance", "--json"]))
-        api_balance = http.get("/api/v1/paper/balance").json()
+        api_balance = http.get("/api/v1/paper/account").json()
         assert cli_balance["data"] == api_balance["data"]
         assert api_balance["data"]["balance"] != api_balance["data"]["initial_balance"]
 

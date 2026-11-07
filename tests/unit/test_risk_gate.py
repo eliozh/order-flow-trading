@@ -88,7 +88,7 @@ def test_stale_mark_blocks() -> None:
 
     assert verdict.verdict == "BLOCK"
     assert verdict.binding_cap == "STALE_MARK"
-    assert "mark" in " ".join(verdict.stale_inputs).lower() or verdict.binding_cap == "STALE_MARK"
+    assert "mark" in " ".join(verdict.stale_inputs).lower()
 
 
 def test_max_positions_blocks() -> None:

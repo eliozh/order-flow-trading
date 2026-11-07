@@ -79,19 +79,26 @@ def _seed_symbol_registry(registry: SymbolRegistry, settings: Settings) -> None:
         registry.refresh_from_fixture(fixture)
 
 
-def build_container(settings: Settings | None = None, *, initialize: bool = False) -> AppContainer:
+def build_container(
+    settings: Settings | None = None,
+    *,
+    initialize: bool = False,
+    clock: ClockPort | None = None,
+) -> AppContainer:
     """Wire adapters to ports.
 
     ``initialize=True`` is the daemon/writer path. Diagnostics leave it false
-    so ``oft status`` never writes to the data directory.
+    so ``oft status`` never writes to the data directory. ``clock`` is injected
+    for deterministic tests and replay (ADR-0011); production uses the system
+    clock.
     """
     resolved = settings or load_settings()
     store = SqliteStore(resolved)
     parquet = ParquetStore(resolved)
-    clock = SystemClock()
-    rate_limiter = GlobalRateLimiter(clock=clock, alert_sink=StructlogAlertSink())
+    resolved_clock = clock or SystemClock()
+    rate_limiter = GlobalRateLimiter(clock=resolved_clock, alert_sink=StructlogAlertSink())
     ws_budget = WsSubscriptionBudget()
-    symbol_registry = SymbolRegistry(store, clock=clock)
+    symbol_registry = SymbolRegistry(store, clock=resolved_clock)
     if resolved.archive_fixture_dir is not None:
         archive: ArchiveSourcePort = FixtureArchiveSource(resolved.archive_fixture_dir)
     elif resolved.env == "test":
@@ -107,7 +114,7 @@ def build_container(settings: Settings | None = None, *, initialize: bool = Fals
         archive=archive,
         parquet=parquet,
         store=store,
-        clock=clock,
+        clock=resolved_clock,
         rate_limiter=rate_limiter,
     )
     if initialize:
@@ -120,7 +127,7 @@ def build_container(settings: Settings | None = None, *, initialize: bool = Fals
     llm_provider = resolve_llm_provider(resolved)
     return AppContainer(
         settings=resolved,
-        clock=clock,
+        clock=resolved_clock,
         market_data=FixtureMarketData(fixtures_dir=resolved.fixtures_dir),
         store=store,
         parquet=parquet,

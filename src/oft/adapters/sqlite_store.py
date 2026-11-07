@@ -10,7 +10,7 @@ import os
 import sqlite3
 from contextlib import closing
 from datetime import UTC, date, datetime, timedelta
-from decimal import Decimal
+from decimal import ROUND_DOWN, Decimal
 from pathlib import Path
 
 from oft.config import Settings
@@ -32,6 +32,7 @@ from oft.ports.store import (
     LeaseLostError,
     LLMCallRecord,
     ManifestEntry,
+    OmsCommit,
     OpportunityEventRecord,
     OpportunityRecord,
     OrderRecord,
@@ -352,7 +353,7 @@ _SCHEMA_SQL = f"""
     CREATE INDEX IF NOT EXISTS decisions_status ON decisions(validation_status);
     CREATE TABLE IF NOT EXISTS budget_ledger (
         record_id TEXT PRIMARY KEY,
-        call_id TEXT NOT NULL UNIQUE,
+        call_id TEXT NOT NULL UNIQUE REFERENCES llm_calls(call_id),
         decision_id TEXT,
         occurred_at TEXT NOT NULL,
         provider TEXT NOT NULL,
@@ -388,7 +389,7 @@ _SCHEMA_SQL = f"""
     );
     CREATE TABLE IF NOT EXISTS trigger_events (
         trigger_id TEXT PRIMARY KEY,
-        opportunity_id TEXT NOT NULL,
+        opportunity_id TEXT NOT NULL REFERENCES opportunities(opportunity_id),
         symbol TEXT NOT NULL,
         status TEXT NOT NULL,
         idempotency_key TEXT NOT NULL UNIQUE,
@@ -399,7 +400,7 @@ _SCHEMA_SQL = f"""
         ON trigger_events(opportunity_id);
     CREATE TABLE IF NOT EXISTS risk_verdicts (
         risk_verdict_id TEXT PRIMARY KEY,
-        trigger_id TEXT NOT NULL,
+        trigger_id TEXT NOT NULL REFERENCES trigger_events(trigger_id),
         decision_id TEXT NOT NULL,
         verdict TEXT NOT NULL CHECK (verdict IN ('ALLOW','REDUCE','BLOCK')),
         binding_cap TEXT NOT NULL,
@@ -437,6 +438,21 @@ _SCHEMA_SQL = f"""
         payload_json TEXT NOT NULL
     );
     CREATE INDEX IF NOT EXISTS positions_state ON positions(state);
+    -- Slice 11 replay/pagination indexes. ``fills(order_id)`` is mandatory:
+    -- it is an FK and the accept replay looks the fill up by order.
+    CREATE INDEX IF NOT EXISTS fills_order_id ON fills(order_id);
+    CREATE INDEX IF NOT EXISTS budget_ledger_decision ON budget_ledger(decision_id);
+    CREATE INDEX IF NOT EXISTS llm_calls_role ON llm_calls(role);
+    CREATE INDEX IF NOT EXISTS decisions_role ON decisions(role);
+    CREATE INDEX IF NOT EXISTS trigger_events_triggered_at ON trigger_events(triggered_at);
+    CREATE INDEX IF NOT EXISTS trigger_events_status_triggered
+        ON trigger_events(status, triggered_at);
+    CREATE INDEX IF NOT EXISTS opportunities_state_created
+        ON opportunities(state, created_at);
+    CREATE INDEX IF NOT EXISTS opportunities_state_symbol ON opportunities(state, symbol);
+    CREATE INDEX IF NOT EXISTS orders_environment_status_symbol
+        ON orders(environment, status, symbol);
+    CREATE INDEX IF NOT EXISTS positions_environment_state ON positions(environment, state);
     CREATE TABLE IF NOT EXISTS paper_accounts (
         account_id TEXT PRIMARY KEY,
         environment TEXT NOT NULL,
@@ -2876,6 +2892,7 @@ class SqliteStore:
                     prompt_version, prompt_hash, input_hash, attempt, request_id,
                     status, raw_output_hash, usage_json, latency_ms, error_code, created_at
                 ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                ON CONFLICT(call_id) DO NOTHING
                 """,
                 (
                     record.call_id,
@@ -2929,6 +2946,7 @@ class SqliteStore:
                     decision_id, role, decision_type, validation_status,
                     raw_output_hash, persisted_at, payload_json
                 ) VALUES (?, ?, ?, ?, ?, ?, ?)
+                ON CONFLICT(decision_id) DO NOTHING
                 """,
                 (
                     record.decision_id,
@@ -2980,6 +2998,7 @@ class SqliteStore:
                     cost_usd, price_version, unpriced, budget_state, period_day,
                     payload_json
                 ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                ON CONFLICT(record_id) DO NOTHING
                 """,
                 (
                     record.record_id,
@@ -3015,13 +3034,18 @@ class SqliteStore:
 
     # -- Opportunity ledger ----------------------------------------------
 
-    def save_opportunity(self, record: OpportunityRecord) -> None:
-        with closing(self._connect()) as connection, connection:
+    def save_opportunity(
+        self, record: OpportunityRecord, event: OpportunityEventRecord | None = None
+    ) -> None:
+        connection = self._connect()
+        try:
+            connection.execute("BEGIN IMMEDIATE")
             connection.execute(
                 """
                 INSERT INTO opportunities (
                     opportunity_id, symbol, state, created_at, updated_at, payload_json
                 ) VALUES (?, ?, ?, ?, ?, ?)
+                ON CONFLICT(opportunity_id) DO NOTHING
                 """,
                 (
                     record.opportunity_id,
@@ -3032,6 +3056,31 @@ class SqliteStore:
                     record.payload_json,
                 ),
             )
+            if event is not None:
+                # The CREATED row is part of the same unit: the timeline must not
+                # lose the creation event once a transition event exists.
+                connection.execute(
+                    """
+                    INSERT OR IGNORE INTO opportunity_events (
+                        opportunity_id, seq, at, from_state, to_state, reason_code, note
+                    ) VALUES (?, ?, ?, ?, ?, ?, ?)
+                    """,
+                    (
+                        event.opportunity_id,
+                        event.seq,
+                        event.at,
+                        event.from_state,
+                        event.to_state,
+                        event.reason_code,
+                        event.note,
+                    ),
+                )
+            connection.commit()
+        except BaseException:
+            connection.rollback()
+            raise
+        finally:
+            connection.close()
 
     def transition_opportunity(
         self, record: OpportunityRecord, event: OpportunityEventRecord
@@ -3201,25 +3250,41 @@ class SqliteStore:
         return _row_to_trigger_event(row) if row is not None else None
 
     def list_trigger_events(
-        self, *, opportunity_id: str | None = None, limit: int = 100
+        self, *, opportunity_id: str | None = None, limit: int = 100, offset: int = 0
     ) -> tuple[TriggerEventRecord, ...]:
         connection = self._connect_read_only()
         if connection is None:
             return ()
         if opportunity_id is None:
-            query = "SELECT * FROM trigger_events ORDER BY triggered_at DESC LIMIT ?"
-            params: tuple[object, ...] = (limit,)
+            query = "SELECT * FROM trigger_events ORDER BY triggered_at DESC LIMIT ? OFFSET ?"
+            params: tuple[object, ...] = (limit, offset)
         else:
             query = (
                 "SELECT * FROM trigger_events WHERE opportunity_id = ? "
-                "ORDER BY triggered_at DESC LIMIT ?"
+                "ORDER BY triggered_at DESC LIMIT ? OFFSET ?"
             )
-            params = (opportunity_id, limit)
+            params = (opportunity_id, limit, offset)
         try:
             rows = connection.execute(query, params).fetchall()
         finally:
             connection.close()
         return tuple(_row_to_trigger_event(row) for row in rows)
+
+    def count_trigger_events(self, *, opportunity_id: str | None = None) -> int:
+        connection = self._connect_read_only()
+        if connection is None:
+            return 0
+        try:
+            if opportunity_id is None:
+                row = connection.execute("SELECT COUNT(*) AS total FROM trigger_events").fetchone()
+            else:
+                row = connection.execute(
+                    "SELECT COUNT(*) AS total FROM trigger_events WHERE opportunity_id = ?",
+                    (opportunity_id,),
+                ).fetchone()
+        finally:
+            connection.close()
+        return int(row["total"]) if row is not None else 0
 
     def save_risk_verdict(self, record: RiskVerdictRecord) -> None:
         with closing(self._connect()) as connection, connection:
@@ -3229,6 +3294,7 @@ class SqliteStore:
                     risk_verdict_id, trigger_id, decision_id, verdict, binding_cap,
                     computed_at, expires_at, payload_json
                 ) VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+                ON CONFLICT(risk_verdict_id) DO NOTHING
                 """,
                 (
                     record.risk_verdict_id,
@@ -3264,13 +3330,32 @@ class SqliteStore:
         fill: FillRecord,
         position: PositionRecord,
         account: PaperAccountRecord,
+        balance_delta: str = "0",
         audit: AuditEventDraft | None = None,
-    ) -> AuditEventRecord | None:
+    ) -> OmsCommit:
         connection = self._connect()
         try:
             connection.execute("BEGIN IMMEDIATE")
             audit_record = (
                 self._insert_audit_event(connection, audit) if audit is not None else None
+            )
+            # Read the account inside the write transaction: an absolute balance
+            # computed by a caller would lose one of two concurrent debits.
+            existing = connection.execute(
+                "SELECT * FROM paper_accounts WHERE account_id = ?", (account.account_id,)
+            ).fetchone()
+            if existing is not None:
+                base = Decimal(str(existing["balance"]))
+                initial_balance = str(existing["initial_balance"])
+                environment = str(existing["environment"])
+                currency = str(existing["currency"])
+            else:
+                base = Decimal(account.initial_balance)
+                initial_balance = account.initial_balance
+                environment = account.environment
+                currency = account.currency
+            balance = (base + Decimal(balance_delta)).quantize(
+                Decimal("0.00000001"), rounding=ROUND_DOWN
             )
             connection.execute(
                 """
@@ -3336,15 +3421,23 @@ class SqliteStore:
                 """,
                 (
                     account.account_id,
-                    account.environment,
-                    account.currency,
-                    account.initial_balance,
-                    account.balance,
+                    environment,
+                    currency,
+                    initial_balance,
+                    str(balance),
                     account.updated_at,
                 ),
             )
             connection.commit()
-            return audit_record
+            committed_account = PaperAccountRecord(
+                account_id=account.account_id,
+                environment=environment,
+                currency=currency,
+                initial_balance=initial_balance,
+                balance=str(balance),
+                updated_at=account.updated_at,
+            )
+            return OmsCommit(account=committed_account, audit=audit_record)
         except BaseException:
             connection.rollback()
             raise
@@ -3387,29 +3480,49 @@ class SqliteStore:
             connection.close()
         return _row_to_order(row) if row is not None else None
 
-    def list_orders(self, *, limit: int = 100) -> tuple[OrderRecord, ...]:
+    def list_orders(self, *, limit: int = 100, offset: int = 0) -> tuple[OrderRecord, ...]:
         connection = self._connect_read_only()
         if connection is None:
             return ()
         try:
             rows = connection.execute(
-                "SELECT * FROM orders ORDER BY created_at DESC LIMIT ?", (limit,)
+                "SELECT * FROM orders ORDER BY created_at DESC LIMIT ? OFFSET ?", (limit, offset)
             ).fetchall()
         finally:
             connection.close()
         return tuple(_row_to_order(row) for row in rows)
 
-    def list_fills(self, *, limit: int = 100) -> tuple[FillRecord, ...]:
+    def count_orders(self) -> int:
+        connection = self._connect_read_only()
+        if connection is None:
+            return 0
+        try:
+            row = connection.execute("SELECT COUNT(*) AS total FROM orders").fetchone()
+        finally:
+            connection.close()
+        return int(row["total"]) if row is not None else 0
+
+    def list_fills(self, *, limit: int = 100, offset: int = 0) -> tuple[FillRecord, ...]:
         connection = self._connect_read_only()
         if connection is None:
             return ()
         try:
             rows = connection.execute(
-                "SELECT * FROM fills ORDER BY filled_at DESC LIMIT ?", (limit,)
+                "SELECT * FROM fills ORDER BY filled_at DESC LIMIT ? OFFSET ?", (limit, offset)
             ).fetchall()
         finally:
             connection.close()
         return tuple(_row_to_fill(row) for row in rows)
+
+    def count_fills(self) -> int:
+        connection = self._connect_read_only()
+        if connection is None:
+            return 0
+        try:
+            row = connection.execute("SELECT COUNT(*) AS total FROM fills").fetchone()
+        finally:
+            connection.close()
+        return int(row["total"]) if row is not None else 0
 
     def get_fill_by_order_id(self, order_id: str) -> FillRecord | None:
         connection = self._connect_read_only()
@@ -3424,22 +3537,39 @@ class SqliteStore:
         return _row_to_fill(row) if row is not None else None
 
     def list_positions(
-        self, *, state: str | None = None, limit: int = 100
+        self, *, state: str | None = None, limit: int = 100, offset: int = 0
     ) -> tuple[PositionRecord, ...]:
         connection = self._connect_read_only()
         if connection is None:
             return ()
         if state is None:
-            query = "SELECT * FROM positions ORDER BY opened_at DESC LIMIT ?"
-            params: tuple[object, ...] = (limit,)
+            query = "SELECT * FROM positions ORDER BY opened_at DESC LIMIT ? OFFSET ?"
+            params: tuple[object, ...] = (limit, offset)
         else:
-            query = "SELECT * FROM positions WHERE state = ? ORDER BY opened_at DESC LIMIT ?"
-            params = (state, limit)
+            query = (
+                "SELECT * FROM positions WHERE state = ? ORDER BY opened_at DESC LIMIT ? OFFSET ?"
+            )
+            params = (state, limit, offset)
         try:
             rows = connection.execute(query, params).fetchall()
         finally:
             connection.close()
         return tuple(_row_to_position(row) for row in rows)
+
+    def count_positions(self, *, state: str | None = None) -> int:
+        connection = self._connect_read_only()
+        if connection is None:
+            return 0
+        try:
+            if state is None:
+                row = connection.execute("SELECT COUNT(*) AS total FROM positions").fetchone()
+            else:
+                row = connection.execute(
+                    "SELECT COUNT(*) AS total FROM positions WHERE state = ?", (state,)
+                ).fetchone()
+        finally:
+            connection.close()
+        return int(row["total"]) if row is not None else 0
 
     def get_position(self, position_id: str) -> PositionRecord | None:
         connection = self._connect_read_only()

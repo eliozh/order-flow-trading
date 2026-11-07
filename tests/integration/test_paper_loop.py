@@ -3,7 +3,8 @@
 from __future__ import annotations
 
 import json
-from datetime import date
+from dataclasses import replace
+from datetime import UTC, date, datetime, timedelta
 from pathlib import Path
 from typing import Any
 
@@ -16,6 +17,7 @@ from oft.application.kill_switch import KillSwitch
 from oft.application.scan_service import ScanRequest, ScanService
 from oft.application.trigger_service import TriggerService
 from oft.bootstrap import build_container
+from oft.clock import FixedClock
 from oft.config import Settings
 from oft.ports.llm import LLMRole
 
@@ -24,6 +26,8 @@ ARCHIVE = ROOT / "tests" / "fixtures" / "archive"
 FIXTURES = ROOT / "tests" / "fixtures" / "llm"
 START = date(2026, 10, 1)
 END = date(2026, 10, 7)
+# ADR-0011: integration tests never depend on the wall clock.
+NOW = datetime(2026, 10, 8, tzinfo=UTC)
 
 
 def _settings(tmp_path: Path) -> Settings:
@@ -38,7 +42,7 @@ def _settings(tmp_path: Path) -> Settings:
 
 
 def _seed(settings: Settings) -> None:
-    container = build_container(settings, initialize=True)
+    container = build_container(settings, initialize=True, clock=FixedClock(NOW))
     result = container.backfill.run(symbol="BTCUSDT", data_type="aggTrades", start=START, end=END)
     assert result.run.status == "COMPLETE"
 
@@ -50,7 +54,7 @@ def _auth(app: Any) -> dict[str, str]:
 def test_api_scan_report_opportunity_trigger_accept_paper_loop(tmp_path: Path) -> None:
     settings = _settings(tmp_path)
     _seed(settings)
-    app = create_app(settings)
+    app = create_app(settings, clock=FixedClock(NOW))
     auth = _auth(app)
 
     with TestClient(app) as client:
@@ -90,7 +94,7 @@ def test_api_scan_report_opportunity_trigger_accept_paper_loop(tmp_path: Path) -
             json={"opportunity_id": opportunity_id},
             headers={**auth, "Idempotency-Key": "trigger-1"},
         )
-        assert evaluated.status_code == 200, evaluated.text
+        assert evaluated.status_code == 201, evaluated.text
         evaluation = evaluated.json()["data"]
         assert evaluation["triggered"] is True
         trigger = evaluation["trigger"]
@@ -104,7 +108,7 @@ def test_api_scan_report_opportunity_trigger_accept_paper_loop(tmp_path: Path) -
             f"/api/v1/triggers/{trigger_id}/accept",
             headers={**auth, "Idempotency-Key": "accept-1"},
         )
-        assert accepted.status_code == 200, accepted.text
+        assert accepted.status_code == 201, accepted.text
         entry = accepted.json()["data"]
         assert entry["status"] == "ACCEPTED"
         assert entry["order"]["status"] == "FILLED"
@@ -125,7 +129,7 @@ def test_api_scan_report_opportunity_trigger_accept_paper_loop(tmp_path: Path) -
 
         orders = client.get("/api/v1/paper/orders", headers=auth).json()["data"]
         fills = client.get("/api/v1/paper/fills", headers=auth).json()["data"]
-        balance = client.get("/api/v1/paper/balance", headers=auth).json()["data"]
+        balance = client.get("/api/v1/paper/account", headers=auth).json()["data"]
         equity = client.get("/api/v1/paper/equity", headers=auth).json()["data"]
         assert len(orders["items"]) == 1
         assert len(fills["items"]) == 1
@@ -150,7 +154,7 @@ def test_api_scan_report_opportunity_trigger_accept_paper_loop(tmp_path: Path) -
 def _container_with_trigger(tmp_path: Path, *, entry_fixture: str | None = None):
     settings = _settings(tmp_path)
     _seed(settings)
-    container = build_container(settings, initialize=True)
+    container = build_container(settings, initialize=True, clock=FixedClock(NOW))
     ScanService(container=container, lock=container.scan_lock).run(
         ScanRequest(symbol="BTCUSDT", period="4h", metrics_only=False, provider="stub")
     )
@@ -185,7 +189,7 @@ def test_rejected_narrative_produces_a_report_and_no_opportunity(tmp_path: Path)
 
     settings = _settings(tmp_path)
     _seed(settings)
-    container = build_container(settings, initialize=True)
+    container = build_container(settings, initialize=True, clock=FixedClock(NOW))
     broken = replace(
         container,
         llm_provider=LLMStub(
@@ -258,7 +262,7 @@ def test_oversized_entry_is_reduced_to_the_stricter_cap(tmp_path: Path) -> None:
 def test_unknown_opportunity_evaluate_returns_404(tmp_path: Path) -> None:
     settings = _settings(tmp_path)
     _seed(settings)
-    app = create_app(settings)
+    app = create_app(settings, clock=FixedClock(NOW))
     auth = _auth(app)
 
     with TestClient(app) as client:
@@ -275,7 +279,7 @@ def test_unknown_opportunity_evaluate_returns_404(tmp_path: Path) -> None:
 def test_opportunities_offset_is_applied(tmp_path: Path) -> None:
     settings = _settings(tmp_path)
     _seed(settings)
-    app = create_app(settings)
+    app = create_app(settings, clock=FixedClock(NOW))
     auth = _auth(app)
 
     with TestClient(app) as client:
@@ -313,7 +317,7 @@ def test_stub_scan_can_be_accepted_without_a_daemon_provider(tmp_path: Path) -> 
         llm_fixtures_dir=FIXTURES,
     )
     _seed(settings)
-    app = create_app(settings)
+    app = create_app(settings, clock=FixedClock(NOW))
     auth = _auth(app)
 
     with TestClient(app) as client:
@@ -336,7 +340,7 @@ def test_stub_scan_can_be_accepted_without_a_daemon_provider(tmp_path: Path) -> 
             json={"opportunity_id": opportunity_id},
             headers={**auth, "Idempotency-Key": "trigger-no-daemon-provider"},
         )
-        assert evaluated.status_code == 200, evaluated.text
+        assert evaluated.status_code == 201, evaluated.text
         trigger_id = evaluated.json()["data"]["trigger"]["trigger_id"]
 
         accepted = client.post(
@@ -344,6 +348,175 @@ def test_stub_scan_can_be_accepted_without_a_daemon_provider(tmp_path: Path) -> 
             headers={**auth, "Idempotency-Key": "accept-no-daemon-provider"},
         )
 
-    assert accepted.status_code == 200, accepted.text
+    assert accepted.status_code == 201, accepted.text
     assert accepted.json()["data"]["status"] == "ACCEPTED"
     assert app.state.container.llm_provider is None
+
+
+def test_same_fixed_clock_scan_twice_is_idempotent(tmp_path: Path) -> None:
+    """ADR-0011: a deterministic replay must not collide on ledger ids."""
+    settings = _settings(tmp_path)
+    _seed(settings)
+    container = build_container(settings, initialize=True, clock=FixedClock(NOW))
+    service = ScanService(container=container, lock=container.scan_lock)
+
+    first = service.run(
+        ScanRequest(symbol="BTCUSDT", period="4h", metrics_only=False, provider="stub")
+    )
+    second = service.run(
+        ScanRequest(symbol="BTCUSDT", period="4h", metrics_only=False, provider="stub")
+    )
+
+    assert first.scan.status == "DONE"
+    assert second.scan.status == "DONE"
+    # Same fixed-clock inputs produce the same decision/call/budget ids; the
+    # writes replay idempotently instead of raising IntegrityError.
+    assert len(container.store.list_decisions(role="ANALYSIS")) == 1
+    assert len(container.store.list_llm_calls(role="ANALYSIS")) == 1
+    assert len(container.store.list_budget_records()) == 1
+
+
+def test_trigger_evaluation_is_stale_when_the_report_mark_is_old(tmp_path: Path) -> None:
+    settings = _settings(tmp_path)
+    _seed(settings)
+    container = build_container(settings, initialize=True, clock=FixedClock(NOW))
+    ScanService(container=container, lock=container.scan_lock).run(
+        ScanRequest(symbol="BTCUSDT", period="4h", metrics_only=False, provider="stub")
+    )
+    opportunity = container.store.list_opportunities(state="OPEN")[0]
+    later = replace(container, clock=FixedClock(NOW + timedelta(seconds=120)))
+
+    run = TriggerService(store=container.store, clock=later.clock).evaluate(
+        opportunity.opportunity_id
+    )
+
+    assert run.evaluation.stale is True
+    assert run.trigger is None
+
+
+def test_trigger_list_reports_real_pagination(tmp_path: Path) -> None:
+    settings = _settings(tmp_path)
+    _seed(settings)
+    app = create_app(settings, clock=FixedClock(NOW))
+    auth = _auth(app)
+
+    with TestClient(app) as client:
+        created = client.post(
+            "/api/v1/scans",
+            json={
+                "symbol": "BTCUSDT",
+                "period": "4h",
+                "source": "backfill",
+                "metrics_only": False,
+                "provider": "stub",
+            },
+            headers={**auth, "Idempotency-Key": "scan-trigger-page"},
+        )
+        assert created.status_code == 201, created.text
+        opportunity_id = created.json()["data"]["report"]["llm"]["opportunity_ids"][0]
+        evaluated = client.post(
+            "/api/v1/triggers/evaluate",
+            json={"opportunity_id": opportunity_id},
+            headers={**auth, "Idempotency-Key": "trigger-page-1"},
+        )
+        assert evaluated.status_code == 201, evaluated.text
+
+        first = client.get("/api/v1/triggers?limit=100&offset=0", headers=auth).json()
+        second = client.get("/api/v1/triggers?limit=100&offset=1", headers=auth).json()
+
+    assert first["meta"]["pagination"]["total"] == 1
+    assert first["meta"]["pagination"]["has_next"] is False
+    assert len(first["data"]["items"]) == 1
+    assert second["data"]["items"] == []
+    assert second["meta"]["pagination"]["total"] == 1
+
+
+def test_reject_replays_by_idempotency_key(tmp_path: Path) -> None:
+    settings = _settings(tmp_path)
+    _seed(settings)
+    app = create_app(settings, clock=FixedClock(NOW))
+    auth = _auth(app)
+
+    with TestClient(app) as client:
+        created = client.post(
+            "/api/v1/scans",
+            json={
+                "symbol": "BTCUSDT",
+                "period": "4h",
+                "source": "backfill",
+                "metrics_only": False,
+                "provider": "stub",
+            },
+            headers={**auth, "Idempotency-Key": "scan-reject-replay"},
+        )
+        opportunity_id = created.json()["data"]["report"]["llm"]["opportunity_ids"][0]
+        evaluated = client.post(
+            "/api/v1/triggers/evaluate",
+            json={"opportunity_id": opportunity_id},
+            headers={**auth, "Idempotency-Key": "trigger-reject-replay"},
+        )
+        trigger_id = evaluated.json()["data"]["trigger"]["trigger_id"]
+
+        first = client.post(
+            f"/api/v1/triggers/{trigger_id}/reject",
+            json={"reason": "manual veto"},
+            headers={**auth, "Idempotency-Key": "reject-replay"},
+        )
+        second = client.post(
+            f"/api/v1/triggers/{trigger_id}/reject",
+            json={"reason": "manual veto"},
+            headers={**auth, "Idempotency-Key": "reject-replay"},
+        )
+        audit_count = len(app.state.container.store.list_audit_events(limit=500))
+
+    assert first.status_code == 200, first.text
+    assert second.status_code == 200, second.text
+    assert second.json()["meta"]["idempotent_replay"] is True
+    assert audit_count == len(app.state.container.store.list_audit_events(limit=500))
+
+
+def test_timeline_keeps_the_created_event_after_a_transition(tmp_path: Path) -> None:
+    settings = _settings(tmp_path)
+    _seed(settings)
+    app = create_app(settings, clock=FixedClock(NOW))
+    auth = _auth(app)
+
+    with TestClient(app) as client:
+        created = client.post(
+            "/api/v1/scans",
+            json={
+                "symbol": "BTCUSDT",
+                "period": "4h",
+                "source": "backfill",
+                "metrics_only": False,
+                "provider": "stub",
+            },
+            headers={**auth, "Idempotency-Key": "scan-timeline"},
+        )
+        opportunity_id = created.json()["data"]["report"]["llm"]["opportunity_ids"][0]
+        client.post(
+            "/api/v1/triggers/evaluate",
+            json={"opportunity_id": opportunity_id},
+            headers={**auth, "Idempotency-Key": "trigger-timeline"},
+        )
+        timeline = client.get(
+            f"/api/v1/opportunities/{opportunity_id}/timeline", headers=auth
+        ).json()["data"]
+
+    assert [event["to_state"] for event in timeline["items"]] == ["OPEN", "TRIGGERED"]
+
+
+def test_negative_trigger_price_is_rejected(tmp_path: Path) -> None:
+    settings = _settings(tmp_path)
+    _seed(settings)
+    app = create_app(settings, clock=FixedClock(NOW))
+    auth = _auth(app)
+
+    with TestClient(app) as client:
+        response = client.post(
+            "/api/v1/triggers/evaluate",
+            json={"opportunity_id": "OPP-X", "price": "-1"},
+            headers={**auth, "Idempotency-Key": "negative-price"},
+        )
+
+    assert response.status_code == 422, response.text
