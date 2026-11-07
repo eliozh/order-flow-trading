@@ -109,3 +109,47 @@ def test_concurrent_content_addressed_write_never_overwrites_different_content(
     with pytest.raises(StoreUnavailableError, match="concurrently"):
         _publish_table(table, directory, name_prefix="prefix", stem_hash="hash")
     assert existing.read_bytes() == b"different content"
+
+
+def test_read_bars_prefers_the_newest_artifact_when_replay_clock_repeats(
+    tmp_path: Path,
+) -> None:
+    """A replay clock can freeze computed_at; run_seq must break the tie."""
+    from oft.adapters.parquet_store import read_bars
+    from oft.adapters.sqlite_store import SqliteStore
+    from oft.application.resampling_service import (
+        BarResampleRequest,
+        ResamplingService,
+    )
+    from oft.clock import FixedClock
+
+    settings = Settings(env="test", port=8765, data_dir=tmp_path / "data")
+    store = SqliteStore(settings)
+    store.initialize()
+    parquet = ParquetStore(settings)
+    parquet.ensure_layout()
+    clock = FixedClock(datetime(2025, 11, 6, 0, 0, tzinfo=UTC))
+    service = ResamplingService(settings=settings, store=store, parquet=parquet, clock=clock)
+    request = BarResampleRequest(
+        symbol="BTCUSDT",
+        period="4h",
+        window_start=datetime(2025, 11, 5, 0, 0, tzinfo=UTC),
+        window_end=datetime(2025, 11, 5, 4, 0, tzinfo=UTC),
+    )
+    first = service.resample_and_persist(request, trades=(_trade(1, 5),))
+    second_trade = _trade(2, 5).model_copy(update={"price": Decimal("200.00")})
+    second = service.resample_and_persist(request, trades=(second_trade,))
+
+    assert first.run.computed_at == second.run.computed_at
+    assert first.entry.path != second.entry.path
+
+    rows = read_bars(
+        settings,
+        symbol="BTCUSDT",
+        period="4h",
+        metric_version=second.run.result.metric_version,
+        store=store,
+    )
+
+    assert [row["close"] for row in rows] == ["200.00"]
+    assert rows[0]["run_id"] == second.run.run_id

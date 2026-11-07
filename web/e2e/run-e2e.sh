@@ -16,20 +16,28 @@ ROOT="$(cd "$WEB_DIR/.." && pwd)"
 
 SYSTEM_PORT="${OFT_E2E_PORT:-7622}"
 SYMBOLS_PORT="${OFT_E2E_SYMBOLS_PORT:-7632}"
+REPORTS_PORT="${OFT_E2E_REPORTS_PORT:-7642}"
 SYSTEM_BASE_URL="http://127.0.0.1:${SYSTEM_PORT}"
 SYMBOLS_BASE_URL="http://127.0.0.1:${SYMBOLS_PORT}"
+REPORTS_BASE_URL="http://127.0.0.1:${REPORTS_PORT}"
 
 SYSTEM_SCREENS_DIR="$ROOT/.claude/ecc-workflow/screens/e2e"
 SYMBOLS_SCREENS_DIR="$ROOT/.claude/ecc-workflow/screens/e2e02"
+REPORTS_SCREENS_DIR="$ROOT/.claude/ecc-workflow/screens/e2e08"
 MARKET_FIXTURE="$ROOT/tests/fixtures/market/btcusdt_agg-trades_sample.csv"
 EXCHANGE_INFO_FIXTURE="$ROOT/tests/fixtures/binance/exchange_info_sample.json"
+ARCHIVE_FIXTURE_DIR="$ROOT/tests/fixtures/archive"
 
 SYSTEM_DATA_DIR="$(mktemp -d -t oft-e2e-system-XXXXXX)"
 SYMBOLS_DATA_DIR="$(mktemp -d -t oft-e2e-symbols-XXXXXX)"
+REPORTS_DATA_DIR="$(mktemp -d -t oft-e2e-reports-XXXXXX)"
 SYSTEM_LOG="$SYSTEM_DATA_DIR/daemon.log"
 SYMBOLS_LOG="$SYMBOLS_DATA_DIR/daemon.log"
+REPORTS_LOG="$REPORTS_DATA_DIR/daemon.log"
 
 # The system daemon inherits these exported settings (CLI scan calls use them).
+export OFT_ENV="test"
+export OFT_ALLOW_FIXTURE_SCAN_DEBUG="true"
 export OFT_DATA_DIR="$SYSTEM_DATA_DIR"
 export OFT_HOST="127.0.0.1"
 export OFT_PORT="$SYSTEM_PORT"
@@ -48,8 +56,17 @@ OFT_DATA_DIR="$SYMBOLS_DATA_DIR" \
   setsid uv run oft serve --port "$SYMBOLS_PORT" >"$SYMBOLS_LOG" 2>&1 &
 SYMBOLS_PID=$!
 
+OFT_DATA_DIR="$REPORTS_DATA_DIR" \
+  OFT_HOST="127.0.0.1" \
+  OFT_PORT="$REPORTS_PORT" \
+  OFT_LOG_LEVEL="WARNING" \
+  OFT_EXCHANGE_INFO_FIXTURE="$EXCHANGE_INFO_FIXTURE" \
+  OFT_ARCHIVE_FIXTURE_DIR="$ARCHIVE_FIXTURE_DIR" \
+  setsid uv run oft serve --port "$REPORTS_PORT" >"$REPORTS_LOG" 2>&1 &
+REPORTS_PID=$!
+
 cleanup() {
-  for pid in "${DAEMON_PID:-}" "${SYMBOLS_PID:-}"; do
+  for pid in "${DAEMON_PID:-}" "${SYMBOLS_PID:-}" "${REPORTS_PID:-}"; do
     if [ -n "$pid" ] && kill -0 "$pid" 2>/dev/null; then
       kill -- "-$pid" 2>/dev/null || kill "$pid" 2>/dev/null || true
       wait "$pid" 2>/dev/null || true
@@ -90,9 +107,14 @@ if port_in_use "$SYMBOLS_PORT"; then
   echo "E2E symbol port $SYMBOLS_PORT is already in use (set OFT_E2E_SYMBOLS_PORT)" >&2
   exit 1
 fi
+if port_in_use "$REPORTS_PORT"; then
+  echo "E2E reports port $REPORTS_PORT is already in use (set OFT_E2E_REPORTS_PORT)" >&2
+  exit 1
+fi
 
 wait_for_health "$SYSTEM_BASE_URL" "$DAEMON_PID" "system" "$SYSTEM_LOG"
 wait_for_health "$SYMBOLS_BASE_URL" "$SYMBOLS_PID" "symbols" "$SYMBOLS_LOG"
+wait_for_health "$REPORTS_BASE_URL" "$REPORTS_PID" "reports" "$REPORTS_LOG"
 
 SCAN_JSON="$(uv run oft scan run \
   --fixture "$MARKET_FIXTURE" \
@@ -130,22 +152,169 @@ if ! curl -fsS -H "Authorization: Bearer $SYMBOLS_TOKEN" \
   exit 1
 fi
 
+# Slice 08: one-week backfill -> metrics-only scan -> frozen CALC report.
+REPORTS_TOKEN="$(cat "$REPORTS_DATA_DIR/run/api-token" 2>/dev/null || true)"
+if [ -z "$REPORTS_TOKEN" ]; then
+  echo "E2E report daemon did not create an API token" >&2
+  cat "$REPORTS_LOG" >&2
+  exit 1
+fi
+BACKFILL_JSON="$(OFT_DATA_DIR="$REPORTS_DATA_DIR" \
+  OFT_HOST="127.0.0.1" \
+  OFT_PORT="$REPORTS_PORT" \
+  OFT_ARCHIVE_FIXTURE_DIR="$ARCHIVE_FIXTURE_DIR" \
+  uv run oft backfill run --symbol BTCUSDT --start 2026-10-01 --end 2026-10-07 \
+  --yes --json)"
+if ! printf '%s' "$BACKFILL_JSON" | jq -e '.ok == true and .data.run.status == "COMPLETE"' >/dev/null; then
+  echo "E2E report backfill did not complete" >&2
+  printf '%s\n' "$BACKFILL_JSON" >&2
+  cat "$REPORTS_LOG" >&2
+  exit 1
+fi
+SCAN_JSON="$(OFT_DATA_DIR="$REPORTS_DATA_DIR" \
+  OFT_HOST="127.0.0.1" \
+  OFT_PORT="$REPORTS_PORT" \
+  uv run oft scan run --metrics-only --symbol BTCUSDT --period 4h --source backfill --json)"
+REPORT_ID="$(printf '%s' "$SCAN_JSON" | jq -r '.data.report_id')"
+REPORT_SCAN_ID="$(printf '%s' "$SCAN_JSON" | jq -r '.data.scan.scan_id')"
+if [ -z "$REPORT_ID" ] || [ "$REPORT_ID" = "null" ]; then
+  echo "E2E metrics-only scan did not return a report id" >&2
+  printf '%s\n' "$SCAN_JSON" >&2
+  cat "$REPORTS_LOG" >&2
+  exit 1
+fi
+if [ -z "$REPORT_SCAN_ID" ] || [ "$REPORT_SCAN_ID" = "null" ]; then
+  echo "E2E metrics-only scan did not return a scan id" >&2
+  printf '%s\n' "$SCAN_JSON" >&2
+  cat "$REPORTS_LOG" >&2
+  exit 1
+fi
+if ! curl -fsS -H "Authorization: Bearer $REPORTS_TOKEN" \
+  "$REPORTS_BASE_URL/api/v1/reports/$REPORT_ID" |
+  jq -e --arg id "$REPORT_ID" \
+    '.ok == true and .data.report_id == $id and
+     .data.llm.configured == false and
+     (.data.metrics.cvd.points | length) > 0 and
+     (.data.snapshot.bars | length) > 0' >/dev/null; then
+  echo "E2E report $REPORT_ID is not readable through the API" >&2
+  exit 1
+fi
+
+# Round 2: a second scan run immediately after the first must produce a
+# distinct, readable report id (rapid sequential scans never collide).
+SECOND_SCAN_JSON="$(OFT_DATA_DIR="$REPORTS_DATA_DIR" \
+  OFT_HOST="127.0.0.1" \
+  OFT_PORT="$REPORTS_PORT" \
+  uv run oft scan run --metrics-only --symbol BTCUSDT --period 4h --source backfill --json)"
+SECOND_REPORT_ID="$(printf '%s' "$SECOND_SCAN_JSON" | jq -r '.data.report_id')"
+SECOND_SCAN_ID="$(printf '%s' "$SECOND_SCAN_JSON" | jq -r '.data.scan.scan_id')"
+if [ -z "$SECOND_REPORT_ID" ] || [ "$SECOND_REPORT_ID" = "null" ] ||
+  [ "$SECOND_REPORT_ID" = "$REPORT_ID" ]; then
+  echo "E2E second consecutive scan did not produce a distinct report id" >&2
+  printf '%s\n' "$SECOND_SCAN_JSON" >&2
+  cat "$REPORTS_LOG" >&2
+  exit 1
+fi
+if [ "$SECOND_SCAN_ID" = "$REPORT_SCAN_ID" ]; then
+  echo "E2E second consecutive scan reused the first scan id" >&2
+  exit 1
+fi
+if ! curl -fsS -H "Authorization: Bearer $REPORTS_TOKEN" \
+  "$REPORTS_BASE_URL/api/v1/reports/$SECOND_REPORT_ID" |
+  jq -e --arg id "$SECOND_REPORT_ID" \
+    '.ok == true and .data.report_id == $id and
+     (.data.snapshot.bars | length) > 0' >/dev/null; then
+  echo "E2E second report $SECOND_REPORT_ID is not readable through the API" >&2
+  exit 1
+fi
+
+# Slice 08 fixtures: MISSING and hostile-symbol reports. They are written to the
+# real SQLite store through the project's own store port (no browser route
+# interception) so the daemon serves them exactly like a scan-produced report.
+MISSING_REPORT_ID="$(OFT_DATA_DIR="$REPORTS_DATA_DIR" uv run python - "$REPORT_ID" <<'PY'
+import json
+import sys
+from dataclasses import replace
+
+from oft.adapters.sqlite_store import SqliteStore
+from oft.config import load_settings
+
+store = SqliteStore(load_settings())
+record = store.get_report(sys.argv[1])
+if record is None:
+    raise SystemExit(f"report {sys.argv[1]} not found")
+snapshot = json.loads(record.snapshot_json)
+snapshot["bars"] = []
+snapshot["data_quality"] = "MISSING"
+snapshot["quality_reasons"] = ["fixture: no market data was recorded for this report"]
+missing_id = "RPT-FIXTURE-MISSING"
+store.save_report(
+    replace(record, report_id=missing_id, data_quality="MISSING", snapshot_json=json.dumps(snapshot))
+)
+print(missing_id)
+PY
+)"
+HOSTILE_REPORT_ID="$(OFT_DATA_DIR="$REPORTS_DATA_DIR" uv run python - "$REPORT_ID" <<'PY'
+import sys
+from dataclasses import replace
+
+from oft.adapters.sqlite_store import SqliteStore
+from oft.config import load_settings
+
+store = SqliteStore(load_settings())
+record = store.get_report(sys.argv[1])
+if record is None:
+    raise SystemExit(f"report {sys.argv[1]} not found")
+hostile_id = "RPT-FIXTURE-HOSTILE"
+store.save_report(
+    replace(record, report_id=hostile_id, symbol='<img src=x onerror="alert(1)">')
+)
+print(hostile_id)
+PY
+)"
+if ! curl -fsS -H "Authorization: Bearer $REPORTS_TOKEN" \
+  "$REPORTS_BASE_URL/api/v1/reports/$MISSING_REPORT_ID" |
+  jq -e --arg id "$MISSING_REPORT_ID" \
+    '.ok == true and .data.report_id == $id and
+     .data.data_quality == "MISSING" and
+     (.data.snapshot.bars | length) == 0' >/dev/null; then
+  echo "E2E MISSING fixture report is not readable through the API" >&2
+  exit 1
+fi
+if ! curl -fsS -H "Authorization: Bearer $REPORTS_TOKEN" \
+  "$REPORTS_BASE_URL/api/v1/reports/$HOSTILE_REPORT_ID" |
+  jq -e '.ok == true and (.data.symbol | startswith("<img"))' >/dev/null; then
+  echo "E2E hostile fixture report is not readable through the API" >&2
+  exit 1
+fi
+
 export OFT_E2E_BASE_URL="$SYSTEM_BASE_URL"
 export OFT_E2E_SYMBOLS_BASE_URL="$SYMBOLS_BASE_URL"
+export OFT_E2E_REPORT_BASE_URL="$REPORTS_BASE_URL"
 export OFT_E2E_SYSTEM_BOOTSTRAP_FILE="$SYSTEM_DATA_DIR/run/browser-bootstrap"
 export OFT_E2E_SYMBOLS_BOOTSTRAP_FILE="$SYMBOLS_DATA_DIR/run/browser-bootstrap"
+export OFT_E2E_REPORT_BOOTSTRAP_FILE="$REPORTS_DATA_DIR/run/browser-bootstrap"
 export OFT_E2E_SYMBOLS_API_TOKEN="$SYMBOLS_TOKEN"
+export OFT_E2E_REPORT_ID="$REPORT_ID"
+export OFT_E2E_REPORT_SCAN_ID="$REPORT_SCAN_ID"
+export OFT_E2E_SECOND_REPORT_ID="$SECOND_REPORT_ID"
+export OFT_E2E_SECOND_SCAN_ID="$SECOND_SCAN_ID"
+export OFT_E2E_MISSING_REPORT_ID="$MISSING_REPORT_ID"
+export OFT_E2E_HOSTILE_REPORT_ID="$HOSTILE_REPORT_ID"
 export OFT_E2E_DATA_DIR="$SYSTEM_DATA_DIR"
 export OFT_E2E_SCAN_ID="$SCAN_ID"
 export OFT_E2E_SCAN_DELTA="$SCAN_DELTA"
 export OFT_E2E_SYSTEM_SCREENS_DIR="$SYSTEM_SCREENS_DIR"
 export OFT_E2E_SYMBOLS_SCREENS_DIR="$SYMBOLS_SCREENS_DIR"
-export OFT_E2E_SCREENS_DIR="$SYMBOLS_SCREENS_DIR"
-export OFT_E2E_REPORT_DIR="$SYMBOLS_SCREENS_DIR/report"
+export OFT_E2E_REPORT_SCREENS_DIR="$REPORTS_SCREENS_DIR"
+# Global Playwright report/artifact output for this run lands under e2e08.
+export OFT_E2E_SCREENS_DIR="$REPORTS_SCREENS_DIR"
+export OFT_E2E_REPORT_DIR="$REPORTS_SCREENS_DIR/report"
 
-mkdir -p "$SYSTEM_SCREENS_DIR" "$SYMBOLS_SCREENS_DIR"
+mkdir -p "$SYSTEM_SCREENS_DIR" "$SYMBOLS_SCREENS_DIR" "$REPORTS_SCREENS_DIR"
 echo "system e2e daemon: $SYSTEM_BASE_URL · data: $SYSTEM_DATA_DIR · scan: $SCAN_ID · delta: $SCAN_DELTA"
 echo "symbol e2e daemon: $SYMBOLS_BASE_URL · data: $SYMBOLS_DATA_DIR · seeded from $EXCHANGE_INFO_FIXTURE"
+echo "report e2e daemon: $REPORTS_BASE_URL · data: $REPORTS_DATA_DIR · report: $REPORT_ID"
 
 cd "$WEB_DIR"
 ./node_modules/.bin/playwright test "$@"

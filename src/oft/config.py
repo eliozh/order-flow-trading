@@ -61,6 +61,7 @@ class Settings(BaseSettings):
     klines_fixture: Path = DEFAULT_KLINES_FIXTURE
     exchange_info_fixture: Path = DEFAULT_EXCHANGE_INFO_FIXTURE
     archive_fixture_dir: Path | None = None
+    allow_fixture_scan_debug: bool = False
     log_level: str = "INFO"
 
     api_token: SecretStr | None = None

@@ -22,6 +22,7 @@ def _meta(
     duration_ms: int,
     provenance: str,
     data_quality: str | None,
+    idempotent_replay: bool = False,
 ) -> dict[str, Any]:
     return {
         "request_id": request_id,
@@ -31,7 +32,7 @@ def _meta(
         "data_quality": data_quality,
         "warnings": [],
         "pagination": None,
-        "idempotent_replay": False,
+        "idempotent_replay": idempotent_replay,
     }
 
 
@@ -44,6 +45,7 @@ def success_envelope(
     provenance: str = "CALC",
     data_quality: str | None = "COMPLETE",
     pagination: dict[str, Any] | None = None,
+    idempotent_replay: bool = False,
 ) -> dict[str, Any]:
     """Build an ``ok: true`` envelope."""
     timestamp = generated_at or utc_timestamp(datetime.now(UTC))
@@ -53,6 +55,7 @@ def success_envelope(
         duration_ms=duration_ms,
         provenance=provenance,
         data_quality=data_quality,
+        idempotent_replay=idempotent_replay,
     )
     meta["pagination"] = pagination
     return {

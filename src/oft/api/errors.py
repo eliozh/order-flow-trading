@@ -47,6 +47,24 @@ ERROR_CATALOG: dict[str, ErrorSpec] = {
     "VALIDATION_FAILED": ErrorSpec(
         422, "VALIDATION", False, "One or more request fields failed validation."
     ),
+    "IDEMPOTENCY_KEY_REQUIRED": ErrorSpec(
+        400,
+        "CONFLICT",
+        False,
+        "A state-changing request was sent without an Idempotency-Key.",
+    ),
+    "IDEMPOTENCY_CONFLICT": ErrorSpec(
+        409,
+        "CONFLICT",
+        False,
+        "The same idempotency key was used with a different request payload.",
+    ),
+    "METRICS_INCOMPLETE": ErrorSpec(
+        409,
+        "DATA",
+        True,
+        "One or more required metrics could not be computed.",
+    ),
     "CONFIG_INVALID": ErrorSpec(
         500, "SYSTEM", False, "The configuration is missing, unreadable, or inconsistent."
     ),

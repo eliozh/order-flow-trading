@@ -3,7 +3,6 @@
 from __future__ import annotations
 
 import hmac
-import threading
 from pathlib import Path
 from typing import Any
 from urllib.parse import urlsplit
@@ -33,6 +32,7 @@ from oft.api.auth import (
 from oft.api.envelope import new_request_id
 from oft.api.errors import ApiError, error_response
 from oft.api.routes.data import router as data_router
+from oft.api.routes.reports import router as reports_router
 from oft.api.routes.scans import router as scans_router
 from oft.api.routes.symbols import router as symbols_router
 from oft.api.routes.system import router as system_router
@@ -46,7 +46,9 @@ logger = structlog.get_logger(__name__)
 
 _MUTATING_METHODS = frozenset({"POST", "PUT", "PATCH", "DELETE"})
 _COOKIE_PATHS = frozenset({"/health", "/ready", "/api/v1/status"})
-_SPA_ENTRY_PATHS = frozenset({"/", "/system", "/system/", "/watchlist", "/watchlist/search"})
+_SPA_ENTRY_PATHS = frozenset(
+    {"/", "/system", "/system/", "/watchlist", "/watchlist/search", "/scans", "/reports"}
+)
 _LOOPBACK_HOSTS = frozenset({"127.0.0.1", "localhost", "::1"})
 _TEST_CLIENT_HOST = "testserver"
 _HTTP_ERRORS = {
@@ -55,8 +57,8 @@ _HTTP_ERRORS = {
 }
 _SECURITY_HEADERS = {
     "Content-Security-Policy": (
-        "default-src 'self'; script-src 'self'; style-src 'self' 'unsafe-inline'; "
-        "img-src 'self' data:; connect-src 'self'; frame-ancestors 'none'; "
+        "default-src 'self'; script-src 'self'; style-src 'self'; "
+        "img-src 'self' data:; connect-src 'self'; frame-ancestors 'none'; object-src 'none'; "
         "base-uri 'self'; form-action 'self'"
     ),
     "X-Frame-Options": "DENY",
@@ -111,7 +113,12 @@ def host_is_allowed(request: Request, settings: Settings) -> bool:
 
 def _is_spa_entry(path: str) -> bool:
     """Client-rendered entry routes that may establish a browser session."""
-    return path in _SPA_ENTRY_PATHS or path.startswith("/watchlist/")
+    return (
+        path in _SPA_ENTRY_PATHS
+        or path.startswith("/watchlist/")
+        or path.startswith("/scans/")
+        or path.startswith("/reports/")
+    )
 
 
 def create_app(settings: Settings | None = None) -> FastAPI:
@@ -132,7 +139,7 @@ def create_app(settings: Settings | None = None) -> FastAPI:
     app.state.settings = resolved
     app.state.container = container
     app.state.api_token = ensure_api_token(resolved)
-    app.state.scan_lock = threading.Lock()
+    app.state.scan_lock = container.scan_lock
     app.state.sessions = SessionStore()
     app.state.browser_bootstrap = write_browser_bootstrap(resolved)
     logger.info("browser_bootstrap_ready", detail=_BOOTSTRAP_READY_MESSAGE)
@@ -208,6 +215,7 @@ def create_app(settings: Settings | None = None) -> FastAPI:
 
     app.include_router(system_router)
     app.include_router(scans_router)
+    app.include_router(reports_router)
     app.include_router(symbols_router)
     app.include_router(watchlist_router)
     app.include_router(data_router)

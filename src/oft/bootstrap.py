@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import threading
 from dataclasses import dataclass
 
 from oft.adapters.archive import (
@@ -33,6 +34,7 @@ class AppContainer:
     symbol_registry: SymbolRegistry
     archive: ArchiveSourcePort
     backfill: BackfillService
+    scan_lock: threading.Lock
 
 
 def _seed_symbol_registry(registry: SymbolRegistry, settings: Settings) -> None:
@@ -88,6 +90,7 @@ def build_container(settings: Settings | None = None, *, initialize: bool = Fals
         symbol_registry=symbol_registry,
         archive=archive,
         backfill=backfill,
+        scan_lock=threading.Lock(),
     )
 
 

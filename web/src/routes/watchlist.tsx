@@ -35,6 +35,7 @@ function SymbolGroup({ label, items }: { label: string; items: SymbolContract[] 
           {label} ({items.length})
         </h2>
       </div>
+      {/* eslint-disable-next-line jsx-a11y/no-noninteractive-tabindex -- scrollable table */}
       <div className="table-wrap" role="region" aria-label={`${label} symbols table`} tabIndex={0}>
         <table className="data-table">
           <caption className="visually-hidden">{label} symbols in the registry</caption>
