@@ -14,6 +14,7 @@ from oft.api.errors import ApiError
 from oft.api.schemas.trigger import TriggerEvaluateRequest, TriggerRejectRequest
 from oft.application.entry_service import EntryRejected, EntryService
 from oft.application.kill_switch import KillSwitch
+from oft.application.opportunity_service import OpportunityNotFound
 from oft.application.trigger_service import (
     TriggerError,
     TriggerNotFound,
@@ -39,20 +40,33 @@ def _trigger_service(request: Request) -> TriggerService:
     return TriggerService(store=container.store, clock=container.clock)
 
 
-def _entry_service(request: Request) -> EntryService:
+def _scan_provider(container: Any, trigger_id: str) -> str | None:
+    """The provider recorded by the scan that produced this trigger, if any."""
+    record = container.store.get_trigger_event(trigger_id)
+    if record is None:
+        return None
+    payload = json.loads(record.payload_json)
+    opportunity = container.store.get_opportunity(str(payload.get("opportunity_id", "")))
+    if opportunity is None:
+        return None
+    opportunity_payload = json.loads(opportunity.payload_json)
+    report_id = str(opportunity_payload.get("source", {}).get("report_id", ""))
+    report = container.store.get_report(report_id) if report_id else None
+    if report is None or report.llm_json is None:
+        return None
+    provider = json.loads(report.llm_json).get("provider")
+    return provider if isinstance(provider, str) else None
+
+
+def _entry_service(request: Request, trigger_id: str) -> EntryService:
     container = request.app.state.container
-    if container.llm_provider is None:
-        raise ApiError(
-            "LLM_PROVIDER_NOT_CONFIGURED",
-            "No LLM provider is configured; the entry re-check cannot run.",
-        )
     kill_switch = KillSwitch(
         settings=container.settings, store=container.store, clock=container.clock
     )
     return EntryService(
         store=container.store,
         clock=container.clock,
-        provider=container.llm_provider,
+        provider=container.provider_for(_scan_provider(container, trigger_id)),
         settings=container.settings,
         kill_switch=kill_switch,
     )
@@ -115,6 +129,8 @@ def evaluate_trigger(
         )
     except TriggerError as exc:
         raise ApiError(exc.code, exc.message) from exc
+    except OpportunityNotFound as exc:
+        raise ApiError("NOT_FOUND", str(exc)) from exc
     data = {
         "opportunity_id": payload.opportunity_id,
         "triggered": run.trigger is not None,
@@ -146,10 +162,12 @@ def accept_trigger(
 ) -> Any:
     key = _idempotency_key(idempotency_key)
     try:
-        result = _entry_service(request).accept(trigger_id, idempotency_key=key)
+        result = _entry_service(request, trigger_id).accept(trigger_id, idempotency_key=key)
     except EntryRejected as exc:
         raise ApiError(exc.code, exc.message) from exc
     except TriggerNotFound as exc:
+        raise ApiError("NOT_FOUND", str(exc)) from exc
+    except OpportunityNotFound as exc:
         raise ApiError("NOT_FOUND", str(exc)) from exc
     return success_envelope(
         {
@@ -177,7 +195,7 @@ def reject_trigger(
 ) -> Any:
     _idempotency_key(idempotency_key)
     try:
-        result = _entry_service(request).reject(trigger_id, reason=payload.reason)
+        result = _entry_service(request, trigger_id).reject(trigger_id, reason=payload.reason)
     except EntryRejected as exc:
         raise ApiError(exc.code, exc.message) from exc
     except TriggerNotFound as exc:

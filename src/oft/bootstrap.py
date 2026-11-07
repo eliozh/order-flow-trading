@@ -4,7 +4,6 @@ from __future__ import annotations
 
 import threading
 from dataclasses import dataclass
-from typing import Any
 
 from oft.adapters.archive import (
     FixtureArchiveSource,
@@ -27,8 +26,23 @@ from oft.clock import SystemClock
 from oft.config import Settings, load_settings
 from oft.ports.archive import ArchiveSourcePort
 from oft.ports.clock import ClockPort
+from oft.ports.llm import LLMPort
 from oft.ports.market_data import MarketDataPort
 from oft.ports.store import StorePort
+
+
+def resolve_llm_provider(settings: Settings, requested: str | None = None) -> LLMPort | None:
+    """Resolve one provider name to an adapter; the only construction point.
+
+    This build ships the deterministic stub only. An unknown or missing name
+    resolves to ``None`` so callers can report ``LLM_PROVIDER_NOT_CONFIGURED``.
+    """
+    name = (requested or settings.llm_provider or "").strip().lower()
+    if not name:
+        return None
+    if name == "stub":
+        return LLMStub(fixtures_dir=settings.llm_fixtures_dir)
+    return None
 
 
 @dataclass(frozen=True)
@@ -44,7 +58,16 @@ class AppContainer:
     scan_lock: threading.Lock
     rate_limiter: GlobalRateLimiter
     ws_budget: WsSubscriptionBudget
-    llm_provider: Any | None = None
+    llm_provider: LLMPort | None = None
+
+    def provider_for(self, requested: str | None = None) -> LLMPort | None:
+        """Resolve the provider for a scan/entry request consistently."""
+        name = (requested or self.settings.llm_provider or "").strip().lower()
+        if not name:
+            return None
+        if name == "stub" and self.llm_provider is not None:
+            return self.llm_provider
+        return resolve_llm_provider(self.settings, requested)
 
 
 def _seed_symbol_registry(registry: SymbolRegistry, settings: Settings) -> None:
@@ -94,9 +117,7 @@ def build_container(settings: Settings | None = None, *, initialize: bool = Fals
         store.initialize()
         parquet.ensure_layout()
         _seed_symbol_registry(symbol_registry, resolved)
-    llm_provider = (
-        LLMStub(fixtures_dir=resolved.llm_fixtures_dir) if resolved.llm_provider == "stub" else None
-    )
+    llm_provider = resolve_llm_provider(resolved)
     return AppContainer(
         settings=resolved,
         clock=clock,

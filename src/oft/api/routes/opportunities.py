@@ -30,19 +30,21 @@ def list_opportunities(
 ) -> dict[str, Any]:
     container = request.app.state.container
     service = OpportunityService(store=container.store, clock=container.clock)
-    items = service.list(state=state, limit=limit)
+    items = service.list(state=state, limit=limit, offset=offset)
     payloads = [opportunity_summary(item) for item in items]
+    total = service.count(state=state)
+    has_next = offset + len(payloads) < total
     return success_envelope(
-        {"items": payloads, "total": len(payloads)},
+        {"items": payloads, "total": total},
         request_id=new_request_id(),
         provenance="MIXED",
         data_quality="COMPLETE" if payloads else "MISSING",
         pagination={
             "limit": limit,
             "cursor": str(offset),
-            "has_next": False,
-            "next_cursor": None,
-            "total": len(payloads),
+            "has_next": has_next,
+            "next_cursor": str(offset + limit) if has_next else None,
+            "total": total,
         },
     )
 

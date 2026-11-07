@@ -10,6 +10,8 @@ from __future__ import annotations
 import math
 import re
 from dataclasses import dataclass
+from datetime import datetime
+from decimal import Decimal, InvalidOperation
 from typing import Literal
 
 from pydantic import BaseModel, ConfigDict, Field
@@ -187,13 +189,38 @@ class DecisionOutput(_Model):
     position_management: PositionManagement | None
 
 
-def _decimal(value: str | None) -> float | None:
+def _decimal(value: str | None) -> Decimal | None:
     if value is None:
         return None
     try:
-        return float(value)
-    except (TypeError, ValueError):
+        parsed = Decimal(value)
+    except (InvalidOperation, TypeError, ValueError):
         return None
+    return parsed if parsed.is_finite() else None
+
+
+def _number_errors(field: str, value: str | None) -> list[SemanticError]:
+    """A present-but-unparseable numeric string is invalid, not absent."""
+    if value is None or _decimal(value) is not None:
+        return []
+    return [SemanticError(field, "NUMBER_INVALID", f"{field} must be a decimal number")]
+
+
+def _numbers_errors(field: str, values: list[str]) -> list[SemanticError]:
+    errors: list[SemanticError] = []
+    for index, value in enumerate(values):
+        errors.extend(_number_errors(f"{field}[{index}]", value))
+    return errors
+
+
+def _timestamp_errors(field: str, value: str | None) -> list[SemanticError]:
+    if value is None:
+        return []
+    try:
+        datetime.fromisoformat(value.replace("Z", "+00:00"))
+    except (AttributeError, TypeError, ValueError):
+        return [SemanticError(field, "TIMESTAMP_INVALID", f"{field} must be an ISO-8601 timestamp")]
+    return []
 
 
 def _unsafe(value: str) -> bool:
@@ -264,10 +291,15 @@ def semantic_errors(output: DecisionOutput, *, role: str) -> tuple[SemanticError
     errors.extend(_text_errors("rationale", output.rationale))
     for index, caveat in enumerate(output.caveats):
         errors.extend(_text_errors(f"caveats[{index}]", caveat))
+    errors.extend(_timestamp_errors("subject.as_of", output.subject.as_of))
 
     if output.analysis is not None:
         errors.extend(_text_errors("analysis.narrative", output.analysis.narrative))
         for index, zone in enumerate(output.analysis.key_zones):
+            errors.extend(_number_errors(f"analysis.key_zones[{index}].price_low", zone.price_low))
+            errors.extend(
+                _number_errors(f"analysis.key_zones[{index}].price_high", zone.price_high)
+            )
             low = _decimal(zone.price_low)
             high = _decimal(zone.price_high)
             if low is not None and high is not None and low > high:
@@ -281,6 +313,37 @@ def semantic_errors(output: DecisionOutput, *, role: str) -> tuple[SemanticError
 
     opportunity = output.opportunity
     if opportunity is not None:
+        errors.extend(_number_errors("opportunity.zone_low", opportunity.zone_low))
+        errors.extend(_number_errors("opportunity.zone_high", opportunity.zone_high))
+        errors.extend(_timestamp_errors("opportunity.expires_at", opportunity.expires_at))
+        errors.extend(
+            _number_errors(
+                "opportunity.risk_request.entry_price", opportunity.risk_request.entry_price
+            )
+        )
+        errors.extend(
+            _number_errors(
+                "opportunity.risk_request.stop_price", opportunity.risk_request.stop_price
+            )
+        )
+        errors.extend(
+            _numbers_errors(
+                "opportunity.risk_request.take_profits",
+                opportunity.risk_request.take_profits,
+            )
+        )
+        for index, trigger in enumerate(opportunity.trigger_conditions):
+            params = trigger.params
+            prefix = f"opportunity.trigger_conditions[{index}].params"
+            errors.extend(_number_errors(f"{prefix}.price", params.price))
+            errors.extend(_number_errors(f"{prefix}.price_low", params.price_low))
+            errors.extend(_number_errors(f"{prefix}.price_high", params.price_high))
+            errors.extend(_timestamp_errors(f"{prefix}.window.start", trigger.window.start))
+            errors.extend(_timestamp_errors(f"{prefix}.window.end", trigger.window.end))
+        for index, invalidation in enumerate(opportunity.invalidation_conditions):
+            prefix = f"opportunity.invalidation_conditions[{index}]"
+            errors.extend(_number_errors(f"{prefix}.price", invalidation.price))
+            errors.extend(_timestamp_errors(f"{prefix}.window_end", invalidation.window_end))
         low = _decimal(opportunity.zone_low)
         high = _decimal(opportunity.zone_high)
         if low is not None and high is not None and low >= high:
@@ -321,12 +384,38 @@ def semantic_errors(output: DecisionOutput, *, role: str) -> tuple[SemanticError
                     )
                 )
             else:
+                intent = entry.order_intent
+                # The paper broker fills every accepted entry at the report mark;
+                # any other entry type would be silently treated as a MARKET fill.
+                if intent.entry_type != "MARKET":
+                    errors.append(
+                        SemanticError(
+                            "entry_recheck.order_intent.entry_type",
+                            "ENTRY_TYPE_UNSUPPORTED",
+                            "only MARKET entries are supported; the broker fills at the mark",
+                        )
+                    )
+                errors.extend(
+                    _number_errors("entry_recheck.order_intent.entry_price", intent.entry_price)
+                )
+                errors.extend(
+                    _number_errors("entry_recheck.order_intent.stop_price", intent.stop_price)
+                )
+                errors.extend(
+                    _numbers_errors("entry_recheck.order_intent.take_profits", intent.take_profits)
+                )
+                errors.extend(
+                    _number_errors(
+                        "entry_recheck.order_intent.quote_notional_usd",
+                        intent.quote_notional_usd,
+                    )
+                )
                 side = "LONG" if entry.decision == "ENTER_LONG" else "SHORT"
                 errors.extend(
                     _stop_side_errors(
                         side,
-                        entry.order_intent.entry_price,
-                        entry.order_intent.stop_price,
+                        intent.entry_price,
+                        intent.stop_price,
                         "entry_recheck.order_intent.stop_price",
                     )
                 )
@@ -334,5 +423,9 @@ def semantic_errors(output: DecisionOutput, *, role: str) -> tuple[SemanticError
     management = output.position_management
     if management is not None:
         errors.extend(_text_errors("position_management.rationale", management.rationale))
+        errors.extend(
+            _number_errors("position_management.new_stop_price", management.new_stop_price)
+        )
+        errors.extend(_numbers_errors("position_management.new_targets", management.new_targets))
 
     return tuple(errors)

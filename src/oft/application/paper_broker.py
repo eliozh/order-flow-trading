@@ -29,6 +29,7 @@ from oft.domain.oms import (
 from oft.domain.time import utc_timestamp
 from oft.ports.clock import ClockPort
 from oft.ports.store import (
+    AuditEventDraft,
     FillRecord,
     OrderRecord,
     PaperAccountRecord,
@@ -129,6 +130,7 @@ class PaperBroker:
         mark_price: Decimal,
         mark_as_of: str,
         now: str,
+        audit_actor: dict[str, Any] | None = None,
     ) -> BrokerResult:
         if intent.quantity <= 0:
             raise BrokerError("quantity must be positive")
@@ -210,6 +212,23 @@ class PaperBroker:
             fill=_fill_record(fill),
             position=_position_record(position),
             account=updated_account,
+            audit=(
+                None
+                if audit_actor is None
+                else AuditEventDraft(
+                    event_type="ORDER_FILLED",
+                    actor=audit_actor,
+                    subject={"kind": "ORDER", "id": order_id},
+                    payload={
+                        "client_order_id": client_id,
+                        "status": order.status.value,
+                        "fill_id": fill_id,
+                        "position_id": position_id,
+                        "environment": intent.environment,
+                    },
+                    created_at=now,
+                )
+            ),
         )
         return BrokerResult(order=order, fill=fill, position=position, account=updated_account)
 

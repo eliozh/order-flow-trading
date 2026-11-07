@@ -10,9 +10,8 @@ from __future__ import annotations
 import json
 from dataclasses import dataclass
 from decimal import Decimal
-from typing import Any
 
-from oft.application.kill_switch import KillSwitch, record_audit
+from oft.application.kill_switch import KillSwitch
 from oft.application.paper_broker import BrokerResult, OrderIntent, PaperBroker
 from oft.domain.time import utc_timestamp
 from oft.ports.clock import ClockPort
@@ -79,36 +78,6 @@ class ExecutionGateway:
             mark_price=mark_price,
             mark_as_of=mark_as_of,
             now=now,
-        )
-        self._audit(
-            event_type="ORDER_FILLED",
-            actor=auth,
-            subject={"kind": "ORDER", "id": result.order.order_id},
-            payload={
-                "client_order_id": result.order.client_order_id,
-                "status": result.order.status.value,
-                "fill_id": result.fill.fill_id,
-                "position_id": result.position.position_id,
-                "environment": self._environment,
-            },
-            at=now,
+            audit_actor={"kind": auth.kind, "id": auth.actor_id},
         )
         return result
-
-    def _audit(
-        self,
-        *,
-        event_type: str,
-        actor: AuthContext,
-        subject: dict[str, Any],
-        payload: dict[str, Any],
-        at: str,
-    ) -> None:
-        record_audit(
-            self._store,
-            event_type=event_type,
-            actor={"kind": actor.kind, "id": actor.actor_id},
-            subject=subject,
-            payload=payload,
-            at=at,
-        )

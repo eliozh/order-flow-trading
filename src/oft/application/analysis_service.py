@@ -10,6 +10,7 @@ from __future__ import annotations
 import hashlib
 import json
 from dataclasses import dataclass
+from decimal import InvalidOperation
 from typing import Any
 
 from oft.application.budget_ledger import BudgetEntry, BudgetLedger, stable_call_id
@@ -23,10 +24,10 @@ from oft.application.llm_validation import (
 )
 from oft.application.opportunity_service import OpportunityService
 from oft.domain.llm_output import DecisionOutput
-from oft.domain.opportunities import Opportunity
+from oft.domain.opportunities import ConditionDraftError, Opportunity
 from oft.domain.time import utc_timestamp
 from oft.ports.clock import ClockPort
-from oft.ports.llm import LLMRequest, LLMResult, LLMRole, LLMUsage
+from oft.ports.llm import LLMPort, LLMRequest, LLMResult, LLMRole, LLMUsage
 from oft.ports.store import DecisionRecord, LLMCallRecord, StorePort
 
 PROMPT_ID = "analysis"
@@ -113,7 +114,7 @@ class AnalysisService:
         *,
         store: StorePort,
         clock: ClockPort,
-        provider: Any,
+        provider: LLMPort,
         budget: BudgetLedger | None = None,
     ) -> None:
         self._store = store
@@ -253,6 +254,56 @@ class AnalysisService:
             raw_output_hash=outcome.raw_output_hash,
             persisted_at=now,
         )
+
+        opportunity: Opportunity | None = None
+        if outcome.valid and outcome.output is not None and outcome.output.opportunity is not None:
+            try:
+                opportunity = self._opportunities.create_from_decision(
+                    opportunity_draft=outcome.output.opportunity,
+                    subject=subject,
+                    decision_id=decision_id,
+                    scan_id=scan_id,
+                    report_id=report_id,
+                    confidence=outcome.output.confidence,
+                    provenance={
+                        "llm": provenance,
+                        "calc_snapshot_id": str(snapshot.get("snapshot_id", "")),
+                        "calc_snapshot_hash": str(snapshot.get("snapshot_hash", "")),
+                        "calc_metric_version": str(metrics.get("metric_version", "")),
+                    },
+                    data_quality=_data_quality(metrics, snapshot),
+                    at=now,
+                )
+            except (ConditionDraftError, InvalidOperation, KeyError, TypeError, ValueError) as exc:
+                # ADR-0005: reject, never crash. A proposed opportunity that
+                # cannot be materialized degrades to a REJECTED decision so the
+                # scan still produces its CALC report.
+                outcome = ValidationOutcome(
+                    status="REJECTED",
+                    output=None,
+                    errors=(
+                        ValidationIssue(
+                            "opportunity",
+                            "VALIDATION_FAILED",
+                            f"the proposed opportunity could not be built: {exc}",
+                        ),
+                    ),
+                    raw_output_hash=outcome.raw_output_hash,
+                )
+                envelope = decision_envelope(
+                    decision_id=decision_id,
+                    role=LLMRole.ANALYSIS.value,
+                    output=None,
+                    subject=subject,
+                    provenance=provenance,
+                    validation_status=outcome.status,
+                    validation_errors=outcome.errors,
+                    rejected_reason=_rejection_reason(outcome),
+                    raw_output_hash=outcome.raw_output_hash,
+                    persisted_at=now,
+                )
+                opportunity = None
+
         self._store.save_decision(
             DecisionRecord(
                 decision_id=decision_id,
@@ -264,25 +315,6 @@ class AnalysisService:
                 payload_json=json.dumps(envelope, sort_keys=True),
             )
         )
-
-        opportunity: Opportunity | None = None
-        if outcome.valid and outcome.output is not None and outcome.output.opportunity is not None:
-            opportunity = self._opportunities.create_from_decision(
-                opportunity_draft=outcome.output.opportunity,
-                subject=subject,
-                decision_id=decision_id,
-                scan_id=scan_id,
-                report_id=report_id,
-                confidence=outcome.output.confidence,
-                provenance={
-                    "llm": provenance,
-                    "calc_snapshot_id": str(snapshot.get("snapshot_id", "")),
-                    "calc_snapshot_hash": str(snapshot.get("snapshot_hash", "")),
-                    "calc_metric_version": str(metrics.get("metric_version", "")),
-                },
-                data_quality=_data_quality(metrics, snapshot),
-                at=now,
-            )
 
         llm_state = _llm_state(
             outcome=outcome,

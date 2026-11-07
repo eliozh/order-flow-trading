@@ -6,6 +6,8 @@ import json
 from datetime import UTC, datetime
 from pathlib import Path
 
+import pytest
+
 from oft.adapters.sqlite_store import SqliteStore
 from oft.application.analysis_service import AnalysisService
 from oft.application.llm_validation import validate_output
@@ -222,3 +224,26 @@ def test_code_assigns_provenance_and_subject_even_when_the_model_omits_them(
     assert decision["subject"]["scan_id"] == "SCAN-1"
     assert decision["subject"]["report_id"] == "RPT-1"
     assert decision["subject"]["environment"] == "PAPER"
+
+
+def test_opportunity_conversion_failure_degrades_to_a_rejected_decision(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from decimal import InvalidOperation
+
+    from oft.application import analysis_service
+
+    def _boom(self, **kwargs):  # type: ignore[no-untyped-def]
+        raise InvalidOperation("not a decimal")
+
+    monkeypatch.setattr(analysis_service.OpportunityService, "create_from_decision", _boom)
+
+    outcome, store = _analyze(tmp_path, _SequencedProvider(["opportunity_valid.json"]))
+
+    assert outcome.validation_status == "REJECTED"
+    assert outcome.opportunity is None
+    assert outcome.opportunity_ids == ()
+    decision = store.get_decision(outcome.decision_id)
+    assert decision is not None
+    assert decision.validation_status == "REJECTED"
+    assert store.list_opportunities() == ()

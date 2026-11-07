@@ -4,6 +4,16 @@
   "title": "LLM decision output (provider-facing)",
   "description": "The only shape an LLM may generate. It contains judgment and proposals, never execution authority. Every object is closed and every property is required so OpenAI strict json_schema, Anthropic structured outputs, and DeepSeek strict tool calling can use the same schema. Provider adapters may strip keywords a provider cannot enforce, but must never add fields or relax additionalProperties.",
   "$defs": {
+    "decimalString": {
+      "type": "string",
+      "pattern": "^-?[0-9]+(\\.[0-9]+)?$",
+      "description": "A finite decimal encoded as a string. Semantic validation rejects a present-but-unparseable value."
+    },
+    "timestampString": {
+      "type": "string",
+      "pattern": "^[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}:[0-9]{2}(\\.[0-9]+)?Z$",
+      "description": "ISO-8601 UTC timestamp."
+    },
     "conditionType": {
       "type": "string",
       "enum": [
@@ -56,7 +66,7 @@
           "type": "string",
           "enum": ["1m", "5m", "15m", "1h", "4h", "8h", "1d"]
         },
-        "as_of": { "type": "string", "description": "ISO-8601 UTC decision time supplied by code." }
+        "as_of": { "$ref": "#/$defs/timestampString" }
       }
     },
     "triggerConditionDraft": {
@@ -81,9 +91,15 @@
             "note"
           ],
           "properties": {
-            "price": { "type": ["string", "null"] },
-            "price_low": { "type": ["string", "null"] },
-            "price_high": { "type": ["string", "null"] },
+            "price": {
+              "anyOf": [{ "$ref": "#/$defs/decimalString" }, { "type": "null" }]
+            },
+            "price_low": {
+              "anyOf": [{ "$ref": "#/$defs/decimalString" }, { "type": "null" }]
+            },
+            "price_high": {
+              "anyOf": [{ "$ref": "#/$defs/decimalString" }, { "type": "null" }]
+            },
             "threshold": { "type": ["string", "null"] },
             "unit": { "type": ["string", "null"] },
             "comparator": { "type": ["string", "null"] },
@@ -98,8 +114,8 @@
           "additionalProperties": false,
           "required": ["start", "end"],
           "properties": {
-            "start": { "type": "string" },
-            "end": { "type": "string" }
+            "start": { "$ref": "#/$defs/timestampString" },
+            "end": { "$ref": "#/$defs/timestampString" }
           }
         },
         "required_data": {
@@ -131,9 +147,13 @@
           ]
         },
         "description": { "type": "string" },
-        "price": { "type": ["string", "null"] },
+        "price": {
+          "anyOf": [{ "$ref": "#/$defs/decimalString" }, { "type": "null" }]
+        },
         "threshold": { "type": ["string", "null"] },
-        "window_end": { "type": ["string", "null"] }
+        "window_end": {
+          "anyOf": [{ "$ref": "#/$defs/timestampString" }, { "type": "null" }]
+        }
       }
     },
     "keyZone": {
@@ -153,8 +173,8 @@
             "OTHER"
           ]
         },
-        "price_low": { "type": "string" },
-        "price_high": { "type": "string" },
+        "price_low": { "$ref": "#/$defs/decimalString" },
+        "price_high": { "$ref": "#/$defs/decimalString" },
         "note": { "type": "string" }
       }
     },
@@ -185,7 +205,9 @@
         },
         "value": { "type": ["string", "null"] },
         "unit": { "type": "string" },
-        "as_of": { "type": ["string", "null"] },
+        "as_of": {
+          "anyOf": [{ "$ref": "#/$defs/timestampString" }, { "type": "null" }]
+        },
         "ref": { "type": ["string", "null"], "description": "Reference into the supplied CALC metric payload, e.g. cvd.points[12]." },
         "note": { "type": "string" }
       }
@@ -220,12 +242,14 @@
       "additionalProperties": false,
       "required": ["entry_price", "stop_price", "take_profits", "risk_pct", "leverage", "max_notional_usd"],
       "properties": {
-        "entry_price": { "type": "string" },
-        "stop_price": { "type": "string" },
-        "take_profits": { "type": "array", "items": { "type": "string" } },
+        "entry_price": { "$ref": "#/$defs/decimalString" },
+        "stop_price": { "$ref": "#/$defs/decimalString" },
+        "take_profits": { "type": "array", "items": { "$ref": "#/$defs/decimalString" } },
         "risk_pct": { "type": "number" },
         "leverage": { "type": "number" },
-        "max_notional_usd": { "type": ["string", "null"] }
+        "max_notional_usd": {
+          "anyOf": [{ "$ref": "#/$defs/decimalString" }, { "type": "null" }]
+        }
       }
     },
     "opportunity": {
@@ -245,8 +269,8 @@
       ],
       "properties": {
         "side": { "type": "string", "enum": ["LONG", "SHORT"] },
-        "zone_low": { "type": "string" },
-        "zone_high": { "type": "string" },
+        "zone_low": { "$ref": "#/$defs/decimalString" },
+        "zone_high": { "$ref": "#/$defs/decimalString" },
         "entry_preference": { "type": "string", "enum": ["LIMIT", "MARKET", "STOP"] },
         "trigger_conditions": {
           "type": "array",
@@ -256,7 +280,7 @@
           "type": "array",
           "items": { "$ref": "#/$defs/invalidationConditionDraft" }
         },
-        "expires_at": { "type": "string" },
+        "expires_at": { "$ref": "#/$defs/timestampString" },
         "risk_request": { "$ref": "#/$defs/riskRequest" },
         "thesis": { "type": "string" },
         "data_needs": {
@@ -292,13 +316,22 @@
             "leverage"
           ],
           "properties": {
-            "entry_type": { "type": "string", "enum": ["MARKET", "LIMIT"] },
-            "entry_price": { "type": ["string", "null"] },
-            "stop_price": { "type": ["string", "null"] },
-            "take_profits": { "type": "array", "items": { "type": "string" } },
+            "entry_type": { "type": "string", "enum": ["MARKET"] },
+            "entry_price": {
+              "anyOf": [{ "$ref": "#/$defs/decimalString" }, { "type": "null" }]
+            },
+            "stop_price": {
+              "anyOf": [{ "$ref": "#/$defs/decimalString" }, { "type": "null" }]
+            },
+            "take_profits": {
+              "type": "array",
+              "items": { "$ref": "#/$defs/decimalString" }
+            },
             "size_mode": { "type": "string", "enum": ["RISK_PCT", "QUOTE_NOTIONAL"] },
             "risk_pct": { "type": ["number", "null"] },
-            "quote_notional_usd": { "type": ["string", "null"] },
+            "quote_notional_usd": {
+              "anyOf": [{ "$ref": "#/$defs/decimalString" }, { "type": "null" }]
+            },
             "leverage": { "type": ["number", "null"] }
           }
         },
@@ -340,8 +373,10 @@
         "action": { "type": "string", "enum": ["HOLD", "PARTIAL_CLOSE", "FULL_CLOSE", "ADD"] },
         "close_fraction": { "type": ["number", "null"] },
         "add_risk_pct": { "type": ["number", "null"] },
-        "new_stop_price": { "type": ["string", "null"] },
-        "new_targets": { "type": "array", "items": { "type": "string" } },
+        "new_stop_price": {
+          "anyOf": [{ "$ref": "#/$defs/decimalString" }, { "type": "null" }]
+        },
+        "new_targets": { "type": "array", "items": { "$ref": "#/$defs/decimalString" } },
         "rationale": { "type": "string" },
         "urgency": { "type": "string", "enum": ["LOW", "MEDIUM", "HIGH"] }
       }

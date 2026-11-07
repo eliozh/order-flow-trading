@@ -56,12 +56,20 @@ class OpportunityService:
 
     # -- reads -----------------------------------------------------------
 
-    def list(self, *, state: str | None = None, limit: int = 100) -> tuple[Opportunity, ...]:
+    def list(
+        self, *, state: str | None = None, limit: int = 100, offset: int = 0
+    ) -> tuple[Opportunity, ...]:
         normalized = state.upper() if state else None
         return tuple(
             _to_domain(record)
-            for record in self._store.list_opportunities(state=normalized, limit=limit)
+            for record in self._store.list_opportunities(
+                state=normalized, limit=limit, offset=offset
+            )
         )
+
+    def count(self, *, state: str | None = None) -> int:
+        normalized = state.upper() if state else None
+        return self._store.count_opportunities(state=normalized)
 
     def show(self, opportunity_id: str) -> Opportunity:
         record = self._store.get_opportunity(opportunity_id)

@@ -3,12 +3,21 @@
 from __future__ import annotations
 
 import json
+import re
 from pathlib import Path
 
 from oft.api.errors import ERROR_CATALOG
 
 ROOT = Path(__file__).resolve().parents[2]
 CONTRACTS = ROOT / "docs" / "contracts"
+SOURCE = ROOT / "src" / "oft"
+
+# Codes that a route forwards to ``ApiError`` (directly or through a typed
+# application exception whose ``code`` becomes the envelope code).
+_API_CODE_CALL = re.compile(
+    r"(?:ApiError|error_response|EntryRejected|TriggerError|GatewayError)"
+    r'\(\s*"([A-Z][A-Z0-9_]+)"'
+)
 
 
 def _load(name: str) -> dict:
@@ -71,3 +80,26 @@ def test_security_and_scan_codes_are_covered_in_both_directions() -> None:
             entry["retryable"],
         )
     assert set(ERROR_CATALOG) <= set(catalog)
+
+
+def test_every_code_forwarded_to_the_api_is_implemented() -> None:
+    """No route or service may emit a code that ``ERROR_CATALOG`` cannot render.
+
+    The catalog contract covers the whole surface (including codes that are not
+    implemented yet). This guard closes the other direction: a code emitted by
+    the application must have an ``ErrorSpec`` so it cannot become a ``KeyError``
+    -> 500 at the envelope boundary.
+    """
+    emitted: set[str] = set()
+    for path in SOURCE.rglob("*.py"):
+        emitted.update(_API_CODE_CALL.findall(path.read_text(encoding="utf-8")))
+
+    assert emitted
+    assert emitted <= set(ERROR_CATALOG), sorted(emitted - set(ERROR_CATALOG))
+
+
+def test_conflict_is_defined_as_a_409() -> None:
+    spec = ERROR_CATALOG["CONFLICT"]
+
+    assert spec.http_status == 409
+    assert spec.category == "CONFLICT"

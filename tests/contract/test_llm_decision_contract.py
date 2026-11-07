@@ -23,6 +23,7 @@ def test_valid_llm_fixtures_validate_against_the_provider_schema() -> None:
         "entry_recheck_no_entry.json",
         "entry_recheck_stopless.json",
         "entry_recheck_oversized.json",
+        "entry_recheck_far_mark.json",
     ):
         document = json.loads((_helpers.LLM_FIXTURES / name).read_text(encoding="utf-8"))
         errors = list(validator.iter_errors(document))
@@ -35,7 +36,12 @@ def test_invalid_llm_fixtures_fail_the_provider_schema() -> None:
     from oft.application.llm_validation import canonical_schema
 
     validator = Draft202012Validator(canonical_schema())
-    for name in ("invalid_schema.json", "refusal.json", "truncated.json"):
+    for name in (
+        "invalid_schema.json",
+        "refusal.json",
+        "truncated.json",
+        "entry_recheck_far_mark_limit.json",
+    ):
         document = json.loads((_helpers.LLM_FIXTURES / name).read_text(encoding="utf-8"))
         assert list(validator.iter_errors(document)), name
 

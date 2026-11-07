@@ -120,6 +120,8 @@ def test_api_scan_report_opportunity_trigger_accept_paper_loop(tmp_path: Path) -
         replayed_body = replayed.json()
         assert replayed_body["meta"]["idempotent_replay"] is True
         assert replayed_body["data"]["order"]["order_id"] == order_id
+        # A replay reproduces the whole original response, not just the order id.
+        assert replayed_body["data"] == accepted.json()["data"]
 
         orders = client.get("/api/v1/paper/orders", headers=auth).json()["data"]
         fills = client.get("/api/v1/paper/fills", headers=auth).json()["data"]
@@ -251,3 +253,97 @@ def test_oversized_entry_is_reduced_to_the_stricter_cap(tmp_path: Path) -> None:
     assert order[0].payload_json
     payload = json.loads(order[0].payload_json)
     assert payload["quantity"] == "0.028"
+
+
+def test_unknown_opportunity_evaluate_returns_404(tmp_path: Path) -> None:
+    settings = _settings(tmp_path)
+    _seed(settings)
+    app = create_app(settings)
+    auth = _auth(app)
+
+    with TestClient(app) as client:
+        response = client.post(
+            "/api/v1/triggers/evaluate",
+            json={"opportunity_id": "OPP-DOES-NOT-EXIST"},
+            headers={**auth, "Idempotency-Key": "unknown-opportunity"},
+        )
+
+    assert response.status_code == 404, response.text
+    assert response.json()["error"]["code"] == "NOT_FOUND"
+
+
+def test_opportunities_offset_is_applied(tmp_path: Path) -> None:
+    settings = _settings(tmp_path)
+    _seed(settings)
+    app = create_app(settings)
+    auth = _auth(app)
+
+    with TestClient(app) as client:
+        created = client.post(
+            "/api/v1/scans",
+            json={
+                "symbol": "BTCUSDT",
+                "period": "4h",
+                "source": "backfill",
+                "metrics_only": False,
+                "provider": "stub",
+            },
+            headers={**auth, "Idempotency-Key": "scan-pagination"},
+        )
+        assert created.status_code == 201, created.text
+
+        first = client.get("/api/v1/opportunities?limit=100&offset=0", headers=auth).json()
+        second = client.get("/api/v1/opportunities?limit=100&offset=1", headers=auth).json()
+
+    assert len(first["data"]["items"]) == 1
+    assert first["meta"]["pagination"]["total"] == 1
+    assert first["meta"]["pagination"]["has_next"] is False
+    assert second["data"]["items"] == []
+    assert second["meta"]["pagination"]["cursor"] == "1"
+    assert second["meta"]["pagination"]["total"] == 1
+
+
+def test_stub_scan_can_be_accepted_without_a_daemon_provider(tmp_path: Path) -> None:
+    settings = Settings(
+        env="test",
+        port=8765,
+        data_dir=tmp_path / "data",
+        archive_fixture_dir=ARCHIVE,
+        llm_provider=None,
+        llm_fixtures_dir=FIXTURES,
+    )
+    _seed(settings)
+    app = create_app(settings)
+    auth = _auth(app)
+
+    with TestClient(app) as client:
+        created = client.post(
+            "/api/v1/scans",
+            json={
+                "symbol": "BTCUSDT",
+                "period": "4h",
+                "source": "backfill",
+                "metrics_only": False,
+                "provider": "stub",
+            },
+            headers={**auth, "Idempotency-Key": "scan-no-daemon-provider"},
+        )
+        assert created.status_code == 201, created.text
+        opportunity_id = created.json()["data"]["report"]["llm"]["opportunity_ids"][0]
+
+        evaluated = client.post(
+            "/api/v1/triggers/evaluate",
+            json={"opportunity_id": opportunity_id},
+            headers={**auth, "Idempotency-Key": "trigger-no-daemon-provider"},
+        )
+        assert evaluated.status_code == 200, evaluated.text
+        trigger_id = evaluated.json()["data"]["trigger"]["trigger_id"]
+
+        accepted = client.post(
+            f"/api/v1/triggers/{trigger_id}/accept",
+            headers={**auth, "Idempotency-Key": "accept-no-daemon-provider"},
+        )
+
+    assert accepted.status_code == 200, accepted.text
+    assert accepted.json()["data"]["status"] == "ACCEPTED"
+    assert app.state.container.llm_provider is None

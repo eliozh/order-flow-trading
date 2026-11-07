@@ -47,6 +47,7 @@ ERROR_CATALOG: dict[str, ErrorSpec] = {
     "VALIDATION_FAILED": ErrorSpec(
         422, "VALIDATION", False, "One or more request fields failed validation."
     ),
+    "CONFLICT": ErrorSpec(409, "CONFLICT", False, "The request conflicts with the current state."),
     "IDEMPOTENCY_KEY_REQUIRED": ErrorSpec(
         400,
         "CONFLICT",

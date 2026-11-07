@@ -206,6 +206,33 @@ def test_non_numeric_stop_is_not_treated_as_a_side_violation() -> None:
     assert "STOP_SIDE" not in _codes(output)
 
 
+def test_present_but_unparseable_zone_low_is_rejected() -> None:
+    opportunity = dict(BASE["opportunity"])
+    opportunity["zone_low"] = "not-a-number"
+    output = DecisionOutput.model_validate(_output(opportunity=opportunity))
+
+    assert "NUMBER_INVALID" in _codes(output)
+
+
+def test_present_but_unparseable_stop_price_is_rejected() -> None:
+    opportunity = dict(BASE["opportunity"])
+    opportunity["risk_request"] = {
+        **BASE["opportunity"]["risk_request"],
+        "stop_price": "abc",
+    }
+    output = DecisionOutput.model_validate(_output(opportunity=opportunity))
+
+    assert "NUMBER_INVALID" in _codes(output)
+
+
+def test_unparseable_expiry_is_rejected() -> None:
+    opportunity = dict(BASE["opportunity"])
+    opportunity["expires_at"] = "not-a-timestamp"
+    output = DecisionOutput.model_validate(_output(opportunity=opportunity))
+
+    assert "TIMESTAMP_INVALID" in _codes(output)
+
+
 def test_stop_without_a_numeric_entry_is_rejected() -> None:
     opportunity = dict(BASE["opportunity"])
     opportunity["risk_request"] = {
@@ -242,6 +269,7 @@ def test_entry_recheck_fixtures_have_no_semantic_errors() -> None:
         "entry_recheck_no_entry.json",
         "entry_recheck_stopless.json",
         "entry_recheck_oversized.json",
+        "entry_recheck_far_mark.json",
     ):
         output = DecisionOutput.model_validate(_entry_payload(name))
         assert semantic_errors(output, role="ENTRY_RECHECK") == (), name
@@ -265,6 +293,17 @@ def test_enter_decision_requires_an_order_intent() -> None:
     output = DecisionOutput.model_validate(document)
 
     assert "PAYLOAD_MISSING" in {
+        error.code for error in semantic_errors(output, role="ENTRY_RECHECK")
+    }
+
+
+def test_non_market_entry_type_is_rejected() -> None:
+    document = _entry_payload("entry_recheck_enter_long.json")
+    document["entry_recheck"]["order_intent"]["entry_type"] = "LIMIT"
+
+    output = DecisionOutput.model_validate(document)
+
+    assert "ENTRY_TYPE_UNSUPPORTED" in {
         error.code for error in semantic_errors(output, role="ENTRY_RECHECK")
     }
 

@@ -7,8 +7,6 @@ typed ``RESUME`` token (ADR-0006).
 
 from __future__ import annotations
 
-import hashlib
-import json
 import os
 from pathlib import Path
 from typing import Any
@@ -16,7 +14,7 @@ from typing import Any
 from oft.config import Settings
 from oft.domain.time import utc_timestamp
 from oft.ports.clock import ClockPort
-from oft.ports.store import AuditEventRecord, StorePort
+from oft.ports.store import AuditEventDraft, AuditEventRecord, StorePort
 
 KILL_SWITCH_KEY = "kill_switch"
 RESUME_TOKEN = "RESUME"
@@ -40,10 +38,6 @@ class InvalidResumeToken(Exception):
         self.message = message
 
 
-def _canonical(payload: dict[str, Any]) -> str:
-    return json.dumps(payload, sort_keys=True, separators=(",", ":"), ensure_ascii=False)
-
-
 def record_audit(
     store: StorePort,
     *,
@@ -53,33 +47,20 @@ def record_audit(
     payload: dict[str, Any],
     at: str,
 ) -> AuditEventRecord:
-    """Append one hash-chained audit event (previous hash -> event hash)."""
-    previous = store.last_audit_event()
-    seq = 1 if previous is None else previous.seq + 1
-    previous_hash = "0" * 64 if previous is None else previous.event_hash
-    body = {
-        "seq": seq,
-        "event_type": event_type,
-        "actor": actor,
-        "subject": subject,
-        "payload": payload,
-        "created_at": at,
-    }
-    event_hash = hashlib.sha256(f"{previous_hash}:{_canonical(body)}".encode()).hexdigest()
-    event_id = f"AUD-{seq:08d}-{event_hash[:8].upper()}"
-    record = AuditEventRecord(
-        event_id=event_id,
-        seq=seq,
-        event_type=event_type,
-        created_at=at,
-        previous_hash=previous_hash,
-        event_hash=event_hash,
-        payload_json=json.dumps(
-            {"actor": actor, "subject": subject, "payload": payload}, sort_keys=True
-        ),
+    """Append one hash-chained audit event (previous hash -> event hash).
+
+    The store computes the seq/previous hash and inserts inside one
+    ``BEGIN IMMEDIATE`` transaction so concurrent writers cannot collide.
+    """
+    return store.append_audit_event(
+        AuditEventDraft(
+            event_type=event_type,
+            actor=actor,
+            subject=subject,
+            payload=payload,
+            created_at=at,
+        )
     )
-    store.save_audit_event(record)
-    return record
 
 
 class KillSwitch:

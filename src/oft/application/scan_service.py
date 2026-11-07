@@ -23,7 +23,6 @@ from typing import Any, Protocol, cast
 
 import structlog
 
-from oft.adapters.llm_stub import LLMStub
 from oft.adapters.parquet_store import read_liquidations
 from oft.application.analysis_service import AnalysisService
 from oft.application.metric_service import MetricInputs, MetricRequest, MetricService
@@ -42,6 +41,7 @@ from oft.domain.metrics.types import decimal_str
 from oft.domain.metrics.version import MetricVersion, orderflow_metric_version
 from oft.domain.time import utc_timestamp
 from oft.ports.clock import ClockPort
+from oft.ports.llm import LLMPort
 from oft.ports.store import ReportRecord, ScanRecord, StorePort, StoreUnavailableError
 
 logger = structlog.get_logger(__name__)
@@ -113,7 +113,9 @@ class ScanContainer(Protocol):
     def parquet(self) -> Any: ...
 
     @property
-    def llm_provider(self) -> Any | None: ...
+    def llm_provider(self) -> LLMPort | None: ...
+
+    def provider_for(self, requested: str | None = None) -> LLMPort | None: ...
 
 
 @dataclass(frozen=True)
@@ -611,9 +613,14 @@ class ScanService:
                 None,
                 (),
             )
-        provider = container.llm_provider
+        provider = container.provider_for(provider_name)
         if provider is None:
-            provider = LLMStub(fixtures_dir=container.settings.llm_fixtures_dir)
+            return (
+                {"configured": False, "reason": LLM_PROVIDER_NOT_CONFIGURED_REASON},
+                None,
+                None,
+                (),
+            )
         service = AnalysisService(store=container.store, clock=container.clock, provider=provider)
         outcome = service.analyze(
             symbol=request.symbol,

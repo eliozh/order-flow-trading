@@ -14,10 +14,12 @@ from decimal import Decimal
 from pathlib import Path
 
 from oft.config import Settings
+from oft.domain.audit import build_audit_entry
 from oft.domain.data_quality import DataGap, GapSeverity
 from oft.domain.symbols import SymbolContract
 from oft.domain.time import utc_timestamp
 from oft.ports.store import (
+    AuditEventDraft,
     AuditEventRecord,
     BackfillManifestRow,
     BackfillRunRecord,
@@ -2769,6 +2771,21 @@ class SqliteStore:
             connection.close()
         return tuple(_row_to_opportunity(row) for row in rows)
 
+    def count_opportunities(self, *, state: str | None = None) -> int:
+        connection = self._connect_read_only()
+        if connection is None:
+            return 0
+        try:
+            if state is None:
+                row = connection.execute("SELECT COUNT(*) AS total FROM opportunities").fetchone()
+            else:
+                row = connection.execute(
+                    "SELECT COUNT(*) AS total FROM opportunities WHERE state = ?", (state,)
+                ).fetchone()
+        finally:
+            connection.close()
+        return int(row["total"]) if row is not None else 0
+
     def list_opportunity_events(self, opportunity_id: str) -> tuple[OpportunityEventRecord, ...]:
         connection = self._connect_read_only()
         if connection is None:
@@ -2904,8 +2921,14 @@ class SqliteStore:
         fill: FillRecord,
         position: PositionRecord,
         account: PaperAccountRecord,
-    ) -> None:
-        with closing(self._connect()) as connection, connection:
+        audit: AuditEventDraft | None = None,
+    ) -> AuditEventRecord | None:
+        connection = self._connect()
+        try:
+            connection.execute("BEGIN IMMEDIATE")
+            audit_record = (
+                self._insert_audit_event(connection, audit) if audit is not None else None
+            )
             connection.execute(
                 """
                 INSERT INTO orders (
@@ -2977,6 +3000,13 @@ class SqliteStore:
                     account.updated_at,
                 ),
             )
+            connection.commit()
+            return audit_record
+        except BaseException:
+            connection.rollback()
+            raise
+        finally:
+            connection.close()
 
     def get_order(self, order_id: str) -> OrderRecord | None:
         connection = self._connect_read_only()
@@ -3037,6 +3067,18 @@ class SqliteStore:
         finally:
             connection.close()
         return tuple(_row_to_fill(row) for row in rows)
+
+    def get_fill_by_order_id(self, order_id: str) -> FillRecord | None:
+        connection = self._connect_read_only()
+        if connection is None:
+            return None
+        try:
+            row = connection.execute(
+                "SELECT * FROM fills WHERE order_id = ? LIMIT 1", (order_id,)
+            ).fetchone()
+        finally:
+            connection.close()
+        return _row_to_fill(row) if row is not None else None
 
     def list_positions(
         self, *, state: str | None = None, limit: int = 100
@@ -3122,6 +3164,62 @@ class SqliteStore:
                     record.payload_json,
                 ),
             )
+
+    def append_audit_event(self, draft: AuditEventDraft) -> AuditEventRecord:
+        connection = self._connect()
+        try:
+            connection.execute("BEGIN IMMEDIATE")
+            record = self._insert_audit_event(connection, draft)
+            connection.commit()
+            return record
+        except BaseException:
+            connection.rollback()
+            raise
+        finally:
+            connection.close()
+
+    def _insert_audit_event(
+        self, connection: sqlite3.Connection, draft: AuditEventDraft
+    ) -> AuditEventRecord:
+        previous = connection.execute(
+            "SELECT seq, event_hash FROM audit_events ORDER BY seq DESC LIMIT 1"
+        ).fetchone()
+        entry = build_audit_entry(
+            previous_seq=None if previous is None else int(previous["seq"]),
+            previous_hash=None if previous is None else str(previous["event_hash"]),
+            event_type=draft.event_type,
+            actor=draft.actor,
+            subject=draft.subject,
+            payload=draft.payload,
+            created_at=draft.created_at,
+        )
+        record = AuditEventRecord(
+            event_id=entry.event_id,
+            seq=entry.seq,
+            event_type=draft.event_type,
+            created_at=draft.created_at,
+            previous_hash=entry.previous_hash,
+            event_hash=entry.event_hash,
+            payload_json=entry.payload_json,
+        )
+        connection.execute(
+            """
+            INSERT INTO audit_events (
+                event_id, seq, event_type, created_at, previous_hash,
+                event_hash, payload_json
+            ) VALUES (?, ?, ?, ?, ?, ?, ?)
+            """,
+            (
+                record.event_id,
+                record.seq,
+                record.event_type,
+                record.created_at,
+                record.previous_hash,
+                record.event_hash,
+                record.payload_json,
+            ),
+        )
+        return record
 
     def list_audit_events(self, *, limit: int = 100) -> tuple[AuditEventRecord, ...]:
         connection = self._connect_read_only()

@@ -35,7 +35,7 @@ from oft.domain.risk import (
 )
 from oft.domain.time import utc_timestamp
 from oft.ports.clock import ClockPort
-from oft.ports.llm import LLMRequest, LLMResult, LLMRole, LLMUsage
+from oft.ports.llm import LLMPort, LLMRequest, LLMResult, LLMRole, LLMUsage
 from oft.ports.store import (
     DecisionRecord,
     LLMCallRecord,
@@ -98,7 +98,7 @@ class EntryService:
         *,
         store: StorePort,
         clock: ClockPort,
-        provider: Any,
+        provider: LLMPort | None,
         settings: Any,
         kill_switch: KillSwitch,
     ) -> None:
@@ -119,6 +119,11 @@ class EntryService:
     # -- re-check --------------------------------------------------------
 
     def recheck(self, trigger_id: str) -> dict[str, Any]:
+        if self._provider is None:
+            raise EntryRejected(
+                "LLM_PROVIDER_NOT_CONFIGURED",
+                "No LLM provider is configured; the entry re-check cannot run.",
+            )
         trigger = self._trigger(trigger_id)
         payload: dict[str, Any] = json.loads(trigger.payload_json)
         opportunity = self._opportunity(payload["opportunity_id"])
@@ -140,9 +145,10 @@ class EntryService:
         )
         calls: list[LLMCallRecord] = []
         budgets: list[BudgetEntry] = []
+        provider = self._provider
 
         def call_provider(attempt: int, prompt: str) -> LLMResult:
-            result: LLMResult = self._provider.complete(replace(request, user_prompt=prompt))
+            result: LLMResult = provider.complete(replace(request, user_prompt=prompt))
             call_id = stable_call_id(decision_id, attempt)
             call = LLMCallRecord(
                 call_id=call_id,
@@ -286,10 +292,20 @@ class EntryService:
         trigger = self._trigger(trigger_id)
         payload: dict[str, Any] = json.loads(trigger.payload_json)
         if payload["status"] == "ACCEPTED" and payload.get("created_order_id"):
-            return self._replay(payload["created_order_id"])
+            return self._replay(payload["created_order_id"], payload)
         existing_order = self._store.get_order_by_idempotency(idempotency_key)
         if existing_order is not None:
-            return self._replay(existing_order.order_id)
+            existing_payload = json.loads(existing_order.payload_json)
+            risk_verdict_id = str(existing_payload.get("risk_verdict_id") or "")
+            verdict_record = (
+                self._store.get_risk_verdict(risk_verdict_id) if risk_verdict_id else None
+            )
+            if verdict_record is None or verdict_record.trigger_id != trigger_id:
+                raise EntryRejected(
+                    "CONFLICT",
+                    "the idempotency key belongs to a different trigger",
+                )
+            return self._replay(existing_order.order_id, payload)
         if payload["status"] in {"REJECTED", "BLOCKED", "EXPIRED"}:
             raise EntryRejected("CONFLICT", f"trigger is {payload['status']}")
 
@@ -322,9 +338,12 @@ class EntryService:
             raise EntryRejected("ORDER_REJECTED", "entry intent is missing")
 
         opportunity = self._opportunity(payload["opportunity_id"])
-        reference_price = self._reference_price(opportunity)
+        reference_price, mark_as_of = self._mark(opportunity)
         side = PositionSide.LONG if payload["side"] == "LONG" else PositionSide.SHORT
-        entry_price = Decimal(str(intent["entry_price"] or reference_price))
+        # Every accepted entry is filled at the reference mark, so the risk caps
+        # are always sized from that price. The LLM-supplied entry_price is
+        # advisory only and never feeds the risk math.
+        risk_entry_price = reference_price
         stop_price = Decimal(str(intent["stop_price"])) if intent["stop_price"] else None
         risk_pct = float(intent["risk_pct"] or 0.8)
         leverage = float(intent["leverage"] or 1.0)
@@ -339,7 +358,7 @@ class EntryService:
             request=RiskRequest(
                 symbol=payload["symbol"],
                 side=side.value,
-                entry_price=entry_price,
+                entry_price=risk_entry_price,
                 stop_price=stop_price,
                 quantity=None,
                 risk_pct=risk_pct,
@@ -351,7 +370,7 @@ class EntryService:
             open_positions=position_count,
             daily_loss_usd=Decimal("0"),
             mark_price=reference_price,
-            mark_as_of=now,
+            mark_as_of=mark_as_of,
             now=now,
             tick_size=contract.tick_size if contract else Decimal("0"),
             step_size=contract.step_size if contract else Decimal("0"),
@@ -359,7 +378,7 @@ class EntryService:
         )
         risk_verdict_id = f"RISK-{_digest(f'{trigger_id}:{decision.decision_id}')}"
         requested_payload = {
-            "entry_price": str(entry_price),
+            "entry_price": str(risk_entry_price),
             "stop_price": str(stop_price) if stop_price is not None else "0",
             "quantity": None,
             "risk_pct": risk_pct,
@@ -421,7 +440,7 @@ class EntryService:
                 order_intent,
                 AuthContext(actor_id=actor_id, approval_id=approval_id),
                 mark_price=reference_price,
-                mark_as_of=now,
+                mark_as_of=mark_as_of,
             )
         except GatewayError as exc:
             raise EntryRejected(exc.code, exc.message) from exc
@@ -508,7 +527,7 @@ class EntryService:
 
         return OpportunityService(store=self._store, clock=self._clock).show(opportunity_id)
 
-    def _reference_price(self, opportunity: Any) -> Decimal:
+    def _mark(self, opportunity: Any) -> tuple[Decimal, str]:
         report_id = str(opportunity.source.get("report_id", ""))
         report = self._store.get_report(report_id) if report_id else None
         if report is None:
@@ -517,7 +536,10 @@ class EntryService:
         value = snapshot.get("last_price") or snapshot.get("mark_price")
         if value is None:
             raise EntryRejected("DATA_UNAVAILABLE", "the snapshot has no reference price")
-        return Decimal(str(value))
+        as_of = snapshot.get("as_of")
+        if not isinstance(as_of, str) or not as_of:
+            raise EntryRejected("DATA_UNAVAILABLE", "the snapshot has no as_of timestamp")
+        return Decimal(str(value)), as_of
 
     def _prompt(self, payload: dict[str, Any], opportunity: Any) -> tuple[str, str]:
         user = _USER_TEMPLATE.format(
@@ -597,24 +619,20 @@ class EntryService:
         except Exception:  # noqa: BLE001 - the opportunity may already be terminal
             return
 
-    def _replay(self, order_id: str) -> EntryResult:
+    def _replay(self, order_id: str, trigger_payload: dict[str, Any]) -> EntryResult:
         order = self._store.get_order(order_id)
         if order is None:
             raise EntryRejected("ORDER_NOT_FOUND", f"Order {order_id} does not exist.")
         order_payload = json.loads(order.payload_json)
         position_id = order_payload.get("position_id")
-        fill_payloads = [
-            json.loads(fill.payload_json)
-            for fill in self._store.list_fills(limit=100)
-            if fill.order_id == order_id
-        ]
+        fill = self._store.get_fill_by_order_id(order_id)
         position = self._store.get_position(position_id) if position_id else None
         account = self._broker.account()
         return EntryResult(
-            decision_id="",
-            risk_verdict={},
+            decision_id=str(trigger_payload.get("entry_decision_id") or ""),
+            risk_verdict=trigger_payload.get("risk_verdict") or {},
             order=order_payload,
-            fill=fill_payloads[0] if fill_payloads else None,
+            fill=json.loads(fill.payload_json) if fill is not None else None,
             position=json.loads(position.payload_json) if position else None,
             account={
                 "account_id": account.account_id,

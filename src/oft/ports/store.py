@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
-from typing import Protocol
+from typing import Any, Protocol
 
 from oft.domain.data_quality import DataGap
 from oft.domain.symbols import SymbolContract
@@ -371,6 +371,17 @@ class AuditEventRecord:
     payload_json: str
 
 
+@dataclass(frozen=True)
+class AuditEventDraft:
+    """An audit event before the store assigns its chained seq/hash."""
+
+    event_type: str
+    actor: dict[str, Any]
+    subject: dict[str, Any]
+    payload: dict[str, Any]
+    created_at: str
+
+
 class StorePort(Protocol):
     """Persistence contract shared by the API and CLI diagnostics."""
 
@@ -627,6 +638,8 @@ class StorePort(Protocol):
         self, *, state: str | None = None, limit: int = 100, offset: int = 0
     ) -> tuple[OpportunityRecord, ...]: ...
 
+    def count_opportunities(self, *, state: str | None = None) -> int: ...
+
     def list_opportunity_events(
         self, opportunity_id: str
     ) -> tuple[OpportunityEventRecord, ...]: ...
@@ -658,7 +671,8 @@ class StorePort(Protocol):
         fill: FillRecord,
         position: PositionRecord,
         account: PaperAccountRecord,
-    ) -> None: ...
+        audit: AuditEventDraft | None = None,
+    ) -> AuditEventRecord | None: ...
 
     def get_order(self, order_id: str) -> OrderRecord | None: ...
 
@@ -669,6 +683,8 @@ class StorePort(Protocol):
     def list_orders(self, *, limit: int = 100) -> tuple[OrderRecord, ...]: ...
 
     def list_fills(self, *, limit: int = 100) -> tuple[FillRecord, ...]: ...
+
+    def get_fill_by_order_id(self, order_id: str) -> FillRecord | None: ...
 
     def list_positions(
         self, *, state: str | None = None, limit: int = 100
@@ -683,6 +699,8 @@ class StorePort(Protocol):
     # -- Audit and system state ------------------------------------------
 
     def save_audit_event(self, record: AuditEventRecord) -> None: ...
+
+    def append_audit_event(self, draft: AuditEventDraft) -> AuditEventRecord: ...
 
     def list_audit_events(self, *, limit: int = 100) -> tuple[AuditEventRecord, ...]: ...
 
