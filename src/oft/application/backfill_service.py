@@ -31,6 +31,7 @@ from oft.adapters.archive import (
 )
 from oft.adapters.parquet_store import recover_orphan_parts
 from oft.application.gap_detection import SUPPORTED_DATA_TYPES, detect_backfill_gaps
+from oft.application.rate_limiter import GlobalRateLimiter
 from oft.config import Settings
 from oft.domain.events import AggTrade
 from oft.domain.time import utc_timestamp
@@ -167,12 +168,14 @@ class BackfillService:
         parquet: ParquetWriterPort,
         store: StorePort,
         clock: ClockPort,
+        rate_limiter: GlobalRateLimiter | None = None,
     ) -> None:
         self._settings = settings
         self._archive = archive
         self._parquet = parquet
         self._store = store
         self._clock = clock
+        self._rate_limiter = rate_limiter
         self._progress_interval_seconds = 5.0
 
     # -- Estimation ------------------------------------------------------

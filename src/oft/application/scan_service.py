@@ -70,8 +70,16 @@ class ScanValidationError(ScanError):
 class ScanAlreadyRunning(ScanError):
     code = "SCAN_ALREADY_RUNNING"
 
-    def __init__(self, message: str = "A scan is already running.") -> None:
+    def __init__(
+        self,
+        message: str = "A scan is already running.",
+        *,
+        running_scan_id: str | None = None,
+    ) -> None:
+        if running_scan_id:
+            message = f"{message} Running scan: {running_scan_id}"
         super().__init__(message)
+        self.running_scan_id = running_scan_id
 
 
 class ScanDataUnavailable(ScanError):
@@ -106,6 +114,7 @@ class ScanRequest:
     metrics_only: bool = True
     start: date | None = None
     end: date | None = None
+    trigger_source: str = "MANUAL"
 
     def __post_init__(self) -> None:
         if _SYMBOL_PATTERN.fullmatch(self.symbol) is None:
@@ -391,15 +400,15 @@ class ScanService:
         self._lock = lock or threading.Lock()
         self._inputs = inputs
 
-    def run(self, request: ScanRequest) -> ScanRun:
+    def run(self, request: ScanRequest, *, scan_id: str | None = None) -> ScanRun:
         if not self._lock.acquire(blocking=False):
             raise ScanAlreadyRunning()
         try:
-            return self._run_locked(request)
+            return self._run_locked(request, scan_id=scan_id)
         finally:
             self._lock.release()
 
-    def _run_locked(self, request: ScanRequest) -> ScanRun:
+    def _run_locked(self, request: ScanRequest, *, scan_id: str | None = None) -> ScanRun:
         container = self._container
         store = container.store
         clock = container.clock
@@ -416,11 +425,11 @@ class ScanService:
             raise ScanValidationError(f"Symbol {request.symbol} is not in the symbol registry.")
         tick_size = contract.tick_size
         scan = ScanRecord(
-            scan_id=_scan_id(started),
+            scan_id=scan_id or _scan_id(started),
             symbol=request.symbol,
             period=request.period,
             status="RUNNING",
-            trigger_source="MANUAL",
+            trigger_source=request.trigger_source,
             metrics_only=True,
             fixture_path="",
             started_at=utc_timestamp(started),
