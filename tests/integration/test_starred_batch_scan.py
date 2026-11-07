@@ -20,7 +20,7 @@ from oft.config import Settings
 from oft.domain.events import AggTrade
 from oft.domain.time import utc_timestamp
 from oft.ports.llm import LLMRole
-from oft.ports.store import ScanSymbolRecord
+from oft.ports.store import ScanRecord, ScanSymbolRecord
 
 ROOT = Path(__file__).resolve().parents[2]
 ARCHIVE = ROOT / "tests" / "fixtures" / "archive"
@@ -289,6 +289,238 @@ def test_reclaimed_batch_resumes_only_unfinished_symbols(tmp_path: Path) -> None
     assert container.store.get_job_run(run_id).status == "DONE"  # type: ignore[union-attr]
     stages = {row.symbol: row.stage for row in container.store.list_scan_symbols(run_id)}
     assert stages == {"BTCUSDT": "DONE", "ETHUSDT": "DONE"}
+
+
+def _child_scan(
+    scan_id: str,
+    symbol: str,
+    *,
+    batch_id: str | None,
+    created_at: str,
+    trade_count: int = 7,
+    data_quality: str = "COMPLETE",
+) -> ScanRecord:
+    return ScanRecord(
+        scan_id=scan_id,
+        symbol=symbol,
+        period="4h",
+        status="DONE",
+        trigger_source="MANUAL",
+        metrics_only=False,
+        fixture_path="",
+        started_at="2026-11-07T08:00:00.000Z",
+        finished_at="2026-11-07T08:01:00.000Z",
+        window_start="2026-10-01T00:00:00.000Z",
+        window_end="2026-10-08T00:00:00.000Z",
+        trade_count=trade_count,
+        buy_volume="1",
+        sell_volume="1",
+        delta="0",
+        cvd="0",
+        data_quality=data_quality,
+        manifest_path="part.parquet",
+        parquet_rows=trade_count,
+        created_at=created_at,
+        report_id=None,
+        source_mode="BACKFILL",
+        batch_id=batch_id,
+    )
+
+
+def _done_row(scan_id: str, symbol: str) -> ScanSymbolRecord:
+    return ScanSymbolRecord(
+        scan_id=scan_id,
+        symbol=symbol,
+        stage="DONE",
+        started_at=utc_timestamp(NOW),
+        finished_at=utc_timestamp(NOW),
+        error_code=None,
+        report_id=f"RPT-{symbol}",
+        data_quality="COMPLETE",
+    )
+
+
+def test_batch_children_survive_more_than_500_newer_scans(tmp_path: Path) -> None:
+    settings = _seed(tmp_path)
+    container = build_container(settings, initialize=True)
+    ledger = JobLedger(store=container.store, clock=FixedClock(NOW))
+    run_id = "SCAN-OLD-BATCH"
+    claim = ledger.claim(
+        "scan",
+        utc_timestamp(WINDOW),
+        trigger_source="MANUAL",
+        owner="old-batch",
+        run_id=run_id,
+    )
+    assert claim.claimed
+    for symbol in ("BTCUSDT", "ETHUSDT"):
+        container.store.save_scan(
+            _child_scan(
+                f"SCAN-{symbol}-CHILD",
+                symbol,
+                batch_id=run_id,
+                created_at="2026-11-07T08:00:00.000Z",
+                trade_count=7,
+            )
+        )
+        container.store.upsert_scan_symbol(_done_row(run_id, symbol))
+    # Push the batch's children out of any "newest 500 scans" window.
+    base = NOW + timedelta(hours=1)
+    for index in range(520):
+        container.store.save_scan(
+            _child_scan(
+                f"SCAN-FILLER-{index:04d}",
+                "SOLUSDT",
+                batch_id=None,
+                created_at=utc_timestamp(base + timedelta(seconds=index)),
+            )
+        )
+
+    harness = _harness(settings)
+    try:
+        detail = harness.client.get(f"/api/v1/scans/{run_id}", headers=harness.auth)
+        listed = harness.client.get("/api/v1/scans", headers=harness.auth)
+    finally:
+        harness.client.close()
+
+    assert detail.status_code == 200, detail.text
+    data = detail.json()["data"]
+    assert data["trade_count"] == 14
+    assert data["window_start"] == "2026-10-01T00:00:00.000Z"
+    assert data["window_end"] == "2026-10-08T00:00:00.000Z"
+    assert data["data_quality"] == "COMPLETE"
+    assert data["source_mode"] == "BACKFILL"
+    assert data["period"] == "4h"
+    assert {row["symbol"] for row in data["symbols"]} == {"BTCUSDT", "ETHUSDT"}
+    items = listed.json()["data"]["items"]
+    assert any(item["scan_id"] == run_id for item in items)
+
+
+def test_resume_metrics_only_partial_batch_skips_the_llm(tmp_path: Path) -> None:
+    settings = _seed(tmp_path)
+    container = build_container(settings, initialize=True)
+    ledger = JobLedger(store=container.store, clock=FixedClock(NOW))
+    claim = ledger.claim_scan(
+        trigger_source="MANUAL",
+        owner="manual-owner",
+        run_id="SCAN-METRICS-ONLY",
+        metrics_only=True,
+    )
+    assert claim.claimed and claim.run is not None
+    run_id = claim.run.run_id
+    container.store.upsert_scan_symbol(_done_row(run_id, "BTCUSDT"))
+
+    later = FixedClock(NOW + timedelta(seconds=60))
+    outcome = ScheduledScanRunner(container=container, clock=later).resume(run_id, period="4h")
+
+    assert outcome.claimed is True
+    assert [scan.symbol for scan in outcome.scans] == ["ETHUSDT"]
+    assert container.store.list_llm_calls() == ()
+    assert container.store.get_job_run(run_id).status == "DONE"  # type: ignore[union-attr]
+
+
+def _single_symbol_claim(container: Any, *, run_id: str, **options: Any) -> Any:
+    """Claim a crashed single-symbol run, mirroring the POST path's scope."""
+    ledger = JobLedger(store=container.store, clock=FixedClock(NOW))
+    claim = ledger.claim_scan(
+        trigger_source="MANUAL",
+        owner=run_id,
+        run_id=run_id,
+        **options,
+    )
+    assert claim.claimed and claim.run is not None
+    return claim.run
+
+
+def _non_terminal_row(scan_id: str, symbol: str, stage: str) -> ScanSymbolRecord:
+    return ScanSymbolRecord(
+        scan_id=scan_id,
+        symbol=symbol,
+        stage=stage,
+        started_at=utc_timestamp(NOW),
+        finished_at=None,
+        error_code=None,
+        report_id=None,
+        data_quality=None,
+    )
+
+
+def test_resume_single_symbol_metrics_only_live_keeps_scope_and_options(
+    tmp_path: Path,
+) -> None:
+    settings = _seed(tmp_path)
+    container = build_container(settings, initialize=True)
+    run = _single_symbol_claim(
+        container,
+        run_id="SCAN-SINGLE-LIVE",
+        source="live",
+        metrics_only=True,
+        provider="stub",
+        symbol="BTCUSDT",
+    )
+    persisted = container.store.get_job_run(run.run_id)
+    assert persisted is not None
+    assert persisted.symbol == "BTCUSDT"
+    assert persisted.source == "live"
+    assert persisted.metrics_only is True
+    assert persisted.provider == "stub"
+    container.store.upsert_scan_symbol(_non_terminal_row(run.run_id, "BTCUSDT", "METRICS"))
+
+    later = FixedClock(NOW + timedelta(seconds=60))
+    outcome = ScheduledScanRunner(container=container, clock=later).resume(run.run_id, period="4h")
+
+    assert outcome.claimed is True
+    assert [scan.symbol for scan in outcome.scans] == ["BTCUSDT"]
+    assert outcome.scans[0].source_mode == "LIVE"
+    assert outcome.scans[0].metrics_only is True
+    assert [report.symbol for report in container.store.list_reports()] == ["BTCUSDT"]
+    assert container.store.list_llm_calls() == ()
+    stages = {row.symbol: row.stage for row in container.store.list_scan_symbols(run.run_id)}
+    assert stages == {"BTCUSDT": "DONE"}
+    assert container.store.get_job_run(run.run_id).status == "DONE"  # type: ignore[union-attr]
+
+
+def test_resume_single_symbol_llm_run_scans_only_its_symbol(tmp_path: Path) -> None:
+    settings = _seed(tmp_path)
+    container = build_container(settings, initialize=True)
+    run = _single_symbol_claim(
+        container,
+        run_id="SCAN-SINGLE-LLM",
+        source="backfill",
+        metrics_only=False,
+        provider="stub",
+        symbol="BTCUSDT",
+    )
+    container.store.upsert_scan_symbol(_non_terminal_row(run.run_id, "BTCUSDT", "LLM"))
+
+    later = FixedClock(NOW + timedelta(seconds=60))
+    outcome = ScheduledScanRunner(container=container, clock=later).resume(run.run_id, period="4h")
+
+    assert outcome.claimed is True
+    assert [scan.symbol for scan in outcome.scans] == ["BTCUSDT"]
+    assert [report.symbol for report in container.store.list_reports()] == ["BTCUSDT"]
+    assert container.store.list_llm_calls()  # the LLM stage ran for the scoped symbol
+    assert {row.symbol for row in container.store.list_scan_symbols(run.run_id)} == {"BTCUSDT"}
+    assert container.store.get_job_run(run.run_id).status == "DONE"  # type: ignore[union-attr]
+
+
+def test_reclaimed_batch_runs_a_symbol_that_never_wrote_a_row(tmp_path: Path) -> None:
+    settings = _seed(tmp_path)
+    container = build_container(settings, initialize=True)
+    ledger = JobLedger(store=container.store, clock=FixedClock(NOW))
+    claim = ledger.claim(
+        "scan", utc_timestamp(WINDOW), owner="crashed", trigger_source="SCHEDULED", lease_seconds=10
+    )
+    assert claim.claimed and claim.run is not None
+    run_id = claim.run.run_id
+    container.store.upsert_scan_symbol(_done_row(run_id, "BTCUSDT"))
+
+    later = FixedClock(NOW + timedelta(seconds=60))
+    outcome = ScheduledScanRunner(container=container, clock=later).run_window(WINDOW, period="4h")
+
+    assert outcome.claimed is True
+    assert [scan.symbol for scan in outcome.scans] == ["ETHUSDT"]
+    assert container.store.get_job_run(run_id).status == "DONE"  # type: ignore[union-attr]
 
 
 def test_batch_detail_exposes_quality_window_and_per_symbol_stage_columns(

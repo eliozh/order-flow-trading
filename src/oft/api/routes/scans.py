@@ -253,15 +253,12 @@ def _batch_status(rows: tuple[ScanSymbolRecord, ...], *, running: bool) -> str:
 
 
 def _batch_children(container: Any, run_id: str) -> tuple[ScanRecord, ...]:
-    return tuple(
-        record
-        for record in container.store.list_scans(limit=500)
-        if (record.batch_id or record.scan_id) == run_id
-    )
+    """One indexed lookup per batch (never a scan of the newest 500 rows)."""
+    children: tuple[ScanRecord, ...] = container.store.list_scans_by_batch(run_id)
+    return children
 
 
-def _batch_period(container: Any, run_id: str) -> str:
-    children = _batch_children(container, run_id)
+def _batch_period(children: tuple[ScanRecord, ...]) -> str:
     if children:
         return str(children[0].period)
     return "4h"
@@ -305,7 +302,7 @@ def _batch_scan_payload(
     """Render a batch job run with its per-symbol stages and cost totals."""
     rows = container.store.list_scan_symbols(run.run_id)
     children = _batch_children(container, run.run_id)
-    resolved_period = period or _batch_period(container, run.run_id)
+    resolved_period = period or _batch_period(children)
     status = _batch_status(rows, running=run.status == "RUNNING")
     completed = sum(1 for row in rows if row.stage == "DONE")
     degraded = sum(1 for row in rows if row.stage == "DEGRADED")
@@ -452,7 +449,16 @@ def _run_metrics_scan(request: Request, payload: ScanCreateRequest) -> dict[str,
     container = request.app.state.container
     ledger = JobLedger(store=container.store, clock=container.clock)
     scan_id = _scan_id(container.clock.now())
-    claim = ledger.claim_scan(trigger_source="MANUAL", owner=scan_id, run_id=scan_id)
+    assert payload.symbol is not None
+    claim = ledger.claim_scan(
+        trigger_source="MANUAL",
+        owner=scan_id,
+        run_id=scan_id,
+        source=payload.source,
+        metrics_only=payload.metrics_only,
+        provider=payload.provider,
+        symbol=payload.symbol,
+    )
     if not claim.claimed:
         conflict = ScanAlreadyRunning(running_scan_id=claim.running_scan_id)
         raise ApiError(

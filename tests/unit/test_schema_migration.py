@@ -80,7 +80,7 @@ def test_v1_database_upgrades_to_v2_with_effective_checks(tmp_path: Path) -> Non
     finally:
         connection.close()
 
-    assert versions == {1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11}
+    assert versions == {1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13}
 
 
 _V2_BACKFILL = """
@@ -138,7 +138,7 @@ def test_v2_database_gains_the_backfill_heartbeat_column(tmp_path: Path) -> None
 
     assert "updated_at" in columns
     assert updated_at == "2026-11-06T00:00:00.000Z"
-    assert versions == {1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11}
+    assert versions == {1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13}
 
 
 def test_v5_checks_indexes_and_foreign_keys(tmp_path: Path) -> None:
@@ -235,7 +235,7 @@ def test_v5_database_migrates_manifest_metrics_columns(tmp_path: Path) -> None:
 
     assert {"metric_version", "input_manifest_hash", "window_start", "window_end"} <= columns
     assert legacy == ("/tmp/legacy.parquet", None, None)
-    assert versions == {1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11}
+    assert versions == {1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13}
 
 
 def test_v6_database_migrates_starred_columns(tmp_path: Path) -> None:
@@ -294,7 +294,7 @@ def test_v6_database_migrates_starred_columns(tmp_path: Path) -> None:
 
     assert {"starred", "starred_at"} <= columns
     assert row == ("BTCUSDT", 0, None)
-    assert versions == {1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11}
+    assert versions == {1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13}
 
 
 def test_manifest_run_metadata_columns_are_added_idempotently(tmp_path: Path) -> None:
@@ -311,4 +311,70 @@ def test_manifest_run_metadata_columns_are_added_idempotently(tmp_path: Path) ->
         connection.close()
 
     assert {"run_id", "last_n", "recomputed_from", "parent_run_id"} <= columns
-    assert versions == {1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11}
+    assert versions == {1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13}
+
+
+_V12_JOB_RUNS = """
+CREATE TABLE schema_migrations (
+    version INTEGER PRIMARY KEY,
+    applied_at TEXT NOT NULL
+);
+INSERT INTO schema_migrations (version, applied_at)
+    VALUES (1,'t'),(2,'t'),(3,'t'),(4,'t'),(5,'t'),(6,'t'),(7,'t'),
+           (8,'t'),(9,'t'),(10,'t'),(11,'t'),(12,'t');
+CREATE TABLE job_runs (
+    run_id TEXT PRIMARY KEY,
+    job_type TEXT NOT NULL,
+    window_start TEXT NOT NULL,
+    status TEXT NOT NULL,
+    trigger_source TEXT NOT NULL,
+    started_at TEXT NOT NULL,
+    finished_at TEXT,
+    error_code TEXT,
+    message TEXT,
+    lease_owner TEXT NOT NULL,
+    lease_expires_at TEXT NOT NULL,
+    heartbeat_at TEXT NOT NULL,
+    source TEXT NOT NULL DEFAULT 'backfill',
+    metrics_only INTEGER NOT NULL DEFAULT 0,
+    provider TEXT,
+    UNIQUE (job_type, window_start)
+);
+INSERT INTO job_runs (
+    run_id, job_type, window_start, status, trigger_source, started_at,
+    finished_at, error_code, message, lease_owner, lease_expires_at, heartbeat_at,
+    source, metrics_only, provider
+) VALUES (
+    'JOB-1', 'scan', '2026-11-07T08:00:00.000Z', 'DONE', 'SCHEDULED', 't',
+    't', NULL, NULL, 'owner', 't', 't', 'backfill', 0, NULL
+);
+"""
+
+
+def test_v12_database_gains_the_job_run_scope_symbol_column(tmp_path: Path) -> None:
+    settings = Settings(env="test", port=8765, data_dir=tmp_path / "data")
+    settings.data_dir.mkdir(parents=True)
+    connection = sqlite3.connect(database_path(settings))
+    try:
+        connection.executescript(_V12_JOB_RUNS)
+        connection.commit()
+    finally:
+        connection.close()
+
+    store = SqliteStore(settings)
+    store.initialize()
+    store.initialize()
+
+    connection = sqlite3.connect(database_path(settings))
+    try:
+        columns = {row[1] for row in connection.execute("PRAGMA table_info(job_runs)")}
+        symbol = connection.execute(
+            "SELECT symbol FROM job_runs WHERE run_id = 'JOB-1'"
+        ).fetchone()[0]
+        versions = {row[0] for row in connection.execute("SELECT version FROM schema_migrations")}
+    finally:
+        connection.close()
+
+    assert "symbol" in columns
+    assert symbol is None  # pre-v13 batch rows keep a null (batch) scope
+    assert versions == {1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13}

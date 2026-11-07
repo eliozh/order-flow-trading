@@ -1,4 +1,4 @@
-import { useEffect, useState } from 'react'
+import { useCallback, useEffect, useRef, useState } from 'react'
 
 import {
   fetchScans,
@@ -129,51 +129,71 @@ export function ScansPage({
   const [load, setLoad] = useState<ScansState>({ state: 'loading', items: [], total: 0 })
   const [trigger, setTrigger] = useState<TriggerState>({ state: 'idle' })
   const compact = useCompact(isCompact)
+  const mounted = useRef(true)
+  const triggerInFlight = useRef(false)
 
-  useEffect(() => {
-    let active = true
-    fetchScansFn()
-      .then((envelope) => {
-        if (!active) {
-          return
-        }
-        if (!envelope.data) {
-          setLoad({
-            state: 'error',
-            items: [],
-            total: 0,
-            message: 'Scan list response was empty.',
-          })
-          return
-        }
-        setLoad({ state: 'ready', items: envelope.data.items, total: envelope.data.total })
+  const loadScans = useCallback(async () => {
+    try {
+      const envelope = await fetchScansFn()
+      if (!mounted.current) {
+        return
+      }
+      if (!envelope.data) {
+        setLoad({
+          state: 'error',
+          items: [],
+          total: 0,
+          message: 'Scan list response was empty.',
+        })
+        return
+      }
+      setLoad({ state: 'ready', items: envelope.data.items, total: envelope.data.total })
+    } catch (error: unknown) {
+      if (!mounted.current) {
+        return
+      }
+      setLoad({
+        state: 'error',
+        items: [],
+        total: 0,
+        message: error instanceof Error ? error.message : 'Unknown error',
       })
-      .catch((error: unknown) => {
-        if (active) {
-          setLoad({
-            state: 'error',
-            items: [],
-            total: 0,
-            message: error instanceof Error ? error.message : 'Unknown error',
-          })
-        }
-      })
-    return () => {
-      active = false
     }
   }, [fetchScansFn])
 
+  useEffect(() => {
+    mounted.current = true
+    setLoad({ state: 'loading', items: [], total: 0 })
+    void loadScans()
+    return () => {
+      mounted.current = false
+    }
+  }, [loadScans])
+
   async function onRun() {
+    if (triggerInFlight.current) {
+      return
+    }
+    triggerInFlight.current = true
     setTrigger({ state: 'running' })
     try {
       const envelope = await triggerScanFn()
+      // POST /api/v1/scans runs the batch synchronously; refresh the history
+      // and schedule card so the finished run appears without a reload.
+      await loadScans()
       const scanId = envelope.data?.scan_id ?? 'scan'
-      setTrigger({ state: 'done', message: `${scanId} queued` })
+      if (mounted.current) {
+        setTrigger({ state: 'done', message: `${scanId} scan finished` })
+      }
     } catch (error: unknown) {
-      setTrigger({
-        state: 'error',
-        message: error instanceof Error ? error.message : 'Manual scan failed.',
-      })
+      if (mounted.current) {
+        setTrigger({
+          state: 'error',
+          message: error instanceof Error ? error.message : 'Manual scan failed.',
+        })
+      }
+    } finally {
+      triggerInFlight.current = false
     }
   }
 
@@ -230,7 +250,8 @@ export function ScansPage({
               type="button"
               className="btn"
               onClick={onRun}
-              disabled={trigger.state === 'running'}
+              aria-disabled={trigger.state === 'running'}
+              aria-busy={trigger.state === 'running'}
             >
               Run scan now
             </button>

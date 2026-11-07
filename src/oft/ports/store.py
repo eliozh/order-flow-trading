@@ -190,6 +190,10 @@ class JobRunRecord:
     lease_owner: str
     lease_expires_at: str
     heartbeat_at: str
+    source: str = "backfill"
+    metrics_only: bool = False
+    provider: str | None = None
+    symbol: str | None = None
 
 
 @dataclass(frozen=True)
@@ -414,6 +418,8 @@ class StorePort(Protocol):
     def latest_scan(self) -> ScanRecord | None: ...
 
     def list_scans(self, limit: int = 20, offset: int = 0) -> tuple[ScanRecord, ...]: ...
+
+    def list_scans_by_batch(self, batch_id: str) -> tuple[ScanRecord, ...]: ...
 
     def count_scans(self) -> int: ...
 

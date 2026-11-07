@@ -19,6 +19,10 @@ interface ScanState {
 
 type StageState = 'DONE' | 'RUNNING' | 'PENDING' | 'FAILED' | 'SKIPPED'
 
+/** How often a RUNNING/QUEUED batch refreshes the detail snapshot. */
+export const SCAN_POLL_INTERVAL_MS = 5000
+const ACTIVE_SCAN_STATUSES = new Set(['RUNNING', 'QUEUED'])
+
 const CHIP_CLASS: Record<StageState, string> = {
   DONE: 'chip chip--ok',
   RUNNING: 'chip',
@@ -221,6 +225,32 @@ export function ScanDetailPage({
       active = false
     }
   }, [scanId, fetchScanFn])
+
+  const activeStatus = load.state === 'ready' ? load.scan?.status : undefined
+  const polling = activeStatus !== undefined && ACTIVE_SCAN_STATUSES.has(activeStatus)
+
+  useEffect(() => {
+    if (!polling) {
+      return
+    }
+    let active = true
+    const timer = setInterval(() => {
+      fetchScanFn(scanId)
+        .then((envelope) => {
+          if (!active || !envelope.data) {
+            return
+          }
+          setLoad({ state: 'ready', scan: envelope.data })
+        })
+        .catch(() => {
+          // Keep the last good snapshot; the next tick retries.
+        })
+    }, SCAN_POLL_INTERVAL_MS)
+    return () => {
+      active = false
+      clearInterval(timer)
+    }
+  }, [polling, scanId, fetchScanFn])
 
   if (load.state === 'loading') {
     return (
@@ -454,9 +484,11 @@ export function ScanDetailPage({
         </section>
       )}
 
-      <p className="panel-foot" role="status">
-        Stages update in place while a scan runs; no fabricated percentage is shown.
-      </p>
+      {polling && (
+        <p className="panel-foot" role="status">
+          Stages update in place while a scan runs; no fabricated percentage is shown.
+        </p>
+      )}
     </section>
   )
 }

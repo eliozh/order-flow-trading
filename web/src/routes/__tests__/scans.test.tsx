@@ -1,8 +1,8 @@
-import { fireEvent, render, screen, waitFor, within } from '@testing-library/react'
-import { describe, expect, it, vi } from 'vitest'
+import { act, fireEvent, render, screen, waitFor, within } from '@testing-library/react'
+import { afterEach, describe, expect, it, vi } from 'vitest'
 
 import type { ApiMeta, ScanData, ScanEnvelope, ScanListEnvelope } from '../../api/scans'
-import { ScanDetailPage } from '../scan-detail'
+import { SCAN_POLL_INTERVAL_MS, ScanDetailPage } from '../scan-detail'
 import { ScansPage } from '../scans'
 
 const meta: ApiMeta = {
@@ -60,6 +60,9 @@ function detailEnvelope(data: ScanData): ScanEnvelope {
 }
 
 describe('ScansPage', () => {
+  afterEach(() => {
+    vi.useRealTimers()
+  })
   it('shows the LLM stage, cost, and a report link for each scan', async () => {
     render(<ScansPage fetchScansFn={async () => listEnvelope([scan()])} />)
 
@@ -181,7 +184,64 @@ describe('ScansPage', () => {
     fireEvent.click(button)
 
     await waitFor(() => expect(triggerScanFn).toHaveBeenCalledTimes(1))
-    expect(await screen.findByText(/ABCD1234 queued/)).toBeInTheDocument()
+    // The POST runs the batch synchronously, so the result is a finished scan.
+    expect(await screen.findByText(/ABCD1234 scan finished/)).toBeInTheDocument()
+  })
+
+  it('refetches the history after a successful trigger', async () => {
+    const fresh = scan({ scan_id: 'SCAN-NEW-0001', status: 'COMPLETE' })
+    const fetchScansFn = vi
+      .fn<() => Promise<ScanListEnvelope>>()
+      .mockResolvedValueOnce(listEnvelope([scan()]))
+      .mockResolvedValueOnce(listEnvelope([fresh]))
+    const triggerScanFn = vi.fn(async () => detailEnvelope(fresh))
+    render(<ScansPage fetchScansFn={fetchScansFn} triggerScanFn={triggerScanFn} />)
+
+    const button = await screen.findByRole('button', { name: /run scan now/i })
+    fireEvent.click(button)
+
+    await waitFor(() => expect(fetchScansFn).toHaveBeenCalledTimes(2))
+    expect(await screen.findByText('SCAN-NEW-0001')).toBeInTheDocument()
+    expect(screen.getByText(/scan finished/)).toBeInTheDocument()
+  })
+
+  it('keeps keyboard focus and announces status while a trigger is in flight', async () => {
+    // @testing-library/user-event is not a dependency of this workspace, so
+    // simulate a focused button receiving a native Enter activation (keydown
+    // followed by the click the browser synthesises).
+    let resolveTrigger: ((value: ScanEnvelope) => void) | undefined
+    const triggerScanFn = vi.fn(
+      () =>
+        new Promise<ScanEnvelope>((resolve) => {
+          resolveTrigger = resolve
+        }),
+    )
+    const fetchScansFn = vi.fn<() => Promise<ScanListEnvelope>>(async () => listEnvelope([]))
+    render(<ScansPage fetchScansFn={fetchScansFn} triggerScanFn={triggerScanFn} />)
+
+    const button = await screen.findByRole('button', { name: /run scan now/i })
+    button.focus()
+    expect(button).toHaveFocus()
+
+    fireEvent.keyDown(button, { key: 'Enter' })
+    fireEvent.click(button)
+    await waitFor(() => expect(triggerScanFn).toHaveBeenCalledTimes(1))
+    // The focused button is not disabled; it advertises busy state instead.
+    expect(button).not.toBeDisabled()
+    expect(button).toHaveAttribute('aria-disabled', 'true')
+    expect(button).toHaveAttribute('aria-busy', 'true')
+    expect(button).toHaveFocus()
+
+    // A second activation while in flight must not start a duplicate run.
+    fireEvent.click(button)
+    expect(triggerScanFn).toHaveBeenCalledTimes(1)
+
+    await act(async () => {
+      resolveTrigger?.(detailEnvelope(scan()))
+    })
+    await waitFor(() => expect(screen.getByText(/scan finished/)).toBeInTheDocument())
+    expect(button).toHaveAttribute('aria-disabled', 'false')
+    expect(button).toHaveFocus()
   })
 })
 
@@ -279,5 +339,45 @@ describe('ScanDetailPage', () => {
     expect(await screen.findByRole('heading', { name: detail.scan_id })).toBeInTheDocument()
     const page = container.querySelector('section[aria-labelledby="scan-heading"]')
     expect(page).toHaveAttribute('data-readonly', 'true')
+  })
+
+  it('refetches while RUNNING and stops once the scan is terminal', async () => {
+    vi.useFakeTimers()
+    try {
+      const running = scan({ status: 'RUNNING', finished_at: '' })
+      const done = scan({ status: 'DONE' })
+      const fetchScanFn = vi
+        .fn()
+        .mockResolvedValueOnce(detailEnvelope(running))
+        .mockResolvedValueOnce(detailEnvelope(running))
+        .mockResolvedValueOnce(detailEnvelope(done))
+      render(<ScanDetailPage scanId={running.scan_id} fetchScanFn={fetchScanFn} />)
+
+      await act(async () => {
+        await vi.advanceTimersByTimeAsync(0)
+      })
+      expect(fetchScanFn).toHaveBeenCalledTimes(1)
+      expect(screen.getByText(/Stages update in place/)).toBeInTheDocument()
+
+      await act(async () => {
+        await vi.advanceTimersByTimeAsync(SCAN_POLL_INTERVAL_MS)
+      })
+      expect(fetchScanFn).toHaveBeenCalledTimes(2)
+      expect(screen.getByText(/Stages update in place/)).toBeInTheDocument()
+
+      await act(async () => {
+        await vi.advanceTimersByTimeAsync(SCAN_POLL_INTERVAL_MS)
+      })
+      expect(fetchScanFn).toHaveBeenCalledTimes(3)
+      // Terminal status stops polling and removes the in-place footer.
+      expect(screen.queryByText(/Stages update in place/)).not.toBeInTheDocument()
+
+      await act(async () => {
+        await vi.advanceTimersByTimeAsync(SCAN_POLL_INTERVAL_MS * 3)
+      })
+      expect(fetchScanFn).toHaveBeenCalledTimes(3)
+    } finally {
+      vi.useRealTimers()
+    }
   })
 })

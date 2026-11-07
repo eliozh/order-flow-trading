@@ -115,6 +115,18 @@ def _boundary_window(value: str) -> datetime | None:
         return None
 
 
+def _pending_symbols(
+    run: JobRunRecord,
+    rows: tuple[ScanSymbolRecord, ...],
+    starred: tuple[str, ...],
+) -> tuple[str, ...]:
+    """Resume scope: a single-symbol run stays on its symbol; a batch uses starring."""
+    terminal = {item.symbol for item in rows if item.stage in _TERMINAL_SCAN_STAGES}
+    if run.symbol is not None:
+        return () if run.symbol in terminal else (run.symbol,)
+    return tuple(symbol for symbol in starred if symbol not in terminal)
+
+
 class JobLedger:
     """Application-level wrapper around the SQLite job tables."""
 
@@ -138,6 +150,10 @@ class JobLedger:
         owner: str | None = None,
         lease_seconds: int = DEFAULT_LEASE_SECONDS,
         run_id: str | None = None,
+        source: str = "backfill",
+        metrics_only: bool = False,
+        provider: str | None = None,
+        symbol: str | None = None,
     ) -> JobClaim:
         """Claim ``(job_type, window_start)`` once; reclaim only a stale lease."""
         now = self._now()
@@ -155,6 +171,10 @@ class JobLedger:
             lease_owner=lease_owner,
             lease_expires_at=utc_timestamp(now + timedelta(seconds=lease_seconds)),
             heartbeat_at=utc_timestamp(now),
+            source=source,
+            metrics_only=metrics_only,
+            provider=provider,
+            symbol=symbol,
         )
         claimed, run, reclaimed = self._store.claim_job_run(record)
         if claimed:
@@ -282,6 +302,10 @@ class JobLedger:
         window_start: str | None = None,
         lease_seconds: int = DEFAULT_LEASE_SECONDS,
         run_id: str | None = None,
+        source: str = "backfill",
+        metrics_only: bool = False,
+        provider: str | None = None,
+        symbol: str | None = None,
     ) -> JobClaim:
         """Claim the single active scan slot shared by manual and scheduled runs.
 
@@ -311,6 +335,10 @@ class JobLedger:
             owner=lease_owner,
             lease_seconds=lease_seconds,
             run_id=run_id,
+            source=source,
+            metrics_only=metrics_only,
+            provider=provider,
+            symbol=symbol,
         )
         if not claim.claimed:
             self.release_scan_lock(lease_owner)
@@ -390,16 +418,21 @@ class ScheduledScanRunner:
         try:
             symbols = tuple(contract.symbol for contract in self._container.store.list_starred())
             if claim.reclaimed:
-                # Resume a reclaimed run from its persisted checkpoints instead
-                # of re-running every starred symbol.
-                checkpointed = self._container.store.list_scan_symbols(run.run_id)
-                if checkpointed:
-                    symbols = tuple(
-                        item.symbol
-                        for item in checkpointed
-                        if item.stage not in _TERMINAL_SCAN_STAGES
-                    )
-            outcome = self._execute(run, symbols, period=period, trigger_source=run.trigger_source)
+                # Resume a reclaimed run from its persisted checkpoints. Compute
+                # pending from the persisted scope: a single-symbol run never
+                # fans out to the starred universe; a batch runs starred minus
+                # terminal rows so a crash during symbol k still finishes it.
+                rows = self._container.store.list_scan_symbols(run.run_id)
+                symbols = _pending_symbols(run, rows, symbols)
+            outcome = self._execute(
+                run,
+                symbols,
+                period=period,
+                trigger_source=run.trigger_source,
+                source=run.source,
+                metrics_only=run.metrics_only,
+                provider=run.provider,
+            )
             self._ledger.finish(
                 run.run_id,
                 DONE if (not outcome.failed_symbols or outcome.scans) else FAILED,
@@ -440,12 +473,21 @@ class ScheduledScanRunner:
         )
         beat.start()
         try:
-            pending = tuple(
-                item.symbol
-                for item in self._container.store.list_scan_symbols(run_id)
-                if item.stage not in _TERMINAL_SCAN_STAGES
-            )
-            if not pending:
+            rows = self._container.store.list_scan_symbols(run_id)
+            starred = tuple(contract.symbol for contract in self._container.store.list_starred())
+            if run.symbol is not None:
+                # A single-symbol run resumes only the symbol it was asked for,
+                # even if the crash happened before its checkpoint row landed.
+                pending = _pending_symbols(run, rows, starred)
+                if not pending:
+                    self._ledger.finish(run.run_id, DONE, owner=run.lease_owner)
+                    return ScheduledScanOutcome(
+                        run=run,
+                        claimed=True,
+                        reason="already_complete",
+                        symbols_total=len(rows),
+                    )
+            elif not rows:
                 if "#manual-" in run.window_start:
                     self._ledger.finish(
                         run.run_id,
@@ -455,9 +497,7 @@ class ScheduledScanRunner:
                         owner=run.lease_owner,
                     )
                     return ScheduledScanOutcome(run=run, claimed=False, reason="no_checkpoint")
-                pending = tuple(
-                    contract.symbol for contract in self._container.store.list_starred()
-                )
+                pending = starred
                 if not pending:
                     self._ledger.finish(
                         run.run_id,
@@ -467,7 +507,28 @@ class ScheduledScanRunner:
                         owner=run.lease_owner,
                     )
                     return ScheduledScanOutcome(run=run, claimed=False, reason="no_checkpoint")
-            outcome = self._execute(run, pending, period=period, trigger_source=run.trigger_source)
+            else:
+                # Pending = starred symbols that have no terminal row. A symbol
+                # that never wrote a row (crash mid-batch) must still run; a
+                # fully terminal batch must not re-run completed symbols.
+                pending = _pending_symbols(run, rows, starred)
+                if not pending:
+                    self._ledger.finish(run.run_id, DONE, owner=run.lease_owner)
+                    return ScheduledScanOutcome(
+                        run=run,
+                        claimed=True,
+                        reason="already_complete",
+                        symbols_total=len(rows),
+                    )
+            outcome = self._execute(
+                run,
+                pending,
+                period=period,
+                trigger_source=run.trigger_source,
+                source=run.source,
+                metrics_only=run.metrics_only,
+                provider=run.provider,
+            )
             self._ledger.finish(
                 run.run_id,
                 DONE if (not outcome.failed_symbols or outcome.scans) else FAILED,
@@ -533,7 +594,14 @@ class ScheduledScanRunner:
         """Claim and run one manual batch over every starred symbol."""
         now = self._clock.now()
         batch_id = f"SCAN-{now:%Y%m%d}-{uuid.uuid4().hex[:8].upper()}"
-        claim = self._ledger.claim_scan(trigger_source="MANUAL", owner=batch_id, run_id=batch_id)
+        claim = self._ledger.claim_scan(
+            trigger_source="MANUAL",
+            owner=batch_id,
+            run_id=batch_id,
+            source=source,
+            metrics_only=metrics_only,
+            provider=provider,
+        )
         if not claim.claimed or claim.run is None:
             raise ScanAlreadyRunning(running_scan_id=claim.running_scan_id)
         run = claim.run

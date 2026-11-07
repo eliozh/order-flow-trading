@@ -46,7 +46,7 @@ from oft.ports.store import (
     TriggerEventRecord,
 )
 
-_SCHEMA_VERSION = 11
+_SCHEMA_VERSION = 13
 STALE_RUNNING_SECONDS = 15 * 60
 _BACKFILL_RUN_STATUSES = ("RUNNING", "COMPLETE", "PARTIAL", "FAILED", "BLOCKED", "STALE")
 _BACKFILL_RUNS_DEFINITION = """
@@ -119,6 +119,10 @@ _JOB_RUNS_DEFINITION = """
     lease_owner TEXT NOT NULL,
     lease_expires_at TEXT NOT NULL,
     heartbeat_at TEXT NOT NULL,
+    source TEXT NOT NULL DEFAULT 'backfill',
+    metrics_only INTEGER NOT NULL DEFAULT 0,
+    provider TEXT,
+    symbol TEXT,
     UNIQUE (job_type, window_start)
 """
 
@@ -246,6 +250,7 @@ _SCHEMA_SQL = f"""
         cost_unpriced INTEGER NOT NULL DEFAULT 1
     );
     CREATE INDEX IF NOT EXISTS scans_created_at ON scans(created_at);
+    CREATE INDEX IF NOT EXISTS scans_batch_id ON scans(batch_id);
     CREATE TABLE IF NOT EXISTS reports (
         report_id TEXT PRIMARY KEY,
         scan_id TEXT NOT NULL REFERENCES scans(scan_id),
@@ -814,6 +819,41 @@ def _migrate_scan_symbols_v11(connection: sqlite3.Connection) -> None:
         raise
 
 
+def _migrate_job_runs_v12(connection: sqlite3.Connection) -> None:
+    """Persist the manual scan options needed to resume a reclaimed batch (v12)."""
+    columns = {row[1] for row in connection.execute("PRAGMA table_info(job_runs)")}
+    needed = (
+        ("source", "TEXT NOT NULL DEFAULT 'backfill'"),
+        ("metrics_only", "INTEGER NOT NULL DEFAULT 0"),
+        ("provider", "TEXT"),
+    )
+    missing = [(name, kind) for name, kind in needed if name not in columns]
+    if not missing:
+        return
+    connection.execute("BEGIN IMMEDIATE")
+    try:
+        for name, kind in missing:
+            connection.execute(f"ALTER TABLE job_runs ADD COLUMN {name} {kind}")
+        connection.execute("COMMIT")
+    except Exception:
+        connection.execute("ROLLBACK")
+        raise
+
+
+def _migrate_job_runs_v13(connection: sqlite3.Connection) -> None:
+    """Persist the target symbol so a single-symbol run resumes its own scope (v13)."""
+    columns = {row[1] for row in connection.execute("PRAGMA table_info(job_runs)")}
+    if "symbol" in columns:
+        return
+    connection.execute("BEGIN IMMEDIATE")
+    try:
+        connection.execute("ALTER TABLE job_runs ADD COLUMN symbol TEXT")
+        connection.execute("COMMIT")
+    except Exception:
+        connection.execute("ROLLBACK")
+        raise
+
+
 def initialize_database(settings: Settings) -> None:
     """Create the data directory and the walking-skeleton schema."""
     settings.data_dir.mkdir(parents=True, exist_ok=True)
@@ -852,6 +892,9 @@ def initialize_database(settings: Settings) -> None:
             _migrate_scans_v11(connection)
         if _table_exists(connection, "scan_symbols"):
             _migrate_scan_symbols_v11(connection)
+        if _table_exists(connection, "job_runs"):
+            _migrate_job_runs_v12(connection)
+            _migrate_job_runs_v13(connection)
         with connection:
             connection.executescript(_SCHEMA_SQL)
             connection.execute(
@@ -896,7 +939,15 @@ def initialize_database(settings: Settings) -> None:
             )
             connection.execute(
                 "INSERT OR IGNORE INTO schema_migrations (version, applied_at) VALUES (?, ?)",
-                (_SCHEMA_VERSION, "2026-11-08T13:00:00.000Z"),
+                (11, "2026-11-08T13:00:00.000Z"),
+            )
+            connection.execute(
+                "INSERT OR IGNORE INTO schema_migrations (version, applied_at) VALUES (?, ?)",
+                (12, "2026-11-08T14:00:00.000Z"),
+            )
+            connection.execute(
+                "INSERT OR IGNORE INTO schema_migrations (version, applied_at) VALUES (?, ?)",
+                (_SCHEMA_VERSION, "2026-11-08T15:00:00.000Z"),
             )
     finally:
         connection.close()
@@ -1096,6 +1147,7 @@ def _row_to_data_gap(row: sqlite3.Row) -> DataGap:
 
 
 def _row_to_job_run(row: sqlite3.Row) -> JobRunRecord:
+    keys = row.keys()
     return JobRunRecord(
         run_id=row["run_id"],
         job_type=row["job_type"],
@@ -1109,6 +1161,10 @@ def _row_to_job_run(row: sqlite3.Row) -> JobRunRecord:
         lease_owner=row["lease_owner"],
         lease_expires_at=row["lease_expires_at"],
         heartbeat_at=row["heartbeat_at"],
+        source=row["source"] if "source" in keys else "backfill",
+        metrics_only=(bool(row["metrics_only"]) if "metrics_only" in keys else False),
+        provider=row["provider"] if "provider" in keys else None,
+        symbol=row["symbol"] if "symbol" in keys else None,
     )
 
 
@@ -1300,6 +1356,23 @@ class SqliteStore:
             rows = connection.execute(
                 "SELECT * FROM scans ORDER BY created_at DESC, scan_id DESC LIMIT ? OFFSET ?",
                 (limit, offset),
+            ).fetchall()
+        finally:
+            connection.close()
+        return tuple(_row_to_scan(row) for row in rows)
+
+    def list_scans_by_batch(self, batch_id: str) -> tuple[ScanRecord, ...]:
+        """Return every child scan of one batch, ordered by symbol.
+
+        Uses the ``scans(batch_id)`` index so a batch whose rows are older than
+        the newest page of scans still renders its full window and quality.
+        """
+        connection = self._connect_read_only()
+        if connection is None:
+            return ()
+        try:
+            rows = connection.execute(
+                "SELECT * FROM scans WHERE batch_id = ? ORDER BY symbol", (batch_id,)
             ).fetchall()
         finally:
             connection.close()
@@ -2448,8 +2521,9 @@ class SqliteStore:
                     INSERT INTO job_runs (
                         run_id, job_type, window_start, status, trigger_source,
                         started_at, finished_at, error_code, message, lease_owner,
-                        lease_expires_at, heartbeat_at
-                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                        lease_expires_at, heartbeat_at, source, metrics_only, provider,
+                        symbol
+                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                     """,
                     (
                         record.run_id,
@@ -2464,6 +2538,10 @@ class SqliteStore:
                         record.lease_owner,
                         record.lease_expires_at,
                         record.heartbeat_at,
+                        record.source,
+                        int(record.metrics_only),
+                        record.provider,
+                        record.symbol,
                     ),
                 )
                 connection.commit()

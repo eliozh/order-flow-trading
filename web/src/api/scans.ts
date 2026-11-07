@@ -160,7 +160,12 @@ function idempotencyKey(): string {
   return `web-${Date.now()}-${Math.random().toString(16).slice(2)}`
 }
 
-/** Trigger one manual starred-symbol batch from the /scans schedule card. */
+/**
+ * Trigger one manual starred-symbol batch from the /scans schedule card.
+ *
+ * The POST runs the whole batch synchronously, so a successful response is a
+ * finished scan rather than a queued job; callers should refetch the history.
+ */
 export async function triggerScan(): Promise<ScanEnvelope> {
   const csrf = readCookie('oft_csrf')
   const headers: Record<string, string> = {
