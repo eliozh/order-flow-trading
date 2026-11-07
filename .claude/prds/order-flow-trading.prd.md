@@ -112,7 +112,7 @@ We'll know we're right when **连续 8 周自用中，机会触发后的漏单�
 
 | # | Milestone | Outcome | Status | Plan |
 |---|---|---|---|---|
-| 1 | 数据与指标地基 | 能实时获取并回补历史数据，稳定算出全部订单流指标 | in-progress | .claude/plans/order-flow-trading.plan.md |
+| 1 | 数据与指标地基 | 能实时获取并回补历史数据，稳定算出全部订单流指标 | complete | .claude/plans/order-flow-trading.plan.md |
 | 2 | 分析闭环（paper） | 星标扫描 → LLM 报告 → 机会台账 → 代码触发 → LLM 复核 → 模拟入场 | pending | — |
 | 3 | 仓位管理与复盘 | 自动仓位管理 + 完整交易日志 + 盈亏/胜率/复盘视图 | pending | — |
 | 4 | 双入口 | CLI 全功能；Web UI 完成配置、持仓、机会、日志与基础图表 | pending | — |
