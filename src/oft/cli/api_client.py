@@ -44,8 +44,12 @@ class ApiClient:
         method: str,
         path: str,
         payload: dict[str, Any] | None = None,
+        *,
+        extra_headers: dict[str, str] | None = None,
     ) -> dict[str, Any]:
         headers = dict(_JSON_HEADERS)
+        if extra_headers:
+            headers.update(extra_headers)
         if self._token:
             headers["Authorization"] = f"Bearer {self._token}"
         data = json.dumps(payload).encode("utf-8") if payload is not None else None
@@ -73,14 +77,29 @@ class ApiClient:
                 f"Local daemon is not reachable at {self._base_url}: {exc}",
             ) from exc
 
-    def create_scan(self, payload: dict[str, Any]) -> dict[str, Any]:
-        return self._request("POST", "/api/v1/scans", payload)
+    def create_scan(
+        self, payload: dict[str, Any], *, idempotency_key: str | None = None
+    ) -> dict[str, Any]:
+        headers = {"Idempotency-Key": idempotency_key} if idempotency_key else None
+        return self._request("POST", "/api/v1/scans", payload, extra_headers=headers)
 
     def set_starred(self, symbol: str, starred: bool) -> dict[str, Any]:
         return self._request("PATCH", f"/api/v1/symbols/{symbol}/star", {"starred": starred})
 
+    def list_scans(self, limit: int = 20) -> dict[str, Any]:
+        return self._request("GET", f"/api/v1/scans?limit={limit}")
+
     def get_scan(self, scan_id: str) -> dict[str, Any]:
         return self._request("GET", f"/api/v1/scans/{scan_id}")
+
+    def list_reports(self, limit: int = 20, scan_id: str | None = None) -> dict[str, Any]:
+        query = f"?limit={limit}"
+        if scan_id:
+            query += f"&scan_id={scan_id}"
+        return self._request("GET", f"/api/v1/reports{query}")
+
+    def get_report(self, report_id: str) -> dict[str, Any]:
+        return self._request("GET", f"/api/v1/reports/{report_id}")
 
     def create_backfill(self, payload: dict[str, Any]) -> dict[str, Any]:
         return self._request("POST", "/api/v1/backfill", payload)

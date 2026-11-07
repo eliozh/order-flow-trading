@@ -66,7 +66,7 @@ class ManifestEntry:
 
 @dataclass(frozen=True)
 class ScanRecord:
-    """A completed fixture scan and its golden delta value."""
+    """A completed scan and its deterministic summary values."""
 
     scan_id: str
     symbol: str
@@ -88,6 +88,39 @@ class ScanRecord:
     manifest_path: str
     parquet_rows: int
     created_at: str
+    report_id: str | None = None
+    source_mode: str = "FIXTURE"
+    metrics_manifest_json: str | None = None
+
+
+@dataclass(frozen=True)
+class ReportRecord:
+    """A CALC-only report: metric manifest plus the frozen snapshot document."""
+
+    report_id: str
+    scan_id: str
+    symbol: str
+    timeframe: str
+    generated_at: str
+    metrics_manifest_json: str
+    llm_decision_id: str | None
+    narrative_ref: str | None
+    data_quality: str
+    snapshot_json: str
+    metrics_json: str
+
+
+@dataclass(frozen=True)
+class IdempotencyRecord:
+    """A stored idempotent response for one ``(scope, key)`` pair."""
+
+    scope: str
+    key: str
+    request_hash: str
+    response_status: int
+    response_json: str
+    created_at: str
+    expires_at: str
 
 
 @dataclass(frozen=True)
@@ -138,6 +171,8 @@ class StorePort(Protocol):
 
     def save_scan(self, record: ScanRecord) -> None: ...
 
+    def update_scan(self, record: ScanRecord) -> None: ...
+
     def save_scan_with_manifest(self, record: ScanRecord, entry: ManifestEntry) -> None: ...
 
     def get_scan(self, scan_id: str) -> ScanRecord | None: ...
@@ -145,6 +180,22 @@ class StorePort(Protocol):
     def latest_scan(self) -> ScanRecord | None: ...
 
     def list_scans(self, limit: int = 20) -> tuple[ScanRecord, ...]: ...
+
+    # -- Reports ---------------------------------------------------------
+
+    def save_report(self, record: ReportRecord) -> None: ...
+
+    def get_report(self, report_id: str) -> ReportRecord | None: ...
+
+    def list_reports(
+        self, *, scan_id: str | None = None, limit: int = 20
+    ) -> tuple[ReportRecord, ...]: ...
+
+    # -- Idempotency -----------------------------------------------------
+
+    def get_idempotency(self, *, scope: str, key: str) -> IdempotencyRecord | None: ...
+
+    def save_idempotency(self, record: IdempotencyRecord) -> None: ...
 
     def record_manifest(self, entry: ManifestEntry) -> None: ...
 

@@ -4,6 +4,10 @@ export interface RouteMatch {
   isWatchlist: boolean
   isSearch: boolean
   isSystem: boolean
+  isScans: boolean
+  scanId: string | null
+  isReports: boolean
+  reportId: string | null
 }
 
 function decodeSegment(segment: string): string {
@@ -27,11 +31,17 @@ export function resolveRoute(pathname: string): RouteMatch {
   const isSearch = path === '/watchlist/search'
   const symbolMatch = /^\/watchlist\/([^/]+)$/.exec(path)
   const inspectorSymbol = symbolMatch !== null && !isSearch ? decodeSegment(symbolMatch[1]) : null
+  const scanMatch = /^\/scans\/([^/]+)$/.exec(path)
+  const reportMatch = /^\/reports\/([^/]+)$/.exec(path)
   return {
     path,
     inspectorSymbol,
     isSearch,
     isWatchlist: path === '/watchlist' || path.startsWith('/watchlist/'),
     isSystem: path === '/' || path === '/system' || path.startsWith('/system/'),
+    isScans: path === '/scans' || path.startsWith('/scans/'),
+    scanId: scanMatch !== null ? decodeSegment(scanMatch[1]) : null,
+    isReports: path === '/reports' || path.startsWith('/reports/'),
+    reportId: reportMatch !== null ? decodeSegment(reportMatch[1]) : null,
   }
 }

@@ -17,7 +17,12 @@ from oft.config import Settings
 
 @pytest.fixture()
 def settings(tmp_path: Path) -> Settings:
-    return Settings(env="test", port=8765, data_dir=tmp_path / "data")
+    return Settings(
+        env="test",
+        port=8765,
+        data_dir=tmp_path / "data",
+        allow_fixture_scan_debug=True,
+    )
 
 
 def _free_port() -> int:
@@ -50,7 +55,13 @@ def live_daemon(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> Iterator[Set
     monkeypatch.setenv("OFT_PORT", str(port))
     monkeypatch.setenv("OFT_DATA", str(data_dir))
     monkeypatch.setenv("OFT_LOG_LEVEL", "INFO")
-    resolved = Settings(env="test", port=port, data_dir=data_dir)
+    monkeypatch.setenv("OFT_ALLOW_FIXTURE_SCAN_DEBUG", "true")
+    resolved = Settings(
+        env="test",
+        port=port,
+        data_dir=data_dir,
+        allow_fixture_scan_debug=True,
+    )
 
     server = uvicorn.Server(
         uvicorn.Config(

@@ -28,7 +28,13 @@ def _configure_environment(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> S
     monkeypatch.setenv("OFT_PORT", "8765")
     monkeypatch.setenv("OFT_DATA", str(tmp_path / "data"))
     monkeypatch.setenv("OFT_LOG_LEVEL", "INFO")
-    return Settings(env="test", port=8765, data_dir=tmp_path / "data")
+    monkeypatch.setenv("OFT_ALLOW_FIXTURE_SCAN_DEBUG", "true")
+    return Settings(
+        env="test",
+        port=8765,
+        data_dir=tmp_path / "data",
+        allow_fixture_scan_debug=True,
+    )
 
 
 def _auth(app: Any) -> dict[str, str]:

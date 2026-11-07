@@ -359,9 +359,11 @@ def read_bars(
     """Read manifest-registered bars in deterministic, gap-free order.
 
     Without ``run_id``, every published run is merged by ``bar_start``. When
-    runs overlap, the bar from the run with the newest ``computed_at`` and
-    then the highest manifest ``run_seq`` wins. A tail-only late recompute
-    therefore replaces just its bars instead of truncating the series.
+    runs overlap, the bar from the newest persisted artifact wins: the highest
+    manifest ``run_seq`` first, then the newest ``computed_at``. A replay clock
+    can make ``computed_at`` identical across runs, so ``run_seq`` is the
+    authoritative recency signal. A tail-only late recompute therefore replaces
+    just its bars instead of truncating the series.
     """
     if store is None:
         from oft.adapters.sqlite_store import SqliteStore
@@ -394,14 +396,14 @@ def read_bars(
         )
     if run_id is None:
         selected: dict[str, dict[str, object]] = {}
-        selected_rank: dict[str, tuple[str, int, str]] = {}
+        selected_rank: dict[str, tuple[int, str, str]] = {}
         for row in rows:
             row_run_id = str(row.get("run_id") or "")
             if not row_run_id:
                 continue
             computed_at, run_seq = run_meta.get(row_run_id, ("", 0))
             slot = str(row.get("bar_start"))
-            rank = (computed_at, run_seq, row_run_id)
+            rank = (run_seq, computed_at, row_run_id)
             if slot not in selected_rank or rank > selected_rank[slot]:
                 selected[slot] = row
                 selected_rank[slot] = rank

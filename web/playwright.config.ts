@@ -2,6 +2,7 @@ import { defineConfig, devices } from '@playwright/test'
 
 const systemBaseURL = process.env.OFT_E2E_BASE_URL ?? 'http://127.0.0.1:7622'
 const symbolsBaseURL = process.env.OFT_E2E_SYMBOLS_BASE_URL ?? 'http://127.0.0.1:7632'
+const reportsBaseURL = process.env.OFT_E2E_REPORT_BASE_URL ?? 'http://127.0.0.1:7642'
 const screensDir = process.env.OFT_E2E_SCREENS_DIR ?? '../.claude/ecc-workflow/screens/e2e02'
 const reportDir = process.env.OFT_E2E_REPORT_DIR ?? `${screensDir}/report`
 
@@ -44,6 +45,11 @@ export default defineConfig({
       name: 'symbols',
       testMatch: /symbols\.spec\.ts/,
       use: { ...devices['Desktop Chrome'], baseURL: symbolsBaseURL },
+    },
+    {
+      name: 'reports',
+      testMatch: /reports\.spec\.ts/,
+      use: { ...devices['Desktop Chrome'], baseURL: reportsBaseURL },
     },
   ],
 })
