@@ -12,11 +12,10 @@ import http.client
 import os
 import re
 import shutil
-import time
 import uuid
 from collections.abc import Callable
 from dataclasses import asdict, dataclass, replace
-from datetime import date
+from datetime import date, datetime
 from pathlib import Path
 from typing import Protocol
 
@@ -582,11 +581,15 @@ class BackfillService:
             raise BackfillError("backfill lease lost; another run owns this job")
 
     def _progress_callback(self, run: BackfillRunRecord, owner: str) -> Callable[[int], None]:
-        state = {"at": 0.0}
+        state: dict[str, datetime | None] = {"at": None}
 
         def progress(_written: int) -> None:
-            now = time.monotonic()
-            if now - state["at"] >= self._progress_interval_seconds:
+            # Time is injected; a deterministic clock never throttles by wall
+            # time, so tests and replay stay reproducible.
+            now = self._clock.now()
+            previous = state["at"]
+            elapsed = 0.0 if previous is None else (now - previous).total_seconds()
+            if previous is None or elapsed >= self._progress_interval_seconds:
                 state["at"] = now
                 self._heartbeat(run, owner)
 

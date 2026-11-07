@@ -27,18 +27,20 @@ from oft.domain.events import (
     MarkPriceEvent,
     NormalizedEvent,
 )
+from oft.domain.layout import PARTITION_ROOTS
 from oft.domain.metrics.footprint import FootprintResult
 from oft.domain.metrics.liquidations import LiquidationEvent, liquidation_sort_key
 from oft.domain.metrics.types import MetricRow, decimal_str
 from oft.domain.resampling import SOURCE_MODES, Bar
 from oft.domain.time import utc_timestamp
-from oft.ports.clock import ClockPort
 from oft.ports.store import ManifestEntry, StorePort, StoreUnavailableError
 
 if TYPE_CHECKING:
     import duckdb
 
-_LAYOUT = ("market", "metrics", "footprint", "liquidations", "bars")
+    from oft.ports.clock import ClockPort
+
+_LAYOUT = PARTITION_ROOTS
 METRICS_DATA_TYPE = "metrics"
 FOOTPRINT_DATA_TYPE = "footprint"
 LIQUIDATIONS_DATA_TYPE = "liquidations"

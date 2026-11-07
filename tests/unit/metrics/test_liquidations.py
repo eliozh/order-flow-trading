@@ -394,3 +394,139 @@ def test_liquidation_sort_key_covers_all_event_fields() -> None:
     assert sorted((first, second), key=liquidation_sort_key) == sorted(
         (second, first), key=liquidation_sort_key
     )
+
+
+def test_liquidation_validation_and_loader_edge_branches(tmp_path: Path) -> None:
+    from decimal import Decimal
+
+    base = dict(
+        received_at=NOW,
+        trade_time=NOW,
+        symbol="BTCUSDT",
+        side="SELL",
+        price=Decimal("1"),
+        average_price=Decimal("1"),
+        quantity=Decimal("1"),
+    )
+    for field, value in (
+        ("symbol", "bad symbol"),
+        ("price", Decimal("0")),
+        ("average_price", Decimal("-1")),
+        ("last_fill_quantity", Decimal("0")),
+        ("source_seq", True),
+    ):
+        kwargs = dict(base)
+        kwargs[field] = value
+        with pytest.raises(ValueError):
+            LiquidationEvent(**kwargs)  # type: ignore[arg-type]
+
+    with pytest.raises(ValueError, match="bucket"):
+        compute_liquidations((), symbol="BTCUSDT", coverage_start=None, bucket_seconds=True)
+    with pytest.raises(ValueError, match="together"):
+        compute_liquidations((), symbol="BTCUSDT", coverage_start=NOW, window_start=NOW)
+    with pytest.raises(ValueError, match="timezone"):
+        compute_liquidations(
+            (),
+            symbol="BTCUSDT",
+            coverage_start=NOW,
+            window_start=datetime(2026, 10, 1),
+            window_end=NOW,
+        )
+    with pytest.raises(ValueError, match="timezone"):
+        compute_liquidations((), symbol="BTCUSDT", coverage_start=datetime(2026, 10, 1))
+    with pytest.raises(ValueError, match="bucket"):
+        LiquidationRecorder(clock=FixedClock(NOW), bucket_seconds=0)
+    with pytest.raises(ValueError, match="bucket"):
+        LiquidationRecorder(clock=FixedClock(NOW), bucket_seconds=True)
+
+    path = tmp_path / "liquidations.jsonl"
+    path.write_text("\n" + json.dumps([1]) + "\n", encoding="utf-8")
+    with pytest.raises(ValueError, match="JSON object"):
+        load_liquidation_events(path)
+
+    path.write_text(json.dumps({"received_at": 1}) + "\n", encoding="utf-8")
+    with pytest.raises(ValueError, match="missing fields"):
+        load_liquidation_events(path)
+
+    path.write_text(json.dumps({"received_at": "2026-10-01T00:00:00"}) + "\n", encoding="utf-8")
+    with pytest.raises(ValueError):
+        load_liquidation_events(path)
+
+    row = {
+        "received_at": "2026-10-01T00:00:00Z",
+        "trade_time": "2026-10-01T00:00:00Z",
+        "symbol": "BTCUSDT",
+        "side": "SELL",
+        "price": "1",
+        "average_price": "1",
+        "quantity": "1",
+        "source_seq": "1",
+    }
+    path.write_text(json.dumps(row) + "\n", encoding="utf-8")
+    with pytest.raises(ValueError, match="integer"):
+        load_liquidation_events(path)
+
+    row["source_seq"] = None
+    row["last_fill_quantity"] = "NaN"
+    path.write_text(json.dumps(row) + "\n", encoding="utf-8")
+    with pytest.raises(ValueError, match="finite"):
+        load_liquidation_events(path)
+
+
+def test_liquidation_remaining_branches(tmp_path: Path) -> None:
+    path = tmp_path / "no-such.jsonl"
+    with pytest.raises(ValueError, match="not found"):
+        load_liquidation_events(path)
+
+    bad = tmp_path / "bad.jsonl"
+    bad.write_bytes(b"\xff\xfe")
+    with pytest.raises(ValueError, match="cannot read"):
+        load_liquidation_events(bad)
+
+    row = {
+        "received_at": "2026-10-01T00:00:00Z",
+        "trade_time": "2026-10-01T00:00:00Z",
+        "symbol": "BTCUSDT",
+        "side": "SELL",
+        "price": "1",
+        "average_price": "1",
+        "quantity": "1",
+    }
+    good = tmp_path / "good.jsonl"
+    good.write_text(json.dumps(row) + "\n", encoding="utf-8")
+    events = load_liquidation_events(good)
+    assert events[0].source_seq is None
+
+    for bad_row in (
+        {**row, "received_at": 1},
+        {**row, "received_at": "2026-10-01T00:00:00"},
+        {**row, "price": "not-a-decimal"},
+    ):
+        bad.write_text(json.dumps(bad_row) + "\n", encoding="utf-8")
+        with pytest.raises(ValueError):
+            load_liquidation_events(bad)
+
+    recorder = LiquidationRecorder(clock=FixedClock(NOW))
+    assert recorder.coverage_start is None
+    recorder.start()
+    assert recorder.coverage_start == NOW
+    assert recorder.events() == ()
+
+    window_event = _event(1, "SELL")
+    result = compute_liquidations(
+        (window_event,),
+        symbol="BTCUSDT",
+        coverage_start=NOW,
+        window_start=NOW,
+        window_end=NOW + timedelta(minutes=2),
+    )
+    assert result.count == 1
+
+    excluded = compute_liquidations(
+        (window_event,),
+        symbol="BTCUSDT",
+        coverage_start=NOW,
+        window_start=NOW,
+        window_end=NOW + timedelta(minutes=1),
+    )
+    assert excluded.count == 0

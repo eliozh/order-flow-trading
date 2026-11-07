@@ -2246,6 +2246,21 @@ class SqliteStore:
             connection.close()
         return tuple(_row_to_job_run(row) for row in rows)
 
+    def list_stale_job_runs(self, *, now: str) -> tuple[JobRunRecord, ...]:
+        connection = self._connect_read_only()
+        if connection is None:
+            return ()
+        try:
+            rows = connection.execute(
+                "SELECT * FROM job_runs "
+                "WHERE status = 'RUNNING' AND lease_expires_at <= ? "
+                "ORDER BY heartbeat_at DESC, rowid DESC",
+                (now,),
+            ).fetchall()
+        finally:
+            connection.close()
+        return tuple(_row_to_job_run(row) for row in rows)
+
     def acquire_job_lock(
         self, lock_name: str, owner: str, *, acquired_at: str, expires_at: str
     ) -> bool:
