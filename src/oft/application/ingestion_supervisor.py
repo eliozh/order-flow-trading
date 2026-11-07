@@ -589,7 +589,8 @@ def reconnect_delay(
     jitter: Callable[[], float] = random.random,
 ) -> float:
     """Exponential backoff with additive jitter, capped at ``max_delay + base``."""
-    exponent = max(0, attempt)
+    # Clamp before exponentiation so a long outage cannot overflow the float.
+    exponent = min(max(0, attempt), 60)
     return float(min(max_delay, base * (2**exponent)) + jitter() * base)
 
 
@@ -779,10 +780,10 @@ class IngestionSupervisor:
                             # Idle until stars change (or the daemon restarts).
                             self._sleep(max(0.05, self._backoff_base))
                             continue
-                        connected = True
                         # 48h REST gap recovery on startup and every reconnect.
                         self._recover()
                         self._write_state()
+                        connected = True
                     except Exception as exc:
                         logger.warning(
                             "ws_startup_connect_failed", attempt=attempt, reason=_safe_reason(exc)
@@ -802,11 +803,22 @@ class IngestionSupervisor:
                 try:
                     stream, payload = self._client.receive_event()
                 except MessageTooLargeError as exc:
-                    # A too-large frame is a data problem: count it, then drop
-                    # the connection and reconnect instead of hanging.
+                    # A too-large frame uses the same drain/backoff/reconnect path.
                     self._reject("OVERSIZED")
                     logger.warning("ws_message_oversized", reason=_safe_reason(exc))
                     connected = False
+                    self._drain_all()
+                    self.state = ConnectionState.RECONNECTING
+                    self._write_state()
+                    self._sleep(
+                        reconnect_delay(
+                            attempt,
+                            base=self._backoff_base,
+                            max_delay=self._backoff_max,
+                            jitter=self._jitter,
+                        )
+                    )
+                    attempt += 1
                     continue
                 except EventValidationError as exc:
                     # Malformed/oversized payloads are data problems, not a
@@ -959,7 +971,7 @@ class IngestionSupervisor:
                 raise BackpressureError(
                     "queue and WAL are both full; stopping instead of dropping"
                 ) from exc
-        if self._queue.stats["spilled"] > 0 or self._is_flush_due():
+        if self._queue.stats["wal_bytes"] > 0 or self._is_flush_due():
             self._relieve()
 
     def _is_flush_due(self) -> bool:
@@ -978,8 +990,12 @@ class IngestionSupervisor:
             self._parquet.add(event)
         for event in self._queue.replay_wal():
             self._parquet.add(event)
-        self._queue.clear_wal()
-        entries = self._parquet.maybe_flush(self._clock.now())
+        had_wal = self._queue.stats["wal_bytes"] > 0
+        # Publish/fsync before truncating the WAL; a crash must not lose spilled
+        # events. A WAL replay forces a flush.
+        entries = self._parquet.flush() if had_wal else self._parquet.maybe_flush(self._clock.now())
+        if had_wal:
+            self._queue.clear_wal()
         self._persisted_rows += sum(entry.rows for entry in entries)
         if entries:
             # Fsync the parts before advancing the durable checkpoint.

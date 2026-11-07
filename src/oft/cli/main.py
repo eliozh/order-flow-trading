@@ -167,8 +167,20 @@ def _run_live_ingestion(settings: Settings, replay_file: Path | None, symbols: s
             symbols=symbol_list,
             symbol_provider=symbol_provider,
         )
+
+        def _run_ws_thread() -> None:
+            try:
+                supervisor.run_forever()
+            except Exception as exc:  # noqa: BLE001 - thread must fail visibly
+                import structlog
+
+                structlog.get_logger(__name__).error(
+                    "ws_ingest_thread_failed", error=type(exc).__name__
+                )
+                WsStateStore(state_path, container.clock).write("FAILED", {}, {})
+
         threading.Thread(
-            target=supervisor.run_forever,
+            target=_run_ws_thread,
             name="oft-ws-ingest",
             daemon=True,
         ).start()

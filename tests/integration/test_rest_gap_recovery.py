@@ -185,3 +185,45 @@ def test_unsafe_symbol_is_rejected() -> None:
             start_time=NOW - timedelta(minutes=10),
             end_time=NOW,
         )
+
+
+class PagedFetch:
+    def __init__(self, *, always_full: bool = False) -> None:
+        self.urls: list[str] = []
+        self.always_full = always_full
+        self.calls = 0
+
+    def __call__(self, url: str, timeout: float, max_bytes: int) -> HttpResponse:
+        self.urls.append(url)
+        self.calls += 1
+        start = int(parse_qs(urlsplit(url).query)["fromId"][0]) if "fromId" in url else 1
+        count = 1000 if self.always_full or self.calls == 1 else 5
+        body = json.dumps([_row(start + offset) for offset in range(count)]).encode()
+        return HttpResponse(
+            status=200,
+            headers={"X-MBX-USED-WEIGHT-1M": "2"},
+            body=body,
+        )
+
+
+def test_full_window_is_paged_with_from_id_until_short_page() -> None:
+    fetch = PagedFetch()
+    client = BinanceRestClient(fetch=fetch)
+
+    result = client.recover_agg_trades("BTCUSDT", last_event_time=NOW - timedelta(hours=1), now=NOW)
+
+    assert result.complete is True
+    assert result.requests == 2
+    from_id_queries = [_query(url) for url in fetch.urls if "fromId" in url]
+    assert from_id_queries and from_id_queries[0]["fromId"] == ["1001"]
+    assert len(result.trades) == 1005
+
+
+def test_full_pages_until_the_request_budget_are_incomplete() -> None:
+    fetch = PagedFetch(always_full=True)
+    client = BinanceRestClient(fetch=fetch, max_requests=3)
+
+    result = client.recover_agg_trades("BTCUSDT", last_event_time=NOW - timedelta(hours=1), now=NOW)
+
+    assert result.complete is False
+    assert result.reason == "RATE_LIMIT_BUDGET_EXHAUSTED"

@@ -171,7 +171,12 @@ def build_doctor(
     ws_state = read_ws_state(settings)
     if ws_state is None:
         ws_check = CheckResult(name="ingest.ws", status="ok", detail="no live WS state yet")
-    elif ws_state.stale or ws_state.connection_state == "FAILED":
+    elif (
+        ws_state.stale
+        or ws_state.connection_state != "SUBSCRIBED"
+        or not ws_state.streams
+        or not ws_state.freshness
+    ):
         ws_check = CheckResult(
             name="ingest.ws",
             status="degraded",

@@ -366,7 +366,8 @@ class BinanceWsClient:
                 stream, data = parse_stream_message(raw, max_bytes=self._max_message_bytes)
             except EventValidationError:
                 continue
-            self._pending.append((stream, data))
+            if len(self._pending) < 10_000:
+                self._pending.append((stream, data))
 
     def receive_event(self, timeout: float | None = None) -> tuple[str, dict[str, Any]]:
         """Receive one bounded, parsed stream event."""
@@ -405,6 +406,7 @@ class BinanceWsClient:
         self._transport = None
         self._ack = None
         self._subscribed = None
+        self._pending.clear()
         if transport is not None:
             try:
                 transport.close()

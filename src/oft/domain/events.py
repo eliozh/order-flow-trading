@@ -264,7 +264,7 @@ def parse_stream_message(
         raise EventValidationError("OVERSIZED", f"stream message exceeds {max_bytes} bytes")
     try:
         document: Any = json.loads(raw)
-    except (json.JSONDecodeError, RecursionError) as exc:
+    except (json.JSONDecodeError, RecursionError, ValueError, OverflowError) as exc:
         raise EventValidationError("MALFORMED_JSON", "stream message is not valid JSON") from exc
     if not isinstance(document, dict):
         raise EventValidationError("NOT_AN_OBJECT", "stream message must be a JSON object")

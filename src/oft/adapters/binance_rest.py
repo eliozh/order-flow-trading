@@ -229,6 +229,7 @@ class BinanceRestClient:
         start_time: datetime,
         end_time: datetime,
         limit: int = AGG_TRADES_LIMIT,
+        from_id: int | None = None,
     ) -> AggTradePage:
         """GET one bounded ``aggTrades`` window (both bounds < 1 h apart).
 
@@ -236,15 +237,18 @@ class BinanceRestClient:
         span of an hour or more, so callers must paginate. ``429``/``418`` and
         an over-cap weight header are surfaced as ``BINANCE_RATE_LIMITED``.
         """
-        _validate_agg_trade_window(symbol, start_time, end_time, limit, self._max_weight)
-        query = urlencode(
-            {
-                "symbol": symbol,
-                "startTime": _epoch_millis(start_time),
-                "endTime": _epoch_millis(end_time),
-                "limit": limit,
-            }
-        )
+        if from_id is None:
+            _validate_agg_trade_window(symbol, start_time, end_time, limit, self._max_weight)
+            query = urlencode(
+                {
+                    "symbol": symbol,
+                    "startTime": _epoch_millis(start_time),
+                    "endTime": _epoch_millis(end_time),
+                    "limit": limit,
+                }
+            )
+        else:
+            query = urlencode({"symbol": symbol, "fromId": from_id, "limit": limit})
         url = f"{self._base_url}{AGG_TRADES_PATH}?{query}"
         try:
             response = self._fetch(url, self._timeout, self._max_bytes)
@@ -324,6 +328,24 @@ class BinanceRestClient:
             requests += 1
             trades.extend(page.trades)
             weight_used = page.weight_used
+            # A full page means the window may have been truncated: page with
+            # fromId until the endpoint returns fewer than `limit` rows.
+            while len(page.trades) >= AGG_TRADES_LIMIT:
+                if requests >= self._max_requests:
+                    reason = reason or "RATE_LIMIT_BUDGET_EXHAUSTED"
+                    break
+                next_from = max(trade.agg_trade_id for trade in page.trades) + 1
+                page = self.fetch_agg_trades(
+                    symbol,
+                    start_time=cursor,
+                    end_time=window_end,
+                    from_id=next_from,
+                )
+                requests += 1
+                weight_used = page.weight_used
+                if not page.trades:
+                    break
+                trades.extend(page.trades)
             cursor = window_end
         if cursor < end and reason is None and requests >= self._max_requests:
             reason = "RATE_LIMIT_BUDGET_EXHAUSTED"

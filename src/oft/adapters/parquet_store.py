@@ -1174,13 +1174,15 @@ class LiveParquetBuffer:
         # LRU-bounded: (symbol, key) -> ``is_closed`` for klines, True for marks.
         self._seen_klines: OrderedDict[tuple[str, object], bool] = OrderedDict()
         self._seen_marks: OrderedDict[tuple[str, object], bool] = OrderedDict()
+        self._seen_agg_ids: OrderedDict[tuple[str, int], None] = OrderedDict()
+        self._retry_persistent_dedupe = False
         # Open bars are not durable: keep only the latest in memory until closed.
         self._open_klines: dict[tuple[str, object], object] = {}
         self._logger = structlog.get_logger(__name__)
 
     @property
     def dedupe_keys(self) -> int:
-        return len(self._seen_klines) + len(self._seen_marks)
+        return len(self._seen_klines) + len(self._seen_marks) + len(self._seen_agg_ids)
 
     def _remember_key(
         self, keys: OrderedDict[tuple[str, object], bool], key: tuple[str, object], closed: bool
@@ -1197,7 +1199,16 @@ class LiveParquetBuffer:
             return
         for entry in self._store.list_manifest():
             try:
-                if entry.data_type == "klines_1m":
+                if entry.data_type == "agg_trades":
+                    table = pq.read_table(entry.path, columns=["symbol", "agg_trade_id"])
+                    for row in table.to_pylist():
+                        if row["agg_trade_id"] is not None:
+                            key = (str(row["symbol"]), int(row["agg_trade_id"]))
+                            self._seen_agg_ids.pop(key, None)
+                            self._seen_agg_ids[key] = None
+                            while len(self._seen_agg_ids) > self._dedupe_max_keys:
+                                self._seen_agg_ids.popitem(last=False)
+                elif entry.data_type == "klines_1m":
                     table = pq.read_table(entry.path, columns=["symbol", "open_time", "is_closed"])
                     for row in table.to_pylist():
                         key = (str(row["symbol"]), row["open_time"])
@@ -1287,11 +1298,37 @@ class LiveParquetBuffer:
         for trade in trades:
             by_symbol.setdefault(trade.symbol, []).append(trade)
         for symbol, symbol_trades in by_symbol.items():
-            published.extend(
-                self._writer.write_agg_trades_batch(
-                    symbol_trades, symbol=symbol, source=self._source
+            unique: list[AggTrade] = []
+            new_keys: list[tuple[str, int]] = []
+            for trade in symbol_trades:
+                key = (trade.symbol, trade.agg_trade_id)
+                if key in self._seen_agg_ids:
+                    continue
+                unique.append(trade)
+                new_keys.append(key)
+            if not unique:
+                continue
+            try:
+                # A retry after a partial publish falls back to the persistent
+                # dedupe backstop; the success path stays incremental.
+                published.extend(
+                    self._writer.write_agg_trades_batch(
+                        unique,
+                        symbol=symbol,
+                        source=self._source,
+                        allow_duplicate_ids=not self._retry_persistent_dedupe,
+                    )
                 )
-            )
+            except Exception:
+                self._retry_persistent_dedupe = True
+                raise
+            else:
+                self._retry_persistent_dedupe = False
+                for key in new_keys:
+                    self._seen_agg_ids.pop(key, None)
+                    self._seen_agg_ids[key] = None
+                    while len(self._seen_agg_ids) > self._dedupe_max_keys:
+                        self._seen_agg_ids.popitem(last=False)
         return published
 
     def _write_klines(self, klines: list[KlineEvent]) -> list[ManifestEntry]:

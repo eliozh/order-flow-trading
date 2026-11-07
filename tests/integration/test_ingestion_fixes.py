@@ -7,6 +7,8 @@ from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
 
+import pytest
+
 from oft.adapters.binance_ws import MessageTooLargeError
 from oft.adapters.parquet_store import LiveParquetBuffer
 from oft.adapters.sqlite_store import SqliteStore
@@ -444,3 +446,117 @@ def test_reconnect_goes_idle_when_all_symbols_are_unstarred_then_recovers(
     assert streams_seen[0] and any("btcusdt@aggTrade" in item for item in streams_seen[0])
     assert len(streams_seen) == 2  # no connect attempt was made while idle
     assert any("ethusdt@aggTrade" in item for item in streams_seen[1])
+
+
+def test_reconnect_delay_is_clamped_for_huge_attempts() -> None:
+    from oft.application.ingestion_supervisor import reconnect_delay
+
+    assert reconnect_delay(100_000, jitter=lambda: 0.0) == 30.0
+
+
+def test_live_agg_dedupe_is_incremental_not_a_full_rescan(tmp_path: Path, monkeypatch) -> None:
+    from decimal import Decimal
+
+    from oft.adapters.parquet_store import ParquetStore
+    from oft.domain.events import AggTrade
+
+    settings = _settings(tmp_path)
+    store = SqliteStore(settings)
+    buffer = LiveParquetBuffer(settings=settings, store=store, clock=Clock())
+
+    def no_rescan(*args, **kwargs):  # type: ignore[no-untyped-def]
+        raise AssertionError("write_agg_trades_batch rescanned history")
+
+    monkeypatch.setattr(ParquetStore, "_existing_agg_trade_ids", no_rescan)
+
+    def trade(trade_id: int) -> AggTrade:
+        return AggTrade(
+            symbol="BTCUSDT",
+            agg_trade_id=trade_id,
+            price=Decimal("100"),
+            quantity=Decimal("1"),
+            first_trade_id=trade_id,
+            last_trade_id=trade_id,
+            transact_time=NOW,
+            is_buyer_maker=False,
+        )
+
+    buffer.add(trade(1))
+    buffer.flush()
+    buffer.add(trade(1))
+    buffer.add(trade(2))
+    buffer.flush()
+
+    root = settings.data_dir / "market" / "um" / "agg_trades" / "symbol=BTCUSDT"
+    import pyarrow.parquet as pq
+
+    rows = []
+    for path in root.glob("date=*/*.parquet"):
+        rows.extend(pq.read_table(path, columns=["agg_trade_id"]).to_pylist())
+    assert sorted(row["agg_trade_id"] for row in rows) == [1, 2]
+
+
+def _agg_trade(symbol: str, trade_id: int):
+    from decimal import Decimal
+
+    from oft.domain.events import AggTrade
+
+    return AggTrade(
+        symbol=symbol,
+        agg_trade_id=trade_id,
+        price=Decimal("100"),
+        quantity=Decimal("1"),
+        first_trade_id=trade_id,
+        last_trade_id=trade_id,
+        transact_time=NOW,
+        is_buyer_maker=False,
+    )
+
+
+def test_same_id_on_different_symbols_is_not_deduped(tmp_path: Path) -> None:
+    settings = _settings(tmp_path)
+    buffer = LiveParquetBuffer(settings=settings, store=SqliteStore(settings), clock=Clock())
+    buffer.add(_agg_trade("BTCUSDT", 7))
+    buffer.add(_agg_trade("ETHUSDT", 7))
+    buffer.flush()
+
+    import pyarrow.parquet as pq
+
+    rows = []
+    for symbol in ("BTCUSDT", "ETHUSDT"):
+        root = settings.data_dir / "market" / "um" / "agg_trades" / f"symbol={symbol}"
+        for path in root.glob("date=*/*.parquet"):
+            rows.extend(pq.read_table(path, columns=["symbol", "agg_trade_id"]).to_pylist())
+    assert sorted((row["symbol"], row["agg_trade_id"]) for row in rows) == [
+        ("BTCUSDT", 7),
+        ("ETHUSDT", 7),
+    ]
+
+
+def test_transient_flush_failure_retries_without_duplicates(tmp_path: Path, monkeypatch) -> None:
+    settings = _settings(tmp_path)
+    buffer = LiveParquetBuffer(settings=settings, store=SqliteStore(settings), clock=Clock())
+    original = buffer._writer.write_agg_trades_batch
+    calls = {"count": 0}
+
+    def flaky(*args, **kwargs):  # type: ignore[no-untyped-def]
+        calls["count"] += 1
+        if calls["count"] == 1:
+            original(*args, **kwargs)  # publish, then simulate a crash
+            raise OSError("disk I/O error")
+        return original(*args, **kwargs)
+
+    monkeypatch.setattr(buffer._writer, "write_agg_trades_batch", flaky)
+    buffer.add(_agg_trade("BTCUSDT", 1))
+
+    with pytest.raises(OSError):
+        buffer.flush()
+    buffer.flush()
+
+    import pyarrow.parquet as pq
+
+    root = settings.data_dir / "market" / "um" / "agg_trades" / "symbol=BTCUSDT"
+    rows = []
+    for path in root.glob("date=*/*.parquet"):
+        rows.extend(pq.read_table(path, columns=["agg_trade_id"]).to_pylist())
+    assert [row["agg_trade_id"] for row in rows] == [1]
