@@ -89,6 +89,9 @@ Order is dependency-driven. Slice 11 is a genuine end-to-end path through all si
 | 19 | `19-report-opportunity-ui` | 12, 16 | yes | yes | **yes** | L |
 | 20 | `20-trigger-paper-ui` | 18, 19 | yes | yes | **yes** | L |
 | 21 | `21-replay-hardening` | 11–20 | no | no | no | M |
+| 22 | `22-storage-refactor` | 11–21 | no | no | no | L |
+
+Slice 22 is a follow-up hardening slice added after the analysis loop is complete; it changes storage structure only and adds no product behavior.
 
 **Security-review rule:** slices 11, 13, 14, 15, 18, 19, and 20 must not merge without a security review. Scope: the LLM boundary (untrusted market/knowledge text, prompt injection, provider keys, output rejection), the paper order path (risk gate, gateway, kill switch, idempotency), and the Web mutation/XSS/CSP surface. This is a review requirement only; it is not a gate approval.
 
@@ -662,6 +665,56 @@ Order is dependency-driven. Slice 11 is a genuine end-to-end path through all si
 
 ---
 
+### 22 — `22-storage-refactor`
+
+**Title:** Storage hardening: split the SQLite store and add residual foreign keys and enum CHECK constraints
+
+**Goal:** Close the three storage items deferred from slice 11 (`fix-mediums.md` M13, M22 residual, M26) without changing behavior:
+
+- **M13 — split `src/oft/adapters/sqlite_store.py`** (3,571 lines at review time) into cohesive store modules behind `StorePort`, using the two-pass mixin plan in `fix-mediums.md`: first extract `SqliteConnectionMixin` (`_connect`, `_connect_read_only`), `LLMStoreMixin` (LLM calls/decisions/budget plus row mappers), and `TradingStoreMixin` (opportunities/events, triggers, risk verdicts, OMS, paper account, `_insert_audit_event`, row mappers); then extract the scan/report/job stores so the remaining file is below the 800-line soft ceiling. `SqliteStore` composes the mixins and keeps the schema DDL and migrations.
+- **M22 residual — add the missing foreign keys** `orders.risk_verdict_id → risk_verdicts(risk_verdict_id)`, `risk_verdicts.decision_id → decisions(decision_id)`, and `positions.account_id → paper_accounts(account_id)`, and reorder `save_order_fill_position` so the account row exists before the position within the same transaction.
+- **M26 — add CHECK constraints** for the v10 status/enum columns: `llm_calls.status`, `decisions.validation_status`, `trigger_events.status`, `orders.status`, and `positions.state`, using the existing additive/rebuild migration pattern.
+
+**Migration version note:** `fix-mediums.md` scoped the upgrade test as **v14 → v15** because v14 was current when slice 11 was reviewed. Slice 12 has since applied v15 (`scan_symbols.failed_stage`), so slice 22 uses the next free version — **v15 → v16** unless an intervening slice adds a migration — and the test records the actual `from`/`to` pair. A populated v14 DB still exercises the whole migration chain.
+
+**Scope fence for this slice:** store module extraction, the residual-FK/CHECK migration, and tests only. No SQL semantics change, no transaction-boundary change, no API/CLI/Web change, no new product behavior, no new tables or columns beyond constraints and keys.
+
+**Files expected**
+- `src/oft/adapters/sqlite_store.py` — keeps schema DDL and migrations; composes the mixins; shrinks below the 800-line soft ceiling after the second pass.
+- `src/oft/adapters/sqlite_connections.py` — `SqliteConnectionMixin` with `_connect`, `_connect_read_only`.
+- `src/oft/adapters/sqlite_llm_ledger.py` — `LLMStoreMixin`: `llm_calls`, `decisions`, `budget_ledger`, and their row mappers.
+- `src/oft/adapters/sqlite_trading_ledger.py` — `TradingStoreMixin`: opportunities/events, triggers, risk verdicts, OMS, paper account, audit-insert helper, and row mappers.
+- `src/oft/adapters/sqlite_scan_store.py` — second-pass mixin for scans/reports/job runs and their row mappers.
+- `src/oft/ports/store.py` — only if a type/protocol re-export is needed; no method signature changes.
+- `tests/integration/test_store_atomicity.py` — seed parent rows for synthetic verdicts, orders, and positions.
+- `tests/integration/test_store_migrations.py` (or the existing upgrade test) — populated v14 → next-version upgrade, `PRAGMA foreign_key_check`, and constraint negatives.
+- Cross-trigger replay tests — seed the parent rows they previously omitted.
+
+**Tests expected**
+- **Behavior unchanged:** the full existing suite passes with only migration-version assertions updated; no test expectation about stored rows, values, or SQL results changes.
+- **Populated upgrade:** build a v14 DB with representative rows in `llm_calls`, `decisions`, `trigger_events`, `risk_verdicts`, `orders`, `fills`, `positions`, `paper_accounts`, and opportunity/event tables, then upgrade; every row is preserved, `PRAGMA foreign_key_check` returns no rows, and no data is lost.
+- **Constraint negatives:** an orphan `orders.risk_verdict_id`, `risk_verdicts.decision_id`, or `positions.account_id` is rejected; an invalid status/enum in each of the five columns is rejected; every value the application writes is accepted.
+- **Atomicity:** `save_order_fill_position` inserts the account before the position and keeps the existing single-transaction and balance behavior (lost-update and duplicate-accept tests pass unchanged).
+- **Structure:** a check confirms `sqlite_store.py` is ≤800 lines after the second pass, or documents each extracted module as cohesive and the remaining file below the ceiling.
+- `uv run pytest -q`, `uv run mypy`, `uv run ruff check .`, `uv run ruff format --check .`, and `uv run lint-imports` all pass.
+
+**UI:** false. **Security:** false (schema/store refactor; no new external input surface). **Security review required:** no.
+
+**Acceptance criteria**
+- [ ] No behavior change: all existing tests pass unchanged except migration-version assertions; SQL text, transaction boundaries, and public method signatures are unchanged by the move.
+- [ ] A populated v14 DB upgrades to the new schema with the three residual FKs and the five CHECK constraints; `PRAGMA foreign_key_check` is empty and no data is lost.
+- [ ] Orphan-key and invalid-enum negative cases are rejected by the database.
+- [ ] `src/oft/adapters/sqlite_store.py` no longer exceeds the 800-line soft ceiling after the split, or each extracted module is cohesive and the remaining file is below it; schema DDL and migrations stay in one place.
+- [ ] `uv run lint-imports` still passes (5 kept / 0 broken) and `mypy`, `ruff`, and `pytest` are green.
+- [ ] The two-PR path is acceptable: the orchestrator may split the slice into two behavior-preserving PRs (mixin extraction first, then scan/report/job extraction), and each PR passes the full suite on its own.
+
+**Preview screens**
+- None (no user-visible surface changes).
+
+**Dependencies:** 11–21. **Size:** L.
+
+---
+
 ## 5. Test strategy for the milestone
 
 ### 5.1 Levels and tools
@@ -837,6 +890,7 @@ Expected: the scan produces CALC + LLM reports, the opportunity ledger is popula
 10. **Paper fill realism:** no queue-position modeling; partial fills off by default. The fill model (slippage/fees) is documented in the journal/runbook and revisited if paper results diverge from live.
 11. **Session/`NO_TRADING` handling:** treat it as a regime flag per research, not a halt; the human validation of order-type rejection during `NO_TRADING` remains a pre-Live item.
 12. **No `needs-human` blocker:** the plan proceeds on the PRD/ADR assumptions above. If G3 wants automatic paper entry, a different paper-account reset policy, or a different knowledge scope, that is a product decision to record before implementation.
+13. **Storage hardening moved to slice 22:** the three storage items deferred from slice 11 are no longer open follow-ups — M13 (`sqlite_store.py` split), M22 residual (`orders.risk_verdict_id`, `risk_verdicts.decision_id`, `positions.account_id` FKs), and M26 (CHECK constraints on the v10 status/enum columns) are slice `22-storage-refactor`. The migration numbers in `fix-mediums.md` are stale: slice 12 consumed schema v15, so slice 22 uses the next free version (v15 → v16 unless an intervening slice adds a migration).
 
 ---
 
@@ -855,6 +909,7 @@ Expected: the scan produces CALC + LLM reports, the opportunity ledger is popula
 | 19 | S04.1 `/reports`; S04.2 `/reports/:reportId`; S04.3 chart unchanged; S05.1 `/opportunities`; S05.2 `/opportunities/:oppId` |
 | 20 | S06.1 `/triggers`; S06.2 `/triggers/:triggerId`; S08.1 `/paper` |
 | 21 | None |
+| 22 | None (storage refactor; no user-visible surface) |
 
 ---
 
