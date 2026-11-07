@@ -44,7 +44,10 @@ def main(argv: list[str]) -> int:
             failures.append(f"{target}: expected exactly one measured path, found {len(matches)}")
             continue
         path = str(matches[0])
-        _, statements, _, missing, missing_branches = cov.analysis2(path)
+        analysis = cov._analyze(path)
+        statements = analysis.statements
+        missing = sorted(analysis.missing)
+        missing_branches = analysis.missing_branch_arcs()
         if missing or missing_branches:
             failures.append(
                 f"{target}: missing lines {missing or []}, missing branches {missing_branches or []}"

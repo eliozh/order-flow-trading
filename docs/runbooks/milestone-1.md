@@ -132,6 +132,7 @@ result = harness.run()
 print("metric_version:", result.metric_version)
 print("metric_hash:   ", result.metric_hash)
 print("output:        ", result.output_path)
+print("idempotent:    ", result.idempotent)
 PY
 ```
 
@@ -141,6 +142,7 @@ Expected output shape (the hashes are stable for this fixture and version):
 metric_version: orderflow_metrics.v1.<16-hex>
 metric_hash:    <64-hex>
 output:         /tmp/<data-dir>/replay/BTCUSDT/4h/orderflow_metrics.v1.<16-hex>/<64-hex>.json
+idempotent:     False (True on the second identical run)
 ```
 
 Run the block twice: the second run prints the same `metric_hash`, the same

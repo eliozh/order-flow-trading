@@ -409,3 +409,12 @@ def test_tampered_document_is_not_treated_as_idempotent(tmp_path: Path) -> None:
 
     with pytest.raises(ReplayNonDeterministicError, match="tampered|different metric hash"):
         harness.run()
+
+
+def test_existing_non_object_replay_document_fails_cleanly(tmp_path: Path) -> None:
+    harness = _harness(tmp_path)
+    result = harness.run()
+    Path(result.output_path).write_text("[]", encoding="utf-8")
+
+    with pytest.raises(ReplayNonDeterministicError, match="not a JSON object"):
+        harness.run()

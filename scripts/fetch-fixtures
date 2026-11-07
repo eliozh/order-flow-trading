@@ -193,7 +193,11 @@ def fetch(
             except (OSError, UnicodeDecodeError, urllib.error.URLError) as exc:
                 destination.unlink(missing_ok=True)
                 raise FixtureError(f"CHECKSUM download failed for {checksum_url}: {exc}") from exc
-            digest = verify_checksum(destination, checksum_text)
+            try:
+                digest = verify_checksum(destination, checksum_text)
+            except FixtureError:
+                destination.unlink(missing_ok=True)
+                raise
             destination.with_name(destination.name + ".CHECKSUM").write_text(
                 checksum_text, encoding="utf-8"
             )

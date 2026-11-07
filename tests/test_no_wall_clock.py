@@ -68,9 +68,35 @@ def _import_aliases(tree: ast.AST) -> dict[str, str]:
     return aliases
 
 
+def _assignments(tree: ast.AST, aliases: dict[str, str]) -> dict[str, str]:
+    bindings: dict[str, str] = {}
+    for _ in range(3):
+        for node in ast.walk(tree):
+            if not isinstance(node, (ast.Assign, ast.AnnAssign)):
+                continue
+            value = node.value
+            raw = _dotted(value) if value is not None else None
+            if not raw:
+                continue
+            first, _, rest = raw.partition(".")
+            resolved = aliases.get(first, bindings.get(first, first)) + (f".{rest}" if rest else "")
+            targets = node.targets if isinstance(node, ast.Assign) else [node.target]
+            for target in targets:
+                if isinstance(target, ast.Name):
+                    bindings[target.id] = resolved
+    return bindings
+
+
+def _resolve(raw: str, aliases: dict[str, str], bindings: dict[str, str]) -> str:
+    first, _, rest = raw.partition(".")
+    base = aliases.get(first, bindings.get(first, first))
+    return base + (f".{rest}" if rest else "")
+
+
 def _wall_clock_calls(tree: ast.AST) -> list[tuple[int, str]]:
     """Return ``(line, expression)`` for every wall-clock call in a module."""
     aliases = _import_aliases(tree)
+    bindings = _assignments(tree, aliases)
     violations: list[tuple[int, str]] = []
     call_nodes = [node for node in ast.walk(tree) if isinstance(node, ast.Call)]
     called_attributes = {
@@ -81,8 +107,7 @@ def _wall_clock_calls(tree: ast.AST) -> list[tuple[int, str]]:
             raw = _dotted(node)
             if not raw:
                 continue
-            first, _, rest = raw.partition(".")
-            resolved = aliases.get(first, first) + (f".{rest}" if rest else "")
+            resolved = _resolve(raw, aliases, bindings)
             parts = resolved.split(".")
             attr = parts[-1]
             if attr in _WALL_CLOCK_ATTRIBUTES and any(
@@ -91,11 +116,22 @@ def _wall_clock_calls(tree: ast.AST) -> list[tuple[int, str]]:
                 violations.append((node.lineno, f"{attr} (attribute)"))
         if not isinstance(node, ast.Call):
             continue
+        if isinstance(node.func, ast.Name) and node.func.id == "getattr":
+            if len(node.args) >= 2:
+                obj = _dotted(node.args[0])
+                attr_node = node.args[1]
+                if obj and isinstance(attr_node, ast.Constant) and isinstance(attr_node.value, str):
+                    resolved = _resolve(obj, aliases, bindings)
+                    parts = resolved.split(".")
+                    if attr_node.value in _WALL_CLOCK_ATTRIBUTES and any(
+                        module in _WALL_CLOCK_MODULES for module in parts
+                    ):
+                        violations.append((node.lineno, f"getattr({attr_node.value})"))
+            continue
         raw = _dotted(node.func)
         if not raw:
             continue
-        first, _, rest = raw.partition(".")
-        resolved = aliases.get(first, first) + (f".{rest}" if rest else "")
+        resolved = _resolve(raw, aliases, bindings)
         parts = resolved.split(".")
         attr = parts[-1]
         if attr not in _WALL_CLOCK_ATTRIBUTES:
@@ -306,24 +342,18 @@ def test_manifest_scan_roots_include_bars_and_resolve_paths(tmp_path: Path) -> N
     bars_dir.mkdir(parents=True)
     part = bars_dir / "part-0.parquet"
     part.write_bytes(b"not-read")
-    relative_entry = ManifestEntry(
-        path="./" + str(part.relative_to(settings.data_dir)),
-        data_type="bars",
-        symbol="BTCUSDT",
-        date="2026-10-01",
-        rows=1,
-        bytes=1,
-        checksum="0" * 64,
-        source="test",
-        created_at=utc_timestamp(NOW),
-    )
-    # Normalize the manifest row path exactly as the checker does.
+    # A relative manifest path must resolve against data_dir, not the CWD.
     store.record_manifest(
         ManifestEntry(
-            **{
-                **relative_entry.__dict__,
-                "path": str(part),
-            }
+            path=str(part.relative_to(settings.data_dir)),
+            data_type="bars",
+            symbol="BTCUSDT",
+            date="2026-10-01",
+            rows=1,
+            bytes=1,
+            checksum="0" * 64,
+            source="test",
+            created_at=utc_timestamp(NOW),
         )
     )
     report = _doctor(settings, store)
@@ -370,3 +400,21 @@ def test_disk_check_uses_injected_disk_usage(tmp_path: Path) -> None:
     low = SimpleNamespace(free=0, used=10, total=10)
     assert _disk_check(settings, disk_usage=lambda _path: healthy).status == "ok"
     assert _disk_check(settings, disk_usage=lambda _path: low).status == "degraded"
+
+
+def test_wall_clock_detector_tracks_rebinding_and_getattr() -> None:
+    tree = ast.parse(
+        "import datetime\n"
+        "import time\n"
+        "clock = datetime\n"
+        "clock.now()\n"
+        "clock2 = datetime.datetime\n"
+        "clock2.utcnow()\n"
+        "factory = time.time\n"
+        "factory()\n"
+        "getattr(datetime.datetime, 'now')\n"
+        "getattr(clock, 'today')()\n"
+    )
+
+    found = {expression for _, expression in _wall_clock_calls(tree)}
+    assert {"now()", "utcnow()", "time()", "getattr(now)", "getattr(today)"} <= found

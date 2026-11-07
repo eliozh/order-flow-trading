@@ -420,6 +420,8 @@ class ReplayHarness:
                 raise ReplayNonDeterministicError(
                     f"existing replay document is unreadable: {output_path.name}"
                 ) from exc
+            if not isinstance(existing, dict):
+                raise ReplayNonDeterministicError("existing replay document is not a JSON object")
             existing_hash = existing.get("metric_hash")
             existing_document = existing.get("document")
             if not isinstance(existing_document, dict):

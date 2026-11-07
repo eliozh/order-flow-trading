@@ -171,8 +171,15 @@ def _manifest_orphans_check(settings: Settings, store: StorePort) -> CheckResult
     except Exception as exc:  # pragma: no cover - defensive boundary
         return CheckResult("manifest.orphans", "degraded", f"manifest unreadable ({exc})")
     data_root = settings.data_dir.expanduser().resolve()
-    known = {str(Path(entry.path).expanduser().resolve()) for entry in entries}
-    missing = [entry for entry in entries if not Path(entry.path).expanduser().resolve().is_file()]
+
+    def _resolve(path: str) -> Path:
+        candidate = Path(path).expanduser()
+        if not candidate.is_absolute():
+            candidate = data_root / candidate
+        return candidate.resolve()
+
+    known = {str(_resolve(entry.path)) for entry in entries}
+    missing = [entry for entry in entries if not _resolve(entry.path).is_file()]
     disk_parts: list[str] = []
     for name in MANIFEST_SCAN_ROOTS:
         root = data_root / name

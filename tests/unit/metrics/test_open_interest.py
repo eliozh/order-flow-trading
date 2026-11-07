@@ -254,3 +254,24 @@ def test_open_interest_validation_and_contract_cover_all_rejections() -> None:
     )
     with pytest.raises(ValueError, match="no measured point"):
         empty.to_contract()
+
+
+def test_irregular_samples_that_do_not_span_the_window_are_estimated_and_reasoned() -> None:
+    samples = (
+        _sample(0, "100.0"),
+        _sample(3, "101.0"),
+        _sample(9, "102.0"),
+    )
+    result = _compute(samples)
+    assert result.sampling == "IRREGULAR_RESAMPLED"
+    assert any("do not span" in reason for reason in result.quality.quality_reasons)
+
+
+def test_irregular_samples_that_span_the_window_skip_the_missing_span_reason() -> None:
+    samples = (
+        _sample(0, "100.0"),
+        _sample(3 * 60 + 59, "101.0"),
+    )
+    result = _compute(samples)
+    assert result.sampling == "IRREGULAR_RESAMPLED"
+    assert not any("do not span" in reason for reason in result.quality.quality_reasons)
