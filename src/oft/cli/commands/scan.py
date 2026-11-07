@@ -124,14 +124,20 @@ def run(
 
 @scan_app.command("status")
 def scan_status(
-    scan_id: str,
+    scan_id: Annotated[
+        str | None,
+        typer.Argument(help="Scan ID; omit to show the scheduled scan state."),
+    ] = None,
     json_output: Annotated[
         bool,
         typer.Option("--json", help="Emit the API envelope as JSON."),
     ] = False,
 ) -> None:
-    """Read one scan through the daemon API."""
+    """Read one scan through the daemon API, or show the scan schedule."""
     settings = _settings_or_exit(json_output)
+    if scan_id is None:
+        _emit_schedule(settings, json_output)
+        return
 
     try:
         envelope = ApiClient.from_settings(settings).get_scan(scan_id)
@@ -144,6 +150,71 @@ def scan_status(
         emit_error("NOT_FOUND", f"Scan {scan_id} does not exist.", json_output=json_output)
         raise typer.Exit(code=1)
     _emit_scan(ScanRecord(**data), json_output)
+
+
+def _emit_schedule(settings: Any, json_output: bool) -> None:
+    """Show the UTC next/last run state without requiring a daemon."""
+    from oft.application.jobs import JobLedger
+    from oft.application.scheduler import (
+        ScheduleState,
+        resolve_schedule_settings,
+    )
+    from oft.bootstrap import build_container
+    from oft.domain.time import utc_timestamp
+
+    try:
+        config = resolve_schedule_settings()
+    except ValueError as exc:
+        emit_error("CONFIG_INVALID", str(exc), json_output=json_output)
+        raise typer.Exit(code=5) from exc
+
+    container = build_container(settings)
+    state = ScheduleState(period=config.period, jitter_seconds_max=config.jitter_seconds)
+    now = container.clock.now()
+    last = JobLedger(store=container.store, clock=container.clock).latest("scan")
+    data: dict[str, Any] = {
+        "timezone": "UTC",
+        "period": state.period_at(now),
+        "pending_period": state.pending_period or "",
+        "next_run_at": utc_timestamp(state.next_run(now)),
+        "last_run": (
+            {
+                "run_id": last.run_id,
+                "status": last.status,
+                "window_start": last.window_start,
+                "finished_at": last.finished_at or "",
+            }
+            if last is not None
+            else None
+        ),
+    }
+    if json_output:
+        typer.echo(
+            json.dumps(
+                success_envelope(
+                    data,
+                    request_id=new_request_id(),
+                    generated_at=utc_timestamp(now),
+                    provenance="CALC",
+                    data_quality="COMPLETE",
+                ),
+                indent=2,
+            )
+        )
+        return
+    lines = [
+        f"Schedule period   {data['period']} (UTC boundaries)",
+        f"Next run (UTC)    {data['next_run_at']}",
+    ]
+    if data["last_run"] is None:
+        lines.append("Last run (UTC)    never")
+    else:
+        last_run = data["last_run"]
+        lines.append(
+            f"Last run (UTC)    {last_run['run_id']} · {last_run['status']} · "
+            f"{last_run['finished_at']}"
+        )
+    typer.echo("\n".join(lines))
 
 
 @scan_app.command("history")

@@ -18,6 +18,7 @@ from urllib.parse import urlsplit
 
 import structlog
 
+from oft.application.rate_limiter import WsSubscriptionBudget
 from oft.domain.events import EventValidationError, parse_stream_message, strip_control_characters
 
 logger = structlog.get_logger(__name__)
@@ -261,6 +262,7 @@ class BinanceWsClient:
         ping_interval: float = DEFAULT_PING_INTERVAL,
         ping_timeout: float = DEFAULT_PING_TIMEOUT,
         ack_timeout: float = DEFAULT_ACK_TIMEOUT,
+        subscription_budget: WsSubscriptionBudget | None = None,
     ) -> None:
         self._base_url = base_url.rstrip("/")
         self._transport_factory = transport_factory
@@ -270,6 +272,7 @@ class BinanceWsClient:
         self._ping_interval = ping_interval
         self._ping_timeout = ping_timeout
         self._ack_timeout = ack_timeout
+        self._subscription_budget = subscription_budget
         self._transport: Any = None
         self._pending: list[tuple[str, dict[str, Any]]] = []
         self._subscribed: tuple[str, ...] | None = None
@@ -300,6 +303,10 @@ class BinanceWsClient:
                 url=strip_control_characters(alert.url)[:512],
             )
             raise WrongWsPathError(alert.message)
+        if self._subscription_budget is not None:
+            self._subscription_budget.reset()
+            if not self._subscription_budget.can_subscribe(len(streams)):
+                raise SubscriptionRejectedError("subscription budget exceeded for this connection")
         self.close()
         self.connection_state = "CONNECTING"
         try:
@@ -313,6 +320,8 @@ class BinanceWsClient:
             transport.connect()
             self._transport = transport
             self.subscribe(streams)
+            if self._subscription_budget is not None:
+                self._subscription_budget.consume(len(streams))
             self.connection_state = "SUBSCRIBED"
         except Exception:
             self.close()

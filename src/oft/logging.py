@@ -40,9 +40,13 @@ def redact_secrets(
 
 
 def configure_logging(settings: Settings) -> None:
-    """Configure structlog JSON output filtered at the configured level."""
+    """Configure structlog JSON output to stdout and the daemon log file."""
     level = getattr(logging, settings.log_level)
-    logging.basicConfig(format="%(message)s", stream=sys.stdout, level=level, force=True)
+    log_dir = settings.data_dir / "logs"
+    log_dir.mkdir(parents=True, exist_ok=True)
+    handlers: list[logging.Handler] = [logging.StreamHandler(sys.stdout)]
+    handlers.append(logging.FileHandler(log_dir / "daemon.log", encoding="utf-8"))
+    logging.basicConfig(format="%(message)s", handlers=handlers, level=level, force=True)
     structlog.configure(
         processors=[
             structlog.contextvars.merge_contextvars,
@@ -52,6 +56,6 @@ def configure_logging(settings: Settings) -> None:
             structlog.processors.JSONRenderer(),
         ],
         wrapper_class=structlog.make_filtering_bound_logger(level),
-        logger_factory=structlog.PrintLoggerFactory(),
+        logger_factory=structlog.stdlib.LoggerFactory(),
         cache_logger_on_first_use=True,
     )

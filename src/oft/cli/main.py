@@ -8,6 +8,7 @@ from typing import Annotated, Any
 import typer
 
 from oft.cli.commands.backfill import backfill_app
+from oft.cli.commands.daemon import daemon_app
 from oft.cli.commands.doctor import doctor_command, emit_error
 from oft.cli.commands.open import open_command
 from oft.cli.commands.report import report_app
@@ -20,10 +21,6 @@ app = typer.Typer(
     help="Order Flow Trading local CLI.",
     no_args_is_help=True,
     add_completion=False,
-)
-daemon_app = typer.Typer(
-    help="Daemon lifecycle (local API/UI plus live ingestion).",
-    no_args_is_help=True,
 )
 
 
@@ -111,6 +108,20 @@ def _active_symbols(explicit: str | None, starred: tuple[str, ...]) -> tuple[str
     return tuple(symbol.upper() for symbol in starred)
 
 
+def _build_limited_clients(container: Any) -> tuple[Any, Any]:
+    """Build the live clients sharing one rate bucket and WS stream budget."""
+    from oft.adapters.binance_rest import BinanceRestClient
+    from oft.adapters.binance_ws import BinanceWsClient
+    from oft.application.rate_limiter import GlobalRateLimiter, WsSubscriptionBudget
+
+    rate_limiter = GlobalRateLimiter(clock=container.clock)
+    ws_budget = WsSubscriptionBudget()
+    return (
+        BinanceWsClient(subscription_budget=ws_budget),
+        BinanceRestClient(rate_limiter=rate_limiter),
+    )
+
+
 def _run_live_ingestion(settings: Settings, replay_file: Path | None, symbols: str | None) -> None:
     """Run one ordered replay, or start the continuous live WS ingester."""
     import threading
@@ -139,10 +150,7 @@ def _run_live_ingestion(settings: Settings, replay_file: Path | None, symbols: s
             # Never open a socket from a test environment.
             WsStateStore(state_path, container.clock).write("DISCONNECTED", {}, {})
             return
-        from oft.adapters.binance_rest import BinanceRestClient
-        from oft.adapters.binance_ws import BinanceWsClient
-
-        live_client = BinanceWsClient()
+        live_client, recovery_client = _build_limited_clients(container)
         live_parquet = LiveParquetBuffer(
             settings=settings,
             store=container.store,
@@ -165,7 +173,7 @@ def _run_live_ingestion(settings: Settings, replay_file: Path | None, symbols: s
             parquet=live_parquet,
             clock=container.clock,
             client=live_client,
-            recovery=BinanceRestClient(),
+            recovery=recovery_client,
             symbols=symbol_list,
             symbol_provider=symbol_provider,
         )
@@ -218,38 +226,6 @@ def serve(
 ) -> None:
     """Start the local API/UI daemon (127.0.0.1:7611 by default)."""
     settings = _resolve_serve_settings(host, port, allow_non_loopback)
-    _run_uvicorn(settings)
-
-
-@daemon_app.command("start")
-def daemon_start(
-    host: Annotated[str | None, typer.Option("--host", help="Loopback bind address.")] = None,
-    port: Annotated[int | None, typer.Option("--port", help="API port.")] = None,
-    allow_non_loopback: Annotated[
-        bool,
-        typer.Option(
-            "--allow-non-loopback",
-            help="Permit a non-loopback bind (unsupported for shared use).",
-        ),
-    ] = False,
-    replay_file: Annotated[
-        Path | None,
-        typer.Option(
-            "--replay-file",
-            help="Replay a recorded WS JSONL fixture before serving.",
-        ),
-    ] = None,
-    symbols: Annotated[
-        str | None,
-        typer.Option(
-            "--symbols",
-            help="Comma-separated symbols for live ingestion; defaults to starred symbols.",
-        ),
-    ] = None,
-) -> None:
-    """Start the local daemon and its live-ingestion supervisor."""
-    settings = _resolve_serve_settings(host, port, allow_non_loopback)
-    _run_live_ingestion(settings, replay_file, symbols)
     _run_uvicorn(settings)
 
 

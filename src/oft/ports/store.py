@@ -166,6 +166,48 @@ class BackfillManifestRow:
     error_code: str | None
 
 
+@dataclass(frozen=True)
+class JobRunRecord:
+    """One durable scheduler job run (periodic window or manual trigger)."""
+
+    run_id: str
+    job_type: str
+    window_start: str
+    status: str
+    trigger_source: str
+    started_at: str
+    finished_at: str | None
+    error_code: str | None
+    message: str | None
+    lease_owner: str
+    lease_expires_at: str
+    heartbeat_at: str
+
+
+@dataclass(frozen=True)
+class JobLockRecord:
+    """A named, leased advisory lock (``backfill``, ``scan``, ...)."""
+
+    lock_name: str
+    owner: str
+    acquired_at: str
+    expires_at: str
+
+
+@dataclass(frozen=True)
+class ScanSymbolRecord:
+    """Per-symbol stage checkpoint inside a scan job."""
+
+    scan_id: str
+    symbol: str
+    stage: str
+    started_at: str | None
+    finished_at: str | None
+    error_code: str | None
+    report_id: str | None
+    data_quality: str | None
+
+
 class StorePort(Protocol):
     """Persistence contract shared by the API and CLI diagnostics."""
 
@@ -338,3 +380,45 @@ class StorePort(Protocol):
         start: str | None = None,
         end: str | None = None,
     ) -> tuple[DataGap, ...]: ...
+
+    # -- Durable job ledger ----------------------------------------------
+
+    def claim_job_run(self, record: JobRunRecord) -> tuple[bool, JobRunRecord | None, bool]: ...
+
+    def finish_job_run(
+        self,
+        run_id: str,
+        *,
+        status: str,
+        finished_at: str,
+        error_code: str | None = None,
+        message: str | None = None,
+    ) -> bool: ...
+
+    def delete_job_run(self, run_id: str) -> bool: ...
+
+    def renew_job_lease(
+        self, run_id: str, *, owner: str, heartbeat_at: str, lease_expires_at: str
+    ) -> bool: ...
+
+    def get_job_run(self, run_id: str) -> JobRunRecord | None: ...
+
+    def get_job_run_by_window(self, job_type: str, window_start: str) -> JobRunRecord | None: ...
+
+    def latest_job_run(self, job_type: str) -> JobRunRecord | None: ...
+
+    def list_job_runs(
+        self, job_type: str | None = None, limit: int = 50
+    ) -> tuple[JobRunRecord, ...]: ...
+
+    def acquire_job_lock(
+        self, lock_name: str, owner: str, *, acquired_at: str, expires_at: str
+    ) -> bool: ...
+
+    def release_job_lock(self, lock_name: str, owner: str) -> bool: ...
+
+    def get_job_lock(self, lock_name: str) -> JobLockRecord | None: ...
+
+    def upsert_scan_symbol(self, record: ScanSymbolRecord) -> None: ...
+
+    def list_scan_symbols(self, scan_id: str) -> tuple[ScanSymbolRecord, ...]: ...

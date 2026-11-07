@@ -21,6 +21,7 @@ from urllib.parse import urlencode
 
 from pydantic import ValidationError
 
+from oft.application.rate_limiter import GlobalRateLimiter
 from oft.domain.events import AggTrade
 from oft.ports.market_data import AggTradeRecovery
 
@@ -160,6 +161,7 @@ class BinanceRestClient:
         max_requests: int = DEFAULT_MAX_REQUESTS,
         fetch: FetchCallable = default_fetch,
         sleep: SleepCallable = asyncio.sleep,
+        rate_limiter: GlobalRateLimiter | None = None,
     ) -> None:
         self._base_url = base_url.rstrip("/")
         self._timeout = timeout
@@ -171,6 +173,21 @@ class BinanceRestClient:
         self._max_requests = max_requests
         self._fetch = fetch
         self._sleep = sleep
+        self._rate_limiter = rate_limiter
+
+    def _acquire(self, path: str) -> None:
+        if self._rate_limiter is None:
+            return
+        decision = self._rate_limiter.acquire(path)
+        if not decision.allowed:
+            raise BinanceRestError(
+                "BINANCE_RATE_LIMITED",
+                f"{decision.reason} for {path}; retry after {decision.retry_after_seconds:.1f}s",
+            )
+
+    def _note_status(self, path: str, status: int) -> None:
+        if self._rate_limiter is not None:
+            self._rate_limiter.note_status(status, endpoint=path)
 
     @property
     def exchange_info_url(self) -> str:
@@ -178,6 +195,7 @@ class BinanceRestClient:
 
     async def fetch_exchange_info(self) -> ExchangeInfoResponse:
         """GET exchangeInfo with bounded retries on transient failures."""
+        self._acquire(EXCHANGE_INFO_PATH)
         attempt = 0
         while True:
             try:
@@ -201,6 +219,7 @@ class BinanceRestClient:
                 attempt += 1
                 continue
 
+            self._note_status(EXCHANGE_INFO_PATH, response.status)
             if response.status in {418, 429}:
                 raise BinanceRestError(
                     "BINANCE_RATE_LIMITED",
@@ -249,6 +268,7 @@ class BinanceRestClient:
             )
         else:
             query = urlencode({"symbol": symbol, "fromId": from_id, "limit": limit})
+        self._acquire(AGG_TRADES_PATH)
         url = f"{self._base_url}{AGG_TRADES_PATH}?{query}"
         try:
             response = self._fetch(url, self._timeout, self._max_bytes)
@@ -261,6 +281,7 @@ class BinanceRestClient:
                 "UPSTREAM_UNAVAILABLE", "Binance aggTrades request failed."
             ) from exc
 
+        self._note_status(AGG_TRADES_PATH, response.status)
         if response.status in {418, 429}:
             raise BinanceRestError(
                 "BINANCE_RATE_LIMITED", "Binance rate-limited the aggTrades request."

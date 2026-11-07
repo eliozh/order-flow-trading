@@ -18,10 +18,13 @@ from oft.api.envelope import new_request_id, success_envelope
 from oft.api.errors import ApiError
 from oft.api.schemas.report import ScanCreateRequest
 from oft.application.fixture_scan import get_scan, run_fixture_scan
+from oft.application.jobs import JobLedger
 from oft.application.scan_service import (
+    ScanAlreadyRunning,
     ScanError,
     ScanRequest,
     ScanService,
+    _scan_id,
     public_scan_payload,
     report_summary,
 )
@@ -143,8 +146,32 @@ def _run_fixture(request: Request, payload: ScanCreateRequest) -> dict[str, Any]
     )
 
 
+def _scan_error_details(exc: ScanError) -> list[dict[str, Any]] | None:
+    if exc.code != "SCAN_ALREADY_RUNNING":
+        return None
+    running_scan_id = getattr(exc, "running_scan_id", None)
+    return [
+        {
+            "field": "scan_id",
+            "code": "scan_already_running",
+            "message": str(running_scan_id or "unknown"),
+        }
+    ]
+
+
 def _run_metrics_scan(request: Request, payload: ScanCreateRequest) -> dict[str, Any]:
     container = request.app.state.container
+    ledger = JobLedger(store=container.store, clock=container.clock)
+    scan_id = _scan_id(container.clock.now())
+    claim = ledger.claim_scan(trigger_source="MANUAL", owner=scan_id, run_id=scan_id)
+    if not claim.claimed:
+        conflict = ScanAlreadyRunning(running_scan_id=claim.running_scan_id)
+        raise ApiError(
+            conflict.code,
+            conflict.message,
+            details=_scan_error_details(conflict),
+        )
+    assert claim.run is not None
     try:
         run = ScanService(container=container, lock=container.scan_lock).run(
             ScanRequest(
@@ -154,10 +181,19 @@ def _run_metrics_scan(request: Request, payload: ScanCreateRequest) -> dict[str,
                 metrics_only=payload.metrics_only,
                 start=payload.start,
                 end=payload.end,
-            )
+            ),
+            scan_id=scan_id,
         )
     except ScanError as exc:
-        raise ApiError(exc.code, exc.message) from exc
+        ledger.finish(claim.run.run_id, "FAILED", error_code=exc.code)
+        raise ApiError(exc.code, exc.message, details=_scan_error_details(exc)) from exc
+    except BaseException:
+        ledger.finish(claim.run.run_id, "FAILED", error_code="SCAN_FAILED")
+        raise
+    else:
+        ledger.finish(claim.run.run_id, "DONE")
+    finally:
+        ledger.release_scan_lock(claim.run.lease_owner)
     return success_envelope(
         {
             "scan": public_scan_payload(run.scan),
