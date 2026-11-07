@@ -27,7 +27,7 @@ from oft.ports.store import (
     SymbolUpsertResult,
 )
 
-_SCHEMA_VERSION = 7
+_SCHEMA_VERSION = 8
 STALE_RUNNING_SECONDS = 15 * 60
 _BACKFILL_RUN_STATUSES = ("RUNNING", "COMPLETE", "PARTIAL", "FAILED", "BLOCKED", "STALE")
 _BACKFILL_RUNS_DEFINITION = """
@@ -184,7 +184,11 @@ _SCHEMA_SQL = f"""
         metric_version TEXT,
         input_manifest_hash TEXT,
         window_start TEXT,
-        window_end TEXT
+        window_end TEXT,
+        run_id TEXT,
+        last_n INTEGER,
+        recomputed_from TEXT,
+        parent_run_id TEXT
     );
     CREATE TABLE IF NOT EXISTS symbols ({_SYMBOLS_DEFINITION});
     CREATE INDEX IF NOT EXISTS symbols_contract_type ON symbols(contract_type);
@@ -379,6 +383,28 @@ def _migrate_manifest_v6(connection: sqlite3.Connection) -> None:
         raise
 
 
+def _migrate_manifest_v8(connection: sqlite3.Connection) -> None:
+    """Add explicit bar-run provenance columns to the manifest table."""
+    columns = {row[1] for row in connection.execute("PRAGMA table_info(manifest)")}
+    needed = (
+        ("run_id", "TEXT"),
+        ("last_n", "INTEGER"),
+        ("recomputed_from", "TEXT"),
+        ("parent_run_id", "TEXT"),
+    )
+    missing = [(name, kind) for name, kind in needed if name not in columns]
+    if not missing:
+        return
+    connection.execute("BEGIN IMMEDIATE")
+    try:
+        for name, kind in missing:
+            connection.execute(f"ALTER TABLE manifest ADD COLUMN {name} {kind}")
+        connection.execute("COMMIT")
+    except Exception:
+        connection.execute("ROLLBACK")
+        raise
+
+
 def initialize_database(settings: Settings) -> None:
     """Create the data directory and the walking-skeleton schema."""
     settings.data_dir.mkdir(parents=True, exist_ok=True)
@@ -402,6 +428,8 @@ def initialize_database(settings: Settings) -> None:
             _migrate_manifest_v6(connection)
         if _schema_version(connection) < 7 and _table_exists(connection, "symbols"):
             _migrate_symbols_v7(connection)
+        if _schema_version(connection) < 8 and _table_exists(connection, "manifest"):
+            _migrate_manifest_v8(connection)
         with connection:
             connection.executescript(_SCHEMA_SQL)
             connection.execute(
@@ -430,7 +458,11 @@ def initialize_database(settings: Settings) -> None:
             )
             connection.execute(
                 "INSERT OR IGNORE INTO schema_migrations (version, applied_at) VALUES (?, ?)",
-                (_SCHEMA_VERSION, "2026-11-06T18:00:00.000Z"),
+                (7, "2026-11-06T18:30:00.000Z"),
+            )
+            connection.execute(
+                "INSERT OR IGNORE INTO schema_migrations (version, applied_at) VALUES (?, ?)",
+                (_SCHEMA_VERSION, "2026-11-06T19:00:00.000Z"),
             )
     finally:
         connection.close()
@@ -479,6 +511,11 @@ def _row_to_manifest(row: sqlite3.Row) -> ManifestEntry:
         input_manifest_hash=row["input_manifest_hash"],
         window_start=row["window_start"],
         window_end=row["window_end"],
+        run_id=row["run_id"],
+        last_n=row["last_n"],
+        recomputed_from=row["recomputed_from"],
+        parent_run_id=row["parent_run_id"],
+        run_seq=row["run_seq"],
     )
 
 
@@ -721,8 +758,9 @@ class SqliteStore:
             INSERT INTO manifest (
                 path, data_type, symbol, date, rows, bytes, checksum,
                 source, created_at, status, metric_version, input_manifest_hash,
-                window_start, window_end
-            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                window_start, window_end, run_id, last_n, recomputed_from,
+                parent_run_id
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             {conflict}
             """,
             (
@@ -740,6 +778,10 @@ class SqliteStore:
                 entry.input_manifest_hash,
                 entry.window_start,
                 entry.window_end,
+                entry.run_id,
+                entry.last_n,
+                entry.recomputed_from,
+                entry.parent_run_id,
             ),
         )
 
@@ -753,7 +795,9 @@ class SqliteStore:
         if connection is None:
             raise StoreUnavailableError("manifest database is unreadable")
         try:
-            row = connection.execute("SELECT * FROM manifest WHERE path = ?", (path,)).fetchone()
+            row = connection.execute(
+                "SELECT rowid AS run_seq, * FROM manifest WHERE path = ?", (path,)
+            ).fetchone()
         except sqlite3.Error as exc:
             raise StoreUnavailableError(f"manifest lookup failed: {exc}") from exc
         finally:
@@ -780,7 +824,8 @@ class SqliteStore:
             return ()
         try:
             rows = connection.execute(
-                f"SELECT * FROM manifest{where} ORDER BY created_at, path", params
+                f"SELECT rowid AS run_seq, * FROM manifest{where} ORDER BY created_at, path",
+                params,
             ).fetchall()
         except sqlite3.Error as exc:
             raise StoreUnavailableError(f"manifest read failed: {exc}") from exc

@@ -1,0 +1,53 @@
+{
+  "bars": [
+    {
+      "bar_end": "2026-10-01T08:00:00.000Z",
+      "bar_start": "2026-10-01T00:00:00.000Z",
+      "close": "98.00",
+      "high": "102.00",
+      "low": "98.00",
+      "open": "100.00",
+      "quote_volume": "526.0000",
+      "taker_buy_volume": "4.5",
+      "trade_count": 5,
+      "volume": "5.25"
+    },
+    {
+      "bar_end": "2026-10-01T16:00:00.000Z",
+      "bar_start": "2026-10-01T08:00:00.000Z",
+      "close": "104.00",
+      "high": "104.00",
+      "low": "103.00",
+      "open": "103.00",
+      "quote_volume": "311.000",
+      "taker_buy_volume": "2.0",
+      "trade_count": 2,
+      "volume": "3.0"
+    },
+    {
+      "bar_end": "2026-10-02T00:00:00.000Z",
+      "bar_start": "2026-10-01T16:00:00.000Z",
+      "close": "107.00",
+      "high": "107.00",
+      "low": "105.00",
+      "open": "105.00",
+      "quote_volume": "238.7500",
+      "taker_buy_volume": "1.25",
+      "trade_count": 3,
+      "volume": "2.25"
+    }
+  ],
+  "data_quality": "COMPLETE",
+  "expected_bar_count": 3,
+  "input_manifest_hash": "8ec8c772cec7773b8262b866dc25f45ec9415093fc3bb523bbb7df084fc2dec3",
+  "metric_version": "agg_bars.v1.caf0f8d0a211709a",
+  "missing_bar_count": 0,
+  "period": "8h",
+  "quality_reasons": [],
+  "source_mode": "BACKFILL",
+  "symbol": "BTCUSDT",
+  "window": {
+    "end": "2026-10-02T00:00:00.000Z",
+    "start": "2026-10-01T00:00:00.000Z"
+  }
+}

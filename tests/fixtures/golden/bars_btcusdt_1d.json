@@ -1,0 +1,29 @@
+{
+  "bars": [
+    {
+      "bar_end": "2026-10-02T00:00:00.000Z",
+      "bar_start": "2026-10-01T00:00:00.000Z",
+      "close": "107.00",
+      "high": "107.00",
+      "low": "98.00",
+      "open": "100.00",
+      "quote_volume": "1075.7500",
+      "taker_buy_volume": "7.75",
+      "trade_count": 10,
+      "volume": "10.50"
+    }
+  ],
+  "data_quality": "COMPLETE",
+  "expected_bar_count": 1,
+  "input_manifest_hash": "aaf6b1b00cfdea685bb330b3d62098462a669c1d38de22393793c0e78a20f63f",
+  "metric_version": "agg_bars.v1.1443f1496593788e",
+  "missing_bar_count": 0,
+  "period": "1d",
+  "quality_reasons": [],
+  "source_mode": "BACKFILL",
+  "symbol": "BTCUSDT",
+  "window": {
+    "end": "2026-10-02T00:00:00.000Z",
+    "start": "2026-10-01T00:00:00.000Z"
+  }
+}
