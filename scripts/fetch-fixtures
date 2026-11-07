@@ -1,0 +1,267 @@
+#!/usr/bin/env python3
+"""Reproducible fixture fetch/prepare for the order-flow trading test suite.
+
+Committed fixtures are the default. This script:
+
+* ``verify``   checks every committed fixture checksum (offline; CI gate);
+* ``prepare``  verifies and copies the archive fixtures into a deterministic
+  target layout with a JSON manifest;
+* ``fetch``    downloads daily ``aggTrades`` archives from the public
+  ``data.binance.vision`` endpoint, verifies every ``.CHECKSUM``, and records a
+  manifest. It refuses to run without an explicit ``--allow-network``.
+
+Nothing is executed from a downloaded archive, and no timestamps enter the
+manifest, so two runs over the same inputs produce identical outputs.
+"""
+
+from __future__ import annotations
+
+import argparse
+import hashlib
+import json
+import os
+import re
+import shutil
+import sys
+import urllib.error
+import urllib.request
+from datetime import date
+from pathlib import Path
+
+ROOT = Path(__file__).resolve().parents[1]
+FIXTURES = ROOT / "tests" / "fixtures"
+ARCHIVE = FIXTURES / "archive"
+MARKET = FIXTURES / "market"
+BASE_URL = "https://data.binance.vision/data/futures/um/daily/aggTrades"
+SYMBOL_PATTERN = re.compile(r"^[A-Z0-9]{2,24}$")
+HEX_PATTERN = re.compile(r"^[0-9a-f]{64}$")
+
+
+class FixtureError(Exception):
+    """A fixture is missing, malformed, or fails its checksum."""
+
+
+def sha256_file(path: Path) -> str:
+    digest = hashlib.sha256()
+    with path.open("rb") as handle:
+        for chunk in iter(lambda: handle.read(1024 * 1024), b""):
+            digest.update(chunk)
+    return digest.hexdigest()
+
+
+def parse_checksum(text: str) -> tuple[str, str]:
+    lines = [line.strip() for line in text.splitlines() if line.strip()]
+    if len(lines) != 1:
+        raise FixtureError("checksum file must contain exactly one digest line")
+    parts = lines[0].split(None, 1)
+    if len(parts) != 2:
+        raise FixtureError("checksum file must contain a digest and a filename")
+    digest, filename = parts[0].lower(), parts[1].strip()
+    if not HEX_PATTERN.fullmatch(digest):
+        raise FixtureError("checksum digest must be 64 hexadecimal characters")
+    return digest, filename
+
+
+def verify_checksum(path: Path, expected: str) -> str:
+    if not path.is_file():
+        raise FixtureError(f"fixture not found: {path}")
+    stripped = expected.strip()
+    if HEX_PATTERN.fullmatch(stripped.lower()):
+        expected_digest = stripped.lower()
+    else:
+        expected_digest = parse_checksum(expected)[0]
+    actual = sha256_file(path)
+    if actual != expected_digest:
+        raise FixtureError(
+            f"checksum mismatch for {path.name}: expected {expected_digest}, got {actual}"
+        )
+    return actual
+
+
+def _market_files() -> list[tuple[Path, str]]:
+    lines = (MARKET / "CHECKSUMS").read_text(encoding="utf-8").splitlines()
+    files: list[tuple[Path, str]] = []
+    for line in lines:
+        if line.strip():
+            digest, filename = parse_checksum(line)
+            files.append((MARKET / filename, digest))
+    return sorted(files, key=lambda item: item[0].name)
+
+
+def _archive_files() -> list[tuple[Path, str]]:
+    files: list[tuple[Path, str]] = []
+    for archive in sorted(ARCHIVE.glob("*.zip")):
+        checksum_path = archive.with_name(archive.name + ".CHECKSUM")
+        if not checksum_path.is_file():
+            # Deliberately hostile fixtures (zip-slip, oversize) carry no
+            # checksum; they are exercised by negative tests, not fetched.
+            continue
+        digest, filename = parse_checksum(checksum_path.read_text(encoding="utf-8"))
+        if filename != archive.name:
+            raise FixtureError(f"CHECKSUM names {filename}, expected {archive.name}")
+        files.append((archive, digest))
+    return files
+
+
+def verify() -> dict[str, int]:
+    market = _market_files()
+    archive = _archive_files()
+    for path, digest in (*market, *archive):
+        verify_checksum(path, digest)
+    if not market or not archive:
+        raise FixtureError("committed fixture sets are empty")
+    return {"market": len(market), "archive": len(archive)}
+
+
+def _write_manifest(dest: Path, entries: list[dict[str, object]]) -> Path:
+    manifest = dest / "raw" / "manifest.json"
+    manifest.parent.mkdir(parents=True, exist_ok=True)
+    payload = json.dumps({"files": entries}, indent=2, sort_keys=True) + "\n"
+    manifest.write_text(payload, encoding="utf-8")
+    return manifest
+
+
+def prepare(dest: Path, *, check_only: bool = False) -> dict[str, int]:
+    summary = verify()
+    if check_only:
+        return summary
+    dest.mkdir(parents=True, exist_ok=True)
+    target = dest / "raw" / "um" / "daily" / "aggTrades" / "BTCUSDT"
+    target.mkdir(parents=True, exist_ok=True)
+    entries: list[dict[str, object]] = []
+    for path, _ in _archive_files():
+        destination = target / path.name
+        shutil.copyfile(path, destination)
+        checksum_source = path.with_name(path.name + ".CHECKSUM")
+        digest = verify_checksum(destination, checksum_source.read_text(encoding="utf-8"))
+        shutil.copyfile(checksum_source, destination.with_name(destination.name + ".CHECKSUM"))
+        entries.append(
+            {
+                "file": str(destination.relative_to(dest)),
+                "sha256": digest,
+                "bytes": destination.stat().st_size,
+                "source": "tests/fixtures/archive",
+            }
+        )
+    _write_manifest(dest, entries)
+    return summary
+
+
+def _download(url: str, destination: Path) -> None:
+    temporary = destination.with_name(destination.name + ".part")
+    try:
+        with urllib.request.urlopen(url, timeout=60) as response, temporary.open("wb") as out:
+            shutil.copyfileobj(response, out)
+        os.replace(temporary, destination)
+    except (OSError, urllib.error.URLError) as exc:
+        temporary.unlink(missing_ok=True)
+        raise FixtureError(f"download failed for {url}: {exc}") from exc
+
+
+def fetch(
+    *,
+    symbol: str,
+    start: date,
+    end: date,
+    dest: Path,
+    allow_network: bool,
+    dry_run: bool = False,
+) -> dict[str, int]:
+    if SYMBOL_PATTERN.fullmatch(symbol) is None:
+        raise FixtureError("symbol must match ^[A-Z0-9]{2,24}$")
+    if end < start:
+        raise FixtureError("--end must be on or after --start")
+    if not allow_network and not dry_run:
+        raise FixtureError("network fetch requires --allow-network (offline by default)")
+
+    target = dest / "raw" / "um" / "daily" / "aggTrades" / symbol
+    target.mkdir(parents=True, exist_ok=True)
+    entries: list[dict[str, object]] = []
+    day = start
+    while day <= end:
+        name = f"{symbol}-aggTrades-{day.isoformat()}.zip"
+        url = f"{BASE_URL}/{symbol}/{name}"
+        destination = target / name
+        if dry_run:
+            print(url)
+        else:
+            _download(url, destination)
+            checksum_url = url + ".CHECKSUM"
+            with urllib.request.urlopen(checksum_url, timeout=60) as response:
+                checksum_text = response.read().decode("utf-8")
+            digest = verify_checksum(destination, checksum_text)
+            destination.with_name(destination.name + ".CHECKSUM").write_text(
+                checksum_text, encoding="utf-8"
+            )
+            entries.append(
+                {
+                    "file": str(destination.relative_to(dest)),
+                    "sha256": digest,
+                    "bytes": destination.stat().st_size,
+                    "source": url,
+                }
+            )
+        day = date.fromordinal(day.toordinal() + 1)
+    if not dry_run:
+        _write_manifest(dest, entries)
+    return {"files": len(entries)}
+
+
+def _date(value: str) -> date:
+    try:
+        return date.fromisoformat(value)
+    except ValueError as exc:
+        raise argparse.ArgumentTypeError(str(exc)) from exc
+
+
+def main(argv: list[str] | None = None) -> int:
+    parser = argparse.ArgumentParser(description=__doc__)
+    sub = parser.add_subparsers(dest="command", required=True)
+
+    verify_parser = sub.add_parser("verify", help="verify committed fixture checksums")
+    verify_parser.set_defaults(command="verify")
+
+    prepare_parser = sub.add_parser("prepare", help="copy archive fixtures into a data dir")
+    prepare_parser.add_argument("--dest", type=Path, required=True)
+    prepare_parser.add_argument(
+        "--check", action="store_true", help="verify only; do not write to --dest"
+    )
+
+    fetch_parser = sub.add_parser("fetch", help="download daily aggTrades archives")
+    fetch_parser.add_argument("--symbol", required=True)
+    fetch_parser.add_argument("--start", type=_date, required=True)
+    fetch_parser.add_argument("--end", type=_date, required=True)
+    fetch_parser.add_argument("--dest", type=Path, required=True)
+    fetch_parser.add_argument("--allow-network", action="store_true")
+    fetch_parser.add_argument("--dry-run", action="store_true")
+
+    args = parser.parse_args(argv)
+    try:
+        if args.command == "verify":
+            summary = verify()
+            print(f"verified market fixtures: {summary['market']}")
+            print(f"verified archive fixtures: {summary['archive']}")
+            print("OK")
+        elif args.command == "prepare":
+            summary = prepare(args.dest, check_only=args.check)
+            print(f"verified market fixtures: {summary['market']}")
+            print(f"verified archive fixtures: {summary['archive']}")
+            print("OK" if args.check else f"prepared fixtures in {args.dest}")
+        else:
+            summary = fetch(
+                symbol=args.symbol,
+                start=args.start,
+                end=args.end,
+                dest=args.dest,
+                allow_network=args.allow_network,
+                dry_run=args.dry_run,
+            )
+            print(f"files: {summary['files']}")
+    except FixtureError as exc:
+        print(f"error: {exc}", file=sys.stderr)
+        return 1
+    return 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

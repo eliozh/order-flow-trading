@@ -372,7 +372,7 @@ class DedupeGuard:
             return DedupVerdict.NEW
 
         event_time = self._event_time(event)
-        if last_time is not None and event_time is not None:
+        if last_time is not None:
             if event_time == last_time:
                 return DedupVerdict.DUPLICATE
             if event_time < last_time:
@@ -380,12 +380,12 @@ class DedupeGuard:
         self._last[stream] = (last_id, event_time)
         return DedupVerdict.NEW
 
-    def _event_time(self, event: NormalizedEvent) -> datetime | None:
+    def _event_time(self, event: NormalizedEvent) -> datetime:
         if isinstance(event, (KlineEvent, MarkPriceEvent)):
             return event.event_time
         if isinstance(event, ForceOrderEvent):
             return event.trade_time
-        return None
+        raise AssertionError(f"unhandled normalized event: {type(event).__name__}")
 
     def last_event_id(self, stream: str) -> int | None:
         return self._last.get(stream, (None, None))[0]
@@ -605,12 +605,14 @@ def _fsync_directory(path: Path) -> None:
         os.close(descriptor)
 
 
-def _event_time(event: NormalizedEvent) -> datetime | None:
+def _event_time(event: NormalizedEvent) -> datetime:
     if isinstance(event, AggTrade):
         return event.transact_time
     if isinstance(event, (KlineEvent, MarkPriceEvent)):
         return event.event_time
-    return event.trade_time
+    if isinstance(event, ForceOrderEvent):
+        return event.trade_time
+    raise AssertionError(f"unhandled normalized event: {type(event).__name__}")
 
 
 def _event_id(event: NormalizedEvent) -> int | None:
@@ -929,7 +931,7 @@ class IngestionSupervisor:
 
     def _accept(self, stream: str, event: NormalizedEvent) -> None:
         event_time = _event_time(event)
-        if self._client is not None and event_time is not None:
+        if self._client is not None:
             now = self._clock.now()
             if event_time > now + timedelta(minutes=5) or event_time < now - timedelta(hours=48):
                 # Never let a skewed timestamp poison dedupe/recovery state.

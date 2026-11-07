@@ -32,11 +32,12 @@ from oft.domain.metrics.liquidations import LiquidationEvent, liquidation_sort_k
 from oft.domain.metrics.types import MetricRow, decimal_str
 from oft.domain.resampling import SOURCE_MODES, Bar
 from oft.domain.time import utc_timestamp
-from oft.ports.clock import ClockPort
 from oft.ports.store import ManifestEntry, StorePort, StoreUnavailableError
 
 if TYPE_CHECKING:
     import duckdb
+
+    from oft.ports.clock import ClockPort
 
 _LAYOUT = ("market", "metrics", "footprint", "liquidations", "bars")
 METRICS_DATA_TYPE = "metrics"

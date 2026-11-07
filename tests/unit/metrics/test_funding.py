@@ -142,3 +142,39 @@ def test_trailing_missing_funding_period_is_not_complete() -> None:
     assert "2026-10-01T16:00:00.000Z" in reasons
     assert "not treated as zero" in reasons
     assert result.next_funding_time == BASE + timedelta(hours=24)
+
+
+def test_funding_validation_covers_each_non_finite_or_non_positive_field() -> None:
+    from decimal import Decimal
+
+    for field, value in (
+        ("rate", Decimal("NaN")),
+        ("mark_price", Decimal("0")),
+        ("index_price", Decimal("NaN")),
+    ):
+        kwargs = {
+            "ts": BASE,
+            "rate": Decimal("0.0001"),
+            "mark_price": Decimal("1"),
+            "index_price": Decimal("1"),
+            "interval_hours": 8,
+        }
+        kwargs[field] = value
+        with pytest.raises(ValueError):
+            FundingSample(**kwargs)  # type: ignore[arg-type]
+
+    from oft.domain.metrics.funding import FundingResult
+    from oft.domain.metrics.types import DataQuality, MetricQuality
+
+    missing = FundingResult(
+        current_rate=None,
+        next_funding_time=None,
+        interval_hours=None,
+        mark_price=None,
+        index_price=None,
+        history=(),
+        missing_periods=(),
+        quality=MetricQuality(DataQuality.MISSING, ("missing",)),
+    )
+    with pytest.raises(ValueError, match="no measured period"):
+        missing.to_contract()

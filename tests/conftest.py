@@ -6,13 +6,22 @@ import socket
 import threading
 import time
 from collections.abc import Iterator
+from datetime import UTC, datetime
 from pathlib import Path
 
 import pytest
 import uvicorn
 
 from oft.api.app import create_app
+from oft.clock import FixedClock
 from oft.config import Settings
+
+REPLAY_NOW = datetime(2026, 11, 6, 12, 0, 0, tzinfo=UTC)
+REPLAY_WINDOW_START = datetime(2025, 11, 5, 0, 0, 0, tzinfo=UTC)
+REPLAY_WINDOW_END = datetime(2025, 11, 5, 4, 0, 0, tzinfo=UTC)
+REPLAY_FIXTURE = (
+    Path(__file__).resolve().parent / "fixtures" / "market" / "btcusdt_agg-trades_sample.csv"
+)
 
 
 @pytest.fixture()
@@ -23,6 +32,24 @@ def settings(tmp_path: Path) -> Settings:
         data_dir=tmp_path / "data",
         allow_fixture_scan_debug=True,
     )
+
+
+@pytest.fixture()
+def fixed_clock() -> FixedClock:
+    """A deterministic clock for every test that needs time."""
+    return FixedClock(REPLAY_NOW)
+
+
+@pytest.fixture()
+def replay_fixture() -> Path:
+    """The committed, checksummed aggTrade sample used by replay tests."""
+    return REPLAY_FIXTURE
+
+
+@pytest.fixture()
+def replay_window() -> tuple[datetime, datetime]:
+    """The committed sample's half-open 4h window."""
+    return REPLAY_WINDOW_START, REPLAY_WINDOW_END
 
 
 def _free_port() -> int:

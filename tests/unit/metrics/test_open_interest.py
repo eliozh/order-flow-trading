@@ -210,3 +210,47 @@ def test_regular_sampling_complete_only_when_samples_span_the_window() -> None:
 def test_negative_optional_ratio_is_rejected() -> None:
     with pytest.raises(ValueError, match="long_short_ratio"):
         _compute((_sample(0, "100.0", long_short_ratio="-1"),))
+
+
+def test_open_interest_validation_and_contract_cover_all_rejections() -> None:
+    from decimal import Decimal
+
+    from oft.domain.metrics.open_interest import OpenInterestResult
+    from oft.domain.metrics.types import DataQuality, MetricQuality
+
+    for field, value in (
+        ("open_interest", Decimal("-1")),
+        ("open_interest_value", Decimal("-1")),
+    ):
+        kwargs = {
+            "ts": WINDOW_START,
+            "open_interest": Decimal("1"),
+            "open_interest_value": Decimal("1"),
+        }
+        kwargs[field] = value
+        with pytest.raises(ValueError):
+            _compute((OpenInterestSample(**kwargs),))  # type: ignore[arg-type]
+
+    with pytest.raises(ValueError, match="timezone-aware"):
+        compute_open_interest(
+            (_sample(0, "100.0"),),
+            window_start=datetime(2026, 10, 1),
+            window_end=WINDOW_END,
+        )
+    with pytest.raises(ValueError, match="after window_start"):
+        compute_open_interest(
+            (_sample(0, "100.0"),),
+            window_start=WINDOW_START,
+            window_end=WINDOW_START,
+        )
+
+    empty = OpenInterestResult(
+        unit="BASE",
+        sampling="REGULAR",
+        points=(),
+        delta_over_window=Decimal("0"),
+        last=None,
+        quality=MetricQuality(DataQuality.MISSING, ("missing",)),
+    )
+    with pytest.raises(ValueError, match="no measured point"):
+        empty.to_contract()

@@ -1,0 +1,66 @@
+#!/usr/bin/env python3
+"""Fail when a pure metric primitive is below 100% branch coverage.
+
+Run after ``pytest --cov=oft --cov-branch``. The gate covers the deterministic
+metric core (CVD, delta, footprint, volume profile, funding, OI,
+liquidations, versioning, and the exact-decimal renderer). These modules have no I/O and are fully unit-testable, so partial
+branches are regressions rather than acceptable gaps.
+"""
+
+from __future__ import annotations
+
+import sys
+from pathlib import Path
+
+import coverage
+
+TARGETS = (
+    "cvd.py",
+    "delta.py",
+    "footprint.py",
+    "types.py",
+    "volume_profile.py",
+    "funding.py",
+    "open_interest.py",
+    "liquidations.py",
+    "version.py",
+)
+DEFAULT_DATA_FILE = ".coverage"
+
+
+def main(argv: list[str]) -> int:
+    data_file = argv[1] if len(argv) > 1 else DEFAULT_DATA_FILE
+    if not Path(data_file).is_file():
+        print(f"error: coverage data file not found: {data_file}", file=sys.stderr)
+        return 1
+
+    cov = coverage.Coverage(data_file=data_file)
+    cov.load()
+    measured = {
+        Path(path).name: path for path in cov.get_data().measured_files()
+    }
+    failures: list[str] = []
+    for target in TARGETS:
+        path = measured.get(target)
+        if path is None:
+            failures.append(f"{target}: not measured")
+            continue
+        _, statements, _, missing, missing_branches = cov.analysis2(path)
+        if missing or missing_branches:
+            failures.append(
+                f"{target}: missing lines {missing or []}, missing branches {missing_branches or []}"
+                f" ({len(statements)} statements)"
+            )
+
+    if failures:
+        print("metric branch gate failed (require 100%):", file=sys.stderr)
+        for failure in failures:
+            print(f"  {failure}", file=sys.stderr)
+        return 1
+
+    print("metric branch gate: 100% branch coverage for " + ", ".join(TARGETS))
+    return 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(main(sys.argv))

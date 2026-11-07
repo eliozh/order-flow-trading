@@ -2,8 +2,10 @@
 
 from __future__ import annotations
 
+import shutil
 import socket
 from dataclasses import asdict, dataclass
+from pathlib import Path
 from typing import Any, Literal
 
 from pydantic import BaseModel, ConfigDict
@@ -16,6 +18,11 @@ from oft.ports.market_data import MarketDataPort
 from oft.ports.store import StorePort
 
 CheckState = Literal["ok", "degraded", "offline"]
+
+MIN_FREE_DISK_BYTES = 1 * 1024**3
+DISK_WARN_USED_PCT = 95.0
+MANIFEST_SCAN_ROOTS = ("market", "metrics", "footprint", "liquidations")
+STALE_JOB_LIMIT = 200
 
 
 class HealthReport(BaseModel):
@@ -137,6 +144,79 @@ def build_readiness(
     )
 
 
+def _existing_ancestor(path: Path) -> Path:
+    probe = path
+    while not probe.exists() and probe != probe.parent:
+        probe = probe.parent
+    return probe
+
+
+def _disk_check(settings: Settings) -> CheckResult:
+    """Report free space without ever reading a file's contents or secrets."""
+    try:
+        usage = shutil.disk_usage(_existing_ancestor(settings.data_dir))
+    except OSError as exc:  # pragma: no cover - defensive boundary
+        return CheckResult("storage.disk", "degraded", f"disk usage unavailable ({exc})")
+    free_gib = usage.free / 1024**3
+    used_pct = (usage.used / usage.total * 100) if usage.total else 0.0
+    detail = f"{free_gib:.1f} GiB free ({used_pct:.0f}% used)"
+    healthy = usage.free >= MIN_FREE_DISK_BYTES and used_pct < DISK_WARN_USED_PCT
+    return _check("storage.disk", healthy, detail)
+
+
+def _manifest_orphans_check(settings: Settings, store: StorePort) -> CheckResult:
+    """Find manifest rows with no file and Parquet parts with no manifest row."""
+    try:
+        entries = store.list_manifest()
+    except Exception as exc:  # pragma: no cover - defensive boundary
+        return CheckResult("manifest.orphans", "degraded", f"manifest unreadable ({exc})")
+    known = {entry.path for entry in entries}
+    missing = [entry for entry in entries if not Path(entry.path).is_file()]
+    disk_parts: list[str] = []
+    for name in MANIFEST_SCAN_ROOTS:
+        root = settings.data_dir / name
+        if root.is_dir():
+            disk_parts.extend(str(path) for path in root.rglob("*.parquet"))
+    orphans = [path for path in disk_parts if path not in known]
+    if missing or orphans:
+        return CheckResult(
+            "manifest.orphans",
+            "degraded",
+            f"{len(missing)} missing part(s), {len(orphans)} orphan part(s)",
+        )
+    return CheckResult(
+        "manifest.orphans",
+        "ok",
+        f"{len(entries)} manifest row(s) consistent",
+    )
+
+
+def _stale_jobs_check(store: StorePort, clock: ClockPort) -> CheckResult:
+    """Report RUNNING job rows whose lease already expired."""
+    try:
+        runs = store.list_job_runs(limit=STALE_JOB_LIMIT)
+    except Exception as exc:  # pragma: no cover - defensive boundary
+        return CheckResult("jobs.stale", "degraded", f"job ledger unreadable ({exc})")
+    now = utc_timestamp(clock.now())
+    stale = [run for run in runs if run.status == "RUNNING" and run.lease_expires_at <= now]
+    if stale:
+        return CheckResult(
+            "jobs.stale",
+            "degraded",
+            f"{len(stale)} stale RUNNING job run(s); recover or fail them",
+        )
+    return CheckResult("jobs.stale", "ok", "no stale RUNNING job runs")
+
+
+def _audit_chain_check() -> CheckResult:
+    """Milestone-1 placeholder: the hash chain is not implemented yet."""
+    return CheckResult(
+        "audit.chain",
+        "ok",
+        "placeholder: audit_events hash chain is not implemented in milestone 1",
+    )
+
+
 def build_doctor(
     settings: Settings,
     store: StorePort,
@@ -195,6 +275,10 @@ def build_doctor(
         )
     checks = (
         *readiness.checks,
+        _disk_check(settings),
+        _manifest_orphans_check(settings, store),
+        _stale_jobs_check(store, clock),
+        _audit_chain_check(),
         ingest_check,
         ws_check,
         CheckResult(

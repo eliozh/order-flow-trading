@@ -1,5 +1,5 @@
 {
-  "metric_version": "orderflow_metrics.v1.17c22720ac65bb85",
+  "metric_version": "orderflow_metrics.v1.654bf2e39086eda4",
   "open_interest": {
     "delta_over_window": "15.0",
     "last": {

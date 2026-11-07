@@ -25,6 +25,9 @@ from oft.ports.store import StorePort, SymbolUpsertResult
 _SYMBOL_PATTERN = re.compile(r"^[A-Z0-9]{2,24}$")
 _TRADING = "TRADING"
 _MIN_ONBOARD_MS = int(datetime(2017, 1, 1, tzinfo=UTC).timestamp() * 1000)
+# When no clock instant is injected there is no wall-clock fallback: use a
+# fixed far-future bound so the parser stays deterministic and clock-free.
+_MAX_ONBOARD_INSTANT = datetime(2100, 1, 1, tzinfo=UTC)
 _MAX_PRECISION = 20
 _MAX_DECIMAL_DIGITS = 30
 _MAX_DECIMAL_ADJUSTED = 18
@@ -32,7 +35,7 @@ MAX_EXCHANGE_INFO_SYMBOLS = 5000
 
 
 def _max_onboard_ms(now: datetime | None = None) -> int:
-    reference = now or datetime.now(UTC)
+    reference = now if now is not None else _MAX_ONBOARD_INSTANT
     return int((reference + timedelta(days=1)).timestamp() * 1000)
 
 

@@ -19,11 +19,13 @@ from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
 from decimal import ROUND_HALF_EVEN, Decimal
 from pathlib import Path
-from typing import Literal, cast
+from typing import TYPE_CHECKING, Literal, cast
 
 from oft.domain.metrics.types import decimal_str
 from oft.domain.time import utc_timestamp
-from oft.ports.clock import ClockPort
+
+if TYPE_CHECKING:
+    from oft.ports.clock import ClockPort
 
 MONEY_QUANTUM = Decimal("0.00000001")
 DEFAULT_BUCKET_SECONDS = 60

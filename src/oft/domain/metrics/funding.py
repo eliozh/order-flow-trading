@@ -146,8 +146,6 @@ def compute_funding(
     if len(intervals) != 1:
         raise ValueError("funding interval must be consistent across samples")
     interval_hours = selected[0].interval_hours
-    if interval_hours not in _VALID_INTERVALS:
-        raise ValueError("interval_hours must be 4 or 8")
     interval = timedelta(hours=interval_hours)
     last = selected[-1]
     # Trailing gap: scheduled rounds after the last sample but at/before as_of

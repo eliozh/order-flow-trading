@@ -18,6 +18,6 @@
     "mark_price": "70100.00",
     "next_funding_time": "2026-10-01T16:00:00.000Z"
   },
-  "metric_version": "orderflow_metrics.v1.36fa7fb3e2db0356",
+  "metric_version": "orderflow_metrics.v1.2e874b58e53b090d",
   "symbol": "BTCUSDT"
 }
