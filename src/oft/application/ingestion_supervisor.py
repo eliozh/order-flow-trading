@@ -31,6 +31,14 @@ from oft.application.freshness import (
     FreshnessGuard,
     FreshnessStamp,
 )
+from oft.application.ws_state import (
+    WS_STATE_FILENAME,
+    WsRuntimeState,
+    read_ws_state,
+)
+from oft.application.ws_state import (
+    run_directory as _run_dir,
+)
 from oft.config import Settings
 from oft.domain.data_quality import DataGap, GapSeverity
 from oft.domain.events import (
@@ -61,11 +69,9 @@ DEFAULT_CHECKPOINT_STALE_SECONDS = 15 * 60
 DEFAULT_BACKOFF_BASE = 0.5
 DEFAULT_BACKOFF_MAX = 30.0
 DEFAULT_MAX_RECONNECT_ATTEMPTS = 3
-RUN_DIRECTORY = "run"
 CHECKPOINT_FILENAME = "ingest_checkpoints.json"
 WAL_FILENAME = "ingest.wal"
 QUARANTINE_FILENAME = "quarantine.jsonl"
-WS_STATE_FILENAME = "ws_state.json"
 
 
 class StreamDisconnected(Exception):
@@ -147,10 +153,6 @@ class CheckpointDiagnostic:
     stale: bool
     streams: Mapping[str, CheckpointEntry]
     updated_at: datetime | None
-
-
-def _run_dir(settings: Settings) -> Path:
-    return settings.data_dir / RUN_DIRECTORY
 
 
 class CheckpointStore:
@@ -482,37 +484,6 @@ class BoundedEventQueue:
         self._wal_bytes = 0
 
 
-class WsRuntimeState:
-    """Read model of the last written WS state file."""
-
-    def __init__(
-        self,
-        *,
-        connection_state: str,
-        streams: Mapping[str, Mapping[str, object]],
-        freshness: Mapping[str, Mapping[str, object]],
-        updated_at: str,
-        stale: bool,
-        stats: Mapping[str, int] | None = None,
-    ) -> None:
-        self.connection_state = connection_state
-        self.streams = {key: dict(value) for key, value in streams.items()}
-        self.freshness = {key: dict(value) for key, value in freshness.items()}
-        self.updated_at = updated_at
-        self.stale = stale
-        self.stats = dict(stats or {})
-
-    def to_dict(self) -> dict[str, object]:
-        return {
-            "connection_state": self.connection_state,
-            "streams": self.streams,
-            "freshness": self.freshness,
-            "updated_at": self.updated_at,
-            "stale": self.stale,
-            "stats": self.stats,
-        }
-
-
 class WsStateStore:
     """Atomic writer for the daemon-independent ``oft status`` WS surface."""
 
@@ -551,34 +522,6 @@ class WsStateStore:
         finally:
             if temp_path.exists():
                 temp_path.unlink()
-
-
-def read_ws_state(settings: Settings) -> WsRuntimeState | None:
-    path = _run_dir(settings) / WS_STATE_FILENAME
-    if not path.is_file():
-        return None
-    try:
-        document = json.loads(path.read_text(encoding="utf-8"))
-    except (OSError, json.JSONDecodeError):
-        return None
-    if not isinstance(document, dict):
-        return None
-    streams = document.get("streams")
-    freshness = document.get("freshness")
-    raw_stats = document.get("stats")
-    stats = (
-        {str(key): int(value) for key, value in raw_stats.items() if isinstance(value, int)}
-        if isinstance(raw_stats, dict)
-        else {}
-    )
-    return WsRuntimeState(
-        connection_state=str(document.get("connection_state", "UNKNOWN")),
-        streams=streams if isinstance(streams, dict) else {},
-        freshness=freshness if isinstance(freshness, dict) else {},
-        updated_at=str(document.get("updated_at", "")),
-        stale=bool(document.get("stale", False)),
-        stats=stats,
-    )
 
 
 def reconnect_delay(

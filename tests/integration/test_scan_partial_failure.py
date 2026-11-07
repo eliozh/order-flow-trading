@@ -120,6 +120,11 @@ def test_data_gap_fails_one_symbol_with_the_exact_window_and_keeps_the_batch(
     failed = rows["XAUUSDT"]
     assert failed["stage"] == "FAILED"
     assert failed["error_code"] == "DATA_UNAVAILABLE"
+    # A failure before the LLM stage carries no usage, so it must not mark the
+    # whole batch's cost as unpriced.
+    assert failed["failed_stage"] == "DATA"
+    assert failed["cost_usd"] == "0"
+    assert failed["cost_unpriced"] is False
     # The exact gap window is visible, not a generic failure.
     assert GAP_START in failed["error_message"]
     assert GAP_END in failed["error_message"]

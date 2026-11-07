@@ -14,7 +14,7 @@ import threading
 import uuid
 from contextlib import suppress
 from dataclasses import dataclass
-from datetime import datetime, timedelta
+from datetime import date, datetime, timedelta
 from decimal import Decimal, InvalidOperation
 from typing import Any, Protocol
 
@@ -45,6 +45,18 @@ FAILED = "FAILED"
 PARTIAL = "PARTIAL"
 MISSED = "MISSED"
 _TERMINAL_SCAN_STAGES = frozenset({"DONE", "DEGRADED", "FAILED"})
+_FAILED_STAGE_BY_CODE = {
+    "DATA_UNAVAILABLE": "DATA",
+    "METRICS_INCOMPLETE": "METRICS",
+}
+
+
+def _failure_stage(exc: BaseException, code: str) -> str:
+    """The stage that failed, from the scan service or the error code."""
+    stage = getattr(exc, "failed_stage", None)
+    if stage:
+        return str(stage)
+    return _FAILED_STAGE_BY_CODE.get(code) or "REPORT"
 
 
 @dataclass(frozen=True)
@@ -613,28 +625,6 @@ class ScheduledScanRunner:
                     "job_heartbeat_failed", run_id=run_id, owner=owner, error=str(exc)
                 )
 
-    def execute_symbols(
-        self,
-        run: JobRunRecord,
-        symbols: tuple[str, ...],
-        *,
-        period: str,
-        trigger_source: str = "MANUAL",
-        source: str = "backfill",
-        metrics_only: bool = False,
-        provider: str | None = None,
-    ) -> ScheduledScanOutcome:
-        """Run one batch over ``symbols`` without claiming; the caller owns the lease."""
-        return self._execute(
-            run,
-            symbols,
-            period=period,
-            trigger_source=trigger_source,
-            source=source,
-            metrics_only=metrics_only,
-            provider=provider,
-        )
-
     def run_manual(
         self,
         *,
@@ -642,6 +632,8 @@ class ScheduledScanRunner:
         source: str = "backfill",
         metrics_only: bool = False,
         provider: str | None = None,
+        start: date | None = None,
+        end: date | None = None,
     ) -> ScheduledScanOutcome:
         """Claim and run one manual batch over every starred symbol."""
         now = self._clock.now()
@@ -689,10 +681,12 @@ class ScheduledScanRunner:
                 source=source,
                 metrics_only=metrics_only,
                 provider=provider,
+                start=start,
+                end=end,
             )
             self._ledger.finish(
                 run.run_id,
-                _outcome_status(outcome),
+                _merged_status(outcome, self._container.store.list_scan_symbols(run.run_id)),
                 owner=run.lease_owner,
             )
             return outcome
@@ -720,6 +714,8 @@ class ScheduledScanRunner:
         source: str = "backfill",
         metrics_only: bool = False,
         provider: str | None = None,
+        start: date | None = None,
+        end: date | None = None,
     ) -> ScheduledScanOutcome:
         scans: list[ScanRecord] = []
         failed: list[str] = []
@@ -737,10 +733,12 @@ class ScheduledScanRunner:
             data_quality: str | None,
             error_code: str | None = None,
             error_message: str | None = None,
+            failed_stage: str | None = None,
             llm_status: str | None = None,
             llm_tokens: int = 0,
             cost_usd: str = "0",
-            cost_unpriced: bool = True,
+            cost_unpriced: bool = False,
+            finished_at: str | None = None,
         ) -> None:
             self._container.store.upsert_scan_symbol(
                 ScanSymbolRecord(
@@ -748,9 +746,10 @@ class ScheduledScanRunner:
                     symbol=symbol,
                     stage=stage,
                     started_at=started_at,
-                    finished_at=utc_timestamp(self._clock.now()),
+                    finished_at=finished_at or utc_timestamp(self._clock.now()),
                     error_code=error_code,
                     error_message=error_message,
+                    failed_stage=failed_stage,
                     report_id=report_id,
                     data_quality=data_quality,
                     llm_status=llm_status,
@@ -760,8 +759,40 @@ class ScheduledScanRunner:
                 )
             )
 
+        # A crash can commit a child scan/report and then lose the terminal
+        # checkpoint write. Reuse the completed scan for that symbol instead of
+        # creating a duplicate row and a second billed LLM call.
+        completed = {
+            child.symbol: child
+            for child in self._container.store.list_scans_by_batch(run.run_id)
+            if child.status == "DONE" and child.report_id
+        }
         for symbol in symbols:
             started_at = utc_timestamp(self._clock.now())
+            previous = completed.get(symbol)
+            if previous is not None:
+                scans.append(previous)
+                previous_stage = "DEGRADED" if previous.llm_status == "REJECTED" else "DONE"
+                if previous_stage == "DEGRADED":
+                    degraded.append(symbol)
+                total_tokens += previous.llm_tokens
+                with suppress(InvalidOperation):
+                    total_cost += Decimal(previous.cost_usd)
+                if previous.llm_status is not None:
+                    any_unpriced = any_unpriced or previous.cost_unpriced
+                _finish_symbol(
+                    symbol,
+                    previous.started_at or started_at,
+                    stage=previous_stage,
+                    report_id=previous.report_id,
+                    data_quality=previous.data_quality,
+                    llm_status=previous.llm_status,
+                    llm_tokens=previous.llm_tokens,
+                    cost_usd=previous.cost_usd,
+                    cost_unpriced=previous.cost_unpriced,
+                    finished_at=previous.finished_at,
+                )
+                continue
 
             def _stage(name: str, symbol: str = symbol, started_at: str = started_at) -> None:
                 self._container.store.upsert_scan_symbol(
@@ -790,6 +821,8 @@ class ScheduledScanRunner:
                         trigger_source=trigger_source,
                         source=source,
                         metrics_only=metrics_only,
+                        start=start,
+                        end=end,
                         provider=provider,
                         batch_id=run.run_id,
                     )
@@ -804,6 +837,7 @@ class ScheduledScanRunner:
                     data_quality=None,
                     error_code=exc.code,
                     error_message=exc.message,
+                    failed_stage=_failure_stage(exc, exc.code),
                 )
             except Exception as exc:  # noqa: BLE001 - one symbol never aborts the batch
                 failed.append(symbol)
@@ -815,6 +849,7 @@ class ScheduledScanRunner:
                     data_quality=None,
                     error_code="SCAN_FAILED",
                     error_message=str(exc),
+                    failed_stage=_failure_stage(exc, "SCAN_FAILED"),
                 )
             else:
                 scans.append(result.scan)
@@ -843,6 +878,7 @@ class ScheduledScanRunner:
                     llm_tokens=llm_tokens,
                     cost_usd=cost_usd,
                     cost_unpriced=cost_unpriced,
+                    finished_at=result.scan.finished_at,
                 )
         return ScheduledScanOutcome(
             run=run,

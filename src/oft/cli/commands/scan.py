@@ -160,7 +160,8 @@ def run(
     ] = None,
     period: Annotated[str, typer.Option("--period", help="Metric period, e.g. 4h.")] = "4h",
     source: Annotated[
-        str, typer.Option("--source", help="Data source for a manual scan (backfill).")
+        str,
+        typer.Option("--source", help="Data source for a manual scan (backfill|live)."),
     ] = "backfill",
     metrics_only: Annotated[
         bool,
@@ -229,6 +230,24 @@ def run(
         raise typer.Exit(code=3)
 
 
+def _show_scan(settings: Any, scan_id: str, json_output: bool) -> None:
+    """Fetch and render one scan; shared by ``status`` and ``show``."""
+    try:
+        envelope = ApiClient.from_settings(settings).get_scan(scan_id)
+    except ApiClientError as exc:
+        emit_error(exc.code, exc.message, json_output=json_output)
+        raise typer.Exit(code=exit_code_for(exc.code)) from exc
+
+    data = envelope.get("data")
+    if not isinstance(data, dict):
+        emit_error("NOT_FOUND", f"Scan {scan_id} does not exist.", json_output=json_output)
+        raise typer.Exit(code=1)
+    if json_output:
+        typer.echo(json.dumps(envelope, indent=2))
+    else:
+        typer.echo(_render_detail(data))
+
+
 @scan_app.command("status")
 def scan_status(
     scan_id: Annotated[
@@ -245,21 +264,7 @@ def scan_status(
     if scan_id is None:
         _emit_schedule(settings, json_output)
         return
-
-    try:
-        envelope = ApiClient.from_settings(settings).get_scan(scan_id)
-    except ApiClientError as exc:
-        emit_error(exc.code, exc.message, json_output=json_output)
-        raise typer.Exit(code=exit_code_for(exc.code)) from exc
-
-    data = envelope.get("data")
-    if not isinstance(data, dict):
-        emit_error("NOT_FOUND", f"Scan {scan_id} does not exist.", json_output=json_output)
-        raise typer.Exit(code=1)
-    if json_output:
-        typer.echo(json.dumps(envelope, indent=2))
-    else:
-        typer.echo(_render_detail(data))
+    _show_scan(settings, scan_id, json_output)
 
 
 @scan_app.command("show")
@@ -272,20 +277,7 @@ def scan_show(
 ) -> None:
     """Show one scan (or batch) with its per-symbol stages."""
     settings = _settings_or_exit(json_output)
-    try:
-        envelope = ApiClient.from_settings(settings).get_scan(scan_id)
-    except ApiClientError as exc:
-        emit_error(exc.code, exc.message, json_output=json_output)
-        raise typer.Exit(code=exit_code_for(exc.code)) from exc
-
-    data = envelope.get("data")
-    if not isinstance(data, dict):
-        emit_error("NOT_FOUND", f"Scan {scan_id} does not exist.", json_output=json_output)
-        raise typer.Exit(code=1)
-    if json_output:
-        typer.echo(json.dumps(envelope, indent=2))
-    else:
-        typer.echo(_render_detail(data))
+    _show_scan(settings, scan_id, json_output)
 
 
 def _emit_schedule(settings: Any, json_output: bool) -> None:

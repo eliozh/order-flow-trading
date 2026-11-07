@@ -220,6 +220,7 @@ class ScanSymbolRecord:
     report_id: str | None
     data_quality: str | None
     error_message: str | None = None
+    failed_stage: str | None = None
     llm_status: str | None = None
     llm_tokens: int = 0
     cost_usd: str = "0"

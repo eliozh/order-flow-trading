@@ -86,6 +86,7 @@ def test_scan_detail_and_list_expose_llm_stage_cost_and_report_links(tmp_path: P
             "data_quality": shown["data_quality"],
             "error_code": None,
             "error_message": None,
+            "failed_stage": None,
             "llm_status": shown["llm_status"],
             "llm_tokens": shown["llm_tokens"],
             "cost_usd": shown["cost_usd"],

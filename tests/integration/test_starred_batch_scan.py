@@ -3,19 +3,24 @@
 from __future__ import annotations
 
 import json
+from contextlib import suppress
 from dataclasses import dataclass, replace
 from datetime import UTC, date, datetime, timedelta
 from decimal import Decimal
 from pathlib import Path
+from types import SimpleNamespace
 from typing import Any
 
 from fastapi.testclient import TestClient
 
+import oft.api.routes.scans as scans_module
 import oft.application.jobs as jobs_module
 import oft.bootstrap as bootstrap
 from oft.adapters.llm_stub import LLMStub
 from oft.api.app import create_app
+from oft.api.schemas.report import ScanCreateRequest
 from oft.application.jobs import JobLedger, ScheduledScanRunner
+from oft.application.scan_service import ScanRequest, ScanService
 from oft.bootstrap import build_container
 from oft.clock import FixedClock
 from oft.config import Settings
@@ -213,6 +218,8 @@ def test_rejected_llm_output_marks_only_that_symbol_degraded(
     assert rows["ETHUSDT"]["stage"] == "DEGRADED"
     assert rows["ETHUSDT"]["llm_status"] == "REJECTED"
     assert rows["ETHUSDT"]["report_id"]
+    job = harness.container.store.get_job_run(data["scan_id"])
+    assert job is not None and job.status == "PARTIAL"
 
     # The degraded symbol still has a CALC-only report and no opportunity.
     report = harness.container.store.get_report(rows["ETHUSDT"]["report_id"])
@@ -221,6 +228,58 @@ def test_rejected_llm_output_marks_only_that_symbol_degraded(
     assert len(harness.container.store.list_reports()) == 2
     opportunities = harness.container.store.list_opportunities()
     assert all("ETHUSDT" not in item.payload_json for item in opportunities)
+
+
+def test_partial_llm_outcome_keeps_complete_data_quality(tmp_path: Path) -> None:
+    settings = _seed(tmp_path)
+    container = build_container(settings, initialize=True)
+    ledger = JobLedger(store=container.store, clock=FixedClock(NOW))
+    run_id = "SCAN-DEGRADED-QUALITY"
+    claim = ledger.claim(
+        "scan",
+        utc_timestamp(WINDOW),
+        trigger_source="MANUAL",
+        owner="quality-owner",
+        run_id=run_id,
+    )
+    assert claim.claimed
+    for symbol in ("BTCUSDT", "ETHUSDT"):
+        container.store.save_scan(
+            _child_scan(
+                f"SCAN-{symbol}-QUALITY",
+                symbol,
+                batch_id=run_id,
+                created_at="2026-11-07T08:01:00.000Z",
+                data_quality="COMPLETE",
+            )
+        )
+    container.store.upsert_scan_symbol(_done_row(run_id, "BTCUSDT"))
+    container.store.upsert_scan_symbol(
+        ScanSymbolRecord(
+            scan_id=run_id,
+            symbol="ETHUSDT",
+            stage="DEGRADED",
+            started_at=utc_timestamp(NOW),
+            finished_at=utc_timestamp(NOW),
+            error_code=None,
+            report_id="RPT-ETHUSDT-QUALITY",
+            data_quality="COMPLETE",
+            llm_status="REJECTED",
+        )
+    )
+
+    harness = _harness(settings)
+    try:
+        response = harness.client.get(f"/api/v1/scans/{run_id}", headers=harness.auth)
+    finally:
+        harness.client.close()
+
+    assert response.status_code == 200, response.text
+    data = response.json()["data"]
+    # A rejected narrative is an LLM outcome, not a data gap.
+    assert data["status"] == "PARTIAL"
+    assert data["data_quality"] == "COMPLETE"
+    assert response.json()["meta"]["data_quality"] == "COMPLETE"
 
 
 def test_manual_batch_while_a_scan_is_running_returns_409(tmp_path: Path) -> None:
@@ -897,3 +956,104 @@ def test_batch_aggregates_priced_usage_tokens_and_cost(tmp_path: Path, monkeypat
     assert data["cost_unpriced"] is False
     assert [row["llm_tokens"] for row in data["symbols"]] == [150, 150]
     assert all(row["cost_unpriced"] is False for row in data["symbols"])
+
+
+def test_batch_honors_the_requested_start_and_end(tmp_path: Path) -> None:
+    harness = _harness(_seed(tmp_path))
+    try:
+        response = harness.client.post(
+            "/api/v1/scans",
+            json={
+                **BATCH_PAYLOAD,
+                "start": "2026-10-02",
+                "end": "2026-10-04",
+            },
+            headers={**harness.auth, "Idempotency-Key": "batch-window"},
+        )
+        data = response.json()["data"]
+        detail = harness.client.get(f"/api/v1/scans/{data['scan_id']}", headers=harness.auth)
+    finally:
+        harness.client.close()
+
+    assert response.status_code == 201, response.text
+    assert data["window_start"] == "2026-10-02T00:00:00.000Z"
+    assert data["window_end"] == "2026-10-05T00:00:00.000Z"
+    for row in detail.json()["data"]["symbols"]:
+        assert row["stage"] == "DONE"
+
+
+def test_resume_reuses_a_committed_child_scan_instead_of_duplicating_it(
+    tmp_path: Path,
+) -> None:
+    settings = _seed(tmp_path)
+    container = build_container(settings, initialize=True)
+    run = _single_symbol_claim(
+        container,
+        run_id="SCAN-DUPLICATE-CHECK",
+        source="backfill",
+        metrics_only=False,
+        provider="stub",
+        symbol="BTCUSDT",
+    )
+    result = ScanService(container=container).run(
+        ScanRequest(
+            symbol="BTCUSDT",
+            period="4h",
+            provider="stub",
+            batch_id=run.run_id,
+        ),
+        scan_id="SCAN-CHILD-BTC",
+    )
+    # Simulate a crash after the report commit but before the terminal row.
+    container.store.upsert_scan_symbol(
+        ScanSymbolRecord(
+            scan_id=run.run_id,
+            symbol="BTCUSDT",
+            stage="REPORT",
+            started_at=utc_timestamp(NOW),
+            finished_at=None,
+            error_code=None,
+            report_id=result.report.report_id,
+            data_quality=result.report.data_quality,
+        )
+    )
+    scans_before = container.store.count_scans()
+    reports_before = len(container.store.list_reports())
+    llm_calls_before = len(container.store.list_llm_calls())
+
+    later = FixedClock(NOW + timedelta(seconds=60))
+    outcome = ScheduledScanRunner(container=container, clock=later).resume(run.run_id, period="4h")
+
+    assert outcome.claimed is True
+    assert container.store.count_scans() == scans_before
+    assert len(container.store.list_reports()) == reports_before
+    assert len(container.store.list_llm_calls()) == llm_calls_before
+    rows = {row.symbol: row for row in container.store.list_scan_symbols(run.run_id)}
+    assert rows["BTCUSDT"].stage == "DONE"
+    assert rows["BTCUSDT"].report_id == result.report.report_id
+    assert container.store.get_job_run(run.run_id).status == "DONE"  # type: ignore[union-attr]
+
+
+def test_non_scan_error_leaves_a_terminal_checkpoint_row(tmp_path: Path, monkeypatch: Any) -> None:
+    settings = _seed(tmp_path)
+    container = build_container(settings, initialize=True)
+
+    class ExplodingScanService:
+        def __init__(self, **kwargs: object) -> None:
+            pass
+
+        def run(self, request: Any, *, scan_id: str | None = None) -> Any:
+            raise KeyboardInterrupt("operator interrupted the scan")
+
+    monkeypatch.setattr(scans_module, "ScanService", ExplodingScanService)
+    request = SimpleNamespace(app=SimpleNamespace(state=SimpleNamespace(container=container)))
+    payload = ScanCreateRequest(symbol="BTCUSDT", period="4h", provider="stub")
+
+    with suppress(KeyboardInterrupt):
+        scans_module._run_metrics_scan(request, payload)  # type: ignore[arg-type]
+
+    run = container.store.list_job_runs("scan")[0]
+    rows = {row.symbol: row for row in container.store.list_scan_symbols(run.run_id)}
+    assert run.status == "FAILED"
+    assert rows["BTCUSDT"].stage == "FAILED"
+    assert rows["BTCUSDT"].error_code == "SCAN_FAILED"

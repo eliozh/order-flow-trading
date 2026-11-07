@@ -81,7 +81,7 @@ def test_v1_database_upgrades_to_v2_with_effective_checks(tmp_path: Path) -> Non
     finally:
         connection.close()
 
-    assert versions == {1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14}
+    assert versions == {1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15}
 
 
 _V2_BACKFILL = """
@@ -139,7 +139,7 @@ def test_v2_database_gains_the_backfill_heartbeat_column(tmp_path: Path) -> None
 
     assert "updated_at" in columns
     assert updated_at == "2026-11-06T00:00:00.000Z"
-    assert versions == {1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14}
+    assert versions == {1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15}
 
 
 def test_v5_checks_indexes_and_foreign_keys(tmp_path: Path) -> None:
@@ -236,7 +236,7 @@ def test_v5_database_migrates_manifest_metrics_columns(tmp_path: Path) -> None:
 
     assert {"metric_version", "input_manifest_hash", "window_start", "window_end"} <= columns
     assert legacy == ("/tmp/legacy.parquet", None, None)
-    assert versions == {1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14}
+    assert versions == {1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15}
 
 
 def test_v6_database_migrates_starred_columns(tmp_path: Path) -> None:
@@ -295,7 +295,7 @@ def test_v6_database_migrates_starred_columns(tmp_path: Path) -> None:
 
     assert {"starred", "starred_at"} <= columns
     assert row == ("BTCUSDT", 0, None)
-    assert versions == {1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14}
+    assert versions == {1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15}
 
 
 def test_manifest_run_metadata_columns_are_added_idempotently(tmp_path: Path) -> None:
@@ -312,7 +312,7 @@ def test_manifest_run_metadata_columns_are_added_idempotently(tmp_path: Path) ->
         connection.close()
 
     assert {"run_id", "last_n", "recomputed_from", "parent_run_id"} <= columns
-    assert versions == {1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14}
+    assert versions == {1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15}
 
 
 _V12_JOB_RUNS = """
@@ -378,7 +378,88 @@ def test_v12_database_gains_the_job_run_scope_symbol_column(tmp_path: Path) -> N
 
     assert "symbol" in columns
     assert symbol is None  # pre-v13 batch rows keep a null (batch) scope
-    assert versions == {1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14}
+    assert versions == {1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15}
+
+
+_V13_JOB_RUNS = """
+CREATE TABLE schema_migrations (
+    version INTEGER PRIMARY KEY,
+    applied_at TEXT NOT NULL
+);
+INSERT INTO schema_migrations (version, applied_at)
+    VALUES (1,'t'),(2,'t'),(3,'t'),(4,'t'),(5,'t'),(6,'t'),(7,'t'),
+           (8,'t'),(9,'t'),(10,'t'),(11,'t'),(12,'t'),(13,'t');
+CREATE TABLE job_runs (
+    run_id TEXT PRIMARY KEY,
+    job_type TEXT NOT NULL,
+    window_start TEXT NOT NULL,
+    status TEXT NOT NULL CHECK (
+        status IN ('RUNNING','DONE','FAILED','MISSED','SKIPPED')
+    ),
+    trigger_source TEXT NOT NULL,
+    started_at TEXT NOT NULL,
+    finished_at TEXT,
+    error_code TEXT,
+    message TEXT,
+    lease_owner TEXT NOT NULL,
+    lease_expires_at TEXT NOT NULL,
+    heartbeat_at TEXT NOT NULL,
+    source TEXT NOT NULL DEFAULT 'backfill',
+    metrics_only INTEGER NOT NULL DEFAULT 0,
+    provider TEXT,
+    symbol TEXT,
+    UNIQUE (job_type, window_start)
+);
+INSERT INTO job_runs (
+    run_id, job_type, window_start, status, trigger_source, started_at,
+    finished_at, error_code, message, lease_owner, lease_expires_at, heartbeat_at,
+    source, metrics_only, provider, symbol
+) VALUES (
+    'JOB-13', 'scan', '2026-11-07T08:00:00.000Z', 'DONE', 'MANUAL', 't',
+    't', NULL, NULL, 'owner', 't', 't', 'live', 1, 'stub', 'BTCUSDT'
+);
+"""
+
+
+def test_v13_database_gains_period_and_the_partial_status(tmp_path: Path) -> None:
+    settings = Settings(env="test", port=8765, data_dir=tmp_path / "data")
+    settings.data_dir.mkdir(parents=True)
+    connection = sqlite3.connect(database_path(settings))
+    try:
+        connection.executescript(_V13_JOB_RUNS)
+        connection.commit()
+    finally:
+        connection.close()
+
+    store = SqliteStore(settings)
+    store.initialize()
+    store.initialize()  # idempotent rebuild
+
+    connection = sqlite3.connect(database_path(settings))
+    try:
+        columns = {row[1] for row in connection.execute("PRAGMA table_info(job_runs)")}
+        definition = connection.execute(
+            "SELECT sql FROM sqlite_master WHERE type = 'table' AND name = 'job_runs'"
+        ).fetchone()[0]
+        indexes = {
+            row[0]
+            for row in connection.execute(
+                "SELECT name FROM sqlite_master WHERE type = 'index' AND tbl_name = 'job_runs'"
+            )
+        }
+        preserved = connection.execute(
+            "SELECT status, source, metrics_only, provider, symbol, period "
+            "FROM job_runs WHERE run_id = 'JOB-13'"
+        ).fetchone()
+        connection.execute("UPDATE job_runs SET status = 'PARTIAL' WHERE run_id = 'JOB-13'")
+    finally:
+        connection.close()
+
+    assert "period" in columns
+    assert "'PARTIAL'" in definition
+    assert "job_runs_type_heartbeat" in indexes
+    # The populated row survives with its options and a null period default.
+    assert tuple(preserved) == ("DONE", "live", 1, "stub", "BTCUSDT", None)
 
 
 _V10_SCAN_SYMBOLS = """
@@ -460,7 +541,14 @@ def test_v10_scan_symbols_upgrade_preserves_rows_and_accepts_llm_costs(
     finally:
         connection.close()
 
-    assert {"error_message", "llm_status", "llm_tokens", "cost_usd", "cost_unpriced"} <= columns
+    assert {
+        "error_message",
+        "failed_stage",
+        "llm_status",
+        "llm_tokens",
+        "cost_usd",
+        "cost_unpriced",
+    } <= columns
     assert "'LLM'" in definition and "'DEGRADED'" in definition
 
     preserved = {item.symbol: item for item in store.list_scan_symbols("SCAN-1")}

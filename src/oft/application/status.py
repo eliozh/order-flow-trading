@@ -63,6 +63,17 @@ class MarketDataStatus(BaseModel):
     counters: dict[str, int] = Field(default_factory=dict)
 
 
+class ScheduleStatus(BaseModel):
+    """Persisted scan cadence surfaced to the web schedule card."""
+
+    model_config = ConfigDict(frozen=True)
+
+    timezone: str = "UTC"
+    period: str
+    pending_period: str | None = None
+    next_run_at: str
+
+
 class StatusReport(BaseModel):
     """Daemon-independent system status."""
 
@@ -80,6 +91,7 @@ class StatusReport(BaseModel):
     daemon: DaemonStatus
     last_scan: LastScanSummary | None = None
     market_data: MarketDataStatus | None = None
+    schedule: ScheduleStatus | None = None
 
 
 def _last_scan(store: StorePort | None) -> LastScanSummary | None:
@@ -141,6 +153,23 @@ def _market_data_status(settings: Settings) -> MarketDataStatus | None:
     )
 
 
+def _schedule_status(settings: Settings, clock: ClockPort) -> ScheduleStatus | None:
+    """Read the persisted scheduler cadence (never guess from the last scan)."""
+    from oft.application.scheduler import resolve_schedule_state
+
+    try:
+        state = resolve_schedule_state(settings)
+    except ValueError:
+        return None
+    payload = state.next_run_payload(clock.now())
+    return ScheduleStatus(
+        timezone=payload["timezone"],
+        period=payload["period"],
+        pending_period=payload["pending_period"] or None,
+        next_run_at=payload["next_run_at"],
+    )
+
+
 def build_status(
     settings: Settings,
     market_data: MarketDataPort,
@@ -165,4 +194,5 @@ def build_status(
         daemon=DaemonStatus(state=probe.state, detail=probe.detail),
         last_scan=_last_scan(store),
         market_data=market_data_status or _market_data_status(settings),
+        schedule=_schedule_status(settings, clock),
     )

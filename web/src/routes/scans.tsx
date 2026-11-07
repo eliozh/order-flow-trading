@@ -7,13 +7,15 @@ import {
   type ScanEnvelope,
   type ScanListEnvelope,
 } from '../api/scans'
+import { fetchStatus, type ScheduleData, type StatusEnvelope } from '../api/status'
 import { DataQualityBadge } from '../components/data-quality'
 import { ProvenanceStamp } from '../components/provenance'
 import { useCompact } from '../hooks/use-compact'
 
 interface ScansPageProps {
   fetchScansFn?: () => Promise<ScanListEnvelope>
-  triggerScanFn?: () => Promise<ScanEnvelope>
+  fetchStatusFn?: () => Promise<StatusEnvelope>
+  triggerScanFn?: (period: string) => Promise<ScanEnvelope>
   isCompact?: boolean
 }
 
@@ -55,6 +57,15 @@ const PERIOD_HOURS: Record<string, number> = {
   '1d': 24,
 }
 
+const BOUNDARY_HOURS: Record<string, string> = {
+  '4h': '00/04/08/12/16/20 UTC',
+  '8h': '00/08/16 UTC',
+}
+
+function boundaryLabel(period: string): string {
+  return BOUNDARY_HOURS[period] ?? 'UTC boundaries'
+}
+
 function displayStage(scan: ScanData): string {
   if (scan.symbol_stage) {
     return scan.symbol_stage
@@ -74,10 +85,15 @@ function symbolRows(scan: ScanData) {
   return scan.symbols ?? []
 }
 
-function symbolsLabel(scan: ScanData): string {
+function symbolCounts(scan: ScanData): { completed: number; total: number } {
   const rows = symbolRows(scan)
   const total = scan.symbols_total ?? (rows.length || 1)
   const completed = scan.symbols_completed ?? rows.filter((row) => row.stage === 'DONE').length
+  return { completed, total }
+}
+
+function symbolsLabel(scan: ScanData): string {
+  const { completed, total } = symbolCounts(scan)
   return `${completed}/${total}`
 }
 
@@ -114,7 +130,11 @@ function nextRunLabel(period: string): string {
 }
 
 function budgetTotal(items: ScanData[]): string {
+  const today = new Date().toISOString().slice(0, 10)
   const total = items.reduce((sum, scan) => {
+    if (!scan.started_at || scan.started_at.slice(0, 10) !== today) {
+      return sum
+    }
     const value = Number(scan.total_cost_usd ?? scan.cost_usd ?? '0')
     return Number.isFinite(value) ? sum + value : sum
   }, 0)
@@ -123,10 +143,12 @@ function budgetTotal(items: ScanData[]): string {
 
 export function ScansPage({
   fetchScansFn = fetchScans,
+  fetchStatusFn = fetchStatus,
   triggerScanFn = triggerScan,
   isCompact,
 }: ScansPageProps) {
   const [load, setLoad] = useState<ScansState>({ state: 'loading', items: [], total: 0 })
+  const [schedule, setSchedule] = useState<ScheduleData | null>(null)
   const [trigger, setTrigger] = useState<TriggerState>({ state: 'idle' })
   const compact = useCompact(isCompact)
   const mounted = useRef(true)
@@ -161,14 +183,26 @@ export function ScansPage({
     }
   }, [fetchScansFn])
 
+  const loadSchedule = useCallback(async () => {
+    try {
+      const envelope = await fetchStatusFn()
+      if (mounted.current && envelope.data?.schedule) {
+        setSchedule(envelope.data.schedule)
+      }
+    } catch {
+      // Keep the last known cadence; the history table still renders.
+    }
+  }, [fetchStatusFn])
+
   useEffect(() => {
     mounted.current = true
     setLoad({ state: 'loading', items: [], total: 0 })
     void loadScans()
+    void loadSchedule()
     return () => {
       mounted.current = false
     }
-  }, [loadScans])
+  }, [loadScans, loadSchedule])
 
   async function onRun() {
     if (triggerInFlight.current) {
@@ -177,10 +211,10 @@ export function ScansPage({
     triggerInFlight.current = true
     setTrigger({ state: 'running' })
     try {
-      const envelope = await triggerScanFn()
+      const envelope = await triggerScanFn(cadence)
       // POST /api/v1/scans runs the batch synchronously; refresh the history
       // and schedule card so the finished run appears without a reload.
-      await loadScans()
+      await Promise.all([loadScans(), loadSchedule()])
       const scanId = envelope.data?.scan_id ?? 'scan'
       if (mounted.current) {
         setTrigger({ state: 'done', message: `${scanId} scan finished` })
@@ -198,7 +232,8 @@ export function ScansPage({
   }
 
   const latest = load.items[0]
-  const cadence = latest?.period ?? '4h'
+  const cadence = schedule?.period ?? latest?.period ?? '4h'
+  const nextRun = schedule?.next_run_at ?? nextRunLabel(cadence)
   const lastRun = latest
     ? `${symbolsLabel(latest)} · ${latest.symbols_degraded ?? 0} degraded · ${
         latest.symbols_failed ?? 0
@@ -227,11 +262,14 @@ export function ScansPage({
         <dl className="scan-grid">
           <div>
             <dt>Next run</dt>
-            <dd className="mono">{nextRunLabel(cadence)}</dd>
+            <dd className="mono">{nextRun}</dd>
           </div>
           <div>
             <dt>Cadence</dt>
-            <dd className="mono">{cadence} · 00/04/08/12/16/20 UTC</dd>
+            <dd className="mono">
+              {cadence} · {boundaryLabel(cadence)}
+              {schedule?.pending_period ? ` · next ${schedule.pending_period}` : ''}
+            </dd>
           </div>
           <div>
             <dt>Last run</dt>
@@ -258,10 +296,20 @@ export function ScansPage({
             <span className="mono-muted" role="status">
               {trigger.state === 'running' && 'Triggering a manual scan…'}
               {trigger.state === 'done' && trigger.message}
-              {trigger.state === 'error' && trigger.message}
               {trigger.state === 'idle' && 'Manual runs are allowed; a scan never sends orders.'}
             </span>
+            {trigger.state === 'error' && (
+              <span className="mono-muted" role="alert">
+                {trigger.message}
+              </span>
+            )}
           </div>
+        )}
+        {compact && (
+          <p className="panel-foot" role="note">
+            Read-only summary on small screens; run scans from desktop or the CLI (
+            <code>oft scan run</code>).
+          </p>
         )}
       </section>
 
@@ -312,74 +360,84 @@ export function ScansPage({
                 </tr>
               </thead>
               <tbody>
-                {load.items.map((scan) => (
-                  <tr key={scan.scan_id}>
-                    <td>
-                      <a
-                        className="rowlink mono"
-                        href={`/scans/${encodeURIComponent(scan.scan_id)}`}
-                      >
-                        {scan.scan_id}
-                      </a>
-                    </td>
-                    {!compact && <td className="mono">{scan.started_at}</td>}
-                    <td className="mono">{durationLabel(scan)}</td>
-                    <td className="mono">
-                      {symbolsLabel(scan)}
-                      {symbolNames(scan).length > 0 && (
-                        <span className="mono-muted"> · {symbolNames(scan).join(', ')}</span>
-                      )}
-                    </td>
-                    <td>
-                      <span className={STATUS_CHIP[displayStage(scan)] ?? 'chip'}>
-                        {displayStage(scan)}
-                      </span>
-                    </td>
-                    {!compact && (
+                {load.items.map((scan) => {
+                  const counts = symbolCounts(scan)
+                  return (
+                    <tr key={scan.scan_id}>
+                      <th scope="row">
+                        <a
+                          className="rowlink mono"
+                          href={`/scans/${encodeURIComponent(scan.scan_id)}`}
+                        >
+                          {scan.scan_id}
+                        </a>
+                      </th>
+                      {!compact && <td className="mono">{scan.started_at}</td>}
+                      <td className="mono">{durationLabel(scan)}</td>
+                      <td className="mono">
+                        <span aria-hidden="true">{symbolsLabel(scan)}</span>
+                        <span className="visually-hidden">
+                          {counts.completed} of {counts.total} symbols completed
+                        </span>
+                        {symbolNames(scan).length > 0 && (
+                          <span className="mono-muted"> · {symbolNames(scan).join(', ')}</span>
+                        )}
+                      </td>
                       <td>
-                        {scan.llm_status ? (
-                          <span className={LLM_CHIP[scan.llm_status] ?? 'chip'}>
-                            {scan.llm_status}
-                          </span>
+                        <span className={STATUS_CHIP[displayStage(scan)] ?? 'chip'}>
+                          {displayStage(scan)}
+                        </span>
+                      </td>
+                      {!compact && (
+                        <td>
+                          {scan.llm_status ? (
+                            <span className={LLM_CHIP[scan.llm_status] ?? 'chip'}>
+                              {scan.llm_status}
+                            </span>
+                          ) : (
+                            <span className="mono-muted">not configured</span>
+                          )}
+                        </td>
+                      )}
+                      {!compact && (
+                        <td>
+                          {scan.data_quality ? (
+                            <DataQualityBadge status={scan.data_quality} />
+                          ) : (
+                            '—'
+                          )}
+                        </td>
+                      )}
+                      {!compact && (
+                        <td className="mono">
+                          {costLabel(scan)}
+                          {scan.cost_unpriced && <span className="mono-muted"> unpriced</span>}
+                        </td>
+                      )}
+                      <td>
+                        {scan.delivery?.configured ? (
+                          'delivered'
                         ) : (
                           <span className="mono-muted">not configured</span>
                         )}
                       </td>
-                    )}
-                    {!compact && (
-                      <td>
-                        {scan.data_quality ? <DataQualityBadge status={scan.data_quality} /> : '—'}
-                      </td>
-                    )}
-                    {!compact && (
-                      <td className="mono">
-                        {costLabel(scan)}
-                        {scan.cost_unpriced && <span className="mono-muted"> unpriced</span>}
-                      </td>
-                    )}
-                    <td>
-                      {scan.delivery?.configured ? (
-                        'delivered'
-                      ) : (
-                        <span className="mono-muted">not configured</span>
+                      {!compact && (
+                        <td className="mono">
+                          {scan.report_id ? (
+                            <a
+                              className="rowlink"
+                              href={`/reports/${encodeURIComponent(scan.report_id)}`}
+                            >
+                              {scan.report_id}
+                            </a>
+                          ) : (
+                            '—'
+                          )}
+                        </td>
                       )}
-                    </td>
-                    {!compact && (
-                      <td className="mono">
-                        {scan.report_id ? (
-                          <a
-                            className="rowlink"
-                            href={`/reports/${encodeURIComponent(scan.report_id)}`}
-                          >
-                            {scan.report_id}
-                          </a>
-                        ) : (
-                          '—'
-                        )}
-                      </td>
-                    )}
-                  </tr>
-                ))}
+                    </tr>
+                  )
+                })}
               </tbody>
             </table>
           </div>

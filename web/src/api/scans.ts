@@ -9,6 +9,7 @@ export interface ScanSymbolRow {
   data_quality: string | null
   error_code: string | null
   error_message: string | null
+  failed_stage?: string | null
   llm_status: string | null
   llm_tokens: number
   cost_usd: string
@@ -32,7 +33,7 @@ export interface DeliveryState {
 
 export interface ScanData {
   scan_id: string
-  symbol: string
+  symbol?: string
   period: string
   status: string
   trigger_source: string
@@ -166,7 +167,7 @@ function idempotencyKey(): string {
  * The POST runs the whole batch synchronously, so a successful response is a
  * finished scan rather than a queued job; callers should refetch the history.
  */
-export async function triggerScan(): Promise<ScanEnvelope> {
+export async function triggerScan(period = '4h'): Promise<ScanEnvelope> {
   const csrf = readCookie('oft_csrf')
   const headers: Record<string, string> = {
     Accept: 'application/json',
@@ -180,7 +181,9 @@ export async function triggerScan(): Promise<ScanEnvelope> {
     method: 'POST',
     headers,
     credentials: 'same-origin',
-    body: JSON.stringify({ period: '4h', source: 'backfill', metrics_only: false }),
+    // Source and metrics_only follow the server defaults so the UI can never
+    // silently force a metrics-only or backfill-only batch.
+    body: JSON.stringify({ period }),
   })
   let envelope: ScanEnvelope | null = null
   try {

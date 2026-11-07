@@ -2,6 +2,7 @@ import { act, fireEvent, render, screen, waitFor, within } from '@testing-librar
 import { afterEach, describe, expect, it, vi } from 'vitest'
 
 import type { ApiMeta, ScanData, ScanEnvelope, ScanListEnvelope } from '../../api/scans'
+import type { StatusEnvelope } from '../../api/status'
 import { SCAN_POLL_INTERVAL_MS, ScanDetailPage } from '../scan-detail'
 import { ScansPage } from '../scans'
 
@@ -57,6 +58,37 @@ function listEnvelope(items: ScanData[]): ScanListEnvelope {
 
 function detailEnvelope(data: ScanData): ScanEnvelope {
   return { ok: true, data, error: null, meta }
+}
+
+function statusEnvelope(period = '4h', nextRun = '2026-11-08T16:00:00.000Z'): StatusEnvelope {
+  return {
+    ok: true,
+    error: null,
+    meta,
+    data: {
+      status: 'ok',
+      env: 'test',
+      version: '0.1.0',
+      host: '127.0.0.1',
+      port: 7611,
+      data_dir: '/tmp',
+      log_level: 'INFO',
+      generated_at: '2026-11-08T12:00:00.000Z',
+      universe: {
+        source: 'fixture',
+        as_of: '2026-11-08T12:00:00.000Z',
+        count: 2,
+        tradifi_count: 1,
+        symbols: [],
+      },
+      schedule: {
+        timezone: 'UTC',
+        period,
+        pending_period: null,
+        next_run_at: nextRun,
+      },
+    },
+  }
 }
 
 describe('ScansPage', () => {
@@ -115,6 +147,7 @@ describe('ScansPage', () => {
     expect(page).toHaveAttribute('data-readonly', 'true')
     expect(screen.queryByRole('columnheader', { name: /Cost/i })).not.toBeInTheDocument()
     expect(screen.queryByRole('button', { name: /run/i })).not.toBeInTheDocument()
+    expect(screen.getByText(/Read-only summary on small screens/i)).toBeInTheDocument()
   })
 
   it('matches S03.1: schedule card, manual trigger, and batch history columns', async () => {
@@ -170,6 +203,8 @@ describe('ScansPage', () => {
     expect(within(table).getByRole('columnheader', { name: /Duration/i })).toBeInTheDocument()
     expect(within(table).getByRole('columnheader', { name: /Telegram/i })).toBeInTheDocument()
     expect(within(table).getByText(/1\/2/)).toBeInTheDocument()
+    expect(within(table).getByText('1 of 2 symbols completed')).toBeInTheDocument()
+    expect(within(table).getByRole('rowheader', { name: /SCAN-BATCH-0001/ })).toBeInTheDocument()
     expect(within(table).getByText(/XAUUSDT/)).toBeInTheDocument()
     expect(within(table).getAllByText(/not configured/i).length).toBeGreaterThan(0)
   })
@@ -242,6 +277,95 @@ describe('ScansPage', () => {
     await waitFor(() => expect(screen.getByText(/scan finished/)).toBeInTheDocument())
     expect(button).toHaveAttribute('aria-disabled', 'false')
     expect(button).toHaveFocus()
+  })
+  it('shows a loading state while the list request is pending', async () => {
+    render(
+      <ScansPage
+        fetchScansFn={() => new Promise<ScanListEnvelope>(() => {})}
+        fetchStatusFn={async () => statusEnvelope()}
+      />,
+    )
+
+    expect(await screen.findByText(/Loading scans/i)).toBeInTheDocument()
+  })
+
+  it('shows the list error banner when the request fails', async () => {
+    render(
+      <ScansPage
+        fetchScansFn={async () => {
+          throw new Error('daemon offline')
+        }}
+        fetchStatusFn={async () => statusEnvelope()}
+      />,
+    )
+
+    expect(await screen.findByRole('alert')).toHaveTextContent(
+      /Scan history unavailable: daemon offline/i,
+    )
+  })
+
+  it('shows the empty state when there are no scans', async () => {
+    render(
+      <ScansPage
+        fetchScansFn={async () => listEnvelope([])}
+        fetchStatusFn={async () => statusEnvelope()}
+      />,
+    )
+
+    expect(await screen.findByText(/No scans yet/i)).toBeInTheDocument()
+  })
+
+  it('announces a trigger failure through an assertive alert', async () => {
+    const triggerScanFn = vi.fn(async () => {
+      throw new Error('daemon down')
+    })
+    render(
+      <ScansPage
+        fetchScansFn={async () => listEnvelope([])}
+        fetchStatusFn={async () => statusEnvelope()}
+        triggerScanFn={triggerScanFn}
+      />,
+    )
+
+    fireEvent.click(await screen.findByRole('button', { name: /run scan now/i }))
+
+    expect(await screen.findByRole('alert')).toHaveTextContent(/daemon down/i)
+    expect(screen.queryByText(/Manual runs are allowed/i)).not.toBeInTheDocument()
+  })
+
+  it('counts only today in the Budget today figure', async () => {
+    const today = new Date().toISOString().slice(0, 10)
+    render(
+      <ScansPage
+        fetchScansFn={async () =>
+          listEnvelope([
+            scan({ scan_id: 'SCAN-TODAY', started_at: `${today}T08:00:00.000Z`, cost_usd: '0.25' }),
+            scan({ scan_id: 'SCAN-OLD', started_at: '2020-01-01T08:00:00.000Z', cost_usd: '99' }),
+          ])
+        }
+        fetchStatusFn={async () => statusEnvelope()}
+      />,
+    )
+
+    const label = await screen.findByText(/Budget today/i)
+    expect(label.parentElement?.querySelector('dd')).toHaveTextContent('$0.25')
+  })
+
+  it('uses the persisted scheduler cadence and passes it to the trigger', async () => {
+    const triggerScanFn = vi.fn(async () => detailEnvelope(scan()))
+    render(
+      <ScansPage
+        fetchScansFn={async () => listEnvelope([scan()])}
+        fetchStatusFn={async () => statusEnvelope('8h', '2026-11-08T16:00:00.000Z')}
+        triggerScanFn={triggerScanFn}
+      />,
+    )
+
+    expect(await screen.findByText(/00\/08\/16 UTC/i)).toBeInTheDocument()
+    expect(screen.getByText('2026-11-08T16:00:00.000Z')).toBeInTheDocument()
+
+    fireEvent.click(screen.getByRole('button', { name: /run scan now/i }))
+    await waitFor(() => expect(triggerScanFn).toHaveBeenCalledWith('8h'))
   })
 })
 
@@ -379,5 +503,102 @@ describe('ScanDetailPage', () => {
     } finally {
       vi.useRealTimers()
     }
+  })
+
+  it('surfaces a stale snapshot when a poll fails', async () => {
+    vi.useFakeTimers()
+    try {
+      const running = scan({ status: 'RUNNING', finished_at: '' })
+      const fetchScanFn = vi
+        .fn()
+        .mockResolvedValueOnce(detailEnvelope(running))
+        .mockRejectedValueOnce(new Error('daemon unreachable'))
+      render(<ScanDetailPage scanId={running.scan_id} fetchScanFn={fetchScanFn} />)
+
+      await act(async () => {
+        await vi.advanceTimersByTimeAsync(0)
+      })
+      await act(async () => {
+        await vi.advanceTimersByTimeAsync(SCAN_POLL_INTERVAL_MS)
+      })
+
+      expect(screen.getByRole('alert')).toHaveTextContent(/Live updates paused/i)
+      expect(screen.getByRole('alert')).toHaveTextContent(/daemon unreachable/i)
+      expect(screen.queryByText(/Stages update in place/)).not.toBeInTheDocument()
+    } finally {
+      vi.useRealTimers()
+    }
+  })
+
+  it('renders the per-symbol table for a one-symbol batch', async () => {
+    const single = scan({
+      status: 'PARTIAL',
+      symbol: undefined,
+      symbols_total: 1,
+      symbols_completed: 1,
+      symbols_degraded: 0,
+      symbols_failed: 0,
+      symbols: [
+        {
+          symbol: 'BTCUSDT',
+          stage: 'DONE',
+          report_id: 'RPT-BTC-1',
+          data_quality: 'COMPLETE',
+          error_code: null,
+          error_message: null,
+          llm_status: 'VALID',
+          llm_tokens: 10,
+          cost_usd: '0.10',
+          cost_unpriced: false,
+          data_stage: 'DONE',
+          metrics_stage: 'DONE',
+          llm_stage: 'DONE',
+          report_stage: 'DONE',
+        },
+      ],
+    })
+    render(
+      <ScanDetailPage scanId={single.scan_id} fetchScanFn={async () => detailEnvelope(single)} />,
+    )
+
+    expect(
+      await screen.findByRole('table', { name: /Per-symbol scan stages/i }),
+    ).toBeInTheDocument()
+    expect(screen.getByRole('rowheader', { name: 'BTCUSDT' })).toBeInTheDocument()
+    expect(screen.getByText(/^4h · trigger MANUAL/i)).toBeInTheDocument()
+  })
+
+  it('marks METRICS failed when the symbol failed at the metrics stage', async () => {
+    const failed = scan({
+      status: 'FAILED',
+      data_quality: 'MISSING',
+      symbols_total: 1,
+      symbols_completed: 0,
+      symbols_failed: 1,
+      symbols: [
+        {
+          symbol: 'BTCUSDT',
+          stage: 'FAILED',
+          report_id: null,
+          data_quality: null,
+          error_code: 'SCAN_FAILED',
+          error_message: 'bars and metrics disagree',
+          failed_stage: 'METRICS',
+          llm_status: null,
+          llm_tokens: 0,
+          cost_usd: '0',
+          cost_unpriced: false,
+        },
+      ],
+    })
+    render(
+      <ScanDetailPage scanId={failed.scan_id} fetchScanFn={async () => detailEnvelope(failed)} />,
+    )
+
+    const stageList = await screen.findByRole('list', { name: /Named scan stages/i })
+    const metrics = within(stageList).getByText('METRICS')
+    expect(within(metrics.closest('li') as HTMLElement).getByText('FAILED')).toBeInTheDocument()
+    const data = within(stageList).getByText('DATA')
+    expect(within(data.closest('li') as HTMLElement).getByText('DONE')).toBeInTheDocument()
   })
 })
