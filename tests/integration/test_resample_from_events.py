@@ -259,6 +259,12 @@ def test_late_event_recomputes_only_the_last_n_bars_into_a_new_versioned_run(
     assert late_entry.path != initial_entry.path
     assert Path(initial_entry.path).read_bytes() == initial_bytes
     assert Path(late_entry.path).is_file()
+    assert initial_entry.run_id == initial.run_id
+    assert initial_entry.last_n is None
+    assert late_entry.run_id == late_run.run_id
+    assert late_entry.last_n == 2
+    assert late_entry.recomputed_from == "2026-10-01T00:08:00.000Z"
+    assert late_entry.parent_run_id == initial.run_id
 
     # A duplicate replay of the same late event is idempotent.
     repeated = harness.service.recompute_late(request, late_trades=(late,), trades=base, last_n=2)
@@ -279,6 +285,19 @@ def test_late_event_recomputes_only_the_last_n_bars_into_a_new_versioned_run(
     ]
     assert rows[-1]["close"] == "999.00"
     assert rows[-1]["trade_count"] == 2
+
+    merged = read_bars(
+        harness.settings,
+        symbol="BTCUSDT",
+        period="1m",
+        metric_version=late_run.result.metric_version,
+    )
+    assert [row["bar_start"] for row in merged] == [
+        DAY_START + timedelta(minutes=minute) for minute in range(10)
+    ]
+    assert {row["run_id"] for row in merged[:8]} == {initial.run_id}
+    assert {row["run_id"] for row in merged[8:]} == {late_run.run_id}
+    assert merged[-1]["close"] == "999.00"
 
 
 def test_late_event_older_than_the_recompute_window_is_rejected(
@@ -463,7 +482,11 @@ def test_default_read_returns_the_newest_run_when_computed_at_ties(
         period="1m",
         metric_version=late_run.result.metric_version,
     )
-    assert {row["run_id"] for row in rows} == {late_run.run_id}
+    assert [row["bar_start"] for row in rows] == [
+        DAY_START + timedelta(minutes=minute) for minute in range(10)
+    ]
+    assert {row["run_id"] for row in rows[:8]} == {initial.run_id}
+    assert {row["run_id"] for row in rows[8:]} == {late_run.run_id}
     assert rows[-1]["close"] == "999.31"
 
 
@@ -481,3 +504,100 @@ def test_recompute_late_before_any_bar_closed_returns_missing(tmp_path: Path) ->
     assert run.result.quality_reasons == ("closed_at is before the first fully closed bar",)
     assert run.last_n == 2
     assert run.recomputed_from is None
+
+
+def _bar_writer(harness: _Harness, computed_at: str):  # type: ignore[no-untyped-def]
+    run = harness.service.compute(
+        _request("1m", end=DAY_START + timedelta(minutes=3)), trades=_minute_trades(3)
+    )
+    result = run.result
+
+    def write() -> object:
+        return harness.parquet.write_bar_part(
+            result.bars,
+            symbol=result.symbol,
+            period=result.period,
+            window_start=result.window_start,
+            window_end=result.window_end,
+            metric_version=result.metric_version,
+            input_manifest_hash=result.input_manifest_hash,
+            source_mode=result.source_mode,
+            source_digest=run.source_digest,
+            run_id=run.run_id,
+            computed_at=computed_at,
+            data_quality=result.data_quality.value,
+            quality_reasons=result.quality_reasons,
+        )
+
+    return write
+
+
+def test_bar_parts_exclude_runtime_metadata_from_their_content_identity(
+    tmp_path: Path,
+) -> None:
+    import pyarrow.parquet as pq
+
+    harness = _Harness(tmp_path)
+    first = _bar_writer(harness, "2026-11-06T12:00:00.000Z")()
+    second = _bar_writer(harness, "2026-11-06T12:00:01.000Z")()
+
+    assert first.path == second.path
+    assert "computed_at" not in pq.read_schema(first.path).names
+
+
+def test_concurrent_identical_bar_parts_do_not_conflict(tmp_path: Path, monkeypatch) -> None:
+    import threading
+    from concurrent.futures import ThreadPoolExecutor
+
+    import oft.adapters.parquet_store as parquet_store_module
+
+    harness = _Harness(tmp_path)
+    writers = [
+        _bar_writer(harness, "2026-11-06T12:00:00.000Z"),
+        _bar_writer(harness, "2026-11-06T12:00:01.000Z"),
+    ]
+    barrier = threading.Barrier(2)
+    original = parquet_store_module._publish_table
+
+    def synchronized(*args, **kwargs):  # type: ignore[no-untyped-def]
+        barrier.wait(timeout=5)
+        return original(*args, **kwargs)
+
+    monkeypatch.setattr(parquet_store_module, "_publish_table", synchronized)
+    with ThreadPoolExecutor(max_workers=2) as pool:
+        entries = [future.result() for future in [pool.submit(write) for write in writers]]
+
+    assert {entry.path for entry in entries} == {entries[0].path}
+
+
+def test_recompute_late_rejects_an_event_in_a_bar_that_has_not_closed(
+    tmp_path: Path,
+) -> None:
+    harness = _Harness(tmp_path, now=DAY_START + timedelta(minutes=8, seconds=30))
+    request = _request("1m", end=DAY_START + timedelta(minutes=10))
+    base = _minute_trades(10)
+    late = _trade(999, price="999.31", quantity="2.0", minute=9, second=30)
+
+    with pytest.raises(ValueError, match="not closed"):
+        harness.service.recompute_late(request, late_trades=(late,), trades=base, last_n=2)
+
+
+def test_recompute_late_rejects_duplicate_ids_in_base_trades(tmp_path: Path) -> None:
+    harness = _Harness(tmp_path)
+    request = _request("1m", end=DAY_START + timedelta(minutes=10))
+    first = _trade(1, price="100.00", quantity="1.0", minute=0)
+    base = (first, first) + _minute_trades(9, first_id=1)
+    late = _trade(999, price="999.31", quantity="2.0", minute=9, second=30)
+
+    with pytest.raises(ValueError, match="duplicate agg_trade_id"):
+        harness.service.recompute_late(request, late_trades=(late,), trades=base, last_n=2)
+
+
+def test_persisting_an_empty_bar_part_is_rejected(tmp_path: Path) -> None:
+    harness = _Harness(tmp_path)
+    missing = harness.service.compute(
+        _request("1m", end=DAY_START + timedelta(minutes=5)), trades=()
+    )
+
+    with pytest.raises(ValueError, match="empty"):
+        harness.service.persist(missing)

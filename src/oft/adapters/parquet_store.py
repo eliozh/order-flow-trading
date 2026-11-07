@@ -356,10 +356,12 @@ def read_bars(
     run_id: str | None = None,
     store: StorePort | None = None,
 ) -> tuple[dict[str, object], ...]:
-    """Read manifest-registered bars for one run in deterministic order.
+    """Read manifest-registered bars in deterministic, gap-free order.
 
-    Without ``run_id`` the most recently computed run wins, so a late-event
-    recompute run can never be silently mixed with the run it supersedes.
+    Without ``run_id``, every published run is merged by ``bar_start``. When
+    runs overlap, the bar from the run with the newest ``computed_at`` and
+    then the highest manifest ``run_seq`` wins. A tail-only late recompute
+    therefore replaces just its bars instead of truncating the series.
     """
     if store is None:
         from oft.adapters.sqlite_store import SqliteStore
@@ -380,36 +382,48 @@ def read_bars(
     except (OSError, ValueError, pa.ArrowException) as exc:
         raise StoreUnavailableError(f"cannot read bar parts for {symbol}: {exc}") from exc
     rows = cast("list[dict[str, object]]", table.to_pylist())
-    if run_id is None:
-        run_sequences: dict[str, int] = {}
-        for entry in store.list_manifest():
-            if entry.data_type != BARS_DATA_TYPE:
-                continue
-            entry_run_id = entry.source.rsplit(":", 1)[-1]
-            run_sequences[entry_run_id] = max(run_sequences.get(entry_run_id, 0), entry.run_seq)
-        newest = max(
-            (
-                (
-                    str(row.get("computed_at") or ""),
-                    run_sequences.get(str(row.get("run_id")), 0),
-                    str(row.get("run_id") or ""),
-                )
-                for row in rows
-                if row.get("run_id") is not None
-            ),
-            default=("", 0, ""),
+    run_meta: dict[str, tuple[str, int]] = {}
+    for entry in store.list_manifest():
+        if entry.data_type != BARS_DATA_TYPE:
+            continue
+        entry_run_id = entry.run_id or entry.source.rsplit(":", 1)[-1]
+        previous = run_meta.get(entry_run_id, ("", 0))
+        run_meta[entry_run_id] = (
+            max(previous[0], entry.created_at),
+            max(previous[1], entry.run_seq),
         )
-        run_id = newest[2]
-    rows = [row for row in rows if str(row.get("run_id")) == run_id]
+    if run_id is None:
+        selected: dict[str, dict[str, object]] = {}
+        selected_rank: dict[str, tuple[str, int, str]] = {}
+        for row in rows:
+            row_run_id = str(row.get("run_id") or "")
+            if not row_run_id:
+                continue
+            computed_at, run_seq = run_meta.get(row_run_id, ("", 0))
+            slot = str(row.get("bar_start"))
+            rank = (computed_at, run_seq, row_run_id)
+            if slot not in selected_rank or rank > selected_rank[slot]:
+                selected[slot] = row
+                selected_rank[slot] = rank
+        rows = list(selected.values())
+    else:
+        rows = [row for row in rows if str(row.get("run_id")) == run_id]
+        rows = list(
+            _unique_rows(
+                rows,
+                key=lambda row: (
+                    row.get("metric_version"),
+                    row.get("run_id"),
+                    row.get("bar_start"),
+                ),
+            )
+        )
+    for row in rows:
+        row_run_id = str(row.get("run_id") or "")
+        computed_at, _ = run_meta.get(row_run_id, ("", 0))
+        row["computed_at"] = computed_at or row.get("computed_at")
     rows.sort(key=lambda row: str(row.get("bar_start")))
-    return _unique_rows(
-        rows,
-        key=lambda row: (
-            row.get("metric_version"),
-            row.get("run_id"),
-            row.get("bar_start"),
-        ),
-    )
+    return tuple(rows)
 
 
 def _registered_parts(
@@ -1122,17 +1136,23 @@ class ParquetStore:
         computed_at: str,
         data_quality: str,
         quality_reasons: tuple[str, ...],
+        last_n: int | None = None,
+        recomputed_from: str | None = None,
+        parent_run_id: str | None = None,
     ) -> ManifestEntry:
         """Publish one immutable, content-addressed resampled-bar part.
 
         The part records ``source_mode``, the input manifest hash, the source
         digest, and the run id so a late-event recompute is auditable and a
-        published part is never edited in place.
+        published part is never edited in place. Run provenance (``last_n``,
+        ``recomputed_from``, ``parent_run_id``) lives in the manifest only.
         """
         if window_start.tzinfo is None or window_end.tzinfo is None:
             raise ValueError("bar window bounds must be timezone-aware")
         if window_end <= window_start:
             raise ValueError("window_end must be after window_start")
+        if not bars:
+            raise ValueError("cannot publish an empty bar part")
         if source_mode not in SOURCE_MODES:
             raise ValueError(f"unsupported source_mode {source_mode!r}")
         if _RUN_ID_PATTERN.fullmatch(run_id) is None:
@@ -1215,6 +1235,10 @@ class ParquetStore:
             input_manifest_hash=input_manifest_hash,
             window_start=utc_timestamp(window_start),
             window_end=utc_timestamp(window_end),
+            run_id=run_id,
+            last_n=last_n,
+            recomputed_from=recomputed_from,
+            parent_run_id=parent_run_id,
         )
 
     def _publish_content_addressed(
@@ -1241,7 +1265,7 @@ class ParquetStore:
                 hashlib.sha256(candidate.read_bytes()).hexdigest(),
                 candidate.stat().st_size,
             )
-        return _publish_table(table, directory, name_prefix=prefix, stem_hash=identity_hash)
+        return _publish_table(identity, directory, name_prefix=prefix, stem_hash=identity_hash)
 
     def _write_part(
         self,

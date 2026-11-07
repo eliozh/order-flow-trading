@@ -96,6 +96,7 @@ class ResampleRun:
     run_id: str
     last_n: int | None = None
     recomputed_from: datetime | None = None
+    parent_run_id: str | None = None
 
     def bar_metric_input(self) -> BarMetricInput:
         """Expose bars and contiguous gaps; missing bars are never invented."""
@@ -139,6 +140,9 @@ class BarWriterPort(Protocol):
         computed_at: str,
         data_quality: str,
         quality_reasons: tuple[str, ...],
+        last_n: int | None = None,
+        recomputed_from: str | None = None,
+        parent_run_id: str | None = None,
     ) -> ManifestEntry: ...
 
 
@@ -249,7 +253,11 @@ def load_published_agg_trades(
 
 
 def _merge_trades(base: Sequence[AggTrade], late: Sequence[AggTrade]) -> tuple[AggTrade, ...]:
-    by_id: dict[int, AggTrade] = {trade.agg_trade_id: trade for trade in base}
+    by_id: dict[int, AggTrade] = {}
+    for trade in base:
+        if trade.agg_trade_id in by_id:
+            raise ValueError(f"duplicate agg_trade_id {trade.agg_trade_id}")
+        by_id[trade.agg_trade_id] = trade
     for trade in late:
         by_id[trade.agg_trade_id] = trade
     return tuple(
@@ -330,6 +338,7 @@ class ResamplingService:
         source_digest: str,
         last_n: int | None = None,
         recomputed_from: datetime | None = None,
+        parent_run_id: str | None = None,
     ) -> ResampleRun:
         computed_at = utc_timestamp(self._clock.now())
         run_id = f"{result.metric_version}-{result.input_manifest_hash[:16]}"
@@ -340,7 +349,21 @@ class ResamplingService:
             run_id=run_id,
             last_n=last_n,
             recomputed_from=recomputed_from,
+            parent_run_id=parent_run_id,
         )
+
+    def _latest_run_id(self, *, symbol: str, metric_version: str) -> str | None:
+        entries = [
+            entry
+            for entry in self._store.list_manifest()
+            if entry.data_type == "bars"
+            and entry.symbol == symbol
+            and entry.metric_version == metric_version
+        ]
+        if not entries:
+            return None
+        latest = max(entries, key=lambda entry: (entry.created_at, entry.run_seq))
+        return latest.run_id or latest.source.rsplit(":", 1)[-1]
 
     def persist(self, run: ResampleRun) -> ManifestEntry:
         """Publish the run's bars as one immutable content-addressed part."""
@@ -358,6 +381,11 @@ class ResamplingService:
             computed_at=run.computed_at,
             data_quality=run.result.data_quality.value,
             quality_reasons=run.result.quality_reasons,
+            last_n=run.last_n,
+            recomputed_from=(
+                utc_timestamp(run.recomputed_from) if run.recomputed_from is not None else None
+            ),
+            parent_run_id=run.parent_run_id,
         )
         try:
             self._store.upsert_manifest_entry(entry)
@@ -437,7 +465,13 @@ class ResamplingService:
                 result,
                 source_digest=self._source_digest(request, fallback=result.input_manifest_hash),
                 last_n=n,
+                parent_run_id=self._latest_run_id(
+                    symbol=request.symbol, metric_version=result.metric_version
+                ),
             )
+        for trade in late_trades:
+            if bar_start_for(trade.transact_time, request.period) >= effective_end:
+                raise ValueError("late trade is in a bar that has not closed yet")
         slots = expected_bar_starts(request.window_start, effective_end, request.period)
         tail_start = slots[max(0, len(slots) - n)]
         for trade in late_trades:
@@ -459,6 +493,9 @@ class ResamplingService:
             source_digest=self._source_digest(request, fallback=result.input_manifest_hash),
             last_n=n,
             recomputed_from=tail_start,
+            parent_run_id=self._latest_run_id(
+                symbol=request.symbol, metric_version=result.metric_version
+            ),
         )
 
 

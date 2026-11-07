@@ -147,7 +147,12 @@ def bars_input_hash(
 
 @dataclass(frozen=True)
 class Bar:
-    """One closed OHLCV bar with exact decimal amounts."""
+    """One closed OHLCV bar with exact decimal amounts.
+
+    ``quote_volume`` is the exact, unrounded ``sum(price * quantity)`` over the
+    bar's trades. It is serialized as a decimal string in the contract, so a
+    consumer must compare it as an exact decimal rather than a binary float.
+    """
 
     symbol: str
     period: str

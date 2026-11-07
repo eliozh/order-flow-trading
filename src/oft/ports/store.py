@@ -57,6 +57,10 @@ class ManifestEntry:
     input_manifest_hash: str | None = None
     window_start: str | None = None
     window_end: str | None = None
+    run_id: str | None = None
+    last_n: int | None = None
+    recomputed_from: str | None = None
+    parent_run_id: str | None = None
     run_seq: int = 0
 
 
