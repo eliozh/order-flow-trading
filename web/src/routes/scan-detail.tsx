@@ -66,11 +66,11 @@ function aggregateStage(flags: StageFlags[], key: keyof StageFlags): StageState 
   if (flags.some((flags) => flags[key] === 'RUNNING')) {
     return 'RUNNING'
   }
-  if (flags.length > 0 && flags.every((flags) => flags[key] === 'DONE')) {
-    return 'DONE'
-  }
-  if (flags.length > 0 && flags.every((flags) => flags[key] === 'SKIPPED')) {
-    return 'SKIPPED'
+  const states = flags.map((flags) => flags[key])
+  if (states.length > 0 && states.every((state) => state === 'DONE' || state === 'SKIPPED')) {
+    // SKIPPED means a symbol failed before this stage, so it never ran there.
+    // A stage that completed for every reachable symbol is DONE, not PENDING.
+    return states.includes('DONE') ? 'DONE' : 'SKIPPED'
   }
   return 'PENDING'
 }
@@ -201,13 +201,19 @@ function symbolStageFlags(row: ScanSymbolRow): StageFlags {
           : 'REPORT')
     if (failedStage === 'DATA') {
       flags.data = 'FAILED'
+      flags.metrics = 'SKIPPED'
+      flags.llm = 'SKIPPED'
+      flags.report = 'SKIPPED'
     } else if (failedStage === 'METRICS') {
       flags.data = 'DONE'
       flags.metrics = 'FAILED'
+      flags.llm = 'SKIPPED'
+      flags.report = 'SKIPPED'
     } else if (failedStage === 'LLM') {
       flags.data = 'DONE'
       flags.metrics = 'DONE'
       flags.llm = 'FAILED'
+      flags.report = 'SKIPPED'
     } else {
       flags.data = 'DONE'
       flags.metrics = 'DONE'

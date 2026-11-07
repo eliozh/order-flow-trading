@@ -601,4 +601,104 @@ describe('ScanDetailPage', () => {
     const data = within(stageList).getByText('DATA')
     expect(within(data.closest('li') as HTMLElement).getByText('DONE')).toBeInTheDocument()
   })
+
+  it('shows LLM and REPORT done when another symbol failed before reaching them', async () => {
+    const partial = scan({
+      status: 'PARTIAL',
+      symbols_total: 2,
+      symbols_completed: 1,
+      symbols_failed: 1,
+      symbols: [
+        {
+          symbol: 'BTCUSDT',
+          stage: 'DONE',
+          report_id: 'RPT-BTC-1',
+          data_quality: 'COMPLETE',
+          error_code: null,
+          error_message: null,
+          llm_status: 'VALID',
+          llm_tokens: 10,
+          cost_usd: '0.10',
+          cost_unpriced: false,
+          data_stage: 'DONE',
+          metrics_stage: 'DONE',
+          llm_stage: 'DONE',
+          report_stage: 'DONE',
+        },
+        {
+          symbol: 'XAUUSDT',
+          stage: 'FAILED',
+          report_id: null,
+          data_quality: null,
+          error_code: 'DATA_UNAVAILABLE',
+          error_message: 'Data gap',
+          failed_stage: 'DATA',
+          llm_status: null,
+          llm_tokens: 0,
+          cost_usd: '0',
+          cost_unpriced: false,
+          // The daemon marks stages after the failure as SKIPPED (never ran),
+          // so a completed symbol's LLM/REPORT stages still aggregate to DONE.
+          data_stage: 'FAILED',
+          metrics_stage: 'SKIPPED',
+          llm_stage: 'SKIPPED',
+          report_stage: 'SKIPPED',
+        },
+      ],
+    })
+    render(
+      <ScanDetailPage scanId={partial.scan_id} fetchScanFn={async () => detailEnvelope(partial)} />,
+    )
+
+    const stageList = await screen.findByRole('list', { name: /Named scan stages/i })
+    const llm = within(stageList).getByText('LLM').closest('li') as HTMLElement
+    expect(within(llm).getByText('DONE')).toBeInTheDocument()
+    const report = within(stageList).getByText('REPORT').closest('li') as HTMLElement
+    expect(within(report).getByText('DONE')).toBeInTheDocument()
+    expect(within(report).queryByText('PENDING')).not.toBeInTheDocument()
+  })
+
+  it('derives the same partial-batch stages when payload stage cells are absent', async () => {
+    const partial = scan({
+      status: 'PARTIAL',
+      symbols_total: 2,
+      symbols_completed: 1,
+      symbols_failed: 1,
+      symbols: [
+        {
+          symbol: 'BTCUSDT',
+          stage: 'DONE',
+          report_id: 'RPT-BTC-1',
+          data_quality: 'COMPLETE',
+          error_code: null,
+          error_message: null,
+          llm_status: 'VALID',
+          llm_tokens: 10,
+          cost_usd: '0.10',
+          cost_unpriced: false,
+        },
+        {
+          symbol: 'XAUUSDT',
+          stage: 'FAILED',
+          report_id: null,
+          data_quality: null,
+          error_code: 'DATA_UNAVAILABLE',
+          error_message: 'Data gap',
+          llm_status: null,
+          llm_tokens: 0,
+          cost_usd: '0',
+          cost_unpriced: false,
+        },
+      ],
+    })
+    render(
+      <ScanDetailPage scanId={partial.scan_id} fetchScanFn={async () => detailEnvelope(partial)} />,
+    )
+
+    const stageList = await screen.findByRole('list', { name: /Named scan stages/i })
+    const llm = within(stageList).getByText('LLM').closest('li') as HTMLElement
+    expect(within(llm).getByText('DONE')).toBeInTheDocument()
+    const report = within(stageList).getByText('REPORT').closest('li') as HTMLElement
+    expect(within(report).getByText('DONE')).toBeInTheDocument()
+  })
 })

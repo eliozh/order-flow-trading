@@ -73,11 +73,23 @@ def test_child_gaps_drive_batch_data_quality() -> None:
 
 
 def test_failed_row_renders_the_persisted_failing_stage() -> None:
+    data = _symbol_row(
+        _row("ETHUSDT", stage="FAILED", failed_stage="DATA", report_id=None, llm_status=None)
+    )
+    assert data["data_stage"] == "FAILED"
+    # Downstream stages never ran, so they are SKIPPED rather than PENDING:
+    # PENDING would make the batch-level aggregate look unfinished.
+    assert data["metrics_stage"] == "SKIPPED"
+    assert data["llm_stage"] == "SKIPPED"
+    assert data["report_stage"] == "SKIPPED"
+
     metrics = _symbol_row(
         _row("ETHUSDT", stage="FAILED", failed_stage="METRICS", report_id=None, llm_status=None)
     )
     assert metrics["data_stage"] == "DONE"
     assert metrics["metrics_stage"] == "FAILED"
+    assert metrics["llm_stage"] == "SKIPPED"
+    assert metrics["report_stage"] == "SKIPPED"
 
     report = _symbol_row(
         _row("ETHUSDT", stage="FAILED", failed_stage="REPORT", report_id=None, llm_status=None)

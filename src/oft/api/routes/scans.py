@@ -241,11 +241,13 @@ def _symbol_stage_flags(row: ScanSymbolRecord) -> dict[str, str]:
         stage = _failed_stage(row)
         if stage == "DATA":
             data = "FAILED"
+            metrics = llm = report = "SKIPPED"
         elif stage == "METRICS":
             data, metrics = "DONE", "FAILED"
+            llm = report = "SKIPPED"
         elif stage == "LLM":
             data = metrics = "DONE"
-            llm = "FAILED"
+            llm, report = "FAILED", "SKIPPED"
         else:
             data = metrics = "DONE"
             llm = "DONE" if row.llm_status is not None else "SKIPPED"
