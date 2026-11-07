@@ -187,8 +187,12 @@ def fetch(
         else:
             _download(url, destination)
             checksum_url = url + ".CHECKSUM"
-            with urllib.request.urlopen(checksum_url, timeout=60) as response:
-                checksum_text = response.read().decode("utf-8")
+            try:
+                with urllib.request.urlopen(checksum_url, timeout=60) as response:
+                    checksum_text = response.read().decode("utf-8")
+            except (OSError, UnicodeDecodeError, urllib.error.URLError) as exc:
+                destination.unlink(missing_ok=True)
+                raise FixtureError(f"CHECKSUM download failed for {checksum_url}: {exc}") from exc
             digest = verify_checksum(destination, checksum_text)
             destination.with_name(destination.name + ".CHECKSUM").write_text(
                 checksum_text, encoding="utf-8"

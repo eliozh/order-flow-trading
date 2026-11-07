@@ -28,7 +28,7 @@ from oft.ports.store import JobRunRecord, ManifestEntry
 
 ROOT = Path(__file__).resolve().parents[1]
 SRC = ROOT / "src" / "oft"
-DETERMINISTIC_PACKAGES = ("domain", "application")
+DETERMINISTIC_PACKAGES = ("domain", "application", "replay")
 NOW = datetime(2026, 11, 6, 12, 0, 0, tzinfo=UTC)
 
 _WALL_CLOCK_MODULES = {"datetime", "date", "time"}
@@ -42,6 +42,8 @@ _WALL_CLOCK_ATTRIBUTES = {
     "monotonic_ns",
     "perf_counter",
     "perf_counter_ns",
+    "clock_gettime",
+    "clock_gettime_ns",
 }
 
 
@@ -70,7 +72,23 @@ def _wall_clock_calls(tree: ast.AST) -> list[tuple[int, str]]:
     """Return ``(line, expression)`` for every wall-clock call in a module."""
     aliases = _import_aliases(tree)
     violations: list[tuple[int, str]] = []
+    call_nodes = [node for node in ast.walk(tree) if isinstance(node, ast.Call)]
+    called_attributes = {
+        id(node.func) for node in call_nodes if isinstance(node.func, ast.Attribute)
+    }
     for node in ast.walk(tree):
+        if isinstance(node, ast.Attribute) and id(node) not in called_attributes:
+            raw = _dotted(node)
+            if not raw:
+                continue
+            first, _, rest = raw.partition(".")
+            resolved = aliases.get(first, first) + (f".{rest}" if rest else "")
+            parts = resolved.split(".")
+            attr = parts[-1]
+            if attr in _WALL_CLOCK_ATTRIBUTES and any(
+                module in _WALL_CLOCK_MODULES for module in parts[:-1]
+            ):
+                violations.append((node.lineno, f"{attr} (attribute)"))
         if not isinstance(node, ast.Call):
             continue
         raw = _dotted(node.func)
@@ -100,6 +118,19 @@ def test_wall_clock_detector_recognizes_direct_calls() -> None:
 
     found = {expression for _, expression in _wall_clock_calls(tree)}
     assert found == {"now()", "monotonic()"}
+
+
+def test_wall_clock_detector_recognizes_uncalled_attributes_and_clock_gettime() -> None:
+    tree = ast.parse(
+        "from datetime import datetime\n"
+        "import time\n"
+        "factory = datetime.now\n"
+        "time.clock_gettime(time.CLOCK_MONOTONIC)\n"
+    )
+
+    found = {(line, expression) for line, expression in _wall_clock_calls(tree)}
+    assert (3, "now (attribute)") in found
+    assert any(expression == "clock_gettime()" for _, expression in found)
 
 
 def test_wall_clock_detector_recognizes_import_aliases_and_chains() -> None:
@@ -175,8 +206,8 @@ def test_doctor_reports_every_required_section(tmp_path: Path) -> None:
     assert checks["clock"].status == "ok"
     assert checks["manifest.orphans"].status == "ok"
     assert checks["jobs.stale"].status == "ok"
-    assert checks["audit.chain"].status == "ok"
-    assert "placeholder" in checks["audit.chain"].detail.lower()
+    assert checks["audit.chain"].status == "unknown"
+    assert "not implemented" in checks["audit.chain"].detail.lower()
     assert report.status == "READY"
 
 
@@ -262,3 +293,80 @@ def test_cli_doctor_never_echoes_secrets(tmp_path: Path, monkeypatch: pytest.Mon
         "jobs.stale",
         "audit.chain",
     } <= names
+
+
+def test_manifest_scan_roots_include_bars_and_resolve_paths(tmp_path: Path) -> None:
+    from oft.application.health import MANIFEST_SCAN_ROOTS
+
+    assert "bars" in MANIFEST_SCAN_ROOTS
+    settings = _settings(tmp_path)
+    store = SqliteStore(settings)
+    store.initialize()
+    bars_dir = settings.data_dir / "bars" / "symbol=BTCUSDT"
+    bars_dir.mkdir(parents=True)
+    part = bars_dir / "part-0.parquet"
+    part.write_bytes(b"not-read")
+    relative_entry = ManifestEntry(
+        path="./" + str(part.relative_to(settings.data_dir)),
+        data_type="bars",
+        symbol="BTCUSDT",
+        date="2026-10-01",
+        rows=1,
+        bytes=1,
+        checksum="0" * 64,
+        source="test",
+        created_at=utc_timestamp(NOW),
+    )
+    # Normalize the manifest row path exactly as the checker does.
+    store.record_manifest(
+        ManifestEntry(
+            **{
+                **relative_entry.__dict__,
+                "path": str(part),
+            }
+        )
+    )
+    report = _doctor(settings, store)
+    check = {item.name: item for item in report.checks}["manifest.orphans"]
+    assert check.status == "ok"
+
+
+def test_stale_job_check_reads_all_matches_not_only_the_newest_page(tmp_path: Path) -> None:
+    from oft.application.health import _stale_jobs_check
+
+    settings = _settings(tmp_path)
+    store = SqliteStore(settings)
+    store.initialize()
+    for index in range(205):
+        claimed, _, _ = store.claim_job_run(
+            JobRunRecord(
+                run_id=f"JOB-{index}",
+                job_type="scan",
+                window_start=f"2026-11-06T08:{index:02d}:00.000Z",
+                status="RUNNING",
+                trigger_source="SCHEDULED",
+                started_at=utc_timestamp(NOW - timedelta(hours=1)),
+                finished_at=None,
+                error_code=None,
+                message=None,
+                lease_owner="owner",
+                lease_expires_at=utc_timestamp(NOW - timedelta(minutes=5)),
+                heartbeat_at=utc_timestamp(NOW - timedelta(hours=1)),
+            )
+        )
+        assert claimed
+    check = _stale_jobs_check(store, FixedClock(NOW))
+    assert check.status == "degraded"
+    assert "205" in check.detail
+
+
+def test_disk_check_uses_injected_disk_usage(tmp_path: Path) -> None:
+    from types import SimpleNamespace
+
+    from oft.application.health import MIN_FREE_DISK_BYTES, _disk_check
+
+    settings = _settings(tmp_path)
+    healthy = SimpleNamespace(free=MIN_FREE_DISK_BYTES + 1, used=1, total=2 * MIN_FREE_DISK_BYTES)
+    low = SimpleNamespace(free=0, used=10, total=10)
+    assert _disk_check(settings, disk_usage=lambda _path: healthy).status == "ok"
+    assert _disk_check(settings, disk_usage=lambda _path: low).status == "degraded"

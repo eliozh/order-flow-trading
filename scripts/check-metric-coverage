@@ -36,15 +36,14 @@ def main(argv: list[str]) -> int:
 
     cov = coverage.Coverage(data_file=data_file)
     cov.load()
-    measured = {
-        Path(path).name: path for path in cov.get_data().measured_files()
-    }
+    measured_paths = tuple(Path(path) for path in cov.get_data().measured_files())
     failures: list[str] = []
     for target in TARGETS:
-        path = measured.get(target)
-        if path is None:
-            failures.append(f"{target}: not measured")
+        matches = [path for path in measured_paths if path.name == target]
+        if len(matches) != 1:
+            failures.append(f"{target}: expected exactly one measured path, found {len(matches)}")
             continue
+        path = str(matches[0])
         _, statements, _, missing, missing_branches = cov.analysis2(path)
         if missing or missing_branches:
             failures.append(

@@ -415,15 +415,21 @@ class ReplayHarness:
         output_path = self._output_path(first)
         if output_path.exists():
             try:
-                existing = json.loads(output_path.read_text(encoding="utf-8"))
+                existing = json.loads(output_path.read_text(encoding="utf-8"), parse_float=Decimal)
             except (OSError, json.JSONDecodeError) as exc:
                 raise ReplayNonDeterministicError(
                     f"existing replay document is unreadable: {output_path.name}"
                 ) from exc
             existing_hash = existing.get("metric_hash")
-            if existing_hash != first.metric_hash:
+            existing_document = existing.get("document")
+            if not isinstance(existing_document, dict):
+                raise ReplayNonDeterministicError("existing replay document has no document body")
+            recomputed_hash = hashlib.sha256(
+                contract_json(existing_document).encode("utf-8")
+            ).hexdigest()
+            if existing_hash != recomputed_hash or existing_hash != first.metric_hash:
                 raise ReplayNonDeterministicError(
-                    "existing replay document has a different metric hash; "
+                    "existing replay document is tampered or has a different metric hash; "
                     "refusing to edit it in place"
                 )
             return ReplayResult(
@@ -449,6 +455,11 @@ class ReplayHarness:
                 handle.flush()
                 os.fsync(handle.fileno())
             os.replace(temporary_name, output_path)
+            directory_fd = os.open(output_path.parent, os.O_RDONLY)
+            try:
+                os.fsync(directory_fd)
+            finally:
+                os.close(directory_fd)
         finally:
             Path(temporary_name).unlink(missing_ok=True)
         return ReplayResult(

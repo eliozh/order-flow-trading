@@ -49,6 +49,8 @@ from oft.replay.harness import (
     ReplayNonDeterministicError,
 )
 
+pytestmark = pytest.mark.replay
+
 ROOT = Path(__file__).resolve().parents[2]
 CONTRACTS = ROOT / "docs" / "contracts"
 TICK_SIZE = Decimal("0.10")
@@ -394,3 +396,16 @@ def test_concurrent_replays_of_the_same_output_are_safe(tmp_path: Path) -> None:
     assert output.is_file()
     assert not list(output.parent.glob("*.tmp"))
     assert not list(output.parent.glob(".*.tmp"))
+
+
+def test_tampered_document_is_not_treated_as_idempotent(tmp_path: Path) -> None:
+    harness = _harness(tmp_path)
+    result = harness.run()
+    output = Path(result.output_path)
+    text = output.read_text(encoding="utf-8")
+    output.write_text(
+        text.replace('"symbol":"BTCUSDT"', '"symbol":"TAMPERED"', 1), encoding="utf-8"
+    )
+
+    with pytest.raises(ReplayNonDeterministicError, match="tampered|different metric hash"):
+        harness.run()

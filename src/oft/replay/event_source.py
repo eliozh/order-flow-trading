@@ -67,9 +67,12 @@ class ReplayEventSource(Protocol):
 
 def _parse_ms(raw: str) -> datetime:
     milliseconds = int(raw)
-    return datetime.fromtimestamp(milliseconds // 1000, tz=UTC) + timedelta(
-        milliseconds=milliseconds % 1000
-    )
+    try:
+        return datetime.fromtimestamp(milliseconds // 1000, tz=UTC) + timedelta(
+            milliseconds=milliseconds % 1000
+        )
+    except (OverflowError, OSError, ValueError) as exc:
+        raise EventSourceError(f"replay timestamp is out of range: {raw}") from exc
 
 
 def _parse_bool(raw: str) -> bool:

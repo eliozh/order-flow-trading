@@ -52,7 +52,7 @@ market_data        OK        3 symbols
 storage.disk       OK        15.3 GiB free (1% used)
 manifest.orphans   OK        0 manifest row(s) consistent
 jobs.stale         OK        no stale RUNNING job runs
-audit.chain        OK        placeholder: audit_events hash chain is not implemented in milestone 1
+audit.chain        UNKNOWN   audit_events hash chain is not implemented in milestone 1
 ingest.checkpoint  OK        no ingestion checkpoint yet
 ingest.ws          OK        no live WS state yet
 daemon             OK        listening on 127.0.0.1:7611
