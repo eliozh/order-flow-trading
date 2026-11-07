@@ -30,6 +30,7 @@ from oft.domain.events import (
 from oft.domain.metrics.footprint import FootprintResult
 from oft.domain.metrics.liquidations import LiquidationEvent, liquidation_sort_key
 from oft.domain.metrics.types import MetricRow, decimal_str
+from oft.domain.resampling import SOURCE_MODES, Bar
 from oft.domain.time import utc_timestamp
 from oft.ports.clock import ClockPort
 from oft.ports.store import ManifestEntry, StorePort, StoreUnavailableError
@@ -37,10 +38,11 @@ from oft.ports.store import ManifestEntry, StorePort, StoreUnavailableError
 if TYPE_CHECKING:
     import duckdb
 
-_LAYOUT = ("market", "metrics", "footprint", "liquidations")
+_LAYOUT = ("market", "metrics", "footprint", "liquidations", "bars")
 METRICS_DATA_TYPE = "metrics"
 FOOTPRINT_DATA_TYPE = "footprint"
 LIQUIDATIONS_DATA_TYPE = "liquidations"
+BARS_DATA_TYPE = "bars"
 
 
 def ensure_layout(settings: Settings) -> tuple[Path, ...]:
@@ -53,6 +55,7 @@ def ensure_layout(settings: Settings) -> tuple[Path, ...]:
 
 _VERSION_TOKEN = re.compile(r"^[a-z][a-z0-9_]*\.v[0-9]+\.[0-9a-f]{16}$")
 _SYMBOL_PATTERN = re.compile(r"^[A-Z0-9]{2,24}$")
+_RUN_ID_PATTERN = re.compile(r"^[A-Za-z0-9._:-]{1,160}$")
 
 
 def _validate_metric_path(symbol: str, period: str) -> None:
@@ -318,6 +321,95 @@ def liquidation_parts(settings: Settings, *, symbol: str, metric_version: str) -
     if not root.is_dir():
         return ()
     return tuple(sorted(root.glob("date=*/*.parquet")))
+
+
+def bar_root(settings: Settings, *, symbol: str, period: str, metric_version: str) -> Path:
+    """Versioned resampled-bar directory following the ADR-0002 hive layout."""
+    _validate_metric_path(symbol, period)
+    if _VERSION_TOKEN.fullmatch(metric_version) is None:
+        raise ValueError("metric_version contains unsafe path characters")
+    return (
+        settings.data_dir
+        / "bars"
+        / f"symbol={symbol}"
+        / f"period={period}"
+        / f"metric_version={metric_version}"
+    )
+
+
+def bar_parts(
+    settings: Settings, *, symbol: str, period: str, metric_version: str
+) -> tuple[Path, ...]:
+    """List published bar parts for one symbol/period/version."""
+    root = bar_root(settings, symbol=symbol, period=period, metric_version=metric_version)
+    if not root.is_dir():
+        return ()
+    return tuple(sorted(root.glob("date=*/*.parquet")))
+
+
+def read_bars(
+    settings: Settings,
+    *,
+    symbol: str,
+    period: str,
+    metric_version: str,
+    run_id: str | None = None,
+    store: StorePort | None = None,
+) -> tuple[dict[str, object], ...]:
+    """Read manifest-registered bars for one run in deterministic order.
+
+    Without ``run_id`` the most recently computed run wins, so a late-event
+    recompute run can never be silently mixed with the run it supersedes.
+    """
+    if store is None:
+        from oft.adapters.sqlite_store import SqliteStore
+
+        store = SqliteStore(settings)
+    parts = _registered_parts(
+        settings,
+        store,
+        BARS_DATA_TYPE,
+        bar_parts(settings, symbol=symbol, period=period, metric_version=metric_version),
+    )
+    if not parts:
+        return ()
+    import pyarrow.dataset as dataset
+
+    try:
+        table = dataset.dataset([str(path) for path in parts], format="parquet").to_table()
+    except (OSError, ValueError, pa.ArrowException) as exc:
+        raise StoreUnavailableError(f"cannot read bar parts for {symbol}: {exc}") from exc
+    rows = cast("list[dict[str, object]]", table.to_pylist())
+    if run_id is None:
+        run_sequences: dict[str, int] = {}
+        for entry in store.list_manifest():
+            if entry.data_type != BARS_DATA_TYPE:
+                continue
+            entry_run_id = entry.source.rsplit(":", 1)[-1]
+            run_sequences[entry_run_id] = max(run_sequences.get(entry_run_id, 0), entry.run_seq)
+        newest = max(
+            (
+                (
+                    str(row.get("computed_at") or ""),
+                    run_sequences.get(str(row.get("run_id")), 0),
+                    str(row.get("run_id") or ""),
+                )
+                for row in rows
+                if row.get("run_id") is not None
+            ),
+            default=("", 0, ""),
+        )
+        run_id = newest[2]
+    rows = [row for row in rows if str(row.get("run_id")) == run_id]
+    rows.sort(key=lambda row: str(row.get("bar_start")))
+    return _unique_rows(
+        rows,
+        key=lambda row: (
+            row.get("metric_version"),
+            row.get("run_id"),
+            row.get("bar_start"),
+        ),
+    )
 
 
 def _registered_parts(
@@ -1007,6 +1099,117 @@ class ParquetStore:
             bytes=size,
             checksum=checksum,
             source=f"liquidations:{metric_version}",
+            created_at=computed_at,
+            metric_version=metric_version,
+            input_manifest_hash=input_manifest_hash,
+            window_start=utc_timestamp(window_start),
+            window_end=utc_timestamp(window_end),
+        )
+
+    def write_bar_part(
+        self,
+        bars: Sequence[Bar],
+        *,
+        symbol: str,
+        period: str,
+        window_start: datetime,
+        window_end: datetime,
+        metric_version: str,
+        input_manifest_hash: str,
+        source_mode: str,
+        source_digest: str,
+        run_id: str,
+        computed_at: str,
+        data_quality: str,
+        quality_reasons: tuple[str, ...],
+    ) -> ManifestEntry:
+        """Publish one immutable, content-addressed resampled-bar part.
+
+        The part records ``source_mode``, the input manifest hash, the source
+        digest, and the run id so a late-event recompute is auditable and a
+        published part is never edited in place.
+        """
+        if window_start.tzinfo is None or window_end.tzinfo is None:
+            raise ValueError("bar window bounds must be timezone-aware")
+        if window_end <= window_start:
+            raise ValueError("window_end must be after window_start")
+        if source_mode not in SOURCE_MODES:
+            raise ValueError(f"unsupported source_mode {source_mode!r}")
+        if _RUN_ID_PATTERN.fullmatch(run_id) is None:
+            raise ValueError("run_id contains unsafe path characters")
+        for bar in bars:
+            if bar.symbol != symbol:
+                raise ValueError(f"bar symbol {bar.symbol!r} does not match {symbol!r}")
+            if bar.period != period:
+                raise ValueError(f"bar period {bar.period!r} does not match {period!r}")
+            if bar.source_mode != source_mode:
+                raise ValueError("bar source_mode does not match the part source_mode")
+            if not (window_start <= bar.bar_start and bar.bar_end <= window_end):
+                raise ValueError("bar is outside the requested window")
+        directory = (
+            bar_root(self._settings, symbol=symbol, period=period, metric_version=metric_version)
+            / f"date={window_start.astimezone(UTC).date().isoformat()}"
+        )
+        directory.mkdir(parents=True, exist_ok=True)
+        reasons = list(quality_reasons)
+        table = pa.table(
+            {
+                "record_type": pa.array(["BAR" for _ in bars], pa.string()),
+                "symbol": pa.array([symbol for _ in bars], pa.string()),
+                "period": pa.array([period for _ in bars], pa.string()),
+                "window_start": pa.array(
+                    [window_start.astimezone(UTC) for _ in bars],
+                    pa.timestamp("ms", tz="UTC"),
+                ),
+                "window_end": pa.array(
+                    [window_end.astimezone(UTC) for _ in bars],
+                    pa.timestamp("ms", tz="UTC"),
+                ),
+                "bar_start": pa.array(
+                    [bar.bar_start.astimezone(UTC) for bar in bars],
+                    pa.timestamp("ms", tz="UTC"),
+                ),
+                "bar_end": pa.array(
+                    [bar.bar_end.astimezone(UTC) for bar in bars],
+                    pa.timestamp("ms", tz="UTC"),
+                ),
+                "open": pa.array([decimal_str(bar.open) for bar in bars], pa.string()),
+                "high": pa.array([decimal_str(bar.high) for bar in bars], pa.string()),
+                "low": pa.array([decimal_str(bar.low) for bar in bars], pa.string()),
+                "close": pa.array([decimal_str(bar.close) for bar in bars], pa.string()),
+                "volume": pa.array([decimal_str(bar.volume) for bar in bars], pa.string()),
+                "quote_volume": pa.array(
+                    [decimal_str(bar.quote_volume) for bar in bars], pa.string()
+                ),
+                "trade_count": pa.array([bar.trade_count for bar in bars], pa.int64()),
+                "taker_buy_volume": pa.array(
+                    [decimal_str(bar.taker_buy_volume) for bar in bars], pa.string()
+                ),
+                "source_mode": pa.array([source_mode for _ in bars], pa.string()),
+                "metric_version": pa.array([metric_version for _ in bars], pa.string()),
+                "input_manifest_hash": pa.array([input_manifest_hash for _ in bars], pa.string()),
+                "source_digest": pa.array([source_digest for _ in bars], pa.string()),
+                "run_id": pa.array([run_id for _ in bars], pa.string()),
+                "computed_at": pa.array([computed_at for _ in bars], pa.string()),
+                "data_quality": pa.array([data_quality for _ in bars], pa.string()),
+                "quality_reasons": pa.array([reasons for _ in bars], type=pa.list_(pa.string())),
+            }
+        )
+        final_path, checksum, size = self._publish_content_addressed(
+            table,
+            directory,
+            window_start=window_start,
+            window_end=window_end,
+        )
+        return ManifestEntry(
+            path=str(final_path),
+            data_type=BARS_DATA_TYPE,
+            symbol=symbol,
+            date=window_start.astimezone(UTC).date().isoformat(),
+            rows=len(bars),
+            bytes=size,
+            checksum=checksum,
+            source=f"bars:{metric_version}:{run_id}",
             created_at=computed_at,
             metric_version=metric_version,
             input_manifest_hash=input_manifest_hash,

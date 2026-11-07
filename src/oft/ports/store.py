@@ -57,6 +57,7 @@ class ManifestEntry:
     input_manifest_hash: str | None = None
     window_start: str | None = None
     window_end: str | None = None
+    run_seq: int = 0
 
 
 @dataclass(frozen=True)

@@ -479,6 +479,7 @@ def _row_to_manifest(row: sqlite3.Row) -> ManifestEntry:
         input_manifest_hash=row["input_manifest_hash"],
         window_start=row["window_start"],
         window_end=row["window_end"],
+        run_seq=row["run_seq"],
     )
 
 
@@ -753,7 +754,9 @@ class SqliteStore:
         if connection is None:
             raise StoreUnavailableError("manifest database is unreadable")
         try:
-            row = connection.execute("SELECT * FROM manifest WHERE path = ?", (path,)).fetchone()
+            row = connection.execute(
+                "SELECT rowid AS run_seq, * FROM manifest WHERE path = ?", (path,)
+            ).fetchone()
         except sqlite3.Error as exc:
             raise StoreUnavailableError(f"manifest lookup failed: {exc}") from exc
         finally:
@@ -780,7 +783,8 @@ class SqliteStore:
             return ()
         try:
             rows = connection.execute(
-                f"SELECT * FROM manifest{where} ORDER BY created_at, path", params
+                f"SELECT rowid AS run_seq, * FROM manifest{where} ORDER BY created_at, path",
+                params,
             ).fetchall()
         except sqlite3.Error as exc:
             raise StoreUnavailableError(f"manifest read failed: {exc}") from exc
