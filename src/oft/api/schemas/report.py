@@ -9,13 +9,13 @@ from pydantic import BaseModel, ConfigDict, Field
 
 
 class ScanCreateRequest(BaseModel):
-    """Manual scan request (fixture scans are a legacy debug path)."""
+    """Manual scan request; omitting ``symbol`` scans every starred symbol."""
 
     model_config = ConfigDict(extra="forbid")
 
-    symbol: str = Field(pattern=r"^[A-Z0-9]{2,24}$")
+    symbol: str | None = Field(default=None, pattern=r"^[A-Z0-9]{2,24}$")
     period: Literal["1m", "5m", "15m", "1h", "4h", "8h", "1d"] = "4h"
-    source: Literal["backfill"] = "backfill"
+    source: Literal["backfill", "live"] = "backfill"
     metrics_only: bool = True
     provider: Literal["stub"] | None = None
     start: date | None = None

@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import json
 import uuid
-from dataclasses import asdict
+from dataclasses import asdict, fields
 from pathlib import Path
 from typing import Annotated, Any
 
@@ -50,10 +50,28 @@ def _emit_scan(record: ScanRecord, json_output: bool) -> None:
         typer.echo(render_scan_table(record))
 
 
+def _is_batch_payload(data: dict[str, Any]) -> bool:
+    """A batch payload has per-symbol rows but no single-scan identity."""
+    return (
+        isinstance(data.get("symbols"), list)
+        and isinstance(data.get("scan"), dict) is False
+        and "symbol" not in data
+        and "status" in data
+    )
+
+
+def _scan_record(data: dict[str, Any]) -> ScanRecord:
+    """Build a ScanRecord from a payload that may carry additive batch fields."""
+    record_fields = {field.name for field in fields(ScanRecord)}
+    return ScanRecord(**{key: value for key, value in data.items() if key in record_fields})
+
+
 def _render_run(data: dict[str, Any]) -> str:
+    if _is_batch_payload(data):
+        return _render_batch(data)
     raw_scan = data.get("scan")
     scan_data = raw_scan if isinstance(raw_scan, dict) else data
-    lines = [render_scan_table(ScanRecord(**scan_data))]
+    lines = [render_scan_table(_scan_record(scan_data))]
     report = data.get("report")
     if isinstance(report, dict):
         llm = report.get("llm") or {}
@@ -70,13 +88,76 @@ def _render_run(data: dict[str, Any]) -> str:
     return "\n".join(lines)
 
 
+def _render_batch(data: dict[str, Any]) -> str:
+    lines = [
+        f"Scan              {data.get('scan_id', '-')}",
+        f"Status            {data.get('status', '-')}",
+        f"Trigger           {data.get('trigger_source', '-')} · period {data.get('period', '-')}",
+        f"Symbols           {data.get('symbols_completed', 0)}/{data.get('symbols_total', 0)}"
+        f" · {data.get('symbols_degraded', 0)} degraded"
+        f" · {data.get('symbols_failed', 0)} failed",
+        f"Cost              ${data.get('total_cost_usd', '0')}"
+        f" · {data.get('total_tokens', 0)} tokens"
+        + (" · unpriced" if data.get("cost_unpriced") else ""),
+        "",
+    ]
+    for row in data.get("symbols") or []:
+        if not isinstance(row, dict):
+            continue
+        result = row.get("stage", "-")
+        llm = row.get("llm_status") or ("not configured" if row.get("stage") == "DONE" else "-")
+        lines.append(
+            f"{str(row.get('symbol', '-')):<12} LLM {str(llm):<10} {str(result):<9}"
+            f" {row.get('report_id') or row.get('error_message') or '-'}"
+        )
+    delivery = data.get("delivery") or {}
+    if isinstance(delivery, dict):
+        lines.append("")
+        lines.append(
+            "Telegram          " + ("delivered" if delivery.get("configured") else "not configured")
+        )
+    return "\n".join(lines)
+
+
+def _is_partial(data: dict[str, Any]) -> bool:
+    status = str(data.get("status") or "")
+    if status == "PARTIAL":
+        return True
+    return bool(data.get("symbols_degraded") or data.get("symbols_failed"))
+
+
+def _render_detail(data: dict[str, Any]) -> str:
+    if _is_batch_payload(data):
+        return _render_batch(data)
+    lines = [_render_run(data)]
+    symbols = data.get("symbols")
+    if isinstance(symbols, list) and symbols:
+        lines.append("")
+        lines.append("Stages")
+        for row in symbols:
+            if not isinstance(row, dict):
+                continue
+            lines.append(
+                f"  {str(row.get('symbol', '-')):<12} {str(row.get('stage', '-')):<9}"
+                f" LLM {str(row.get('llm_status') or '-'):<10}"
+                f" {row.get('report_id') or '-'}"
+            )
+    return "\n".join(lines)
+
+
 @scan_app.command("run")
 def run(
     fixture: Annotated[
         Path | None,
         typer.Option("--fixture", help="Legacy aggTrades CSV fixture debug path."),
     ] = None,
-    symbol: Annotated[str, typer.Option("--symbol", help="Contract symbol.")] = "BTCUSDT",
+    symbol: Annotated[
+        str | None,
+        typer.Option(
+            "--symbol",
+            help="Single contract symbol; omit to scan every starred symbol.",
+        ),
+    ] = None,
     period: Annotated[str, typer.Option("--period", help="Metric period, e.g. 4h.")] = "4h",
     source: Annotated[
         str, typer.Option("--source", help="Data source for a manual scan (backfill).")
@@ -104,6 +185,13 @@ def run(
     """Run one manual scan through the daemon (the only writer)."""
     settings = _settings_or_exit(json_output)
     if fixture is not None:
+        if symbol is None:
+            emit_error(
+                "VALIDATION_FAILED",
+                "--fixture scans require --symbol.",
+                json_output=json_output,
+            )
+            raise typer.Exit(code=1)
         payload: dict[str, Any] = {
             "fixture_path": str(fixture),
             "symbol": symbol,
@@ -113,11 +201,12 @@ def run(
         key = None
     else:
         payload = {
-            "symbol": symbol,
             "period": period,
             "source": source,
             "metrics_only": metrics_only,
         }
+        if symbol is not None:
+            payload["symbol"] = symbol
         if provider is not None:
             payload["provider"] = provider
         key = idempotency_key or f"cli-{uuid.uuid4().hex}"
@@ -136,6 +225,8 @@ def run(
         typer.echo(json.dumps(envelope, indent=2))
     else:
         typer.echo(_render_run(data))
+    if _is_partial(data):
+        raise typer.Exit(code=3)
 
 
 @scan_app.command("status")
@@ -165,7 +256,36 @@ def scan_status(
     if not isinstance(data, dict):
         emit_error("NOT_FOUND", f"Scan {scan_id} does not exist.", json_output=json_output)
         raise typer.Exit(code=1)
-    _emit_scan(ScanRecord(**data), json_output)
+    if json_output:
+        typer.echo(json.dumps(envelope, indent=2))
+    else:
+        typer.echo(_render_detail(data))
+
+
+@scan_app.command("show")
+def scan_show(
+    scan_id: Annotated[str, typer.Argument(help="Scan or batch ID.")],
+    json_output: Annotated[
+        bool,
+        typer.Option("--json", help="Emit the API envelope as JSON."),
+    ] = False,
+) -> None:
+    """Show one scan (or batch) with its per-symbol stages."""
+    settings = _settings_or_exit(json_output)
+    try:
+        envelope = ApiClient.from_settings(settings).get_scan(scan_id)
+    except ApiClientError as exc:
+        emit_error(exc.code, exc.message, json_output=json_output)
+        raise typer.Exit(code=exit_code_for(exc.code)) from exc
+
+    data = envelope.get("data")
+    if not isinstance(data, dict):
+        emit_error("NOT_FOUND", f"Scan {scan_id} does not exist.", json_output=json_output)
+        raise typer.Exit(code=1)
+    if json_output:
+        typer.echo(json.dumps(envelope, indent=2))
+    else:
+        typer.echo(_render_detail(data))
 
 
 def _emit_schedule(settings: Any, json_output: bool) -> None:
@@ -234,6 +354,22 @@ def _emit_schedule(settings: Any, json_output: bool) -> None:
     typer.echo("\n".join(lines))
 
 
+def _format_duration(started_at: Any, finished_at: Any) -> str:
+    if not started_at:
+        return "-"
+    if not finished_at:
+        return "running"
+    try:
+        from datetime import datetime
+
+        started = datetime.fromisoformat(str(started_at).replace("Z", "+00:00"))
+        finished = datetime.fromisoformat(str(finished_at).replace("Z", "+00:00"))
+    except ValueError:
+        return "-"
+    seconds = max(0, int((finished - started).total_seconds()))
+    return f"{seconds // 60}:{seconds % 60:02d}"
+
+
 @scan_app.command("history")
 def scan_history(
     limit: Annotated[int, typer.Option("--limit", help="Rows to show.")] = 20,
@@ -242,7 +378,7 @@ def scan_history(
         typer.Option("--json", help="Emit the API envelope as JSON."),
     ] = False,
 ) -> None:
-    """List recent scans."""
+    """List recent scan batches."""
     settings = _settings_or_exit(json_output)
     try:
         envelope = ApiClient.from_settings(settings).list_scans(limit=limit)
@@ -261,12 +397,15 @@ def scan_history(
     if not items:
         typer.echo("No scans yet. Run: oft scan run --metrics-only --symbol BTCUSDT")
         return
-    typer.echo(f"{'SCAN ID':<28}{'SYMBOL':<12}{'PERIOD':<8}{'STATUS':<10}QUALITY")
+    typer.echo(f"{'SCAN ID':<34}{'DURATION':<10}{'SYMBOLS':<9}{'STATUS':<10}{'COST':<9}TELEGRAM")
     for item in items:
+        delivery = item.get("delivery") or {}
+        telegram = "delivered" if delivery.get("configured") else "not configured"
         typer.echo(
-            f"{str(item.get('scan_id', '-')):<28}"
-            f"{str(item.get('symbol', '-')):<12}"
-            f"{str(item.get('period', '-')):<8}"
+            f"{str(item.get('scan_id', '-')):<34}"
+            f"{_format_duration(item.get('started_at'), item.get('finished_at')):<10}"
+            f"{item.get('symbols_completed', 0)}/{item.get('symbols_total', 0):<7}"
             f"{str(item.get('status', '-')):<10}"
-            f"{item.get('data_quality', '-')}"
+            f"${item.get('total_cost_usd', item.get('cost_usd', '0')):<8}"
+            f"{telegram}"
         )

@@ -29,7 +29,10 @@ const SECOND_REPORT_ID = process.env.OFT_E2E_SECOND_REPORT_ID
 const SCAN_ID = process.env.OFT_E2E_REPORT_SCAN_ID
 const MISSING_REPORT_ID = process.env.OFT_E2E_MISSING_REPORT_ID
 const HOSTILE_REPORT_ID = process.env.OFT_E2E_HOSTILE_REPORT_ID
+const BATCH_ID = process.env.OFT_E2E_BATCH_ID
+const BATCH_DEGRADED_ID = process.env.OFT_E2E_BATCH_DEGRADED_ID
 const SYMBOL = 'BTCUSDT'
+const MISSING_DATA_SYMBOL = 'XAUUSDT'
 
 interface SnapshotBar {
   bar_start: string
@@ -108,6 +111,33 @@ interface ScanData {
   report_id: string | null
   source_mode: string
   metrics_manifest_json: string | null
+}
+
+interface BatchSymbolRow {
+  symbol: string
+  stage: string
+  report_id: string | null
+  data_quality: string | null
+  error_code: string | null
+  error_message: string | null
+  llm_status: string | null
+  llm_tokens: number
+  cost_usd: string
+  cost_unpriced: boolean
+}
+
+interface BatchScanData {
+  scan_id: string
+  status: string
+  trigger_source: string
+  period: string
+  symbols_total: number
+  symbols_completed: number
+  symbols_degraded: number
+  symbols_failed: number
+  symbols: BatchSymbolRow[]
+  report_links: { symbol: string; report_id: string; href: string }[]
+  delivery: { configured: boolean; reason: string }
 }
 
 interface BrowserDiagnostics {
@@ -311,6 +341,15 @@ async function fetchScan(page: Page, scanId: string): Promise<ScanData> {
   expect(body.ok).toBe(true)
   expect(body.data).not.toBeNull()
   return body.data as ScanData
+}
+
+async function fetchBatchScan(page: Page, batchId: string): Promise<BatchScanData> {
+  const response = await page.request.get(`/api/v1/scans/${encodeURIComponent(batchId)}`)
+  expect(response.status()).toBe(200)
+  const body = (await response.json()) as Envelope<BatchScanData>
+  expect(body.ok).toBe(true)
+  expect(body.data).not.toBeNull()
+  return body.data as BatchScanData
 }
 
 function calcRegion(page: Page) {
@@ -610,7 +649,8 @@ test('/scans lists the metrics-only scan and links to its report', async ({ page
   await expect(table).toBeVisible()
   const row = table.locator('tbody tr').filter({ hasText: SCAN_ID as string })
   await expect(row).toContainText(SYMBOL)
-  await expect(row).toContainText('4h')
+  // S03.1 history rows are batch-level; the cadence lives in the schedule card.
+  await expect(page.getByText(/4h · UTC boundaries/)).toBeVisible()
   await expect(row).toContainText('DONE')
   await expect(row.locator('a', { hasText: SCAN_ID as string })).toHaveAttribute(
     'href',
@@ -776,5 +816,151 @@ test('/reports lists CALC reports and links to the frozen detail', async ({ page
     'href',
     `/reports/${REPORT_ID as string}`,
   )
+  expectClean(diagnostics)
+})
+
+function symbolRow(batch: BatchScanData, symbol: string): BatchSymbolRow {
+  const row = batch.symbols.find((item) => item.symbol === symbol)
+  expect(row, `symbol row for ${symbol}`).toBeTruthy()
+  return row as BatchSymbolRow
+}
+
+test('starred batch detail shows per-symbol LLM state, a FAILED chip, and report links', async ({
+  page,
+}) => {
+  expect(BATCH_ID, 'OFT_E2E_BATCH_ID is required').toBeTruthy()
+  const diagnostics = collectDiagnostics(page)
+  await authenticate(page)
+  const batch = await fetchBatchScan(page, BATCH_ID as string)
+
+  // Two starred symbols in one manual batch; the batch never aborts on the
+  // symbol with no recorded market data.
+  expect(batch.status).toBe('PARTIAL')
+  expect(batch.trigger_source).toBe('MANUAL')
+  expect(batch.period).toBe('4h')
+  expect(batch.symbols_total).toBe(2)
+  expect(batch.symbols_completed).toBe(1)
+  expect(batch.symbols_failed).toBe(1)
+  expect(batch.delivery.configured).toBe(false)
+
+  const completed = symbolRow(batch, SYMBOL)
+  const failed = symbolRow(batch, MISSING_DATA_SYMBOL)
+  expect(completed.stage).toBe('DONE')
+  expect(completed.llm_status).toBeTruthy()
+  expect(completed.report_id).toBeTruthy()
+  expect(failed.stage).toBe('FAILED')
+  expect(failed.report_id).toBeNull()
+
+  await page.goto(`/scans/${encodeURIComponent(BATCH_ID as string)}`)
+  await expect(page.getByRole('heading', { level: 1 })).toHaveText(BATCH_ID as string)
+  await expect(
+    page.getByText(`${batch.symbols_completed}/${batch.symbols_total}`).first(),
+  ).toBeVisible()
+
+  const stages = page.getByRole('list', { name: 'Named scan stages' })
+  await expect(stages.getByRole('listitem').filter({ hasText: 'LLM' })).toContainText('DONE')
+  await expect(stages.getByRole('listitem').filter({ hasText: 'REPORT' })).toContainText('DONE')
+
+  const table = page.getByRole('table', { name: 'Per-symbol scan stages' })
+  const completedRow = table.locator('tbody tr').filter({ hasText: completed.report_id as string })
+  await expect(completedRow).toContainText(SYMBOL)
+  await expect(completedRow).toContainText(completed.llm_status as string)
+  await expect(completedRow).toContainText('DONE')
+  await expect(
+    completedRow.locator('a', { hasText: completed.report_id as string }),
+  ).toHaveAttribute('href', `/reports/${completed.report_id as string}`)
+
+  const failedRow = table.locator('tbody tr').filter({ hasText: MISSING_DATA_SYMBOL })
+  await expect(failedRow).toContainText('FAILED')
+  await expect(failedRow).toContainText(/No published agg_trades|Data gap/)
+  await expect(failedRow.locator('a')).toHaveCount(0)
+
+  await expect(page.getByText(/TELEGRAM_NOT_CONFIGURED/)).toBeVisible()
+  expect(await page.locator('main').getByText(/%/).count()).toBe(0)
+  expectClean(diagnostics)
+})
+
+test('a rejected LLM narrative surfaces as DEGRADED with a CALC-only report link', async ({
+  page,
+}) => {
+  expect(BATCH_DEGRADED_ID, 'OFT_E2E_BATCH_DEGRADED_ID is required').toBeTruthy()
+  const diagnostics = collectDiagnostics(page)
+  await authenticate(page)
+  const batch = await fetchBatchScan(page, BATCH_DEGRADED_ID as string)
+
+  expect(batch.status).toBe('PARTIAL')
+  expect(batch.symbols_degraded).toBe(1)
+  const degraded = symbolRow(batch, SYMBOL)
+  const failed = symbolRow(batch, MISSING_DATA_SYMBOL)
+  expect(degraded.stage).toBe('DEGRADED')
+  expect(degraded.llm_status).toBe('REJECTED')
+  expect(degraded.report_id).toBeTruthy()
+  expect(failed.stage).toBe('FAILED')
+
+  await page.goto(`/scans/${encodeURIComponent(BATCH_DEGRADED_ID as string)}`)
+  await expect(page.getByRole('heading', { level: 1 })).toHaveText(BATCH_DEGRADED_ID as string)
+
+  const stages = page.getByRole('list', { name: 'Named scan stages' })
+  const llmStage = stages.getByRole('listitem').filter({ hasText: 'LLM' })
+  await expect(llmStage).toContainText('FAILED')
+  await expect(llmStage).toContainText(/rejected/i)
+
+  const table = page.getByRole('table', { name: 'Per-symbol scan stages' })
+  const degradedRow = table.locator('tbody tr').filter({ hasText: degraded.report_id as string })
+  await expect(degradedRow).toContainText(SYMBOL)
+  await expect(degradedRow).toContainText('DEGRADED')
+  await expect(degradedRow).toContainText('REJECTED')
+  await expect(degradedRow.locator('a', { hasText: degraded.report_id as string })).toHaveAttribute(
+    'href',
+    `/reports/${degraded.report_id as string}`,
+  )
+
+  const failedRow = table.locator('tbody tr').filter({ hasText: MISSING_DATA_SYMBOL })
+  await expect(failedRow).toContainText('FAILED')
+
+  expect(await page.locator('main').getByText(/%/).count()).toBe(0)
+  expectClean(diagnostics)
+})
+
+test('/scans lists batch symbols with LLM state, DEGRADED/FAILED chips, and report links', async ({
+  page,
+}) => {
+  expect(BATCH_ID, 'OFT_E2E_BATCH_ID is required').toBeTruthy()
+  expect(BATCH_DEGRADED_ID, 'OFT_E2E_BATCH_DEGRADED_ID is required').toBeTruthy()
+  const diagnostics = collectDiagnostics(page)
+  await authenticate(page)
+  const valid = await fetchBatchScan(page, BATCH_ID as string)
+  const degraded = await fetchBatchScan(page, BATCH_DEGRADED_ID as string)
+  const completed = symbolRow(valid, SYMBOL)
+  const degradedRow = symbolRow(degraded, SYMBOL)
+  expect(degradedRow.report_id).not.toBe(completed.report_id)
+
+  await page.goto('/scans')
+  const table = page.getByRole('region', { name: 'Scans table' })
+  await expect(table).toBeVisible()
+
+  const completedListRow = table
+    .locator('tbody tr')
+    .filter({ hasText: completed.report_id as string })
+  await expect(completedListRow).toContainText(SYMBOL)
+  await expect(completedListRow).toContainText(completed.llm_status as string)
+  await expect(
+    completedListRow.locator('a', { hasText: completed.report_id as string }),
+  ).toHaveAttribute('href', `/reports/${completed.report_id as string}`)
+
+  const degradedListRow = table
+    .locator('tbody tr')
+    .filter({ hasText: degradedRow.report_id as string })
+  await expect(degradedListRow).toContainText(SYMBOL)
+  await expect(degradedListRow).toContainText('DEGRADED')
+  await expect(degradedListRow).toContainText('REJECTED')
+  await expect(
+    degradedListRow.locator('a', { hasText: degradedRow.report_id as string }),
+  ).toHaveAttribute('href', `/reports/${degradedRow.report_id as string}`)
+
+  // The batch detail owns the FAILED symbol; the per-scan history only lists
+  // symbols that produced a scan record, so here we assert the LLM states and
+  // report links for the completed and degraded rows.
+  expect(await page.locator('main').getByText(/%/).count()).toBe(0)
   expectClean(diagnostics)
 })

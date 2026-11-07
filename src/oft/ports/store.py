@@ -93,6 +93,12 @@ class ScanRecord:
     metrics_manifest_json: str | None = None
     error_code: str | None = None
     error_message: str | None = None
+    batch_id: str | None = None
+    llm_configured: bool = False
+    llm_status: str | None = None
+    llm_tokens: int = 0
+    cost_usd: str = "0"
+    cost_unpriced: bool = True
 
 
 @dataclass(frozen=True)
@@ -111,6 +117,7 @@ class ReportRecord:
     snapshot_json: str
     metrics_json: str
     llm_json: str | None = None
+    window_policy_json: str | None = None
 
 
 @dataclass(frozen=True)
@@ -183,6 +190,11 @@ class JobRunRecord:
     lease_owner: str
     lease_expires_at: str
     heartbeat_at: str
+    source: str = "backfill"
+    metrics_only: bool = False
+    provider: str | None = None
+    symbol: str | None = None
+    period: str | None = None
 
 
 @dataclass(frozen=True)
@@ -207,6 +219,11 @@ class ScanSymbolRecord:
     error_code: str | None
     report_id: str | None
     data_quality: str | None
+    error_message: str | None = None
+    llm_status: str | None = None
+    llm_tokens: int = 0
+    cost_usd: str = "0"
+    cost_unpriced: bool = True
 
 
 @dataclass(frozen=True)
@@ -403,6 +420,8 @@ class StorePort(Protocol):
 
     def list_scans(self, limit: int = 20, offset: int = 0) -> tuple[ScanRecord, ...]: ...
 
+    def list_scans_by_batch(self, batch_id: str) -> tuple[ScanRecord, ...]: ...
+
     def count_scans(self) -> int: ...
 
     # -- Reports ---------------------------------------------------------
@@ -585,8 +604,10 @@ class StorePort(Protocol):
     def latest_job_run(self, job_type: str) -> JobRunRecord | None: ...
 
     def list_job_runs(
-        self, job_type: str | None = None, limit: int = 50
+        self, job_type: str | None = None, limit: int = 50, offset: int = 0
     ) -> tuple[JobRunRecord, ...]: ...
+
+    def count_job_runs(self, job_type: str | None = None) -> int: ...
 
     def list_stale_job_runs(self, *, now: str) -> tuple[JobRunRecord, ...]: ...
 

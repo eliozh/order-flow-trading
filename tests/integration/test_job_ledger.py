@@ -40,7 +40,7 @@ def test_job_tables_are_created_idempotently(tmp_path: Path) -> None:
         }
         versions = {row[0] for row in connection.execute("SELECT version FROM schema_migrations")}
     assert {"job_runs", "job_locks", "scan_symbols"} <= tables
-    assert versions == {1, 2, 3, 4, 5, 6, 7, 8, 9, 10}
+    assert versions == {1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14}
 
 
 def test_duplicate_job_claim_is_skipped(tmp_path: Path) -> None:
@@ -506,6 +506,7 @@ def test_resume_without_checkpoints_reruns_the_scheduled_window(
         *,
         period: str,
         trigger_source: str = "SCHEDULED",
+        **kwargs: object,
     ) -> ScheduledScanOutcome:
         captured.append(symbols)
         return ScheduledScanOutcome(run=None, claimed=True)
@@ -518,6 +519,186 @@ def test_resume_without_checkpoints_reruns_the_scheduled_window(
     assert outcome.claimed is True
     assert captured == [("BTCUSDT",)]
     assert container.store.get_job_run(claim.run.run_id).status == "DONE"  # type: ignore[union-attr]
+
+
+def test_resume_preserves_manual_source_metrics_only_and_provider(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from types import SimpleNamespace
+
+    import oft.application.jobs as jobs_module
+    from oft.bootstrap import build_container
+
+    settings = Settings(env="test", port=8765, data_dir=tmp_path / "data")
+    container = build_container(settings, initialize=True)
+    ledger = JobLedger(store=container.store, clock=FixedClock(NOW))
+    claim = ledger.claim_scan(
+        trigger_source="MANUAL",
+        owner="manual-owner",
+        run_id="SCAN-OPTIONS",
+        source="live",
+        metrics_only=True,
+        provider="stub",
+    )
+    assert claim.claimed and claim.run is not None
+    run_id = claim.run.run_id
+    assert claim.run.source == "live"
+    assert claim.run.metrics_only is True
+    assert claim.run.provider == "stub"
+    container.store.upsert_scan_symbol(
+        ScanSymbolRecord(
+            scan_id=run_id,
+            symbol="BTCUSDT",
+            stage="DONE",
+            started_at=utc_timestamp(NOW),
+            finished_at=utc_timestamp(NOW),
+            error_code=None,
+            report_id="RPT-BTC",
+            data_quality="COMPLETE",
+        )
+    )
+    monkeypatch.setattr(
+        container.store,
+        "list_starred",
+        lambda: (SimpleNamespace(symbol="BTCUSDT"), SimpleNamespace(symbol="ETHUSDT")),
+    )
+    captured: list[object] = []
+
+    class FakeScanService:
+        def __init__(self, **kwargs: object) -> None:
+            pass
+
+        def run(self, request: object, *, scan_id: str | None = None) -> object:
+            captured.append(request)
+            return SimpleNamespace(
+                scan=SimpleNamespace(finished_at=utc_timestamp(NOW)),
+                report=SimpleNamespace(report_id="RPT-ETH", data_quality="COMPLETE"),
+                symbol_stage="DONE",
+                llm_tokens=0,
+                cost_usd="0",
+                cost_unpriced=False,
+                llm_state={"configured": False},
+            )
+
+    monkeypatch.setattr(jobs_module, "ScanService", FakeScanService)
+    runner = ScheduledScanRunner(container=container, clock=FixedClock(NOW))
+
+    outcome = runner.resume(run_id, period="4h")
+
+    assert outcome.claimed is True
+    assert len(captured) == 1
+    request = captured[0]
+    assert request.symbol == "ETHUSDT"  # type: ignore[union-attr]
+    assert request.source == "live"  # type: ignore[union-attr]
+    assert request.metrics_only is True  # type: ignore[union-attr]
+    assert request.provider == "stub"  # type: ignore[union-attr]
+    # metrics-only never reaches the LLM stage.
+    assert container.store.list_llm_calls() == ()
+
+
+def test_resume_runs_symbols_that_never_wrote_a_checkpoint_row(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from types import SimpleNamespace
+
+    from oft.application.jobs import ScheduledScanOutcome
+    from oft.bootstrap import build_container
+
+    settings = Settings(env="test", port=8765, data_dir=tmp_path / "data")
+    container = build_container(settings, initialize=True)
+    ledger = JobLedger(store=container.store, clock=FixedClock(NOW))
+    claim = ledger.claim_scan(trigger_source="MANUAL", owner="manual-owner", run_id="SCAN-MIDCRASH")
+    assert claim.claimed and claim.run is not None
+    run_id = claim.run.run_id
+    container.store.upsert_scan_symbol(
+        ScanSymbolRecord(
+            scan_id=run_id,
+            symbol="BTCUSDT",
+            stage="DONE",
+            started_at=utc_timestamp(NOW),
+            finished_at=utc_timestamp(NOW),
+            error_code=None,
+            report_id="RPT-BTC",
+            data_quality="COMPLETE",
+        )
+    )
+    monkeypatch.setattr(
+        container.store,
+        "list_starred",
+        lambda: (SimpleNamespace(symbol="BTCUSDT"), SimpleNamespace(symbol="ETHUSDT")),
+    )
+    captured: list[tuple[str, ...]] = []
+
+    def fake_execute(
+        self: ScheduledScanRunner,
+        run: object,
+        symbols: tuple[str, ...],
+        **kwargs: object,
+    ) -> ScheduledScanOutcome:
+        captured.append(symbols)
+        return ScheduledScanOutcome(run=None, claimed=True)
+
+    monkeypatch.setattr(ScheduledScanRunner, "_execute", fake_execute)
+    runner = ScheduledScanRunner(container=container, clock=FixedClock(NOW))
+
+    outcome = runner.resume(run_id, period="4h")
+
+    assert outcome.claimed is True
+    assert captured == [("ETHUSDT",)]
+    assert container.store.get_job_run(run_id).status == "DONE"  # type: ignore[union-attr]
+
+
+def test_resume_with_every_row_terminal_finishes_without_rerunning(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from types import SimpleNamespace
+
+    from oft.application.jobs import ScheduledScanOutcome
+    from oft.bootstrap import build_container
+
+    settings = Settings(env="test", port=8765, data_dir=tmp_path / "data")
+    container = build_container(settings, initialize=True)
+    ledger = JobLedger(store=container.store, clock=FixedClock(NOW))
+    claim = ledger.claim_scan(trigger_source="MANUAL", owner="manual-owner", run_id="SCAN-ALLDONE")
+    assert claim.claimed and claim.run is not None
+    run_id = claim.run.run_id
+    for symbol in ("BTCUSDT", "ETHUSDT"):
+        container.store.upsert_scan_symbol(
+            ScanSymbolRecord(
+                scan_id=run_id,
+                symbol=symbol,
+                stage="DONE",
+                started_at=utc_timestamp(NOW),
+                finished_at=utc_timestamp(NOW),
+                error_code=None,
+                report_id=f"RPT-{symbol}",
+                data_quality="COMPLETE",
+            )
+        )
+    monkeypatch.setattr(
+        container.store,
+        "list_starred",
+        lambda: (SimpleNamespace(symbol="BTCUSDT"), SimpleNamespace(symbol="ETHUSDT")),
+    )
+    captured: list[tuple[str, ...]] = []
+
+    def fake_execute(
+        self: ScheduledScanRunner,
+        run: object,
+        symbols: tuple[str, ...],
+        **kwargs: object,
+    ) -> ScheduledScanOutcome:
+        captured.append(symbols)
+        return ScheduledScanOutcome(run=None, claimed=True)
+
+    monkeypatch.setattr(ScheduledScanRunner, "_execute", fake_execute)
+    runner = ScheduledScanRunner(container=container, clock=FixedClock(NOW))
+
+    outcome = runner.resume(run_id, period="4h")
+
+    assert outcome.claimed is True
+    assert captured == []
+    assert container.store.get_job_run(run_id).status == "DONE"  # type: ignore[union-attr]
 
 
 def test_resume_manual_run_without_checkpoints_is_failed_not_done(tmp_path: Path) -> None:

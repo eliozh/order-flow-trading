@@ -46,7 +46,7 @@ from oft.ports.store import (
     TriggerEventRecord,
 )
 
-_SCHEMA_VERSION = 10
+_SCHEMA_VERSION = 14
 STALE_RUNNING_SECONDS = 15 * 60
 _BACKFILL_RUN_STATUSES = ("RUNNING", "COMPLETE", "PARTIAL", "FAILED", "BLOCKED", "STALE")
 _BACKFILL_RUNS_DEFINITION = """
@@ -109,7 +109,7 @@ _JOB_RUNS_DEFINITION = """
     job_type TEXT NOT NULL,
     window_start TEXT NOT NULL,
     status TEXT NOT NULL CHECK (
-        status IN ('RUNNING','DONE','FAILED','MISSED','SKIPPED')
+        status IN ('RUNNING','PARTIAL','DONE','FAILED','MISSED','SKIPPED')
     ),
     trigger_source TEXT NOT NULL,
     started_at TEXT NOT NULL,
@@ -119,6 +119,11 @@ _JOB_RUNS_DEFINITION = """
     lease_owner TEXT NOT NULL,
     lease_expires_at TEXT NOT NULL,
     heartbeat_at TEXT NOT NULL,
+    source TEXT NOT NULL DEFAULT 'backfill',
+    metrics_only INTEGER NOT NULL DEFAULT 0,
+    provider TEXT,
+    symbol TEXT,
+    period TEXT,
     UNIQUE (job_type, window_start)
 """
 
@@ -133,13 +138,20 @@ _SCAN_SYMBOLS_DEFINITION = """
     scan_id TEXT NOT NULL,
     symbol TEXT NOT NULL,
     stage TEXT NOT NULL CHECK (
-        stage IN ('QUEUED','DATA','METRICS','REPORT','DONE','FAILED')
+        stage IN (
+            'QUEUED','DATA','METRICS','LLM','REPORT','DONE','DEGRADED','FAILED'
+        )
     ),
     started_at TEXT,
     finished_at TEXT,
     error_code TEXT,
+    error_message TEXT,
     report_id TEXT,
     data_quality TEXT,
+    llm_status TEXT,
+    llm_tokens INTEGER NOT NULL DEFAULT 0,
+    cost_usd TEXT NOT NULL DEFAULT '0',
+    cost_unpriced INTEGER NOT NULL DEFAULT 1,
     PRIMARY KEY (scan_id, symbol)
 """
 
@@ -230,9 +242,16 @@ _SCHEMA_SQL = f"""
         source_mode TEXT NOT NULL DEFAULT 'FIXTURE',
         metrics_manifest_json TEXT,
         error_code TEXT,
-        error_message TEXT
+        error_message TEXT,
+        batch_id TEXT,
+        llm_configured INTEGER NOT NULL DEFAULT 0,
+        llm_status TEXT,
+        llm_tokens INTEGER NOT NULL DEFAULT 0,
+        cost_usd TEXT NOT NULL DEFAULT '0',
+        cost_unpriced INTEGER NOT NULL DEFAULT 1
     );
     CREATE INDEX IF NOT EXISTS scans_created_at ON scans(created_at);
+    CREATE INDEX IF NOT EXISTS scans_batch_id ON scans(batch_id);
     CREATE TABLE IF NOT EXISTS reports (
         report_id TEXT PRIMARY KEY,
         scan_id TEXT NOT NULL REFERENCES scans(scan_id),
@@ -245,7 +264,8 @@ _SCHEMA_SQL = f"""
         data_quality TEXT NOT NULL,
         snapshot_json TEXT NOT NULL,
         metrics_json TEXT NOT NULL,
-        llm_json TEXT
+        llm_json TEXT,
+        window_policy_json TEXT
     );
     CREATE INDEX IF NOT EXISTS reports_generated_at ON reports(generated_at);
     CREATE INDEX IF NOT EXISTS reports_scan_id ON reports(scan_id);
@@ -707,6 +727,195 @@ def _migrate_reports_v10(connection: sqlite3.Connection) -> None:
         raise
 
 
+def _migrate_reports_v11(connection: sqlite3.Connection) -> None:
+    """Add the additive window-policy column to an existing reports table (v11)."""
+    columns = {row[1] for row in connection.execute("PRAGMA table_info(reports)")}
+    if "window_policy_json" in columns:
+        return
+    connection.execute("BEGIN IMMEDIATE")
+    try:
+        connection.execute("ALTER TABLE reports ADD COLUMN window_policy_json TEXT")
+        connection.execute("COMMIT")
+    except Exception:
+        connection.execute("ROLLBACK")
+        raise
+
+
+def _migrate_scans_v11(connection: sqlite3.Connection) -> None:
+    """Add batch identity and LLM cost fields to an existing scans table (v11)."""
+    columns = {row[1] for row in connection.execute("PRAGMA table_info(scans)")}
+    needed = (
+        ("batch_id", "TEXT"),
+        ("llm_configured", "INTEGER NOT NULL DEFAULT 0"),
+        ("llm_status", "TEXT"),
+        ("llm_tokens", "INTEGER NOT NULL DEFAULT 0"),
+        ("cost_usd", "TEXT NOT NULL DEFAULT '0'"),
+        ("cost_unpriced", "INTEGER NOT NULL DEFAULT 1"),
+    )
+    missing = [(name, kind) for name, kind in needed if name not in columns]
+    if not missing:
+        return
+    connection.execute("BEGIN IMMEDIATE")
+    try:
+        for name, kind in missing:
+            connection.execute(f"ALTER TABLE scans ADD COLUMN {name} {kind}")
+        connection.execute("COMMIT")
+    except Exception:
+        connection.execute("ROLLBACK")
+        raise
+
+
+def _migrate_scan_symbols_v11(connection: sqlite3.Connection) -> None:
+    """Rebuild ``scan_symbols`` for the LLM/DEGRADED stages and cost fields (v11).
+
+    SQLite cannot widen a CHECK constraint with ``ALTER TABLE``, so the table is
+    recreated and copied. The migration is idempotent: a table that already has
+    the new definition is left untouched.
+    """
+    row = connection.execute(
+        "SELECT sql FROM sqlite_master WHERE type = 'table' AND name = 'scan_symbols'"
+    ).fetchone()
+    if row is None or row[0] is None:
+        return
+    definition = str(row[0])
+    columns = {item[1] for item in connection.execute("PRAGMA table_info(scan_symbols)")}
+    needs_rebuild = (
+        "'LLM'" not in definition
+        or "'DEGRADED'" not in definition
+        or "error_message" not in columns
+        or "llm_tokens" not in columns
+        or "cost_usd" not in columns
+        or "cost_unpriced" not in columns
+    )
+    if not needs_rebuild:
+        return
+    connection.execute("BEGIN IMMEDIATE")
+    try:
+        connection.execute("ALTER TABLE scan_symbols RENAME TO scan_symbols_v10")
+        connection.execute(f"CREATE TABLE scan_symbols ({_SCAN_SYMBOLS_DEFINITION})")
+        copied = [
+            name
+            for name in (
+                "scan_id",
+                "symbol",
+                "stage",
+                "started_at",
+                "finished_at",
+                "error_code",
+                "report_id",
+                "data_quality",
+            )
+            if name in columns
+        ]
+        if copied:
+            column_list = ", ".join(copied)
+            connection.execute(
+                f"INSERT INTO scan_symbols ({column_list}) "
+                f"SELECT {column_list} FROM scan_symbols_v10"
+            )
+        connection.execute("DROP TABLE scan_symbols_v10")
+        connection.execute("COMMIT")
+    except Exception:
+        connection.execute("ROLLBACK")
+        raise
+
+
+def _migrate_job_runs_v12(connection: sqlite3.Connection) -> None:
+    """Persist the manual scan options needed to resume a reclaimed batch (v12)."""
+    columns = {row[1] for row in connection.execute("PRAGMA table_info(job_runs)")}
+    needed = (
+        ("source", "TEXT NOT NULL DEFAULT 'backfill'"),
+        ("metrics_only", "INTEGER NOT NULL DEFAULT 0"),
+        ("provider", "TEXT"),
+    )
+    missing = [(name, kind) for name, kind in needed if name not in columns]
+    if not missing:
+        return
+    connection.execute("BEGIN IMMEDIATE")
+    try:
+        for name, kind in missing:
+            connection.execute(f"ALTER TABLE job_runs ADD COLUMN {name} {kind}")
+        connection.execute("COMMIT")
+    except Exception:
+        connection.execute("ROLLBACK")
+        raise
+
+
+def _migrate_job_runs_v13(connection: sqlite3.Connection) -> None:
+    """Persist the target symbol so a single-symbol run resumes its own scope (v13)."""
+    columns = {row[1] for row in connection.execute("PRAGMA table_info(job_runs)")}
+    if "symbol" in columns:
+        return
+    connection.execute("BEGIN IMMEDIATE")
+    try:
+        connection.execute("ALTER TABLE job_runs ADD COLUMN symbol TEXT")
+        connection.execute("COMMIT")
+    except Exception:
+        connection.execute("ROLLBACK")
+        raise
+
+
+def _migrate_job_runs_v14(connection: sqlite3.Connection) -> None:
+    """Add the persisted scan period and the ``PARTIAL`` batch status (v14).
+
+    SQLite cannot widen a CHECK constraint with ``ALTER TABLE``, so the table is
+    recreated and copied when the old definition is detected. The migration is
+    idempotent: a table that already has the period column and the wider status
+    check is left untouched.
+    """
+    row = connection.execute(
+        "SELECT sql FROM sqlite_master WHERE type = 'table' AND name = 'job_runs'"
+    ).fetchone()
+    if row is None or row[0] is None:
+        return
+    definition = str(row[0])
+    columns = {item[1] for item in connection.execute("PRAGMA table_info(job_runs)")}
+    needs_rebuild = "'PARTIAL'" not in definition
+    needs_period = "period" not in columns
+    if not needs_rebuild and not needs_period:
+        return
+    connection.execute("BEGIN IMMEDIATE")
+    try:
+        if needs_rebuild:
+            connection.execute("ALTER TABLE job_runs RENAME TO job_runs_v13")
+            connection.execute(f"CREATE TABLE job_runs ({_JOB_RUNS_DEFINITION})")
+            copied = [
+                name
+                for name in (
+                    "run_id",
+                    "job_type",
+                    "window_start",
+                    "status",
+                    "trigger_source",
+                    "started_at",
+                    "finished_at",
+                    "error_code",
+                    "message",
+                    "lease_owner",
+                    "lease_expires_at",
+                    "heartbeat_at",
+                    "source",
+                    "metrics_only",
+                    "provider",
+                    "symbol",
+                    "period",
+                )
+                if name in columns
+            ]
+            if copied:
+                column_list = ", ".join(copied)
+                connection.execute(
+                    f"INSERT INTO job_runs ({column_list}) SELECT {column_list} FROM job_runs_v13"
+                )
+            connection.execute("DROP TABLE job_runs_v13")
+        else:
+            connection.execute("ALTER TABLE job_runs ADD COLUMN period TEXT")
+        connection.execute("COMMIT")
+    except Exception:
+        connection.execute("ROLLBACK")
+        raise
+
+
 def initialize_database(settings: Settings) -> None:
     """Create the data directory and the walking-skeleton schema."""
     settings.data_dir.mkdir(parents=True, exist_ok=True)
@@ -740,6 +949,15 @@ def initialize_database(settings: Settings) -> None:
             _migrate_reports_v9(connection)
         if _table_exists(connection, "reports"):
             _migrate_reports_v10(connection)
+            _migrate_reports_v11(connection)
+        if _table_exists(connection, "scans"):
+            _migrate_scans_v11(connection)
+        if _table_exists(connection, "scan_symbols"):
+            _migrate_scan_symbols_v11(connection)
+        if _table_exists(connection, "job_runs"):
+            _migrate_job_runs_v12(connection)
+            _migrate_job_runs_v13(connection)
+            _migrate_job_runs_v14(connection)
         with connection:
             connection.executescript(_SCHEMA_SQL)
             connection.execute(
@@ -780,7 +998,23 @@ def initialize_database(settings: Settings) -> None:
             )
             connection.execute(
                 "INSERT OR IGNORE INTO schema_migrations (version, applied_at) VALUES (?, ?)",
-                (_SCHEMA_VERSION, "2026-11-08T12:00:00.000Z"),
+                (10, "2026-11-08T12:00:00.000Z"),
+            )
+            connection.execute(
+                "INSERT OR IGNORE INTO schema_migrations (version, applied_at) VALUES (?, ?)",
+                (11, "2026-11-08T13:00:00.000Z"),
+            )
+            connection.execute(
+                "INSERT OR IGNORE INTO schema_migrations (version, applied_at) VALUES (?, ?)",
+                (12, "2026-11-08T14:00:00.000Z"),
+            )
+            connection.execute(
+                "INSERT OR IGNORE INTO schema_migrations (version, applied_at) VALUES (?, ?)",
+                (13, "2026-11-08T15:00:00.000Z"),
+            )
+            connection.execute(
+                "INSERT OR IGNORE INTO schema_migrations (version, applied_at) VALUES (?, ?)",
+                (_SCHEMA_VERSION, "2026-11-08T16:00:00.000Z"),
             )
     finally:
         connection.close()
@@ -818,6 +1052,12 @@ def _row_to_scan(row: sqlite3.Row) -> ScanRecord:
         ),
         error_code=row["error_code"] if "error_code" in keys else None,
         error_message=row["error_message"] if "error_message" in keys else None,
+        batch_id=row["batch_id"] if "batch_id" in keys else None,
+        llm_configured=(bool(row["llm_configured"]) if "llm_configured" in keys else False),
+        llm_status=row["llm_status"] if "llm_status" in keys else None,
+        llm_tokens=int(row["llm_tokens"]) if "llm_tokens" in keys else 0,
+        cost_usd=row["cost_usd"] if "cost_usd" in keys else "0",
+        cost_unpriced=bool(row["cost_unpriced"]) if "cost_unpriced" in keys else True,
     )
 
 
@@ -836,6 +1076,7 @@ def _row_to_report(row: sqlite3.Row) -> ReportRecord:
         snapshot_json=row["snapshot_json"],
         metrics_json=row["metrics_json"],
         llm_json=row["llm_json"] if "llm_json" in keys else None,
+        window_policy_json=(row["window_policy_json"] if "window_policy_json" in keys else None),
     )
 
 
@@ -973,6 +1214,7 @@ def _row_to_data_gap(row: sqlite3.Row) -> DataGap:
 
 
 def _row_to_job_run(row: sqlite3.Row) -> JobRunRecord:
+    keys = row.keys()
     return JobRunRecord(
         run_id=row["run_id"],
         job_type=row["job_type"],
@@ -986,6 +1228,11 @@ def _row_to_job_run(row: sqlite3.Row) -> JobRunRecord:
         lease_owner=row["lease_owner"],
         lease_expires_at=row["lease_expires_at"],
         heartbeat_at=row["heartbeat_at"],
+        source=row["source"] if "source" in keys else "backfill",
+        metrics_only=(bool(row["metrics_only"]) if "metrics_only" in keys else False),
+        provider=row["provider"] if "provider" in keys else None,
+        symbol=row["symbol"] if "symbol" in keys else None,
+        period=row["period"] if "period" in keys else None,
     )
 
 
@@ -999,6 +1246,7 @@ def _row_to_job_lock(row: sqlite3.Row) -> JobLockRecord:
 
 
 def _row_to_scan_symbol(row: sqlite3.Row) -> ScanSymbolRecord:
+    keys = row.keys()
     return ScanSymbolRecord(
         scan_id=row["scan_id"],
         symbol=row["symbol"],
@@ -1008,6 +1256,11 @@ def _row_to_scan_symbol(row: sqlite3.Row) -> ScanSymbolRecord:
         error_code=row["error_code"],
         report_id=row["report_id"],
         data_quality=row["data_quality"],
+        error_message=row["error_message"] if "error_message" in keys else None,
+        llm_status=row["llm_status"] if "llm_status" in keys else None,
+        llm_tokens=int(row["llm_tokens"]) if "llm_tokens" in keys else 0,
+        cost_usd=row["cost_usd"] if "cost_usd" in keys else "0",
+        cost_unpriced=bool(row["cost_unpriced"]) if "cost_unpriced" in keys else True,
     )
 
 
@@ -1054,8 +1307,12 @@ class SqliteStore:
                 fixture_path, started_at, finished_at, window_start, window_end,
                 trade_count, buy_volume, sell_volume, delta, cvd, data_quality,
                 manifest_path, parquet_rows, created_at, report_id, source_mode,
-                metrics_manifest_json, error_code, error_message
-            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                metrics_manifest_json, error_code, error_message, batch_id,
+                llm_configured, llm_status, llm_tokens, cost_usd, cost_unpriced
+            ) VALUES (
+                ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?,
+                ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?
+            )
             """,
             (
                 record.scan_id,
@@ -1083,6 +1340,12 @@ class SqliteStore:
                 record.metrics_manifest_json,
                 record.error_code,
                 record.error_message,
+                record.batch_id,
+                int(record.llm_configured),
+                record.llm_status,
+                record.llm_tokens,
+                record.cost_usd,
+                int(record.cost_unpriced),
             ),
         )
 
@@ -1095,7 +1358,9 @@ class SqliteStore:
                     status = ?, finished_at = ?, data_quality = ?, report_id = ?,
                     trade_count = ?, buy_volume = ?, sell_volume = ?, delta = ?,
                     cvd = ?, manifest_path = ?, parquet_rows = ?,
-                    metrics_manifest_json = ?, error_code = ?, error_message = ?
+                    metrics_manifest_json = ?, error_code = ?, error_message = ?,
+                    batch_id = ?, llm_configured = ?, llm_status = ?,
+                    llm_tokens = ?, cost_usd = ?, cost_unpriced = ?
                 WHERE scan_id = ?
                 """,
                 (
@@ -1113,6 +1378,12 @@ class SqliteStore:
                     record.metrics_manifest_json,
                     record.error_code,
                     record.error_message,
+                    record.batch_id,
+                    int(record.llm_configured),
+                    record.llm_status,
+                    record.llm_tokens,
+                    record.cost_usd,
+                    int(record.cost_unpriced),
                     record.scan_id,
                 ),
             )
@@ -1158,6 +1429,23 @@ class SqliteStore:
             connection.close()
         return tuple(_row_to_scan(row) for row in rows)
 
+    def list_scans_by_batch(self, batch_id: str) -> tuple[ScanRecord, ...]:
+        """Return every child scan of one batch, ordered by symbol.
+
+        Uses the ``scans(batch_id)`` index so a batch whose rows are older than
+        the newest page of scans still renders its full window and quality.
+        """
+        connection = self._connect_read_only()
+        if connection is None:
+            return ()
+        try:
+            rows = connection.execute(
+                "SELECT * FROM scans WHERE batch_id = ? ORDER BY symbol", (batch_id,)
+            ).fetchall()
+        finally:
+            connection.close()
+        return tuple(_row_to_scan(row) for row in rows)
+
     def count_scans(self) -> int:
         connection = self._connect_read_only()
         if connection is None:
@@ -1180,8 +1468,9 @@ class SqliteStore:
             INSERT INTO reports (
                 report_id, scan_id, symbol, timeframe, generated_at,
                 metrics_manifest_json, llm_decision_id, narrative_ref,
-                data_quality, snapshot_json, metrics_json, llm_json
-            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                data_quality, snapshot_json, metrics_json, llm_json,
+                window_policy_json
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             """,
             (
                 record.report_id,
@@ -1196,6 +1485,7 @@ class SqliteStore:
                 record.snapshot_json,
                 record.metrics_json,
                 record.llm_json,
+                record.window_policy_json,
             ),
         )
 
@@ -1213,7 +1503,9 @@ class SqliteStore:
                     status = ?, finished_at = ?, data_quality = ?, report_id = ?,
                     trade_count = ?, buy_volume = ?, sell_volume = ?, delta = ?,
                     cvd = ?, manifest_path = ?, parquet_rows = ?,
-                    metrics_manifest_json = ?, error_code = ?, error_message = ?
+                    metrics_manifest_json = ?, error_code = ?, error_message = ?,
+                    batch_id = ?, llm_configured = ?, llm_status = ?,
+                    llm_tokens = ?, cost_usd = ?, cost_unpriced = ?
                 WHERE scan_id = ?
                 """,
                 (
@@ -1231,6 +1523,12 @@ class SqliteStore:
                     scan.metrics_manifest_json,
                     scan.error_code,
                     scan.error_message,
+                    scan.batch_id,
+                    int(scan.llm_configured),
+                    scan.llm_status,
+                    scan.llm_tokens,
+                    scan.cost_usd,
+                    int(scan.cost_unpriced),
                     scan.scan_id,
                 ),
             )
@@ -2266,7 +2564,8 @@ class SqliteStore:
                         UPDATE job_runs SET
                             status = 'RUNNING', trigger_source = ?, started_at = ?,
                             finished_at = NULL, error_code = NULL, message = NULL,
-                            lease_owner = ?, lease_expires_at = ?, heartbeat_at = ?
+                            lease_owner = ?, lease_expires_at = ?, heartbeat_at = ?,
+                            period = COALESCE(period, ?)
                         WHERE run_id = ?
                         """,
                         (
@@ -2275,6 +2574,7 @@ class SqliteStore:
                             record.lease_owner,
                             record.lease_expires_at,
                             record.heartbeat_at,
+                            record.period,
                             existing.run_id,
                         ),
                     )
@@ -2291,8 +2591,9 @@ class SqliteStore:
                     INSERT INTO job_runs (
                         run_id, job_type, window_start, status, trigger_source,
                         started_at, finished_at, error_code, message, lease_owner,
-                        lease_expires_at, heartbeat_at
-                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                        lease_expires_at, heartbeat_at, source, metrics_only, provider,
+                        symbol, period
+                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                     """,
                     (
                         record.run_id,
@@ -2307,6 +2608,11 @@ class SqliteStore:
                         record.lease_owner,
                         record.lease_expires_at,
                         record.heartbeat_at,
+                        record.source,
+                        int(record.metrics_only),
+                        record.provider,
+                        record.symbol,
+                        record.period,
                     ),
                 )
                 connection.commit()
@@ -2423,21 +2729,36 @@ class SqliteStore:
         return _row_to_job_run(row) if row is not None else None
 
     def list_job_runs(
-        self, job_type: str | None = None, limit: int = 50
+        self, job_type: str | None = None, limit: int = 50, offset: int = 0
     ) -> tuple[JobRunRecord, ...]:
         connection = self._connect_read_only()
         if connection is None:
             return ()
         where = " WHERE job_type = ?" if job_type is not None else ""
-        params: tuple[object, ...] = (job_type, limit) if job_type is not None else (limit,)
+        params: tuple[object, ...] = (
+            (job_type, limit, offset) if job_type is not None else (limit, offset)
+        )
         try:
             rows = connection.execute(
-                f"SELECT * FROM job_runs{where} ORDER BY heartbeat_at DESC, rowid DESC LIMIT ?",
+                f"SELECT * FROM job_runs{where} ORDER BY heartbeat_at DESC, rowid DESC "
+                "LIMIT ? OFFSET ?",
                 params,
             ).fetchall()
         finally:
             connection.close()
         return tuple(_row_to_job_run(row) for row in rows)
+
+    def count_job_runs(self, job_type: str | None = None) -> int:
+        connection = self._connect_read_only()
+        if connection is None:
+            return 0
+        where = " WHERE job_type = ?" if job_type is not None else ""
+        params: tuple[object, ...] = (job_type,) if job_type is not None else ()
+        try:
+            row = connection.execute(f"SELECT COUNT(*) FROM job_runs{where}", params).fetchone()
+        finally:
+            connection.close()
+        return int(row[0]) if row is not None else 0
 
     def list_stale_job_runs(self, *, now: str) -> tuple[JobRunRecord, ...]:
         connection = self._connect_read_only()
@@ -2499,15 +2820,21 @@ class SqliteStore:
                 """
                 INSERT INTO scan_symbols (
                     scan_id, symbol, stage, started_at, finished_at, error_code,
-                    report_id, data_quality
-                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+                    error_message, report_id, data_quality, llm_status, llm_tokens,
+                    cost_usd, cost_unpriced
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 ON CONFLICT(scan_id, symbol) DO UPDATE SET
                     stage = excluded.stage,
                     started_at = excluded.started_at,
                     finished_at = excluded.finished_at,
                     error_code = excluded.error_code,
+                    error_message = excluded.error_message,
                     report_id = excluded.report_id,
-                    data_quality = excluded.data_quality
+                    data_quality = excluded.data_quality,
+                    llm_status = excluded.llm_status,
+                    llm_tokens = excluded.llm_tokens,
+                    cost_usd = excluded.cost_usd,
+                    cost_unpriced = excluded.cost_unpriced
                 """,
                 (
                     record.scan_id,
@@ -2516,8 +2843,13 @@ class SqliteStore:
                     record.started_at,
                     record.finished_at,
                     record.error_code,
+                    record.error_message,
                     record.report_id,
                     record.data_quality,
+                    record.llm_status,
+                    record.llm_tokens,
+                    record.cost_usd,
+                    int(record.cost_unpriced),
                 ),
             )
 

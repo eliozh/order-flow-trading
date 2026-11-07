@@ -12,11 +12,18 @@ from __future__ import annotations
 
 import threading
 import uuid
+from contextlib import suppress
 from dataclasses import dataclass
 from datetime import datetime, timedelta
+from decimal import Decimal, InvalidOperation
 from typing import Any, Protocol
 
-from oft.application.scan_service import ScanError, ScanRequest, ScanService
+from oft.application.scan_service import (
+    ScanAlreadyRunning,
+    ScanError,
+    ScanRequest,
+    ScanService,
+)
 from oft.application.scheduler import CatchUpPlan, plan_catch_up
 from oft.domain.time import utc_timestamp
 from oft.ports.clock import ClockPort
@@ -35,8 +42,9 @@ HEARTBEAT_SECONDS = 300
 RUNNING = "RUNNING"
 DONE = "DONE"
 FAILED = "FAILED"
+PARTIAL = "PARTIAL"
 MISSED = "MISSED"
-_TERMINAL_SCAN_STAGES = frozenset({"DONE", "FAILED"})
+_TERMINAL_SCAN_STAGES = frozenset({"DONE", "DEGRADED", "FAILED"})
 
 
 @dataclass(frozen=True)
@@ -75,7 +83,12 @@ class ScheduledScanOutcome:
     claimed: bool
     scans: tuple[ScanRecord, ...] = ()
     failed_symbols: tuple[str, ...] = ()
+    degraded_symbols: tuple[str, ...] = ()
     reason: str = ""
+    symbols_total: int = 0
+    total_tokens: int = 0
+    total_cost_usd: str = "0"
+    cost_unpriced: bool = False
 
 
 class ScanContainer(Protocol):
@@ -103,6 +116,64 @@ def _boundary_window(value: str) -> datetime | None:
         return None
 
 
+def _pending_symbols(
+    run: JobRunRecord,
+    rows: tuple[ScanSymbolRecord, ...],
+    starred: tuple[str, ...],
+) -> tuple[str, ...]:
+    """Resume scope: a single-symbol run stays on its symbol; a batch uses starring."""
+    terminal = {item.symbol for item in rows if item.stage in _TERMINAL_SCAN_STAGES}
+    if run.symbol is not None:
+        return () if run.symbol in terminal else (run.symbol,)
+    return tuple(symbol for symbol in starred if symbol not in terminal)
+
+
+def _outcome_status(outcome: ScheduledScanOutcome) -> str:
+    """Persist ``PARTIAL`` when only some symbols succeeded, ``FAILED`` otherwise."""
+    if not outcome.failed_symbols:
+        return DONE
+    return PARTIAL if outcome.scans else FAILED
+
+
+def _rows_status(rows: tuple[ScanSymbolRecord, ...]) -> str:
+    """Derive a run status from terminal checkpoint rows only.
+
+    Matches ``_batch_status`` semantics: ``DONE`` when every terminal row
+    finished cleanly, ``FAILED`` when nothing succeeded, and ``PARTIAL`` for
+    mixed or degraded outcomes.
+    """
+    terminal = tuple(row for row in rows if row.stage in _TERMINAL_SCAN_STAGES)
+    if not terminal:
+        return FAILED
+    if all(row.stage == DONE for row in terminal):
+        return DONE
+    if all(row.stage == FAILED for row in terminal):
+        return FAILED
+    return PARTIAL
+
+
+def _merged_status(
+    outcome: ScheduledScanOutcome,
+    rows: tuple[ScanSymbolRecord, ...],
+) -> str:
+    """Merge this pass's outcome with every terminal checkpoint row for the run.
+
+    ``run_window`` and ``resume`` only execute pending symbols, so the in-pass
+    outcome alone hides a prior owner's terminal ``FAILED`` or ``DEGRADED``
+    checkpoints. With no terminal rows there is nothing to merge; the pass's
+    own outcome is authoritative.
+    """
+    if not any(row.stage in _TERMINAL_SCAN_STAGES for row in rows):
+        return _outcome_status(outcome)
+    outcome_status = _outcome_status(outcome)
+    rows_status = _rows_status(rows)
+    if outcome_status == DONE and rows_status == DONE:
+        return DONE
+    if outcome_status == FAILED and rows_status == FAILED:
+        return FAILED
+    return PARTIAL
+
+
 class JobLedger:
     """Application-level wrapper around the SQLite job tables."""
 
@@ -126,6 +197,11 @@ class JobLedger:
         owner: str | None = None,
         lease_seconds: int = DEFAULT_LEASE_SECONDS,
         run_id: str | None = None,
+        source: str = "backfill",
+        metrics_only: bool = False,
+        provider: str | None = None,
+        symbol: str | None = None,
+        period: str | None = None,
     ) -> JobClaim:
         """Claim ``(job_type, window_start)`` once; reclaim only a stale lease."""
         now = self._now()
@@ -143,6 +219,11 @@ class JobLedger:
             lease_owner=lease_owner,
             lease_expires_at=utc_timestamp(now + timedelta(seconds=lease_seconds)),
             heartbeat_at=utc_timestamp(now),
+            source=source,
+            metrics_only=metrics_only,
+            provider=provider,
+            symbol=symbol,
+            period=period,
         )
         claimed, run, reclaimed = self._store.claim_job_run(record)
         if claimed:
@@ -270,6 +351,11 @@ class JobLedger:
         window_start: str | None = None,
         lease_seconds: int = DEFAULT_LEASE_SECONDS,
         run_id: str | None = None,
+        source: str = "backfill",
+        metrics_only: bool = False,
+        provider: str | None = None,
+        symbol: str | None = None,
+        period: str | None = None,
     ) -> JobClaim:
         """Claim the single active scan slot shared by manual and scheduled runs.
 
@@ -299,6 +385,11 @@ class JobLedger:
             owner=lease_owner,
             lease_seconds=lease_seconds,
             run_id=run_id,
+            source=source,
+            metrics_only=metrics_only,
+            provider=provider,
+            symbol=symbol,
+            period=period,
         )
         if not claim.claimed:
             self.release_scan_lock(lease_owner)
@@ -348,6 +439,7 @@ class ScheduledScanRunner:
             SCAN_JOB_TYPE,
             utc_timestamp(window_start),
             trigger_source=trigger_source,
+            period=period,
         )
         if not claim.claimed or claim.run is None:
             return ScheduledScanOutcome(run=claim.run, claimed=False, reason=claim.reason)
@@ -378,19 +470,24 @@ class ScheduledScanRunner:
         try:
             symbols = tuple(contract.symbol for contract in self._container.store.list_starred())
             if claim.reclaimed:
-                # Resume a reclaimed run from its persisted checkpoints instead
-                # of re-running every starred symbol.
-                checkpointed = self._container.store.list_scan_symbols(run.run_id)
-                if checkpointed:
-                    symbols = tuple(
-                        item.symbol
-                        for item in checkpointed
-                        if item.stage not in _TERMINAL_SCAN_STAGES
-                    )
-            outcome = self._execute(run, symbols, period=period, trigger_source=run.trigger_source)
+                # Resume a reclaimed run from its persisted checkpoints: the
+                # current starred symbols minus terminal checkpoint rows. A
+                # single-symbol run resumes only its persisted symbol, never the
+                # whole starred universe.
+                rows = self._container.store.list_scan_symbols(run.run_id)
+                symbols = _pending_symbols(run, rows, symbols)
+            outcome = self._execute(
+                run,
+                symbols,
+                period=run.period or period,
+                trigger_source=run.trigger_source,
+                source=run.source,
+                metrics_only=run.metrics_only,
+                provider=run.provider,
+            )
             self._ledger.finish(
                 run.run_id,
-                DONE if not outcome.failed_symbols else FAILED,
+                _merged_status(outcome, self._container.store.list_scan_symbols(run.run_id)),
                 owner=run.lease_owner,
             )
             return outcome
@@ -428,12 +525,21 @@ class ScheduledScanRunner:
         )
         beat.start()
         try:
-            pending = tuple(
-                item.symbol
-                for item in self._container.store.list_scan_symbols(run_id)
-                if item.stage not in _TERMINAL_SCAN_STAGES
-            )
-            if not pending:
+            rows = self._container.store.list_scan_symbols(run_id)
+            starred = tuple(contract.symbol for contract in self._container.store.list_starred())
+            if run.symbol is not None:
+                # A single-symbol run resumes only the symbol it was asked for,
+                # even if the crash happened before its checkpoint row landed.
+                pending = _pending_symbols(run, rows, starred)
+                if not pending:
+                    self._ledger.finish(run.run_id, _rows_status(rows), owner=run.lease_owner)
+                    return ScheduledScanOutcome(
+                        run=run,
+                        claimed=True,
+                        reason="already_complete",
+                        symbols_total=len(rows),
+                    )
+            elif not rows:
                 if "#manual-" in run.window_start:
                     self._ledger.finish(
                         run.run_id,
@@ -443,9 +549,7 @@ class ScheduledScanRunner:
                         owner=run.lease_owner,
                     )
                     return ScheduledScanOutcome(run=run, claimed=False, reason="no_checkpoint")
-                pending = tuple(
-                    contract.symbol for contract in self._container.store.list_starred()
-                )
+                pending = starred
                 if not pending:
                     self._ledger.finish(
                         run.run_id,
@@ -455,10 +559,31 @@ class ScheduledScanRunner:
                         owner=run.lease_owner,
                     )
                     return ScheduledScanOutcome(run=run, claimed=False, reason="no_checkpoint")
-            outcome = self._execute(run, pending, period=period, trigger_source=run.trigger_source)
+            else:
+                # Pending = starred symbols that have no terminal row. A symbol
+                # that never wrote a row (crash mid-batch) must still run; a
+                # fully terminal batch must not re-run completed symbols.
+                pending = _pending_symbols(run, rows, starred)
+                if not pending:
+                    self._ledger.finish(run.run_id, _rows_status(rows), owner=run.lease_owner)
+                    return ScheduledScanOutcome(
+                        run=run,
+                        claimed=True,
+                        reason="already_complete",
+                        symbols_total=len(rows),
+                    )
+            outcome = self._execute(
+                run,
+                pending,
+                period=run.period or period,
+                trigger_source=run.trigger_source,
+                source=run.source,
+                metrics_only=run.metrics_only,
+                provider=run.provider,
+            )
             self._ledger.finish(
                 run.run_id,
-                DONE if not outcome.failed_symbols else FAILED,
+                _merged_status(outcome, self._container.store.list_scan_symbols(run.run_id)),
                 owner=run.lease_owner,
             )
             return outcome
@@ -488,6 +613,103 @@ class ScheduledScanRunner:
                     "job_heartbeat_failed", run_id=run_id, owner=owner, error=str(exc)
                 )
 
+    def execute_symbols(
+        self,
+        run: JobRunRecord,
+        symbols: tuple[str, ...],
+        *,
+        period: str,
+        trigger_source: str = "MANUAL",
+        source: str = "backfill",
+        metrics_only: bool = False,
+        provider: str | None = None,
+    ) -> ScheduledScanOutcome:
+        """Run one batch over ``symbols`` without claiming; the caller owns the lease."""
+        return self._execute(
+            run,
+            symbols,
+            period=period,
+            trigger_source=trigger_source,
+            source=source,
+            metrics_only=metrics_only,
+            provider=provider,
+        )
+
+    def run_manual(
+        self,
+        *,
+        period: str = "4h",
+        source: str = "backfill",
+        metrics_only: bool = False,
+        provider: str | None = None,
+    ) -> ScheduledScanOutcome:
+        """Claim and run one manual batch over every starred symbol."""
+        now = self._clock.now()
+        batch_id = f"SCAN-{now:%Y%m%d}-{uuid.uuid4().hex[:8].upper()}"
+        claim = self._ledger.claim_scan(
+            trigger_source="MANUAL",
+            owner=batch_id,
+            run_id=batch_id,
+            source=source,
+            metrics_only=metrics_only,
+            provider=provider,
+            period=period,
+        )
+        if not claim.claimed or claim.run is None:
+            raise ScanAlreadyRunning(running_scan_id=claim.running_scan_id)
+        run = claim.run
+        stop = threading.Event()
+        beat = threading.Thread(
+            target=self._heartbeat_loop,
+            args=(run.run_id, run.lease_owner, stop),
+            daemon=True,
+        )
+        beat.start()
+        try:
+            symbols = tuple(contract.symbol for contract in self._container.store.list_starred())
+            if not symbols:
+                self._ledger.finish(
+                    run.run_id,
+                    FAILED,
+                    error_code="NO_STARRED_SYMBOLS",
+                    message="no starred symbols to scan",
+                    owner=run.lease_owner,
+                )
+                return ScheduledScanOutcome(
+                    run=run,
+                    claimed=True,
+                    reason="no_starred_symbols",
+                    symbols_total=0,
+                )
+            outcome = self._execute(
+                run,
+                symbols,
+                period=run.period or period,
+                trigger_source="MANUAL",
+                source=source,
+                metrics_only=metrics_only,
+                provider=provider,
+            )
+            self._ledger.finish(
+                run.run_id,
+                _outcome_status(outcome),
+                owner=run.lease_owner,
+            )
+            return outcome
+        except BaseException as exc:
+            self._ledger.finish(
+                run.run_id,
+                FAILED,
+                error_code=str(getattr(exc, "code", "JOB_FAILED")),
+                message=str(exc),
+                owner=run.lease_owner,
+            )
+            raise
+        finally:
+            stop.set()
+            beat.join(timeout=1)
+            self._ledger.release_scan_lock(run.lease_owner)
+
     def _execute(
         self,
         run: JobRunRecord,
@@ -495,67 +717,143 @@ class ScheduledScanRunner:
         *,
         period: str,
         trigger_source: str = "SCHEDULED",
+        source: str = "backfill",
+        metrics_only: bool = False,
+        provider: str | None = None,
     ) -> ScheduledScanOutcome:
         scans: list[ScanRecord] = []
         failed: list[str] = []
-        for symbol in symbols:
-            started_at = utc_timestamp(self._clock.now())
+        degraded: list[str] = []
+        total_tokens = 0
+        total_cost = Decimal("0")
+        any_unpriced = False
+
+        def _finish_symbol(
+            symbol: str,
+            started_at: str,
+            *,
+            stage: str,
+            report_id: str | None,
+            data_quality: str | None,
+            error_code: str | None = None,
+            error_message: str | None = None,
+            llm_status: str | None = None,
+            llm_tokens: int = 0,
+            cost_usd: str = "0",
+            cost_unpriced: bool = True,
+        ) -> None:
             self._container.store.upsert_scan_symbol(
                 ScanSymbolRecord(
                     scan_id=run.run_id,
                     symbol=symbol,
-                    stage="DATA",
+                    stage=stage,
                     started_at=started_at,
-                    finished_at=None,
-                    error_code=None,
-                    report_id=None,
-                    data_quality=None,
+                    finished_at=utc_timestamp(self._clock.now()),
+                    error_code=error_code,
+                    error_message=error_message,
+                    report_id=report_id,
+                    data_quality=data_quality,
+                    llm_status=llm_status,
+                    llm_tokens=llm_tokens,
+                    cost_usd=cost_usd,
+                    cost_unpriced=cost_unpriced,
                 )
             )
+
+        for symbol in symbols:
+            started_at = utc_timestamp(self._clock.now())
+
+            def _stage(name: str, symbol: str = symbol, started_at: str = started_at) -> None:
+                self._container.store.upsert_scan_symbol(
+                    ScanSymbolRecord(
+                        scan_id=run.run_id,
+                        symbol=symbol,
+                        stage=name,
+                        started_at=started_at,
+                        finished_at=None,
+                        error_code=None,
+                        report_id=None,
+                        data_quality=None,
+                    )
+                )
+
+            _stage("QUEUED")
             try:
                 result = ScanService(
                     container=self._container,  # type: ignore[arg-type]
                     lock=self._container.scan_lock,
+                    on_stage=_stage,
                 ).run(
                     ScanRequest(
                         symbol=symbol,
                         period=period,
                         trigger_source=trigger_source,
+                        source=source,
+                        metrics_only=metrics_only,
+                        provider=provider,
+                        batch_id=run.run_id,
                     )
                 )
             except ScanError as exc:
                 failed.append(symbol)
-                self._container.store.upsert_scan_symbol(
-                    ScanSymbolRecord(
-                        scan_id=run.run_id,
-                        symbol=symbol,
-                        stage="FAILED",
-                        started_at=started_at,
-                        finished_at=utc_timestamp(self._clock.now()),
-                        error_code=exc.code,
-                        report_id=None,
-                        data_quality=None,
-                    )
+                _finish_symbol(
+                    symbol,
+                    started_at,
+                    stage="FAILED",
+                    report_id=None,
+                    data_quality=None,
+                    error_code=exc.code,
+                    error_message=exc.message,
+                )
+            except Exception as exc:  # noqa: BLE001 - one symbol never aborts the batch
+                failed.append(symbol)
+                _finish_symbol(
+                    symbol,
+                    started_at,
+                    stage="FAILED",
+                    report_id=None,
+                    data_quality=None,
+                    error_code="SCAN_FAILED",
+                    error_message=str(exc),
                 )
             else:
                 scans.append(result.scan)
-                self._container.store.upsert_scan_symbol(
-                    ScanSymbolRecord(
-                        scan_id=run.run_id,
-                        symbol=symbol,
-                        stage="DONE",
-                        started_at=started_at,
-                        finished_at=result.scan.finished_at,
-                        error_code=None,
-                        report_id=result.report.report_id,
-                        data_quality=result.report.data_quality,
-                    )
+                symbol_stage = getattr(result, "symbol_stage", "DONE")
+                llm_tokens = int(getattr(result, "llm_tokens", 0))
+                cost_usd = str(getattr(result, "cost_usd", "0"))
+                cost_unpriced = bool(getattr(result, "cost_unpriced", False))
+                llm_state = getattr(result, "llm_state", {})
+                if symbol_stage == "DEGRADED":
+                    degraded.append(symbol)
+                total_tokens += llm_tokens
+                with suppress(InvalidOperation):
+                    total_cost += Decimal(cost_usd)
+                any_unpriced = any_unpriced or cost_unpriced
+                _finish_symbol(
+                    symbol,
+                    started_at,
+                    stage=symbol_stage,
+                    report_id=getattr(result.report, "report_id", None),
+                    data_quality=getattr(result.report, "data_quality", None),
+                    llm_status=(
+                        str(llm_state.get("validation_status"))
+                        if isinstance(llm_state, dict) and llm_state.get("configured")
+                        else None
+                    ),
+                    llm_tokens=llm_tokens,
+                    cost_usd=cost_usd,
+                    cost_unpriced=cost_unpriced,
                 )
         return ScheduledScanOutcome(
             run=run,
             claimed=True,
             scans=tuple(scans),
             failed_symbols=tuple(failed),
+            degraded_symbols=tuple(degraded),
+            symbols_total=len(symbols),
+            total_tokens=total_tokens,
+            total_cost_usd=format(total_cost, "f"),
+            cost_unpriced=any_unpriced,
         )
 
 
@@ -566,6 +864,7 @@ __all__ = [
     "JobClaim",
     "JobLedger",
     "MISSED",
+    "PARTIAL",
     "RestartState",
     "RUNNING",
     "SCAN_JOB_TYPE",
