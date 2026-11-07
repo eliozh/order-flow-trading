@@ -1,0 +1,10 @@
+{"stream":"btcusdt@aggTrade","data":{"e":"aggTrade","E":1793966400000,"s":"BTCUSDT","a":100,"p":"35000.10","q":"0.250","f":1000,"l":1001,"T":1793966400000,"m":false,"M":true}}
+{"stream":"btcusdt@aggTrade","data":{"e":"aggTrade","E":1793966400100,"s":"BTCUSDT","a":101,"p":"35001.00","q":"0.100","f":1002,"l":1002,"T":1793966400100,"m":true,"M":true}}
+{"stream":"btcusdt@aggTrade","data":{"e":"aggTrade","E":1793966400100,"s":"BTCUSDT","a":101,"p":"35001.00","q":"0.100","f":1002,"l":1002,"T":1793966400100,"m":true,"M":true}}
+{"stream":"btcusdt@aggTrade","data":{"e":"aggTrade","E":1793966399900,"s":"BTCUSDT","a":99,"p":"34999.50","q":"0.050","f":999,"l":999,"T":1793966399900,"m":false,"M":true}}
+{"stream":"btcusdt@aggTrade","data":{"e":"aggTrade","E":1793966400200,"s":"BTCUSDT","a":102,"q":"0.200","f":1003,"l":1003,"T":1793966400200,"m":false,"M":true}}
+{"stream":"btcusdt@aggTrade","data":{"e":"aggTrade","E":1793966400300,"s":"BTCUSDT","a":106,"p":"35002.00","q":"0.300","f":1004,"l":1004,"T":1793966400300,"m":"maybe","M":true}}
+{"stream":"btcusdt@aggTrade","data":{"e":"aggTrade","E":1793966400400,"s":"BTC\u0001USDT","a":103,"p":"35003.00","q":"0.400","f":1005,"l":1005,"T":1793966400400,"m":false,"M":true}}
+{"stream":"btcusdt@aggTrade","data":{"e":"aggTrade","E":1793966400500,"s":"BTCUSDT","a":104,"p":"35004.00","q":"0.500","f":1006,"l":1006,"T":1793966400500,"m":true,"M":true,"padding":"xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx"}}
+{"e":"aggTrade","E":1793966400600,"s":"BTCUSDT","a":105,"p":"35005.00","q":"0.600","f":1007,"l":1007,"T":1793966400600,"m":false,"M":true}
+{not-json

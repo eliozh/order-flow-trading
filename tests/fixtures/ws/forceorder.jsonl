@@ -1,0 +1,5 @@
+{"stream":"btcusdt@forceOrder","data":{"e":"forceOrder","E":1793966400000,"o":{"s":"BTCUSDT","S":"SELL","o":"LIMIT","f":"IOC","q":"0.100","p":"34900.00","ap":"34900.00","X":"FILLED","l":"0.100","z":"0.100","T":1793966400000}}}
+{"stream":"btcusdt@forceOrder","data":{"e":"forceOrder","E":1793966401000,"o":{"s":"BTCUSDT","S":"BUY","o":"LIMIT","f":"IOC","q":"0.200","p":"35100.00","ap":"35100.00","X":"FILLED","l":"0.200","z":"0.200","T":1793966401000}}}
+{"stream":"btcusdt@forceOrder","data":{"e":"forceOrder","E":1793966402000,"o":{"s":"BTCUSDT","S":"HOLD","o":"LIMIT","f":"IOC","q":"0.100","p":"34900.00","ap":"34900.00","X":"FILLED","l":"0.100","z":"0.100","T":1793966402000}}}
+{"stream":"btcusdt@forceOrder","data":{"e":"forceOrder","E":1793966403000,"o":{"s":"BTCUSDT","S":"SELL","o":"\u0001LIMIT","f":"IOC","q":"0.300","p":"34800.00","ap":"34800.00","X":"FILLED","l":"0.300","z":"0.300","T":1793966403000}}}
+{"stream":"btcusdt@forceOrder","data":{"e":"forceOrder","E":1793966404000,"o":{"s":"BTCUSDT","S":"SELL","o":"LIMIT","f":"IOC","q":"0.400","p":"34700.00","ap":"34700.00","X":"FILLED","l":"0.400","z":"0.400","T":1793966404000}}}

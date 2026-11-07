@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+from pathlib import Path
 from typing import Annotated, Any
 
 import typer
@@ -12,12 +13,16 @@ from oft.cli.commands.open import open_command
 from oft.cli.commands.scan import scan_app
 from oft.cli.commands.status import status_command
 from oft.cli.commands.watchlist import watchlist_app
-from oft.config import ConfigError, load_settings
+from oft.config import ConfigError, Settings, load_settings
 
 app = typer.Typer(
     help="Order Flow Trading local CLI.",
     no_args_is_help=True,
     add_completion=False,
+)
+daemon_app = typer.Typer(
+    help="Daemon lifecycle (local API/UI plus live ingestion).",
+    no_args_is_help=True,
 )
 
 
@@ -32,23 +37,16 @@ app.command(name="open")(open_command)
 app.add_typer(scan_app, name="scan")
 app.add_typer(watchlist_app, name="watchlist")
 app.add_typer(backfill_app, name="backfill")
+app.add_typer(daemon_app, name="daemon")
 
 _LOOPBACK_HOSTS = frozenset({"127.0.0.1", "localhost", "::1"})
 
 
-@app.command()
-def serve(
-    host: Annotated[str | None, typer.Option("--host", help="Loopback bind address.")] = None,
-    port: Annotated[int | None, typer.Option("--port", help="API port.")] = None,
-    allow_non_loopback: Annotated[
-        bool,
-        typer.Option(
-            "--allow-non-loopback",
-            help="Permit a non-loopback bind (unsupported for shared use).",
-        ),
-    ] = False,
-) -> None:
-    """Start the local API/UI daemon (127.0.0.1:7611 by default)."""
+def _resolve_serve_settings(
+    host: str | None,
+    port: int | None,
+    allow_non_loopback: bool,
+) -> Settings:
     try:
         base = load_settings()
     except ConfigError as exc:
@@ -76,11 +74,13 @@ def serve(
     # CLI overrides must reach the app factory: create_app() must not reload the
     # environment and silently fall back to the default host/port.
     try:
-        settings = load_settings(host=resolved_host, port=resolved_port)
+        return load_settings(host=resolved_host, port=resolved_port)
     except ConfigError as exc:
         emit_error("CONFIG_INVALID", exc.message, json_output=False)
         raise typer.Exit(code=5) from exc
 
+
+def _run_uvicorn(settings: Settings) -> None:
     def app_factory() -> Any:
         from oft.api.app import create_app
 
@@ -96,6 +96,147 @@ def serve(
         log_level=settings.log_level.lower(),
         access_log=False,
     )
+
+
+def _active_symbols(explicit: str | None, starred: tuple[str, ...]) -> tuple[str, ...]:
+    """Resolve the ingestion universe: explicit ``--symbols`` overrides stars.
+
+    Star changes take effect on the next connect/reconnect; the live
+    connection's stream set is fixed when the supervisor is constructed.
+    """
+    if explicit is not None:
+        return tuple(item.strip().upper() for item in explicit.split(",") if item.strip())
+    return tuple(symbol.upper() for symbol in starred)
+
+
+def _run_live_ingestion(settings: Settings, replay_file: Path | None, symbols: str | None) -> None:
+    """Run one ordered replay, or start the continuous live WS ingester."""
+    import threading
+
+    from oft.adapters.parquet_store import (
+        FlushPolicy,
+        LiveParquetBuffer,
+        quarantine_orphan_live_parts,
+    )
+    from oft.application.ingestion_supervisor import IngestionSupervisor, WsStateStore
+    from oft.bootstrap import build_container
+
+    container = build_container(settings, initialize=True)
+    # A crash between rename and manifest insert leaves an unregistered part;
+    # move it aside on startup instead of silently adopting it.
+    quarantine_orphan_live_parts(settings, container.store, clock=container.clock)
+    state_path = settings.data_dir / "run" / "ws_state.json"
+    starred = tuple(contract.symbol for contract in container.symbol_registry.list_starred())
+    symbol_list = _active_symbols(symbols, starred)
+    if replay_file is None:
+        if not symbol_list:
+            # No explicit override and nothing starred: start idle, never default.
+            WsStateStore(state_path, container.clock).write("IDLE", {}, {})
+            return
+        if settings.env.value == "test":
+            # Never open a socket from a test environment.
+            WsStateStore(state_path, container.clock).write("DISCONNECTED", {}, {})
+            return
+        from oft.adapters.binance_rest import BinanceRestClient
+        from oft.adapters.binance_ws import BinanceWsClient
+
+        live_client = BinanceWsClient()
+        live_parquet = LiveParquetBuffer(
+            settings=settings,
+            store=container.store,
+            clock=container.clock,
+            policy=FlushPolicy(),
+        )
+        symbol_provider = None
+        if symbols is None:
+
+            def _starred_provider() -> tuple[str, ...]:
+                return tuple(
+                    contract.symbol for contract in container.symbol_registry.list_starred()
+                )
+
+            symbol_provider = _starred_provider
+        supervisor = IngestionSupervisor(
+            settings=settings,
+            source=(),
+            store=container.store,
+            parquet=live_parquet,
+            clock=container.clock,
+            client=live_client,
+            recovery=BinanceRestClient(),
+            symbols=symbol_list,
+            symbol_provider=symbol_provider,
+        )
+        threading.Thread(
+            target=supervisor.run_forever,
+            name="oft-ws-ingest",
+            daemon=True,
+        ).start()
+        return
+    buffer = LiveParquetBuffer(
+        settings=settings,
+        store=container.store,
+        clock=container.clock,
+        policy=FlushPolicy(),
+    )
+    supervisor = IngestionSupervisor(
+        settings=settings,
+        source=replay_file.read_text(encoding="utf-8").splitlines(),
+        store=container.store,
+        parquet=buffer,
+        clock=container.clock,
+        symbols=symbol_list,
+    )
+    supervisor.run()
+
+
+@app.command()
+def serve(
+    host: Annotated[str | None, typer.Option("--host", help="Loopback bind address.")] = None,
+    port: Annotated[int | None, typer.Option("--port", help="API port.")] = None,
+    allow_non_loopback: Annotated[
+        bool,
+        typer.Option(
+            "--allow-non-loopback",
+            help="Permit a non-loopback bind (unsupported for shared use).",
+        ),
+    ] = False,
+) -> None:
+    """Start the local API/UI daemon (127.0.0.1:7611 by default)."""
+    settings = _resolve_serve_settings(host, port, allow_non_loopback)
+    _run_uvicorn(settings)
+
+
+@daemon_app.command("start")
+def daemon_start(
+    host: Annotated[str | None, typer.Option("--host", help="Loopback bind address.")] = None,
+    port: Annotated[int | None, typer.Option("--port", help="API port.")] = None,
+    allow_non_loopback: Annotated[
+        bool,
+        typer.Option(
+            "--allow-non-loopback",
+            help="Permit a non-loopback bind (unsupported for shared use).",
+        ),
+    ] = False,
+    replay_file: Annotated[
+        Path | None,
+        typer.Option(
+            "--replay-file",
+            help="Replay a recorded WS JSONL fixture before serving.",
+        ),
+    ] = None,
+    symbols: Annotated[
+        str | None,
+        typer.Option(
+            "--symbols",
+            help="Comma-separated symbols for live ingestion; defaults to starred symbols.",
+        ),
+    ] = None,
+) -> None:
+    """Start the local daemon and its live-ingestion supervisor."""
+    settings = _resolve_serve_settings(host, port, allow_non_loopback)
+    _run_live_ingestion(settings, replay_file, symbols)
+    _run_uvicorn(settings)
 
 
 def main() -> None:

@@ -1,0 +1,5 @@
+{"stream":"btcusdt@markPrice@1s","data":{"e":"markPriceUpdate","E":1793966400000,"s":"BTCUSDT","p":"35000.50","i":"34999.00","P":"35000.25","r":"0.00010000","T":1793966520000}}
+{"stream":"btcusdt@markPrice@1s","data":{"e":"markPriceUpdate","E":1793966400000,"s":"BTCUSDT","p":"35000.50","i":"34999.00","P":"35000.25","r":"0.00010000","T":1793966520000}}
+{"stream":"btcusdt@markPrice@1s","data":{"e":"markPriceUpdate","E":1793966401000,"s":"BTCUSDT","p":"-1.00","i":"34999.00","P":"35000.25","r":"0.00010000","T":1793966520000}}
+{"stream":"btcusdt@markPrice@1s","data":{"e":"markPriceUpdate","E":1793966402000,"s":"BTC\u001fUSDT","p":"35001.00","i":"34999.00","P":"35000.25","r":"0.00010000","T":1793966520000}}
+{"stream":"btcusdt@markPrice@1s","data":{"e":"markPriceUpdate","E":1793966403000,"s":"BTCUSDT","p":"35002.00","i":"34999.00","P":"35000.25","r":"0.00010000","T":1793966520000}}

@@ -7,8 +7,10 @@ import json
 import os
 import re
 import uuid
+from collections import OrderedDict
 from collections.abc import Callable, Sequence
-from datetime import UTC, datetime
+from dataclasses import dataclass
+from datetime import UTC, datetime, timedelta
 from decimal import Decimal, InvalidOperation
 from pathlib import Path
 from typing import TYPE_CHECKING, cast
@@ -18,11 +20,18 @@ import pyarrow.parquet as pq
 import structlog
 
 from oft.config import Settings
-from oft.domain.events import AggTrade
+from oft.domain.events import (
+    AggTrade,
+    ForceOrderEvent,
+    KlineEvent,
+    MarkPriceEvent,
+    NormalizedEvent,
+)
 from oft.domain.metrics.footprint import FootprintResult
 from oft.domain.metrics.liquidations import LiquidationEvent, liquidation_sort_key
 from oft.domain.metrics.types import MetricRow, decimal_str
 from oft.domain.time import utc_timestamp
+from oft.ports.clock import ClockPort
 from oft.ports.store import ManifestEntry, StorePort, StoreUnavailableError
 
 if TYPE_CHECKING:
@@ -1099,3 +1108,468 @@ class ParquetStore:
             source=source,
             created_at=ingested_at,
         )
+
+
+@dataclass(frozen=True)
+class FlushPolicy:
+    """Flush live buffers at 30 s or 50k rows (ADR-0008 defaults)."""
+
+    max_rows: int = 50_000
+    max_interval_seconds: float = 30.0
+
+    def __post_init__(self) -> None:
+        if self.max_rows <= 0:
+            raise ValueError("max_rows must be positive")
+        if self.max_interval_seconds <= 0:
+            raise ValueError("max_interval_seconds must be positive")
+
+
+LIVE_METRIC_VERSION = "live.v1.0000000000000000"
+_LIVE_LAYOUT = {
+    "agg_trades": "agg_trades",
+    "klines_1m": "klines_1m",
+    "mark_price_klines": "mark_price_klines",
+}
+
+
+def _content_digest(table: pa.Table) -> str:
+    sink = pa.BufferOutputStream()
+    pq.write_table(table, sink, compression="snappy")
+    return hashlib.sha256(sink.getvalue().to_pybytes()).hexdigest()
+
+
+class LiveParquetBuffer:
+    """Buffer normalized live events and publish immutable Parquet parts.
+
+    Parts follow the existing ``temp -> fsync -> rename`` publication path and
+    are recorded in the manifest immediately, so a restart never sees a part
+    that the manifest does not know about.
+    """
+
+    def __init__(
+        self,
+        *,
+        settings: Settings,
+        store: StorePort,
+        clock: ClockPort,
+        policy: FlushPolicy | None = None,
+        source: str = "live:ws",
+        dedupe_max_keys: int = 200_000,
+    ) -> None:
+        self._settings = settings
+        self._store = store
+        self._writer = ParquetStore(settings)
+        self._clock = clock
+        self._policy = policy or FlushPolicy()
+        self._source = source
+        self._agg: list[AggTrade] = []
+        self._klines: list[KlineEvent] = []
+        self._marks: list[MarkPriceEvent] = []
+        self._liquidations: list[ForceOrderEvent] = []
+        self._last_flush = clock.now()
+        self._flushes = 0
+        self._rows_written = 0
+        self._dedupe_loaded = False
+        self._dedupe_max_keys = dedupe_max_keys
+        # LRU-bounded: (symbol, key) -> ``is_closed`` for klines, True for marks.
+        self._seen_klines: OrderedDict[tuple[str, object], bool] = OrderedDict()
+        self._seen_marks: OrderedDict[tuple[str, object], bool] = OrderedDict()
+        # Open bars are not durable: keep only the latest in memory until closed.
+        self._open_klines: dict[tuple[str, object], object] = {}
+        self._logger = structlog.get_logger(__name__)
+
+    @property
+    def dedupe_keys(self) -> int:
+        return len(self._seen_klines) + len(self._seen_marks)
+
+    def _remember_key(
+        self, keys: OrderedDict[tuple[str, object], bool], key: tuple[str, object], closed: bool
+    ) -> None:
+        if key in keys:
+            keys.pop(key)
+        keys[key] = closed
+        while len(keys) > self._dedupe_max_keys:
+            keys.popitem(last=False)
+
+    def _load_existing_live_keys(self) -> None:
+        """Load persisted kline/mark keys so a lost checkpoint cannot duplicate."""
+        if self._dedupe_loaded:
+            return
+        for entry in self._store.list_manifest():
+            try:
+                if entry.data_type == "klines_1m":
+                    table = pq.read_table(entry.path, columns=["symbol", "open_time", "is_closed"])
+                    for row in table.to_pylist():
+                        key = (str(row["symbol"]), row["open_time"])
+                        if self._seen_klines.get(key) is not True:
+                            self._remember_key(self._seen_klines, key, bool(row["is_closed"]))
+                elif entry.data_type == "mark_price_klines":
+                    table = pq.read_table(entry.path, columns=["symbol", "event_time"])
+                    for row in table.to_pylist():
+                        self._remember_key(
+                            self._seen_marks,
+                            (str(row["symbol"]), row["event_time"]),
+                            True,
+                        )
+            except (OSError, ValueError, pa.ArrowException) as exc:
+                raise StoreUnavailableError(
+                    f"cannot read existing live part {entry.path}: {exc}"
+                ) from exc
+        self._dedupe_loaded = True
+
+    @property
+    def pending_rows(self) -> int:
+        return len(self._agg) + len(self._klines) + len(self._marks) + len(self._liquidations)
+
+    @property
+    def max_rows(self) -> int:
+        return self._policy.max_rows
+
+    def is_due(self, now: datetime | None = None) -> bool:
+        """True when the interval budget elapsed since the last flush."""
+        instant = now or self._clock.now()
+        return (instant - self._last_flush).total_seconds() >= self._policy.max_interval_seconds
+
+    @property
+    def stats(self) -> dict[str, int]:
+        return {
+            "flushes": self._flushes,
+            "rows_written": self._rows_written,
+            "pending_rows": self.pending_rows,
+        }
+
+    def add(self, event: NormalizedEvent) -> None:
+        if isinstance(event, AggTrade):
+            self._agg.append(event)
+        elif isinstance(event, KlineEvent):
+            self._klines.append(event)
+        elif isinstance(event, MarkPriceEvent):
+            self._marks.append(event)
+        elif isinstance(event, ForceOrderEvent):
+            self._liquidations.append(event)
+        else:  # pragma: no cover - the union is closed
+            raise TypeError(f"unsupported live event: {type(event)!r}")
+
+    def should_flush(self, now: datetime | None = None) -> bool:
+        if self.pending_rows == 0:
+            return False
+        if self.pending_rows >= self._policy.max_rows:
+            return True
+        return self.is_due(now)
+
+    def maybe_flush(self, now: datetime | None = None) -> tuple[ManifestEntry, ...]:
+        return self.flush() if self.should_flush(now) else ()
+
+    def flush(self) -> tuple[ManifestEntry, ...]:
+        """Publish every buffered stream type and record manifest rows."""
+        self._load_existing_live_keys()
+        entries: list[ManifestEntry] = []
+        entries.extend(self._write_agg_trades(self._agg))
+        entries.extend(self._write_klines(self._klines))
+        entries.extend(self._write_mark_prices(self._marks))
+        entries.extend(self._write_liquidations(self._liquidations))
+        if entries:
+            self._store.upsert_manifest_entries(tuple(entries))
+        self._agg.clear()
+        self._klines.clear()
+        self._marks.clear()
+        self._liquidations.clear()
+        self._last_flush = self._clock.now()
+        self._flushes += 1
+        self._rows_written += sum(entry.rows for entry in entries)
+        return tuple(entries)
+
+    def _write_agg_trades(self, trades: list[AggTrade]) -> list[ManifestEntry]:
+        if not trades:
+            return []
+        published: list[ManifestEntry] = []
+        by_symbol: dict[str, list[AggTrade]] = {}
+        for trade in trades:
+            by_symbol.setdefault(trade.symbol, []).append(trade)
+        for symbol, symbol_trades in by_symbol.items():
+            published.extend(
+                self._writer.write_agg_trades_batch(
+                    symbol_trades, symbol=symbol, source=self._source
+                )
+            )
+        return published
+
+    def _write_klines(self, klines: list[KlineEvent]) -> list[ManifestEntry]:
+        if not klines:
+            return []
+        published: list[ManifestEntry] = []
+        by_symbol: dict[str, list[KlineEvent]] = {}
+        for event in klines:
+            by_symbol.setdefault(event.symbol, []).append(event)
+        for symbol, events in by_symbol.items():
+            by_day: dict[str, list[KlineEvent]] = {}
+            for event in events:
+                day = event.open_time.astimezone(UTC).date().isoformat()
+                by_day.setdefault(day, []).append(event)
+            for day, day_events in by_day.items():
+                pending: dict[tuple[str, object], KlineEvent] = {}
+                for event in day_events:
+                    key: tuple[str, object] = (symbol, event.open_time)
+                    if self._seen_klines.get(key) is True:
+                        continue  # already final
+                    if not event.is_closed:
+                        # Keep the newest open bar in memory; persist only closed
+                        # bars so the same open_time can never yield two rows.
+                        self._open_klines[key] = event
+                        continue
+                    self._open_klines.pop(key, None)
+                    pending[key] = event  # last closed update wins
+                if not pending:
+                    continue
+                day_events = list(pending.values())
+                table = pa.table(
+                    {
+                        "event_time": pa.array(
+                            [event.event_time.astimezone(UTC) for event in day_events],
+                            pa.timestamp("ms", tz="UTC"),
+                        ),
+                        "open_time": pa.array(
+                            [event.open_time.astimezone(UTC) for event in day_events],
+                            pa.timestamp("ms", tz="UTC"),
+                        ),
+                        "close_time": pa.array(
+                            [event.close_time.astimezone(UTC) for event in day_events],
+                            pa.timestamp("ms", tz="UTC"),
+                        ),
+                        "symbol": pa.array([symbol for _ in day_events], pa.string()),
+                        "interval": pa.array([event.interval for event in day_events], pa.string()),
+                        "open": pa.array([str(event.open) for event in day_events], pa.string()),
+                        "high": pa.array([str(event.high) for event in day_events], pa.string()),
+                        "low": pa.array([str(event.low) for event in day_events], pa.string()),
+                        "close": pa.array([str(event.close) for event in day_events], pa.string()),
+                        "volume": pa.array(
+                            [str(event.volume) for event in day_events], pa.string()
+                        ),
+                        "quote_volume": pa.array(
+                            [str(event.quote_volume) for event in day_events], pa.string()
+                        ),
+                        "trade_count": pa.array(
+                            [event.trade_count for event in day_events], pa.int64()
+                        ),
+                        "taker_buy_volume": pa.array(
+                            [str(event.taker_buy_volume) for event in day_events], pa.string()
+                        ),
+                        "taker_buy_quote_volume": pa.array(
+                            [str(event.taker_buy_quote_volume) for event in day_events],
+                            pa.string(),
+                        ),
+                        "is_closed": pa.array(
+                            [event.is_closed for event in day_events], pa.bool_()
+                        ),
+                        "source": pa.array([self._source for _ in day_events], pa.string()),
+                        "ingested_at": pa.array(
+                            [self._clock.now().astimezone(UTC) for _ in day_events],
+                            pa.timestamp("ms", tz="UTC"),
+                        ),
+                    }
+                )
+                published.append(
+                    self._publish_live_part(
+                        table,
+                        data_type="klines_1m",
+                        symbol=symbol,
+                        day=day,
+                        prefix=f"{day}-kline",
+                    )
+                )
+                for key, event in pending.items():
+                    self._remember_key(self._seen_klines, key, event.is_closed)
+        return published
+
+    def _write_mark_prices(self, marks: list[MarkPriceEvent]) -> list[ManifestEntry]:
+        if not marks:
+            return []
+        published: list[ManifestEntry] = []
+        by_symbol: dict[str, list[MarkPriceEvent]] = {}
+        for event in marks:
+            by_symbol.setdefault(event.symbol, []).append(event)
+        for symbol, events in by_symbol.items():
+            by_day: dict[str, list[MarkPriceEvent]] = {}
+            for event in events:
+                day = event.event_time.astimezone(UTC).date().isoformat()
+                by_day.setdefault(day, []).append(event)
+            for day, day_events in by_day.items():
+                pending_marks: dict[tuple[str, object], MarkPriceEvent] = {}
+                for event in day_events:
+                    key: tuple[str, object] = (symbol, event.event_time)
+                    if key in self._seen_marks:
+                        continue
+                    pending_marks[key] = event
+                if not pending_marks:
+                    continue
+                day_events = list(pending_marks.values())
+                table = pa.table(
+                    {
+                        "event_time": pa.array(
+                            [event.event_time.astimezone(UTC) for event in day_events],
+                            pa.timestamp("ms", tz="UTC"),
+                        ),
+                        "symbol": pa.array([symbol for _ in day_events], pa.string()),
+                        "mark_price": pa.array(
+                            [str(event.mark_price) for event in day_events], pa.string()
+                        ),
+                        "index_price": pa.array(
+                            [str(event.index_price) for event in day_events], pa.string()
+                        ),
+                        "funding_rate": pa.array(
+                            [str(event.funding_rate) for event in day_events], pa.string()
+                        ),
+                        "next_funding_time": pa.array(
+                            [
+                                event.next_funding_time.astimezone(UTC)
+                                if event.next_funding_time is not None
+                                else None
+                                for event in day_events
+                            ],
+                            pa.timestamp("ms", tz="UTC"),
+                        ),
+                        "source": pa.array([self._source for _ in day_events], pa.string()),
+                        "ingested_at": pa.array(
+                            [self._clock.now().astimezone(UTC) for _ in day_events],
+                            pa.timestamp("ms", tz="UTC"),
+                        ),
+                    }
+                )
+                published.append(
+                    self._publish_live_part(
+                        table,
+                        data_type="mark_price_klines",
+                        symbol=symbol,
+                        day=day,
+                        prefix=f"{day}-mark",
+                    )
+                )
+                for key in pending_marks:
+                    self._remember_key(self._seen_marks, key, True)
+        return published
+
+    def _write_liquidations(self, events: list[ForceOrderEvent]) -> list[ManifestEntry]:
+        if not events:
+            return []
+        published: list[ManifestEntry] = []
+        by_symbol: dict[str, list[ForceOrderEvent]] = {}
+        for event in events:
+            by_symbol.setdefault(event.symbol, []).append(event)
+        writer = self._writer
+        for symbol, symbol_events in by_symbol.items():
+            normalized = sorted(
+                (self._liquidation_event(event) for event in symbol_events),
+                key=liquidation_sort_key,
+            )
+            window_start = min(event.received_at for event in normalized)
+            window_end = max(event.received_at for event in normalized) + timedelta(milliseconds=1)
+            published.append(
+                writer.write_liquidation_part(
+                    normalized,
+                    symbol=symbol,
+                    window_start=window_start,
+                    window_end=window_end,
+                    metric_version=LIVE_METRIC_VERSION,
+                    input_manifest_hash="live",
+                    computed_at=utc_timestamp(self._clock.now()),
+                    data_quality="COMPLETE",
+                    quality_reasons=(),
+                )
+            )
+        return published
+
+    def _liquidation_event(self, event: ForceOrderEvent) -> LiquidationEvent:
+        return LiquidationEvent(
+            received_at=event.event_time,
+            trade_time=event.trade_time,
+            symbol=event.symbol,
+            side=event.side,
+            price=event.price,
+            average_price=event.average_price,
+            quantity=event.quantity,
+            order_type=event.order_type,
+            time_in_force=event.time_in_force,
+            order_status=event.order_status,
+            last_fill_quantity=event.last_fill_quantity,
+            source_seq=event.source_seq,
+        )
+
+    def _publish_live_part(
+        self,
+        table: pa.Table,
+        *,
+        data_type: str,
+        symbol: str,
+        day: str,
+        prefix: str,
+    ) -> ManifestEntry:
+        directory = (
+            self._settings.data_dir
+            / "market"
+            / "um"
+            / _LIVE_LAYOUT[data_type]
+            / f"symbol={symbol}"
+            / f"date={day}"
+        )
+        directory.mkdir(parents=True, exist_ok=True)
+        digest = _content_digest(table)
+        final_path, checksum, size = _publish_table(
+            table, directory, name_prefix=prefix, stem_hash=digest
+        )
+        return ManifestEntry(
+            path=str(final_path),
+            data_type=data_type,
+            symbol=symbol,
+            date=day,
+            rows=table.num_rows,
+            bytes=size,
+            checksum=checksum,
+            source=self._source,
+            created_at=utc_timestamp(self._clock.now()),
+        )
+
+
+def quarantine_orphan_live_parts(
+    settings: Settings,
+    store: StorePort,
+    *,
+    clock: ClockPort | None = None,
+) -> tuple[Path, ...]:
+    """Move live Parquet parts with no manifest row into ``quarantine/``.
+
+    A crash between the atomic rename and the manifest transaction leaves an
+    unregistered part; adopting it silently would hide the failure, so it is
+    moved aside and logged instead.
+    """
+    registered = {entry.path for entry in store.list_manifest()}
+    roots = [
+        settings.data_dir / "market" / "um" / name
+        for name in ("agg_trades", "klines_1m", "mark_price_klines")
+    ]
+    roots.append(settings.data_dir / "liquidations")
+    quarantined: list[Path] = []
+    logger = structlog.get_logger(__name__)
+    for root in roots:
+        if not root.is_dir():
+            continue
+        for path in sorted(root.glob("**/part-*.parquet")):
+            if str(path) in registered or not path.is_file():
+                continue
+            relative = path.relative_to(settings.data_dir)
+            destination = settings.data_dir / "quarantine" / relative
+            destination.parent.mkdir(parents=True, exist_ok=True)
+            os.replace(path, destination)
+            _fsync_dir(destination.parent)
+            quarantined.append(destination)
+            logger.warning(
+                "orphan_part_quarantined",
+                path=str(relative),
+                quarantined_as=str(destination.relative_to(settings.data_dir)),
+                observed_at=utc_timestamp((clock or _SystemClock()).now()),
+            )
+    return tuple(quarantined)
+
+
+class _SystemClock:
+    def now(self) -> datetime:
+        return datetime.now(UTC)

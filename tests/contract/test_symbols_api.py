@@ -370,3 +370,97 @@ def test_cli_store_failure_reports_data_unavailable(
     assert payload["ok"] is False
     assert payload["error"]["code"] == "DATA_UNAVAILABLE"
     assert "secret" not in result.output
+
+
+def test_star_and_unstar_symbol_via_patch(
+    settings: Settings, validator: Draft202012Validator
+) -> None:
+    app = create_app(settings)
+
+    with TestClient(app) as client:
+        starred = client.patch(
+            "/api/v1/symbols/BTCUSDT/star", json={"starred": True}, headers=_auth(app)
+        )
+        filtered = client.get("/api/v1/symbols", params={"starred": "true"}, headers=_auth(app))
+        unstarred = client.patch(
+            "/api/v1/symbols/BTCUSDT/star", json={"starred": False}, headers=_auth(app)
+        )
+        empty = client.get("/api/v1/symbols", params={"starred": "true"}, headers=_auth(app))
+
+    assert starred.status_code == 200
+    body = starred.json()
+    _validate(validator, body)
+    assert body["data"] == {
+        "symbol": "BTCUSDT",
+        "starred": True,
+        "starred_at": body["data"]["starred_at"],
+    }
+    assert body["data"]["starred_at"]
+    assert [item["symbol"] for item in filtered.json()["data"]["items"]] == ["BTCUSDT"]
+    assert filtered.json()["data"]["total"] == 1
+    assert unstarred.status_code == 200
+    assert unstarred.json()["data"]["starred"] is False
+    assert empty.json()["data"]["items"] == []
+
+
+def test_star_unknown_symbol_is_not_found(
+    settings: Settings, validator: Draft202012Validator
+) -> None:
+    app = create_app(settings)
+
+    with TestClient(app) as client:
+        response = client.patch(
+            "/api/v1/symbols/NOPEUSDT/star", json={"starred": True}, headers=_auth(app)
+        )
+
+    assert response.status_code == 404
+    assert response.json()["error"]["code"] == "NOT_FOUND"
+
+
+def test_star_requires_a_boolean_body(settings: Settings) -> None:
+    app = create_app(settings)
+
+    with TestClient(app) as client:
+        response = client.patch("/api/v1/symbols/BTCUSDT/star", json={}, headers=_auth(app))
+
+    assert response.status_code == 422
+    assert response.json()["error"]["code"] == "VALIDATION_FAILED"
+
+
+def test_cli_star_unstar_and_starred_list(
+    live_daemon: Settings, validator: Draft202012Validator
+) -> None:
+    runner = CliRunner()
+
+    starred = runner.invoke(cli_app, ["watchlist", "star", "BTCUSDT", "--json"])
+    assert starred.exit_code == 0, starred.output
+    assert json.loads(starred.stdout)["data"]["starred"] is True
+
+    listed = runner.invoke(cli_app, ["watchlist", "list", "--starred", "--format", "json"])
+    assert listed.exit_code == 0, listed.output
+    payload = json.loads(listed.stdout)
+    _validate(validator, payload)
+    assert [item["symbol"] for item in payload["data"]["items"]] == ["BTCUSDT"]
+
+    unstarred = runner.invoke(cli_app, ["watchlist", "unstar", "BTCUSDT", "--json"])
+    assert unstarred.exit_code == 0, unstarred.output
+    empty = runner.invoke(cli_app, ["watchlist", "list", "--starred", "--format", "json"])
+    assert json.loads(empty.stdout)["data"]["items"] == []
+
+
+def test_cli_star_unknown_symbol_exits_nonzero(live_daemon: Settings) -> None:
+    result = CliRunner().invoke(cli_app, ["watchlist", "star", "NOPEUSDT", "--json"])
+
+    assert result.exit_code == 1
+    assert json.loads(result.stdout)["error"]["code"] == "NOT_FOUND"
+
+
+def test_cli_star_without_daemon_reports_daemon_not_running(
+    settings: Settings, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    _configure_cli(monkeypatch, settings)
+
+    result = CliRunner().invoke(cli_app, ["watchlist", "star", "BTCUSDT", "--json"])
+
+    assert result.exit_code == 1
+    assert json.loads(result.stdout)["error"]["code"] == "DAEMON_NOT_RUNNING"

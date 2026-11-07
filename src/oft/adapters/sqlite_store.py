@@ -27,7 +27,7 @@ from oft.ports.store import (
     SymbolUpsertResult,
 )
 
-_SCHEMA_VERSION = 6
+_SCHEMA_VERSION = 7
 STALE_RUNNING_SECONDS = 15 * 60
 _BACKFILL_RUN_STATUSES = ("RUNNING", "COMPLETE", "PARTIAL", "FAILED", "BLOCKED", "STALE")
 _BACKFILL_RUNS_DEFINITION = """
@@ -129,7 +129,10 @@ _SYMBOLS_DEFINITION = """
     onboard_date INTEGER NOT NULL,
     tradifi INTEGER NOT NULL,
     updated_at TEXT NOT NULL,
+    starred INTEGER NOT NULL DEFAULT 0,
+    starred_at TEXT,
     CHECK (tradifi IN (0, 1)),
+    CHECK (starred IN (0, 1)),
     CHECK (price_precision >= 0 AND quantity_precision >= 0),
     CHECK (onboard_date > 0)
 """
@@ -341,6 +344,24 @@ def _migrate_checks_v5(connection: sqlite3.Connection) -> None:
         connection.execute("PRAGMA foreign_keys=ON")
 
 
+def _migrate_symbols_v7(connection: sqlite3.Connection) -> None:
+    """Add the starred/starred_at columns to an existing symbols table."""
+    columns = {row[1] for row in connection.execute("PRAGMA table_info(symbols)")}
+    missing = [name for name in ("starred", "starred_at") if name not in columns]
+    if not missing:
+        return
+    connection.execute("BEGIN IMMEDIATE")
+    try:
+        if "starred" in missing:
+            connection.execute("ALTER TABLE symbols ADD COLUMN starred INTEGER NOT NULL DEFAULT 0")
+        if "starred_at" in missing:
+            connection.execute("ALTER TABLE symbols ADD COLUMN starred_at TEXT")
+        connection.execute("COMMIT")
+    except Exception:
+        connection.execute("ROLLBACK")
+        raise
+
+
 def _migrate_manifest_v6(connection: sqlite3.Connection) -> None:
     """Add nullable metrics provenance columns to the manifest table."""
     columns = {row[1] for row in connection.execute("PRAGMA table_info(manifest)")}
@@ -379,6 +400,8 @@ def initialize_database(settings: Settings) -> None:
             _migrate_checks_v5(connection)
         if _schema_version(connection) < 6 and _table_exists(connection, "manifest"):
             _migrate_manifest_v6(connection)
+        if _schema_version(connection) < 7 and _table_exists(connection, "symbols"):
+            _migrate_symbols_v7(connection)
         with connection:
             connection.executescript(_SCHEMA_SQL)
             connection.execute(
@@ -400,6 +423,10 @@ def initialize_database(settings: Settings) -> None:
             connection.execute(
                 "INSERT OR IGNORE INTO schema_migrations (version, applied_at) VALUES (?, ?)",
                 (5, "2026-11-06T17:00:00.000Z"),
+            )
+            connection.execute(
+                "INSERT OR IGNORE INTO schema_migrations (version, applied_at) VALUES (?, ?)",
+                (6, "2026-11-06T18:00:00.000Z"),
             )
             connection.execute(
                 "INSERT OR IGNORE INTO schema_migrations (version, applied_at) VALUES (?, ?)",
@@ -817,6 +844,7 @@ class SqliteStore:
         query: str | None,
         tradifi: bool | None,
         contract_type: str | None,
+        starred: bool | None = None,
     ) -> tuple[str, list[object]]:
         clauses: list[str] = []
         params: list[object] = []
@@ -832,6 +860,9 @@ class SqliteStore:
         if contract_type:
             clauses.append("contract_type = ?")
             params.append(contract_type)
+        if starred is not None:
+            clauses.append("starred = ?")
+            params.append(int(starred))
         where = f" WHERE {' AND '.join(clauses)}" if clauses else ""
         return where, params
 
@@ -841,6 +872,7 @@ class SqliteStore:
         query: str | None = None,
         tradifi: bool | None = None,
         contract_type: str | None = None,
+        starred: bool | None = None,
         limit: int | None = None,
         offset: int = 0,
     ) -> tuple[SymbolContract, ...]:
@@ -848,7 +880,7 @@ class SqliteStore:
         if connection is None:
             return ()
         where, params = self._symbol_query(
-            query=query, tradifi=tradifi, contract_type=contract_type
+            query=query, tradifi=tradifi, contract_type=contract_type, starred=starred
         )
         if query:
             order = " ORDER BY CASE WHEN symbol = ? THEN 0 ELSE 1 END, tradifi ASC, symbol ASC"
@@ -873,12 +905,13 @@ class SqliteStore:
         query: str | None = None,
         tradifi: bool | None = None,
         contract_type: str | None = None,
+        starred: bool | None = None,
     ) -> int:
         connection = self._connect_read_only()
         if connection is None:
             return 0
         where, params = self._symbol_query(
-            query=query, tradifi=tradifi, contract_type=contract_type
+            query=query, tradifi=tradifi, contract_type=contract_type, starred=starred
         )
         try:
             row = connection.execute(f"SELECT COUNT(*) FROM symbols{where}", params).fetchone()
@@ -899,6 +932,28 @@ class SqliteStore:
         finally:
             connection.close()
         return _row_to_symbol(row) if row is not None else None
+
+    def set_starred(self, symbol: str, starred: bool, *, starred_at: str | None = None) -> bool:
+        with closing(self._connect()) as connection, connection:
+            cursor = connection.execute(
+                "UPDATE symbols SET starred = ?, starred_at = ? WHERE symbol = ?",
+                (int(starred), starred_at if starred else None, symbol),
+            )
+            return cursor.rowcount > 0
+
+    def list_starred(self) -> tuple[SymbolContract, ...]:
+        connection = self._connect_read_only()
+        if connection is None:
+            return ()
+        try:
+            rows = connection.execute(
+                "SELECT * FROM symbols WHERE starred = 1 ORDER BY symbol"
+            ).fetchall()
+        except sqlite3.Error as exc:
+            raise StoreUnavailableError(f"starred symbol read failed: {exc}") from exc
+        finally:
+            connection.close()
+        return tuple(_row_to_symbol(row) for row in rows)
 
     # -- Backfill state --------------------------------------------------
 
