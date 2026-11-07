@@ -23,6 +23,10 @@ _UNSAFE_PATTERNS = (
     re.compile(r"^\s*system\s*:", re.IGNORECASE | re.MULTILINE),
     re.compile(r"<\s*script", re.IGNORECASE),
 )
+# C0 controls (except tab/newline/carriage return) and C1 controls include
+# terminal escape sequences (ESC = \x1b, CSI = \x9b). They are rejected in
+# every model-controlled text field before anything is persisted or rendered.
+_CONTROL_CHARS = re.compile(r"[\x00-\x08\x0b\x0c\x0e-\x1f\x7f-\x9f]")
 
 _ROLE_DECISION_TYPES: dict[str, frozenset[str]] = {
     "ANALYSIS": frozenset({"MARKET_ANALYSIS", "OPPORTUNITY_PROPOSAL"}),
@@ -262,6 +266,8 @@ def _text_errors(field: str, value: str) -> list[SemanticError]:
         errors.append(
             SemanticError(field, "RATIONALE_TOO_LONG", f"{field} exceeds the bounded length")
         )
+    if _CONTROL_CHARS.search(value):
+        errors.append(SemanticError(field, "UNSAFE_TEXT", f"{field} contains a control character"))
     if _unsafe(value):
         errors.append(
             SemanticError(
@@ -270,6 +276,17 @@ def _text_errors(field: str, value: str) -> list[SemanticError]:
                 f"{field} contains a markdown fence or embedded instruction",
             )
         )
+    return errors
+
+
+def _optional_text_errors(field: str, value: str | None) -> list[SemanticError]:
+    return [] if value is None else _text_errors(field, value)
+
+
+def _texts_errors(field: str, values: list[str]) -> list[SemanticError]:
+    errors: list[SemanticError] = []
+    for index, value in enumerate(values):
+        errors.extend(_text_errors(f"{field}[{index}]", value))
     return errors
 
 
@@ -337,8 +354,12 @@ def semantic_errors(output: DecisionOutput, *, role: str) -> tuple[SemanticError
     errors.extend(_timestamp_errors("subject.as_of", output.subject.as_of))
 
     if output.analysis is not None:
+        errors.extend(_text_errors("analysis.market_structure", output.analysis.market_structure))
+        errors.extend(_optional_text_errors("analysis.absorption", output.analysis.absorption))
+        errors.extend(_optional_text_errors("analysis.exhaustion", output.analysis.exhaustion))
         errors.extend(_text_errors("analysis.narrative", output.analysis.narrative))
         for index, zone in enumerate(output.analysis.key_zones):
+            errors.extend(_text_errors(f"analysis.key_zones[{index}].note", zone.note))
             errors.extend(_number_errors(f"analysis.key_zones[{index}].price_low", zone.price_low))
             errors.extend(
                 _number_errors(f"analysis.key_zones[{index}].price_high", zone.price_high)
@@ -353,6 +374,12 @@ def semantic_errors(output: DecisionOutput, *, role: str) -> tuple[SemanticError
                         "key zone low must not exceed high",
                     )
                 )
+        for index, cited in enumerate(output.analysis.metrics_cited):
+            prefix = f"analysis.metrics_cited[{index}]"
+            errors.extend(_optional_text_errors(f"{prefix}.value", cited.value))
+            errors.extend(_text_errors(f"{prefix}.unit", cited.unit))
+            errors.extend(_optional_text_errors(f"{prefix}.ref", cited.ref))
+            errors.extend(_text_errors(f"{prefix}.note", cited.note))
 
     opportunity = output.opportunity
     if opportunity is not None:
@@ -378,6 +405,16 @@ def semantic_errors(output: DecisionOutput, *, role: str) -> tuple[SemanticError
         for index, trigger in enumerate(opportunity.trigger_conditions):
             params = trigger.params
             prefix = f"opportunity.trigger_conditions[{index}].params"
+            errors.extend(
+                _text_errors(
+                    f"opportunity.trigger_conditions[{index}].description", trigger.description
+                )
+            )
+            errors.extend(_optional_text_errors(f"{prefix}.threshold", params.threshold))
+            errors.extend(_optional_text_errors(f"{prefix}.unit", params.unit))
+            errors.extend(_optional_text_errors(f"{prefix}.comparator", params.comparator))
+            errors.extend(_optional_text_errors(f"{prefix}.note", params.note))
+            errors.extend(_texts_errors(f"{prefix}.session_states", params.session_states))
             errors.extend(_number_errors(f"{prefix}.price", params.price))
             errors.extend(_number_errors(f"{prefix}.price_low", params.price_low))
             errors.extend(_number_errors(f"{prefix}.price_high", params.price_high))
@@ -385,6 +422,8 @@ def semantic_errors(output: DecisionOutput, *, role: str) -> tuple[SemanticError
             errors.extend(_timestamp_errors(f"{prefix}.window.end", trigger.window.end))
         for index, invalidation in enumerate(opportunity.invalidation_conditions):
             prefix = f"opportunity.invalidation_conditions[{index}]"
+            errors.extend(_text_errors(f"{prefix}.description", invalidation.description))
+            errors.extend(_optional_text_errors(f"{prefix}.threshold", invalidation.threshold))
             errors.extend(_number_errors(f"{prefix}.price", invalidation.price))
             errors.extend(_timestamp_errors(f"{prefix}.window_end", invalidation.window_end))
         low = _decimal(opportunity.zone_low)
@@ -409,6 +448,16 @@ def semantic_errors(output: DecisionOutput, *, role: str) -> tuple[SemanticError
 
     entry = output.entry_recheck
     if entry is not None:
+        errors.extend(_text_errors("entry_recheck.management_plan", entry.management_plan))
+        errors.extend(_texts_errors("entry_recheck.reasons", entry.reasons))
+        for index, condition in enumerate(entry.recheck_conditions):
+            prefix = f"entry_recheck.recheck_conditions[{index}]"
+            errors.extend(_optional_text_errors(f"{prefix}.observed", condition.observed))
+            errors.extend(_text_errors(f"{prefix}.note", condition.note))
+        for index, invalidation in enumerate(entry.invalidation_conditions):
+            prefix = f"entry_recheck.invalidation_conditions[{index}]"
+            errors.extend(_text_errors(f"{prefix}.description", invalidation.description))
+            errors.extend(_optional_text_errors(f"{prefix}.threshold", invalidation.threshold))
         if entry.decision == "NO_ENTRY" and entry.order_intent is not None:
             errors.append(
                 SemanticError(

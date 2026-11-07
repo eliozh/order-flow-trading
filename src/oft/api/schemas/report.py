@@ -16,7 +16,7 @@ class ScanCreateRequest(BaseModel):
     symbol: str | None = Field(default=None, pattern=r"^[A-Z0-9]{2,24}$")
     period: Literal["1m", "5m", "15m", "1h", "4h", "8h", "1d"] = "4h"
     source: Literal["backfill", "live"] = "backfill"
-    metrics_only: bool = True
+    metrics_only: bool = False
     provider: Literal["stub"] | None = None
     start: date | None = None
     end: date | None = None

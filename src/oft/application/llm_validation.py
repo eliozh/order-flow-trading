@@ -21,6 +21,9 @@ from pydantic import ValidationError
 from oft.domain.llm_output import DecisionOutput, SemanticError, semantic_errors
 
 _CONTRACTS = Path(__file__).resolve().parents[3] / "docs" / "contracts"
+# Reject an oversized body before parsing: an untrusted provider (or a future
+# real adapter) must not be able to force an unbounded allocation.
+MAX_RAW_OUTPUT_CHARS = 256_000
 
 
 @dataclass(frozen=True)
@@ -101,6 +104,14 @@ def _semantic_issues(output: DecisionOutput, role: str) -> list[ValidationIssue]
 def _validate_once(
     raw_text: str, *, role: str
 ) -> tuple[DecisionOutput | None, list[ValidationIssue]]:
+    if len(raw_text) > MAX_RAW_OUTPUT_CHARS:
+        return None, [
+            ValidationIssue(
+                "output",
+                "LLM_SCHEMA_INVALID",
+                f"the provider output exceeds {MAX_RAW_OUTPUT_CHARS} characters",
+            )
+        ]
     text = raw_text.strip()
     if not text:
         return None, [

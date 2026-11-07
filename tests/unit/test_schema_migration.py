@@ -408,6 +408,33 @@ INSERT INTO scan_symbols VALUES (
 """
 
 
+_V9_SCHEMA = """
+CREATE TABLE schema_migrations (
+    version INTEGER PRIMARY KEY,
+    applied_at TEXT NOT NULL
+);
+INSERT INTO schema_migrations (version, applied_at) VALUES (1, 't');
+INSERT INTO schema_migrations (version, applied_at) VALUES (2, 't');
+INSERT INTO schema_migrations (version, applied_at) VALUES (3, 't');
+INSERT INTO schema_migrations (version, applied_at) VALUES (4, 't');
+INSERT INTO schema_migrations (version, applied_at) VALUES (5, 't');
+INSERT INTO schema_migrations (version, applied_at) VALUES (6, 't');
+INSERT INTO schema_migrations (version, applied_at) VALUES (7, 't');
+INSERT INTO schema_migrations (version, applied_at) VALUES (8, 't');
+INSERT INTO schema_migrations (version, applied_at) VALUES (9, 't');
+CREATE TABLE scans (
+    scan_id TEXT PRIMARY KEY,
+    started_at TEXT NOT NULL,
+    created_at TEXT NOT NULL
+);
+CREATE TABLE reports (
+    report_id TEXT PRIMARY KEY,
+    scan_id TEXT NOT NULL,
+    generated_at TEXT NOT NULL
+);
+"""
+
+
 def test_v10_scan_symbols_upgrade_preserves_rows_and_accepts_llm_costs(
     tmp_path: Path,
 ) -> None:
@@ -484,3 +511,55 @@ def test_v10_scan_symbols_upgrade_preserves_rows_and_accepts_llm_costs(
     assert upgraded["ETHUSDT"].cost_usd == "0.0015"
     assert upgraded["ETHUSDT"].cost_unpriced is False
     assert upgraded["SOLUSDT"].stage == "LLM"
+
+
+def test_v9_database_upgrades_to_v10_with_ledgers_and_indexes(tmp_path: Path) -> None:
+    settings = Settings(env="test", port=8765, data_dir=tmp_path / "data")
+    settings.data_dir.mkdir(parents=True)
+    connection = sqlite3.connect(database_path(settings))
+    try:
+        connection.executescript(_V9_SCHEMA)
+        connection.commit()
+    finally:
+        connection.close()
+
+    SqliteStore(settings).initialize()
+
+    connection = sqlite3.connect(database_path(settings))
+    try:
+        versions = {row[0] for row in connection.execute("SELECT version FROM schema_migrations")}
+        tables = {
+            row[0]
+            for row in connection.execute("SELECT name FROM sqlite_master WHERE type = 'table'")
+        }
+        indexes = {
+            row[0]
+            for row in connection.execute("SELECT name FROM sqlite_master WHERE type = 'index'")
+        }
+        report_columns = {row[1] for row in connection.execute("PRAGMA table_info(reports)")}
+        foreign_key_errors = connection.execute("PRAGMA foreign_key_check").fetchall()
+    finally:
+        connection.close()
+
+    assert versions == {1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14}
+    assert "llm_json" in report_columns
+    assert {
+        "llm_calls",
+        "decisions",
+        "budget_ledger",
+        "opportunities",
+        "opportunity_events",
+        "trigger_events",
+        "risk_verdicts",
+        "orders",
+        "fills",
+        "positions",
+        "paper_accounts",
+        "audit_events",
+    } <= tables
+    assert {
+        "fills_order_id",
+        "opportunities_state_created",
+        "trigger_events_triggered_at",
+    } <= indexes
+    assert foreign_key_errors == []

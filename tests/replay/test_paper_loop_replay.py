@@ -33,7 +33,7 @@ def _run(tmp_path: Path) -> dict[str, Any]:
         llm_provider="stub",
         llm_fixtures_dir=FIXTURES,
     )
-    container = build_container(settings, initialize=True)
+    container = build_container(settings, initialize=True, clock=FixedClock(NOW))
     backfill = container.backfill.run(symbol="BTCUSDT", data_type="aggTrades", start=START, end=END)
     assert backfill.run.status == "COMPLETE"
     container = replace(container, clock=FixedClock(NOW))

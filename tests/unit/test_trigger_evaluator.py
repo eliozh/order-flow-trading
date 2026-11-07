@@ -202,3 +202,19 @@ def test_condition_result_serializes_for_the_contract() -> None:
     assert payload["condition_id"] == "C-1"
     assert payload["type"] == "PRICE_TOUCH_ZONE"
     assert payload["met"] is True
+
+
+def test_snapshot_hash_commits_to_the_symbol() -> None:
+    args = {
+        "conditions": (_condition(),),
+        "last_price": Decimal("70000.00"),
+        "snapshot_as_of": "2026-11-06T12:00:00.000Z",
+        "now": "2026-11-06T12:00:00.000Z",
+        "data_quality": "COMPLETE",
+        "snapshot_id": "SNAP-1",
+    }
+
+    btc = evaluate_trigger(**args, symbol="BTCUSDT")
+    eth = evaluate_trigger(**args, symbol="ETHUSDT")
+
+    assert btc.snapshot_hash != eth.snapshot_hash

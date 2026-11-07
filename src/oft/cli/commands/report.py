@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+from decimal import Decimal, InvalidOperation
 from typing import Annotated, Any
 
 import typer
@@ -28,8 +29,8 @@ def _settings_or_exit(json_output: bool) -> Any:
 
 def _signed(value: str) -> str:
     try:
-        number = float(value)
-    except (TypeError, ValueError):
+        number = Decimal(value)
+    except (TypeError, ValueError, InvalidOperation):
         return str(value)
     if number > 0:
         return f"▲ +{value}"

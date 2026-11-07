@@ -147,7 +147,19 @@ class OpportunityService:
             data_quality=data_quality,
             at=at,
         )
-        self._store.save_opportunity(_record(opportunity))
+        created = opportunity.state_history[0]
+        self._store.save_opportunity(
+            _record(opportunity),
+            OpportunityEventRecord(
+                opportunity_id=opportunity.opportunity_id,
+                seq=1,
+                at=created.at,
+                from_state=None,
+                to_state=created.to_state.value,
+                reason_code=created.reason_code,
+                note=created.note,
+            ),
+        )
         return opportunity
 
     def expire(self, opportunity_id: str, *, reason: str = "past expires_at") -> Opportunity:

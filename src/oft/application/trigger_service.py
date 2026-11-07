@@ -42,6 +42,7 @@ class TriggerRun:
     trigger: TriggerEventRecord | None
     evaluation: TriggerEvaluation
     opportunity: Opportunity
+    created: bool = False
 
 
 def _digest(value: str) -> str:
@@ -85,13 +86,21 @@ class TriggerService:
                 opportunity=expired,
             )
 
-        reference_price = price if price is not None else self._reference_price(opportunity)
-        snapshot_as_of = as_of or now
+        if price is not None and as_of is not None:
+            reference_price: Decimal = price
+            snapshot_as_of = as_of
+        else:
+            report_price, report_as_of = self._report_mark(opportunity)
+            reference_price = price if price is not None else report_price
+            # The stale-snapshot guard must see when the frozen report mark was
+            # taken, not the wall clock, or it can never fire.
+            snapshot_as_of = as_of or report_as_of
         resolved_snapshot_id = (
             snapshot_id or f"SNAP-{_digest(f'{opportunity_id}:{snapshot_as_of}')}"
         )
         evaluation = evaluate_trigger(
             opportunity.trigger_conditions,
+            symbol=opportunity.symbol,
             last_price=reference_price,
             snapshot_as_of=snapshot_as_of,
             now=now,
@@ -157,16 +166,23 @@ class TriggerService:
             },
             at=now,
         )
-        return TriggerRun(trigger=record, evaluation=evaluation, opportunity=triggered)
+        return TriggerRun(
+            trigger=record, evaluation=evaluation, opportunity=triggered, created=True
+        )
 
     def list(
-        self, *, opportunity_id: str | None = None, limit: int = 100
+        self, *, opportunity_id: str | None = None, limit: int = 100, offset: int = 0
     ) -> tuple[dict[str, Any], ...]:
         payloads: list[dict[str, Any]] = []
-        for record in self._store.list_trigger_events(opportunity_id=opportunity_id, limit=limit):
+        for record in self._store.list_trigger_events(
+            opportunity_id=opportunity_id, limit=limit, offset=offset
+        ):
             payload: dict[str, Any] = json.loads(record.payload_json)
             payloads.append(payload)
         return tuple(payloads)
+
+    def count(self, *, opportunity_id: str | None = None) -> int:
+        return self._store.count_trigger_events(opportunity_id=opportunity_id)
 
     def show(self, trigger_id: str) -> dict[str, Any]:
         record = self._store.get_trigger_event(trigger_id)
@@ -179,7 +195,7 @@ class TriggerService:
         matches = self._store.list_trigger_events(opportunity_id=opportunity_id, limit=1)
         return matches[0] if matches else None
 
-    def _reference_price(self, opportunity: Opportunity) -> Decimal:
+    def _report_mark(self, opportunity: Opportunity) -> tuple[Decimal, str]:
         report_id = str(opportunity.source.get("report_id", ""))
         report = self._store.get_report(report_id) if report_id else None
         if report is None:
@@ -188,7 +204,10 @@ class TriggerService:
         value = snapshot.get("last_price") or snapshot.get("mark_price")
         if value is None:
             raise TriggerError("DATA_UNAVAILABLE", "the snapshot has no reference price")
-        return Decimal(str(value))
+        as_of = snapshot.get("as_of")
+        if not isinstance(as_of, str) or not as_of:
+            raise TriggerError("DATA_UNAVAILABLE", "the snapshot has no as_of timestamp")
+        return Decimal(str(value)), as_of
 
 
 def _not_evaluated(at: str, reason: str) -> TriggerEvaluation:

@@ -43,6 +43,7 @@ from oft.api.routes.watchlist import router as watchlist_router
 from oft.bootstrap import build_container
 from oft.config import ConfigError, Settings, load_settings
 from oft.logging import configure_logging
+from oft.ports.clock import ClockPort
 from oft.ports.store import StoreUnavailableError
 
 logger = structlog.get_logger(__name__)
@@ -124,14 +125,16 @@ def _is_spa_entry(path: str) -> bool:
     )
 
 
-def create_app(settings: Settings | None = None) -> FastAPI:
+def create_app(settings: Settings | None = None, *, clock: ClockPort | None = None) -> FastAPI:
     """Create the local API application.
 
-    Run with ``uvicorn oft.api.app:create_app --factory``.
+    Run with ``uvicorn oft.api.app:create_app --factory``. ``clock`` is
+    injectable so integration tests and replay never depend on the wall clock
+    (ADR-0011).
     """
     resolved = settings or load_settings()
     configure_logging(resolved)
-    container = build_container(resolved, initialize=True)
+    container = build_container(resolved, initialize=True, clock=clock)
 
     app = FastAPI(
         title="Order Flow Trading",

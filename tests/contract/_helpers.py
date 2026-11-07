@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 import json
-from datetime import date
+from datetime import UTC, date, datetime
 from pathlib import Path
 from typing import Any
 
@@ -13,6 +13,7 @@ from oft.application.kill_switch import KillSwitch
 from oft.application.scan_service import ScanRequest, ScanService
 from oft.application.trigger_service import TriggerService
 from oft.bootstrap import build_container
+from oft.clock import FixedClock
 from oft.config import Settings
 from oft.ports.llm import LLMRole
 
@@ -22,6 +23,7 @@ LLM_FIXTURES = ROOT / "tests" / "fixtures" / "llm"
 CONTRACTS = ROOT / "docs" / "contracts"
 START = date(2026, 10, 1)
 END = date(2026, 10, 7)
+NOW = datetime(2026, 10, 8, tzinfo=UTC)
 
 
 def settings(tmp_path: Path) -> Settings:
@@ -41,7 +43,7 @@ def build_loop(
     entry_fixture: str | None = None,
 ) -> dict[str, Any]:
     resolved = settings(tmp_path)
-    container = build_container(resolved, initialize=True)
+    container = build_container(resolved, initialize=True, clock=FixedClock(NOW))
     backfill = container.backfill.run(symbol="BTCUSDT", data_type="aggTrades", start=START, end=END)
     assert backfill.run.status == "COMPLETE"
     scan = ScanService(container=container, lock=container.scan_lock).run(
