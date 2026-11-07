@@ -215,3 +215,38 @@ def test_configured_logging_writes_a_tailable_daemon_log(
     result = CliRunner().invoke(cli_app, ["daemon", "logs", "--lines", "5"])
     assert result.exit_code == 0, result.output
     assert "daemon_log_probe" in result.output
+
+
+def test_fresh_database_catch_up_runs_only_the_latest_due_window(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from oft.application.scheduler import ScheduleState
+    from oft.bootstrap import build_container
+    from oft.cli.commands import daemon as daemon_module
+
+    settings = _settings(tmp_path)
+    container = build_container(settings, initialize=True)
+    calls: list[object] = []
+    monkeypatch.setattr(
+        daemon_module.ScheduledScanRunner,
+        "run_window",
+        lambda self, window, period="4h": calls.append(window),
+    )
+
+    daemon_module._catch_up_on_start(container, ScheduleState(period="4h"))
+
+    assert len(calls) == 1
+
+
+def test_daemon_start_refuses_a_live_pid(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    from oft.cli.commands import daemon as daemon_module
+
+    settings = _settings(tmp_path)
+    _cli_env(monkeypatch, settings)
+    monkeypatch.setattr(daemon_module, "read_pid", lambda _settings: 4242)
+    monkeypatch.setattr(daemon_module, "process_alive", lambda _pid: True)
+
+    result = CliRunner().invoke(cli_app, ["daemon", "start"])
+
+    assert result.exit_code == 1
+    assert "already running" in result.output

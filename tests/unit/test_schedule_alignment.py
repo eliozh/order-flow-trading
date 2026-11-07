@@ -204,3 +204,65 @@ def test_catch_up_uses_eight_hour_boundaries() -> None:
     )
     assert plan.run_window == DAY.replace(hour=16)
     assert [missed.window_start for missed in plan.missed] == [DAY.replace(hour=8)]
+
+
+def test_no_history_catch_up_respects_the_completed_set() -> None:
+    due = latest_due_window(DAY.replace(hour=13), "4h")
+    plan = plan_catch_up(
+        now=DAY.replace(hour=13),
+        period="4h",
+        last_attempted_window_start=None,
+        completed_window_starts=(due,),
+    )
+    assert plan.run_window is None
+
+
+def test_jitter_must_be_shorter_than_the_period() -> None:
+    from oft.application.scheduler import resolve_schedule_settings
+
+    with pytest.raises(ValueError, match="less than the scan period"):
+        resolve_schedule_settings(
+            {"OFT_SCAN_PERIOD": "4h", "OFT_SCAN_JITTER_SECONDS": str(4 * 3600)}
+        )
+    with pytest.raises(ValueError, match="less than the scan period"):
+        ScheduleState(period="4h", jitter_seconds_max=4 * 3600)
+
+
+def test_date_trigger_has_no_misfire_cap_so_fire_always_reschedules() -> None:
+    from oft.application.scheduler import ScanDaemonScheduler
+    from oft.clock import FixedClock
+
+    scheduler = ScanDaemonScheduler(
+        clock=FixedClock(DAY),
+        state=ScheduleState(period="4h"),
+        job=lambda _window: None,
+    )
+    scheduler._schedule_next()
+    job = scheduler.scheduler.get_job("scan")
+    assert job is not None
+    assert job.misfire_grace_time is None
+    scheduler.shutdown()
+
+
+def test_pending_period_change_is_persisted_and_reloaded(tmp_path) -> None:  # type: ignore[no-untyped-def]
+    from oft.application.scheduler import (
+        ScanDaemonScheduler,
+        load_schedule_state,
+        save_schedule_state,
+    )
+    from oft.clock import FixedClock
+
+    path = tmp_path / "schedule.json"
+    scheduler = ScanDaemonScheduler(
+        clock=FixedClock(DAY),
+        state=ScheduleState(period="4h"),
+        job=lambda _window: None,
+        state_path=path,
+    )
+    scheduler.request_period("8h", now=DAY)
+    loaded = load_schedule_state(path, default=ScheduleState(period="4h"))
+    assert loaded.pending_period == "8h"
+    assert loaded.period_at(DAY + timedelta(hours=4)) == "8h"
+
+    save_schedule_state(path, ScheduleState(period="8h"))
+    assert load_schedule_state(path, default=ScheduleState(period="4h")).period == "8h"

@@ -18,4 +18,6 @@ def test_live_clients_share_limiter_and_ws_budget(tmp_path: Path) -> None:
 
     assert ws_client._subscription_budget is not None
     assert rest_client._rate_limiter is not None
+    assert rest_client._rate_limiter is container.rate_limiter
+    assert ws_client._subscription_budget is container.ws_budget
     assert rest_client._rate_limiter._clock is container.clock

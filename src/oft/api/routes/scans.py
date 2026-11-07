@@ -36,6 +36,7 @@ router = APIRouter()
 
 _IDEMPOTENCY_TTL = timedelta(hours=24)
 _IDEMPOTENCY_LEASE = timedelta(seconds=30)
+_SCAN_HEARTBEAT_SECONDS = 10.0
 _IDEMPOTENCY_HEARTBEAT = timedelta(seconds=10)
 
 
@@ -172,6 +173,25 @@ def _run_metrics_scan(request: Request, payload: ScanCreateRequest) -> dict[str,
             details=_scan_error_details(conflict),
         )
     assert claim.run is not None
+    heartbeat_stop = threading.Event()
+
+    def _heartbeat() -> None:
+        while not heartbeat_stop.wait(_SCAN_HEARTBEAT_SECONDS):
+            try:
+                ledger.heartbeat(claim.run.run_id, owner=claim.run.lease_owner)  # type: ignore[union-attr]
+                ledger.acquire_scan_lock(claim.run.lease_owner)  # type: ignore[union-attr]
+            except Exception as exc:  # noqa: BLE001 - never stop the scan for a heartbeat
+                import structlog
+
+                structlog.get_logger(__name__).warning(
+                    "scan_heartbeat_failed",
+                    run_id=claim.run.run_id,  # type: ignore[union-attr]
+                    owner=claim.run.lease_owner,  # type: ignore[union-attr]
+                    error=str(exc),
+                )
+
+    heartbeat = threading.Thread(target=_heartbeat, daemon=True)
+    heartbeat.start()
     try:
         run = ScanService(container=container, lock=container.scan_lock).run(
             ScanRequest(
@@ -185,14 +205,21 @@ def _run_metrics_scan(request: Request, payload: ScanCreateRequest) -> dict[str,
             scan_id=scan_id,
         )
     except ScanError as exc:
-        ledger.finish(claim.run.run_id, "FAILED", error_code=exc.code)
+        ledger.finish(claim.run.run_id, "FAILED", error_code=exc.code, owner=claim.run.lease_owner)
         raise ApiError(exc.code, exc.message, details=_scan_error_details(exc)) from exc
     except BaseException:
-        ledger.finish(claim.run.run_id, "FAILED", error_code="SCAN_FAILED")
+        ledger.finish(
+            claim.run.run_id,
+            "FAILED",
+            error_code="SCAN_FAILED",
+            owner=claim.run.lease_owner,
+        )
         raise
     else:
-        ledger.finish(claim.run.run_id, "DONE")
+        ledger.finish(claim.run.run_id, "DONE", owner=claim.run.lease_owner)
     finally:
+        heartbeat_stop.set()
+        heartbeat.join(timeout=1)
         ledger.release_scan_lock(claim.run.lease_owner)
     return success_envelope(
         {

@@ -186,3 +186,41 @@ def test_ws_client_rejects_a_connection_over_the_subscription_budget() -> None:
     client = BinanceWsClient(subscription_budget=WsSubscriptionBudget(max_streams=1))
     with pytest.raises(SubscriptionRejectedError, match="budget"):
         client.connect(["btcusdt@aggTrade", "ethusdt@aggTrade"])
+
+
+def test_418_during_a_429_cooldown_upgrades_the_ban_to_120s() -> None:
+    sink = ListAlertSink()
+    clock = FixedClock(NOW)
+    limiter = GlobalRateLimiter(clock=clock, alert_sink=sink)
+    limiter.note_status(429)
+    limiter.note_status(418)
+
+    assert limiter.cooldown_until == NOW + timedelta(seconds=COOLDOWN_418_SECONDS)
+    assert len(sink.alerts) == 1
+
+
+def test_concurrent_acquires_never_overdraw_the_bucket() -> None:
+    import threading
+
+    limiter = GlobalRateLimiter(clock=FixedClock(NOW), capacity=10, refill_per_second=0)
+    results: list[bool] = []
+    lock = threading.Lock()
+
+    def take() -> None:
+        decision = limiter.acquire("/fapi/v1/aggTrades", weight=1)
+        with lock:
+            results.append(decision.allowed)
+
+    threads = [threading.Thread(target=take) for _ in range(50)]
+    for thread in threads:
+        thread.start()
+    for thread in threads:
+        thread.join()
+
+    assert results.count(True) == 10
+
+
+def test_structlog_alert_sink_is_available_for_the_composition_root() -> None:
+    from oft.application.rate_limiter import StructlogAlertSink
+
+    assert StructlogAlertSink() is not None

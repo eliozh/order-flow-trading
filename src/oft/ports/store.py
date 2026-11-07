@@ -393,7 +393,10 @@ class StorePort(Protocol):
         finished_at: str,
         error_code: str | None = None,
         message: str | None = None,
+        lease_owner: str | None = None,
     ) -> bool: ...
+
+    def fail_stale_job_runs(self, *, job_type: str, now: str) -> int: ...
 
     def delete_job_run(self, run_id: str) -> bool: ...
 

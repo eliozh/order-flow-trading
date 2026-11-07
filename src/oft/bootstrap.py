@@ -14,6 +14,11 @@ from oft.adapters.fixture_market_data import FixtureMarketData
 from oft.adapters.parquet_store import ParquetStore
 from oft.adapters.sqlite_store import SqliteStore
 from oft.application.backfill_service import BackfillService
+from oft.application.rate_limiter import (
+    GlobalRateLimiter,
+    StructlogAlertSink,
+    WsSubscriptionBudget,
+)
 from oft.application.status import StatusReport, build_status
 from oft.application.symbol_registry import SymbolRegistry
 from oft.clock import SystemClock
@@ -35,6 +40,8 @@ class AppContainer:
     archive: ArchiveSourcePort
     backfill: BackfillService
     scan_lock: threading.Lock
+    rate_limiter: GlobalRateLimiter
+    ws_budget: WsSubscriptionBudget
 
 
 def _seed_symbol_registry(registry: SymbolRegistry, settings: Settings) -> None:
@@ -56,6 +63,8 @@ def build_container(settings: Settings | None = None, *, initialize: bool = Fals
     store = SqliteStore(resolved)
     parquet = ParquetStore(resolved)
     clock = SystemClock()
+    rate_limiter = GlobalRateLimiter(clock=clock, alert_sink=StructlogAlertSink())
+    ws_budget = WsSubscriptionBudget()
     symbol_registry = SymbolRegistry(store, clock=clock)
     if resolved.archive_fixture_dir is not None:
         archive: ArchiveSourcePort = FixtureArchiveSource(resolved.archive_fixture_dir)
@@ -73,6 +82,7 @@ def build_container(settings: Settings | None = None, *, initialize: bool = Fals
         parquet=parquet,
         store=store,
         clock=clock,
+        rate_limiter=rate_limiter,
     )
     if initialize:
         resolved.data_dir.mkdir(parents=True, exist_ok=True, mode=0o700)
@@ -91,6 +101,8 @@ def build_container(settings: Settings | None = None, *, initialize: bool = Fals
         archive=archive,
         backfill=backfill,
         scan_lock=threading.Lock(),
+        rate_limiter=rate_limiter,
+        ws_budget=ws_budget,
     )
 
 

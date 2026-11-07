@@ -90,7 +90,6 @@ _DATA_GAPS_DEFINITION = """
     run_id TEXT REFERENCES backfill_runs(run_id)
 """
 
-_JOB_RUN_STATUSES = ("RUNNING", "DONE", "FAILED", "MISSED", "SKIPPED")
 _JOB_RUNS_DEFINITION = """
     run_id TEXT PRIMARY KEY,
     job_type TEXT NOT NULL,
@@ -2140,16 +2139,34 @@ class SqliteStore:
         finished_at: str,
         error_code: str | None = None,
         message: str | None = None,
+        lease_owner: str | None = None,
     ) -> bool:
+        owner_clause = " AND lease_owner = ?" if lease_owner is not None else ""
+        params: list[object] = [status, finished_at, error_code, message, run_id]
+        if lease_owner is not None:
+            params.append(lease_owner)
+        with closing(self._connect()) as connection, connection:
+            cursor = connection.execute(
+                f"""
+                UPDATE job_runs SET status = ?, finished_at = ?, error_code = ?, message = ?
+                WHERE run_id = ? AND status = 'RUNNING'{owner_clause}
+                """,
+                tuple(params),
+            )
+        return cursor.rowcount > 0
+
+    def fail_stale_job_runs(self, *, job_type: str, now: str) -> int:
         with closing(self._connect()) as connection, connection:
             cursor = connection.execute(
                 """
-                UPDATE job_runs SET status = ?, finished_at = ?, error_code = ?, message = ?
-                WHERE run_id = ? AND status = 'RUNNING'
+                UPDATE job_runs SET
+                    status = 'FAILED', finished_at = ?, error_code = 'LEASE_EXPIRED',
+                    message = 'stale RUNNING scan lease expired'
+                WHERE job_type = ? AND status = 'RUNNING' AND lease_expires_at <= ?
                 """,
-                (status, finished_at, error_code, message, run_id),
+                (now, job_type, now),
             )
-        return cursor.rowcount > 0
+        return cursor.rowcount
 
     def delete_job_run(self, run_id: str) -> bool:
         with closing(self._connect()) as connection, connection:

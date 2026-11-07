@@ -9,10 +9,12 @@ boundary of the currently active schedule (ADR-0007).
 from __future__ import annotations
 
 import hashlib
+import json
 import os
 from collections.abc import Callable, Mapping
 from dataclasses import dataclass, replace
 from datetime import UTC, datetime, timedelta
+from pathlib import Path
 from typing import Any
 
 from apscheduler.schedulers.background import BackgroundScheduler
@@ -148,8 +150,9 @@ def plan_catch_up(
     replayed (ADR-0007 catch-up policy).
     """
     due = latest_due_window(_require_aware(now), period)
+    completed = {align_to_boundary(item, period) for item in completed_window_starts}
     if last_attempted_window_start is None:
-        return CatchUpPlan(run_window=due, missed=())
+        return CatchUpPlan(run_window=None if due in completed else due, missed=())
     last = align_to_boundary(last_attempted_window_start, period)
     if last >= due:
         return CatchUpPlan(run_window=None, missed=())
@@ -158,7 +161,6 @@ def plan_catch_up(
     if not candidates:
         return CatchUpPlan(run_window=None, missed=())
     latest = candidates[-1]
-    completed = {align_to_boundary(item, period) for item in completed_window_starts}
     missed = tuple(
         MissedWindow(window_start=window, reason=_MISSED_REASON) for window in candidates[:-1]
     )
@@ -183,6 +185,10 @@ class ScheduleState:
             validate_period(self.pending_period)
         if self.effective_from is not None:
             _require_aware(self.effective_from)
+        if self.jitter_seconds_max < 0:
+            raise ValueError("jitter_seconds_max must be >= 0")
+        if self.jitter_seconds_max >= PERIOD_HOURS[self.period] * 3600:
+            raise ValueError("jitter_seconds_max must be less than the scan period")
 
     def period_at(self, instant: datetime) -> str:
         resolved = _require_aware(instant)
@@ -257,7 +263,49 @@ def resolve_schedule_settings(
         raise ValueError(f"OFT_SCAN_JITTER_SECONDS must be an integer, got {raw_jitter!r}") from exc
     if jitter < 0:
         raise ValueError("OFT_SCAN_JITTER_SECONDS must be >= 0")
+    if jitter >= PERIOD_HOURS[period] * 3600:
+        raise ValueError("OFT_SCAN_JITTER_SECONDS must be less than the scan period")
     return ScheduleConfig(period=period, jitter_seconds=jitter)
+
+
+def load_schedule_state(path: Any, *, default: ScheduleState) -> ScheduleState:
+    """Load a persisted period/pending change, falling back to the default."""
+    try:
+        payload = json.loads(Path(path).read_text(encoding="utf-8"))
+    except (OSError, ValueError, TypeError):
+        return default
+    try:
+        effective = payload.get("effective_from")
+        return ScheduleState(
+            period=str(payload.get("period") or default.period),
+            pending_period=payload.get("pending_period") or None,
+            effective_from=(
+                datetime.fromisoformat(str(effective).replace("Z", "+00:00")) if effective else None
+            ),
+            jitter_seconds_max=int(payload.get("jitter_seconds_max", default.jitter_seconds_max)),
+        )
+    except (ValueError, TypeError):
+        return default
+
+
+def save_schedule_state(path: Any, state: ScheduleState) -> None:
+    target = Path(path)
+    target.parent.mkdir(parents=True, exist_ok=True)
+    target.write_text(
+        json.dumps(
+            {
+                "period": state.period,
+                "pending_period": state.pending_period,
+                "effective_from": (
+                    utc_timestamp(state.effective_from)
+                    if state.effective_from is not None
+                    else None
+                ),
+                "jitter_seconds_max": state.jitter_seconds_max,
+            }
+        ),
+        encoding="utf-8",
+    )
 
 
 class ScanDaemonScheduler:
@@ -270,10 +318,12 @@ class ScanDaemonScheduler:
         state: ScheduleState,
         job: Callable[[datetime], Any],
         timezone: str = "UTC",
+        state_path: Any | None = None,
     ) -> None:
         self._clock = clock
         self._state = state
         self._job = job
+        self._state_path = state_path
         self._scheduler = BackgroundScheduler(timezone=timezone)
 
     @property
@@ -289,6 +339,8 @@ class ScanDaemonScheduler:
 
     def request_period(self, new_period: str, *, now: datetime | None = None) -> None:
         self._state = self._state.request_period(new_period, now=now or self._clock.now())
+        if self._state_path is not None:
+            save_schedule_state(self._state_path, self._state)
         self._schedule_next()
 
     def start(self) -> None:
@@ -308,7 +360,7 @@ class ScanDaemonScheduler:
             replace_existing=True,
             max_instances=1,
             coalesce=True,
-            misfire_grace_time=MISFIRE_GRACE_SECONDS,
+            misfire_grace_time=None,
         )
 
     def _fire(self) -> None:

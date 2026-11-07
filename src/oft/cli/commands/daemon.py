@@ -74,13 +74,22 @@ def _settings_or_exit(json_output: bool) -> Settings:
         raise typer.Exit(code=5) from exc
 
 
-def _schedule_state() -> ScheduleState:
+def schedule_state_path(settings: Settings) -> Path:
+    return settings.data_dir / "run" / "schedule.json"
+
+
+def _schedule_state(settings: Settings | None = None) -> ScheduleState:
     try:
         config = resolve_schedule_settings()
     except ValueError as exc:
         emit_error("CONFIG_INVALID", str(exc), json_output=False)
         raise typer.Exit(code=5) from exc
-    return ScheduleState(period=config.period, jitter_seconds_max=config.jitter_seconds)
+    default = ScheduleState(period=config.period, jitter_seconds_max=config.jitter_seconds)
+    if settings is None:
+        return default
+    from oft.application.scheduler import load_schedule_state
+
+    return load_schedule_state(schedule_state_path(settings), default=default)
 
 
 def _last_scheduled_run(settings: Settings) -> Any:
@@ -150,9 +159,20 @@ def daemon_start(
     from oft.cli.main import _resolve_serve_settings, _run_live_ingestion, _run_uvicorn
 
     settings = _resolve_serve_settings(host, port, allow_non_loopback)
-    state = _schedule_state()
-    _run_live_ingestion(settings, replay_file, symbols)
-    scheduler = _start_scheduler(settings, state)
+    pid = read_pid(settings)
+    if pid is not None and process_alive(pid):
+        emit_error(
+            "DAEMON_ALREADY_RUNNING",
+            f"daemon already running with pid {pid}",
+            json_output=False,
+        )
+        raise typer.Exit(code=1)
+    state = _schedule_state(settings)
+    from oft.bootstrap import build_container
+
+    container = build_container(settings, initialize=True)
+    _run_live_ingestion(settings, replay_file, symbols, container=container)
+    scheduler = _start_scheduler(settings, state, container=container)
     try:
         _run_uvicorn(settings)
     finally:
@@ -160,18 +180,32 @@ def daemon_start(
         pid_path(settings).unlink(missing_ok=True)
 
 
-def _start_scheduler(settings: Settings, state: ScheduleState) -> ScanDaemonScheduler:
+def _start_scheduler(
+    settings: Settings,
+    state: ScheduleState,
+    *,
+    container: Any | None = None,
+) -> ScanDaemonScheduler:
     from oft.bootstrap import build_container
 
-    container = build_container(settings, initialize=True)
-    runner = ScheduledScanRunner(container=container)
+    resolved = container or build_container(settings, initialize=True)
+    runner = ScheduledScanRunner(container=resolved)
+    holder: dict[str, ScanDaemonScheduler] = {}
+
+    def _run_due(window: datetime) -> Any:
+        scheduler = holder["scheduler"]
+        period = scheduler.state.period_at(resolved.clock.now())
+        return runner.run_window(window, period=period)
+
     scheduler = ScanDaemonScheduler(
-        clock=container.clock,
+        clock=resolved.clock,
         state=state,
-        job=lambda window: runner.run_window(window, period=state.period_at(container.clock.now())),
+        job=_run_due,
+        state_path=schedule_state_path(settings),
     )
+    holder["scheduler"] = scheduler
     if settings.env != "test":
-        _catch_up_on_start(container, state)
+        _catch_up_on_start(resolved, state)
     scheduler.start()
     write_pid(settings)
     return scheduler
@@ -243,7 +277,7 @@ def daemon_status(
 ) -> None:
     """Show PID state plus the next and last UTC scan windows."""
     settings = _settings_or_exit(json_output)
-    state = _schedule_state()
+    state = _schedule_state(settings)
     payload = _status_payload(settings, state)
     if json_output:
         typer.echo(

@@ -12,7 +12,6 @@ from __future__ import annotations
 
 import threading
 import uuid
-from contextlib import suppress
 from dataclasses import dataclass
 from datetime import datetime, timedelta
 from typing import Any, Protocol
@@ -37,7 +36,6 @@ RUNNING = "RUNNING"
 DONE = "DONE"
 FAILED = "FAILED"
 MISSED = "MISSED"
-SKIPPED = "SKIPPED"
 _TERMINAL_SCAN_STAGES = frozenset({"DONE", "FAILED"})
 
 
@@ -159,6 +157,7 @@ class JobLedger:
         *,
         error_code: str | None = None,
         message: str | None = None,
+        owner: str | None = None,
     ) -> bool:
         return self._store.finish_job_run(
             run_id,
@@ -166,6 +165,7 @@ class JobLedger:
             finished_at=utc_timestamp(self._now()),
             error_code=error_code,
             message=message,
+            lease_owner=owner,
         )
 
     def heartbeat(
@@ -281,17 +281,10 @@ class JobLedger:
         now = self._now()
         stamp = utc_timestamp(now)
         lease_owner = owner or f"scan-{uuid.uuid4().hex[:8]}"
-        # A crashed owner must not block a new manual scan forever: expire
-        # stale RUNNING rows before checking the shared slot.
-        for run in self._store.list_job_runs(SCAN_JOB_TYPE):
-            if run.status == RUNNING and run.lease_expires_at <= stamp:
-                self._store.finish_job_run(
-                    run.run_id,
-                    status=FAILED,
-                    finished_at=stamp,
-                    error_code="LEASE_EXPIRED",
-                    message="stale RUNNING scan lease expired",
-                )
+        # A crashed owner must not block a new manual scan forever. This is a
+        # single conditional UPDATE, so a concurrent heartbeat cannot be
+        # clobbered between a read and a write.
+        self._store.fail_stale_job_runs(job_type=SCAN_JOB_TYPE, now=stamp)
         active = self.active_run(SCAN_JOB_TYPE)
         if active is not None and active.lease_expires_at > stamp:
             return JobClaim(claimed=False, run=active, reason="already_running")
@@ -384,8 +377,21 @@ class ScheduledScanRunner:
                         if item.stage not in _TERMINAL_SCAN_STAGES
                     )
             outcome = self._execute(run, symbols, period=period, trigger_source=run.trigger_source)
-            self._ledger.finish(run.run_id, DONE if not outcome.failed_symbols else FAILED)
+            self._ledger.finish(
+                run.run_id,
+                DONE if not outcome.failed_symbols else FAILED,
+                owner=run.lease_owner,
+            )
             return outcome
+        except BaseException as exc:
+            self._ledger.finish(
+                run.run_id,
+                FAILED,
+                error_code=str(getattr(exc, "code", "JOB_FAILED")),
+                message=str(exc),
+                owner=run.lease_owner,
+            )
+            raise
         finally:
             stop.set()
             beat.join(timeout=1)
@@ -412,8 +418,21 @@ class ScheduledScanRunner:
                 if item.stage not in _TERMINAL_SCAN_STAGES
             )
             outcome = self._execute(run, pending, period=period, trigger_source=run.trigger_source)
-            self._ledger.finish(run.run_id, DONE if not outcome.failed_symbols else FAILED)
+            self._ledger.finish(
+                run.run_id,
+                DONE if not outcome.failed_symbols else FAILED,
+                owner=run.lease_owner,
+            )
             return outcome
+        except BaseException as exc:
+            self._ledger.finish(
+                run.run_id,
+                FAILED,
+                error_code=str(getattr(exc, "code", "JOB_FAILED")),
+                message=str(exc),
+                owner=run.lease_owner,
+            )
+            raise
         finally:
             stop.set()
             beat.join(timeout=1)
@@ -421,8 +440,15 @@ class ScheduledScanRunner:
 
     def _heartbeat_loop(self, run_id: str, owner: str, stop: threading.Event) -> None:
         while not stop.wait(HEARTBEAT_SECONDS):
-            with suppress(Exception):
+            try:
                 self._ledger.heartbeat(run_id, owner=owner)
+                self._ledger.acquire_scan_lock(owner)
+            except Exception as exc:  # noqa: BLE001 - log, keep trying while running
+                import structlog
+
+                structlog.get_logger(__name__).warning(
+                    "job_heartbeat_failed", run_id=run_id, owner=owner, error=str(exc)
+                )
 
     def _execute(
         self,
@@ -506,7 +532,6 @@ __all__ = [
     "RUNNING",
     "SCAN_JOB_TYPE",
     "SCAN_LOCK_NAME",
-    "SKIPPED",
     "ScheduledScanOutcome",
     "ScheduledScanRunner",
 ]

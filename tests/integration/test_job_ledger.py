@@ -330,7 +330,7 @@ def test_restart_resumes_an_unexpired_running_lease(
     assert resumed == [claim.run.run_id]
 
 
-def test_scheduled_runner_heartbeats_during_a_long_window(
+def test_scheduled_runner_heartbeat_loop_renews_without_sleep(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     import oft.application.jobs as jobs_module
@@ -340,30 +340,46 @@ def test_scheduled_runner_heartbeats_during_a_long_window(
     container = build_container(settings, initialize=True)
     runner = ScheduledScanRunner(container=container, clock=FixedClock(NOW))
     calls: list[str] = []
-    original = JobLedger.heartbeat
 
     def counting(self: JobLedger, run_id: str, *, owner: str, lease_seconds: int = 900) -> bool:
         calls.append(run_id)
-        return original(self, run_id, owner=owner, lease_seconds=lease_seconds)
+        return True
 
-    def slow_execute(
-        self: object, run: object, symbols: object, *, period: str, **kwargs: object
-    ) -> object:
-        import time
+    class OneTickStop:
+        ticks = 0
 
-        time.sleep(0.06)
-        from oft.application.jobs import ScheduledScanOutcome
+        def wait(self, _timeout: float) -> bool:
+            self.ticks += 1
+            return self.ticks > 1
 
-        return ScheduledScanOutcome(run=None, claimed=True)
-
-    monkeypatch.setattr(jobs_module, "HEARTBEAT_SECONDS", 0.01)
+    monkeypatch.setattr(jobs_module, "HEARTBEAT_SECONDS", 1)
     monkeypatch.setattr(JobLedger, "heartbeat", counting)
-    monkeypatch.setattr(ScheduledScanRunner, "_execute", slow_execute)
+    runner._heartbeat_loop("JOB-RUN", "owner", OneTickStop())  # type: ignore[arg-type]
 
-    outcome = runner.run_window(WINDOW, period="4h")
+    assert calls == ["JOB-RUN"]
 
-    assert outcome.claimed is True
-    assert calls
+
+def test_scheduled_runner_finishes_failed_on_an_unexpected_exception(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from oft.bootstrap import build_container
+
+    settings = Settings(env="test", port=8765, data_dir=tmp_path / "data")
+    container = build_container(settings, initialize=True)
+    runner = ScheduledScanRunner(container=container, clock=FixedClock(NOW))
+
+    def explode(*args: object, **kwargs: object) -> object:
+        raise RuntimeError("execute exploded")
+
+    monkeypatch.setattr(ScheduledScanRunner, "_execute", explode)
+    with pytest.raises(RuntimeError, match="execute exploded"):
+        runner.run_window(WINDOW, period="4h")
+
+    run = container.store.get_job_run_by_window("scan", utc_timestamp(WINDOW))
+    assert run is not None
+    assert run.status == "FAILED"
+    assert run.error_code == "JOB_FAILED"
+    assert "execute exploded" in (run.message or "")
 
 
 def test_scheduled_lock_contention_defers_instead_of_skipping(tmp_path: Path) -> None:

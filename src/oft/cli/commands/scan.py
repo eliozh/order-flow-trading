@@ -154,24 +154,25 @@ def scan_status(
 
 def _emit_schedule(settings: Any, json_output: bool) -> None:
     """Show the UTC next/last run state without requiring a daemon."""
-    from oft.application.jobs import JobLedger
-    from oft.application.scheduler import (
-        ScheduleState,
-        resolve_schedule_settings,
-    )
+    from oft.application.scheduler import resolve_schedule_settings
     from oft.bootstrap import build_container
     from oft.domain.time import utc_timestamp
 
     try:
-        config = resolve_schedule_settings()
+        resolve_schedule_settings()
     except ValueError as exc:
         emit_error("CONFIG_INVALID", str(exc), json_output=json_output)
         raise typer.Exit(code=5) from exc
 
     container = build_container(settings)
-    state = ScheduleState(period=config.period, jitter_seconds_max=config.jitter_seconds)
+    from oft.cli.commands.daemon import _schedule_state
+
+    state = _schedule_state(settings)
     now = container.clock.now()
-    last = JobLedger(store=container.store, clock=container.clock).latest("scan")
+    last = next(
+        (run for run in container.store.list_job_runs("scan") if run.trigger_source == "SCHEDULED"),
+        None,
+    )
     data: dict[str, Any] = {
         "timezone": "UTC",
         "period": state.period_at(now),

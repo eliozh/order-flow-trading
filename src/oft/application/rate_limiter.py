@@ -8,6 +8,7 @@ tests never sleep.
 
 from __future__ import annotations
 
+import threading
 from dataclasses import dataclass, field
 from datetime import datetime, timedelta
 from typing import Any, Protocol
@@ -107,6 +108,15 @@ class AlertSink(Protocol):
     def alert(self, event: str, payload: dict[str, Any]) -> None: ...
 
 
+class StructlogAlertSink:
+    """Emit rate-limit alerts through the daemon's structured log."""
+
+    def alert(self, event: str, payload: dict[str, Any]) -> None:
+        import structlog
+
+        structlog.get_logger(__name__).error(event, **payload)
+
+
 class ListAlertSink:
     """Recording sink used by tests and the daemon log adapter."""
 
@@ -134,6 +144,7 @@ class GlobalRateLimiter:
         self._bucket = TokenBucket(capacity=self.capacity, refill_per_second=rate)
         self._cooldown_until: datetime | None = None
         self._alert_sink: AlertSink = alert_sink or ListAlertSink()
+        self._lock = threading.RLock()
 
     def _now(self) -> datetime:
         return self._clock.now()
@@ -143,16 +154,18 @@ class GlobalRateLimiter:
         return self._cooldown_until
 
     def available_weight(self) -> float:
-        return self._bucket.available(self._now())
+        with self._lock:
+            return self._bucket.available(self._now())
 
     def in_cooldown(self, now: datetime | None = None) -> bool:
-        instant = now or self._now()
-        if self._cooldown_until is None:
+        with self._lock:
+            instant = now or self._now()
+            if self._cooldown_until is None:
+                return False
+            if instant < self._cooldown_until:
+                return True
+            self._cooldown_until = None
             return False
-        if instant < self._cooldown_until:
-            return True
-        self._cooldown_until = None
-        return False
 
     def _remaining_cooldown(self, now: datetime) -> float:
         if self._cooldown_until is None:
@@ -161,6 +174,12 @@ class GlobalRateLimiter:
 
     def acquire(
         self, path: str, *, now: datetime | None = None, weight: int | None = None
+    ) -> RateLimitDecision:
+        with self._lock:
+            return self._acquire_locked(path, now=now, weight=weight)
+
+    def _acquire_locked(
+        self, path: str, *, now: datetime | None, weight: int | None
     ) -> RateLimitDecision:
         instant = now or self._now()
         resolved_weight = endpoint_weight(path) if weight is None else weight
@@ -194,9 +213,19 @@ class GlobalRateLimiter:
         """Apply a provider response; ``429``/``418`` enter a cooldown once."""
         if status not in (429, 418):
             return None
+        with self._lock:
+            return self._note_status_locked(status, endpoint=endpoint, now=now)
+
+    def _note_status_locked(
+        self, status: int, *, endpoint: str, now: datetime | None
+    ) -> RateLimitDecision:
         instant = now or self._now()
         if self._cooldown_until is not None and instant < self._cooldown_until:
-            # Already cooling down: do not extend or emit a second alert.
+            if status == 418:
+                upgraded = max(
+                    self._cooldown_until, instant + timedelta(seconds=COOLDOWN_418_SECONDS)
+                )
+                self._cooldown_until = upgraded
             return RateLimitDecision(
                 allowed=False,
                 retry_after_seconds=self._remaining_cooldown(instant),

@@ -112,17 +112,20 @@ def _build_limited_clients(container: Any) -> tuple[Any, Any]:
     """Build the live clients sharing one rate bucket and WS stream budget."""
     from oft.adapters.binance_rest import BinanceRestClient
     from oft.adapters.binance_ws import BinanceWsClient
-    from oft.application.rate_limiter import GlobalRateLimiter, WsSubscriptionBudget
 
-    rate_limiter = GlobalRateLimiter(clock=container.clock)
-    ws_budget = WsSubscriptionBudget()
     return (
-        BinanceWsClient(subscription_budget=ws_budget),
-        BinanceRestClient(rate_limiter=rate_limiter),
+        BinanceWsClient(subscription_budget=container.ws_budget),
+        BinanceRestClient(rate_limiter=container.rate_limiter),
     )
 
 
-def _run_live_ingestion(settings: Settings, replay_file: Path | None, symbols: str | None) -> None:
+def _run_live_ingestion(
+    settings: Settings,
+    replay_file: Path | None,
+    symbols: str | None,
+    *,
+    container: Any | None = None,
+) -> None:
     """Run one ordered replay, or start the continuous live WS ingester."""
     import threading
 
@@ -134,7 +137,8 @@ def _run_live_ingestion(settings: Settings, replay_file: Path | None, symbols: s
     from oft.application.ingestion_supervisor import IngestionSupervisor, WsStateStore
     from oft.bootstrap import build_container
 
-    container = build_container(settings, initialize=True)
+    resolved_container = container or build_container(settings, initialize=True)
+    container = resolved_container
     # A crash between rename and manifest insert leaves an unregistered part;
     # move it aside on startup instead of silently adopting it.
     quarantine_orphan_live_parts(settings, container.store, clock=container.clock)
