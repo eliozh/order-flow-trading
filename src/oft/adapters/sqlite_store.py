@@ -18,21 +18,33 @@ from oft.domain.data_quality import DataGap, GapSeverity
 from oft.domain.symbols import SymbolContract
 from oft.domain.time import utc_timestamp
 from oft.ports.store import (
+    AuditEventRecord,
     BackfillManifestRow,
     BackfillRunRecord,
+    BudgetRecord,
+    DecisionRecord,
+    FillRecord,
     IdempotencyRecord,
     JobLockRecord,
     JobRunRecord,
     LeaseLostError,
+    LLMCallRecord,
     ManifestEntry,
+    OpportunityEventRecord,
+    OpportunityRecord,
+    OrderRecord,
+    PaperAccountRecord,
+    PositionRecord,
     ReportRecord,
+    RiskVerdictRecord,
     ScanRecord,
     ScanSymbolRecord,
     StoreUnavailableError,
     SymbolUpsertResult,
+    TriggerEventRecord,
 )
 
-_SCHEMA_VERSION = 9
+_SCHEMA_VERSION = 10
 STALE_RUNNING_SECONDS = 15 * 60
 _BACKFILL_RUN_STATUSES = ("RUNNING", "COMPLETE", "PARTIAL", "FAILED", "BLOCKED", "STALE")
 _BACKFILL_RUNS_DEFINITION = """
@@ -230,7 +242,8 @@ _SCHEMA_SQL = f"""
         narrative_ref TEXT,
         data_quality TEXT NOT NULL,
         snapshot_json TEXT NOT NULL,
-        metrics_json TEXT NOT NULL
+        metrics_json TEXT NOT NULL,
+        llm_json TEXT
     );
     CREATE INDEX IF NOT EXISTS reports_generated_at ON reports(generated_at);
     CREATE INDEX IF NOT EXISTS reports_scan_id ON reports(scan_id);
@@ -285,6 +298,161 @@ _SCHEMA_SQL = f"""
     CREATE TABLE IF NOT EXISTS scan_symbols ({_SCAN_SYMBOLS_DEFINITION});
     CREATE INDEX IF NOT EXISTS scan_symbols_stage ON scan_symbols(scan_id, stage);
     CREATE INDEX IF NOT EXISTS manifest_symbol_date ON manifest(symbol, date);
+    CREATE TABLE IF NOT EXISTS llm_calls (
+        call_id TEXT PRIMARY KEY,
+        decision_id TEXT,
+        role TEXT NOT NULL,
+        provider TEXT NOT NULL,
+        model TEXT NOT NULL,
+        prompt_id TEXT NOT NULL,
+        prompt_version INTEGER NOT NULL,
+        prompt_hash TEXT NOT NULL,
+        input_hash TEXT NOT NULL,
+        attempt INTEGER NOT NULL CHECK (attempt IN (1, 2)),
+        request_id TEXT NOT NULL,
+        status TEXT NOT NULL,
+        raw_output_hash TEXT NOT NULL,
+        usage_json TEXT NOT NULL,
+        latency_ms INTEGER NOT NULL,
+        error_code TEXT,
+        created_at TEXT NOT NULL
+    );
+    CREATE INDEX IF NOT EXISTS llm_calls_decision ON llm_calls(decision_id);
+    CREATE TABLE IF NOT EXISTS decisions (
+        decision_id TEXT PRIMARY KEY,
+        role TEXT NOT NULL,
+        decision_type TEXT NOT NULL,
+        validation_status TEXT NOT NULL,
+        raw_output_hash TEXT NOT NULL,
+        persisted_at TEXT NOT NULL,
+        payload_json TEXT NOT NULL
+    );
+    CREATE INDEX IF NOT EXISTS decisions_status ON decisions(validation_status);
+    CREATE TABLE IF NOT EXISTS budget_ledger (
+        record_id TEXT PRIMARY KEY,
+        call_id TEXT NOT NULL UNIQUE,
+        decision_id TEXT,
+        occurred_at TEXT NOT NULL,
+        provider TEXT NOT NULL,
+        model TEXT NOT NULL,
+        cost_usd TEXT NOT NULL,
+        price_version TEXT NOT NULL,
+        unpriced INTEGER NOT NULL CHECK (unpriced IN (0, 1)),
+        budget_state TEXT NOT NULL,
+        period_day TEXT NOT NULL,
+        payload_json TEXT NOT NULL
+    );
+    CREATE INDEX IF NOT EXISTS budget_ledger_day ON budget_ledger(period_day);
+    CREATE TABLE IF NOT EXISTS opportunities (
+        opportunity_id TEXT PRIMARY KEY,
+        symbol TEXT NOT NULL,
+        state TEXT NOT NULL CHECK (
+            state IN ('OPEN','TRIGGERED','EXPIRED','INVALIDATED')
+        ),
+        created_at TEXT NOT NULL,
+        updated_at TEXT NOT NULL,
+        payload_json TEXT NOT NULL
+    );
+    CREATE INDEX IF NOT EXISTS opportunities_state ON opportunities(state);
+    CREATE TABLE IF NOT EXISTS opportunity_events (
+        opportunity_id TEXT NOT NULL REFERENCES opportunities(opportunity_id),
+        seq INTEGER NOT NULL,
+        at TEXT NOT NULL,
+        from_state TEXT,
+        to_state TEXT NOT NULL,
+        reason_code TEXT NOT NULL,
+        note TEXT NOT NULL,
+        PRIMARY KEY (opportunity_id, seq)
+    );
+    CREATE TABLE IF NOT EXISTS trigger_events (
+        trigger_id TEXT PRIMARY KEY,
+        opportunity_id TEXT NOT NULL,
+        symbol TEXT NOT NULL,
+        status TEXT NOT NULL,
+        idempotency_key TEXT NOT NULL UNIQUE,
+        triggered_at TEXT NOT NULL,
+        payload_json TEXT NOT NULL
+    );
+    CREATE INDEX IF NOT EXISTS trigger_events_opportunity
+        ON trigger_events(opportunity_id);
+    CREATE TABLE IF NOT EXISTS risk_verdicts (
+        risk_verdict_id TEXT PRIMARY KEY,
+        trigger_id TEXT NOT NULL,
+        decision_id TEXT NOT NULL,
+        verdict TEXT NOT NULL CHECK (verdict IN ('ALLOW','REDUCE','BLOCK')),
+        binding_cap TEXT NOT NULL,
+        computed_at TEXT NOT NULL,
+        expires_at TEXT NOT NULL,
+        payload_json TEXT NOT NULL
+    );
+    CREATE TABLE IF NOT EXISTS orders (
+        order_id TEXT PRIMARY KEY,
+        client_order_id TEXT NOT NULL UNIQUE,
+        environment TEXT NOT NULL,
+        symbol TEXT NOT NULL,
+        status TEXT NOT NULL,
+        risk_verdict_id TEXT NOT NULL,
+        idempotency_key TEXT NOT NULL UNIQUE,
+        created_at TEXT NOT NULL,
+        updated_at TEXT NOT NULL,
+        payload_json TEXT NOT NULL
+    );
+    CREATE TABLE IF NOT EXISTS fills (
+        fill_id TEXT PRIMARY KEY,
+        order_id TEXT NOT NULL REFERENCES orders(order_id),
+        environment TEXT NOT NULL,
+        symbol TEXT NOT NULL,
+        filled_at TEXT NOT NULL,
+        payload_json TEXT NOT NULL
+    );
+    CREATE TABLE IF NOT EXISTS positions (
+        position_id TEXT PRIMARY KEY,
+        account_id TEXT NOT NULL,
+        environment TEXT NOT NULL,
+        symbol TEXT NOT NULL,
+        state TEXT NOT NULL,
+        opened_at TEXT NOT NULL,
+        payload_json TEXT NOT NULL
+    );
+    CREATE INDEX IF NOT EXISTS positions_state ON positions(state);
+    CREATE TABLE IF NOT EXISTS paper_accounts (
+        account_id TEXT PRIMARY KEY,
+        environment TEXT NOT NULL,
+        currency TEXT NOT NULL,
+        initial_balance TEXT NOT NULL,
+        balance TEXT NOT NULL,
+        updated_at TEXT NOT NULL
+    );
+    CREATE TABLE IF NOT EXISTS audit_events (
+        event_id TEXT PRIMARY KEY,
+        seq INTEGER NOT NULL UNIQUE,
+        event_type TEXT NOT NULL,
+        created_at TEXT NOT NULL,
+        previous_hash TEXT NOT NULL,
+        event_hash TEXT NOT NULL,
+        payload_json TEXT NOT NULL
+    );
+    CREATE TABLE IF NOT EXISTS prompt_templates (
+        prompt_id TEXT PRIMARY KEY,
+        role TEXT NOT NULL,
+        active_version INTEGER NOT NULL,
+        created_at TEXT NOT NULL,
+        updated_at TEXT NOT NULL
+    );
+    CREATE TABLE IF NOT EXISTS prompt_versions (
+        prompt_id TEXT NOT NULL REFERENCES prompt_templates(prompt_id),
+        version INTEGER NOT NULL,
+        body TEXT NOT NULL,
+        body_hash TEXT NOT NULL,
+        is_active INTEGER NOT NULL CHECK (is_active IN (0, 1)),
+        created_at TEXT NOT NULL,
+        PRIMARY KEY (prompt_id, version)
+    );
+    CREATE TABLE IF NOT EXISTS system_state (
+        key TEXT PRIMARY KEY,
+        value TEXT NOT NULL,
+        updated_at TEXT NOT NULL
+    );
 """
 
 
@@ -523,6 +691,20 @@ def _migrate_scans_v9(connection: sqlite3.Connection) -> None:
         raise
 
 
+def _migrate_reports_v10(connection: sqlite3.Connection) -> None:
+    """Add the additive LLM band column to an existing reports table (v10)."""
+    columns = {row[1] for row in connection.execute("PRAGMA table_info(reports)")}
+    if "llm_json" in columns:
+        return
+    connection.execute("BEGIN IMMEDIATE")
+    try:
+        connection.execute("ALTER TABLE reports ADD COLUMN llm_json TEXT")
+        connection.execute("COMMIT")
+    except Exception:
+        connection.execute("ROLLBACK")
+        raise
+
+
 def initialize_database(settings: Settings) -> None:
     """Create the data directory and the walking-skeleton schema."""
     settings.data_dir.mkdir(parents=True, exist_ok=True)
@@ -554,6 +736,8 @@ def initialize_database(settings: Settings) -> None:
         # older migration expectations remain valid while the columns land.
         if _table_exists(connection, "scans"):
             _migrate_reports_v9(connection)
+        if _table_exists(connection, "reports"):
+            _migrate_reports_v10(connection)
         with connection:
             connection.executescript(_SCHEMA_SQL)
             connection.execute(
@@ -590,7 +774,11 @@ def initialize_database(settings: Settings) -> None:
             )
             connection.execute(
                 "INSERT OR IGNORE INTO schema_migrations (version, applied_at) VALUES (?, ?)",
-                (_SCHEMA_VERSION, "2026-11-06T20:00:00.000Z"),
+                (9, "2026-11-06T20:00:00.000Z"),
+            )
+            connection.execute(
+                "INSERT OR IGNORE INTO schema_migrations (version, applied_at) VALUES (?, ?)",
+                (_SCHEMA_VERSION, "2026-11-08T12:00:00.000Z"),
             )
     finally:
         connection.close()
@@ -632,6 +820,7 @@ def _row_to_scan(row: sqlite3.Row) -> ScanRecord:
 
 
 def _row_to_report(row: sqlite3.Row) -> ReportRecord:
+    keys = row.keys()
     return ReportRecord(
         report_id=row["report_id"],
         scan_id=row["scan_id"],
@@ -644,6 +833,7 @@ def _row_to_report(row: sqlite3.Row) -> ReportRecord:
         data_quality=row["data_quality"],
         snapshot_json=row["snapshot_json"],
         metrics_json=row["metrics_json"],
+        llm_json=row["llm_json"] if "llm_json" in keys else None,
     )
 
 
@@ -988,8 +1178,8 @@ class SqliteStore:
             INSERT INTO reports (
                 report_id, scan_id, symbol, timeframe, generated_at,
                 metrics_manifest_json, llm_decision_id, narrative_ref,
-                data_quality, snapshot_json, metrics_json
-            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                data_quality, snapshot_json, metrics_json, llm_json
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             """,
             (
                 record.report_id,
@@ -1003,6 +1193,7 @@ class SqliteStore:
                 record.data_quality,
                 record.snapshot_json,
                 record.metrics_json,
+                record.llm_json,
             ),
         )
 
@@ -2339,3 +2530,803 @@ class SqliteStore:
         finally:
             connection.close()
         return tuple(_row_to_scan_symbol(row) for row in rows)
+
+    # -- LLM decision ledger ---------------------------------------------
+
+    def save_llm_call(self, record: LLMCallRecord) -> None:
+        with closing(self._connect()) as connection, connection:
+            connection.execute(
+                """
+                INSERT INTO llm_calls (
+                    call_id, decision_id, role, provider, model, prompt_id,
+                    prompt_version, prompt_hash, input_hash, attempt, request_id,
+                    status, raw_output_hash, usage_json, latency_ms, error_code, created_at
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                """,
+                (
+                    record.call_id,
+                    record.decision_id,
+                    record.role,
+                    record.provider,
+                    record.model,
+                    record.prompt_id,
+                    record.prompt_version,
+                    record.prompt_hash,
+                    record.input_hash,
+                    record.attempt,
+                    record.request_id,
+                    record.status,
+                    record.raw_output_hash,
+                    record.usage_json,
+                    record.latency_ms,
+                    record.error_code,
+                    record.created_at,
+                ),
+            )
+
+    def list_llm_calls(
+        self, *, decision_id: str | None = None, role: str | None = None
+    ) -> tuple[LLMCallRecord, ...]:
+        connection = self._connect_read_only()
+        if connection is None:
+            return ()
+        clauses: list[str] = []
+        params: list[object] = []
+        if decision_id is not None:
+            clauses.append("decision_id = ?")
+            params.append(decision_id)
+        if role is not None:
+            clauses.append("role = ?")
+            params.append(role)
+        where = f"WHERE {' AND '.join(clauses)}" if clauses else ""
+        try:
+            rows = connection.execute(
+                f"SELECT * FROM llm_calls {where} ORDER BY created_at, attempt", tuple(params)
+            ).fetchall()
+        finally:
+            connection.close()
+        return tuple(_row_to_llm_call(row) for row in rows)
+
+    def save_decision(self, record: DecisionRecord) -> None:
+        with closing(self._connect()) as connection, connection:
+            connection.execute(
+                """
+                INSERT INTO decisions (
+                    decision_id, role, decision_type, validation_status,
+                    raw_output_hash, persisted_at, payload_json
+                ) VALUES (?, ?, ?, ?, ?, ?, ?)
+                """,
+                (
+                    record.decision_id,
+                    record.role,
+                    record.decision_type,
+                    record.validation_status,
+                    record.raw_output_hash,
+                    record.persisted_at,
+                    record.payload_json,
+                ),
+            )
+
+    def get_decision(self, decision_id: str) -> DecisionRecord | None:
+        connection = self._connect_read_only()
+        if connection is None:
+            return None
+        try:
+            row = connection.execute(
+                "SELECT * FROM decisions WHERE decision_id = ?", (decision_id,)
+            ).fetchone()
+        finally:
+            connection.close()
+        return _row_to_decision(row) if row is not None else None
+
+    def list_decisions(self, *, role: str | None = None) -> tuple[DecisionRecord, ...]:
+        connection = self._connect_read_only()
+        if connection is None:
+            return ()
+        if role is None:
+            query = "SELECT * FROM decisions ORDER BY persisted_at"
+            params: tuple[object, ...] = ()
+        else:
+            query = "SELECT * FROM decisions WHERE role = ? ORDER BY persisted_at"
+            params = (role,)
+        try:
+            rows = connection.execute(query, params).fetchall()
+        finally:
+            connection.close()
+        return tuple(_row_to_decision(row) for row in rows)
+
+    # -- Budget ledger ---------------------------------------------------
+
+    def save_budget_record(self, record: BudgetRecord) -> None:
+        with closing(self._connect()) as connection, connection:
+            connection.execute(
+                """
+                INSERT INTO budget_ledger (
+                    record_id, call_id, decision_id, occurred_at, provider, model,
+                    cost_usd, price_version, unpriced, budget_state, period_day,
+                    payload_json
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                """,
+                (
+                    record.record_id,
+                    record.call_id,
+                    record.decision_id,
+                    record.occurred_at,
+                    record.provider,
+                    record.model,
+                    record.cost_usd,
+                    record.price_version,
+                    int(record.unpriced),
+                    record.budget_state,
+                    record.period_day,
+                    record.payload_json,
+                ),
+            )
+
+    def list_budget_records(self, *, decision_id: str | None = None) -> tuple[BudgetRecord, ...]:
+        connection = self._connect_read_only()
+        if connection is None:
+            return ()
+        if decision_id is None:
+            query = "SELECT * FROM budget_ledger ORDER BY occurred_at"
+            params: tuple[object, ...] = ()
+        else:
+            query = "SELECT * FROM budget_ledger WHERE decision_id = ? ORDER BY occurred_at"
+            params = (decision_id,)
+        try:
+            rows = connection.execute(query, params).fetchall()
+        finally:
+            connection.close()
+        return tuple(_row_to_budget(row) for row in rows)
+
+    # -- Opportunity ledger ----------------------------------------------
+
+    def save_opportunity(self, record: OpportunityRecord) -> None:
+        with closing(self._connect()) as connection, connection:
+            connection.execute(
+                """
+                INSERT INTO opportunities (
+                    opportunity_id, symbol, state, created_at, updated_at, payload_json
+                ) VALUES (?, ?, ?, ?, ?, ?)
+                """,
+                (
+                    record.opportunity_id,
+                    record.symbol,
+                    record.state,
+                    record.created_at,
+                    record.updated_at,
+                    record.payload_json,
+                ),
+            )
+
+    def transition_opportunity(
+        self, record: OpportunityRecord, event: OpportunityEventRecord
+    ) -> bool:
+        with closing(self._connect()) as connection, connection:
+            cursor = connection.execute(
+                """
+                UPDATE opportunities SET state = ?, updated_at = ?, payload_json = ?
+                WHERE opportunity_id = ? AND state != 'TRIGGERED'
+                  AND state != 'EXPIRED' AND state != 'INVALIDATED'
+                """,
+                (
+                    record.state,
+                    record.updated_at,
+                    record.payload_json,
+                    record.opportunity_id,
+                ),
+            )
+            if cursor.rowcount == 0:
+                return False
+            connection.execute(
+                """
+                INSERT INTO opportunity_events (
+                    opportunity_id, seq, at, from_state, to_state, reason_code, note
+                ) VALUES (?, ?, ?, ?, ?, ?, ?)
+                """,
+                (
+                    event.opportunity_id,
+                    event.seq,
+                    event.at,
+                    event.from_state,
+                    event.to_state,
+                    event.reason_code,
+                    event.note,
+                ),
+            )
+        return True
+
+    def get_opportunity(self, opportunity_id: str) -> OpportunityRecord | None:
+        connection = self._connect_read_only()
+        if connection is None:
+            return None
+        try:
+            row = connection.execute(
+                "SELECT * FROM opportunities WHERE opportunity_id = ?", (opportunity_id,)
+            ).fetchone()
+        finally:
+            connection.close()
+        return _row_to_opportunity(row) if row is not None else None
+
+    def list_opportunities(
+        self, *, state: str | None = None, limit: int = 100, offset: int = 0
+    ) -> tuple[OpportunityRecord, ...]:
+        connection = self._connect_read_only()
+        if connection is None:
+            return ()
+        if state is None:
+            query = "SELECT * FROM opportunities ORDER BY created_at DESC LIMIT ? OFFSET ?"
+            params: tuple[object, ...] = (limit, offset)
+        else:
+            query = (
+                "SELECT * FROM opportunities WHERE state = ? "
+                "ORDER BY created_at DESC LIMIT ? OFFSET ?"
+            )
+            params = (state, limit, offset)
+        try:
+            rows = connection.execute(query, params).fetchall()
+        finally:
+            connection.close()
+        return tuple(_row_to_opportunity(row) for row in rows)
+
+    def list_opportunity_events(self, opportunity_id: str) -> tuple[OpportunityEventRecord, ...]:
+        connection = self._connect_read_only()
+        if connection is None:
+            return ()
+        try:
+            rows = connection.execute(
+                "SELECT * FROM opportunity_events WHERE opportunity_id = ? ORDER BY seq",
+                (opportunity_id,),
+            ).fetchall()
+        finally:
+            connection.close()
+        return tuple(_row_to_opportunity_event(row) for row in rows)
+
+    # -- Triggers and risk verdicts --------------------------------------
+
+    def save_trigger_event(self, record: TriggerEventRecord) -> bool:
+        with closing(self._connect()) as connection, connection:
+            cursor = connection.execute(
+                """
+                INSERT OR IGNORE INTO trigger_events (
+                    trigger_id, opportunity_id, symbol, status, idempotency_key,
+                    triggered_at, payload_json
+                ) VALUES (?, ?, ?, ?, ?, ?, ?)
+                """,
+                (
+                    record.trigger_id,
+                    record.opportunity_id,
+                    record.symbol,
+                    record.status,
+                    record.idempotency_key,
+                    record.triggered_at,
+                    record.payload_json,
+                ),
+            )
+        return cursor.rowcount == 1
+
+    def update_trigger_event(self, record: TriggerEventRecord) -> bool:
+        with closing(self._connect()) as connection, connection:
+            cursor = connection.execute(
+                """
+                UPDATE trigger_events SET status = ?, payload_json = ?
+                WHERE trigger_id = ?
+                """,
+                (record.status, record.payload_json, record.trigger_id),
+            )
+        return cursor.rowcount == 1
+
+    def get_trigger_event(self, trigger_id: str) -> TriggerEventRecord | None:
+        connection = self._connect_read_only()
+        if connection is None:
+            return None
+        try:
+            row = connection.execute(
+                "SELECT * FROM trigger_events WHERE trigger_id = ?", (trigger_id,)
+            ).fetchone()
+        finally:
+            connection.close()
+        return _row_to_trigger_event(row) if row is not None else None
+
+    def get_trigger_by_idempotency(self, idempotency_key: str) -> TriggerEventRecord | None:
+        connection = self._connect_read_only()
+        if connection is None:
+            return None
+        try:
+            row = connection.execute(
+                "SELECT * FROM trigger_events WHERE idempotency_key = ?", (idempotency_key,)
+            ).fetchone()
+        finally:
+            connection.close()
+        return _row_to_trigger_event(row) if row is not None else None
+
+    def list_trigger_events(
+        self, *, opportunity_id: str | None = None, limit: int = 100
+    ) -> tuple[TriggerEventRecord, ...]:
+        connection = self._connect_read_only()
+        if connection is None:
+            return ()
+        if opportunity_id is None:
+            query = "SELECT * FROM trigger_events ORDER BY triggered_at DESC LIMIT ?"
+            params: tuple[object, ...] = (limit,)
+        else:
+            query = (
+                "SELECT * FROM trigger_events WHERE opportunity_id = ? "
+                "ORDER BY triggered_at DESC LIMIT ?"
+            )
+            params = (opportunity_id, limit)
+        try:
+            rows = connection.execute(query, params).fetchall()
+        finally:
+            connection.close()
+        return tuple(_row_to_trigger_event(row) for row in rows)
+
+    def save_risk_verdict(self, record: RiskVerdictRecord) -> None:
+        with closing(self._connect()) as connection, connection:
+            connection.execute(
+                """
+                INSERT INTO risk_verdicts (
+                    risk_verdict_id, trigger_id, decision_id, verdict, binding_cap,
+                    computed_at, expires_at, payload_json
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+                """,
+                (
+                    record.risk_verdict_id,
+                    record.trigger_id,
+                    record.decision_id,
+                    record.verdict,
+                    record.binding_cap,
+                    record.computed_at,
+                    record.expires_at,
+                    record.payload_json,
+                ),
+            )
+
+    def get_risk_verdict(self, risk_verdict_id: str) -> RiskVerdictRecord | None:
+        connection = self._connect_read_only()
+        if connection is None:
+            return None
+        try:
+            row = connection.execute(
+                "SELECT * FROM risk_verdicts WHERE risk_verdict_id = ?",
+                (risk_verdict_id,),
+            ).fetchone()
+        finally:
+            connection.close()
+        return _row_to_risk_verdict(row) if row is not None else None
+
+    # -- Paper OMS -------------------------------------------------------
+
+    def save_order_fill_position(
+        self,
+        *,
+        order: OrderRecord,
+        fill: FillRecord,
+        position: PositionRecord,
+        account: PaperAccountRecord,
+    ) -> None:
+        with closing(self._connect()) as connection, connection:
+            connection.execute(
+                """
+                INSERT INTO orders (
+                    order_id, client_order_id, environment, symbol, status,
+                    risk_verdict_id, idempotency_key, created_at, updated_at,
+                    payload_json
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                """,
+                (
+                    order.order_id,
+                    order.client_order_id,
+                    order.environment,
+                    order.symbol,
+                    order.status,
+                    order.risk_verdict_id,
+                    order.idempotency_key,
+                    order.created_at,
+                    order.updated_at,
+                    order.payload_json,
+                ),
+            )
+            connection.execute(
+                """
+                INSERT INTO fills (
+                    fill_id, order_id, environment, symbol, filled_at, payload_json
+                ) VALUES (?, ?, ?, ?, ?, ?)
+                """,
+                (
+                    fill.fill_id,
+                    fill.order_id,
+                    fill.environment,
+                    fill.symbol,
+                    fill.filled_at,
+                    fill.payload_json,
+                ),
+            )
+            connection.execute(
+                """
+                INSERT INTO positions (
+                    position_id, account_id, environment, symbol, state,
+                    opened_at, payload_json
+                ) VALUES (?, ?, ?, ?, ?, ?, ?)
+                """,
+                (
+                    position.position_id,
+                    position.account_id,
+                    position.environment,
+                    position.symbol,
+                    position.state,
+                    position.opened_at,
+                    position.payload_json,
+                ),
+            )
+            connection.execute(
+                """
+                INSERT INTO paper_accounts (
+                    account_id, environment, currency, initial_balance, balance, updated_at
+                ) VALUES (?, ?, ?, ?, ?, ?)
+                ON CONFLICT(account_id) DO UPDATE SET
+                    balance = excluded.balance,
+                    updated_at = excluded.updated_at
+                """,
+                (
+                    account.account_id,
+                    account.environment,
+                    account.currency,
+                    account.initial_balance,
+                    account.balance,
+                    account.updated_at,
+                ),
+            )
+
+    def get_order(self, order_id: str) -> OrderRecord | None:
+        connection = self._connect_read_only()
+        if connection is None:
+            return None
+        try:
+            row = connection.execute(
+                "SELECT * FROM orders WHERE order_id = ?", (order_id,)
+            ).fetchone()
+        finally:
+            connection.close()
+        return _row_to_order(row) if row is not None else None
+
+    def get_order_by_idempotency(self, idempotency_key: str) -> OrderRecord | None:
+        connection = self._connect_read_only()
+        if connection is None:
+            return None
+        try:
+            row = connection.execute(
+                "SELECT * FROM orders WHERE idempotency_key = ?", (idempotency_key,)
+            ).fetchone()
+        finally:
+            connection.close()
+        return _row_to_order(row) if row is not None else None
+
+    def get_order_by_client_order_id(self, client_order_id: str) -> OrderRecord | None:
+        connection = self._connect_read_only()
+        if connection is None:
+            return None
+        try:
+            row = connection.execute(
+                "SELECT * FROM orders WHERE client_order_id = ?", (client_order_id,)
+            ).fetchone()
+        finally:
+            connection.close()
+        return _row_to_order(row) if row is not None else None
+
+    def list_orders(self, *, limit: int = 100) -> tuple[OrderRecord, ...]:
+        connection = self._connect_read_only()
+        if connection is None:
+            return ()
+        try:
+            rows = connection.execute(
+                "SELECT * FROM orders ORDER BY created_at DESC LIMIT ?", (limit,)
+            ).fetchall()
+        finally:
+            connection.close()
+        return tuple(_row_to_order(row) for row in rows)
+
+    def list_fills(self, *, limit: int = 100) -> tuple[FillRecord, ...]:
+        connection = self._connect_read_only()
+        if connection is None:
+            return ()
+        try:
+            rows = connection.execute(
+                "SELECT * FROM fills ORDER BY filled_at DESC LIMIT ?", (limit,)
+            ).fetchall()
+        finally:
+            connection.close()
+        return tuple(_row_to_fill(row) for row in rows)
+
+    def list_positions(
+        self, *, state: str | None = None, limit: int = 100
+    ) -> tuple[PositionRecord, ...]:
+        connection = self._connect_read_only()
+        if connection is None:
+            return ()
+        if state is None:
+            query = "SELECT * FROM positions ORDER BY opened_at DESC LIMIT ?"
+            params: tuple[object, ...] = (limit,)
+        else:
+            query = "SELECT * FROM positions WHERE state = ? ORDER BY opened_at DESC LIMIT ?"
+            params = (state, limit)
+        try:
+            rows = connection.execute(query, params).fetchall()
+        finally:
+            connection.close()
+        return tuple(_row_to_position(row) for row in rows)
+
+    def get_position(self, position_id: str) -> PositionRecord | None:
+        connection = self._connect_read_only()
+        if connection is None:
+            return None
+        try:
+            row = connection.execute(
+                "SELECT * FROM positions WHERE position_id = ?", (position_id,)
+            ).fetchone()
+        finally:
+            connection.close()
+        return _row_to_position(row) if row is not None else None
+
+    def get_paper_account(self, account_id: str) -> PaperAccountRecord | None:
+        connection = self._connect_read_only()
+        if connection is None:
+            return None
+        try:
+            row = connection.execute(
+                "SELECT * FROM paper_accounts WHERE account_id = ?", (account_id,)
+            ).fetchone()
+        finally:
+            connection.close()
+        return _row_to_paper_account(row) if row is not None else None
+
+    def save_paper_account(self, record: PaperAccountRecord) -> None:
+        with closing(self._connect()) as connection, connection:
+            connection.execute(
+                """
+                INSERT INTO paper_accounts (
+                    account_id, environment, currency, initial_balance, balance, updated_at
+                ) VALUES (?, ?, ?, ?, ?, ?)
+                ON CONFLICT(account_id) DO UPDATE SET
+                    balance = excluded.balance,
+                    updated_at = excluded.updated_at
+                """,
+                (
+                    record.account_id,
+                    record.environment,
+                    record.currency,
+                    record.initial_balance,
+                    record.balance,
+                    record.updated_at,
+                ),
+            )
+
+    # -- Audit and system state ------------------------------------------
+
+    def save_audit_event(self, record: AuditEventRecord) -> None:
+        with closing(self._connect()) as connection, connection:
+            connection.execute(
+                """
+                INSERT INTO audit_events (
+                    event_id, seq, event_type, created_at, previous_hash,
+                    event_hash, payload_json
+                ) VALUES (?, ?, ?, ?, ?, ?, ?)
+                """,
+                (
+                    record.event_id,
+                    record.seq,
+                    record.event_type,
+                    record.created_at,
+                    record.previous_hash,
+                    record.event_hash,
+                    record.payload_json,
+                ),
+            )
+
+    def list_audit_events(self, *, limit: int = 100) -> tuple[AuditEventRecord, ...]:
+        connection = self._connect_read_only()
+        if connection is None:
+            return ()
+        try:
+            rows = connection.execute(
+                "SELECT * FROM audit_events ORDER BY seq DESC LIMIT ?", (limit,)
+            ).fetchall()
+        finally:
+            connection.close()
+        return tuple(_row_to_audit(row) for row in rows)
+
+    def last_audit_event(self) -> AuditEventRecord | None:
+        connection = self._connect_read_only()
+        if connection is None:
+            return None
+        try:
+            row = connection.execute(
+                "SELECT * FROM audit_events ORDER BY seq DESC LIMIT 1"
+            ).fetchone()
+        finally:
+            connection.close()
+        return _row_to_audit(row) if row is not None else None
+
+    def get_system_state(self, key: str) -> str | None:
+        connection = self._connect_read_only()
+        if connection is None:
+            return None
+        try:
+            row = connection.execute(
+                "SELECT value FROM system_state WHERE key = ?", (key,)
+            ).fetchone()
+        finally:
+            connection.close()
+        return str(row["value"]) if row is not None else None
+
+    def set_system_state(self, key: str, value: str, *, updated_at: str) -> None:
+        with closing(self._connect()) as connection, connection:
+            connection.execute(
+                """
+                INSERT INTO system_state (key, value, updated_at) VALUES (?, ?, ?)
+                ON CONFLICT(key) DO UPDATE SET
+                    value = excluded.value,
+                    updated_at = excluded.updated_at
+                """,
+                (key, value, updated_at),
+            )
+
+
+def _row_to_llm_call(row: sqlite3.Row) -> LLMCallRecord:
+    return LLMCallRecord(
+        call_id=row["call_id"],
+        decision_id=row["decision_id"],
+        role=row["role"],
+        provider=row["provider"],
+        model=row["model"],
+        prompt_id=row["prompt_id"],
+        prompt_version=row["prompt_version"],
+        prompt_hash=row["prompt_hash"],
+        input_hash=row["input_hash"],
+        attempt=row["attempt"],
+        request_id=row["request_id"],
+        status=row["status"],
+        raw_output_hash=row["raw_output_hash"],
+        usage_json=row["usage_json"],
+        latency_ms=row["latency_ms"],
+        error_code=row["error_code"],
+        created_at=row["created_at"],
+    )
+
+
+def _row_to_decision(row: sqlite3.Row) -> DecisionRecord:
+    return DecisionRecord(
+        decision_id=row["decision_id"],
+        role=row["role"],
+        decision_type=row["decision_type"],
+        validation_status=row["validation_status"],
+        raw_output_hash=row["raw_output_hash"],
+        persisted_at=row["persisted_at"],
+        payload_json=row["payload_json"],
+    )
+
+
+def _row_to_budget(row: sqlite3.Row) -> BudgetRecord:
+    return BudgetRecord(
+        record_id=row["record_id"],
+        call_id=row["call_id"],
+        decision_id=row["decision_id"],
+        occurred_at=row["occurred_at"],
+        provider=row["provider"],
+        model=row["model"],
+        cost_usd=row["cost_usd"],
+        price_version=row["price_version"],
+        unpriced=bool(row["unpriced"]),
+        budget_state=row["budget_state"],
+        period_day=row["period_day"],
+        payload_json=row["payload_json"],
+    )
+
+
+def _row_to_opportunity(row: sqlite3.Row) -> OpportunityRecord:
+    return OpportunityRecord(
+        opportunity_id=row["opportunity_id"],
+        symbol=row["symbol"],
+        state=row["state"],
+        created_at=row["created_at"],
+        updated_at=row["updated_at"],
+        payload_json=row["payload_json"],
+    )
+
+
+def _row_to_opportunity_event(row: sqlite3.Row) -> OpportunityEventRecord:
+    return OpportunityEventRecord(
+        opportunity_id=row["opportunity_id"],
+        seq=row["seq"],
+        at=row["at"],
+        from_state=row["from_state"],
+        to_state=row["to_state"],
+        reason_code=row["reason_code"],
+        note=row["note"],
+    )
+
+
+def _row_to_trigger_event(row: sqlite3.Row) -> TriggerEventRecord:
+    return TriggerEventRecord(
+        trigger_id=row["trigger_id"],
+        opportunity_id=row["opportunity_id"],
+        symbol=row["symbol"],
+        status=row["status"],
+        idempotency_key=row["idempotency_key"],
+        triggered_at=row["triggered_at"],
+        payload_json=row["payload_json"],
+    )
+
+
+def _row_to_risk_verdict(row: sqlite3.Row) -> RiskVerdictRecord:
+    return RiskVerdictRecord(
+        risk_verdict_id=row["risk_verdict_id"],
+        trigger_id=row["trigger_id"],
+        decision_id=row["decision_id"],
+        verdict=row["verdict"],
+        binding_cap=row["binding_cap"],
+        computed_at=row["computed_at"],
+        expires_at=row["expires_at"],
+        payload_json=row["payload_json"],
+    )
+
+
+def _row_to_order(row: sqlite3.Row) -> OrderRecord:
+    return OrderRecord(
+        order_id=row["order_id"],
+        client_order_id=row["client_order_id"],
+        environment=row["environment"],
+        symbol=row["symbol"],
+        status=row["status"],
+        risk_verdict_id=row["risk_verdict_id"],
+        idempotency_key=row["idempotency_key"],
+        created_at=row["created_at"],
+        updated_at=row["updated_at"],
+        payload_json=row["payload_json"],
+    )
+
+
+def _row_to_fill(row: sqlite3.Row) -> FillRecord:
+    return FillRecord(
+        fill_id=row["fill_id"],
+        order_id=row["order_id"],
+        environment=row["environment"],
+        symbol=row["symbol"],
+        filled_at=row["filled_at"],
+        payload_json=row["payload_json"],
+    )
+
+
+def _row_to_position(row: sqlite3.Row) -> PositionRecord:
+    return PositionRecord(
+        position_id=row["position_id"],
+        account_id=row["account_id"],
+        environment=row["environment"],
+        symbol=row["symbol"],
+        state=row["state"],
+        opened_at=row["opened_at"],
+        payload_json=row["payload_json"],
+    )
+
+
+def _row_to_paper_account(row: sqlite3.Row) -> PaperAccountRecord:
+    return PaperAccountRecord(
+        account_id=row["account_id"],
+        environment=row["environment"],
+        currency=row["currency"],
+        initial_balance=row["initial_balance"],
+        balance=row["balance"],
+        updated_at=row["updated_at"],
+    )
+
+
+def _row_to_audit(row: sqlite3.Row) -> AuditEventRecord:
+    return AuditEventRecord(
+        event_id=row["event_id"],
+        seq=row["seq"],
+        event_type=row["event_type"],
+        created_at=row["created_at"],
+        previous_hash=row["previous_hash"],
+        event_hash=row["event_hash"],
+        payload_json=row["payload_json"],
+    )

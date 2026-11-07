@@ -110,3 +110,79 @@ class ApiClient:
 
     def get_latest_backfill(self) -> dict[str, Any]:
         return self._request("GET", "/api/v1/backfill/latest")
+
+    # -- Opportunities ---------------------------------------------------
+
+    def list_opportunities(self, *, state: str | None = None, limit: int = 100) -> dict[str, Any]:
+        query = f"?limit={limit}"
+        if state:
+            query += f"&state={quote(state, safe='')}"
+        return self._request("GET", f"/api/v1/opportunities{query}")
+
+    def get_opportunity(self, opportunity_id: str) -> dict[str, Any]:
+        return self._request("GET", f"/api/v1/opportunities/{quote(opportunity_id, safe='')}")
+
+    def get_opportunity_timeline(self, opportunity_id: str) -> dict[str, Any]:
+        return self._request(
+            "GET", f"/api/v1/opportunities/{quote(opportunity_id, safe='')}/timeline"
+        )
+
+    # -- Triggers --------------------------------------------------------
+
+    def list_triggers(
+        self, *, opportunity_id: str | None = None, limit: int = 100
+    ) -> dict[str, Any]:
+        query = f"?limit={limit}"
+        if opportunity_id:
+            query += f"&opportunity_id={quote(opportunity_id, safe='')}"
+        return self._request("GET", f"/api/v1/triggers{query}")
+
+    def get_trigger(self, trigger_id: str) -> dict[str, Any]:
+        return self._request("GET", f"/api/v1/triggers/{quote(trigger_id, safe='')}")
+
+    def evaluate_trigger(
+        self, payload: dict[str, Any], *, idempotency_key: str | None = None
+    ) -> dict[str, Any]:
+        headers = {"Idempotency-Key": idempotency_key} if idempotency_key else None
+        return self._request("POST", "/api/v1/triggers/evaluate", payload, extra_headers=headers)
+
+    def accept_trigger(self, trigger_id: str, *, idempotency_key: str) -> dict[str, Any]:
+        return self._request(
+            "POST",
+            f"/api/v1/triggers/{quote(trigger_id, safe='')}/accept",
+            {},
+            extra_headers={"Idempotency-Key": idempotency_key},
+        )
+
+    def reject_trigger(
+        self, trigger_id: str, payload: dict[str, Any], *, idempotency_key: str
+    ) -> dict[str, Any]:
+        return self._request(
+            "POST",
+            f"/api/v1/triggers/{quote(trigger_id, safe='')}/reject",
+            payload,
+            extra_headers={"Idempotency-Key": idempotency_key},
+        )
+
+    # -- Paper and kill switch -------------------------------------------
+
+    def paper_balance(self) -> dict[str, Any]:
+        return self._request("GET", "/api/v1/paper/balance")
+
+    def paper_orders(self, limit: int = 100) -> dict[str, Any]:
+        return self._request("GET", f"/api/v1/paper/orders?limit={limit}")
+
+    def paper_fills(self, limit: int = 100) -> dict[str, Any]:
+        return self._request("GET", f"/api/v1/paper/fills?limit={limit}")
+
+    def paper_equity(self) -> dict[str, Any]:
+        return self._request("GET", "/api/v1/paper/equity")
+
+    def kill_status(self) -> dict[str, Any]:
+        return self._request("GET", "/api/v1/kill")
+
+    def set_kill_switch(self, *, active: bool, token: str | None = None) -> dict[str, Any]:
+        payload: dict[str, Any] = {"active": active}
+        if token is not None:
+            payload["token"] = token
+        return self._request("POST", "/api/v1/kill", payload)

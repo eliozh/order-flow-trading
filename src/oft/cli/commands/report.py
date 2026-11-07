@@ -95,14 +95,35 @@ def render_report_table(data: dict[str, Any]) -> str:
         "",
     ]
     llm = data.get("llm") or {}
-    reason = llm.get("reason") or ("LLM not configured; no narrative or decision was generated.")
-    notice = (
-        reason
-        if reason.lower().startswith("llm not configured")
-        else f"LLM not configured — {reason}"
-    )
-    lines.append(notice)
-    lines.append("No LLM call, order, or credential was required or recorded.")
+    if llm.get("configured"):
+        status = str(llm.get("validation_status") or "")
+        if status in {"VALID", "REPAIRED"}:
+            narrative = llm.get("narrative") or llm.get("rationale") or "(no narrative)"
+            lines.append(f"LLM › {narrative}")
+            lines.append(
+                f"LLM decision {llm.get('decision_type', '-')}"
+                f" · confidence {llm.get('confidence', '-')}"
+                f" · provider {llm.get('provider', '-')}/{llm.get('model', '-')}"
+            )
+            opportunities = llm.get("opportunity_ids") or []
+            lines.append(
+                "LLM opportunities " + (", ".join(str(item) for item in opportunities) or "none")
+            )
+        else:
+            reason = llm.get("reason") or "the model output was rejected"
+            lines.append(f"LLM rejected — {reason}")
+            lines.append("No narrative, opportunity, or order was created from this output.")
+    else:
+        reason = llm.get("reason") or (
+            "LLM not configured; no narrative or decision was generated."
+        )
+        notice = (
+            reason
+            if reason.lower().startswith("llm not configured")
+            else f"LLM not configured — {reason}"
+        )
+        lines.append(notice)
+        lines.append("No LLM call, order, or credential was required or recorded.")
     return "\n".join(lines)
 
 

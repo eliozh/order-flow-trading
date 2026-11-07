@@ -105,6 +105,44 @@ ERROR_CATALOG: dict[str, ErrorSpec] = {
         True,
         "A backfill is already running.",
     ),
+    "LLM_PROVIDER_NOT_CONFIGURED": ErrorSpec(
+        412, "LLM", False, "No LLM provider/key is configured for this role."
+    ),
+    "LLM_SCHEMA_INVALID": ErrorSpec(
+        422,
+        "LLM",
+        False,
+        "The model output failed schema or semantic validation after the repair attempt.",
+    ),
+    "LLM_OUTPUT_TRUNCATED": ErrorSpec(
+        422, "LLM", False, "The model output was truncated (incomplete status)."
+    ),
+    "LLM_REFUSED": ErrorSpec(422, "LLM", False, "The model refused the request."),
+    "KILL_SWITCH_ACTIVE": ErrorSpec(
+        423, "RISK", False, "The kill switch blocks new orders and LLM-driven execution."
+    ),
+    "RISK_BLOCKED": ErrorSpec(422, "RISK", False, "The deterministic risk gate blocked the order."),
+    "RISK_DATA_INCOMPLETE": ErrorSpec(
+        409,
+        "RISK",
+        True,
+        "A required risk input (mark, bracket, balance, position) is missing or stale.",
+    ),
+    "ORDER_REJECTED": ErrorSpec(
+        422,
+        "EXECUTION",
+        False,
+        "Binance rejected the order (filters, margin, permissions, or state).",
+    ),
+    "ORDER_DUPLICATE": ErrorSpec(
+        409,
+        "EXECUTION",
+        False,
+        "An order with this client order id or idempotency key already exists.",
+    ),
+    "ORDER_NOT_FOUND": ErrorSpec(
+        404, "EXECUTION", False, "The order is not known locally or at the exchange."
+    ),
 }
 
 

@@ -56,10 +56,17 @@ def _render_run(data: dict[str, Any]) -> str:
     lines = [render_scan_table(ScanRecord(**scan_data))]
     report = data.get("report")
     if isinstance(report, dict):
+        llm = report.get("llm") or {}
         lines.append("")
         lines.append(f"Report            {report.get('report_id', '-')}")
         lines.append(f"Report quality    {report.get('data_quality', '-')}")
-        lines.append("LLM               not configured (metrics-only CALC report)")
+        if llm.get("configured"):
+            lines.append(
+                f"LLM               {llm.get('validation_status', '-')}"
+                f" · opportunities {', '.join(llm.get('opportunity_ids') or []) or 'none'}"
+            )
+        else:
+            lines.append("LLM               not configured (metrics-only CALC report)")
     return "\n".join(lines)
 
 
@@ -76,8 +83,15 @@ def run(
     ] = "backfill",
     metrics_only: Annotated[
         bool,
-        typer.Option("--metrics-only/--no-metrics-only", help="CALC-only scan."),
-    ] = True,
+        typer.Option(
+            "--metrics-only/--no-metrics-only",
+            help="Force a CALC-only scan; the default uses the configured provider.",
+        ),
+    ] = False,
+    provider: Annotated[
+        str | None,
+        typer.Option("--provider", help="Provider override for this scan (stub)."),
+    ] = None,
     idempotency_key: Annotated[
         str | None,
         typer.Option("--idempotency-key", help="Reuse a key for safe scripted retries."),
@@ -104,6 +118,8 @@ def run(
             "source": source,
             "metrics_only": metrics_only,
         }
+        if provider is not None:
+            payload["provider"] = provider
         key = idempotency_key or f"cli-{uuid.uuid4().hex}"
 
     try:

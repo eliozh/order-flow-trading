@@ -1,0 +1,23 @@
+{
+  "decision_type": "MARKET_ANALYSIS",
+  "subject": {
+    "symbol": "BTCUSDT",
+    "timeframe": "4h",
+    "as_of": "2026-11-06T12:00:00.000Z"
+  },
+  "confidence": 0.61,
+  "rationale": "Range rotation with neutral delta and no confirmed edge.",
+  "caveats": ["No actionable setup"],
+  "analysis": {
+    "market_structure": "Balanced range.",
+    "regime": "RANGE",
+    "absorption": null,
+    "exhaustion": null,
+    "key_zones": [],
+    "narrative": "The market is balanced; no trigger condition is proposed.",
+    "metrics_cited": []
+  },
+  "opportunity": null,
+  "entry_recheck": null,
+  "position_management": null
+}

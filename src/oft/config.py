@@ -21,6 +21,7 @@ DEFAULT_EXCHANGE_INFO_FIXTURE = (
     / "binance"
     / "exchange_info_sample.json"
 )
+DEFAULT_LLM_FIXTURES_DIR = Path(__file__).resolve().parents[2] / "tests" / "fixtures" / "llm"
 
 
 class Environment(StrEnum):
@@ -64,6 +65,16 @@ class Settings(BaseSettings):
     allow_fixture_scan_debug: bool = False
     log_level: str = "INFO"
 
+    # LLM configuration. No default provider/model is shipped (plan §2.2).
+    llm_provider: str | None = None
+    llm_model: str = "fixture"
+    llm_fixtures_dir: Path = DEFAULT_LLM_FIXTURES_DIR
+
+    # Paper broker defaults (ADR-0006). Decimal strings, never floats.
+    paper_initial_balance: str = "10000.00"
+    paper_slippage_bps: str = "2"
+    paper_taker_fee_bps: str = "5"
+
     api_token: SecretStr | None = None
     binance_api_key: SecretStr | None = None
     binance_api_secret: SecretStr | None = None
@@ -80,10 +91,24 @@ class Settings(BaseSettings):
             raise ValueError(f"log_level must be one of {sorted(_VALID_LOG_LEVELS)}")
         return level
 
-    @field_validator("data_dir", "fixtures_dir", "klines_fixture", "exchange_info_fixture")
+    @field_validator(
+        "data_dir",
+        "fixtures_dir",
+        "klines_fixture",
+        "exchange_info_fixture",
+        "llm_fixtures_dir",
+    )
     @classmethod
     def _expand_paths(cls, value: Path) -> Path:
         return value.expanduser()
+
+    @field_validator("llm_provider")
+    @classmethod
+    def _normalize_provider(cls, value: str | None) -> str | None:
+        if value is None:
+            return None
+        normalized = value.strip().lower()
+        return normalized or None
 
     @field_validator("archive_fixture_dir")
     @classmethod

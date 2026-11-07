@@ -1,0 +1,31 @@
+{
+  "decision_type": "ENTRY_RECHECK",
+  "subject": {
+    "symbol": "BTCUSDT",
+    "timeframe": "4h",
+    "as_of": "2026-11-06T12:05:00.000Z"
+  },
+  "confidence": 0.66,
+  "rationale": "Entry proposed without a protective stop; the risk gate must block it.",
+  "caveats": [],
+  "analysis": null,
+  "opportunity": null,
+  "entry_recheck": {
+    "decision": "ENTER_LONG",
+    "order_intent": {
+      "entry_type": "MARKET",
+      "entry_price": "70000.00",
+      "stop_price": null,
+      "take_profits": ["72000.00"],
+      "size_mode": "QUOTE_NOTIONAL",
+      "risk_pct": 0.8,
+      "quote_notional_usd": "1000.00",
+      "leverage": 2.0
+    },
+    "recheck_conditions": [],
+    "reasons": ["setup still valid"],
+    "invalidation_conditions": [],
+    "management_plan": ""
+  },
+  "position_management": null
+}

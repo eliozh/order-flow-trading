@@ -110,6 +110,7 @@ class ReportRecord:
     data_quality: str
     snapshot_json: str
     metrics_json: str
+    llm_json: str | None = None
 
 
 @dataclass(frozen=True)
@@ -206,6 +207,168 @@ class ScanSymbolRecord:
     error_code: str | None
     report_id: str | None
     data_quality: str | None
+
+
+@dataclass(frozen=True)
+class LLMCallRecord:
+    """One provider call attempt, including the repair attempt (``attempt=2``)."""
+
+    call_id: str
+    role: str
+    provider: str
+    model: str
+    prompt_id: str
+    prompt_version: int
+    prompt_hash: str
+    input_hash: str
+    attempt: int
+    request_id: str
+    status: str
+    raw_output_hash: str
+    usage_json: str
+    latency_ms: int
+    created_at: str
+    decision_id: str | None = None
+    error_code: str | None = None
+
+
+@dataclass(frozen=True)
+class DecisionRecord:
+    """The persisted ``llm-decision`` envelope plus query keys."""
+
+    decision_id: str
+    role: str
+    decision_type: str
+    validation_status: str
+    raw_output_hash: str
+    persisted_at: str
+    payload_json: str
+
+
+@dataclass(frozen=True)
+class BudgetRecord:
+    """One per-call budget ledger row (rollups are derived, never hand-edited)."""
+
+    record_id: str
+    call_id: str
+    decision_id: str | None
+    occurred_at: str
+    provider: str
+    model: str
+    cost_usd: str
+    price_version: str
+    unpriced: bool
+    budget_state: str
+    period_day: str
+    payload_json: str
+
+
+@dataclass(frozen=True)
+class OpportunityRecord:
+    """The persisted ``opportunity`` contract envelope plus query keys."""
+
+    opportunity_id: str
+    symbol: str
+    state: str
+    created_at: str
+    updated_at: str
+    payload_json: str
+
+
+@dataclass(frozen=True)
+class OpportunityEventRecord:
+    """One append-only state history entry."""
+
+    opportunity_id: str
+    seq: int
+    at: str
+    from_state: str | None
+    to_state: str
+    reason_code: str
+    note: str
+
+
+@dataclass(frozen=True)
+class TriggerEventRecord:
+    """The persisted ``trigger-event`` contract envelope plus query keys."""
+
+    trigger_id: str
+    opportunity_id: str
+    symbol: str
+    status: str
+    idempotency_key: str
+    triggered_at: str
+    payload_json: str
+
+
+@dataclass(frozen=True)
+class RiskVerdictRecord:
+    """A persisted deterministic risk verdict."""
+
+    risk_verdict_id: str
+    trigger_id: str
+    decision_id: str
+    verdict: str
+    binding_cap: str
+    computed_at: str
+    expires_at: str
+    payload_json: str
+
+
+@dataclass(frozen=True)
+class OrderRecord:
+    order_id: str
+    client_order_id: str
+    environment: str
+    symbol: str
+    status: str
+    risk_verdict_id: str
+    idempotency_key: str
+    created_at: str
+    updated_at: str
+    payload_json: str
+
+
+@dataclass(frozen=True)
+class FillRecord:
+    fill_id: str
+    order_id: str
+    environment: str
+    symbol: str
+    filled_at: str
+    payload_json: str
+
+
+@dataclass(frozen=True)
+class PositionRecord:
+    position_id: str
+    account_id: str
+    environment: str
+    symbol: str
+    state: str
+    opened_at: str
+    payload_json: str
+
+
+@dataclass(frozen=True)
+class PaperAccountRecord:
+    account_id: str
+    environment: str
+    currency: str
+    initial_balance: str
+    balance: str
+    updated_at: str
+
+
+@dataclass(frozen=True)
+class AuditEventRecord:
+    event_id: str
+    seq: int
+    event_type: str
+    created_at: str
+    previous_hash: str
+    event_hash: str
+    payload_json: str
 
 
 class StorePort(Protocol):
@@ -427,3 +590,104 @@ class StorePort(Protocol):
     def upsert_scan_symbol(self, record: ScanSymbolRecord) -> None: ...
 
     def list_scan_symbols(self, scan_id: str) -> tuple[ScanSymbolRecord, ...]: ...
+
+    # -- LLM decision ledger ---------------------------------------------
+
+    def save_llm_call(self, record: LLMCallRecord) -> None: ...
+
+    def list_llm_calls(
+        self, *, decision_id: str | None = None, role: str | None = None
+    ) -> tuple[LLMCallRecord, ...]: ...
+
+    def save_decision(self, record: DecisionRecord) -> None: ...
+
+    def get_decision(self, decision_id: str) -> DecisionRecord | None: ...
+
+    def list_decisions(self, *, role: str | None = None) -> tuple[DecisionRecord, ...]: ...
+
+    # -- Budget ledger ---------------------------------------------------
+
+    def save_budget_record(self, record: BudgetRecord) -> None: ...
+
+    def list_budget_records(
+        self, *, decision_id: str | None = None
+    ) -> tuple[BudgetRecord, ...]: ...
+
+    # -- Opportunity ledger ----------------------------------------------
+
+    def save_opportunity(self, record: OpportunityRecord) -> None: ...
+
+    def transition_opportunity(
+        self, record: OpportunityRecord, event: OpportunityEventRecord
+    ) -> bool: ...
+
+    def get_opportunity(self, opportunity_id: str) -> OpportunityRecord | None: ...
+
+    def list_opportunities(
+        self, *, state: str | None = None, limit: int = 100, offset: int = 0
+    ) -> tuple[OpportunityRecord, ...]: ...
+
+    def list_opportunity_events(
+        self, opportunity_id: str
+    ) -> tuple[OpportunityEventRecord, ...]: ...
+
+    # -- Triggers and risk verdicts --------------------------------------
+
+    def save_trigger_event(self, record: TriggerEventRecord) -> bool: ...
+
+    def update_trigger_event(self, record: TriggerEventRecord) -> bool: ...
+
+    def get_trigger_event(self, trigger_id: str) -> TriggerEventRecord | None: ...
+
+    def get_trigger_by_idempotency(self, idempotency_key: str) -> TriggerEventRecord | None: ...
+
+    def list_trigger_events(
+        self, *, opportunity_id: str | None = None, limit: int = 100
+    ) -> tuple[TriggerEventRecord, ...]: ...
+
+    def save_risk_verdict(self, record: RiskVerdictRecord) -> None: ...
+
+    def get_risk_verdict(self, risk_verdict_id: str) -> RiskVerdictRecord | None: ...
+
+    # -- Paper OMS -------------------------------------------------------
+
+    def save_order_fill_position(
+        self,
+        *,
+        order: OrderRecord,
+        fill: FillRecord,
+        position: PositionRecord,
+        account: PaperAccountRecord,
+    ) -> None: ...
+
+    def get_order(self, order_id: str) -> OrderRecord | None: ...
+
+    def get_order_by_idempotency(self, idempotency_key: str) -> OrderRecord | None: ...
+
+    def get_order_by_client_order_id(self, client_order_id: str) -> OrderRecord | None: ...
+
+    def list_orders(self, *, limit: int = 100) -> tuple[OrderRecord, ...]: ...
+
+    def list_fills(self, *, limit: int = 100) -> tuple[FillRecord, ...]: ...
+
+    def list_positions(
+        self, *, state: str | None = None, limit: int = 100
+    ) -> tuple[PositionRecord, ...]: ...
+
+    def get_position(self, position_id: str) -> PositionRecord | None: ...
+
+    def get_paper_account(self, account_id: str) -> PaperAccountRecord | None: ...
+
+    def save_paper_account(self, record: PaperAccountRecord) -> None: ...
+
+    # -- Audit and system state ------------------------------------------
+
+    def save_audit_event(self, record: AuditEventRecord) -> None: ...
+
+    def list_audit_events(self, *, limit: int = 100) -> tuple[AuditEventRecord, ...]: ...
+
+    def last_audit_event(self) -> AuditEventRecord | None: ...
+
+    def get_system_state(self, key: str) -> str | None: ...
+
+    def set_system_state(self, key: str, value: str, *, updated_at: str) -> None: ...

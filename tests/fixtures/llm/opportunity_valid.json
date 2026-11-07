@@ -1,0 +1,87 @@
+{
+  "decision_type": "OPPORTUNITY_PROPOSAL",
+  "subject": {
+    "symbol": "BTCUSDT",
+    "timeframe": "4h",
+    "as_of": "2026-11-06T12:00:00.000Z"
+  },
+  "confidence": 0.72,
+  "rationale": "Range high retest with positive delta; the code trigger must confirm the touch.",
+  "caveats": ["Thin overnight liquidity"],
+  "analysis": {
+    "market_structure": "Balanced range between the value-area low and the range high.",
+    "regime": "RANGE",
+    "absorption": null,
+    "exhaustion": null,
+    "key_zones": [
+      {
+        "role": "RESISTANCE",
+        "price_low": "70000.00",
+        "price_high": "70100.00",
+        "note": "range high"
+      }
+    ],
+    "narrative": "Price is rotating inside the range with a positive cumulative delta.",
+    "metrics_cited": [
+      {
+        "metric": "DELTA",
+        "value": "1.50",
+        "unit": "BASE",
+        "as_of": "2026-11-06T12:00:00.000Z",
+        "ref": "cvd.points[0]",
+        "note": "positive delta"
+      }
+    ]
+  },
+  "opportunity": {
+    "side": "LONG",
+    "zone_low": "69000.00",
+    "zone_high": "71000.00",
+    "entry_preference": "MARKET",
+    "trigger_conditions": [
+      {
+        "draft_id": "c1",
+        "type": "PRICE_TOUCH_ZONE",
+        "params": {
+          "price": null,
+          "price_low": "69900.00",
+          "price_high": "70100.00",
+          "threshold": null,
+          "unit": "PRICE",
+          "comparator": "BETWEEN",
+          "lookback_bars": null,
+          "session_states": [],
+          "note": "retest of the range high"
+        },
+        "window": {
+          "start": "2026-11-01T00:00:00.000Z",
+          "end": "2026-12-01T00:00:00.000Z"
+        },
+        "required_data": ["MARK_PRICE"],
+        "description": "price touches the range-high zone"
+      }
+    ],
+    "invalidation_conditions": [
+      {
+        "type": "PRICE_CROSS_BELOW",
+        "description": "range low lost",
+        "price": "69000.00",
+        "threshold": null,
+        "window_end": null
+      }
+    ],
+    "expires_at": "2027-01-01T00:00:00.000Z",
+    "risk_request": {
+      "entry_price": "70000.00",
+      "stop_price": "69000.00",
+      "take_profits": ["72000.00"],
+      "risk_pct": 0.8,
+      "leverage": 2.0,
+      "max_notional_usd": "1000.00"
+    },
+    "thesis": "Range high retest with positive delta and a protected stop.",
+    "data_needs": ["MARK_PRICE"]
+  },
+  "entry_recheck": null,
+  "position_management": null
+}

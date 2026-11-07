@@ -211,13 +211,15 @@ def test_metrics_only_scan_produces_a_report_and_no_llm_call(tmp_path: Path) -> 
             "footprint",
         }
 
-        # No LLM table or artifact exists in this metrics-only slice.
+        # The v10 tables exist, but a metrics-only scan writes no LLM rows.
         with sqlite3.connect(database_path(harness.settings)) as connection:
             tables = {
                 row[0]
                 for row in connection.execute("SELECT name FROM sqlite_master WHERE type = 'table'")
             }
-        assert "llm_calls" not in tables
+            llm_rows = connection.execute("SELECT COUNT(*) FROM llm_calls").fetchone()[0]
+        assert "llm_calls" in tables
+        assert llm_rows == 0
         assert body["meta"]["provenance"] == "CALC"
     finally:
         harness.close()
@@ -536,13 +538,32 @@ def test_fixture_debug_path_is_allowed_with_the_flag_in_tests(tmp_path: Path) ->
     assert response.json()["data"]["data_quality"]
 
 
-def test_snapshot_ids_are_unique_within_the_same_second() -> None:
+def test_snapshot_ids_are_deterministic_for_the_same_window_and_clock() -> None:
     from oft.application.scan_service import _snapshot_id
 
     instant = datetime(2026, 11, 6, 12, 0, 0, tzinfo=UTC)
-    ids = {_snapshot_id("BTCUSDT", instant) for _ in range(100)}
-    assert len(ids) == 100
-    assert all(snapshot_id.startswith("SNAP-BTCUSDT-") for snapshot_id in ids)
+    first = _snapshot_id(
+        "BTCUSDT",
+        instant,
+        window_start="2026-10-01T00:00:00.000Z",
+        window_end="2026-10-08T00:00:00.000Z",
+    )
+    second = _snapshot_id(
+        "BTCUSDT",
+        instant,
+        window_start="2026-10-01T00:00:00.000Z",
+        window_end="2026-10-08T00:00:00.000Z",
+    )
+    other_window = _snapshot_id(
+        "BTCUSDT",
+        instant,
+        window_start="2026-10-02T00:00:00.000Z",
+        window_end="2026-10-08T00:00:00.000Z",
+    )
+
+    assert first == second
+    assert other_window != first
+    assert first.startswith("SNAP-BTCUSDT-")
 
 
 def test_reports_pagination_reports_offset_total_and_next_cursor(tmp_path: Path) -> None:

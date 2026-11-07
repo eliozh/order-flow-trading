@@ -10,10 +10,14 @@ import typer
 from oft.cli.commands.backfill import backfill_app
 from oft.cli.commands.daemon import daemon_app
 from oft.cli.commands.doctor import doctor_command, emit_error
+from oft.cli.commands.kill import kill_app
 from oft.cli.commands.open import open_command
+from oft.cli.commands.opp import opp_app
+from oft.cli.commands.paper import paper_app
 from oft.cli.commands.report import report_app
 from oft.cli.commands.scan import scan_app
 from oft.cli.commands.status import status_command
+from oft.cli.commands.trigger import trigger_app
 from oft.cli.commands.watchlist import watchlist_app
 from oft.config import ConfigError, Settings, load_settings
 
@@ -37,6 +41,10 @@ app.add_typer(report_app, name="report")
 app.add_typer(watchlist_app, name="watchlist")
 app.add_typer(backfill_app, name="backfill")
 app.add_typer(daemon_app, name="daemon")
+app.add_typer(opp_app, name="opp")
+app.add_typer(trigger_app, name="trigger")
+app.add_typer(paper_app, name="paper")
+app.add_typer(kill_app, name="kill")
 
 _LOOPBACK_HOSTS = frozenset({"127.0.0.1", "localhost", "::1"})
 

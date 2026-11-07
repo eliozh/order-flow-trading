@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import threading
 from dataclasses import dataclass
+from typing import Any
 
 from oft.adapters.archive import (
     FixtureArchiveSource,
@@ -11,6 +12,7 @@ from oft.adapters.archive import (
     UnconfiguredArchiveSource,
 )
 from oft.adapters.fixture_market_data import FixtureMarketData
+from oft.adapters.llm_stub import LLMStub
 from oft.adapters.parquet_store import ParquetStore
 from oft.adapters.sqlite_store import SqliteStore
 from oft.application.backfill_service import BackfillService
@@ -42,6 +44,7 @@ class AppContainer:
     scan_lock: threading.Lock
     rate_limiter: GlobalRateLimiter
     ws_budget: WsSubscriptionBudget
+    llm_provider: Any | None = None
 
 
 def _seed_symbol_registry(registry: SymbolRegistry, settings: Settings) -> None:
@@ -91,6 +94,9 @@ def build_container(settings: Settings | None = None, *, initialize: bool = Fals
         store.initialize()
         parquet.ensure_layout()
         _seed_symbol_registry(symbol_registry, resolved)
+    llm_provider = (
+        LLMStub(fixtures_dir=resolved.llm_fixtures_dir) if resolved.llm_provider == "stub" else None
+    )
     return AppContainer(
         settings=resolved,
         clock=clock,
@@ -103,6 +109,7 @@ def build_container(settings: Settings | None = None, *, initialize: bool = Fals
         scan_lock=threading.Lock(),
         rate_limiter=rate_limiter,
         ws_budget=ws_budget,
+        llm_provider=llm_provider,
     )
 
 
