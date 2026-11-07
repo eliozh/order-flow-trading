@@ -695,14 +695,22 @@ class SqliteStore:
 
     def upsert_manifest_entry(self, entry: ManifestEntry) -> None:
         """Metrics-only idempotent manifest write (re-persist same content)."""
-        with closing(self._connect()) as connection, connection:
-            self._insert_manifest(connection, entry, upsert=True)
+        try:
+            with closing(self._connect()) as connection, connection:
+                self._insert_manifest(connection, entry, upsert=True)
+        except sqlite3.Error as exc:
+            raise StoreUnavailableError(f"manifest write failed: {exc}") from exc
 
     def upsert_manifest_entries(self, entries: tuple[ManifestEntry, ...]) -> None:
         """Publish metrics + footprint manifest rows in one transaction."""
-        with closing(self._connect()) as connection, connection:
-            for entry in entries:
-                self._insert_manifest(connection, entry, upsert=True)
+        try:
+            with closing(self._connect()) as connection, connection:
+                for entry in entries:
+                    self._insert_manifest(connection, entry, upsert=True)
+        except sqlite3.Error as exc:
+            # "database is locked"/disk-full are OperationalError, not OSError;
+            # map them so the supervisor treats them as fatal.
+            raise StoreUnavailableError(f"manifest write failed: {exc}") from exc
 
     def _insert_manifest(
         self, connection: sqlite3.Connection, entry: ManifestEntry, *, upsert: bool = False

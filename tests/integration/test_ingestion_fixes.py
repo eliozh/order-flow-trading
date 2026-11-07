@@ -560,3 +560,103 @@ def test_transient_flush_failure_retries_without_duplicates(tmp_path: Path, monk
     for path in root.glob("date=*/*.parquet"):
         rows.extend(pq.read_table(path, columns=["agg_trade_id"]).to_pylist())
     assert [row["agg_trade_id"] for row in rows] == [1]
+
+
+def test_manifest_failure_keeps_events_retryable_and_checkpoint_behind(
+    tmp_path: Path, monkeypatch
+) -> None:
+    settings = _settings(tmp_path)
+    clock = Clock()
+    store = SqliteStore(settings)
+    buffer = LiveParquetBuffer(settings=settings, store=store, clock=clock)
+    fixture = Path(__file__).resolve().parents[2] / "tests" / "fixtures" / "ws" / "aggtrade.jsonl"
+    lines = fixture.read_text(encoding="utf-8").splitlines()[:2]
+    supervisor = IngestionSupervisor(
+        settings=settings,
+        source=lines,
+        store=store,
+        parquet=buffer,
+        clock=clock,
+        sleep=lambda _seconds: None,
+    )
+    original = store.upsert_manifest_entries
+    calls = {"count": 0}
+
+    def flaky(entries):  # type: ignore[no-untyped-def]
+        calls["count"] += 1
+        if calls["count"] == 1:
+            raise OSError("sqlite busy")
+        return original(entries)
+
+    monkeypatch.setattr(store, "upsert_manifest_entries", flaky)
+
+    with pytest.raises(OSError):
+        supervisor.run()
+    assert supervisor.state.value == "FAILED"
+    assert supervisor.checkpoint.load() == {}  # checkpoint did not advance
+
+    monkeypatch.setattr(store, "upsert_manifest_entries", original)
+    supervisor._drain_all()
+
+    import pyarrow.parquet as pq
+
+    root = settings.data_dir / "market" / "um" / "agg_trades" / "symbol=BTCUSDT"
+    ids: list[int] = []
+    for path in root.glob("date=*/*.parquet"):
+        ids.extend(pq.read_table(path, columns=["agg_trade_id"]).column(0).to_pylist())
+    assert len(ids) == len(set(ids))  # no duplicate rows
+    assert all(row.path for row in store.list_manifest() if row.data_type == "agg_trades")
+    assert supervisor.checkpoint.load()  # advanced only after a durable commit
+
+
+@pytest.mark.parametrize(
+    ("fixture_name", "data_type"),
+    [
+        ("aggtrade.jsonl", "agg_trades"),
+        ("kline.jsonl", "klines_1m"),
+        ("markprice.jsonl", "mark_price_klines"),
+    ],
+)
+def test_locked_manifest_is_fatal_but_retryable(
+    tmp_path: Path, monkeypatch, fixture_name: str, data_type: str
+) -> None:
+    import sqlite3
+
+    from oft.ports.store import StoreUnavailableError
+
+    settings = _settings(tmp_path)
+    clock = Clock()
+    store = SqliteStore(settings)
+    buffer = LiveParquetBuffer(settings=settings, store=store, clock=clock)
+    fixture = Path(__file__).resolve().parents[2] / "tests" / "fixtures" / "ws" / fixture_name
+    lines = fixture.read_text(encoding="utf-8").splitlines()
+    supervisor = IngestionSupervisor(
+        settings=settings,
+        source=lines,
+        store=store,
+        parquet=buffer,
+        clock=clock,
+        sleep=lambda _seconds: None,
+    )
+    original_connect = store._connect
+    state = {"fail": True}
+
+    def flaky_connect():  # type: ignore[no-untyped-def]
+        if state["fail"]:
+            state["fail"] = False
+            raise sqlite3.OperationalError("database is locked")
+        return original_connect()
+
+    monkeypatch.setattr(store, "_connect", flaky_connect)
+
+    with pytest.raises(StoreUnavailableError):
+        supervisor.run()
+    assert supervisor.state.value == "FAILED"
+    assert supervisor.checkpoint.load() == {}
+
+    supervisor._drain_all()
+    manifest = [row for row in store.list_manifest() if row.data_type == data_type]
+    assert manifest
+    before = list(store.list_manifest())
+    supervisor._drain_all()
+    assert store.list_manifest() == tuple(before)

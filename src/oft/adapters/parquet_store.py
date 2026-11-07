@@ -1176,9 +1176,31 @@ class LiveParquetBuffer:
         self._seen_marks: OrderedDict[tuple[str, object], bool] = OrderedDict()
         self._seen_agg_ids: OrderedDict[tuple[str, int], None] = OrderedDict()
         self._retry_persistent_dedupe = False
+        self._pending_marks: list[tuple[str, tuple[object, ...], bool]] = []
+        self._uncommitted_entries: list[ManifestEntry] = []
+        self._max_uncommitted_entries = 10_000
+        self._last_commit = False
         # Open bars are not durable: keep only the latest in memory until closed.
         self._open_klines: dict[tuple[str, object], object] = {}
         self._logger = structlog.get_logger(__name__)
+
+    def _apply_pending_marks(self) -> None:
+        for kind, raw_key, closed in self._pending_marks:
+            if kind == "agg":
+                agg_key = cast("tuple[str, int]", raw_key)
+                self._seen_agg_ids.pop(agg_key, None)
+                self._seen_agg_ids[agg_key] = None
+                while len(self._seen_agg_ids) > self._dedupe_max_keys:
+                    self._seen_agg_ids.popitem(last=False)
+            elif kind == "kline":
+                self._remember_key(self._seen_klines, cast("tuple[str, object]", raw_key), closed)
+            else:
+                self._remember_key(self._seen_marks, cast("tuple[str, object]", raw_key), True)
+        self._pending_marks.clear()
+
+    @property
+    def last_flush_committed(self) -> bool:
+        return self._last_commit
 
     @property
     def dedupe_keys(self) -> int:
@@ -1274,13 +1296,37 @@ class LiveParquetBuffer:
     def flush(self) -> tuple[ManifestEntry, ...]:
         """Publish every buffered stream type and record manifest rows."""
         self._load_existing_live_keys()
+        self._pending_marks = []
+        self._last_commit = False
         entries: list[ManifestEntry] = []
         entries.extend(self._write_agg_trades(self._agg))
         entries.extend(self._write_klines(self._klines))
         entries.extend(self._write_mark_prices(self._marks))
         entries.extend(self._write_liquidations(self._liquidations))
-        if entries:
-            self._store.upsert_manifest_entries(tuple(entries))
+        try:
+            if self._uncommitted_entries:
+                # Parts published by a previous failed flush: record them now,
+                # before the retry dedupes against those same parts.
+                self._store.upsert_manifest_entries(tuple(self._uncommitted_entries))
+                self._uncommitted_entries = []
+                self._last_commit = True
+            if entries:
+                self._store.upsert_manifest_entries(tuple(entries))
+                self._last_commit = True
+        except Exception:
+            # Manifest did not commit: keep buffers/parts and do NOT mark keys
+            # seen, so a retry can record them and re-attempt the data.
+            combined = [*self._uncommitted_entries, *entries]
+            if len(combined) > self._max_uncommitted_entries:
+                raise StoreUnavailableError(
+                    "uncommitted published parts exceeded the retry cap; "
+                    "manual recovery is required"
+                ) from None
+            self._uncommitted_entries = combined
+            self._retry_persistent_dedupe = True
+            self._pending_marks = []
+            raise
+        self._apply_pending_marks()
         self._agg.clear()
         self._klines.clear()
         self._marks.clear()
@@ -1324,11 +1370,7 @@ class LiveParquetBuffer:
                 raise
             else:
                 self._retry_persistent_dedupe = False
-                for key in new_keys:
-                    self._seen_agg_ids.pop(key, None)
-                    self._seen_agg_ids[key] = None
-                    while len(self._seen_agg_ids) > self._dedupe_max_keys:
-                        self._seen_agg_ids.popitem(last=False)
+                self._pending_marks.extend(("agg", key, True) for key in new_keys)
         return published
 
     def _write_klines(self, klines: list[KlineEvent]) -> list[ManifestEntry]:
@@ -1414,8 +1456,9 @@ class LiveParquetBuffer:
                         prefix=f"{day}-kline",
                     )
                 )
-                for key, event in pending.items():
-                    self._remember_key(self._seen_klines, key, event.is_closed)
+                self._pending_marks.extend(
+                    ("kline", key, event.is_closed) for key, event in pending.items()
+                )
         return published
 
     def _write_mark_prices(self, marks: list[MarkPriceEvent]) -> list[ManifestEntry]:
@@ -1481,8 +1524,7 @@ class LiveParquetBuffer:
                         prefix=f"{day}-mark",
                     )
                 )
-                for key in pending_marks:
-                    self._remember_key(self._seen_marks, key, True)
+                self._pending_marks.extend(("mark", key, True) for key in pending_marks)
         return published
 
     def _write_liquidations(self, events: list[ForceOrderEvent]) -> list[ManifestEntry]:

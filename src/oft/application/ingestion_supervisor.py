@@ -50,7 +50,7 @@ from oft.domain.events import (
 from oft.domain.time import utc_timestamp
 from oft.ports.clock import ClockPort
 from oft.ports.market_data import AggTradeRecoveryPort, MarketDataStreamPort
-from oft.ports.store import StorePort
+from oft.ports.store import StorePort, StoreUnavailableError
 
 logger = structlog.get_logger(__name__)
 
@@ -742,9 +742,8 @@ class IngestionSupervisor:
                 self._counters["received"] += 1
                 try:
                     self._handle_raw(raw)
-                except Exception as exc:  # noqa: BLE001 - data must not kill the run
-                    logger.warning("ws_event_internal_error", reason=_safe_reason(exc))
-                    self._reject("INTERNAL_ERROR")
+                except Exception as exc:  # noqa: BLE001 - classify fatal vs data
+                    self._handle_event_exception(exc)
                 if max_events is not None and self._counters["received"] >= max_events:
                     break
         except StreamDisconnected as exc:
@@ -754,8 +753,13 @@ class IngestionSupervisor:
             # Durable flush first; only then persist the checkpoint.
             self._drain_all()
             self._handle_disconnect()
-        self._drain_all()
-        self._save_checkpoint()
+        try:
+            self._drain_all()
+            self._save_checkpoint()
+        except (BackpressureError, StoreUnavailableError, OSError):
+            self.state = ConnectionState.FAILED
+            self._write_state()
+            raise
         self._write_state()
         return self.stats
 
@@ -848,9 +852,8 @@ class IngestionSupervisor:
                 self._counters["received"] += 1
                 try:
                     self._handle_raw(raw)
-                except Exception as exc:  # noqa: BLE001 - data must not kill the thread
-                    logger.warning("ws_event_internal_error", reason=_safe_reason(exc))
-                    self._reject("INTERNAL_ERROR")
+                except Exception as exc:  # noqa: BLE001 - classify fatal vs data
+                    self._handle_event_exception(exc)
         finally:
             self._drain_all()
             self._save_checkpoint()
@@ -905,6 +908,17 @@ class IngestionSupervisor:
             self._counters["ignored"] += 1
             return
         self._accept(stream, event)
+
+    def _handle_event_exception(self, exc: Exception) -> None:
+        if isinstance(exc, (BackpressureError, StoreUnavailableError, OSError)):
+            # Storage/backpressure failures are fatal, not malformed data:
+            # surface FAILED, stop the loop, and never advance the checkpoint.
+            self.state = ConnectionState.FAILED
+            self._write_state()
+            logger.error("ws_ingest_fatal", reason=_safe_reason(exc))
+            raise exc
+        logger.warning("ws_event_internal_error", reason=_safe_reason(exc))
+        self._reject("INTERNAL_ERROR")
 
     def _reject(self, reason: str) -> None:
         if reason == "OVERSIZED":
@@ -997,8 +1011,8 @@ class IngestionSupervisor:
         if had_wal:
             self._queue.clear_wal()
         self._persisted_rows += sum(entry.rows for entry in entries)
-        if entries:
-            # Fsync the parts before advancing the durable checkpoint.
+        if entries or self._parquet.last_flush_committed:
+            # Fsync/commit the parts before advancing the durable checkpoint.
             self._save_checkpoint()
             self._write_state()
 
@@ -1006,7 +1020,7 @@ class IngestionSupervisor:
         self._relieve()
         entries = self._parquet.flush()
         self._persisted_rows += sum(entry.rows for entry in entries)
-        if entries:
+        if entries or self._parquet.last_flush_committed:
             self._save_checkpoint()
         self._write_state()
 
