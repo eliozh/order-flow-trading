@@ -80,6 +80,30 @@
       "type": "string",
       "enum": ["PENDING_RECHECK", "RECHECKED", "ACCEPTED", "REJECTED", "BLOCKED", "EXPIRED"]
     },
+    "riskVerdictStatus": {
+      "type": "string",
+      "enum": ["ALLOW", "REDUCE", "BLOCK"],
+      "description": "A BLOCK verdict never carries an allowed quantity; ALLOW/REDUCE require a positive one."
+    },
+    "bindingCap": {
+      "type": "string",
+      "enum": [
+        "NONE",
+        "PER_TRADE_RISK",
+        "MAX_POSITIONS",
+        "DAILY_LOSS",
+        "MAX_LEVERAGE",
+        "MAX_NOTIONAL",
+        "EXCHANGE_BRACKET",
+        "MIN_NOTIONAL",
+        "STALE_MARK",
+        "STALE_DATA",
+        "MISSING_STOP",
+        "PRICE_MOVED",
+        "SPREAD",
+        "SLIPPAGE"
+      ]
+    },
     "decisionType": {
       "type": "string",
       "enum": ["MARKET_ANALYSIS", "OPPORTUNITY_PROPOSAL", "ENTRY_RECHECK", "POSITION_MANAGEMENT"]
@@ -244,7 +268,7 @@
         "stale_inputs"
       ],
       "properties": {
-        "verdict": { "type": "string", "enum": ["ALLOW", "REDUCE", "BLOCK"] },
+        "verdict": { "$ref": "#/$defs/riskVerdictStatus" },
         "requested": { "$ref": "#/$defs/riskRequest" },
         "allowed": {
           "type": "object",
@@ -257,25 +281,7 @@
             "risk_amount_usd": { "$ref": "#/$defs/money" }
           }
         },
-        "binding_cap": {
-          "type": "string",
-          "enum": [
-            "NONE",
-            "PER_TRADE_RISK",
-            "MAX_POSITIONS",
-            "DAILY_LOSS",
-            "MAX_LEVERAGE",
-            "MAX_NOTIONAL",
-            "EXCHANGE_BRACKET",
-            "MIN_NOTIONAL",
-            "STALE_MARK",
-            "STALE_DATA",
-            "MISSING_STOP",
-            "PRICE_MOVED",
-            "SPREAD",
-            "SLIPPAGE"
-          ]
-        },
+        "binding_cap": { "$ref": "#/$defs/bindingCap" },
         "reasons": {
           "type": "array",
           "items": { "type": "string" }

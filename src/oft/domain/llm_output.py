@@ -14,7 +14,7 @@ from datetime import datetime
 from decimal import Decimal, InvalidOperation
 from typing import Literal
 
-from pydantic import BaseModel, ConfigDict, Field
+from pydantic import BaseModel, ConfigDict, Field, model_validator
 
 MAX_RATIONALE_CHARS = 4000
 _UNSAFE_PATTERNS = (
@@ -37,6 +37,17 @@ _PAYLOAD_BY_DECISION = {
     "ENTRY_RECHECK": "entry_recheck",
     "POSITION_MANAGEMENT": "position_management",
 }
+
+# OPPORTUNITY_PROPOSAL also carries its supporting analysis; everything else is
+# closed so a non-null payload cannot ride along with the wrong decision type.
+_ALLOWED_PAYLOADS_BY_DECISION: dict[str, frozenset[str]] = {
+    "MARKET_ANALYSIS": frozenset({"analysis"}),
+    "OPPORTUNITY_PROPOSAL": frozenset({"analysis", "opportunity"}),
+    "ENTRY_RECHECK": frozenset({"entry_recheck"}),
+    "POSITION_MANAGEMENT": frozenset({"position_management"}),
+}
+
+_PAYLOAD_FIELDS = ("analysis", "opportunity", "entry_recheck", "position_management")
 
 
 @dataclass(frozen=True)
@@ -138,9 +149,27 @@ class EntryOrderIntent(_Model):
     stop_price: str | None
     take_profits: list[str]
     size_mode: Literal["RISK_PCT", "QUOTE_NOTIONAL"]
-    risk_pct: float | None
+    risk_pct: float | None = Field(default=None, gt=0)
     quote_notional_usd: str | None
-    leverage: float | None
+    leverage: float | None = Field(default=None, gt=0)
+
+    @model_validator(mode="after")
+    def _bind_size_mode(self) -> EntryOrderIntent:
+        """Tie size_mode to exactly the field that governs the requested size."""
+        if self.size_mode == "RISK_PCT":
+            if self.risk_pct is None:
+                raise ValueError("size_mode RISK_PCT requires a positive risk_pct")
+            if self.quote_notional_usd is not None:
+                raise ValueError("size_mode RISK_PCT must not carry quote_notional_usd")
+            return self
+        if self.quote_notional_usd is None:
+            raise ValueError("size_mode QUOTE_NOTIONAL requires quote_notional_usd")
+        if self.risk_pct is not None:
+            raise ValueError("size_mode QUOTE_NOTIONAL must not carry risk_pct")
+        notional = _decimal(self.quote_notional_usd)
+        if notional is None or notional <= 0:
+            raise ValueError("quote_notional_usd must be a positive decimal")
+        return self
 
 
 class RecheckCondition(_Model):
@@ -287,6 +316,20 @@ def semantic_errors(output: DecisionOutput, *, role: str) -> tuple[SemanticError
                 f"{output.decision_type} requires the {payload_name} payload",
             )
         )
+
+    # The pairing is two-way: a payload that does not belong to this decision
+    # type must be null, otherwise a MARKET_ANALYSIS could still create an
+    # opportunity.
+    allowed_payloads = _ALLOWED_PAYLOADS_BY_DECISION.get(output.decision_type, frozenset())
+    for name in _PAYLOAD_FIELDS:
+        if getattr(output, name) is not None and name not in allowed_payloads:
+            errors.append(
+                SemanticError(
+                    name,
+                    "PAYLOAD_MISMATCH",
+                    f"{output.decision_type} must not carry the {name} payload",
+                )
+            )
 
     errors.extend(_text_errors("rationale", output.rationale))
     for index, caveat in enumerate(output.caveats):

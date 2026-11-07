@@ -256,7 +256,12 @@ class AnalysisService:
         )
 
         opportunity: Opportunity | None = None
-        if outcome.valid and outcome.output is not None and outcome.output.opportunity is not None:
+        if (
+            outcome.valid
+            and outcome.output is not None
+            and outcome.output.decision_type == "OPPORTUNITY_PROPOSAL"
+            and outcome.output.opportunity is not None
+        ):
             try:
                 opportunity = self._opportunities.create_from_decision(
                     opportunity_draft=outcome.output.opportunity,

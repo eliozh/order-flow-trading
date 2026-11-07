@@ -2,13 +2,18 @@
 
 from __future__ import annotations
 
+import json
 from decimal import Decimal
+from pathlib import Path
 
 import pytest
 
 from oft.domain.risk import (
     DEFAULT_CAPS,
+    BindingCap,
     RiskRequest,
+    RiskVerdict,
+    Verdict,
     evaluate_risk,
 )
 
@@ -257,3 +262,75 @@ def test_unaligned_stop_is_recorded_as_rounded() -> None:
 
     assert any("stop price" in reason for reason in verdict.reasons)
     assert verdict.stop_price == Decimal("68500.00")
+
+
+def test_missing_daily_loss_input_is_recorded_as_unevaluated() -> None:
+    # Slice 11 has no realized-PnL source: a missing daily-loss input must be
+    # recorded rather than silently treated as zero.
+    verdict = _evaluate(daily_loss_usd=None)
+
+    assert verdict.verdict in {"ALLOW", "REDUCE"}
+    assert "daily_loss_usd" in verdict.stale_inputs
+
+
+def test_provided_daily_loss_still_blocks() -> None:
+    verdict = _evaluate(daily_loss_usd=DEFAULT_CAPS.daily_loss_limit_usd)
+
+    assert verdict.verdict == "BLOCK"
+    assert verdict.binding_cap == BindingCap.DAILY_LOSS
+    assert "daily_loss_usd" not in verdict.stale_inputs
+
+
+def test_block_verdict_may_not_carry_an_allowed_quantity() -> None:
+    with pytest.raises(ValueError):
+        RiskVerdict(
+            verdict=Verdict.BLOCK,
+            requested_quantity=None,
+            allowed_quantity=Decimal("0.01"),
+            allowed_notional_usd=None,
+            allowed_leverage=1.0,
+            risk_amount_usd=Decimal("0"),
+            binding_cap=BindingCap.MISSING_STOP,
+            reasons=(),
+            computed_at=NOW,
+            expires_at=NOW,
+            inputs_hash="h",
+            stale_inputs=(),
+            entry_price=Decimal("70000.00"),
+            stop_price=None,
+        )
+
+
+@pytest.mark.parametrize("verdict", [Verdict.ALLOW, Verdict.REDUCE])
+def test_sized_verdict_requires_a_positive_allowed_quantity(verdict: Verdict) -> None:
+    for quantity in (None, Decimal("0"), Decimal("-0.01")):
+        with pytest.raises(ValueError):
+            RiskVerdict(
+                verdict=verdict,
+                requested_quantity=None,
+                allowed_quantity=quantity,
+                allowed_notional_usd=None,
+                allowed_leverage=1.0,
+                risk_amount_usd=Decimal("0"),
+                binding_cap=BindingCap.NONE,
+                reasons=(),
+                computed_at=NOW,
+                expires_at=NOW,
+                inputs_hash="h",
+                stale_inputs=(),
+                entry_price=Decimal("70000.00"),
+                stop_price=Decimal("69000.00"),
+            )
+
+
+def test_verdict_enums_match_the_common_contract() -> None:
+    schema_path = Path(__file__).resolve().parents[2] / "docs" / "contracts" / "common.schema.json"
+    schema = json.loads(schema_path.read_text(encoding="utf-8"))
+    risk_verdict = schema["$defs"]["riskVerdict"]["properties"]
+    verdict_contract = schema["$defs"]["riskVerdictStatus"]["enum"]
+    binding_contract = schema["$defs"]["bindingCap"]["enum"]
+
+    assert risk_verdict["verdict"]["$ref"] == "#/$defs/riskVerdictStatus"
+    assert risk_verdict["binding_cap"]["$ref"] == "#/$defs/bindingCap"
+    assert {item.value for item in Verdict} == set(verdict_contract)
+    assert {item.value for item in BindingCap} == set(binding_contract)

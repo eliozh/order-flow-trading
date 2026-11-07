@@ -2704,18 +2704,29 @@ class SqliteStore:
     def transition_opportunity(
         self, record: OpportunityRecord, event: OpportunityEventRecord
     ) -> bool:
+        # OPEN may move to any terminal state; TRIGGERED may only be invalidated
+        # (a human reject or NO_ENTRY re-check). The domain transition() is the
+        # authority; this condition pins the same rule in one atomic statement.
+        allowed_from: tuple[str, ...]
+        if record.state == "INVALIDATED":
+            allowed_from = ("OPEN", "TRIGGERED")
+        elif record.state in {"TRIGGERED", "EXPIRED"}:
+            allowed_from = ("OPEN",)
+        else:
+            return False
+        placeholders = ", ".join("?" for _ in allowed_from)
         with closing(self._connect()) as connection, connection:
             cursor = connection.execute(
-                """
+                f"""
                 UPDATE opportunities SET state = ?, updated_at = ?, payload_json = ?
-                WHERE opportunity_id = ? AND state != 'TRIGGERED'
-                  AND state != 'EXPIRED' AND state != 'INVALIDATED'
+                WHERE opportunity_id = ? AND state IN ({placeholders})
                 """,
                 (
                     record.state,
                     record.updated_at,
                     record.payload_json,
                     record.opportunity_id,
+                    *allowed_from,
                 ),
             )
             if cursor.rowcount == 0:

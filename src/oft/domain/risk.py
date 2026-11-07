@@ -1,8 +1,14 @@
 """Deterministic risk gate (ADR-0006).
 
-The gate recomputes every cap from code-owned inputs. The LLM's proposal is
-only one of the terms in ``effective_size = min(proposal, per-trade, notional,
-leverage, exchange max)``; the verdict records which cap bound the size.
+The gate recomputes every cap it has an input for from code-owned inputs. The
+LLM's proposal is only one of the terms in ``effective_size = min(proposal,
+per-trade risk, max notional, max leverage)``; the verdict records which cap
+bound the size. Exchange tick/step rounding and the minimum-notional filter are
+post-hoc adjustments and blocks applied to the chosen size, not terms in the
+minimum; the contract's ``EXCHANGE_BRACKET`` cap is unused because no exchange
+bracket data is ingested. The daily-loss cap is not evaluated in this slice:
+there is no realized-PnL source yet, so a missing input is recorded in
+``stale_inputs`` rather than silently treated as zero (slice-18 follow-up).
 """
 
 from __future__ import annotations
@@ -12,9 +18,37 @@ import json
 from dataclasses import dataclass
 from datetime import datetime
 from decimal import ROUND_DOWN, Decimal
+from enum import StrEnum
 from typing import Any
 
 RISK_VERDICT_TTL_SECONDS = 30
+
+
+class Verdict(StrEnum):
+    """The closed verdict vocabulary from ``common.schema.json``."""
+
+    ALLOW = "ALLOW"
+    REDUCE = "REDUCE"
+    BLOCK = "BLOCK"
+
+
+class BindingCap(StrEnum):
+    """The closed binding-cap vocabulary from ``common.schema.json``."""
+
+    NONE = "NONE"
+    PER_TRADE_RISK = "PER_TRADE_RISK"
+    MAX_POSITIONS = "MAX_POSITIONS"
+    DAILY_LOSS = "DAILY_LOSS"
+    MAX_LEVERAGE = "MAX_LEVERAGE"
+    MAX_NOTIONAL = "MAX_NOTIONAL"
+    EXCHANGE_BRACKET = "EXCHANGE_BRACKET"
+    MIN_NOTIONAL = "MIN_NOTIONAL"
+    STALE_MARK = "STALE_MARK"
+    STALE_DATA = "STALE_DATA"
+    MISSING_STOP = "MISSING_STOP"
+    PRICE_MOVED = "PRICE_MOVED"
+    SPREAD = "SPREAD"
+    SLIPPAGE = "SLIPPAGE"
 
 
 @dataclass(frozen=True)
@@ -56,13 +90,13 @@ class RiskRequest:
 
 @dataclass(frozen=True)
 class RiskVerdict:
-    verdict: str
+    verdict: Verdict
     requested_quantity: Decimal | None
     allowed_quantity: Decimal | None
     allowed_notional_usd: Decimal | None
     allowed_leverage: float
     risk_amount_usd: Decimal
-    binding_cap: str
+    binding_cap: BindingCap
     reasons: tuple[str, ...]
     computed_at: str
     expires_at: str
@@ -70,6 +104,14 @@ class RiskVerdict:
     stale_inputs: tuple[str, ...]
     entry_price: Decimal
     stop_price: Decimal | None
+
+    def __post_init__(self) -> None:
+        if self.verdict is Verdict.BLOCK:
+            if self.allowed_quantity is not None:
+                raise ValueError("a BLOCK verdict must not carry an allowed quantity")
+            return
+        if self.allowed_quantity is None or self.allowed_quantity <= 0:
+            raise ValueError(f"a {self.verdict.value} verdict requires a positive allowed quantity")
 
 
 def _parse(value: str) -> datetime:
@@ -96,6 +138,11 @@ def _inputs_hash(request: RiskRequest, *, equity: Decimal, open_positions: int) 
     return hashlib.sha256(_canonical(payload).encode("utf-8")).hexdigest()
 
 
+def verdict_inputs_hash(request: RiskRequest, *, equity: Decimal, open_positions: int) -> str:
+    """Recompute the input digest so callers can bind an intent to a verdict."""
+    return _inputs_hash(request, equity=equity, open_positions=open_positions)
+
+
 def _round_down(value: Decimal, step: Decimal) -> Decimal:
     if step <= 0:
         return value
@@ -111,7 +158,7 @@ def _round_tick(value: Decimal, tick: Decimal) -> Decimal:
 def _block(
     request: RiskRequest,
     *,
-    binding_cap: str,
+    binding_cap: BindingCap,
     reason: str,
     now: str,
     inputs_hash: str,
@@ -119,7 +166,7 @@ def _block(
     stale_inputs: tuple[str, ...] = (),
 ) -> RiskVerdict:
     return RiskVerdict(
-        verdict="BLOCK",
+        verdict=Verdict.BLOCK,
         requested_quantity=request.quantity,
         allowed_quantity=None,
         allowed_notional_usd=None,
@@ -150,7 +197,7 @@ def evaluate_risk(
     caps: RiskCaps,
     equity: Decimal,
     open_positions: int,
-    daily_loss_usd: Decimal,
+    daily_loss_usd: Decimal | None,
     mark_price: Decimal,
     mark_as_of: str,
     now: str,
@@ -158,8 +205,15 @@ def evaluate_risk(
     step_size: Decimal,
     min_notional: Decimal,
 ) -> RiskVerdict:
-    """Recompute the caps and return ALLOW/REDUCE/BLOCK with the binding cap."""
+    """Recompute the caps and return ALLOW/REDUCE/BLOCK with the binding cap.
+
+    ``daily_loss_usd`` is ``None`` when the caller has no realized-PnL source;
+    the cap is then not evaluated and the verdict names it in ``stale_inputs``.
+    """
     digest = _inputs_hash(request, equity=equity, open_positions=open_positions)
+    # No PnL engine exists in this slice, so callers pass None. Never treat a
+    # missing daily-loss input as an evaluated zero (slice-18 follow-up).
+    unevaluated: tuple[str, ...] = () if daily_loss_usd is not None else ("daily_loss_usd",)
     allowed_leverage = min(request.leverage, caps.max_leverage)
     entry_price = _round_tick(request.entry_price, tick_size)
     stop_price = request.stop_price
@@ -167,69 +221,74 @@ def evaluate_risk(
     if stop_price is None or stop_price <= 0:
         return _block(
             request,
-            binding_cap="MISSING_STOP",
+            binding_cap=BindingCap.MISSING_STOP,
             reason="a protective stop is required",
             now=now,
             inputs_hash=digest,
             allowed_leverage=allowed_leverage,
+            stale_inputs=unevaluated,
         )
     if request.side == "LONG" and stop_price >= entry_price:
         return _block(
             request,
-            binding_cap="MISSING_STOP",
+            binding_cap=BindingCap.MISSING_STOP,
             reason="a LONG stop must be below the entry",
             now=now,
             inputs_hash=digest,
             allowed_leverage=allowed_leverage,
+            stale_inputs=unevaluated,
         )
     if request.side == "SHORT" and stop_price <= entry_price:
         return _block(
             request,
-            binding_cap="MISSING_STOP",
+            binding_cap=BindingCap.MISSING_STOP,
             reason="a SHORT stop must be above the entry",
             now=now,
             inputs_hash=digest,
             allowed_leverage=allowed_leverage,
+            stale_inputs=unevaluated,
         )
 
     if mark_price <= 0:
         return _block(
             request,
-            binding_cap="STALE_MARK",
+            binding_cap=BindingCap.STALE_MARK,
             reason="mark price is missing",
             now=now,
             inputs_hash=digest,
             allowed_leverage=allowed_leverage,
-            stale_inputs=("mark_price",),
+            stale_inputs=_merge_stale(unevaluated, "mark_price"),
         )
     mark_age = (_parse(now) - _parse(mark_as_of)).total_seconds()
     if mark_age > caps.stale_mark_seconds:
         return _block(
             request,
-            binding_cap="STALE_MARK",
+            binding_cap=BindingCap.STALE_MARK,
             reason=f"mark price is stale by {int(mark_age)}s",
             now=now,
             inputs_hash=digest,
             allowed_leverage=allowed_leverage,
-            stale_inputs=("mark_price",),
+            stale_inputs=_merge_stale(unevaluated, "mark_price"),
         )
     if open_positions >= caps.max_concurrent_positions:
         return _block(
             request,
-            binding_cap="MAX_POSITIONS",
+            binding_cap=BindingCap.MAX_POSITIONS,
             reason="maximum concurrent positions reached",
             now=now,
             inputs_hash=digest,
             allowed_leverage=allowed_leverage,
+            stale_inputs=unevaluated,
         )
-    if daily_loss_usd >= caps.daily_loss_limit_usd:
+    if daily_loss_usd is not None and daily_loss_usd >= caps.daily_loss_limit_usd:
         return _block(
             request,
-            binding_cap="DAILY_LOSS",
+            binding_cap=BindingCap.DAILY_LOSS,
             reason="daily loss limit reached",
             now=now,
             inputs_hash=digest,
             allowed_leverage=allowed_leverage,
+            stale_inputs=unevaluated,
         )
 
     distance = abs(entry_price - _round_tick(stop_price, tick_size))
@@ -252,20 +311,21 @@ def evaluate_risk(
         ("MAX_NOTIONAL", notional_quantity),
         ("MAX_LEVERAGE", leverage_quantity),
     ]
-    binding_cap, allowed_quantity = min(candidates, key=lambda item: item[1])
-    if binding_cap == "PROPOSAL":
-        binding_cap = "NONE"
+    binding_name, allowed_quantity = min(candidates, key=lambda item: item[1])
+    if binding_name == "PROPOSAL":
+        binding_name = "NONE"
 
     allowed_quantity = _round_down(allowed_quantity, step_size)
     notional = allowed_quantity * entry_price
     if allowed_quantity <= 0 or notional < min_notional:
         return _block(
             request,
-            binding_cap="MIN_NOTIONAL",
+            binding_cap=BindingCap.MIN_NOTIONAL,
             reason="effective size is below the exchange minimum notional",
             now=now,
             inputs_hash=digest,
             allowed_leverage=allowed_leverage,
+            stale_inputs=unevaluated,
         )
 
     reasons: list[str] = []
@@ -274,14 +334,16 @@ def evaluate_risk(
     if _round_tick(stop_price, tick_size) != stop_price:
         reasons.append("stop price was rounded to the tick size")
 
-    if binding_cap == "NONE" and allowed_leverage < request.leverage:
-        binding_cap = "MAX_LEVERAGE"
+    if binding_name == "NONE" and allowed_leverage < request.leverage:
+        binding_name = "MAX_LEVERAGE"
         reasons.append("leverage clamped to the configured cap")
-    if binding_cap == "NONE":
-        verdict = "ALLOW"
+    if binding_name == "NONE":
+        verdict = Verdict.ALLOW
     else:
-        verdict = "REDUCE"
-        reasons.append(f"{binding_cap.lower()} reduced the requested size")
+        verdict = Verdict.REDUCE
+        reasons.append(f"{binding_name.lower()} reduced the requested size")
+    if unevaluated:
+        reasons.append("daily loss cap was not evaluated: no realized-PnL source in this slice")
 
     return RiskVerdict(
         verdict=verdict,
@@ -290,15 +352,20 @@ def evaluate_risk(
         allowed_notional_usd=notional,
         allowed_leverage=allowed_leverage,
         risk_amount_usd=allowed_quantity * distance,
-        binding_cap=binding_cap,
+        binding_cap=BindingCap(binding_name),
         reasons=tuple(reasons),
         computed_at=now,
         expires_at=_expires(now),
         inputs_hash=digest,
-        stale_inputs=(),
+        stale_inputs=unevaluated,
         entry_price=entry_price,
         stop_price=_round_tick(stop_price, tick_size),
     )
+
+
+def _merge_stale(base: tuple[str, ...], name: str) -> tuple[str, ...]:
+    """Add a stale-input name without duplicating it."""
+    return base if name in base else (*base, name)
 
 
 def verdict_to_contract(
@@ -308,7 +375,7 @@ def verdict_to_contract(
 ) -> dict[str, Any]:
     """Render the persisted verdict as ``common.schema.json#/$defs/riskVerdict``."""
     return {
-        "verdict": verdict.verdict,
+        "verdict": verdict.verdict.value,
         "requested": requested_payload,
         "allowed": {
             "quantity": (
@@ -320,7 +387,7 @@ def verdict_to_contract(
             "leverage": verdict.allowed_leverage,
             "risk_amount_usd": str(verdict.risk_amount_usd),
         },
-        "binding_cap": verdict.binding_cap,
+        "binding_cap": verdict.binding_cap.value,
         "reasons": list(verdict.reasons),
         "computed_at": verdict.computed_at,
         "expires_at": verdict.expires_at,

@@ -18,7 +18,7 @@
       "stop_price": "69000.00",
       "take_profits": ["72000.00"],
       "size_mode": "QUOTE_NOTIONAL",
-      "risk_pct": 0.8,
+      "risk_pct": null,
       "quote_notional_usd": "50000.00",
       "leverage": 2.0
     },

@@ -114,7 +114,9 @@ def test_decision_type_must_match_the_role() -> None:
 
     errors = semantic_errors(output, role="ENTRY_RECHECK")
 
-    assert {error.code for error in errors} == {"DECISION_TYPE_ROLE_MISMATCH"}
+    # MARKET_ANALYSIS also carries an opportunity here, which is now an
+    # additional PAYLOAD_MISMATCH; the role rule must still be reported.
+    assert "DECISION_TYPE_ROLE_MISMATCH" in {error.code for error in errors}
 
 
 def test_decision_type_requires_its_payload() -> None:
@@ -123,9 +125,16 @@ def test_decision_type_requires_its_payload() -> None:
     assert "PAYLOAD_MISSING" in _codes(output)
 
 
-def test_analysis_payload_must_not_accompany_an_opportunity_proposal() -> None:
+def test_market_analysis_must_not_carry_an_opportunity() -> None:
+    # Previously this asserted no errors, which let a MARKET_ANALYSIS output
+    # silently create an opportunity (one-way payload pairing). The rule is
+    # now enforced in both directions.
     output = DecisionOutput.model_validate(_output(decision_type="MARKET_ANALYSIS"))
-    assert semantic_errors(output, role="ANALYSIS") == ()
+
+    errors = semantic_errors(output, role="ANALYSIS")
+
+    assert "PAYLOAD_MISMATCH" in {error.code for error in errors}
+    assert {error.field for error in errors if error.code == "PAYLOAD_MISMATCH"} == {"opportunity"}
 
 
 def test_zone_must_be_ordered() -> None:
@@ -306,6 +315,75 @@ def test_non_market_entry_type_is_rejected() -> None:
     assert "ENTRY_TYPE_UNSUPPORTED" in {
         error.code for error in semantic_errors(output, role="ENTRY_RECHECK")
     }
+
+
+def test_risk_pct_size_mode_requires_risk_pct() -> None:
+    from pydantic import ValidationError
+
+    document = _entry_payload("entry_recheck_enter_long.json")
+    document["entry_recheck"]["order_intent"]["risk_pct"] = None
+
+    with pytest.raises(ValidationError):
+        DecisionOutput.model_validate(document)
+
+
+def test_quote_notional_size_mode_requires_quote_notional() -> None:
+    from pydantic import ValidationError
+
+    document = _entry_payload("entry_recheck_oversized.json")
+    document["entry_recheck"]["order_intent"]["quote_notional_usd"] = None
+
+    with pytest.raises(ValidationError):
+        DecisionOutput.model_validate(document)
+
+
+def test_quote_notional_size_mode_requires_a_positive_notional() -> None:
+    from pydantic import ValidationError
+
+    document = _entry_payload("entry_recheck_oversized.json")
+    document["entry_recheck"]["order_intent"]["quote_notional_usd"] = "0"
+
+    with pytest.raises(ValidationError):
+        DecisionOutput.model_validate(document)
+
+
+def test_risk_pct_size_mode_rejects_a_quote_notional() -> None:
+    from pydantic import ValidationError
+
+    document = _entry_payload("entry_recheck_enter_long.json")
+    document["entry_recheck"]["order_intent"]["quote_notional_usd"] = "1000.00"
+
+    with pytest.raises(ValidationError):
+        DecisionOutput.model_validate(document)
+
+
+def test_quote_notional_size_mode_rejects_a_risk_pct() -> None:
+    from pydantic import ValidationError
+
+    document = _entry_payload("entry_recheck_oversized.json")
+    document["entry_recheck"]["order_intent"]["risk_pct"] = 0.8
+
+    with pytest.raises(ValidationError):
+        DecisionOutput.model_validate(document)
+
+
+@pytest.mark.parametrize(
+    ("field", "value"),
+    [
+        ("leverage", 0.0),
+        ("leverage", -1.0),
+        ("risk_pct", 0.0),
+        ("risk_pct", -0.1),
+    ],
+)
+def test_entry_intent_risk_fields_must_be_positive(field: str, value: float) -> None:
+    from pydantic import ValidationError
+
+    document = _entry_payload("entry_recheck_enter_long.json")
+    document["entry_recheck"]["order_intent"][field] = value
+
+    with pytest.raises(ValidationError):
+        DecisionOutput.model_validate(document)
 
 
 def test_position_management_rationale_is_bounded_and_sanitized() -> None:

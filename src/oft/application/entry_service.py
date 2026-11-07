@@ -1,8 +1,11 @@
 """Entry re-check, deterministic risk verdict, and the human paper accept/reject.
 
-The LLM only proposes an entry. The risk gate recomputes every cap from current
-account state; the execution gateway submits the reduced/approved intent; the
-paper broker fills it deterministically. No path bypasses the gateway.
+The LLM only proposes an entry. The risk gate recomputes every cap it has an
+input for from current account state; the daily-loss cap is not evaluated here
+because this slice has no realized-PnL source, and the verdict records that
+input as unevaluated (slice-18 follow-up). The execution gateway submits the
+reduced/approved intent; the paper broker fills it deterministically. No path
+bypasses the gateway.
 """
 
 from __future__ import annotations
@@ -340,42 +343,73 @@ class EntryService:
         opportunity = self._opportunity(payload["opportunity_id"])
         reference_price, mark_as_of = self._mark(opportunity)
         side = PositionSide.LONG if payload["side"] == "LONG" else PositionSide.SHORT
-        # Every accepted entry is filled at the reference mark, so the risk caps
-        # are always sized from that price. The LLM-supplied entry_price is
-        # advisory only and never feeds the risk math.
+        # The broker fills at the reference mark adjusted by the configured
+        # slippage, so the risk caps are always sized from the mark. The
+        # LLM-supplied entry_price is advisory only and never feeds the risk math.
         risk_entry_price = reference_price
-        stop_price = Decimal(str(intent["stop_price"])) if intent["stop_price"] else None
-        risk_pct = float(intent["risk_pct"] or 0.8)
-        leverage = float(intent["leverage"] or 1.0)
-        notional = (
-            Decimal(str(intent["quote_notional_usd"])) if intent["quote_notional_usd"] else None
-        )
         contract = self._store.get_symbol(payload["symbol"])
+        if contract is None:
+            # Fail closed: without tick/step/min-notional the gate would size and
+            # round as if every filter were zero, which is unsafe.
+            raise EntryRejected(
+                "DATA_UNAVAILABLE",
+                f"the symbol contract for {payload['symbol']} is missing",
+            )
         now = utc_timestamp(self._clock.now())
         account = self._broker.account()
         position_count = len(self._store.list_positions(state="OPEN"))
-        verdict = evaluate_risk(
-            request=RiskRequest(
-                symbol=payload["symbol"],
-                side=side.value,
-                entry_price=risk_entry_price,
-                stop_price=stop_price,
-                quantity=None,
-                risk_pct=risk_pct,
-                leverage=leverage,
-                notional_usd=notional,
-            ),
-            caps=DEFAULT_CAPS,
-            equity=Decimal(account.balance),
-            open_positions=position_count,
-            daily_loss_usd=Decimal("0"),
-            mark_price=reference_price,
-            mark_as_of=mark_as_of,
-            now=now,
-            tick_size=contract.tick_size if contract else Decimal("0"),
-            step_size=contract.step_size if contract else Decimal("0"),
-            min_notional=contract.min_notional if contract else Decimal("0"),
-        )
+        try:
+            # size_mode is exclusive: only the governing sizing field is read,
+            # and a persisted intent that violates the mode is rejected rather
+            # than silently sized by the other field. Parsing lives inside this
+            # guard so malformed persisted numerics become EntryRejected.
+            size_mode = intent.get("size_mode")
+            if size_mode == "RISK_PCT":
+                if intent.get("risk_pct") is None:
+                    raise EntryRejected("ORDER_REJECTED", "size_mode RISK_PCT requires risk_pct")
+                risk_pct = float(intent["risk_pct"])
+                notional = None
+            elif size_mode == "QUOTE_NOTIONAL":
+                if intent.get("quote_notional_usd") is None:
+                    raise EntryRejected(
+                        "ORDER_REJECTED",
+                        "size_mode QUOTE_NOTIONAL requires quote_notional_usd",
+                    )
+                risk_pct = DEFAULT_CAPS.per_trade_risk_pct
+                notional = Decimal(str(intent["quote_notional_usd"]))
+            else:
+                raise EntryRejected("ORDER_REJECTED", f"unknown size_mode: {size_mode!r}")
+            stop_price = Decimal(str(intent["stop_price"])) if intent.get("stop_price") else None
+            leverage = float(intent["leverage"]) if intent.get("leverage") is not None else 1.0
+            take_profits = tuple(Decimal(str(value)) for value in intent.get("take_profits", []))
+            verdict = evaluate_risk(
+                request=RiskRequest(
+                    symbol=payload["symbol"],
+                    side=side.value,
+                    entry_price=risk_entry_price,
+                    stop_price=stop_price,
+                    quantity=None,
+                    risk_pct=risk_pct,
+                    leverage=leverage,
+                    notional_usd=notional,
+                ),
+                caps=DEFAULT_CAPS,
+                equity=Decimal(account.balance),
+                open_positions=position_count,
+                # No realized-PnL source exists in this slice, so the daily-loss
+                # cap is passed as unavailable and recorded as unevaluated
+                # instead of a silent zero (slice-18 follow-up).
+                daily_loss_usd=None,
+                mark_price=reference_price,
+                mark_as_of=mark_as_of,
+                now=now,
+                tick_size=contract.tick_size,
+                step_size=contract.step_size,
+                min_notional=contract.min_notional,
+            )
+        except (KeyError, TypeError, ValueError, ArithmeticError) as exc:
+            # A malformed persisted intent must not surface as an unhandled 500.
+            raise EntryRejected("ORDER_REJECTED", f"the entry intent is invalid: {exc}") from exc
         risk_verdict_id = f"RISK-{_digest(f'{trigger_id}:{decision.decision_id}')}"
         requested_payload = {
             "entry_price": str(risk_entry_price),
@@ -391,8 +425,8 @@ class EntryService:
                 risk_verdict_id=risk_verdict_id,
                 trigger_id=trigger_id,
                 decision_id=decision.decision_id,
-                verdict=verdict.verdict,
-                binding_cap=verdict.binding_cap,
+                verdict=verdict.verdict.value,
+                binding_cap=verdict.binding_cap.value,
                 computed_at=verdict.computed_at,
                 expires_at=verdict.expires_at,
                 payload_json=json.dumps(verdict_payload, sort_keys=True),
@@ -425,7 +459,7 @@ class EntryService:
             quantity=verdict.allowed_quantity,
             price=None,
             stop_price=stop_price,
-            take_profits=tuple(Decimal(str(value)) for value in intent.get("take_profits", [])),
+            take_profits=take_profits,
             leverage=verdict.allowed_leverage,
             decision_id=decision.decision_id,
             risk_verdict_id=risk_verdict_id,
@@ -612,11 +646,14 @@ class EntryService:
 
     def _invalidate_opportunity(self, opportunity_id: str, reason: str) -> None:
         from oft.application.opportunity_service import OpportunityService
+        from oft.domain.opportunities import OpportunityTransitionError
 
         service = OpportunityService(store=self._store, clock=self._clock)
         try:
             service.invalidate(opportunity_id, reason=reason)
-        except Exception:  # noqa: BLE001 - the opportunity may already be terminal
+        except OpportunityTransitionError:
+            # A repeat reject may find the opportunity already terminal; that is
+            # the only transition failure we tolerate. Anything else propagates.
             return
 
     def _replay(self, order_id: str, trigger_payload: dict[str, Any]) -> EntryResult:

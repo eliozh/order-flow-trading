@@ -188,6 +188,47 @@ def test_open_terminal_transitions(target: OpportunityState) -> None:
     assert updated.state is target
 
 
+def test_triggered_opportunity_can_be_invalidated() -> None:
+    triggered = transition(
+        _opportunity(),
+        OpportunityState.TRIGGERED,
+        at="2026-11-06T12:05:00.000Z",
+        reason_code="TRIGGER_MET",
+        note="trigger-1",
+    )
+
+    invalidated = transition(
+        triggered,
+        OpportunityState.INVALIDATED,
+        at="2026-11-06T12:06:00.000Z",
+        reason_code="REJECTED",
+        note="human rejected the entry",
+    )
+
+    assert invalidated.state is OpportunityState.INVALIDATED
+    assert invalidated.state_history[-1].from_state is OpportunityState.TRIGGERED
+    assert invalidated.state_history[-1].to_state is OpportunityState.INVALIDATED
+
+
+def test_triggered_opportunity_cannot_expire() -> None:
+    triggered = transition(
+        _opportunity(),
+        OpportunityState.TRIGGERED,
+        at="2026-11-06T12:05:00.000Z",
+        reason_code="TRIGGER_MET",
+        note="trigger-1",
+    )
+
+    with pytest.raises(OpportunityTransitionError):
+        transition(
+            triggered,
+            OpportunityState.EXPIRED,
+            at="2026-11-06T12:06:00.000Z",
+            reason_code="EXPIRED",
+            note="",
+        )
+
+
 def test_terminal_states_cannot_transition_again() -> None:
     expired = transition(
         _opportunity(),

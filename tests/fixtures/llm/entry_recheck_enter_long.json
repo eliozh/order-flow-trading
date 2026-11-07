@@ -19,7 +19,7 @@
       "take_profits": ["72000.00"],
       "size_mode": "RISK_PCT",
       "risk_pct": 0.8,
-      "quote_notional_usd": "1000.00",
+      "quote_notional_usd": null,
       "leverage": 2.0
     },
     "recheck_conditions": [

@@ -29,6 +29,15 @@ _TERMINAL_STATES = frozenset(
     {OpportunityState.TRIGGERED, OpportunityState.EXPIRED, OpportunityState.INVALIDATED}
 )
 
+# TRIGGERED stays terminal for expiry, but a human reject or a NO_ENTRY re-check
+# invalidates the trade idea, so that one transition is allowed.
+_ALLOWED_TRANSITIONS: dict[OpportunityState, frozenset[OpportunityState]] = {
+    OpportunityState.OPEN: frozenset(
+        {OpportunityState.TRIGGERED, OpportunityState.EXPIRED, OpportunityState.INVALIDATED}
+    ),
+    OpportunityState.TRIGGERED: frozenset({OpportunityState.INVALIDATED}),
+}
+
 
 class OpportunityTransitionError(Exception):
     """The requested state change is not allowed by the state machine."""
@@ -283,13 +292,15 @@ def transition(
     reason_code: str,
     note: str,
 ) -> Opportunity:
-    """Move ``OPEN`` to exactly one terminal state; history is append-only."""
-    if opportunity.state is not OpportunityState.OPEN:
+    """Move ``OPEN`` to a terminal state, or ``TRIGGERED`` to ``INVALIDATED``.
+
+    History is append-only; every other transition is rejected.
+    """
+    allowed = _ALLOWED_TRANSITIONS.get(opportunity.state, frozenset())
+    if to_state not in allowed:
         raise OpportunityTransitionError(
-            f"cannot transition from terminal state {opportunity.state.value}"
+            f"cannot transition from {opportunity.state.value} to {to_state.value}"
         )
-    if to_state is OpportunityState.OPEN:
-        raise OpportunityTransitionError("transition target must differ from OPEN")
     entry = StateHistoryEntry(
         from_state=opportunity.state,
         to_state=to_state,
