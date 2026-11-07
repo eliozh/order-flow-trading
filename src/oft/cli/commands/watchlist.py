@@ -11,7 +11,8 @@ from oft.api.envelope import new_request_id, success_envelope
 from oft.api.errors import ERROR_CATALOG
 from oft.application.symbol_registry import SymbolRegistry
 from oft.bootstrap import build_container
-from oft.cli.commands.doctor import emit_error
+from oft.cli.api_client import ApiClient, ApiClientError
+from oft.cli.commands.doctor import emit_error, exit_code_for
 from oft.config import ConfigError, load_settings
 from oft.domain.symbols import SymbolContract
 from oft.ports.store import StoreUnavailableError
@@ -118,6 +119,7 @@ def list_command(
     group: Annotated[
         str | None, typer.Option("--group", help="Filter to crypto or tradfi.")
     ] = None,
+    starred: Annotated[bool, typer.Option("--starred", help="Only starred symbols.")] = False,
 ) -> None:
     """List registry contracts grouped by Crypto / TradFi."""
     as_json = _resolve_output(format_, json_output)
@@ -131,7 +133,7 @@ def list_command(
     registry = _open_registry(as_json)
     tradifi = None if group is None else group == "tradfi"
     try:
-        contracts = registry.list_symbols(tradifi=tradifi)
+        contracts = registry.list_symbols(tradifi=tradifi, starred=True if starred else None)
     except StoreUnavailableError:
         emit_error(
             "DATA_UNAVAILABLE",
@@ -141,7 +143,7 @@ def list_command(
         raise typer.Exit(code=1) from None
     _emit(
         contracts,
-        {"total": len(contracts), "group": group},
+        {"total": len(contracts), "group": group, "starred": starred},
         render_symbols_table(contracts, title="WATCHLIST · read-only symbol registry"),
         as_json,
     )
@@ -212,3 +214,42 @@ def groups_command(
         )
     else:
         typer.echo(_render_groups(counts))
+
+
+def _set_star(symbol: str, starred: bool, json_output: bool) -> None:
+    try:
+        settings = load_settings()
+    except ConfigError as exc:
+        emit_error("CONFIG_INVALID", exc.message, json_output=json_output)
+        raise typer.Exit(code=5) from exc
+    try:
+        envelope = ApiClient.from_settings(settings).set_starred(symbol, starred)
+    except ApiClientError as exc:
+        emit_error(exc.code, exc.message, json_output=json_output)
+        raise typer.Exit(code=exit_code_for(exc.code)) from exc
+    data = envelope.get("data") or {}
+    if not isinstance(data, dict):
+        emit_error("INTERNAL_ERROR", "API returned no star data.", json_output=json_output)
+        raise typer.Exit(code=1)
+    if json_output:
+        typer.echo(json.dumps(envelope, indent=2))
+    else:
+        typer.echo(f"{'starred' if starred else 'unstarred'} {symbol.strip().upper()}")
+
+
+@watchlist_app.command("star")
+def star_command(
+    symbol: str,
+    json_output: Annotated[bool, typer.Option("--json", help="Emit JSON.")] = False,
+) -> None:
+    """Star a registry symbol."""
+    _set_star(symbol, True, json_output)
+
+
+@watchlist_app.command("unstar")
+def unstar_command(
+    symbol: str,
+    json_output: Annotated[bool, typer.Option("--json", help="Emit JSON.")] = False,
+) -> None:
+    """Unstar a registry symbol."""
+    _set_star(symbol, False, json_output)

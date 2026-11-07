@@ -5,10 +5,12 @@ from __future__ import annotations
 from typing import Annotated, Any, Literal
 
 from fastapi import APIRouter, Query, Request
+from pydantic import BaseModel, ConfigDict
 
 from oft.api.envelope import new_request_id, success_envelope
 from oft.api.errors import ApiError
 from oft.domain.symbols import build_symbol_detail
+from oft.domain.time import utc_timestamp
 
 router = APIRouter()
 
@@ -41,6 +43,7 @@ def list_symbols(
         str | None,
         Query(max_length=_MAX_CONTRACT_TYPE_LENGTH, description="exchangeInfo contractType."),
     ] = None,
+    starred: Annotated[bool | None, Query(description="Filter to starred symbols.")] = None,
     limit: Annotated[int, Query(ge=1, le=_MAX_LIMIT)] = _DEFAULT_LIMIT,
     offset: Annotated[int, Query(ge=0, le=10_000_000)] = 0,
 ) -> dict[str, Any]:
@@ -52,10 +55,13 @@ def list_symbols(
             query=q,
             tradifi=tradifi,
             contract_type=contract_type,
+            starred=starred,
             limit=limit,
             offset=offset,
         )
-        total = registry.count_symbols(query=q, tradifi=tradifi, contract_type=contract_type)
+        total = registry.count_symbols(
+            query=q, tradifi=tradifi, contract_type=contract_type, starred=starred
+        )
     except OverflowError as exc:
         raise ApiError(
             "VALIDATION_FAILED", "Pagination offset is outside the supported range."
@@ -93,6 +99,33 @@ def get_symbol(symbol: str, request: Request) -> dict[str, Any]:
     detail = build_symbol_detail(contract)
     return success_envelope(
         detail.model_dump(mode="json"),
+        request_id=new_request_id(),
+        provenance="CALC",
+        data_quality="COMPLETE",
+    )
+
+
+class StarRequest(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    starred: bool
+
+
+@router.patch("/api/v1/symbols/{symbol}/star")
+def set_star(symbol: str, payload: StarRequest, request: Request) -> dict[str, Any]:
+    """Star or unstar one registry symbol (idempotent)."""
+    registry = _registry(request)
+    starred_at = utc_timestamp(request.app.state.container.clock.now())
+    updated = registry.set_starred(symbol, payload.starred, starred_at=starred_at)
+    if not updated:
+        raise ApiError("NOT_FOUND", f"Symbol {symbol} does not exist.")
+    resolved = symbol.strip().upper()
+    return success_envelope(
+        {
+            "symbol": resolved,
+            "starred": payload.starred,
+            "starred_at": starred_at if payload.starred else None,
+        },
         request_id=new_request_id(),
         provenance="CALC",
         data_quality="COMPLETE",

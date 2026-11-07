@@ -147,8 +147,56 @@ def build_doctor(
 ) -> DoctorReport:
     readiness = build_readiness(settings, store, market_data, clock)
     probe = daemon or probe_daemon(settings)
+    from oft.application.ingestion_supervisor import checkpoint_diagnostic, read_ws_state
+
+    checkpoint = checkpoint_diagnostic(settings, clock)
+    if not checkpoint.present:
+        ingest_check = CheckResult(
+            name="ingest.checkpoint",
+            status="ok",
+            detail="no ingestion checkpoint yet",
+        )
+    elif checkpoint.stale:
+        ingest_check = CheckResult(
+            name="ingest.checkpoint",
+            status="degraded",
+            detail=(f"stale checkpoint ({checkpoint.age_seconds:.0f}s old) at {checkpoint.path}"),
+        )
+    else:
+        ingest_check = CheckResult(
+            name="ingest.checkpoint",
+            status="ok",
+            detail=(f"{len(checkpoint.streams)} stream(s), {checkpoint.age_seconds:.0f}s old"),
+        )
+    ws_state = read_ws_state(settings)
+    if ws_state is None:
+        ws_check = CheckResult(name="ingest.ws", status="ok", detail="no live WS state yet")
+    elif (
+        ws_state.stale
+        or ws_state.connection_state != "SUBSCRIBED"
+        or not ws_state.streams
+        or not ws_state.freshness
+    ):
+        ws_check = CheckResult(
+            name="ingest.ws",
+            status="degraded",
+            detail=f"{ws_state.connection_state}; stale={ws_state.stale}",
+        )
+    else:
+        ws_check = CheckResult(
+            name="ingest.ws",
+            status="ok",
+            detail=(
+                f"{ws_state.connection_state}; streams={len(ws_state.streams)}; "
+                f"malformed={ws_state.stats.get('malformed', 0)}; "
+                f"oversized={ws_state.stats.get('oversized', 0)}; "
+                f"accepted={ws_state.stats.get('accepted', 0)}"
+            ),
+        )
     checks = (
         *readiness.checks,
+        ingest_check,
+        ws_check,
         CheckResult(
             name="daemon",
             status="ok" if probe.state == "UP" else "offline",

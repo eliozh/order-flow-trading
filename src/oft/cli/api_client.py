@@ -76,6 +76,9 @@ class ApiClient:
     def create_scan(self, payload: dict[str, Any]) -> dict[str, Any]:
         return self._request("POST", "/api/v1/scans", payload)
 
+    def set_starred(self, symbol: str, starred: bool) -> dict[str, Any]:
+        return self._request("PATCH", f"/api/v1/symbols/{symbol}/star", {"starred": starred})
+
     def get_scan(self, scan_id: str) -> dict[str, Any]:
         return self._request("GET", f"/api/v1/scans/{scan_id}")
 

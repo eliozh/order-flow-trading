@@ -307,6 +307,7 @@ class SymbolRegistry:
         query: str | None = None,
         tradifi: bool | None = None,
         contract_type: str | None = None,
+        starred: bool | None = None,
         limit: int | None = None,
         offset: int = 0,
     ) -> tuple[SymbolContract, ...]:
@@ -314,6 +315,7 @@ class SymbolRegistry:
             query=query,
             tradifi=tradifi,
             contract_type=contract_type,
+            starred=starred,
             limit=limit,
             offset=offset,
         )
@@ -324,11 +326,20 @@ class SymbolRegistry:
         query: str | None = None,
         tradifi: bool | None = None,
         contract_type: str | None = None,
+        starred: bool | None = None,
     ) -> int:
-        return self._store.count_symbols(query=query, tradifi=tradifi, contract_type=contract_type)
+        return self._store.count_symbols(
+            query=query, tradifi=tradifi, contract_type=contract_type, starred=starred
+        )
 
     def get_symbol(self, symbol: str) -> SymbolContract | None:
         return self._store.get_symbol(symbol.strip().upper())
+
+    def set_starred(self, symbol: str, starred: bool, *, starred_at: str | None = None) -> bool:
+        return self._store.set_starred(symbol.strip().upper(), starred, starred_at=starred_at)
+
+    def list_starred(self) -> tuple[SymbolContract, ...]:
+        return self._store.list_starred()
 
     def count(self) -> int:
         return self._store.count_symbols()

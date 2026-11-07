@@ -73,14 +73,14 @@ def test_v1_database_upgrades_to_v2_with_effective_checks(tmp_path: Path) -> Non
                 """
                 INSERT INTO symbols VALUES (
                     'BADUSDT', 'B', 'USDT', 'PERPETUAL', NULL, 'TRADING',
-                    '0.1', '0.1', '1', '5', -1, 2, 1567900800000, 0, 't'
+                    '0.1', '0.1', '1', '5', -1, 2, 1567900800000, 0, 't', 0, NULL
                 )
                 """
             )
     finally:
         connection.close()
 
-    assert versions == {1, 2, 3, 4, 5, 6}
+    assert versions == {1, 2, 3, 4, 5, 6, 7}
 
 
 _V2_BACKFILL = """
@@ -138,7 +138,7 @@ def test_v2_database_gains_the_backfill_heartbeat_column(tmp_path: Path) -> None
 
     assert "updated_at" in columns
     assert updated_at == "2026-11-06T00:00:00.000Z"
-    assert versions == {1, 2, 3, 4, 5, 6}
+    assert versions == {1, 2, 3, 4, 5, 6, 7}
 
 
 def test_v5_checks_indexes_and_foreign_keys(tmp_path: Path) -> None:
@@ -235,4 +235,63 @@ def test_v5_database_migrates_manifest_metrics_columns(tmp_path: Path) -> None:
 
     assert {"metric_version", "input_manifest_hash", "window_start", "window_end"} <= columns
     assert legacy == ("/tmp/legacy.parquet", None, None)
-    assert versions == {1, 2, 3, 4, 5, 6}
+    assert versions == {1, 2, 3, 4, 5, 6, 7}
+
+
+def test_v6_database_migrates_starred_columns(tmp_path: Path) -> None:
+    settings = Settings(env="test", port=8765, data_dir=tmp_path / "data")
+    settings.data_dir.mkdir(parents=True)
+    connection = sqlite3.connect(database_path(settings))
+    try:
+        connection.executescript(
+            """
+            CREATE TABLE schema_migrations (
+                version INTEGER PRIMARY KEY,
+                applied_at TEXT NOT NULL
+            );
+            INSERT INTO schema_migrations (version, applied_at)
+                VALUES (1,'t'),(2,'t'),(3,'t'),(4,'t'),(5,'t'),(6,'t');
+            CREATE TABLE symbols (
+                symbol TEXT PRIMARY KEY,
+                base_asset TEXT NOT NULL,
+                quote_asset TEXT NOT NULL,
+                contract_type TEXT NOT NULL,
+                underlying_type TEXT,
+                status TEXT NOT NULL,
+                tick_size TEXT NOT NULL,
+                step_size TEXT NOT NULL,
+                min_qty TEXT NOT NULL,
+                min_notional TEXT NOT NULL,
+                price_precision INTEGER NOT NULL,
+                quantity_precision INTEGER NOT NULL,
+                onboard_date INTEGER NOT NULL,
+                tradifi INTEGER NOT NULL,
+                updated_at TEXT NOT NULL
+            );
+            INSERT INTO symbols VALUES (
+                'BTCUSDT','BTC','USDT','PERPETUAL','COIN','TRADING',
+                '0.10','0.001','0.001','5.00',2,3,1567900800000,0,'t'
+            );
+            """
+        )
+        connection.commit()
+    finally:
+        connection.close()
+
+    store = SqliteStore(settings)
+    store.initialize()
+    store.initialize()
+
+    connection = sqlite3.connect(database_path(settings))
+    try:
+        columns = {row[1] for row in connection.execute("PRAGMA table_info(symbols)")}
+        row = connection.execute(
+            "SELECT symbol, starred, starred_at FROM symbols WHERE symbol = 'BTCUSDT'"
+        ).fetchone()
+        versions = {row_[0] for row_ in connection.execute("SELECT version FROM schema_migrations")}
+    finally:
+        connection.close()
+
+    assert {"starred", "starred_at"} <= columns
+    assert row == ("BTCUSDT", 0, None)
+    assert versions == {1, 2, 3, 4, 5, 6, 7}

@@ -166,6 +166,7 @@ class StorePort(Protocol):
         query: str | None = None,
         tradifi: bool | None = None,
         contract_type: str | None = None,
+        starred: bool | None = None,
         limit: int | None = None,
         offset: int = 0,
     ) -> tuple[SymbolContract, ...]: ...
@@ -176,9 +177,14 @@ class StorePort(Protocol):
         query: str | None = None,
         tradifi: bool | None = None,
         contract_type: str | None = None,
+        starred: bool | None = None,
     ) -> int: ...
 
     def get_symbol(self, symbol: str) -> SymbolContract | None: ...
+
+    def set_starred(self, symbol: str, starred: bool, *, starred_at: str | None = None) -> bool: ...
+
+    def list_starred(self) -> tuple[SymbolContract, ...]: ...
 
     # -- Backfill state --------------------------------------------------
 

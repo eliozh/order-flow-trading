@@ -4,7 +4,7 @@ from __future__ import annotations
 
 from typing import Literal
 
-from pydantic import BaseModel, ConfigDict
+from pydantic import BaseModel, ConfigDict, Field
 
 from oft import __version__
 from oft.application.health import DaemonProbe
@@ -39,6 +39,30 @@ class LastScanSummary(BaseModel):
     finished_at: str
 
 
+class MarketDataStreamState(BaseModel):
+    """Last event position for one live stream."""
+
+    model_config = ConfigDict(frozen=True)
+
+    stream: str
+    symbol: str | None = None
+    last_event_time: str | None = None
+    last_event_id: int | None = None
+    stale: bool = False
+
+
+class MarketDataStatus(BaseModel):
+    """WS connection state and last event times (daemon-independent)."""
+
+    model_config = ConfigDict(frozen=True)
+
+    connection_state: str
+    updated_at: str
+    stale: bool
+    streams: tuple[MarketDataStreamState, ...]
+    counters: dict[str, int] = Field(default_factory=dict)
+
+
 class StatusReport(BaseModel):
     """Daemon-independent system status."""
 
@@ -55,6 +79,7 @@ class StatusReport(BaseModel):
     universe: SymbolUniverseSummary
     daemon: DaemonStatus
     last_scan: LastScanSummary | None = None
+    market_data: MarketDataStatus | None = None
 
 
 def _last_scan(store: StorePort | None) -> LastScanSummary | None:
@@ -74,6 +99,48 @@ def _last_scan(store: StorePort | None) -> LastScanSummary | None:
     )
 
 
+def _freshness_key(stream: str) -> str | None:
+    if "@markPrice" in stream:
+        return "mark"
+    if "@kline_" in stream:
+        return "kline_1m"
+    return None
+
+
+def _market_data_status(settings: Settings) -> MarketDataStatus | None:
+    from oft.application.ingestion_supervisor import read_ws_state
+
+    state = read_ws_state(settings)
+    if state is None:
+        return None
+    streams: list[MarketDataStreamState] = []
+    for stream in sorted(state.streams):
+        payload = state.streams[stream]
+        freshness_key = _freshness_key(stream)
+        fresh = state.freshness.get(freshness_key, {}) if freshness_key else {}
+        raw_id = payload.get("last_event_id")
+        streams.append(
+            MarketDataStreamState(
+                stream=stream,
+                symbol=payload.get("symbol") if isinstance(payload.get("symbol"), str) else None,
+                last_event_time=(
+                    payload.get("last_event_time")
+                    if isinstance(payload.get("last_event_time"), str)
+                    else None
+                ),
+                last_event_id=raw_id if isinstance(raw_id, int) else None,
+                stale=bool(fresh.get("stale", False)),
+            )
+        )
+    return MarketDataStatus(
+        connection_state=state.connection_state,
+        updated_at=state.updated_at,
+        stale=state.stale,
+        streams=tuple(streams),
+        counters=dict(state.stats),
+    )
+
+
 def build_status(
     settings: Settings,
     market_data: MarketDataPort,
@@ -81,6 +148,7 @@ def build_status(
     *,
     store: StorePort | None = None,
     daemon: DaemonProbe | None = None,
+    market_data_status: MarketDataStatus | None = None,
 ) -> StatusReport:
     """Build the status report from typed settings plus optional local state."""
     summary = summarize_universe(market_data.load_universe())
@@ -96,4 +164,5 @@ def build_status(
         universe=summary,
         daemon=DaemonStatus(state=probe.state, detail=probe.detail),
         last_scan=_last_scan(store),
+        market_data=market_data_status or _market_data_status(settings),
     )

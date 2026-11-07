@@ -9,7 +9,7 @@ from oft.ports.store import ScanRecord
 
 def render_status_table(report: StatusReport) -> str:
     """Render a deterministic, copy-friendly status table."""
-    rows = (
+    rows: list[tuple[str, str]] = [
         ("Environment", report.env),
         ("Status", report.status),
         ("Version", report.version),
@@ -21,7 +21,14 @@ def render_status_table(report: StatusReport) -> str:
         ("TradFi symbols", str(report.universe.tradifi_count)),
         ("Universe source", report.universe.source),
         ("Generated at", report.generated_at),
-    )
+    ]
+    if report.market_data is not None:
+        rows.extend(
+            [
+                ("WS state", report.market_data.connection_state),
+                ("WS stale", "yes" if report.market_data.stale else "no"),
+            ]
+        )
     width = max(len(label) for label, _ in rows)
     lines = [f"{label:<{width}}  {value}" for label, value in rows]
     if report.last_scan is not None:
@@ -29,6 +36,13 @@ def render_status_table(report: StatusReport) -> str:
         lines.append("")
         lines.append(f"Last scan    {scan.scan_id} · {scan.symbol} · {scan.period}")
         lines.append(f"             status {scan.status} · delta {scan.delta} · cvd {scan.cvd}")
+    if report.market_data is not None:
+        lines.append("")
+        for stream in report.market_data.streams:
+            lines.append(
+                f"WS {stream.stream:<32} {stream.last_event_time or 'never'}"
+                f"{' STALE' if stream.stale else ''}"
+            )
     lines.append("")
     lines.append(f"{'SYMBOL':<14}{'CONTRACT':<22}SOURCE")
     for symbol in report.universe.symbols:

@@ -659,6 +659,7 @@ dependencies = [
     { name = "structlog" },
     { name = "typer" },
     { name = "uvicorn", extra = ["standard"] },
+    { name = "websockets" },
 ]
 
 [package.dev-dependencies]
@@ -682,6 +683,7 @@ requires-dist = [
     { name = "structlog", specifier = ">=24.4.0" },
     { name = "typer", specifier = ">=0.15.0" },
     { name = "uvicorn", extras = ["standard"], specifier = ">=0.32.1" },
+    { name = "websockets", specifier = ">=13.0" },
 ]
 
 [package.metadata.requires-dev]
