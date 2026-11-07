@@ -682,7 +682,9 @@ test('/scans/:id shows the DATA -> METRICS -> REPORT metrics-only detail', async
     await expect(item).toContainText('DONE')
   }
   await expect(page.getByText(/No LLM stage exists in this metrics-only slice/i)).toBeVisible()
-  await expect(page.getByRole('link', { name: REPORT_ID as string })).toHaveAttribute(
+  // The report link is also rendered in the per-symbol table and the
+  // "Report links" footer, so scope the assertion to the summary detail grid.
+  await expect(grid.getByRole('link', { name: REPORT_ID as string })).toHaveAttribute(
     'href',
     `/reports/${REPORT_ID as string}`,
   )

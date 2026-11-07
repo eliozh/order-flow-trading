@@ -15,13 +15,16 @@ from collections.abc import Callable, Mapping
 from dataclasses import dataclass, replace
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
-from typing import Any
+from typing import TYPE_CHECKING, Any
 
 from apscheduler.schedulers.background import BackgroundScheduler
 from apscheduler.triggers.date import DateTrigger
 
 from oft.domain.time import utc_timestamp
 from oft.ports.clock import ClockPort
+
+if TYPE_CHECKING:
+    from oft.config import Settings
 
 SCAN_PERIODS = ("4h", "8h")
 PERIOD_HOURS: dict[str, int] = {"4h": 4, "8h": 8}
@@ -269,6 +272,18 @@ def resolve_schedule_settings(
     if jitter >= PERIOD_HOURS[period] * 3600:
         raise ValueError("OFT_SCAN_JITTER_SECONDS must be less than the scan period")
     return ScheduleConfig(period=period, jitter_seconds=jitter)
+
+
+def schedule_state_path(settings: Settings) -> Path:
+    """Where the daemon persists the active scan cadence."""
+    return settings.data_dir / "run" / "schedule.json"
+
+
+def resolve_schedule_state(settings: Settings) -> ScheduleState:
+    """The persisted state, falling back to ``OFT_SCAN_*`` defaults."""
+    config = resolve_schedule_settings()
+    default = ScheduleState(period=config.period, jitter_seconds_max=config.jitter_seconds)
+    return load_schedule_state(schedule_state_path(settings), default=default)
 
 
 def load_schedule_state(path: Any, *, default: ScheduleState) -> ScheduleState:

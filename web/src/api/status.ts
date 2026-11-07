@@ -14,6 +14,13 @@ export interface UniverseSummary {
   symbols: SymbolInfo[]
 }
 
+export interface ScheduleData {
+  timezone: string
+  period: string
+  pending_period: string | null
+  next_run_at: string
+}
+
 export interface StatusData {
   status: 'ok'
   env: string
@@ -24,6 +31,7 @@ export interface StatusData {
   log_level: string
   generated_at: string
   universe: UniverseSummary
+  schedule?: ScheduleData | null
 }
 
 export interface ApiError {

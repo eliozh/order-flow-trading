@@ -7,9 +7,11 @@ import json
 import threading
 from contextlib import suppress
 from datetime import timedelta
+from decimal import Decimal, InvalidOperation
 from pathlib import Path
 from typing import Any
 
+import structlog
 from fastapi import APIRouter, Header, Query, Request
 from fastapi import Path as PathParam
 from fastapi.responses import JSONResponse
@@ -33,12 +35,26 @@ from oft.config import Environment
 from oft.domain.time import utc_timestamp
 from oft.ports.store import IdempotencyRecord, ScanRecord, ScanSymbolRecord
 
+logger = structlog.get_logger(__name__)
+
 router = APIRouter()
 
 _IDEMPOTENCY_TTL = timedelta(hours=24)
 _IDEMPOTENCY_LEASE = timedelta(seconds=30)
 _SCAN_HEARTBEAT_SECONDS = 10.0
 _IDEMPOTENCY_HEARTBEAT = timedelta(seconds=10)
+_FAILED_STAGE_BY_CODE = {
+    "DATA_UNAVAILABLE": "DATA",
+    "METRICS_INCOMPLETE": "METRICS",
+}
+
+
+def _failure_stage(exc: BaseException, code: str) -> str:
+    """The stage that failed, from the scan service or the error code."""
+    stage = getattr(exc, "failed_stage", None)
+    if stage:
+        return str(stage)
+    return _FAILED_STAGE_BY_CODE.get(code) or "REPORT"
 
 
 def _validated_fixture_path(raw: str, fixtures_dir: Path) -> str:
@@ -183,6 +199,21 @@ def _report_links(rows: tuple[ScanSymbolRecord, ...]) -> list[dict[str, str]]:
     return links
 
 
+def _failed_stage(row: ScanSymbolRecord) -> str:
+    """Return the stage a FAILED row actually failed in.
+
+    New rows persist ``failed_stage``; legacy rows fall back to the error code
+    so the four cells stay honest for both shapes.
+    """
+    if row.failed_stage:
+        return row.failed_stage
+    if row.error_code == "DATA_UNAVAILABLE":
+        return "DATA"
+    if row.error_code == "METRICS_INCOMPLETE":
+        return "METRICS"
+    return "REPORT"
+
+
 def _symbol_stage_flags(row: ScanSymbolRecord) -> dict[str, str]:
     """Derive the per-symbol DATA/METRICS/LLM/REPORT cells for S03.2."""
     data = metrics = llm = report = "PENDING"
@@ -207,11 +238,20 @@ def _symbol_stage_flags(row: ScanSymbolRecord) -> dict[str, str]:
         )
         report = "DONE" if row.report_id else "SKIPPED"
     elif row.stage == "FAILED":
-        if row.error_code == "DATA_UNAVAILABLE":
+        stage = _failed_stage(row)
+        if stage == "DATA":
             data = "FAILED"
+            metrics = llm = report = "SKIPPED"
+        elif stage == "METRICS":
+            data, metrics = "DONE", "FAILED"
+            llm = report = "SKIPPED"
+        elif stage == "LLM":
+            data = metrics = "DONE"
+            llm, report = "FAILED", "SKIPPED"
         else:
-            data = "DONE"
-            metrics = "FAILED"
+            data = metrics = "DONE"
+            llm = "DONE" if row.llm_status is not None else "SKIPPED"
+            report = "FAILED"
     return {
         "data_stage": data,
         "metrics_stage": metrics,
@@ -228,12 +268,38 @@ def _symbol_row(row: ScanSymbolRecord) -> dict[str, object]:
         "data_quality": row.data_quality,
         "error_code": row.error_code,
         "error_message": row.error_message,
+        "failed_stage": row.failed_stage,
         "llm_status": row.llm_status,
         "llm_tokens": row.llm_tokens,
         "cost_usd": row.cost_usd,
         "cost_unpriced": row.cost_unpriced,
         **_symbol_stage_flags(row),
     }
+
+
+def _cost_totals(rows: tuple[ScanSymbolRecord, ...]) -> tuple[Decimal, bool]:
+    """Aggregate child costs; an unparseable amount is surfaced as unpriced.
+
+    A failure row carries no LLM usage, so its default ``cost_unpriced`` must
+    not mark the whole batch unpriced. Only configured-LLM rows participate in
+    the unpriced flag.
+    """
+    cost = Decimal("0")
+    unpriced = False
+    for row in rows:
+        try:
+            cost += Decimal(row.cost_usd)
+        except (InvalidOperation, TypeError, ValueError):
+            unpriced = True
+            logger.warning(
+                "scan_cost_unparseable",
+                symbol=row.symbol,
+                cost_usd=row.cost_usd,
+            )
+            continue
+        if row.llm_status is not None:
+            unpriced = unpriced or row.cost_unpriced
+    return cost, unpriced
 
 
 def _batch_status(rows: tuple[ScanSymbolRecord, ...], *, running: bool) -> str:
@@ -273,12 +339,15 @@ def _batch_source_mode(children: tuple[ScanRecord, ...]) -> str:
     return children[0].source_mode if children else "BACKFILL"
 
 
-def _batch_data_quality(status: str, children: tuple[ScanRecord, ...]) -> str:
-    if status == "PARTIAL":
-        return "PARTIAL"
-    if status in {"FAILED", "RUNNING"} and not children:
+def _batch_data_quality(children: tuple[ScanRecord, ...]) -> str:
+    """Derive data quality from child scans only.
+
+    LLM rejection/degradation is an LLM outcome, not a data gap: a batch whose
+    children have COMPLETE data stays COMPLETE even when STATUS is PARTIAL.
+    """
+    if not children:
         return "MISSING"
-    qualities = {child.data_quality for child in children}
+    qualities = {child.data_quality or "MISSING" for child in children}
     if "MISSING" in qualities:
         return "MISSING"
     if qualities - {"COMPLETE"}:
@@ -310,16 +379,7 @@ def _batch_scan_payload(
     degraded = sum(1 for row in rows if row.stage == "DEGRADED")
     failed = sum(1 for row in rows if row.stage == "FAILED")
     tokens = sum(row.llm_tokens for row in rows)
-    from decimal import Decimal, InvalidOperation
-
-    cost = Decimal("0")
-    unpriced = False
-    for row in rows:
-        try:
-            cost += Decimal(row.cost_usd)
-        except InvalidOperation:
-            continue
-        unpriced = unpriced or row.cost_unpriced
+    cost, unpriced = _cost_totals(rows)
     window_starts = [child.window_start for child in children if child.window_start]
     window_ends = [child.window_end for child in children if child.window_end]
     report_ids = [row.report_id for row in rows if row.report_id]
@@ -333,7 +393,7 @@ def _batch_scan_payload(
         "finished_at": run.finished_at or "",
         "error_code": run.error_code,
         "error_message": run.message,
-        "data_quality": _batch_data_quality(status, children),
+        "data_quality": _batch_data_quality(children),
         "source_mode": _batch_source_mode(children),
         "window_start": min(window_starts) if window_starts else "",
         "window_end": max(window_ends) if window_ends else "",
@@ -366,33 +426,28 @@ def _scan_detail_payload(container: Any, record: ScanRecord) -> dict[str, object
     cost_unpriced = record.cost_unpriced
     if rows:
         total_tokens = sum(row.llm_tokens for row in rows)
-        from decimal import Decimal, InvalidOperation
-
-        cost = Decimal("0")
-        unpriced = False
-        for row in rows:
-            try:
-                cost += Decimal(row.cost_usd)
-            except InvalidOperation:
-                continue
-            unpriced = unpriced or row.cost_unpriced
+        cost, cost_unpriced = _cost_totals(rows)
         total_cost = format(cost, "f")
-        cost_unpriced = unpriced
         symbols = [_symbol_row(row) for row in rows]
     else:
         symbols = [
-            {
-                "symbol": record.symbol,
-                "stage": payload.get("symbol_stage"),
-                "report_id": record.report_id,
-                "data_quality": record.data_quality,
-                "error_code": record.error_code,
-                "error_message": record.error_message,
-                "llm_status": record.llm_status,
-                "llm_tokens": record.llm_tokens,
-                "cost_usd": record.cost_usd,
-                "cost_unpriced": record.cost_unpriced,
-            }
+            _symbol_row(
+                ScanSymbolRecord(
+                    scan_id=record.scan_id,
+                    symbol=record.symbol,
+                    stage=str(payload.get("symbol_stage") or record.status),
+                    started_at=record.started_at,
+                    finished_at=record.finished_at or None,
+                    error_code=record.error_code,
+                    report_id=record.report_id,
+                    data_quality=record.data_quality,
+                    error_message=record.error_message,
+                    llm_status=record.llm_status,
+                    llm_tokens=record.llm_tokens,
+                    cost_usd=record.cost_usd,
+                    cost_unpriced=record.cost_unpriced,
+                )
+            )
         ]
     payload.update(
         {
@@ -531,17 +586,38 @@ def _run_metrics_scan(request: Request, payload: ScanCreateRequest) -> dict[str,
                 finished_at=utc_timestamp(container.clock.now()),
                 error_code=exc.code,
                 error_message=exc.message,
+                failed_stage=_failure_stage(exc, exc.code),
                 report_id=None,
                 data_quality=None,
+                cost_usd="0",
+                cost_unpriced=False,
             )
         )
         raise ApiError(exc.code, exc.message, details=_scan_error_details(exc)) from exc
-    except BaseException:
+    except BaseException as exc:
         ledger.finish(
             claim.run.run_id,
             "FAILED",
             error_code="SCAN_FAILED",
             owner=claim.run.lease_owner,
+        )
+        # A non-ScanError (including a cancellation) must still leave a
+        # terminal checkpoint row; otherwise the symbol renders as running.
+        container.store.upsert_scan_symbol(
+            ScanSymbolRecord(
+                scan_id=scan_id,
+                symbol=payload.symbol,
+                stage="FAILED",
+                started_at=started_at,
+                finished_at=utc_timestamp(container.clock.now()),
+                error_code="SCAN_FAILED",
+                error_message=str(exc),
+                failed_stage=_failure_stage(exc, "SCAN_FAILED"),
+                report_id=None,
+                data_quality=None,
+                cost_usd="0",
+                cost_unpriced=False,
+            )
         )
         raise
     else:
@@ -597,6 +673,8 @@ def _run_batch_scan(request: Request, payload: ScanCreateRequest) -> dict[str, A
             source=payload.source,
             metrics_only=payload.metrics_only,
             provider=payload.provider,
+            start=payload.start,
+            end=payload.end,
         )
     except ScanAlreadyRunning as exc:
         raise ApiError(
@@ -618,13 +696,7 @@ def _run_batch_scan(request: Request, payload: ScanCreateRequest) -> dict[str, A
         request_id=new_request_id(),
         generated_at=outcome.run.finished_at or outcome.run.started_at,
         provenance="CALC",
-        data_quality=(
-            "COMPLETE"
-            if data["status"] == "COMPLETE"
-            else "PARTIAL"
-            if data["status"] == "PARTIAL"
-            else "MISSING"
-        ),
+        data_quality=str(data["data_quality"]),
     )
 
 
@@ -780,12 +852,6 @@ def read_scan(
             request_id=new_request_id(),
             generated_at=run.finished_at or run.started_at,
             provenance="CALC",
-            data_quality=(
-                "COMPLETE"
-                if data["status"] == "COMPLETE"
-                else "PARTIAL"
-                if data["status"] == "PARTIAL"
-                else "MISSING"
-            ),
+            data_quality=str(data["data_quality"]),
         )
     raise ApiError("NOT_FOUND", f"Scan {scan_id} does not exist.")

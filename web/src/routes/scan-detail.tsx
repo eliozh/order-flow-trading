@@ -37,13 +37,15 @@ const LLM_CHIP: Record<string, string> = {
   REJECTED: 'chip chip--danger',
 }
 
+const TERMINAL_STAGES = new Set(['DONE', 'DEGRADED', 'FAILED'])
+
 function symbolRows(scan: ScanData): ScanSymbolRow[] {
   if (scan.symbols && scan.symbols.length > 0) {
     return scan.symbols
   }
   return [
     {
-      symbol: scan.symbol,
+      symbol: scan.symbol ?? scan.scan_id,
       stage: scan.symbol_stage ?? scan.status,
       report_id: scan.report_id,
       data_quality: scan.data_quality,
@@ -57,48 +59,74 @@ function symbolRows(scan: ScanData): ScanSymbolRow[] {
   ]
 }
 
+function aggregateStage(flags: StageFlags[], key: keyof StageFlags): StageState {
+  if (flags.some((flags) => flags[key] === 'FAILED')) {
+    return 'FAILED'
+  }
+  if (flags.some((flags) => flags[key] === 'RUNNING')) {
+    return 'RUNNING'
+  }
+  const states = flags.map((flags) => flags[key])
+  if (states.length > 0 && states.every((state) => state === 'DONE' || state === 'SKIPPED')) {
+    // SKIPPED means a symbol failed before this stage, so it never ran there.
+    // A stage that completed for every reachable symbol is DONE, not PENDING.
+    return states.includes('DONE') ? 'DONE' : 'SKIPPED'
+  }
+  return 'PENDING'
+}
+
 function stages(scan: ScanData): { name: string; state: StageState; detail: string }[] {
   const rows = symbolRows(scan)
+  const flags = rows.map(symbolStageFlags)
+  const running = scan.status === 'RUNNING' || scan.status === 'QUEUED'
   const failed = scan.status === 'FAILED'
-  const running = scan.status === 'RUNNING'
-  const anyReport = rows.some((row) => Boolean(row.report_id))
-  const anyLlm = rows.some((row) => Boolean(row.llm_status))
+  const terminal = rows.length > 0 && rows.every((row) => TERMINAL_STAGES.has(row.stage))
+  const started = terminal || rows.some((row) => row.stage !== 'QUEUED')
   const anyRejected = rows.some((row) => row.llm_status === 'REJECTED')
-  const dataFailed = rows.some(
-    (row) => row.stage === 'FAILED' && row.error_code === 'DATA_UNAVAILABLE',
-  )
-  const terminal = rows.every((row) => ['DONE', 'DEGRADED', 'FAILED'].includes(row.stage))
+  const dataState = aggregateStage(flags, 'data')
+  const metricsState = aggregateStage(flags, 'metrics')
+  const llmState = aggregateStage(flags, 'llm')
+  let reportState = aggregateStage(flags, 'report')
+  if (reportState === 'PENDING' && failed) {
+    reportState = 'FAILED'
+  } else if (reportState === 'PENDING' && running) {
+    reportState = 'RUNNING'
+  }
   return [
     {
       name: 'QUEUED',
-      state: terminal ? 'DONE' : running ? 'RUNNING' : 'PENDING',
+      state: started ? 'DONE' : running ? 'RUNNING' : 'PENDING',
       detail: `${rows.length} symbol${rows.length === 1 ? '' : 's'} in this run`,
     },
     {
       name: 'DATA',
-      state: dataFailed ? 'FAILED' : terminal ? 'DONE' : running ? 'RUNNING' : 'PENDING',
-      detail: dataFailed
-        ? 'one symbol has a data gap'
-        : 'persisted aggTrades resampled to UTC bars',
+      state: dataState,
+      detail:
+        dataState === 'FAILED'
+          ? 'one symbol has a data gap'
+          : 'persisted aggTrades resampled to UTC bars',
     },
     {
       name: 'METRICS',
-      state: failed && !terminal ? 'FAILED' : terminal ? 'DONE' : 'PENDING',
-      detail: 'versioned order-flow document and snapshot',
+      state: metricsState,
+      detail:
+        metricsState === 'FAILED'
+          ? 'one symbol failed while computing the order-flow document'
+          : 'versioned order-flow document and snapshot',
     },
     {
       name: 'LLM',
-      state: anyRejected ? 'FAILED' : anyLlm ? 'DONE' : running ? 'RUNNING' : 'SKIPPED',
+      state: anyRejected ? 'FAILED' : llmState,
       detail: anyRejected
         ? 'narrative rejected; CALC-only report kept'
-        : anyLlm
+        : llmState === 'DONE'
           ? 'schema-validated narrative'
           : 'not configured for this run',
     },
     {
       name: 'REPORT',
-      state: anyReport ? 'DONE' : failed ? 'FAILED' : running ? 'RUNNING' : 'PENDING',
-      detail: anyReport ? 'at least one report link available' : 'no report yet',
+      state: reportState,
+      detail: reportState === 'DONE' ? 'at least one report link available' : 'no report yet',
     },
   ]
 }
@@ -164,11 +192,33 @@ function symbolStageFlags(row: ScanSymbolRow): StageFlags {
           : 'SKIPPED'
     flags.report = row.report_id ? 'DONE' : 'SKIPPED'
   } else if (row.stage === 'FAILED') {
-    if (row.error_code === 'DATA_UNAVAILABLE') {
+    const failedStage =
+      row.failed_stage ??
+      (row.error_code === 'DATA_UNAVAILABLE'
+        ? 'DATA'
+        : row.error_code === 'METRICS_INCOMPLETE'
+          ? 'METRICS'
+          : 'REPORT')
+    if (failedStage === 'DATA') {
       flags.data = 'FAILED'
-    } else {
+      flags.metrics = 'SKIPPED'
+      flags.llm = 'SKIPPED'
+      flags.report = 'SKIPPED'
+    } else if (failedStage === 'METRICS') {
       flags.data = 'DONE'
       flags.metrics = 'FAILED'
+      flags.llm = 'SKIPPED'
+      flags.report = 'SKIPPED'
+    } else if (failedStage === 'LLM') {
+      flags.data = 'DONE'
+      flags.metrics = 'DONE'
+      flags.llm = 'FAILED'
+      flags.report = 'SKIPPED'
+    } else {
+      flags.data = 'DONE'
+      flags.metrics = 'DONE'
+      flags.llm = row.llm_status ? 'DONE' : 'SKIPPED'
+      flags.report = 'FAILED'
     }
   }
   return flags
@@ -176,19 +226,27 @@ function symbolStageFlags(row: ScanSymbolRow): StageFlags {
 
 function StageCell({ value }: { value: string }) {
   if (value === 'DONE') {
-    return <span className="value-up">✓ done</span>
+    return (
+      <span className="value-up">
+        <span aria-hidden="true">✓</span> done
+      </span>
+    )
   }
   if (value === 'RUNNING') {
-    return <span className="mono-muted">› running</span>
+    return (
+      <span className="mono-muted">
+        <span aria-hidden="true">›</span> running
+      </span>
+    )
   }
   if (value === 'FAILED') {
-    return <span className="value-down">✕ failed</span>
+    return (
+      <span className="value-down">
+        <span aria-hidden="true">✕</span> failed
+      </span>
+    )
   }
   return <span className="mono-muted">—</span>
-}
-
-function batches(scan: ScanData): number {
-  return scan.batch_id && scan.batch_id !== scan.scan_id ? 1 : 0
 }
 
 export function ScanDetailPage({
@@ -197,11 +255,13 @@ export function ScanDetailPage({
   isCompact,
 }: ScanDetailPageProps) {
   const [load, setLoad] = useState<ScanState>({ state: 'loading' })
+  const [pollError, setPollError] = useState<string | null>(null)
   const compact = useCompact(isCompact)
 
   useEffect(() => {
     let active = true
     setLoad({ state: 'loading' })
+    setPollError(null)
     fetchScanFn(scanId)
       .then((envelope) => {
         if (!active) {
@@ -237,13 +297,22 @@ export function ScanDetailPage({
     const timer = setInterval(() => {
       fetchScanFn(scanId)
         .then((envelope) => {
-          if (!active || !envelope.data) {
+          if (!active) {
             return
           }
+          if (!envelope.data) {
+            setPollError('the daemon returned an empty response')
+            return
+          }
+          setPollError(null)
           setLoad({ state: 'ready', scan: envelope.data })
         })
-        .catch(() => {
-          // Keep the last good snapshot; the next tick retries.
+        .catch((error: unknown) => {
+          if (!active) {
+            return
+          }
+          // Keep the last good snapshot, but surface that it is now stale.
+          setPollError(error instanceof Error ? error.message : 'refresh failed')
         })
     }, SCAN_POLL_INTERVAL_MS)
     return () => {
@@ -276,7 +345,9 @@ export function ScanDetailPage({
   const rows = symbolRows(scan)
   const totalTokens = scan.total_tokens ?? scan.llm_tokens ?? 0
   const totalCost = scan.total_cost_usd ?? scan.cost_usd ?? '0'
-  const stageRows = batches(scan) > 0 || rows.length > 0 ? rows : []
+  const stageRows = scan.symbols ?? []
+  const completedCount = scan.symbols_completed ?? rows.filter((row) => row.stage === 'DONE').length
+  const totalCount = scan.symbols_total ?? rows.length
   return (
     <section
       className="system-page scan-page"
@@ -295,8 +366,14 @@ export function ScanDetailPage({
             {scan.scan_id}
           </h1>
           <p className="page-sub">
-            {scan.symbol} · {scan.period} · trigger {scan.trigger_source} · source{' '}
-            {scan.source_mode}
+            {[
+              scan.symbol,
+              scan.period,
+              `trigger ${scan.trigger_source}`,
+              `source ${scan.source_mode}`,
+            ]
+              .filter(Boolean)
+              .join(' · ')}
           </p>
         </div>
         <div className="report-stamps">
@@ -313,8 +390,12 @@ export function ScanDetailPage({
         <div>
           <dt>Symbols</dt>
           <dd className="mono">
-            {scan.symbols_completed ?? rows.filter((row) => row.stage === 'DONE').length}/
-            {scan.symbols_total ?? rows.length}
+            <span aria-hidden="true">
+              {completedCount}/{totalCount}
+            </span>
+            <span className="visually-hidden">
+              {completedCount} of {totalCount} symbols completed
+            </span>
             {(scan.symbols_degraded ?? 0) > 0 ? ` · ${scan.symbols_degraded} degraded` : ''}
             {(scan.symbols_failed ?? 0) > 0 ? ` · ${scan.symbols_failed} failed` : ''}
           </dd>
@@ -383,7 +464,7 @@ export function ScanDetailPage({
         )}
       </section>
 
-      {stageRows.length > 1 && (
+      {stageRows.length > 0 && (
         <section className="panel" aria-labelledby="symbols-heading">
           <div className="panel-head">
             <h2 id="symbols-heading">Per-symbol results</h2>
@@ -411,7 +492,9 @@ export function ScanDetailPage({
                   const flags = symbolStageFlags(row)
                   return (
                     <tr key={row.symbol}>
-                      <td className="mono">{row.symbol}</td>
+                      <th scope="row" className="mono">
+                        {row.symbol}
+                      </th>
                       <td>
                         <StageCell value={flags.data} />
                       </td>
@@ -484,7 +567,13 @@ export function ScanDetailPage({
         </section>
       )}
 
-      {polling && (
+      {polling && pollError && (
+        <p className="panel-foot status-message--error" role="alert">
+          Live updates paused ({pollError}); showing the last snapshot.
+        </p>
+      )}
+
+      {polling && !pollError && (
         <p className="panel-foot" role="status">
           Stages update in place while a scan runs; no fabricated percentage is shown.
         </p>

@@ -499,6 +499,18 @@ def scan_symbol_stage(llm_state: Mapping[str, object]) -> str:
     return "DONE" if status in {"VALID", "REPAIRED"} else "DEGRADED"
 
 
+def scan_llm_stage(llm_state: Mapping[str, object]) -> str:
+    """The LLM cell of a report: ``SKIPPED`` when no provider ran."""
+    if not bool(llm_state.get("configured")):
+        return "SKIPPED"
+    status = llm_state.get("validation_status")
+    if status in {"VALID", "REPAIRED"}:
+        return "DONE"
+    if status == "REJECTED":
+        return "FAILED"
+    return "SKIPPED"
+
+
 def scan_llm_status(llm_state: Mapping[str, object]) -> str | None:
     if not bool(llm_state.get("configured")):
         return None
@@ -575,9 +587,11 @@ class ScanService:
             batch_id=request.batch_id or resolved_scan_id,
         )
         store.save_scan(scan)
+        current_stage = "QUEUED"
         try:
             # DATA: resample persisted agg_trades into immutable UTC bars.
             self._stage("DATA")
+            current_stage = "DATA"
             resampling = ResamplingService(
                 settings=container.settings,
                 store=store,
@@ -596,6 +610,7 @@ class ScanService:
 
             # METRICS: compute the versioned document + footprint parts.
             self._stage("METRICS")
+            current_stage = "METRICS"
             metric_request = MetricRequest(
                 symbol=request.symbol,
                 period=request.period,
@@ -618,6 +633,7 @@ class ScanService:
             # LLM (optional): analyze the snapshot, then freeze the report with
             # whatever CALC + LLM state was produced.
             self._stage("LLM")
+            current_stage = "LLM"
             finished = clock.now()
             snapshot_id = _snapshot_id(
                 request.symbol,
@@ -651,6 +667,7 @@ class ScanService:
                 report_id=report_id,
             )
             self._stage("REPORT")
+            current_stage = "REPORT"
             if opportunity_ids:
                 llm_state = {**llm_state, "opportunity_ids": list(opportunity_ids)}
             tokens, cost_usd, cost_unpriced = _llm_totals(llm_state)
@@ -702,6 +719,10 @@ class ScanService:
                 cost_unpriced=cost_unpriced,
             )
         except Exception as exc:
+            # Record which stage failed so a FAILED checkpoint row renders the
+            # correct DATA/METRICS/LLM/REPORT cells instead of assuming METRICS.
+            with suppress(Exception):
+                cast(Any, exc).failed_stage = current_stage
             failed = replace(
                 scan,
                 status="FAILED",
@@ -898,7 +919,7 @@ def report_payload(report: ReportRecord) -> dict[str, object]:
         "llm_decision_id": report.llm_decision_id,
         "narrative_ref": report.narrative_ref,
         "llm": llm,
-        "llm_stage": scan_symbol_stage(llm),
+        "llm_stage": scan_llm_stage(llm),
         "llm_tokens": tokens,
         "cost_usd": cost_usd,
         "cost_unpriced": cost_unpriced,
@@ -926,7 +947,7 @@ def report_summary(report: ReportRecord) -> dict[str, object]:
         "data_quality": report.data_quality,
         "llm_decision_id": report.llm_decision_id,
         "narrative_ref": report.narrative_ref,
-        "llm_stage": scan_symbol_stage(llm),
+        "llm_stage": scan_llm_stage(llm),
         "llm_tokens": tokens,
         "cost_usd": cost_usd,
         "cost_unpriced": cost_unpriced,
@@ -958,5 +979,6 @@ __all__ = [
     "report_payload",
     "report_summary",
     "scan_llm_status",
+    "scan_llm_stage",
     "scan_symbol_stage",
 ]

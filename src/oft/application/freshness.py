@@ -8,18 +8,20 @@ order and does not import the risk or trigger domains.
 
 from __future__ import annotations
 
-import json
 from collections.abc import Mapping
 from dataclasses import dataclass
 from datetime import datetime, timedelta
 from enum import StrEnum
-from pathlib import Path
-from typing import Any
+from typing import TYPE_CHECKING
 
 import structlog
 
+from oft.application.ws_state import WS_STATE_FILENAME, read_ws_state
 from oft.domain.time import utc_timestamp
 from oft.ports.clock import ClockPort
+
+if TYPE_CHECKING:
+    from oft.config import Settings
 
 MARK_STREAM = "mark"
 KLINE_1M_STREAM = "kline_1m"
@@ -285,7 +287,6 @@ class FreshnessGuard:
 
 LIVE_SCAN_STREAMS: tuple[str, ...] = (KLINE_1M_STREAM, MARK_STREAM)
 _LIVE_CONNECTION_STATES = frozenset({"SUBSCRIBED"})
-WS_STATE_FILENAME = "ws_state.json"
 
 
 @dataclass(frozen=True)
@@ -390,25 +391,22 @@ def evaluate_live_source(
 
 
 def read_live_source_state(
-    settings: Any,
+    settings: Settings,
 ) -> tuple[str | None, Mapping[str, Mapping[str, object]] | None]:
-    """Read the daemon-independent ``ws_state.json`` written by live ingestion."""
-    path = Path(settings.data_dir) / "run" / WS_STATE_FILENAME
-    try:
-        document = json.loads(path.read_text(encoding="utf-8"))
-    except (OSError, json.JSONDecodeError):
+    """Read the shared ``ws_state.json`` written by live ingestion.
+
+    Delegates to the shared WS-state reader so the daemon and the scan path
+    can never drift on the file name, location, or shape.
+    """
+    state = read_ws_state(settings)
+    if state is None:
         return None, None
-    if not isinstance(document, dict):
-        return None, None
-    connection_state = document.get("connection_state")
-    freshness = document.get("freshness")
-    return (
-        str(connection_state) if connection_state is not None else None,
-        freshness if isinstance(freshness, dict) else None,
-    )
+    connection_state = state.connection_state or None
+    freshness = state.freshness or None
+    return connection_state, freshness
 
 
-def check_live_source(settings: Any, clock: ClockPort) -> LiveSourceVerdict:
+def check_live_source(settings: Settings, clock: ClockPort) -> LiveSourceVerdict:
     """Combine the persisted live state with the injected clock."""
     connection_state, freshness = read_live_source_state(settings)
     return evaluate_live_source(

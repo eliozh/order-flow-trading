@@ -47,7 +47,7 @@ from oft.ports.store import (
     TriggerEventRecord,
 )
 
-_SCHEMA_VERSION = 14
+_SCHEMA_VERSION = 15
 STALE_RUNNING_SECONDS = 15 * 60
 _BACKFILL_RUN_STATUSES = ("RUNNING", "COMPLETE", "PARTIAL", "FAILED", "BLOCKED", "STALE")
 _BACKFILL_RUNS_DEFINITION = """
@@ -147,6 +147,7 @@ _SCAN_SYMBOLS_DEFINITION = """
     finished_at TEXT,
     error_code TEXT,
     error_message TEXT,
+    failed_stage TEXT,
     report_id TEXT,
     data_quality TEXT,
     llm_status TEXT,
@@ -316,6 +317,7 @@ _SCHEMA_SQL = f"""
     CREATE INDEX IF NOT EXISTS data_gaps_series ON data_gaps(symbol, data_type, gap_start);
     CREATE TABLE IF NOT EXISTS job_runs ({_JOB_RUNS_DEFINITION});
     CREATE INDEX IF NOT EXISTS job_runs_type_status ON job_runs(job_type, status);
+    CREATE INDEX IF NOT EXISTS job_runs_type_heartbeat ON job_runs(job_type, heartbeat_at);
     CREATE INDEX IF NOT EXISTS job_runs_window ON job_runs(job_type, window_start);
     CREATE TABLE IF NOT EXISTS job_locks ({_JOB_LOCKS_DEFINITION});
     CREATE TABLE IF NOT EXISTS scan_symbols ({_SCAN_SYMBOLS_DEFINITION});
@@ -836,6 +838,20 @@ def _migrate_scan_symbols_v11(connection: sqlite3.Connection) -> None:
         raise
 
 
+def _migrate_scan_symbols_v15(connection: sqlite3.Connection) -> None:
+    """Add the failing stage so a FAILED row renders the real stage (v15)."""
+    columns = {row[1] for row in connection.execute("PRAGMA table_info(scan_symbols)")}
+    if "failed_stage" in columns:
+        return
+    connection.execute("BEGIN IMMEDIATE")
+    try:
+        connection.execute("ALTER TABLE scan_symbols ADD COLUMN failed_stage TEXT")
+        connection.execute("COMMIT")
+    except Exception:
+        connection.execute("ROLLBACK")
+        raise
+
+
 def _migrate_job_runs_v12(connection: sqlite3.Connection) -> None:
     """Persist the manual scan options needed to resume a reclaimed batch (v12)."""
     columns = {row[1] for row in connection.execute("PRAGMA table_info(job_runs)")}
@@ -970,6 +986,7 @@ def initialize_database(settings: Settings) -> None:
             _migrate_scans_v11(connection)
         if _table_exists(connection, "scan_symbols"):
             _migrate_scan_symbols_v11(connection)
+            _migrate_scan_symbols_v15(connection)
         if _table_exists(connection, "job_runs"):
             _migrate_job_runs_v12(connection)
             _migrate_job_runs_v13(connection)
@@ -1030,7 +1047,11 @@ def initialize_database(settings: Settings) -> None:
             )
             connection.execute(
                 "INSERT OR IGNORE INTO schema_migrations (version, applied_at) VALUES (?, ?)",
-                (_SCHEMA_VERSION, "2026-11-08T16:00:00.000Z"),
+                (14, "2026-11-08T16:00:00.000Z"),
+            )
+            connection.execute(
+                "INSERT OR IGNORE INTO schema_migrations (version, applied_at) VALUES (?, ?)",
+                (_SCHEMA_VERSION, "2026-11-08T17:00:00.000Z"),
             )
     finally:
         connection.close()
@@ -1273,6 +1294,7 @@ def _row_to_scan_symbol(row: sqlite3.Row) -> ScanSymbolRecord:
         report_id=row["report_id"],
         data_quality=row["data_quality"],
         error_message=row["error_message"] if "error_message" in keys else None,
+        failed_stage=row["failed_stage"] if "failed_stage" in keys else None,
         llm_status=row["llm_status"] if "llm_status" in keys else None,
         llm_tokens=int(row["llm_tokens"]) if "llm_tokens" in keys else 0,
         cost_usd=row["cost_usd"] if "cost_usd" in keys else "0",
@@ -2836,15 +2858,16 @@ class SqliteStore:
                 """
                 INSERT INTO scan_symbols (
                     scan_id, symbol, stage, started_at, finished_at, error_code,
-                    error_message, report_id, data_quality, llm_status, llm_tokens,
-                    cost_usd, cost_unpriced
-                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    error_message, failed_stage, report_id, data_quality, llm_status,
+                    llm_tokens, cost_usd, cost_unpriced
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 ON CONFLICT(scan_id, symbol) DO UPDATE SET
                     stage = excluded.stage,
                     started_at = excluded.started_at,
                     finished_at = excluded.finished_at,
                     error_code = excluded.error_code,
                     error_message = excluded.error_message,
+                    failed_stage = excluded.failed_stage,
                     report_id = excluded.report_id,
                     data_quality = excluded.data_quality,
                     llm_status = excluded.llm_status,
@@ -2860,6 +2883,7 @@ class SqliteStore:
                     record.finished_at,
                     record.error_code,
                     record.error_message,
+                    record.failed_stage,
                     record.report_id,
                     record.data_quality,
                     record.llm_status,
