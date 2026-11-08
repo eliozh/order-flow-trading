@@ -10,6 +10,7 @@ from __future__ import annotations
 
 import logging
 import re
+import unicodedata
 from dataclasses import dataclass
 from typing import Any
 
@@ -42,6 +43,32 @@ _UNTRUSTED_TAGS = re.compile(
     r"<\s*/?\s*(?:knowledge|system|instructions?|tool|tools|order|orders)\b[^>]*>",
     re.IGNORECASE,
 )
+# ANSI/terminal escape sequences: CSI (``ESC [ ... final``) and two-byte escapes.
+_ANSI_ESCAPE = re.compile(r"\x1b(?:\[[0-?]*[ -/]*[@-~]|[@-_])")
+_PRESERVED_CONTROL = frozenset("\n\t")
+
+
+def _is_dropped_char(character: str) -> bool:
+    """Drop C0/C1 controls and format characters (zero-width, bidi overrides)."""
+    if character in _PRESERVED_CONTROL:
+        return False
+    return unicodedata.category(character) in {"Cc", "Cf"}
+
+
+def sanitize_knowledge_text(text: str) -> str:
+    """Neutralize a hostile knowledge corpus so it stays inert data.
+
+    ANSI escapes are removed, the text is NFKC-normalized (so fullwidth or
+    compatibility tag delimiters cannot bypass the filter), zero-width/bidi
+    format characters and control characters are dropped, known dangerous tags
+    are replaced, and every remaining angle bracket is escaped. As a result no
+    ``<knowledge>``/``<system>``/``<|im_start|>``-style delimiter can survive.
+    """
+    text = _ANSI_ESCAPE.sub("", text)
+    text = unicodedata.normalize("NFKC", text)
+    text = "".join(character for character in text if not _is_dropped_char(character))
+    text = _UNTRUSTED_TAGS.sub("[tag-removed]", text)
+    return text.replace("<", "&lt;").replace(">", "&gt;")
 
 
 @dataclass(frozen=True)
@@ -89,11 +116,6 @@ class KnowledgeInjection:
             "reason": self.reason,
             "exact_replay": self.exact_replay,
         }
-
-
-def sanitize_knowledge_text(text: str) -> str:
-    """Neutralize control tags that could break out of the data region."""
-    return _UNTRUSTED_TAGS.sub("[tag-removed]", text)
 
 
 def delimit_knowledge(text: str) -> str:

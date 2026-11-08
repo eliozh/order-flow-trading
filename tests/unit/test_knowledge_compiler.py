@@ -12,12 +12,14 @@ from oft.domain.knowledge import (
     DEFAULT_TAXONOMY,
     LICENSE_NOTE,
     PLAYBOOK_TOKEN_BUDGET,
+    RULES_TOKEN_BUDGET,
     SECTION_ID_PATTERN,
     TOKEN_COUNT_METHOD,
     KnowledgeError,
     KnowledgeManifest,
     KnowledgeModeUnavailable,
     KnowledgeSection,
+    RawSection,
     absent_state,
     artifact_hash,
     available_state,
@@ -229,6 +231,8 @@ def test_state_is_explicit_about_a_missing_artifact() -> None:
 
     inactive = available_state(artifact.manifest, active=False)
     assert inactive.active is False
+    # A present-but-inactive artifact cannot replay exactly: injection is absent.
+    assert inactive.exact_replay is False
 
     absent = absent_state()
     assert absent.status == "ABSENT"
@@ -249,6 +253,66 @@ def test_parse_markdown_skips_a_document_title_and_empty_sections() -> None:
     assert parse_markdown("# Only a title\n\nbody\n") == ()
     sections = parse_markdown("## Empty\n\n## Filled\n\nbody\n")
     assert [section.title for section in sections] == ["Filled"]
+
+
+def test_parse_markdown_ignores_headings_inside_fenced_code() -> None:
+    document = "## Delta context\n\nintro\n\n```\n# not a heading\ncode line\n```\n\ntail line\n"
+
+    sections = parse_markdown(document, source="doc")
+
+    assert [section.title for section in sections] == ["Delta context"]
+    assert "# not a heading" in sections[0].body
+    assert "code line" in sections[0].body
+    assert "tail line" in sections[0].body
+
+
+def test_parse_markdown_treats_tilde_fences_like_backtick_fences() -> None:
+    document = "## Delta context\n\n~~~\n# still code\n~~~\n\nbody\n"
+
+    sections = parse_markdown(document, source="doc")
+
+    assert [section.title for section in sections] == ["Delta context"]
+    assert "# still code" in sections[0].body
+
+
+def test_fenced_content_before_any_section_is_recorded_as_skipped() -> None:
+    skipped: list[RawSection] = []
+
+    sections = parse_markdown(
+        "```\n## Delta context\ncode before a section\n```\n\n## Delta context\n\nbody\n",
+        source="doc",
+        skipped=skipped,
+    )
+
+    assert [section.title for section in sections] == ["Delta context"]
+    assert len(skipped) == 1
+    assert "code before a section" in skipped[0].body
+
+
+def test_compile_records_fenced_code_content_skipped_before_sections() -> None:
+    artifact = compile_artifact(
+        [("doc", "```\n## Delta context\ncode\n```\n\n## Delta context\n\nBody.\n")],
+        generated_at=GENERATED_AT,
+        taxonomy=topic_definitions(_topic_config()),
+    )
+
+    reasons = {item["reason"] for item in artifact.manifest.dropped}
+    assert "fenced_code" in reasons
+
+
+def test_over_cap_rules_are_trimmed_to_the_budget_and_recorded() -> None:
+    rules = [f"rule {index} " + "x" * 80 for index in range(300)]
+    artifact = compile_artifact(
+        [("doc", "## Delta context\n\nBody.\n")],
+        generated_at=GENERATED_AT,
+        taxonomy=topic_definitions(_topic_config()),
+        rules_config={"roles": {"ANALYSIS": {"topics": ["delta"], "rules": rules}}},
+    )
+
+    kept = artifact.rules["roles"]["ANALYSIS"]["rules"]
+    assert sum(count_tokens(rule) for rule in kept) <= RULES_TOKEN_BUDGET
+    assert 0 < len(kept) < len(rules)
+    assert any(item["reason"] == "rules_budget" for item in artifact.manifest.dropped)
 
 
 def test_topic_definitions_fall_back_and_skip_invalid_entries() -> None:

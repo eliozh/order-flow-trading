@@ -6,10 +6,13 @@ import pytest
 
 from oft.domain.knowledge import (
     PLAYBOOK_TOKEN_BUDGET,
+    KnowledgeSection,
     compile_artifact,
     count_tokens,
+    fit_sections_to_budget,
     summarize_text,
     topic_definitions,
+    validate_manifest,
 )
 
 GENERATED_AT = "2026-10-08T00:00:00.000Z"
@@ -126,3 +129,37 @@ def test_empty_corpus_is_rejected() -> None:
 
     with pytest.raises(KnowledgeError):
         compile_artifact([("empty", "")], generated_at=GENERATED_AT)
+
+
+def test_a_single_section_that_cannot_fit_is_dropped_never_oversized() -> None:
+    # After the summarize fallback the section (18 tokens) still cannot fit a
+    # 10-token playbook; it must be dropped rather than emitted oversized.
+    sections = (KnowledgeSection("K-delta-1", "delta", "Delta context", "delta " * 400, "s"),)
+
+    result = fit_sections_to_budget(sections, budget=10)
+
+    assert result.token_count <= 10
+    assert result.sections == ()
+    assert any(item.reason == "budget" for item in result.dropped)
+
+
+def test_a_tiny_budget_still_produces_a_valid_reloadable_manifest() -> None:
+    artifact = compile_artifact(
+        [("doc", "## Delta context\n\n" + "delta " * 400 + "\n")],
+        generated_at=GENERATED_AT,
+        taxonomy=topic_definitions(
+            {
+                "topics": [
+                    {"name": name, "title": title, "keywords": list(keywords)}
+                    for name, title, keywords in TAXONOMY
+                ]
+            }
+        ),
+        budget=10,
+    )
+
+    assert artifact.manifest.token_count <= 10
+    assert artifact.manifest.token_count == count_tokens(artifact.playbook)
+    # The manifest validates on reload: token_count never exceeds the budget.
+    reloaded = validate_manifest(artifact.manifest.to_dict())
+    assert reloaded.token_count == artifact.manifest.token_count

@@ -11,7 +11,7 @@ from __future__ import annotations
 import json
 import os
 from collections.abc import Mapping
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from pathlib import Path
 from typing import Any
 
@@ -28,6 +28,7 @@ from oft.domain.knowledge import (
     KNOWLEDGE_NOT_ACTIVE,
     KNOWLEDGE_NOT_REVIEWED,
     KNOWLEDGE_SOURCE_EMPTY,
+    KNOWLEDGE_SOURCE_TOO_LARGE,
     LICENSE_NOTE,
     PRIVATE_WARNING,
     REVIEW_APPROVED,
@@ -53,6 +54,12 @@ TOPICS_FILE = "topics.json"
 RULES_FILE = "rules.json"
 MANIFEST_FILE = "manifest.json"
 ACTIVE_FILE = "active.json"
+LOCATION_FILE = "location.json"
+
+# A directory scan is bounded so a hostile or accidental corpus cannot make the
+# compiler read an unbounded amount of data.
+MAX_SOURCE_FILES = 500
+MAX_SOURCE_FILE_BYTES = 1_048_576
 
 
 @dataclass(frozen=True)
@@ -155,11 +162,8 @@ class KnowledgeService:
             documents = [source]
             config_dir = source.parent
         elif source.is_dir():
-            documents = sorted(
-                path
-                for path in source.rglob("*.md")
-                if path.name != PLAYBOOK_FILE and path.is_file()
-            )
+            source_root = source.resolve()
+            documents = self._discover_documents(source, source_root)
             config_dir = source
         else:
             raise KnowledgeError(KNOWLEDGE_SOURCE_EMPTY, f"knowledge source not found: {source}")
@@ -168,6 +172,13 @@ class KnowledgeService:
                 KNOWLEDGE_SOURCE_EMPTY,
                 f"no markdown skill documents found in knowledge source: {source}",
             )
+        if len(documents) > MAX_SOURCE_FILES:
+            raise KnowledgeError(
+                KNOWLEDGE_SOURCE_TOO_LARGE,
+                f"knowledge source has {len(documents)} files; the limit is {MAX_SOURCE_FILES}",
+            )
+        for document in documents:
+            self._check_source_size(document)
 
         topics_config = self._optional_json(config_dir / TOPICS_FILE)
         rules_config = self._optional_json(config_dir / RULES_FILE)
@@ -178,8 +189,14 @@ class KnowledgeService:
             else None
         )
         generated_at = created_at or utc_timestamp(self._clock.now())
+        try:
+            source_documents = [(path.stem, path.read_text(encoding="utf-8")) for path in documents]
+        except (OSError, UnicodeDecodeError) as exc:
+            raise KnowledgeError(
+                KNOWLEDGE_SOURCE_EMPTY, f"cannot read the knowledge source: {exc}"
+            ) from exc
         artifact = compile_artifact(
-            [(path.stem, path.read_text(encoding="utf-8")) for path in documents],
+            source_documents,
             generated_at=generated_at,
             taxonomy=topic_definitions(
                 topics_config if isinstance(topics_config, Mapping) else None
@@ -188,7 +205,8 @@ class KnowledgeService:
             calc_context=calc_context,
         )
 
-        target = (output or self._paths.playbook).expanduser()
+        configured = self._paths.playbook
+        target = (output or configured).expanduser()
         self._paths.books.mkdir(parents=True, exist_ok=True, mode=0o700)
         self._paths.skills.mkdir(parents=True, exist_ok=True, mode=0o700)
         target.mkdir(parents=True, exist_ok=True, mode=0o700)
@@ -197,6 +215,7 @@ class KnowledgeService:
         _write_json(target / TOPICS_FILE, artifact.topics)
         _write_json(target / RULES_FILE, artifact.rules)
         _write_json(target / MANIFEST_FILE, artifact.manifest.to_dict())
+        self._record_location(configured, target)
         return KnowledgeBuildResult(
             artifact=artifact,
             output_dir=target,
@@ -208,12 +227,80 @@ class KnowledgeService:
             ),
         )
 
+    def _discover_documents(self, source: Path, source_root: Path) -> list[Path]:
+        """Markdown files under ``source``, skipping symlinks/outside files."""
+        documents: list[Path] = []
+        for path in sorted(source.rglob("*.md")):
+            if path.name == PLAYBOOK_FILE or path.is_symlink() or not path.is_file():
+                continue
+            try:
+                resolved = path.resolve()
+            except OSError:
+                continue
+            if not resolved.is_relative_to(source_root):
+                continue
+            documents.append(path)
+        return documents
+
+    def _check_source_size(self, path: Path) -> None:
+        try:
+            size = path.stat().st_size
+        except OSError as exc:
+            raise KnowledgeError(
+                KNOWLEDGE_SOURCE_EMPTY, f"cannot stat knowledge source {path}: {exc}"
+            ) from exc
+        if size > MAX_SOURCE_FILE_BYTES:
+            raise KnowledgeError(
+                KNOWLEDGE_SOURCE_TOO_LARGE,
+                f"knowledge source file {path.name} is {size} bytes; "
+                f"the limit is {MAX_SOURCE_FILE_BYTES}",
+            )
+
+    def _record_location(self, configured: Path, target: Path) -> None:
+        """Persist which directory holds the artifact so the lifecycle finds it."""
+        location = configured / LOCATION_FILE
+        if target.resolve() == configured.resolve():
+            if location.exists():
+                location.unlink()
+            return
+        _write_json(
+            location,
+            {"playbook_dir": str(target.resolve()), "private": True},
+        )
+
+    def _resolve_playbook_dir(self) -> Path:
+        """Honor a persisted ``--output`` location; otherwise use the config root."""
+        pointer = self._paths.playbook / LOCATION_FILE
+        if not pointer.is_file():
+            return self._paths.playbook
+        try:
+            payload = _read_json(pointer)
+        except (OSError, UnicodeDecodeError, json.JSONDecodeError):
+            return self._paths.playbook
+        value = payload.get("playbook_dir") if isinstance(payload, Mapping) else None
+        if not isinstance(value, str) or not value.strip():
+            return self._paths.playbook
+        candidate = Path(value).expanduser()
+        if not candidate.is_absolute():
+            candidate = self._paths.playbook / candidate
+        try:
+            resolved = candidate.resolve()
+        except OSError:
+            return self._paths.playbook
+        return resolved if resolved.is_dir() else self._paths.playbook
+
+    def _playbook_paths(self) -> KnowledgePaths:
+        playbook = self._resolve_playbook_dir()
+        if playbook == self._paths.playbook:
+            return self._paths
+        return replace(self._paths, playbook=playbook)
+
     def _optional_json(self, path: Path) -> Any:
         if not path.is_file():
             return None
         try:
             return _read_json(path)
-        except (OSError, json.JSONDecodeError) as exc:
+        except (OSError, UnicodeDecodeError, json.JSONDecodeError) as exc:
             raise KnowledgeError(
                 KNOWLEDGE_MANIFEST_INVALID, f"cannot read {path.name}: {exc}"
             ) from exc
@@ -222,10 +309,11 @@ class KnowledgeService:
 
     def load_artifact(self) -> CompiledArtifact:
         """Load and verify the compiled artifact; absent means absent."""
-        manifest_path = self._paths.manifest_file
-        playbook_path = self._paths.playbook_file
-        topics_path = self._paths.topics_file
-        rules_path = self._paths.rules_file
+        paths = self._playbook_paths()
+        manifest_path = paths.manifest_file
+        playbook_path = paths.playbook_file
+        topics_path = paths.topics_file
+        rules_path = paths.rules_file
         if not manifest_path.is_file():
             raise KnowledgeError(KNOWLEDGE_ABSENT, "no compiled knowledge manifest is present")
         try:
@@ -233,7 +321,7 @@ class KnowledgeService:
             playbook = playbook_path.read_text(encoding="utf-8")
             topics = _read_json(topics_path)
             rules = _read_json(rules_path)
-        except (OSError, json.JSONDecodeError) as exc:
+        except (OSError, UnicodeDecodeError, json.JSONDecodeError) as exc:
             raise KnowledgeError(
                 KNOWLEDGE_ABSENT, f"the compiled knowledge artifact is unreadable: {exc}"
             ) from exc
@@ -266,12 +354,12 @@ class KnowledgeService:
         return available_state(artifact.manifest, active=self._is_active(artifact.artifact_id))
 
     def _is_active(self, artifact_id: str) -> bool:
-        path = self._paths.active_file
+        path = self._playbook_paths().active_file
         if not path.is_file():
             return False
         try:
             payload = _read_json(path)
-        except (OSError, json.JSONDecodeError):
+        except (OSError, UnicodeDecodeError, json.JSONDecodeError):
             return False
         return isinstance(payload, Mapping) and payload.get("artifact_id") == artifact_id
 
@@ -306,7 +394,7 @@ class KnowledgeService:
             )
         now = utc_timestamp(self._clock.now())
         _write_json(
-            self._paths.active_file,
+            self._playbook_paths().active_file,
             {
                 "artifact_id": manifest.artifact_id,
                 "activated_at": now,
@@ -326,7 +414,7 @@ class KnowledgeService:
         return available_state(manifest, active=True)
 
     def _write_manifest(self, manifest: KnowledgeManifest) -> None:
-        _write_json(self._paths.manifest_file, manifest.to_dict())
+        _write_json(self._playbook_paths().manifest_file, manifest.to_dict())
 
     def _audit(
         self,
@@ -369,7 +457,10 @@ class KnowledgeService:
 
 __all__ = [
     "ACTIVE_FILE",
+    "LOCATION_FILE",
     "MANIFEST_FILE",
+    "MAX_SOURCE_FILES",
+    "MAX_SOURCE_FILE_BYTES",
     "PLAYBOOK_DIRNAME",
     "PLAYBOOK_FILE",
     "RULES_FILE",

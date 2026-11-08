@@ -23,7 +23,6 @@ CHARS_PER_TOKEN = 4
 PLAYBOOK_TOKEN_BUDGET = 10_000
 INJECTION_TOKEN_BUDGET = 10_000
 RULES_TOKEN_BUDGET = 2_000
-GLOSSARY_TOKEN_BUDGET = 1_500
 LICENSE_NOTE = "private; do not distribute"
 PRIVATE_WARNING = (
     "The knowledge artifact is private: it may contain derived copyrighted "
@@ -34,6 +33,7 @@ KNOWLEDGE_ABSENT = "KNOWLEDGE_ABSENT"
 KNOWLEDGE_MANIFEST_INVALID = "KNOWLEDGE_MANIFEST_INVALID"
 KNOWLEDGE_ARTIFACT_MISMATCH = "KNOWLEDGE_ARTIFACT_MISMATCH"
 KNOWLEDGE_SOURCE_EMPTY = "KNOWLEDGE_SOURCE_EMPTY"
+KNOWLEDGE_SOURCE_TOO_LARGE = "KNOWLEDGE_SOURCE_TOO_LARGE"
 KNOWLEDGE_NO_SECTIONS = "KNOWLEDGE_NO_SECTIONS"
 KNOWLEDGE_NOT_REVIEWED = "KNOWLEDGE_NOT_REVIEWED"
 KNOWLEDGE_NOT_ACTIVE = "KNOWLEDGE_NOT_ACTIVE"
@@ -283,12 +283,25 @@ def _normalize_heading(text: str) -> str:
     return re.sub(r"\s+", " ", text).strip()
 
 
-def parse_markdown(markdown: str, *, source: str = "inline") -> tuple[RawSection, ...]:
-    """Split a skill document into level-2+ sections with normalized bodies."""
+def parse_markdown(
+    markdown: str,
+    *,
+    source: str = "inline",
+    skipped: list[RawSection] | None = None,
+) -> tuple[RawSection, ...]:
+    """Split a skill document into level-2+ sections with normalized bodies.
+
+    Fenced code blocks (````` ``` ````` or ``~~~``) are opaque: a ``#`` line
+    inside them is never a heading. A fenced block that appears before any
+    section is not silently lost; when ``skipped`` is supplied it is appended
+    there so the compiler can record it as dropped content.
+    """
     normalized = markdown.replace("\r\n", "\n").replace("\r", "\n")
     sections: list[RawSection] = []
     title: str | None = None
     body: list[str] = []
+    fence: str | None = None
+    skipped_block: list[str] = []
 
     def _flush() -> None:
         if title is None:
@@ -297,8 +310,42 @@ def parse_markdown(markdown: str, *, source: str = "inline") -> tuple[RawSection
         if text:
             sections.append(RawSection(title=title, body=text, source=source, order=len(sections)))
 
+    def _flush_skipped() -> None:
+        if skipped is None:
+            return
+        text = _normalize_body("\n".join(skipped_block))
+        if text:
+            skipped.append(
+                RawSection(
+                    title=f"fenced code block {len(skipped) + 1}",
+                    body=text,
+                    source=source,
+                    order=len(skipped),
+                )
+            )
+
     for raw_line in normalized.split("\n"):
         line = raw_line.rstrip()
+        stripped = line.strip()
+        if fence is not None:
+            if stripped.startswith(fence):
+                fence = None
+                if title is not None:
+                    body.append(line)
+                else:
+                    _flush_skipped()
+                skipped_block.clear()
+                continue
+            if title is not None:
+                body.append(line)
+            else:
+                skipped_block.append(line)
+            continue
+        if stripped.startswith("```") or stripped.startswith("~~~"):
+            fence = stripped[:3]
+            if title is not None:
+                body.append(line)
+            continue
         match = _HEADING.match(line)
         if match is not None:
             _flush()
@@ -310,6 +357,7 @@ def parse_markdown(markdown: str, *, source: str = "inline") -> tuple[RawSection
         if title is not None:
             body.append(line)
     _flush()
+    _flush_skipped()
     return tuple(sections)
 
 
@@ -467,13 +515,16 @@ def fit_sections_to_budget(
             )
         )
 
-    if current and _total_tokens(current) > budget:
+    # The summarize fallback can still leave a single section over budget (its
+    # heading plus the ``[summarized]`` marker cannot be shrunk indefinitely).
+    # Keep dropping until the rendered playbook fits, then refuse lopsidedly
+    # tiny budgets that cannot even hold the header.
+    while current and _total_tokens(current) > budget:
         section = current[0]
-        summary = summarize_text(
-            section.body,
-            max(1, body_budget - count_tokens(f"## {section.section_id} — {section.title}\n\n")),
-        )
-        if summary.strip() != section.body.strip():
+        heading_tokens = count_tokens(f"## {section.section_id} — {section.title}\n\n")
+        allowed = max(1, body_budget - heading_tokens)
+        summary = summarize_text(section.body, allowed)
+        if len(current) == 1 and summary.strip() != section.body.strip():
             lost = max(0, count_tokens(section.body) - count_tokens(summary))
             current[0] = replace(section, body=summary)
             dropped.append(
@@ -484,7 +535,23 @@ def fit_sections_to_budget(
                     source=section.source,
                 )
             )
+            if _total_tokens(current) <= budget:
+                break
+        removed = current.pop()
+        dropped.append(
+            DroppedContent(
+                title=removed.title,
+                reason="budget",
+                tokens=count_tokens(render_section(removed)),
+                source=removed.source,
+            )
+        )
 
+    if _total_tokens(current) > budget:
+        raise KnowledgeError(
+            KNOWLEDGE_BUDGET_EXCEEDED,
+            f"the playbook header alone exceeds the {budget}-token budget",
+        )
     return BudgetResult(tuple(current), _dedupe_dropped(dropped), True, _total_tokens(current))
 
 
@@ -568,6 +635,64 @@ def build_rules_document(
     return {"version": 1, "roles": roles}
 
 
+def fit_rules_to_budget(
+    rules_document: Mapping[str, Any], *, budget: int = RULES_TOKEN_BUDGET
+) -> tuple[dict[str, Any], tuple[DroppedContent, ...]]:
+    """Trim role rule text to ``budget`` tokens, recording each removal.
+
+    Rules are advisory prompt content (ADR-0009): an oversized skill pack is
+    trimmed deterministically instead of being injected whole or dropped whole.
+    """
+    roles_raw = rules_document.get("roles")
+    roles: dict[str, dict[str, list[str]]] = {}
+    if isinstance(roles_raw, Mapping):
+        for role, entry in roles_raw.items():
+            if not isinstance(entry, Mapping):
+                continue
+            raw_ids = entry.get("section_ids")
+            raw_rules = entry.get("rules")
+            roles[str(role)] = {
+                "section_ids": (
+                    [str(item) for item in raw_ids if isinstance(item, str)]
+                    if isinstance(raw_ids, list)
+                    else []
+                ),
+                "rules": (
+                    [str(item) for item in raw_rules if isinstance(item, str)]
+                    if isinstance(raw_rules, list)
+                    else []
+                ),
+            }
+    document: dict[str, Any] = {
+        "version": rules_document.get("version", 1),
+        "roles": roles,
+    }
+
+    def _rule_tokens() -> int:
+        return sum(count_tokens(rule) for entry in roles.values() for rule in entry["rules"])
+
+    trimmed: dict[str, int] = {}
+    while _rule_tokens() > budget:
+        candidates = [(name, entry) for name, entry in sorted(roles.items()) if entry["rules"]]
+        if not candidates:
+            break
+        role, entry = max(
+            candidates,
+            key=lambda item: (sum(count_tokens(rule) for rule in item[1]["rules"]), item[0]),
+        )
+        rule = entry["rules"].pop()
+        trimmed[role] = trimmed.get(role, 0) + count_tokens(rule)
+    dropped = tuple(
+        DroppedContent(
+            title=f"ROLE RULES ({role})",
+            reason="rules_budget",
+            tokens=tokens,
+        )
+        for role, tokens in sorted(trimmed.items())
+    )
+    return document, dropped
+
+
 def artifact_hash(playbook: str, topics: Mapping[str, Any], rules: Mapping[str, Any]) -> str:
     """Deterministic content hash over the compiled outputs (not timestamps)."""
     payload = {"playbook": playbook, "topics": topics, "rules": rules}
@@ -592,6 +717,7 @@ def compile_artifact(
     resolved_taxonomy = tuple(taxonomy) if taxonomy else DEFAULT_TAXONOMY
     sources: list[dict[str, str]] = []
     raw_sections: list[RawSection] = []
+    skipped_sections: list[RawSection] = []
     for slug, markdown in source_documents:
         if not markdown.strip():
             continue
@@ -601,7 +727,7 @@ def compile_artifact(
                 "content_hash": hashlib.sha256(markdown.encode("utf-8")).hexdigest(),
             }
         )
-        raw_sections.extend(parse_markdown(markdown, source=slug))
+        raw_sections.extend(parse_markdown(markdown, source=slug, skipped=skipped_sections))
     if not raw_sections:
         raise KnowledgeError(
             KNOWLEDGE_SOURCE_EMPTY,
@@ -615,11 +741,27 @@ def compile_artifact(
             "no source section matched the order-flow taxonomy",
         )
     budgeted = fit_sections_to_budget(selected, budget=budget)
+    if budgeted.token_count > budget:
+        raise KnowledgeError(
+            KNOWLEDGE_BUDGET_EXCEEDED,
+            f"the compiled playbook ({budgeted.token_count} tokens) exceeds budget {budget}",
+        )
+    fenced_dropped = tuple(
+        DroppedContent(
+            title=section.title,
+            reason="fenced_code",
+            tokens=count_tokens(section.body),
+            source=section.source,
+        )
+        for section in skipped_sections
+    )
     playbook = render_playbook(budgeted.sections)
     topics_document = build_topics_document(resolved_taxonomy, budgeted.sections, calc_context)
-    rules_document = build_rules_document(rules_config, topics_document)
+    rules_document, rules_dropped = fit_rules_to_budget(
+        build_rules_document(rules_config, topics_document), budget=RULES_TOKEN_BUDGET
+    )
     digest = artifact_hash(playbook, topics_document, rules_document)
-    dropped_items = _dedupe_dropped((*dropped, *budgeted.dropped))
+    dropped_items = _dedupe_dropped((*dropped, *fenced_dropped, *budgeted.dropped, *rules_dropped))
     manifest = KnowledgeManifest(
         artifact_id=digest,
         compiler_version=COMPILER_VERSION,
@@ -890,7 +1032,8 @@ def available_state(manifest: KnowledgeManifest, *, active: bool) -> KnowledgeSt
         status="AVAILABLE",
         reason=None,
         artifact_id=manifest.artifact_id,
-        exact_replay=True,
+        # Only an active artifact is injected, so only then can replay be exact.
+        exact_replay=active,
         active=active,
         reviewed_by=manifest.reviewed_by,
         review_status=manifest.review_status,
@@ -904,7 +1047,6 @@ __all__ = [
     "CHARS_PER_TOKEN",
     "COMPILER_VERSION",
     "DEFAULT_TAXONOMY",
-    "GLOSSARY_TOKEN_BUDGET",
     "INJECTION_TOKEN_BUDGET",
     "KNOWLEDGE_ABSENT",
     "KNOWLEDGE_ARTIFACT_MISMATCH",
@@ -915,6 +1057,7 @@ __all__ = [
     "KNOWLEDGE_NOT_REVIEWED",
     "KNOWLEDGE_NO_SECTIONS",
     "KNOWLEDGE_SOURCE_EMPTY",
+    "KNOWLEDGE_SOURCE_TOO_LARGE",
     "LICENSE_NOTE",
     "PLAYBOOK_TOKEN_BUDGET",
     "PRIVATE_WARNING",
@@ -940,6 +1083,7 @@ __all__ = [
     "build_topics_document",
     "compile_artifact",
     "count_tokens",
+    "fit_rules_to_budget",
     "fit_sections_to_budget",
     "load_sections",
     "parse_markdown",

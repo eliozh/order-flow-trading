@@ -273,6 +273,18 @@ def validate_body(body: str, *, role: PromptRole, system: bool = False) -> tuple
     for name in REQUIRED_VARIABLES[role]:
         if name not in variables:
             raise PromptValidationError(f"missing required variable {{{{{name}}}}}", variable=name)
+    if "knowledge" in variables:
+        # Knowledge text is untrusted data: the template itself must delimit it,
+        # so a body that interpolates {{knowledge}} outside the tags is rejected.
+        opening = body.find("<knowledge>")
+        closing = body.find("</knowledge>")
+        placeholder = body.find("{{knowledge}}")
+        if opening == -1 or closing == -1 or not opening < placeholder < closing:
+            raise PromptValidationError(
+                "the {{knowledge}} variable must appear inside "
+                "<knowledge>...</knowledge> delimiters",
+                variable="knowledge",
+            )
     return variables
 
 

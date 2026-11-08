@@ -10,9 +10,10 @@ import typer
 
 from oft.api.envelope import new_request_id, success_envelope
 from oft.application.knowledge_service import KnowledgeService
+from oft.application.prompt_builder import sanitize_knowledge_text
 from oft.bootstrap import build_container
 from oft.cli.commands.doctor import emit_error, exit_code_for
-from oft.config import ConfigError, load_settings
+from oft.config import ConfigError, Settings, load_settings
 from oft.domain.knowledge import (
     KNOWLEDGE_ABSENT,
     KNOWLEDGE_ARTIFACT_MISMATCH,
@@ -21,6 +22,7 @@ from oft.domain.knowledge import (
     KNOWLEDGE_NOT_ACTIVE,
     KNOWLEDGE_NOT_REVIEWED,
     KNOWLEDGE_SOURCE_EMPTY,
+    KNOWLEDGE_SOURCE_TOO_LARGE,
     PRIVATE_WARNING,
     KnowledgeError,
 )
@@ -33,6 +35,7 @@ knowledge_app = typer.Typer(
 
 _ERROR_CODES = {
     KNOWLEDGE_SOURCE_EMPTY: "VALIDATION_FAILED",
+    KNOWLEDGE_SOURCE_TOO_LARGE: "VALIDATION_FAILED",
     KNOWLEDGE_NO_SECTIONS: "VALIDATION_FAILED",
     KNOWLEDGE_MANIFEST_INVALID: "VALIDATION_FAILED",
     KNOWLEDGE_ARTIFACT_MISMATCH: "CONFLICT",
@@ -42,7 +45,7 @@ _ERROR_CODES = {
 }
 
 
-def _settings_or_exit(json_output: bool) -> Any:
+def _settings_or_exit(json_output: bool) -> Settings:
     try:
         return load_settings()
     except ConfigError as exc:
@@ -50,13 +53,24 @@ def _settings_or_exit(json_output: bool) -> Any:
         raise typer.Exit(code=5) from exc
 
 
-def _service(settings: Any, *, initialize: bool = False) -> KnowledgeService:
+def _service(settings: Settings, *, initialize: bool = False) -> KnowledgeService:
     container = build_container(settings, initialize=initialize)
     return KnowledgeService(
         settings=settings,
         clock=container.clock,
         store=container.store,
     )
+
+
+def _sanitize_config(value: Any) -> Any:
+    """Apply the knowledge sanitizer to every string in a config tree."""
+    if isinstance(value, str):
+        return sanitize_knowledge_text(value)
+    if isinstance(value, dict):
+        return {str(key): _sanitize_config(item) for key, item in value.items()}
+    if isinstance(value, list):
+        return [_sanitize_config(item) for item in value]
+    return value
 
 
 def _emit_json(data: dict[str, Any], *, data_quality: str = "COMPLETE") -> None:
@@ -92,7 +106,11 @@ def build_command(
     output: Annotated[
         Path | None,
         typer.Option(
-            "--output", help="Artifact directory (default: $OFT_DATA/knowledge/playbook)."
+            "--output",
+            help=(
+                "Artifact directory; persisted so review/activate/status find it "
+                "(default: $OFT_DATA/knowledge/playbook)."
+            ),
         ),
     ] = None,
     json_output: Annotated[bool, typer.Option("--json", help="Emit JSON.")] = False,
@@ -147,16 +165,29 @@ def review_command(
 ) -> None:
     """Record human sign-off on the compiled playbook."""
     settings = _settings_or_exit(json_output)
+    service = _service(settings, initialize=True)
     try:
-        state = _service(settings, initialize=True).review(reviewed_by=reviewed_by)
+        artifact = service.load_artifact()
+        state = service.review(reviewed_by=reviewed_by)
     except KnowledgeError as exc:
         _fail(exc, json_output)
         return
+    # Show exactly what is being approved: a hostile skill pack's rules are not
+    # injected as ROLE RULES unseen, and rule text is sanitized as data.
+    safe_playbook = sanitize_knowledge_text(artifact.playbook)
+    safe_rules = _sanitize_config(artifact.rules)
     if json_output:
-        _emit_json(state.to_dict())
+        data = state.to_dict()
+        data["playbook"] = safe_playbook
+        data["rules"] = safe_rules
+        _emit_json(data)
         return
     _warn_private()
     typer.echo(f"Reviewed knowledge artifact {str(state.artifact_id)[:12]}… by {reviewed_by}")
+    typer.echo("compiled playbook under review:")
+    typer.echo(safe_playbook)
+    typer.echo("compiled role rules under review:")
+    typer.echo(json.dumps(safe_rules, indent=2, sort_keys=True))
     typer.echo("  next     oft knowledge activate")
 
 
@@ -204,8 +235,7 @@ def status_command(
     typer.echo(f"  tokens      {state.token_count if state.token_count is not None else '-'}")
     if state.reason:
         typer.echo(f"  reason      {state.reason}")
-    if state.status != "AVAILABLE":
-        typer.echo("  replay      exact replay disabled (no knowledge artifact)")
+    typer.echo(f"  replay      {'exact' if state.exact_replay else 'exact replay disabled'}")
     _warn_private()
 
 

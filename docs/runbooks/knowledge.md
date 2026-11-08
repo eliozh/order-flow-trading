@@ -21,11 +21,16 @@ uv run oft knowledge status            # add --json for the envelope
 ```
 
 `--source` accepts markdown skill output, not raw book text; output defaults to
-`$OFT_DATA/knowledge/playbook` (`--output` overrides). Build deterministically
-writes `playbook.md` with stable `K-<topic>-<n>` IDs plus `topics.json`,
-`rules.json`, and `manifest.json`. `activate` refuses an unreviewed artifact; a
-missing, tampered, or inactive artifact is reported as absent and disables
-exact replay rather than fabricating knowledge.
+`$OFT_DATA/knowledge/playbook`. `--output` overrides that directory and the
+choice is persisted in `location.json`, so the later `review`, `activate`, and
+`status` commands read the same artifact instead of looking in an empty default
+directory. Build deterministically writes `playbook.md` with stable
+`K-<topic>-<n>` IDs plus `topics.json`, `rules.json`, and `manifest.json`.
+`review` prints the compiled playbook and role rules it is approving (rules are
+shown sanitized, because a skill pack is untrusted input). `activate` refuses an
+unreviewed artifact; a missing or tampered artifact is reported as absent, and
+an inactive artifact reports `exact_replay=false` and is not injected, rather
+than fabricating knowledge.
 
 ## Manifest, provenance, and safety
 
