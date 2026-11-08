@@ -6,6 +6,7 @@ The daemon is the only writer. Diagnostic commands open the database with
 
 from __future__ import annotations
 
+import json
 import os
 import sqlite3
 from contextlib import closing
@@ -16,6 +17,16 @@ from pathlib import Path
 from oft.config import Settings
 from oft.domain.audit import build_audit_entry
 from oft.domain.data_quality import DataGap, GapSeverity
+from oft.domain.prompts import (
+    DEFAULT_SYSTEM_BODIES,
+    DEFAULT_USER_BODIES,
+    PROMPT_IDS,
+    REQUIRED_VARIABLES,
+    SYSTEM_PROMPT_IDS,
+    PromptRole,
+    PromptStatus,
+    content_hash,
+)
 from oft.domain.symbols import SymbolContract
 from oft.domain.time import utc_timestamp
 from oft.ports.store import (
@@ -38,6 +49,8 @@ from oft.ports.store import (
     OrderRecord,
     PaperAccountRecord,
     PositionRecord,
+    PromptTemplateRecord,
+    PromptVersionRecord,
     ReportRecord,
     RiskVerdictRecord,
     ScanRecord,
@@ -47,7 +60,7 @@ from oft.ports.store import (
     TriggerEventRecord,
 )
 
-_SCHEMA_VERSION = 15
+_SCHEMA_VERSION = 16
 STALE_RUNNING_SECONDS = 15 * 60
 _BACKFILL_RUN_STATUSES = ("RUNNING", "COMPLETE", "PARTIAL", "FAILED", "BLOCKED", "STALE")
 _BACKFILL_RUNS_DEFINITION = """
@@ -340,7 +353,10 @@ _SCHEMA_SQL = f"""
         usage_json TEXT NOT NULL,
         latency_ms INTEGER NOT NULL,
         error_code TEXT,
-        created_at TEXT NOT NULL
+        created_at TEXT NOT NULL,
+        system_prompt_id TEXT NOT NULL DEFAULT '',
+        system_prompt_version INTEGER NOT NULL DEFAULT 1,
+        system_prompt_hash TEXT NOT NULL DEFAULT ''
     );
     CREATE INDEX IF NOT EXISTS llm_calls_decision ON llm_calls(decision_id);
     CREATE TABLE IF NOT EXISTS decisions (
@@ -486,6 +502,16 @@ _SCHEMA_SQL = f"""
         body_hash TEXT NOT NULL,
         is_active INTEGER NOT NULL CHECK (is_active IN (0, 1)),
         created_at TEXT NOT NULL,
+        system_prompt_id TEXT NOT NULL DEFAULT '',
+        system_prompt_version INTEGER NOT NULL DEFAULT 1,
+        system_body TEXT NOT NULL DEFAULT '',
+        system_body_hash TEXT NOT NULL DEFAULT '',
+        required_variables_json TEXT NOT NULL DEFAULT '[]',
+        knowledge_artifact_hash TEXT,
+        status TEXT NOT NULL DEFAULT 'ACTIVE',
+        author TEXT NOT NULL DEFAULT '',
+        reason TEXT NOT NULL DEFAULT '',
+        is_default INTEGER NOT NULL DEFAULT 0,
         PRIMARY KEY (prompt_id, version)
     );
     CREATE TABLE IF NOT EXISTS system_state (
@@ -948,6 +974,124 @@ def _migrate_job_runs_v14(connection: sqlite3.Connection) -> None:
         raise
 
 
+_PROMPT_SEED_CREATED_AT = "2026-11-08T18:00:00.000Z"
+_PROMPT_VERSION_ADDITIONS = (
+    ("system_prompt_id", "TEXT NOT NULL DEFAULT ''"),
+    ("system_prompt_version", "INTEGER NOT NULL DEFAULT 1"),
+    ("system_body", "TEXT NOT NULL DEFAULT ''"),
+    ("system_body_hash", "TEXT NOT NULL DEFAULT ''"),
+    ("required_variables_json", "TEXT NOT NULL DEFAULT '[]'"),
+    ("knowledge_artifact_hash", "TEXT"),
+    ("status", "TEXT NOT NULL DEFAULT 'ACTIVE'"),
+    ("author", "TEXT NOT NULL DEFAULT ''"),
+    ("reason", "TEXT NOT NULL DEFAULT ''"),
+    ("is_default", "INTEGER NOT NULL DEFAULT 0"),
+)
+_LLM_CALL_ADDITIONS = (
+    ("system_prompt_id", "TEXT NOT NULL DEFAULT ''"),
+    ("system_prompt_version", "INTEGER NOT NULL DEFAULT 1"),
+    ("system_prompt_hash", "TEXT NOT NULL DEFAULT ''"),
+)
+
+
+def _add_missing_columns(
+    connection: sqlite3.Connection, table: str, additions: tuple[tuple[str, str], ...]
+) -> None:
+    if not _table_exists(connection, table):
+        return
+    existing = {row[1] for row in connection.execute(f"PRAGMA table_info({table})")}
+    for name, definition in additions:
+        if name not in existing:
+            connection.execute(f"ALTER TABLE {table} ADD COLUMN {name} {definition}")
+
+
+def _migrate_prompts_v16(connection: sqlite3.Connection) -> None:
+    """Add the ADR-0009 prompt-version and system-prompt columns (v16)."""
+    prompt_columns_added = _table_exists(connection, "prompt_versions") and any(
+        name not in {row[1] for row in connection.execute("PRAGMA table_info(prompt_versions)")}
+        for name, _definition in _PROMPT_VERSION_ADDITIONS
+    )
+    llm_columns_added = _table_exists(connection, "llm_calls") and any(
+        name not in {row[1] for row in connection.execute("PRAGMA table_info(llm_calls)")}
+        for name, _definition in _LLM_CALL_ADDITIONS
+    )
+    if not prompt_columns_added and not llm_columns_added:
+        return
+    connection.execute("BEGIN IMMEDIATE")
+    try:
+        _add_missing_columns(connection, "prompt_versions", _PROMPT_VERSION_ADDITIONS)
+        _add_missing_columns(connection, "llm_calls", _LLM_CALL_ADDITIONS)
+        connection.execute("COMMIT")
+    except Exception:
+        connection.execute("ROLLBACK")
+        raise
+
+
+def _seed_prompt_defaults(connection: sqlite3.Connection) -> None:
+    """Seed the built-in ANALYSIS/ENTRY_RECHECK templates as active v1.
+
+    ``INSERT OR IGNORE`` keeps the seed idempotent; an operator's edits and
+    activations are never overwritten by a later initialize.
+    """
+    now = _PROMPT_SEED_CREATED_AT
+    for role in (PromptRole.ANALYSIS, PromptRole.ENTRY_RECHECK):
+        user_id = PROMPT_IDS[role]
+        system_id = SYSTEM_PROMPT_IDS[role]
+        for prompt_id in (user_id, system_id):
+            connection.execute(
+                """
+                INSERT OR IGNORE INTO prompt_templates
+                    (prompt_id, role, active_version, created_at, updated_at)
+                VALUES (?, ?, 1, ?, ?)
+                """,
+                (prompt_id, role.value, now, now),
+            )
+        system_body = DEFAULT_SYSTEM_BODIES[role]
+        system_hash = content_hash(system_body)
+        connection.execute(
+            """
+            INSERT OR IGNORE INTO prompt_versions (
+                prompt_id, version, body, body_hash, is_active, created_at,
+                system_prompt_id, system_prompt_version, system_body,
+                system_body_hash, required_variables_json, knowledge_artifact_hash,
+                status, author, reason, is_default
+            ) VALUES (?, 1, ?, ?, 1, ?, ?, 1, ?, ?, '[]', NULL, ?, 'system', 'built-in default', 1)
+            """,
+            (
+                system_id,
+                system_body,
+                system_hash,
+                now,
+                system_id,
+                system_body,
+                system_hash,
+                PromptStatus.ACTIVE.value,
+            ),
+        )
+        user_body = DEFAULT_USER_BODIES[role]
+        connection.execute(
+            """
+            INSERT OR IGNORE INTO prompt_versions (
+                prompt_id, version, body, body_hash, is_active, created_at,
+                system_prompt_id, system_prompt_version, system_body,
+                system_body_hash, required_variables_json, knowledge_artifact_hash,
+                status, author, reason, is_default
+            ) VALUES (?, 1, ?, ?, 1, ?, ?, 1, ?, ?, ?, NULL, ?, 'system', 'built-in default', 1)
+            """,
+            (
+                user_id,
+                user_body,
+                content_hash(user_body),
+                now,
+                system_id,
+                system_body,
+                system_hash,
+                json.dumps(list(REQUIRED_VARIABLES[role])),
+                PromptStatus.ACTIVE.value,
+            ),
+        )
+
+
 def initialize_database(settings: Settings) -> None:
     """Create the data directory and the walking-skeleton schema."""
     settings.data_dir.mkdir(parents=True, exist_ok=True)
@@ -991,6 +1135,8 @@ def initialize_database(settings: Settings) -> None:
             _migrate_job_runs_v12(connection)
             _migrate_job_runs_v13(connection)
             _migrate_job_runs_v14(connection)
+        if _schema_version(connection) < 16:
+            _migrate_prompts_v16(connection)
         with connection:
             connection.executescript(_SCHEMA_SQL)
             connection.execute(
@@ -1051,8 +1197,13 @@ def initialize_database(settings: Settings) -> None:
             )
             connection.execute(
                 "INSERT OR IGNORE INTO schema_migrations (version, applied_at) VALUES (?, ?)",
-                (_SCHEMA_VERSION, "2026-11-08T17:00:00.000Z"),
+                (15, "2026-11-08T17:00:00.000Z"),
             )
+            connection.execute(
+                "INSERT OR IGNORE INTO schema_migrations (version, applied_at) VALUES (?, ?)",
+                (_SCHEMA_VERSION, "2026-11-08T18:00:00.000Z"),
+            )
+            _seed_prompt_defaults(connection)
     finally:
         connection.close()
         # The DB may hold a trading journal; never leave it group/world readable.
@@ -2914,8 +3065,11 @@ class SqliteStore:
                 INSERT INTO llm_calls (
                     call_id, decision_id, role, provider, model, prompt_id,
                     prompt_version, prompt_hash, input_hash, attempt, request_id,
-                    status, raw_output_hash, usage_json, latency_ms, error_code, created_at
-                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    status, raw_output_hash, usage_json, latency_ms, error_code, created_at,
+                    system_prompt_id, system_prompt_version, system_prompt_hash
+                ) VALUES (
+                    ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?
+                )
                 ON CONFLICT(call_id) DO NOTHING
                 """,
                 (
@@ -2936,6 +3090,9 @@ class SqliteStore:
                     record.latency_ms,
                     record.error_code,
                     record.created_at,
+                    record.system_prompt_id,
+                    record.system_prompt_version,
+                    record.system_prompt_hash,
                 ),
             )
 
@@ -3010,6 +3167,142 @@ class SqliteStore:
         finally:
             connection.close()
         return tuple(_row_to_decision(row) for row in rows)
+
+    # -- Prompt templates and immutable versions (ADR-0009) --------------
+
+    def save_prompt_template(self, record: PromptTemplateRecord) -> None:
+        with closing(self._connect()) as connection, connection:
+            connection.execute(
+                """
+                INSERT INTO prompt_templates
+                    (prompt_id, role, active_version, created_at, updated_at)
+                VALUES (?, ?, ?, ?, ?)
+                ON CONFLICT(prompt_id) DO UPDATE SET
+                    role = excluded.role,
+                    updated_at = excluded.updated_at
+                """,
+                (
+                    record.prompt_id,
+                    record.role,
+                    record.active_version,
+                    record.created_at,
+                    record.updated_at,
+                ),
+            )
+
+    def get_prompt_template(self, prompt_id: str) -> PromptTemplateRecord | None:
+        connection = self._connect_read_only()
+        if connection is None:
+            return None
+        try:
+            row = connection.execute(
+                "SELECT * FROM prompt_templates WHERE prompt_id = ?", (prompt_id,)
+            ).fetchone()
+        finally:
+            connection.close()
+        return None if row is None else _row_to_prompt_template(row)
+
+    def list_prompt_templates(self) -> tuple[PromptTemplateRecord, ...]:
+        connection = self._connect_read_only()
+        if connection is None:
+            return ()
+        try:
+            rows = connection.execute(
+                "SELECT * FROM prompt_templates ORDER BY prompt_id"
+            ).fetchall()
+        finally:
+            connection.close()
+        return tuple(_row_to_prompt_template(row) for row in rows)
+
+    def save_prompt_version(self, record: PromptVersionRecord) -> None:
+        with closing(self._connect()) as connection, connection:
+            connection.execute(
+                """
+                INSERT INTO prompt_versions (
+                    prompt_id, version, body, body_hash, is_active, created_at,
+                    system_prompt_id, system_prompt_version, system_body,
+                    system_body_hash, required_variables_json, knowledge_artifact_hash,
+                    status, author, reason, is_default
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                """,
+                (
+                    record.prompt_id,
+                    record.version,
+                    record.body,
+                    record.body_hash,
+                    int(record.is_active),
+                    record.created_at,
+                    record.system_prompt_id,
+                    record.system_prompt_version,
+                    record.system_body,
+                    record.system_body_hash,
+                    record.required_variables_json,
+                    record.knowledge_artifact_hash,
+                    record.status,
+                    record.author,
+                    record.reason,
+                    int(record.is_default),
+                ),
+            )
+
+    def get_prompt_version(self, prompt_id: str, version: int) -> PromptVersionRecord | None:
+        connection = self._connect_read_only()
+        if connection is None:
+            return None
+        try:
+            row = connection.execute(
+                "SELECT * FROM prompt_versions WHERE prompt_id = ? AND version = ?",
+                (prompt_id, version),
+            ).fetchone()
+        finally:
+            connection.close()
+        return None if row is None else _row_to_prompt_version(row)
+
+    def list_prompt_versions(self, prompt_id: str) -> tuple[PromptVersionRecord, ...]:
+        connection = self._connect_read_only()
+        if connection is None:
+            return ()
+        try:
+            rows = connection.execute(
+                "SELECT * FROM prompt_versions WHERE prompt_id = ? ORDER BY version",
+                (prompt_id,),
+            ).fetchall()
+        finally:
+            connection.close()
+        return tuple(_row_to_prompt_version(row) for row in rows)
+
+    def activate_prompt_version(self, prompt_id: str, version: int, *, activated_at: str) -> bool:
+        with closing(self._connect()) as connection, connection:
+            exists = connection.execute(
+                "SELECT 1 FROM prompt_versions WHERE prompt_id = ? AND version = ?",
+                (prompt_id, version),
+            ).fetchone()
+            if exists is None:
+                return False
+            connection.execute(
+                """
+                UPDATE prompt_versions
+                SET is_active = 0, status = ?
+                WHERE prompt_id = ? AND version <> ? AND status = ?
+                """,
+                (
+                    PromptStatus.SUPERSEDED.value,
+                    prompt_id,
+                    version,
+                    PromptStatus.ACTIVE.value,
+                ),
+            )
+            connection.execute(
+                "UPDATE prompt_versions SET is_active = 1, status = ? "
+                "WHERE prompt_id = ? AND version = ?",
+                (PromptStatus.ACTIVE.value, prompt_id, version),
+            )
+            connection.execute(
+                "UPDATE prompt_templates SET active_version = ?, updated_at = ? "
+                "WHERE prompt_id = ?",
+                (version, activated_at, prompt_id),
+            )
+            return True
 
     # -- Budget ledger ---------------------------------------------------
 
@@ -3768,6 +4061,7 @@ class SqliteStore:
 
 
 def _row_to_llm_call(row: sqlite3.Row) -> LLMCallRecord:
+    keys = row.keys()
     return LLMCallRecord(
         call_id=row["call_id"],
         decision_id=row["decision_id"],
@@ -3786,6 +4080,49 @@ def _row_to_llm_call(row: sqlite3.Row) -> LLMCallRecord:
         latency_ms=row["latency_ms"],
         error_code=row["error_code"],
         created_at=row["created_at"],
+        system_prompt_id=row["system_prompt_id"] if "system_prompt_id" in keys else "",
+        system_prompt_version=(
+            row["system_prompt_version"] if "system_prompt_version" in keys else 1
+        ),
+        system_prompt_hash=row["system_prompt_hash"] if "system_prompt_hash" in keys else "",
+    )
+
+
+def _row_to_prompt_template(row: sqlite3.Row) -> PromptTemplateRecord:
+    return PromptTemplateRecord(
+        prompt_id=row["prompt_id"],
+        role=row["role"],
+        active_version=row["active_version"],
+        created_at=row["created_at"],
+        updated_at=row["updated_at"],
+    )
+
+
+def _row_to_prompt_version(row: sqlite3.Row) -> PromptVersionRecord:
+    keys = row.keys()
+    return PromptVersionRecord(
+        prompt_id=row["prompt_id"],
+        version=row["version"],
+        body=row["body"],
+        body_hash=row["body_hash"],
+        is_active=bool(row["is_active"]),
+        created_at=row["created_at"],
+        system_prompt_id=row["system_prompt_id"] if "system_prompt_id" in keys else "",
+        system_prompt_version=(
+            row["system_prompt_version"] if "system_prompt_version" in keys else 1
+        ),
+        system_body=row["system_body"] if "system_body" in keys else "",
+        system_body_hash=row["system_body_hash"] if "system_body_hash" in keys else "",
+        required_variables_json=(
+            row["required_variables_json"] if "required_variables_json" in keys else "[]"
+        ),
+        knowledge_artifact_hash=(
+            row["knowledge_artifact_hash"] if "knowledge_artifact_hash" in keys else None
+        ),
+        status=row["status"] if "status" in keys else PromptStatus.ACTIVE.value,
+        author=row["author"] if "author" in keys else "",
+        reason=row["reason"] if "reason" in keys else "",
+        is_default=bool(row["is_default"]) if "is_default" in keys else False,
     )
 
 

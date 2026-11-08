@@ -248,6 +248,9 @@ class LLMCallRecord:
     created_at: str
     decision_id: str | None = None
     error_code: str | None = None
+    system_prompt_id: str = ""
+    system_prompt_version: int = 1
+    system_prompt_hash: str = ""
 
 
 @dataclass(frozen=True)
@@ -261,6 +264,39 @@ class DecisionRecord:
     raw_output_hash: str
     persisted_at: str
     payload_json: str
+
+
+@dataclass(frozen=True)
+class PromptTemplateRecord:
+    """One prompt template family and its explicitly selected active version."""
+
+    prompt_id: str
+    role: str
+    active_version: int
+    created_at: str
+    updated_at: str
+
+
+@dataclass(frozen=True)
+class PromptVersionRecord:
+    """One immutable prompt version (user body plus its pinned system prompt)."""
+
+    prompt_id: str
+    version: int
+    body: str
+    body_hash: str
+    is_active: bool
+    created_at: str
+    system_prompt_id: str = ""
+    system_prompt_version: int = 1
+    system_body: str = ""
+    system_body_hash: str = ""
+    required_variables_json: str = "[]"
+    knowledge_artifact_hash: str | None = None
+    status: str = "DRAFT"
+    author: str = ""
+    reason: str = ""
+    is_default: bool = False
 
 
 @dataclass(frozen=True)
@@ -645,6 +681,24 @@ class StorePort(Protocol):
     def get_decision(self, decision_id: str) -> DecisionRecord | None: ...
 
     def list_decisions(self, *, role: str | None = None) -> tuple[DecisionRecord, ...]: ...
+
+    # -- Prompt templates and immutable versions (ADR-0009) --------------
+
+    def save_prompt_template(self, record: PromptTemplateRecord) -> None: ...
+
+    def get_prompt_template(self, prompt_id: str) -> PromptTemplateRecord | None: ...
+
+    def list_prompt_templates(self) -> tuple[PromptTemplateRecord, ...]: ...
+
+    def save_prompt_version(self, record: PromptVersionRecord) -> None: ...
+
+    def get_prompt_version(self, prompt_id: str, version: int) -> PromptVersionRecord | None: ...
+
+    def list_prompt_versions(self, prompt_id: str) -> tuple[PromptVersionRecord, ...]: ...
+
+    def activate_prompt_version(
+        self, prompt_id: str, version: int, *, activated_at: str
+    ) -> bool: ...
 
     # -- Budget ledger ---------------------------------------------------
 

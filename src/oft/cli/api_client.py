@@ -186,3 +186,51 @@ class ApiClient:
             return self._request("POST", "/api/v1/kill-switch")
         query = f"?token={quote(token, safe='')}" if token is not None else ""
         return self._request("DELETE", f"/api/v1/kill-switch{query}")
+
+    # -- Prompts ---------------------------------------------------------
+
+    def list_prompts(self) -> dict[str, Any]:
+        return self._request("GET", "/api/v1/prompts")
+
+    def get_prompt(self, prompt_id: str) -> dict[str, Any]:
+        return self._request("GET", f"/api/v1/prompts/{quote(prompt_id, safe='')}")
+
+    def prompt_history(self, prompt_id: str) -> dict[str, Any]:
+        return self._request("GET", f"/api/v1/prompts/{quote(prompt_id, safe='')}/history")
+
+    def prompt_diff(self, prompt_id: str, from_version: int, to_version: int) -> dict[str, Any]:
+        return self._request(
+            "GET",
+            f"/api/v1/prompts/{quote(prompt_id, safe='')}/diff"
+            f"?from_version={from_version}&to_version={to_version}",
+        )
+
+    def edit_prompt(
+        self, prompt_id: str, payload: dict[str, Any], *, idempotency_key: str
+    ) -> dict[str, Any]:
+        return self._request(
+            "POST",
+            f"/api/v1/prompts/{quote(prompt_id, safe='')}/versions",
+            payload,
+            extra_headers={"Idempotency-Key": idempotency_key},
+        )
+
+    def activate_prompt(
+        self, prompt_id: str, payload: dict[str, Any], *, idempotency_key: str
+    ) -> dict[str, Any]:
+        return self._request(
+            "POST",
+            f"/api/v1/prompts/{quote(prompt_id, safe='')}/activate",
+            payload,
+            extra_headers={"Idempotency-Key": idempotency_key},
+        )
+
+    def restore_prompt(
+        self, prompt_id: str, payload: dict[str, Any], *, idempotency_key: str
+    ) -> dict[str, Any]:
+        return self._request(
+            "POST",
+            f"/api/v1/prompts/{quote(prompt_id, safe='')}/restore",
+            payload,
+            extra_headers={"Idempotency-Key": idempotency_key},
+        )
