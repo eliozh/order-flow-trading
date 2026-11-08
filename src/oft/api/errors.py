@@ -119,6 +119,19 @@ ERROR_CATALOG: dict[str, ErrorSpec] = {
         422, "LLM", False, "The model output was truncated (incomplete status)."
     ),
     "LLM_REFUSED": ErrorSpec(422, "LLM", False, "The model refused the request."),
+    "PROMPT_VALIDATION_FAILED": ErrorSpec(
+        422,
+        "LLM",
+        False,
+        "A prompt template is missing a required variable or has invalid syntax.",
+    ),
+    "PROMPT_VERSION_MISSING": ErrorSpec(
+        409,
+        "LLM",
+        False,
+        "A decision references a prompt version that no longer exists or has no "
+        "pinned system version.",
+    ),
     "KILL_SWITCH_ACTIVE": ErrorSpec(
         423, "RISK", False, "The kill switch blocks new orders and LLM-driven execution."
     ),

@@ -34,6 +34,7 @@ from oft.api.errors import ApiError, error_response
 from oft.api.routes.data import router as data_router
 from oft.api.routes.opportunities import router as opportunities_router
 from oft.api.routes.paper import router as paper_router
+from oft.api.routes.prompts import router as prompts_router
 from oft.api.routes.reports import router as reports_router
 from oft.api.routes.scans import router as scans_router
 from oft.api.routes.symbols import router as symbols_router
@@ -42,6 +43,7 @@ from oft.api.routes.triggers import router as triggers_router
 from oft.api.routes.watchlist import router as watchlist_router
 from oft.bootstrap import build_container
 from oft.config import ConfigError, Settings, load_settings
+from oft.domain.prompts import PromptError
 from oft.logging import configure_logging
 from oft.ports.clock import ClockPort
 from oft.ports.store import StoreUnavailableError
@@ -227,6 +229,7 @@ def create_app(settings: Settings | None = None, *, clock: ClockPort | None = No
     app.include_router(opportunities_router)
     app.include_router(triggers_router)
     app.include_router(paper_router)
+    app.include_router(prompts_router)
     app.include_router(data_router)
 
     @app.exception_handler(ApiError)
@@ -255,6 +258,15 @@ def create_app(settings: Settings | None = None, *, clock: ClockPort | None = No
     @app.exception_handler(ConfigError)
     async def _config_error(_request: Request, exc: ConfigError) -> JSONResponse:
         return error_response(exc.code, message=exc.message)
+
+    @app.exception_handler(PromptError)
+    async def _prompt_error(_request: Request, exc: PromptError) -> JSONResponse:
+        details = (
+            [{"field": exc.variable, "code": exc.code, "message": exc.message}]
+            if exc.variable is not None
+            else []
+        )
+        return error_response(exc.code, message=exc.message, details=details)
 
     @app.exception_handler(StoreUnavailableError)
     async def _store_error(_request: Request, exc: StoreUnavailableError) -> JSONResponse:

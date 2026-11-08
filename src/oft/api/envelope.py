@@ -15,6 +15,18 @@ def new_request_id() -> str:
     return f"REQ-{uuid.uuid4().hex[:_REQUEST_ID_ALPHABET_LENGTH].upper()}"
 
 
+def pagination_meta(*, limit: int, offset: int, returned: int, total: int) -> dict[str, Any]:
+    """Build the ``meta.pagination`` block shared by bounded list routes."""
+    has_next = offset + returned < total
+    return {
+        "limit": limit,
+        "cursor": str(offset),
+        "has_next": has_next,
+        "next_cursor": str(offset + limit) if has_next else None,
+        "total": total,
+    }
+
+
 def _meta(
     *,
     request_id: str,

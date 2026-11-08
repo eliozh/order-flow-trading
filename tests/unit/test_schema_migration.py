@@ -81,7 +81,7 @@ def test_v1_database_upgrades_to_v2_with_effective_checks(tmp_path: Path) -> Non
     finally:
         connection.close()
 
-    assert versions == {1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15}
+    assert versions == {1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16}
 
 
 _V2_BACKFILL = """
@@ -139,7 +139,7 @@ def test_v2_database_gains_the_backfill_heartbeat_column(tmp_path: Path) -> None
 
     assert "updated_at" in columns
     assert updated_at == "2026-11-06T00:00:00.000Z"
-    assert versions == {1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15}
+    assert versions == {1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16}
 
 
 def test_v5_checks_indexes_and_foreign_keys(tmp_path: Path) -> None:
@@ -236,7 +236,7 @@ def test_v5_database_migrates_manifest_metrics_columns(tmp_path: Path) -> None:
 
     assert {"metric_version", "input_manifest_hash", "window_start", "window_end"} <= columns
     assert legacy == ("/tmp/legacy.parquet", None, None)
-    assert versions == {1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15}
+    assert versions == {1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16}
 
 
 def test_v6_database_migrates_starred_columns(tmp_path: Path) -> None:
@@ -295,7 +295,7 @@ def test_v6_database_migrates_starred_columns(tmp_path: Path) -> None:
 
     assert {"starred", "starred_at"} <= columns
     assert row == ("BTCUSDT", 0, None)
-    assert versions == {1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15}
+    assert versions == {1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16}
 
 
 def test_manifest_run_metadata_columns_are_added_idempotently(tmp_path: Path) -> None:
@@ -312,7 +312,7 @@ def test_manifest_run_metadata_columns_are_added_idempotently(tmp_path: Path) ->
         connection.close()
 
     assert {"run_id", "last_n", "recomputed_from", "parent_run_id"} <= columns
-    assert versions == {1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15}
+    assert versions == {1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16}
 
 
 _V12_JOB_RUNS = """
@@ -378,7 +378,7 @@ def test_v12_database_gains_the_job_run_scope_symbol_column(tmp_path: Path) -> N
 
     assert "symbol" in columns
     assert symbol is None  # pre-v13 batch rows keep a null (batch) scope
-    assert versions == {1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15}
+    assert versions == {1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16}
 
 
 _V13_JOB_RUNS = """
@@ -629,7 +629,7 @@ def test_v9_database_upgrades_to_v10_with_ledgers_and_indexes(tmp_path: Path) ->
     finally:
         connection.close()
 
-    assert versions == {1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15}
+    assert versions == {1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16}
     assert "llm_json" in report_columns
     assert {
         "llm_calls",
@@ -651,3 +651,200 @@ def test_v9_database_upgrades_to_v10_with_ledgers_and_indexes(tmp_path: Path) ->
         "trigger_events_triggered_at",
     } <= indexes
     assert foreign_key_errors == []
+
+
+_V15_PROMPTS = """
+CREATE TABLE schema_migrations (
+    version INTEGER PRIMARY KEY,
+    applied_at TEXT NOT NULL
+);
+INSERT INTO schema_migrations (version, applied_at) VALUES (1, 't'), (2, 't'), (3, 't'),
+    (4, 't'), (5, 't'), (6, 't'), (7, 't'), (8, 't'), (9, 't'), (10, 't'), (11, 't'),
+    (12, 't'), (13, 't'), (14, 't'), (15, 't');
+CREATE TABLE prompt_templates (
+    prompt_id TEXT PRIMARY KEY,
+    role TEXT NOT NULL,
+    active_version INTEGER NOT NULL,
+    created_at TEXT NOT NULL,
+    updated_at TEXT NOT NULL
+);
+INSERT INTO prompt_templates VALUES ('analysis', 'ANALYSIS', 2, 't1', 't2');
+CREATE TABLE prompt_versions (
+    prompt_id TEXT NOT NULL,
+    version INTEGER NOT NULL,
+    body TEXT NOT NULL,
+    body_hash TEXT NOT NULL,
+    is_active INTEGER NOT NULL CHECK (is_active IN (0, 1)),
+    created_at TEXT NOT NULL,
+    PRIMARY KEY (prompt_id, version)
+);
+INSERT INTO prompt_versions VALUES ('analysis', 1, 'OLD V1', 'HASH1', 0, 't1');
+INSERT INTO prompt_versions VALUES ('analysis', 2, 'CUSTOM V2', 'HASH2', 1, 't2');
+CREATE TABLE llm_calls (
+    call_id TEXT PRIMARY KEY,
+    decision_id TEXT,
+    role TEXT NOT NULL,
+    provider TEXT NOT NULL,
+    model TEXT NOT NULL,
+    prompt_id TEXT NOT NULL,
+    prompt_version INTEGER NOT NULL,
+    prompt_hash TEXT NOT NULL,
+    input_hash TEXT NOT NULL,
+    attempt INTEGER NOT NULL,
+    request_id TEXT NOT NULL,
+    status TEXT NOT NULL,
+    raw_output_hash TEXT NOT NULL,
+    usage_json TEXT NOT NULL,
+    latency_ms INTEGER NOT NULL,
+    error_code TEXT,
+    created_at TEXT NOT NULL
+);
+INSERT INTO llm_calls VALUES (
+    'CALL-1', 'DEC-1', 'ANALYSIS', 'stub', 'fixture', 'analysis', 1, 'PH', 'IH',
+    1, 'REQ-1', 'OK', 'RH', '{}', 0, NULL, 't1'
+);
+"""
+
+
+def test_v15_prompt_and_llm_rows_upgrade_to_v16_and_seed_only_missing_families(
+    tmp_path: Path,
+) -> None:
+    settings = Settings(env="test", port=8765, data_dir=tmp_path / "data")
+    settings.data_dir.mkdir(parents=True)
+    connection = sqlite3.connect(database_path(settings))
+    try:
+        connection.executescript(_V15_PROMPTS)
+        connection.commit()
+    finally:
+        connection.close()
+
+    store = SqliteStore(settings)
+    store.initialize()
+    store.initialize()  # idempotent re-initialize
+
+    connection = sqlite3.connect(database_path(settings))
+    try:
+        prompt_columns = {
+            row[1] for row in connection.execute("PRAGMA table_info(prompt_versions)")
+        }
+        llm_columns = {row[1] for row in connection.execute("PRAGMA table_info(llm_calls)")}
+        preserved = connection.execute(
+            "SELECT version, body, body_hash, is_active FROM prompt_versions "
+            "WHERE prompt_id = 'analysis' ORDER BY version"
+        ).fetchall()
+        upgraded_defaults = connection.execute(
+            "SELECT system_prompt_id, system_prompt_version, system_body, "
+            "system_body_hash, status, author, reason, is_default "
+            "FROM prompt_versions WHERE prompt_id = 'analysis' AND version = 2"
+        ).fetchone()
+        active_version = connection.execute(
+            "SELECT active_version FROM prompt_templates WHERE prompt_id = 'analysis'"
+        ).fetchone()[0]
+        templates = {
+            row[0]
+            for row in connection.execute("SELECT prompt_id FROM prompt_templates ORDER BY 1")
+        }
+        llm_defaults = connection.execute(
+            "SELECT system_prompt_id, system_prompt_version, system_prompt_hash "
+            "FROM llm_calls WHERE call_id = 'CALL-1'"
+        ).fetchone()
+        versions = {row[0] for row in connection.execute("SELECT version FROM schema_migrations")}
+    finally:
+        connection.close()
+
+    assert {
+        "system_prompt_id",
+        "system_prompt_version",
+        "system_body",
+        "system_body_hash",
+        "required_variables_json",
+        "knowledge_artifact_hash",
+        "status",
+        "author",
+        "reason",
+        "is_default",
+    } <= prompt_columns
+    assert {"system_prompt_id", "system_prompt_version", "system_prompt_hash"} <= llm_columns
+    # Operator-authored rows survive untouched.
+    assert [tuple(row) for row in preserved] == [
+        (1, "OLD V1", "HASH1", 0),
+        (2, "CUSTOM V2", "HASH2", 1),
+    ]
+    assert tuple(upgraded_defaults) == ("", 1, "", "", "ACTIVE", "", "", 0)
+    assert active_version == 2
+    # Only the missing families are seeded; the existing 'analysis' family and
+    # its operator version are not overwritten.
+    assert templates == {
+        "analysis",
+        "analysis:system",
+        "entry_recheck",
+        "entry_recheck:system",
+    }
+    assert tuple(llm_defaults) == ("", 1, "")
+    assert versions == {1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16}
+
+
+def test_prompt_versions_are_immutable_and_have_one_active_row_per_prompt(
+    tmp_path: Path,
+) -> None:
+    settings = Settings(env="test", port=8765, data_dir=tmp_path / "data")
+    SqliteStore(settings).initialize()
+
+    connection = sqlite3.connect(database_path(settings))
+    try:
+        with pytest.raises(sqlite3.IntegrityError):
+            connection.execute(
+                "UPDATE prompt_versions SET body = 'TAMPERED' "
+                "WHERE prompt_id = 'analysis' AND version = 1"
+            )
+        with pytest.raises(sqlite3.IntegrityError):
+            connection.execute(
+                "UPDATE prompt_versions SET body_hash = 'TAMPERED' "
+                "WHERE prompt_id = 'analysis' AND version = 1"
+            )
+        # The whole pinned-system and validation contract is immutable too.
+        for column, value in (
+            ("system_prompt_id", "'other:system'"),
+            ("system_prompt_version", "99"),
+            ("system_body", "'TAMPERED'"),
+            ("system_body_hash", "'TAMPERED'"),
+            ("required_variables_json", "'[]'"),
+            ("knowledge_artifact_hash", "'TAMPERED'"),
+        ):
+            with pytest.raises(sqlite3.IntegrityError):
+                connection.execute(
+                    f"UPDATE prompt_versions SET {column} = {value} "
+                    "WHERE prompt_id = 'analysis' AND version = 1"
+                )
+        # Only one row per prompt may be active.
+        with pytest.raises(sqlite3.IntegrityError):
+            connection.execute(
+                "INSERT INTO prompt_versions "
+                "(prompt_id, version, body, body_hash, is_active, created_at, status) "
+                "VALUES ('analysis', 99, 'BODY', 'HASH', 1, 't', 'ACTIVE')"
+            )
+        # Activation bookkeeping and drafts stay mutable.
+        connection.execute(
+            "UPDATE prompt_versions SET is_active = 0, status = 'SUPERSEDED' "
+            "WHERE prompt_id = 'analysis' AND version = 1"
+        )
+        connection.execute(
+            "UPDATE prompt_versions SET is_active = 0, status = 'DRAFT' "
+            "WHERE prompt_id = 'analysis' AND version = 1"
+        )
+        # The status enum and the is_active/status invariant are enforced.
+        with pytest.raises(sqlite3.IntegrityError):
+            connection.execute(
+                "INSERT INTO prompt_versions "
+                "(prompt_id, version, body, body_hash, is_active, created_at, status) "
+                "VALUES ('analysis', 100, 'BODY', 'HASH', 0, 't', 'BOGUS')"
+            )
+        with pytest.raises(sqlite3.IntegrityError):
+            connection.execute(
+                "INSERT INTO prompt_versions "
+                "(prompt_id, version, body, body_hash, is_active, created_at, status) "
+                "VALUES ('analysis', 101, 'BODY', 'HASH', 0, 't', 'ACTIVE')"
+            )
+        connection.commit()
+    finally:
+        connection.close()

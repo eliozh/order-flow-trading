@@ -784,7 +784,12 @@ class ScanService:
                 None,
                 (),
             )
-        service = AnalysisService(store=container.store, clock=container.clock, provider=provider)
+        service = AnalysisService(
+            store=container.store,
+            clock=container.clock,
+            provider=provider,
+            settings=container.settings,
+        )
         try:
             outcome = service.analyze(
                 symbol=request.symbol,

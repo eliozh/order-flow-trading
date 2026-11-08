@@ -12,6 +12,7 @@ from oft.config import Settings
 from oft.ports.store import (
     AuditEventDraft,
     FillRecord,
+    IdempotencyRecord,
     ManifestEntry,
     OrderRecord,
     PaperAccountRecord,
@@ -192,3 +193,43 @@ def test_balance_delta_is_applied_inside_the_write_transaction(tmp_path: Path) -
     stored = store.get_paper_account("ACC-PAPER")
     assert stored is not None
     assert stored.balance == "8600.00000000"
+
+
+def test_completing_a_purged_idempotency_lease_reinserts_the_response(
+    tmp_path: Path,
+) -> None:
+    settings = Settings(env="test", port=8765, data_dir=tmp_path / "data")
+    store = SqliteStore(settings)
+    store.initialize()
+    reservation = IdempotencyRecord(
+        scope="test:POST:/api/v1/prompts/analysis/versions",
+        key="lease-lost",
+        request_hash="REQUEST",
+        response_status=0,
+        response_json="",
+        created_at="2026-11-08T12:00:00.000Z",
+        expires_at="2026-11-08T12:00:30.000Z",
+    )
+    assert store.reserve_idempotency(reservation) is True
+    # A concurrent purge (or an expired lease reclaimed by another writer)
+    # removes the reservation before the first request completes.
+    store.delete_idempotency(scope=reservation.scope, key=reservation.key)
+    assert store.get_idempotency(scope=reservation.scope, key=reservation.key) is None
+
+    store.complete_idempotency(
+        IdempotencyRecord(
+            scope=reservation.scope,
+            key=reservation.key,
+            request_hash="REQUEST",
+            response_status=201,
+            response_json='{"ok": true}',
+            created_at="2026-11-08T12:00:01.000Z",
+            expires_at="2026-11-09T12:00:01.000Z",
+        )
+    )
+
+    # The lost lease must not silently lose the recorded response.
+    stored = store.get_idempotency(scope=reservation.scope, key=reservation.key)
+    assert stored is not None
+    assert stored.response_status == 201
+    assert stored.response_json == '{"ok": true}'
