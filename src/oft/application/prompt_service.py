@@ -9,11 +9,13 @@ from __future__ import annotations
 
 import difflib
 import json
+import sqlite3
 from collections.abc import Mapping, Sequence
 from dataclasses import dataclass
 from typing import Any
 
 from oft.application.kill_switch import record_audit
+from oft.config import Settings
 from oft.domain.prompts import (
     DEFAULT_SYSTEM_BODIES,
     DEFAULT_USER_BODIES,
@@ -31,6 +33,7 @@ from oft.domain.prompts import (
     content_hash,
     is_system_prompt_id,
     prompt_id_for_role,
+    redact_secrets,
     render,
     rendered_prompt_hash,
     role_for_prompt_id,
@@ -55,6 +58,12 @@ class PromptNotFoundError(PromptError):
     """The requested prompt template or version does not exist."""
 
     code = "NOT_FOUND"
+
+
+class PromptConflictError(PromptError):
+    """A concurrent edit took the version this one tried to allocate."""
+
+    code = "CONFLICT"
 
 
 @dataclass(frozen=True)
@@ -161,7 +170,7 @@ class PromptDetail:
         }
 
 
-def secret_values_from_settings(settings: Any) -> tuple[str, ...]:
+def secret_values_from_settings(settings: Settings) -> tuple[str, ...]:
     """Collect the configured secret values that must never reach a prompt."""
     values: list[str] = []
     for name in _SECRET_FIELDS:
@@ -206,9 +215,16 @@ def _parse_required(raw: str, role: PromptRole) -> tuple[str, ...]:
 
 
 class PromptService:
-    def __init__(self, *, store: StorePort, clock: ClockPort) -> None:
+    def __init__(
+        self,
+        *,
+        store: StorePort,
+        clock: ClockPort,
+        secret_values: Sequence[str] = (),
+    ) -> None:
         self._store = store
         self._clock = clock
+        self._secrets = tuple(secret_values)
 
     # -- reads -----------------------------------------------------------
 
@@ -247,6 +263,13 @@ class PromptService:
 
     def history(self, prompt_id: str) -> tuple[PromptVersionView, ...]:
         return self.show(prompt_id).versions
+
+    def history_page(
+        self, prompt_id: str, *, limit: int, offset: int
+    ) -> tuple[tuple[PromptVersionView, ...], int]:
+        """Return one bounded page of history plus the unpaginated total."""
+        versions = self.show(prompt_id).versions
+        return versions[offset : offset + limit], len(versions)
 
     def diff(self, prompt_id: str, from_version: int, to_version: int) -> str:
         resolved = resolve_prompt_id(prompt_id)
@@ -351,57 +374,104 @@ class PromptService:
         self._template(resolved)
         role = _role_for(resolved)
         system = is_system_prompt_id(resolved)
+        # Redact before validation, hashing, and persistence so a secret pasted
+        # into a template never lands in SQLite, the hash, or an idempotency
+        # response (ADR-0010).
+        body = redact_secrets(body, secret_values=self._secrets)
+        author = redact_secrets(author, secret_values=self._secrets)
+        reason = redact_secrets(reason, secret_values=self._secrets)
         validate_body(body, role=role, system=system)
 
-        versions = self._store.list_prompt_versions(resolved)
-        next_version = (versions[-1].version + 1) if versions else 1
-        if system:
-            system_prompt_id = resolved
-            system_version = next_version
-            system_body = body
-            system_body_hash = content_hash(body)
-            required: tuple[str, ...] = ()
-        else:
-            system_prompt_id, system_version, system_body, system_body_hash = (
-                self._active_system_pin(role)
-            )
-            required = REQUIRED_VARIABLES[role]
-
         now = utc_timestamp(self._clock.now())
-        record = PromptVersionRecord(
-            prompt_id=resolved,
-            version=next_version,
-            body=body,
-            body_hash=content_hash(body),
-            is_active=False,
-            created_at=now,
-            system_prompt_id=system_prompt_id,
-            system_prompt_version=system_version,
-            system_body=system_body,
-            system_body_hash=system_body_hash,
-            required_variables_json=json.dumps(list(required)),
-            knowledge_artifact_hash=knowledge_artifact_hash,
-            status=PromptStatus.DRAFT.value,
+        record = self._allocate_and_save(
+            resolved,
+            body,
+            role=role,
+            system=system,
             author=author,
             reason=reason,
             is_default=is_default,
+            knowledge_artifact_hash=knowledge_artifact_hash,
+            now=now,
         )
-        self._store.save_prompt_version(record)
         record_audit(
             self._store,
             event_type=("PROMPT_DEFAULT_RESTORED" if is_default else "PROMPT_VERSION_CREATED"),
             actor={"kind": "USER", "id": author},
             subject={"kind": "PROMPT", "id": resolved},
             payload={
-                "version": next_version,
+                "version": record.version,
                 "body_hash": record.body_hash,
                 "reason": reason,
             },
             at=now,
         )
         if activate:
-            return self.activate(resolved, next_version, actor=author, reason=reason)
+            return self.activate(resolved, record.version, actor=author, reason=reason)
         return self._view(record)
+
+    def _allocate_and_save(
+        self,
+        resolved: str,
+        body: str,
+        *,
+        role: PromptRole,
+        system: bool,
+        author: str,
+        reason: str,
+        is_default: bool,
+        knowledge_artifact_hash: str | None,
+        now: str,
+    ) -> PromptVersionRecord:
+        """Allocate the next version and persist it, retrying one collision.
+
+        Two concurrent edits can read the same latest version. The composite
+        primary key rejects the loser; recompute once so a concurrent writer
+        yields a fresh version instead of a raw 500.
+        """
+        attempts = 2
+        for attempt in range(attempts):
+            versions = self._store.list_prompt_versions(resolved)
+            next_version = (versions[-1].version + 1) if versions else 1
+            if system:
+                system_prompt_id = resolved
+                system_version = next_version
+                system_body = body
+                system_body_hash = content_hash(body)
+                required: tuple[str, ...] = ()
+            else:
+                system_prompt_id, system_version, system_body, system_body_hash = (
+                    self._active_system_pin(role)
+                )
+                required = REQUIRED_VARIABLES[role]
+            record = PromptVersionRecord(
+                prompt_id=resolved,
+                version=next_version,
+                body=body,
+                body_hash=content_hash(body),
+                is_active=False,
+                created_at=now,
+                system_prompt_id=system_prompt_id,
+                system_prompt_version=system_version,
+                system_body=system_body,
+                system_body_hash=system_body_hash,
+                required_variables_json=json.dumps(list(required)),
+                knowledge_artifact_hash=knowledge_artifact_hash,
+                status=PromptStatus.DRAFT.value,
+                author=author,
+                reason=reason,
+                is_default=is_default,
+            )
+            try:
+                self._store.save_prompt_version(record)
+            except sqlite3.IntegrityError as exc:
+                if attempt + 1 >= attempts:
+                    raise PromptConflictError(
+                        f"a concurrent edit took the next version for {resolved}; retry"
+                    ) from exc
+                continue
+            return record
+        raise PromptConflictError(f"could not allocate a version for {resolved}")
 
     # -- rendering -------------------------------------------------------
 
@@ -474,6 +544,8 @@ class PromptService:
             )
         prompt_id = provenance.get("prompt_id")
         version = provenance.get("prompt_version")
+        recorded_hash = provenance.get("prompt_hash")
+        recorded_hash = recorded_hash if isinstance(recorded_hash, str) else None
         if not isinstance(prompt_id, str) or not isinstance(version, int) or version < 1:
             return PromptProvenance(
                 status="missing",
@@ -491,13 +563,37 @@ class PromptService:
                 exact_replay=False,
                 code=PROMPT_VERSION_MISSING,
             )
+        # Exact replay also requires the pinned system-prompt version to still
+        # exist. A row with no pinned system reference (pre-v16 upgrade) or a
+        # missing pinned version cannot be replayed exactly; never substitute
+        # the built-in default silently.
+        system_prompt_id = record.system_prompt_id
+        system_version = record.system_prompt_version
+        system_record = (
+            self._store.get_prompt_version(system_prompt_id, system_version)
+            if system_prompt_id and system_version >= 1
+            else None
+        )
+        if system_record is None:
+            return PromptProvenance(
+                status="missing",
+                prompt_id=prompt_id,
+                version=version,
+                exact_replay=False,
+                code=PROMPT_VERSION_MISSING,
+                prompt_hash=recorded_hash,
+                body_hash=record.body_hash,
+            )
+        # ``prompt_hash`` is the rendered hash the decision recorded; the
+        # immutable template body hash is exposed separately.
         return PromptProvenance(
             status="available",
             prompt_id=prompt_id,
             version=version,
             exact_replay=True,
             code=None,
-            prompt_hash=record.body_hash,
+            prompt_hash=recorded_hash,
+            body_hash=record.body_hash,
         )
 
     # -- helpers ---------------------------------------------------------
@@ -564,6 +660,7 @@ class PromptService:
 
 __all__ = [
     "ActivePrompt",
+    "PromptConflictError",
     "PromptDetail",
     "PromptNotFoundError",
     "PromptService",

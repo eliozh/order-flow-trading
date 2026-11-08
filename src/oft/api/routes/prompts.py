@@ -2,126 +2,64 @@
 
 from __future__ import annotations
 
-import hashlib
-import json
 from dataclasses import asdict
-from datetime import timedelta
 from typing import Any
 
-from fastapi import APIRouter, Header, Query, Request, Response
-from fastapi.responses import JSONResponse
-from pydantic import BaseModel, ConfigDict, Field
+from fastapi import APIRouter, Header, Query, Request
 
 from oft.api.envelope import new_request_id, success_envelope
-from oft.api.errors import ApiError
-from oft.application.prompt_service import PromptService
-from oft.domain.time import utc_timestamp
-from oft.ports.store import IdempotencyRecord
+from oft.api.idempotency import (
+    complete,
+    release,
+    request_hash,
+    reserve,
+)
+from oft.api.idempotency import (
+    idempotency_key as require_idempotency_key,
+)
+from oft.api.schemas.prompt import (
+    ERROR_RESPONSES,
+    ActivatePromptRequest,
+    EditPromptRequest,
+    Envelope,
+    PromptDetailData,
+    PromptDiffData,
+    PromptHistoryData,
+    PromptListData,
+    PromptVersionData,
+    RestorePromptRequest,
+    mutation_openapi,
+)
+from oft.application.prompt_service import PromptService, secret_values_from_settings
 
 router = APIRouter()
-
-_IDEMPOTENCY_LEASE = timedelta(seconds=30)
-_IDEMPOTENCY_TTL = timedelta(hours=24)
-
-
-class EditPromptRequest(BaseModel):
-    model_config = ConfigDict(extra="forbid")
-
-    body: str = Field(min_length=1)
-    author: str = Field(default="cli", max_length=64)
-    reason: str = Field(default="", max_length=500)
-    activate: bool = False
-    knowledge_artifact_hash: str | None = None
-
-
-class ActivatePromptRequest(BaseModel):
-    model_config = ConfigDict(extra="forbid")
-
-    version: int = Field(ge=1)
-    actor: str = Field(default="cli", max_length=64)
-    reason: str = Field(default="", max_length=500)
-
-
-class RestorePromptRequest(BaseModel):
-    model_config = ConfigDict(extra="forbid")
-
-    author: str = Field(default="cli", max_length=64)
-    reason: str = Field(default="restore default", max_length=500)
 
 
 def _service(request: Request) -> PromptService:
     container = request.app.state.container
-    return PromptService(store=container.store, clock=container.clock)
-
-
-def _scope(request: Request) -> str:
-    settings = request.app.state.container.settings
-    return f"{settings.env.value}:{request.method}:{request.url.path}"
-
-
-def _idempotency_key(presented: str | None) -> str:
-    key = (presented or "").strip()
-    if not key:
-        raise ApiError("IDEMPOTENCY_KEY_REQUIRED")
-    if len(key) > 200:
-        raise ApiError("VALIDATION_FAILED", "Idempotency-Key is too long.")
-    return key
-
-
-def _request_hash(payload: Any) -> str:
-    canonical = json.dumps(payload.model_dump(mode="json"), sort_keys=True, separators=(",", ":"))
-    return hashlib.sha256(canonical.encode("utf-8")).hexdigest()
-
-
-def _reserve(request: Request, *, key: str, request_hash: str) -> JSONResponse | None:
-    container = request.app.state.container
-    now = container.clock.now()
-    scope = _scope(request)
-    container.store.purge_expired_idempotency(now=utc_timestamp(now))
-    reservation = IdempotencyRecord(
-        scope=scope,
-        key=key,
-        request_hash=request_hash,
-        response_status=0,
-        response_json="",
-        created_at=utc_timestamp(now),
-        expires_at=utc_timestamp(now + _IDEMPOTENCY_LEASE),
-    )
-    if container.store.reserve_idempotency(reservation):
-        return None
-    existing = container.store.get_idempotency(scope=scope, key=key)
-    if existing is not None and existing.request_hash != request_hash:
-        raise ApiError("IDEMPOTENCY_CONFLICT")
-    if existing is not None and existing.response_json:
-        envelope = json.loads(existing.response_json)
-        envelope["meta"]["idempotent_replay"] = True
-        return JSONResponse(status_code=existing.response_status, content=envelope)
-    raise ApiError("IDEMPOTENCY_CONFLICT", "A request with this Idempotency-Key is still running.")
-
-
-def _complete(
-    request: Request, *, key: str, request_hash: str, envelope: dict[str, Any], status: int
-) -> None:
-    container = request.app.state.container
-    now = container.clock.now()
-    container.store.complete_idempotency(
-        IdempotencyRecord(
-            scope=_scope(request),
-            key=key,
-            request_hash=request_hash,
-            response_status=status,
-            response_json=json.dumps(envelope),
-            created_at=utc_timestamp(now),
-            expires_at=utc_timestamp(now + _IDEMPOTENCY_TTL),
-        )
+    return PromptService(
+        store=container.store,
+        clock=container.clock,
+        secret_values=secret_values_from_settings(container.settings),
     )
 
 
-def _release(request: Request, *, key: str) -> None:
-    request.app.state.container.store.delete_idempotency(scope=_scope(request), key=key)
+def _pagination(*, limit: int, offset: int, returned: int, total: int) -> dict[str, Any]:
+    has_next = offset + returned < total
+    return {
+        "limit": limit,
+        "cursor": str(offset),
+        "has_next": has_next,
+        "next_cursor": str(offset + limit) if has_next else None,
+        "total": total,
+    }
 
 
-@router.get("/api/v1/prompts")
+@router.get(
+    "/api/v1/prompts",
+    response_model=Envelope[PromptListData],
+    responses=ERROR_RESPONSES,
+)
 def list_prompts(request: Request) -> dict[str, Any]:
     """List prompt template families with their explicit active version."""
     items = [asdict(summary) for summary in _service(request).list_templates()]
@@ -133,7 +71,11 @@ def list_prompts(request: Request) -> dict[str, Any]:
     )
 
 
-@router.get("/api/v1/prompts/{prompt_id}")
+@router.get(
+    "/api/v1/prompts/{prompt_id}",
+    response_model=Envelope[PromptDetailData],
+    responses=ERROR_RESPONSES,
+)
 def show_prompt(prompt_id: str, request: Request) -> dict[str, Any]:
     """Show one template with its immutable version history."""
     detail = _service(request).show(prompt_id)
@@ -145,24 +87,37 @@ def show_prompt(prompt_id: str, request: Request) -> dict[str, Any]:
     )
 
 
-@router.get("/api/v1/prompts/{prompt_id}/history")
-def prompt_history(prompt_id: str, request: Request) -> dict[str, Any]:
-    """List every version of one template, newest history included."""
-    service = _service(request)
-    versions = service.history(prompt_id)
+@router.get(
+    "/api/v1/prompts/{prompt_id}/history",
+    response_model=Envelope[PromptHistoryData],
+    responses=ERROR_RESPONSES,
+)
+def prompt_history(
+    prompt_id: str,
+    request: Request,
+    limit: int = Query(default=100, ge=1, le=500),
+    offset: int = Query(default=0, ge=0),
+) -> dict[str, Any]:
+    """List a bounded page of one template's immutable version history."""
+    versions, total = _service(request).history_page(prompt_id, limit=limit, offset=offset)
     return success_envelope(
         {
             "prompt_id": prompt_id,
             "items": [version.to_contract() for version in versions],
-            "total": len(versions),
+            "total": total,
         },
         request_id=new_request_id(),
         provenance="CALC",
         data_quality="COMPLETE" if versions else "MISSING",
+        pagination=_pagination(limit=limit, offset=offset, returned=len(versions), total=total),
     )
 
 
-@router.get("/api/v1/prompts/{prompt_id}/diff")
+@router.get(
+    "/api/v1/prompts/{prompt_id}/diff",
+    response_model=Envelope[PromptDiffData],
+    responses=ERROR_RESPONSES,
+)
 def prompt_diff(
     prompt_id: str,
     request: Request,
@@ -184,18 +139,23 @@ def prompt_diff(
     )
 
 
-@router.post("/api/v1/prompts/{prompt_id}/versions")
+@router.post(
+    "/api/v1/prompts/{prompt_id}/versions",
+    status_code=201,
+    response_model=Envelope[PromptVersionData],
+    responses=ERROR_RESPONSES,
+    openapi_extra=mutation_openapi(),
+)
 def create_prompt_version(
     prompt_id: str,
     payload: EditPromptRequest,
     request: Request,
-    response: Response,
     idempotency_key: str | None = Header(default=None, alias="Idempotency-Key"),
 ) -> Any:
     """Create a new immutable DRAFT version (never edits an existing one)."""
-    key = _idempotency_key(idempotency_key)
-    request_hash = _request_hash(payload)
-    replay = _reserve(request, key=key, request_hash=request_hash)
+    key = require_idempotency_key(idempotency_key)
+    payload_hash = request_hash(payload)
+    replay = reserve(request, key=key, request_hash=payload_hash)
     if replay is not None:
         return replay
     try:
@@ -208,7 +168,7 @@ def create_prompt_version(
             knowledge_artifact_hash=payload.knowledge_artifact_hash,
         )
     except BaseException:
-        _release(request, key=key)
+        release(request, key=key)
         raise
     envelope = success_envelope(
         version.to_contract(),
@@ -216,23 +176,26 @@ def create_prompt_version(
         provenance="CALC",
         data_quality="COMPLETE",
     )
-    _complete(request, key=key, request_hash=request_hash, envelope=envelope, status=201)
-    response.status_code = 201
+    complete(request, key=key, request_hash=payload_hash, envelope=envelope, status=201)
     return envelope
 
 
-@router.post("/api/v1/prompts/{prompt_id}/activate")
+@router.post(
+    "/api/v1/prompts/{prompt_id}/activate",
+    response_model=Envelope[PromptVersionData],
+    responses=ERROR_RESPONSES,
+    openapi_extra=mutation_openapi(),
+)
 def activate_prompt_version(
     prompt_id: str,
     payload: ActivatePromptRequest,
     request: Request,
-    response: Response,
     idempotency_key: str | None = Header(default=None, alias="Idempotency-Key"),
 ) -> Any:
     """Explicitly switch the active version; drafts are never used implicitly."""
-    key = _idempotency_key(idempotency_key)
-    request_hash = _request_hash(payload)
-    replay = _reserve(request, key=key, request_hash=request_hash)
+    key = require_idempotency_key(idempotency_key)
+    payload_hash = request_hash(payload)
+    replay = reserve(request, key=key, request_hash=payload_hash)
     if replay is not None:
         return replay
     try:
@@ -240,7 +203,7 @@ def activate_prompt_version(
             prompt_id, payload.version, actor=payload.actor, reason=payload.reason
         )
     except BaseException:
-        _release(request, key=key)
+        release(request, key=key)
         raise
     envelope = success_envelope(
         version.to_contract(),
@@ -248,23 +211,27 @@ def activate_prompt_version(
         provenance="CALC",
         data_quality="COMPLETE",
     )
-    _complete(request, key=key, request_hash=request_hash, envelope=envelope, status=200)
-    response.status_code = 200
+    complete(request, key=key, request_hash=payload_hash, envelope=envelope, status=200)
     return envelope
 
 
-@router.post("/api/v1/prompts/{prompt_id}/restore")
+@router.post(
+    "/api/v1/prompts/{prompt_id}/restore",
+    status_code=201,
+    response_model=Envelope[PromptVersionData],
+    responses=ERROR_RESPONSES,
+    openapi_extra=mutation_openapi(),
+)
 def restore_prompt_default(
     prompt_id: str,
     payload: RestorePromptRequest,
     request: Request,
-    response: Response,
     idempotency_key: str | None = Header(default=None, alias="Idempotency-Key"),
 ) -> Any:
     """Create a new DRAFT version that restores the built-in default body."""
-    key = _idempotency_key(idempotency_key)
-    request_hash = _request_hash(payload)
-    replay = _reserve(request, key=key, request_hash=request_hash)
+    key = require_idempotency_key(idempotency_key)
+    payload_hash = request_hash(payload)
+    replay = reserve(request, key=key, request_hash=payload_hash)
     if replay is not None:
         return replay
     try:
@@ -272,7 +239,7 @@ def restore_prompt_default(
             prompt_id, author=payload.author, reason=payload.reason
         )
     except BaseException:
-        _release(request, key=key)
+        release(request, key=key)
         raise
     envelope = success_envelope(
         version.to_contract(),
@@ -280,6 +247,5 @@ def restore_prompt_default(
         provenance="CALC",
         data_quality="COMPLETE",
     )
-    _complete(request, key=key, request_hash=request_hash, envelope=envelope, status=201)
-    response.status_code = 201
+    complete(request, key=key, request_hash=payload_hash, envelope=envelope, status=201)
     return envelope

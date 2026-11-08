@@ -2,15 +2,18 @@
 
 from __future__ import annotations
 
+import sqlite3
 from datetime import UTC, datetime
 from pathlib import Path
 
 import pytest
 
-from oft.adapters.sqlite_store import SqliteStore
+from oft.adapters.sqlite_store import SqliteStore, database_path
 from oft.application.prompt_service import (
+    PromptConflictError,
     PromptService,
     PromptVersionMissingError,
+    secret_values_from_settings,
 )
 from oft.clock import FixedClock
 from oft.config import Settings
@@ -199,3 +202,115 @@ def test_system_prompt_is_versioned_separately_from_the_user_template(
     system_versions = store.list_prompt_versions("analysis:system")
     assert len(system_versions) == 1
     assert system_versions[0].is_active is True
+
+
+def test_missing_pinned_system_version_disables_exact_replay(tmp_path: Path) -> None:
+    settings = Settings(env="test", port=8765, data_dir=tmp_path / "data")
+    store = SqliteStore(settings)
+    store.initialize()
+    service = PromptService(store=store, clock=FixedClock(NOW))
+    decision = {
+        "provenance": {"prompt_id": "analysis", "prompt_version": 1, "prompt_hash": "recorded"},
+    }
+    assert service.resolve_decision(decision).exact_replay is True
+
+    connection = sqlite3.connect(database_path(settings))
+    try:
+        connection.execute(
+            "DELETE FROM prompt_versions WHERE prompt_id = 'analysis:system' AND version = 1"
+        )
+        connection.commit()
+    finally:
+        connection.close()
+
+    resolution = service.resolve_decision(decision)
+
+    assert resolution.status == "missing"
+    assert resolution.exact_replay is False
+    assert resolution.code == "PROMPT_VERSION_MISSING"
+
+
+def test_a_concurrent_version_allocation_is_retried(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    service, store = _service(tmp_path)
+    original = store.save_prompt_version
+    calls = {"count": 0}
+
+    def flaky(record):  # type: ignore[no-untyped-def]
+        calls["count"] += 1
+        if calls["count"] == 1:
+            # Simulate another writer committing this version between our read
+            # of the latest version and our INSERT.
+            original(record)
+            raise sqlite3.IntegrityError("UNIQUE constraint failed: prompt_versions")
+        return original(record)
+
+    monkeypatch.setattr(store, "save_prompt_version", flaky)
+    body = (
+        "Symbol: {{symbol}}\nTimeframe: {{timeframe}}\n"
+        "<market_data>{{metrics}}</market_data>\n<knowledge>{{knowledge}}</knowledge>\n"
+        "<schema>{{schema}}</schema>\nRETRIED\n"
+    )
+
+    created = service.edit("analysis", body)
+
+    assert created.version == 3
+    assert calls["count"] == 2
+
+
+def test_a_persistent_version_conflict_is_a_clean_conflict(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    service, store = _service(tmp_path)
+    body = (
+        "Symbol: {{symbol}}\nTimeframe: {{timeframe}}\n"
+        "<market_data>{{metrics}}</market_data>\n<knowledge>{{knowledge}}</knowledge>\n"
+        "<schema>{{schema}}</schema>\nCONFLICT\n"
+    )
+
+    def always_conflict(record):  # type: ignore[no-untyped-def]
+        raise sqlite3.IntegrityError("UNIQUE constraint failed: prompt_versions")
+
+    monkeypatch.setattr(store, "save_prompt_version", always_conflict)
+
+    with pytest.raises(PromptConflictError) as excinfo:
+        service.edit("analysis", body)
+
+    assert excinfo.value.code == "CONFLICT"
+
+
+def test_a_secret_in_the_body_is_redacted_before_persisting(tmp_path: Path) -> None:
+    api_secret = "api-token-super-secret-value"
+    settings = Settings(env="test", port=8765, data_dir=tmp_path / "data", api_token=api_secret)
+    store = SqliteStore(settings)
+    store.initialize()
+    service = PromptService(
+        store=store,
+        clock=FixedClock(NOW),
+        secret_values=secret_values_from_settings(settings),
+    )
+    body = (
+        "Symbol: {{symbol}}\nTimeframe: {{timeframe}}\n"
+        "<market_data>{{metrics}}</market_data>\n<knowledge>{{knowledge}}</knowledge>\n"
+        "<schema>{{schema}}</schema>\n"
+        f"api_token={api_secret}\nkey: sk-live-abcdefghijklmnop\n"
+    )
+
+    created = service.edit(
+        "analysis",
+        body,
+        author=api_secret,
+        reason="sk-live-abcdefghijklmnop",
+    )
+
+    stored = store.get_prompt_version("analysis", created.version)
+    assert stored is not None
+    assert api_secret not in stored.body
+    assert "sk-live-abcdefghijklmnop" not in stored.body
+    assert api_secret not in stored.author
+    assert "sk-live-abcdefghijklmnop" not in stored.reason
+    assert "[REDACTED]" in stored.body
+    # The persisted hash must describe the persisted (redacted) body.
+    assert stored.body_hash == content_hash(stored.body)
+    assert api_secret not in created.body

@@ -116,6 +116,52 @@ def test_a_historical_decision_with_a_missing_version_is_missing_not_substituted
     assert resolution.prompt_hash is None
 
 
+def test_resolution_returns_the_recorded_rendered_hash_not_the_template_body_hash(
+    tmp_path: Path,
+) -> None:
+    loop = _helpers.build_loop(tmp_path)
+    container = loop["container"]
+    decision = json.loads(container.store.list_decisions(role="ANALYSIS")[0].payload_json)
+    service = PromptService(store=container.store, clock=container.clock)
+
+    resolution = service.resolve_decision(decision)
+
+    provenance = decision["provenance"]
+    record = container.store.get_prompt_version(
+        provenance["prompt_id"], provenance["prompt_version"]
+    )
+    assert record is not None
+    assert resolution.status == "available"
+    assert resolution.exact_replay is True
+    # A replay consumer compares against the decision's rendered hash, which is
+    # not the immutable template body hash.
+    assert resolution.prompt_hash == provenance["prompt_hash"]
+    assert resolution.prompt_hash != record.body_hash
+    assert resolution.body_hash == record.body_hash
+
+
+def test_missing_pinned_system_version_disables_exact_replay(tmp_path: Path) -> None:
+    loop = _helpers.build_loop(tmp_path)
+    container = loop["container"]
+    decision = json.loads(container.store.list_decisions(role="ANALYSIS")[0].payload_json)
+
+    connection = sqlite3.connect(database_path(container.settings))
+    try:
+        connection.execute(
+            "DELETE FROM prompt_versions WHERE prompt_id = 'analysis:system' AND version = 1"
+        )
+        connection.commit()
+    finally:
+        connection.close()
+
+    service = PromptService(store=container.store, clock=container.clock)
+    resolution = service.resolve_decision(decision)
+
+    assert resolution.status == "missing"
+    assert resolution.exact_replay is False
+    assert resolution.code == "PROMPT_VERSION_MISSING"
+
+
 def test_rendered_prompts_and_hash_inputs_never_carry_a_secret(tmp_path: Path) -> None:
     api_secret = "api-token-super-secret-value"
     provider_secret = "sk-openai-super-secret-value"

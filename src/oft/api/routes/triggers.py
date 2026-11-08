@@ -4,15 +4,25 @@ from __future__ import annotations
 
 import hashlib
 import json
-from datetime import UTC, timedelta
+from datetime import UTC
 from decimal import Decimal
 from typing import Any
 
 from fastapi import APIRouter, Header, Path, Query, Request, Response
-from fastapi.responses import JSONResponse
 
 from oft.api.envelope import new_request_id, success_envelope
 from oft.api.errors import ApiError
+from oft.api.idempotency import (
+    complete,
+    release,
+    reserve,
+)
+from oft.api.idempotency import (
+    idempotency_key as require_idempotency_key,
+)
+from oft.api.idempotency import (
+    request_hash as compute_request_hash,
+)
 from oft.api.schemas.trigger import (
     Envelope,
     TriggerAcceptData,
@@ -30,80 +40,8 @@ from oft.application.trigger_service import (
     trigger_summary,
 )
 from oft.domain.time import utc_timestamp
-from oft.ports.store import IdempotencyRecord
 
 router = APIRouter()
-
-_IDEMPOTENCY_LEASE = timedelta(seconds=30)
-_IDEMPOTENCY_TTL = timedelta(hours=24)
-
-
-def _idempotency_key(presented: str | None) -> str:
-    key = (presented or "").strip()
-    if not key:
-        raise ApiError("IDEMPOTENCY_KEY_REQUIRED")
-    if len(key) > 200:
-        raise ApiError("VALIDATION_FAILED", "Idempotency-Key is too long.")
-    return key
-
-
-def _scope(request: Request) -> str:
-    settings = request.app.state.container.settings
-    return f"{settings.env.value}:{request.method}:{request.url.path}"
-
-
-def _request_hash(payload: Any) -> str:
-    canonical = json.dumps(payload.model_dump(mode="json"), sort_keys=True, separators=(",", ":"))
-    return hashlib.sha256(canonical.encode("utf-8")).hexdigest()
-
-
-def _reserve(request: Request, *, key: str, request_hash: str) -> JSONResponse | None:
-    """Reserve ``(method, path, key)``; return a stored replay if one exists."""
-    container = request.app.state.container
-    now = container.clock.now()
-    scope = _scope(request)
-    container.store.purge_expired_idempotency(now=utc_timestamp(now))
-    reservation = IdempotencyRecord(
-        scope=scope,
-        key=key,
-        request_hash=request_hash,
-        response_status=0,
-        response_json="",
-        created_at=utc_timestamp(now),
-        expires_at=utc_timestamp(now + _IDEMPOTENCY_LEASE),
-    )
-    if container.store.reserve_idempotency(reservation):
-        return None
-    existing = container.store.get_idempotency(scope=scope, key=key)
-    if existing is not None and existing.request_hash != request_hash:
-        raise ApiError("IDEMPOTENCY_CONFLICT")
-    if existing is not None and existing.response_json:
-        envelope = json.loads(existing.response_json)
-        envelope["meta"]["idempotent_replay"] = True
-        return JSONResponse(status_code=existing.response_status, content=envelope)
-    raise ApiError("IDEMPOTENCY_CONFLICT", "A request with this Idempotency-Key is still running.")
-
-
-def _complete(
-    request: Request, *, key: str, request_hash: str, envelope: dict[str, Any], status: int
-) -> None:
-    container = request.app.state.container
-    now = container.clock.now()
-    container.store.complete_idempotency(
-        IdempotencyRecord(
-            scope=_scope(request),
-            key=key,
-            request_hash=request_hash,
-            response_status=status,
-            response_json=json.dumps(envelope),
-            created_at=utc_timestamp(now),
-            expires_at=utc_timestamp(now + _IDEMPOTENCY_TTL),
-        )
-    )
-
-
-def _release(request: Request, *, key: str) -> None:
-    request.app.state.container.store.delete_idempotency(scope=_scope(request), key=key)
 
 
 def _trigger_service(request: Request) -> TriggerService:
@@ -199,15 +137,15 @@ def evaluate_trigger(
     response: Response,
     idempotency_key: str | None = Header(default=None, alias="Idempotency-Key"),
 ) -> Any:
-    key = _idempotency_key(idempotency_key)
-    request_hash = _request_hash(payload)
-    replay = _reserve(request, key=key, request_hash=request_hash)
+    key = require_idempotency_key(idempotency_key)
+    request_hash = compute_request_hash(payload)
+    replay = reserve(request, key=key, request_hash=request_hash)
     if replay is not None:
         return replay
     as_of = None
     if payload.as_of is not None:
         if payload.as_of.tzinfo is None:
-            _release(request, key=key)
+            release(request, key=key)
             raise ApiError("VALIDATION_FAILED", "as_of must be timezone-aware UTC.")
         as_of = utc_timestamp(payload.as_of.astimezone(UTC))
     try:
@@ -218,13 +156,13 @@ def evaluate_trigger(
             snapshot_id=payload.snapshot_id,
         )
     except TriggerError as exc:
-        _release(request, key=key)
+        release(request, key=key)
         raise ApiError(exc.code, exc.message) from exc
     except OpportunityNotFound as exc:
-        _release(request, key=key)
+        release(request, key=key)
         raise ApiError("NOT_FOUND", str(exc)) from exc
     except BaseException:
-        _release(request, key=key)
+        release(request, key=key)
         raise
     data = {
         "opportunity_id": payload.opportunity_id,
@@ -248,7 +186,7 @@ def evaluate_trigger(
         provenance="CALC",
         data_quality=run.evaluation.data_quality,
     )
-    _complete(request, key=key, request_hash=request_hash, envelope=envelope, status=status)
+    complete(request, key=key, request_hash=request_hash, envelope=envelope, status=status)
     response.status_code = status
     return envelope
 
@@ -260,23 +198,23 @@ def recheck_trigger(
     idempotency_key: str | None = Header(default=None, alias="Idempotency-Key"),
 ) -> Any:
     """Run the LLM entry re-check for one trigger (ADR-0003 surface)."""
-    key = _idempotency_key(idempotency_key)
+    key = require_idempotency_key(idempotency_key)
     request_hash = hashlib.sha256(
         json.dumps({"trigger_id": trigger_id}, sort_keys=True).encode("utf-8")
     ).hexdigest()
-    replay = _reserve(request, key=key, request_hash=request_hash)
+    replay = reserve(request, key=key, request_hash=request_hash)
     if replay is not None:
         return replay
     try:
         result = _entry_service(request, trigger_id).recheck(trigger_id)
     except EntryRejected as exc:
-        _release(request, key=key)
+        release(request, key=key)
         raise ApiError(exc.code, exc.message) from exc
     except TriggerNotFound as exc:
-        _release(request, key=key)
+        release(request, key=key)
         raise ApiError("NOT_FOUND", str(exc)) from exc
     except BaseException:
-        _release(request, key=key)
+        release(request, key=key)
         raise
     envelope = success_envelope(
         result,
@@ -284,7 +222,7 @@ def recheck_trigger(
         provenance="MIXED",
         data_quality="COMPLETE",
     )
-    _complete(request, key=key, request_hash=request_hash, envelope=envelope, status=200)
+    complete(request, key=key, request_hash=request_hash, envelope=envelope, status=200)
     return envelope
 
 
@@ -295,7 +233,7 @@ def accept_trigger(
     trigger_id: str = Path(min_length=1, max_length=64, pattern=r"^[A-Za-z0-9._:-]+$"),
     idempotency_key: str | None = Header(default=None, alias="Idempotency-Key"),
 ) -> Any:
-    key = _idempotency_key(idempotency_key)
+    key = require_idempotency_key(idempotency_key)
     try:
         result = _entry_service(request, trigger_id).accept(trigger_id, idempotency_key=key)
     except EntryRejected as exc:
@@ -329,21 +267,21 @@ def reject_trigger(
     trigger_id: str = Path(min_length=1, max_length=64, pattern=r"^[A-Za-z0-9._:-]+$"),
     idempotency_key: str | None = Header(default=None, alias="Idempotency-Key"),
 ) -> Any:
-    key = _idempotency_key(idempotency_key)
-    request_hash = _request_hash(payload)
-    replay = _reserve(request, key=key, request_hash=request_hash)
+    key = require_idempotency_key(idempotency_key)
+    request_hash = compute_request_hash(payload)
+    replay = reserve(request, key=key, request_hash=request_hash)
     if replay is not None:
         return replay
     try:
         result = _entry_service(request, trigger_id).reject(trigger_id, reason=payload.reason)
     except EntryRejected as exc:
-        _release(request, key=key)
+        release(request, key=key)
         raise ApiError(exc.code, exc.message) from exc
     except TriggerNotFound as exc:
-        _release(request, key=key)
+        release(request, key=key)
         raise ApiError("NOT_FOUND", str(exc)) from exc
     except BaseException:
-        _release(request, key=key)
+        release(request, key=key)
         raise
     envelope = success_envelope(
         result,
@@ -351,5 +289,5 @@ def reject_trigger(
         provenance="CALC",
         data_quality="COMPLETE",
     )
-    _complete(request, key=key, request_hash=request_hash, envelope=envelope, status=200)
+    complete(request, key=key, request_hash=request_hash, envelope=envelope, status=200)
     return envelope

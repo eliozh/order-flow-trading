@@ -259,3 +259,134 @@ def test_cli_prompt_lifecycle(tmp_path: Path, live_daemon: Settings) -> None:
     restored = runner.invoke(cli_app, ["prompt", "restore", "analysis"])
     assert restored.exit_code == 0, restored.output
     assert "v3" in restored.output
+
+
+def test_prompt_version_route_requires_an_idempotency_key(tmp_path: Path) -> None:
+    settings = _settings(tmp_path)
+    app = create_app(settings, clock=FixedClock(NOW))
+    auth = _auth(app)
+
+    with TestClient(app) as client:
+        response = client.post(
+            "/api/v1/prompts/analysis/versions",
+            json={"body": _NEW_ANALYSIS_BODY},
+            headers=auth,
+        )
+
+    assert response.status_code == 400, response.text
+    assert response.json()["error"]["code"] == "IDEMPOTENCY_KEY_REQUIRED"
+
+
+def test_prompt_version_route_replays_an_identical_request(tmp_path: Path) -> None:
+    settings = _settings(tmp_path)
+    app = create_app(settings, clock=FixedClock(NOW))
+    auth = _auth(app)
+
+    with TestClient(app) as client:
+        headers = {**auth, "Idempotency-Key": "prompt-replay-1"}
+        first = client.post(
+            "/api/v1/prompts/analysis/versions",
+            json={"body": _NEW_ANALYSIS_BODY},
+            headers=headers,
+        )
+        second = client.post(
+            "/api/v1/prompts/analysis/versions",
+            json={"body": _NEW_ANALYSIS_BODY},
+            headers=headers,
+        )
+        history = client.get("/api/v1/prompts/analysis/history", headers=auth).json()
+
+    assert first.status_code == 201, first.text
+    assert second.status_code == 201, second.text
+    assert first.json()["meta"]["idempotent_replay"] is False
+    assert second.json()["meta"]["idempotent_replay"] is True
+    assert second.json()["data"] == first.json()["data"]
+    assert [item["version"] for item in history["data"]["items"]] == [1, 2]
+
+
+def test_prompt_version_route_conflicts_on_a_different_payload(tmp_path: Path) -> None:
+    settings = _settings(tmp_path)
+    app = create_app(settings, clock=FixedClock(NOW))
+    auth = _auth(app)
+
+    with TestClient(app) as client:
+        headers = {**auth, "Idempotency-Key": "prompt-conflict-1"}
+        first = client.post(
+            "/api/v1/prompts/analysis/versions",
+            json={"body": _NEW_ANALYSIS_BODY},
+            headers=headers,
+        )
+        second = client.post(
+            "/api/v1/prompts/analysis/versions",
+            json={"body": _NEW_ANALYSIS_BODY + "\nDIFFERENT"},
+            headers=headers,
+        )
+
+    assert first.status_code == 201, first.text
+    assert second.status_code == 409, second.text
+    assert second.json()["error"]["code"] == "IDEMPOTENCY_CONFLICT"
+
+
+def test_history_is_bounded_and_populates_pagination_meta(tmp_path: Path) -> None:
+    settings = _settings(tmp_path)
+    app = create_app(settings, clock=FixedClock(NOW))
+    auth = _auth(app)
+
+    with TestClient(app) as client:
+        for index in range(3):
+            created = client.post(
+                "/api/v1/prompts/analysis/versions",
+                json={"body": _NEW_ANALYSIS_BODY + f"\nVARIANT {index}"},
+                headers={**auth, "Idempotency-Key": f"prompt-page-{index}"},
+            )
+            assert created.status_code == 201, created.text
+
+        first_page = client.get("/api/v1/prompts/analysis/history?limit=2&offset=0", headers=auth)
+        second_page = client.get("/api/v1/prompts/analysis/history?limit=2&offset=2", headers=auth)
+
+    assert first_page.status_code == 200, first_page.text
+    first_body = first_page.json()
+    assert [item["version"] for item in first_body["data"]["items"]] == [1, 2]
+    assert first_body["data"]["total"] == 4
+    first_meta = first_body["meta"]["pagination"]
+    assert first_meta["limit"] == 2
+    assert first_meta["cursor"] == "0"
+    assert first_meta["has_next"] is True
+    assert first_meta["next_cursor"] == "2"
+    assert first_meta["total"] == 4
+
+    second_body = second_page.json()
+    assert [item["version"] for item in second_body["data"]["items"]] == [3, 4]
+    second_meta = second_body["meta"]["pagination"]
+    assert second_meta["has_next"] is False
+    assert second_meta["next_cursor"] is None
+
+
+def test_api_never_echoes_a_secret_written_into_a_template_body(tmp_path: Path) -> None:
+    api_secret = "api-token-super-secret-value"
+    settings = Settings(
+        env="test",
+        port=8765,
+        data_dir=tmp_path / "data",
+        archive_fixture_dir=ARCHIVE,
+        llm_provider="stub",
+        llm_fixtures_dir=FIXTURES,
+        api_token=api_secret,
+    )
+    app = create_app(settings, clock=FixedClock(NOW))
+    auth = _auth(app)
+    body = _NEW_ANALYSIS_BODY + f"\napi_token={api_secret}\nkey: sk-live-abcdefghijklmnop\n"
+
+    with TestClient(app) as client:
+        created = client.post(
+            "/api/v1/prompts/analysis/versions",
+            json={"body": body, "author": api_secret, "reason": "sk-live-abcdefghijklmnop"},
+            headers={**auth, "Idempotency-Key": "prompt-secret-1"},
+        )
+        shown = client.get("/api/v1/prompts/analysis", headers=auth)
+
+    assert created.status_code == 201, created.text
+    assert api_secret not in created.text
+    assert "sk-live-abcdefghijklmnop" not in created.text
+    assert api_secret not in shown.text
+    assert "sk-live-abcdefghijklmnop" not in shown.text

@@ -17,6 +17,7 @@ from oft.application.prompt_service import (
     PromptService,
     PromptVersionView,
     resolve_prompt_id,
+    secret_values_from_settings,
 )
 from oft.bootstrap import build_container
 from oft.cli.api_client import ApiClient, ApiClientError
@@ -41,7 +42,11 @@ def _settings_or_exit(json_output: bool) -> Any:
 
 def _service(settings: Any) -> PromptService:
     container = build_container(settings)
-    return PromptService(store=container.store, clock=container.clock)
+    return PromptService(
+        store=container.store,
+        clock=container.clock,
+        secret_values=secret_values_from_settings(settings),
+    )
 
 
 def _render_list(items: list[dict[str, Any]]) -> str:

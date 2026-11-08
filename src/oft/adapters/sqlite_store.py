@@ -514,6 +514,14 @@ _SCHEMA_SQL = f"""
         is_default INTEGER NOT NULL DEFAULT 0,
         PRIMARY KEY (prompt_id, version)
     );
+    CREATE UNIQUE INDEX IF NOT EXISTS prompt_versions_one_active
+        ON prompt_versions(prompt_id) WHERE is_active = 1;
+    CREATE TRIGGER IF NOT EXISTS prompt_versions_immutable
+        BEFORE UPDATE OF prompt_id, version, body, body_hash, created_at
+        ON prompt_versions
+    BEGIN
+        SELECT RAISE(ABORT, 'prompt_versions rows are immutable');
+    END;
     CREATE TABLE IF NOT EXISTS system_state (
         key TEXT PRIMARY KEY,
         value TEXT NOT NULL,

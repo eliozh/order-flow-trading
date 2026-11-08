@@ -28,6 +28,7 @@ from oft.application.prompt_service import (
     RenderedPrompt,
     secret_values_from_settings,
 )
+from oft.config import Settings
 from oft.domain.llm_output import DecisionOutput
 from oft.domain.opportunities import ConditionDraftError, Opportunity
 from oft.domain.prompts import (
@@ -111,15 +112,15 @@ class AnalysisService:
         clock: ClockPort,
         provider: LLMPort,
         budget: BudgetLedger | None = None,
-        settings: Any | None = None,
+        settings: Settings | None = None,
     ) -> None:
         self._store = store
         self._clock = clock
         self._provider = provider
         self._budget = budget or BudgetLedger(store=store)
         self._opportunities = OpportunityService(store=store, clock=clock)
-        self._prompts = PromptService(store=store, clock=clock)
         self._secrets = secret_values_from_settings(settings) if settings is not None else ()
+        self._prompts = PromptService(store=store, clock=clock, secret_values=self._secrets)
 
     def analyze(
         self,

@@ -323,6 +323,7 @@ class PromptProvenance:
     exact_replay: bool
     code: str | None = None
     prompt_hash: str | None = None
+    body_hash: str | None = None
 
 
 def provenance_status(prompt_id: str, version: int, available_versions: Sequence[int]) -> str:

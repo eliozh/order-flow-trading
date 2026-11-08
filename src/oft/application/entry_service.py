@@ -97,8 +97,8 @@ class EntryService:
         self._kill_switch = kill_switch
         self._budget = BudgetLedger(store=store)
         self._broker = PaperBroker(settings=settings, store=store, clock=clock)
-        self._prompts = PromptService(store=store, clock=clock)
         self._secrets = secret_values_from_settings(settings) if settings is not None else ()
+        self._prompts = PromptService(store=store, clock=clock, secret_values=self._secrets)
         self._gateway = ExecutionGateway(
             store=store,
             broker=self._broker,
@@ -117,8 +117,9 @@ class EntryService:
         trigger = self._trigger(trigger_id)
         payload: dict[str, Any] = json.loads(trigger.payload_json)
         opportunity = self._opportunity(payload["opportunity_id"])
+        timeframe = self._timeframe(opportunity)
         now = utc_timestamp(self._clock.now())
-        rendered = self._prompt(payload, opportunity)
+        rendered = self._prompt(payload, opportunity, timeframe)
         system, user = rendered.system, rendered.user
         digest = hash_text(f"{system}\n{user}\n{schema_text()}")
         decision_id = f"DEC-ENTRY-{digest[:16].upper()}"
@@ -208,7 +209,7 @@ class EntryService:
 
         subject = {
             "symbol": payload["symbol"],
-            "timeframe": "4h",
+            "timeframe": timeframe,
             "as_of": now,
             "scan_id": opportunity.source.get("scan_id"),
             "report_id": opportunity.source.get("report_id"),
@@ -565,12 +566,27 @@ class EntryService:
             raise EntryRejected("DATA_UNAVAILABLE", "the snapshot has no as_of timestamp")
         return Decimal(str(value)), as_of
 
-    def _prompt(self, payload: dict[str, Any], opportunity: Any) -> RenderedPrompt:
+    def _timeframe(self, opportunity: Any) -> str:
+        """The scan period this opportunity came from (never a hardcoded literal)."""
+        scan_id = str(opportunity.source.get("scan_id") or "")
+        scan = self._store.get_scan(scan_id) if scan_id else None
+        if scan is not None and scan.period:
+            return scan.period
+        report_id = str(opportunity.source.get("report_id") or "")
+        report = self._store.get_report(report_id) if report_id else None
+        if report is not None and report.timeframe:
+            return report.timeframe
+        raise EntryRejected(
+            "DATA_UNAVAILABLE",
+            "the opportunity has no source scan period for the entry re-check",
+        )
+
+    def _prompt(self, payload: dict[str, Any], opportunity: Any, timeframe: str) -> RenderedPrompt:
         return self._prompts.render_active(
             PromptRole.ENTRY_RECHECK,
             {
                 "symbol": payload["symbol"],
-                "timeframe": "4h",
+                "timeframe": timeframe,
                 "side": payload["side"],
                 "trigger": json.dumps(payload["condition_results"], sort_keys=True),
                 "thesis": opportunity.thesis,
