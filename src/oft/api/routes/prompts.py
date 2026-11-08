@@ -7,16 +7,8 @@ from typing import Any
 
 from fastapi import APIRouter, Header, Query, Request
 
-from oft.api.envelope import new_request_id, success_envelope
-from oft.api.idempotency import (
-    complete,
-    release,
-    request_hash,
-    reserve,
-)
-from oft.api.idempotency import (
-    idempotency_key as require_idempotency_key,
-)
+from oft.api.envelope import new_request_id, pagination_meta, success_envelope
+from oft.api.idempotency import idempotent_mutation
 from oft.api.schemas.prompt import (
     ERROR_RESPONSES,
     ActivatePromptRequest,
@@ -42,17 +34,6 @@ def _service(request: Request) -> PromptService:
         clock=container.clock,
         secret_values=secret_values_from_settings(container.settings),
     )
-
-
-def _pagination(*, limit: int, offset: int, returned: int, total: int) -> dict[str, Any]:
-    has_next = offset + returned < total
-    return {
-        "limit": limit,
-        "cursor": str(offset),
-        "has_next": has_next,
-        "next_cursor": str(offset + limit) if has_next else None,
-        "total": total,
-    }
 
 
 @router.get(
@@ -109,7 +90,7 @@ def prompt_history(
         request_id=new_request_id(),
         provenance="CALC",
         data_quality="COMPLETE" if versions else "MISSING",
-        pagination=_pagination(limit=limit, offset=offset, returned=len(versions), total=total),
+        pagination=pagination_meta(limit=limit, offset=offset, returned=len(versions), total=total),
     )
 
 
@@ -153,31 +134,24 @@ def create_prompt_version(
     idempotency_key: str | None = Header(default=None, alias="Idempotency-Key"),
 ) -> Any:
     """Create a new immutable DRAFT version (never edits an existing one)."""
-    key = require_idempotency_key(idempotency_key)
-    payload_hash = request_hash(payload)
-    replay = reserve(request, key=key, request_hash=payload_hash)
-    if replay is not None:
-        return replay
-    try:
-        version = _service(request).edit(
-            prompt_id,
-            payload.body,
-            author=payload.author,
-            reason=payload.reason,
-            activate=payload.activate,
-            knowledge_artifact_hash=payload.knowledge_artifact_hash,
-        )
-    except BaseException:
-        release(request, key=key)
-        raise
-    envelope = success_envelope(
-        version.to_contract(),
-        request_id=new_request_id(),
-        provenance="CALC",
-        data_quality="COMPLETE",
+    return idempotent_mutation(
+        request,
+        presented_key=idempotency_key,
+        payload=payload,
+        status=201,
+        mutate=lambda: (
+            _service(request)
+            .edit(
+                prompt_id,
+                payload.body,
+                author=payload.author,
+                reason=payload.reason,
+                activate=payload.activate,
+                knowledge_artifact_hash=payload.knowledge_artifact_hash,
+            )
+            .to_contract()
+        ),
     )
-    complete(request, key=key, request_hash=payload_hash, envelope=envelope, status=201)
-    return envelope
 
 
 @router.post(
@@ -193,26 +167,17 @@ def activate_prompt_version(
     idempotency_key: str | None = Header(default=None, alias="Idempotency-Key"),
 ) -> Any:
     """Explicitly switch the active version; drafts are never used implicitly."""
-    key = require_idempotency_key(idempotency_key)
-    payload_hash = request_hash(payload)
-    replay = reserve(request, key=key, request_hash=payload_hash)
-    if replay is not None:
-        return replay
-    try:
-        version = _service(request).activate(
-            prompt_id, payload.version, actor=payload.actor, reason=payload.reason
-        )
-    except BaseException:
-        release(request, key=key)
-        raise
-    envelope = success_envelope(
-        version.to_contract(),
-        request_id=new_request_id(),
-        provenance="CALC",
-        data_quality="COMPLETE",
+    return idempotent_mutation(
+        request,
+        presented_key=idempotency_key,
+        payload=payload,
+        status=200,
+        mutate=lambda: (
+            _service(request)
+            .activate(prompt_id, payload.version, actor=payload.actor, reason=payload.reason)
+            .to_contract()
+        ),
     )
-    complete(request, key=key, request_hash=payload_hash, envelope=envelope, status=200)
-    return envelope
 
 
 @router.post(
@@ -229,23 +194,14 @@ def restore_prompt_default(
     idempotency_key: str | None = Header(default=None, alias="Idempotency-Key"),
 ) -> Any:
     """Create a new DRAFT version that restores the built-in default body."""
-    key = require_idempotency_key(idempotency_key)
-    payload_hash = request_hash(payload)
-    replay = reserve(request, key=key, request_hash=payload_hash)
-    if replay is not None:
-        return replay
-    try:
-        version = _service(request).restore_default(
-            prompt_id, author=payload.author, reason=payload.reason
-        )
-    except BaseException:
-        release(request, key=key)
-        raise
-    envelope = success_envelope(
-        version.to_contract(),
-        request_id=new_request_id(),
-        provenance="CALC",
-        data_quality="COMPLETE",
+    return idempotent_mutation(
+        request,
+        presented_key=idempotency_key,
+        payload=payload,
+        status=201,
+        mutate=lambda: (
+            _service(request)
+            .restore_default(prompt_id, author=payload.author, reason=payload.reason)
+            .to_contract()
+        ),
     )
-    complete(request, key=key, request_hash=payload_hash, envelope=envelope, status=201)
-    return envelope

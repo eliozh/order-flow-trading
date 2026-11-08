@@ -28,6 +28,11 @@ class PromptStatus(StrEnum):
     SUPERSEDED = "SUPERSEDED"
 
 
+class PromptKind(StrEnum):
+    SYSTEM = "SYSTEM"
+    USER = "USER"
+
+
 PROMPT_VALIDATION_FAILED = "PROMPT_VALIDATION_FAILED"
 PROMPT_VERSION_MISSING = "PROMPT_VERSION_MISSING"
 
@@ -67,6 +72,10 @@ ROLE_BY_PROMPT_ID: Mapping[str, PromptRole] = {
     **{prompt_id: role for role, prompt_id in PROMPT_IDS.items()},
     **{prompt_id: role for role, prompt_id in SYSTEM_PROMPT_IDS.items()},
 }
+
+# Roles whose built-in templates are seeded at initialize time. A missing
+# template row for one of these is data loss, never a reason to fall back.
+SEEDED_ROLES: frozenset[PromptRole] = frozenset({PromptRole.ANALYSIS, PromptRole.ENTRY_RECHECK})
 
 DEFAULT_SYSTEM_BODIES: Mapping[PromptRole, str] = {
     PromptRole.ANALYSIS: (
@@ -276,7 +285,11 @@ def rendered_prompt_hash(prompt_id: str, version: int, system: str, user: str) -
 
 
 def redact_secrets(text: str, *, secret_values: Sequence[str] = ()) -> str:
-    """Replace configured secret values and secret-like strings with a marker."""
+    """Replace configured secret values and secret-like strings with a marker.
+
+    Configured values shorter than six characters are ignored: replacing them
+    would corrupt ordinary prose, so short values rely on the pattern rules.
+    """
     redacted = text
     for value in sorted((value for value in secret_values if value), key=len, reverse=True):
         if len(value) >= 6:
@@ -340,9 +353,11 @@ __all__ = [
     "REDACTED",
     "REQUIRED_VARIABLES",
     "ROLE_BY_PROMPT_ID",
+    "SEEDED_ROLES",
     "SYSTEM_PROMPT_IDS",
     "SYSTEM_PROMPT_SUFFIX",
     "PromptError",
+    "PromptKind",
     "PromptProvenance",
     "PromptRole",
     "PromptStatus",

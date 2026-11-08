@@ -11,12 +11,14 @@ from __future__ import annotations
 
 import hashlib
 import json
+from collections.abc import Callable
 from datetime import timedelta
 from typing import Any
 
 from fastapi import Request
 from fastapi.responses import JSONResponse
 
+from oft.api.envelope import new_request_id, success_envelope
 from oft.api.errors import ApiError
 from oft.domain.time import utc_timestamp
 from oft.ports.store import IdempotencyRecord
@@ -93,11 +95,46 @@ def release(request: Request, *, key: str) -> None:
     request.app.state.container.store.delete_idempotency(scope=scope(request), key=key)
 
 
+def idempotent_mutation(
+    request: Request,
+    *,
+    presented_key: str | None,
+    payload: Any,
+    status: int,
+    mutate: Callable[[], dict[str, Any]],
+) -> Any:
+    """Run one state-changing request exactly once per ``Idempotency-Key``.
+
+    Reserves the key, returns a stored replay when present, executes ``mutate``
+    (which returns the contract data payload), records the success envelope, and
+    releases the reservation if the mutation raises.
+    """
+    key = idempotency_key(presented_key)
+    payload_hash = request_hash(payload)
+    replay = reserve(request, key=key, request_hash=payload_hash)
+    if replay is not None:
+        return replay
+    try:
+        data = mutate()
+    except BaseException:
+        release(request, key=key)
+        raise
+    envelope = success_envelope(
+        data,
+        request_id=new_request_id(),
+        provenance="CALC",
+        data_quality="COMPLETE",
+    )
+    complete(request, key=key, request_hash=payload_hash, envelope=envelope, status=status)
+    return envelope
+
+
 __all__ = [
     "IDEMPOTENCY_LEASE",
     "IDEMPOTENCY_TTL",
     "complete",
     "idempotency_key",
+    "idempotent_mutation",
     "release",
     "request_hash",
     "reserve",

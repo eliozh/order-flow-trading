@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import difflib
 import json
+import logging
 import sqlite3
 from collections.abc import Mapping, Sequence
 from dataclasses import dataclass
@@ -23,8 +24,10 @@ from oft.domain.prompts import (
     PROMPT_VERSION_MISSING,
     REQUIRED_VARIABLES,
     ROLE_BY_PROMPT_ID,
+    SEEDED_ROLES,
     SYSTEM_PROMPT_IDS,
     PromptError,
+    PromptKind,
     PromptProvenance,
     PromptRole,
     PromptStatus,
@@ -43,6 +46,8 @@ from oft.domain.time import utc_timestamp
 from oft.ports.clock import ClockPort
 from oft.ports.store import PromptTemplateRecord, PromptVersionRecord, StorePort
 
+_LOGGER = logging.getLogger(__name__)
+
 _SECRET_FIELDS = (
     "api_token",
     "binance_api_key",
@@ -55,7 +60,7 @@ _SECRET_FIELDS = (
 
 
 class PromptNotFoundError(PromptError):
-    """The requested prompt template or version does not exist."""
+    """The requested prompt template does not exist."""
 
     code = "NOT_FOUND"
 
@@ -102,8 +107,8 @@ class RenderedPrompt:
 @dataclass(frozen=True)
 class PromptSummary:
     prompt_id: str
-    role: str
-    kind: str
+    role: PromptRole
+    kind: PromptKind
     active_version: int
     version_count: int
     latest_version: int
@@ -114,7 +119,7 @@ class PromptSummary:
 class PromptVersionView:
     prompt_id: str
     version: int
-    status: str
+    status: PromptStatus
     is_active: bool
     body: str
     body_hash: str
@@ -151,8 +156,8 @@ class PromptVersionView:
 @dataclass(frozen=True)
 class PromptDetail:
     prompt_id: str
-    role: str
-    kind: str
+    role: PromptRole
+    kind: PromptKind
     active_version: int
     created_at: str
     updated_at: str
@@ -208,10 +213,39 @@ def _parse_required(raw: str, role: PromptRole) -> tuple[str, ...]:
     try:
         values = json.loads(raw)
     except (json.JSONDecodeError, TypeError, ValueError):
+        _LOGGER.warning(
+            "prompt version has malformed required_variables_json %r; using role defaults",
+            raw,
+        )
         return REQUIRED_VARIABLES[role]
     if not isinstance(values, list):
+        _LOGGER.warning(
+            "prompt version has non-list required_variables_json %r; using role defaults",
+            raw,
+        )
         return REQUIRED_VARIABLES[role]
     return tuple(str(value) for value in values)
+
+
+def _resolve_role(role: str | PromptRole) -> PromptRole:
+    """Resolve a role name or prompt id; unknown values raise ``PromptError``."""
+    if isinstance(role, PromptRole):
+        return role
+    try:
+        resolved_id = resolve_prompt_id(str(role))
+    except PromptNotFoundError as exc:
+        raise PromptNotFoundError(f"unknown prompt role {role!r}") from exc
+    return _role_for(resolved_id)
+
+
+def _is_version_collision(error: sqlite3.IntegrityError) -> bool:
+    """True only for the composite ``(prompt_id, version)`` primary-key race.
+
+    CHECK/NOT NULL/trigger and one-active-index failures are real bugs and must
+    not be retried or reported as a retryable CONFLICT.
+    """
+    message = str(error)
+    return "prompt_versions.prompt_id" in message and "prompt_versions.version" in message
 
 
 class PromptService:
@@ -236,7 +270,11 @@ class PromptService:
                 PromptSummary(
                     prompt_id=template.prompt_id,
                     role=template.role,
-                    kind="SYSTEM" if is_system_prompt_id(template.prompt_id) else "USER",
+                    kind=(
+                        PromptKind.SYSTEM
+                        if is_system_prompt_id(template.prompt_id)
+                        else PromptKind.USER
+                    ),
                     active_version=template.active_version,
                     version_count=len(versions),
                     latest_version=versions[-1].version if versions else 0,
@@ -251,7 +289,9 @@ class PromptService:
         return PromptDetail(
             prompt_id=template.prompt_id,
             role=template.role,
-            kind="SYSTEM" if is_system_prompt_id(template.prompt_id) else "USER",
+            kind=(
+                PromptKind.SYSTEM if is_system_prompt_id(template.prompt_id) else PromptKind.USER
+            ),
             active_version=template.active_version,
             created_at=template.created_at,
             updated_at=template.updated_at,
@@ -314,6 +354,14 @@ class PromptService:
     def activate(
         self, prompt_id: str, version: int, *, actor: str = "cli", reason: str = ""
     ) -> PromptVersionView:
+        """Explicitly activate one existing version (DRAFT or already ACTIVE).
+
+        Raises ``PromptNotFoundError`` for an unknown template,
+        ``PromptVersionMissingError`` when the version row is missing, and
+        ``PromptValidationError`` when the stored body no longer validates.
+        Re-activating the active version is idempotent. ``actor``/``reason`` are
+        redacted before the audit chain is written.
+        """
         resolved = resolve_prompt_id(prompt_id)
         self._template(resolved)
         record = self._store.get_prompt_version(resolved, version)
@@ -323,6 +371,8 @@ class PromptService:
             )
         role = _role_for(resolved)
         validate_body(record.body, role=role, system=is_system_prompt_id(resolved))
+        actor = redact_secrets(actor, secret_values=self._secrets)
+        reason = redact_secrets(reason, secret_values=self._secrets)
         now = utc_timestamp(self._clock.now())
         if not self._store.activate_prompt_version(resolved, version, activated_at=now):
             raise PromptVersionMissingError(
@@ -457,7 +507,7 @@ class PromptService:
                 system_body_hash=system_body_hash,
                 required_variables_json=json.dumps(list(required)),
                 knowledge_artifact_hash=knowledge_artifact_hash,
-                status=PromptStatus.DRAFT.value,
+                status=PromptStatus.DRAFT,
                 author=author,
                 reason=reason,
                 is_default=is_default,
@@ -465,6 +515,14 @@ class PromptService:
             try:
                 self._store.save_prompt_version(record)
             except sqlite3.IntegrityError as exc:
+                if not _is_version_collision(exc):
+                    _LOGGER.error(
+                        "prompt version save failed for %s v%s: %s",
+                        resolved,
+                        next_version,
+                        exc,
+                    )
+                    raise
                 if attempt + 1 >= attempts:
                     raise PromptConflictError(
                         f"a concurrent edit took the next version for {resolved}; retry"
@@ -476,22 +534,50 @@ class PromptService:
     # -- rendering -------------------------------------------------------
 
     def active_for(self, role: str | PromptRole) -> ActivePrompt:
-        resolved_role = role if isinstance(role, PromptRole) else PromptRole(str(role))
+        """The explicitly active version for a role.
+
+        Seeded roles (ANALYSIS/ENTRY_RECHECK) fail closed when their template
+        row or active version is unreadable: silently substituting the built-in
+        v1 would bypass an operator's activation and record false provenance.
+        Only never-seeded roles (MANAGEMENT/REVIEW) use the built-in default,
+        and that fallback is logged.
+        """
+        resolved_role = _resolve_role(role)
         prompt_id = PROMPT_IDS[resolved_role]
         template = self._store.get_prompt_template(prompt_id)
         if template is None:
+            if resolved_role in SEEDED_ROLES:
+                _LOGGER.error(
+                    "seeded prompt template %s is missing; refusing the built-in v1 fallback",
+                    prompt_id,
+                )
+                raise PromptVersionMissingError(
+                    f"prompt template {prompt_id} is missing for a seeded role"
+                )
+            _LOGGER.info("using the built-in prompt for never-seeded role %s", resolved_role.value)
             return self._builtin_active(resolved_role)
         record = self._store.get_prompt_version(prompt_id, template.active_version)
         if record is None:
+            _LOGGER.error(
+                "active prompt version %s for %s is missing",
+                template.active_version,
+                prompt_id,
+            )
             raise PromptVersionMissingError(
                 f"active prompt version {template.active_version} is missing for {prompt_id}"
             )
-        if record.status != PromptStatus.ACTIVE.value or not record.is_active:
+        if record.status != PromptStatus.ACTIVE or not record.is_active:
             raise PromptVersionMissingError(
                 f"prompt version {record.version} for {prompt_id} is not active"
             )
         system_body = record.system_body or DEFAULT_SYSTEM_BODIES[resolved_role]
         system_hash = record.system_body_hash or content_hash(system_body)
+        if not record.system_body:
+            _LOGGER.debug(
+                "prompt version %s v%s has a blank pinned system body; using the built-in default",
+                prompt_id,
+                record.version,
+            )
         return ActivePrompt(
             prompt_id=prompt_id,
             version=record.version,
@@ -513,10 +599,18 @@ class PromptService:
         *,
         secret_values: Sequence[str] = (),
     ) -> RenderedPrompt:
-        resolved_role = role if isinstance(role, PromptRole) else PromptRole(str(role))
+        """Render the active version, redacting the service's own secrets.
+
+        Caller-supplied ``secret_values`` are unioned with the service's
+        configured secrets; there is no fail-open default. Raises
+        ``PromptError`` for an unknown role and ``PromptVersionMissingError``
+        when the active version cannot be read.
+        """
+        resolved_role = _resolve_role(role)
+        secrets = tuple(dict.fromkeys((*self._secrets, *secret_values)))
         active = self.active_for(resolved_role)
-        system = render(active.system_body, {}, secret_values=secret_values)
-        user = render(active.body, values, role=resolved_role, secret_values=secret_values)
+        system = render(active.system_body, {}, secret_values=secrets)
+        user = render(active.body, values, role=resolved_role, secret_values=secrets)
         return RenderedPrompt(
             prompt_id=active.prompt_id,
             version=active.version,
@@ -585,7 +679,19 @@ class PromptService:
                 body_hash=record.body_hash,
             )
         # ``prompt_hash`` is the rendered hash the decision recorded; the
-        # immutable template body hash is exposed separately.
+        # immutable template body hash is exposed separately. A decision with
+        # no recorded rendered hash (pre-v16 decisions) cannot be replayed
+        # exactly, even though its template version still exists.
+        if recorded_hash is None:
+            return PromptProvenance(
+                status="available",
+                prompt_id=prompt_id,
+                version=version,
+                exact_replay=False,
+                code=None,
+                prompt_hash=None,
+                body_hash=record.body_hash,
+            )
         return PromptProvenance(
             status="available",
             prompt_id=prompt_id,
@@ -606,7 +712,9 @@ class PromptService:
 
     def _view(self, record: PromptVersionRecord) -> PromptVersionView:
         role = _role_for(record.prompt_id)
-        system_hash = record.system_body_hash or content_hash(record.system_body)
+        system_hash = record.system_body_hash or content_hash(
+            record.system_body or DEFAULT_SYSTEM_BODIES[role]
+        )
         return PromptVersionView(
             prompt_id=record.prompt_id,
             version=record.version,
@@ -628,15 +736,27 @@ class PromptService:
     def _active_system_pin(self, role: PromptRole) -> tuple[str, int, str, str]:
         system_id = SYSTEM_PROMPT_IDS[role]
         template = self._store.get_prompt_template(system_id)
-        if template is not None:
-            record = self._store.get_prompt_version(system_id, template.active_version)
-            if record is not None:
-                return (
-                    system_id,
-                    record.version,
-                    record.body,
-                    record.body_hash or content_hash(record.body),
-                )
+        record = (
+            self._store.get_prompt_version(system_id, template.active_version)
+            if template is not None
+            else None
+        )
+        if record is not None:
+            return (
+                system_id,
+                record.version,
+                record.body,
+                record.body_hash or content_hash(record.body),
+            )
+        if role in SEEDED_ROLES:
+            _LOGGER.error(
+                "seeded system prompt %s is missing; refusing to pin the built-in v1",
+                system_id,
+            )
+            raise PromptVersionMissingError(
+                f"system prompt {system_id} is missing for a seeded role"
+            )
+        _LOGGER.info("pinning the built-in system prompt for never-seeded role %s", role.value)
         body = DEFAULT_SYSTEM_BODIES[role]
         return system_id, 1, body, content_hash(body)
 
@@ -648,7 +768,7 @@ class PromptService:
             version=1,
             body=body,
             body_hash=content_hash(body),
-            status=PromptStatus.ACTIVE.value,
+            status=PromptStatus.ACTIVE,
             system_prompt_id=SYSTEM_PROMPT_IDS[role],
             system_version=1,
             system_body=system_body,

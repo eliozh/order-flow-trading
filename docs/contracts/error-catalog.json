@@ -355,7 +355,7 @@
       "httpStatus": 409,
       "category": "LLM",
       "retryable": false,
-      "summary": "A decision references a prompt version that no longer exists.",
+      "summary": "A decision references a prompt version that no longer exists or has no pinned system version.",
       "userAction": "Exact replay is disabled; restore the version or accept a non-reproducible replay."
     },
     {

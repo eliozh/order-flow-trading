@@ -390,3 +390,123 @@ def test_api_never_echoes_a_secret_written_into_a_template_body(tmp_path: Path) 
     assert "sk-live-abcdefghijklmnop" not in created.text
     assert api_secret not in shown.text
     assert "sk-live-abcdefghijklmnop" not in shown.text
+
+
+def test_activate_route_requires_an_idempotency_key_and_replays(tmp_path: Path) -> None:
+    settings = _settings(tmp_path)
+    app = create_app(settings, clock=FixedClock(NOW))
+    auth = _auth(app)
+
+    with TestClient(app) as client:
+        missing_key = client.post(
+            "/api/v1/prompts/analysis/activate",
+            json={"version": 1},
+            headers=auth,
+        )
+        headers = {**auth, "Idempotency-Key": "prompt-activate-replay-1"}
+        first = client.post(
+            "/api/v1/prompts/analysis/activate", json={"version": 1}, headers=headers
+        )
+        second = client.post(
+            "/api/v1/prompts/analysis/activate", json={"version": 1}, headers=headers
+        )
+        conflict = client.post(
+            "/api/v1/prompts/analysis/activate", json={"version": 2}, headers=headers
+        )
+
+    assert missing_key.status_code == 400, missing_key.text
+    assert missing_key.json()["error"]["code"] == "IDEMPOTENCY_KEY_REQUIRED"
+    assert first.status_code == 200, first.text
+    assert first.json()["data"]["is_active"] is True
+    assert second.status_code == 200, second.text
+    assert second.json()["meta"]["idempotent_replay"] is True
+    assert conflict.status_code == 409, conflict.text
+    assert conflict.json()["error"]["code"] == "IDEMPOTENCY_CONFLICT"
+
+
+def test_restore_route_requires_an_idempotency_key_and_replays(tmp_path: Path) -> None:
+    settings = _settings(tmp_path)
+    app = create_app(settings, clock=FixedClock(NOW))
+    auth = _auth(app)
+
+    with TestClient(app) as client:
+        missing_key = client.post(
+            "/api/v1/prompts/analysis/restore",
+            json={},
+            headers=auth,
+        )
+        headers = {**auth, "Idempotency-Key": "prompt-restore-replay-1"}
+        first = client.post("/api/v1/prompts/analysis/restore", json={}, headers=headers)
+        second = client.post("/api/v1/prompts/analysis/restore", json={}, headers=headers)
+        conflict = client.post(
+            "/api/v1/prompts/analysis/restore", json={"author": "other"}, headers=headers
+        )
+
+    assert missing_key.status_code == 400, missing_key.text
+    assert missing_key.json()["error"]["code"] == "IDEMPOTENCY_KEY_REQUIRED"
+    assert first.status_code == 201, first.text
+    assert first.json()["data"]["version"] == 2
+    assert second.status_code == 201, second.text
+    assert second.json()["meta"]["idempotent_replay"] is True
+    assert second.json()["data"] == first.json()["data"]
+    assert conflict.status_code == 409, conflict.text
+    assert conflict.json()["error"]["code"] == "IDEMPOTENCY_CONFLICT"
+
+
+def test_body_length_is_limited_in_utf8_bytes_not_code_points(tmp_path: Path) -> None:
+    settings = _settings(tmp_path)
+    app = create_app(settings, clock=FixedClock(NOW))
+    auth = _auth(app)
+    # 40,000 code points but 80,000 UTF-8 bytes: under the code-point cap,
+    # over the byte cap.
+    body = "é" * 40_000
+
+    with TestClient(app) as client:
+        rejected = client.post(
+            "/api/v1/prompts/analysis/versions",
+            json={"body": body},
+            headers={**auth, "Idempotency-Key": "prompt-too-many-bytes"},
+        )
+
+    assert rejected.status_code == 422, rejected.text
+    assert rejected.json()["error"]["code"] == "VALIDATION_FAILED"
+
+
+def test_api_activation_redacts_actor_and_reason_in_the_audit_chain(tmp_path: Path) -> None:
+    api_secret = "api-token-super-secret-value"
+    settings = Settings(
+        env="test",
+        port=8765,
+        data_dir=tmp_path / "data",
+        archive_fixture_dir=ARCHIVE,
+        llm_provider="stub",
+        llm_fixtures_dir=FIXTURES,
+        api_token=api_secret,
+    )
+    app = create_app(settings, clock=FixedClock(NOW))
+    auth = _auth(app)
+
+    with TestClient(app) as client:
+        created = client.post(
+            "/api/v1/prompts/analysis/versions",
+            json={"body": _NEW_ANALYSIS_BODY, "author": "tester"},
+            headers={**auth, "Idempotency-Key": "prompt-audit-create"},
+        )
+        assert created.status_code == 201, created.text
+        activated = client.post(
+            "/api/v1/prompts/analysis/activate",
+            json={
+                "version": created.json()["data"]["version"],
+                "actor": api_secret,
+                "reason": f"token {api_secret}",
+            },
+            headers={**auth, "Idempotency-Key": "prompt-audit-activate"},
+        )
+        assert activated.status_code == 200, activated.text
+        events = app.state.container.store.list_audit_events(limit=10)
+
+    event_types = {event.event_type for event in events}
+    assert {"PROMPT_VERSION_CREATED", "PROMPT_VERSION_ACTIVATED"} <= event_types
+    audit_text = "\n".join(event.payload_json for event in events)
+    assert api_secret not in audit_text
+    assert "[REDACTED]" in audit_text

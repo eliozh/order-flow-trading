@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import json
 import uuid
+from collections.abc import Callable
 from dataclasses import asdict
 from pathlib import Path
 from typing import Annotated, Any
@@ -220,6 +221,23 @@ def _api_or_exit(settings: Any, json_output: bool) -> ApiClient:
     return ApiClient.from_settings(settings)
 
 
+def _mutate(
+    *,
+    json_output: bool,
+    request: Callable[[ApiClient], dict[str, Any]],
+) -> dict[str, Any]:
+    """Run one prompt mutation against the daemon with shared error mapping."""
+    settings = _settings_or_exit(json_output)
+    try:
+        return request(_api_or_exit(settings, json_output))
+    except PromptError as exc:
+        _handle_prompt_error(exc, json_output)
+        raise typer.Exit(code=exit_code_for(exc.code)) from exc
+    except ApiClientError as exc:
+        emit_error(exc.code, exc.message, json_output=json_output)
+        raise typer.Exit(code=exit_code_for(exc.code)) from exc
+
+
 def _body_from_options(body: str | None, file: Path | None, json_output: bool) -> str:
     if body is not None and file is not None:
         emit_error(
@@ -258,19 +276,14 @@ def edit_command(
 ) -> None:
     """Create a new immutable version; the old versions stay readable."""
     text = _body_from_options(body, file, json_output)
-    settings = _settings_or_exit(json_output)
-    try:
-        envelope = _api_or_exit(settings, json_output).edit_prompt(
+    envelope = _mutate(
+        json_output=json_output,
+        request=lambda client: client.edit_prompt(
             resolve_prompt_id(prompt),
             {"body": text, "author": author, "reason": reason, "activate": activate},
             idempotency_key=f"cli-{uuid.uuid4().hex}",
-        )
-    except PromptError as exc:
-        _handle_prompt_error(exc, json_output)
-        raise typer.Exit(code=exit_code_for(exc.code)) from exc
-    except ApiClientError as exc:
-        emit_error(exc.code, exc.message, json_output=json_output)
-        raise typer.Exit(code=exit_code_for(exc.code)) from exc
+        ),
+    )
     data = envelope.get("data") or {}
     if json_output:
         typer.echo(json.dumps(envelope, indent=2))
@@ -289,19 +302,14 @@ def activate_command(
     json_output: Annotated[bool, typer.Option("--json", help="Emit JSON.")] = False,
 ) -> None:
     """Explicitly switch the active version (a draft is never used implicitly)."""
-    settings = _settings_or_exit(json_output)
-    try:
-        envelope = _api_or_exit(settings, json_output).activate_prompt(
+    envelope = _mutate(
+        json_output=json_output,
+        request=lambda client: client.activate_prompt(
             resolve_prompt_id(prompt),
             {"version": version, "actor": actor, "reason": reason},
             idempotency_key=f"cli-{uuid.uuid4().hex}",
-        )
-    except PromptError as exc:
-        _handle_prompt_error(exc, json_output)
-        raise typer.Exit(code=exit_code_for(exc.code)) from exc
-    except ApiClientError as exc:
-        emit_error(exc.code, exc.message, json_output=json_output)
-        raise typer.Exit(code=exit_code_for(exc.code)) from exc
+        ),
+    )
     data = envelope.get("data") or {}
     if json_output:
         typer.echo(json.dumps(envelope, indent=2))
@@ -321,19 +329,14 @@ def restore_command(
     json_output: Annotated[bool, typer.Option("--json", help="Emit JSON.")] = False,
 ) -> None:
     """Create a new version with the built-in default body (history is kept)."""
-    settings = _settings_or_exit(json_output)
-    try:
-        envelope = _api_or_exit(settings, json_output).restore_prompt(
+    envelope = _mutate(
+        json_output=json_output,
+        request=lambda client: client.restore_prompt(
             resolve_prompt_id(prompt),
             {"author": author, "reason": reason},
             idempotency_key=f"cli-{uuid.uuid4().hex}",
-        )
-    except PromptError as exc:
-        _handle_prompt_error(exc, json_output)
-        raise typer.Exit(code=exit_code_for(exc.code)) from exc
-    except ApiClientError as exc:
-        emit_error(exc.code, exc.message, json_output=json_output)
-        raise typer.Exit(code=exit_code_for(exc.code)) from exc
+        ),
+    )
     data = envelope.get("data") or {}
     if json_output:
         typer.echo(json.dumps(envelope, indent=2))

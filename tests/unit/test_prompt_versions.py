@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import logging
 import sqlite3
 from datetime import UTC, datetime
 from pathlib import Path
@@ -11,6 +12,7 @@ import pytest
 from oft.adapters.sqlite_store import SqliteStore, database_path
 from oft.application.prompt_service import (
     PromptConflictError,
+    PromptNotFoundError,
     PromptService,
     PromptVersionMissingError,
     secret_values_from_settings,
@@ -23,6 +25,8 @@ from oft.domain.prompts import (
     PromptStatus,
     content_hash,
 )
+
+_COLLISION = "UNIQUE constraint failed: prompt_versions.prompt_id, prompt_versions.version"
 
 NOW = datetime(2026, 11, 8, 12, 0, tzinfo=UTC)
 
@@ -175,7 +179,9 @@ def test_a_missing_historical_version_reports_missing_and_never_falls_back(
         {"provenance": {"prompt_id": "analysis", "prompt_version": 1}}
     )
     assert available.status == "available"
-    assert available.exact_replay is True
+    # Without the decision's recorded rendered hash, an exact replay cannot be
+    # claimed even though the template version still exists.
+    assert available.exact_replay is False
 
 
 def test_activating_an_unknown_version_fails_loudly(tmp_path: Path) -> None:
@@ -243,7 +249,7 @@ def test_a_concurrent_version_allocation_is_retried(
             # Simulate another writer committing this version between our read
             # of the latest version and our INSERT.
             original(record)
-            raise sqlite3.IntegrityError("UNIQUE constraint failed: prompt_versions")
+            raise sqlite3.IntegrityError(_COLLISION)
         return original(record)
 
     monkeypatch.setattr(store, "save_prompt_version", flaky)
@@ -270,7 +276,7 @@ def test_a_persistent_version_conflict_is_a_clean_conflict(
     )
 
     def always_conflict(record):  # type: ignore[no-untyped-def]
-        raise sqlite3.IntegrityError("UNIQUE constraint failed: prompt_versions")
+        raise sqlite3.IntegrityError(_COLLISION)
 
     monkeypatch.setattr(store, "save_prompt_version", always_conflict)
 
@@ -314,3 +320,216 @@ def test_a_secret_in_the_body_is_redacted_before_persisting(tmp_path: Path) -> N
     # The persisted hash must describe the persisted (redacted) body.
     assert stored.body_hash == content_hash(stored.body)
     assert api_secret not in created.body
+
+
+def test_a_non_collision_integrity_error_is_not_retried_or_relabelled(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    service, store = _service(tmp_path)
+    calls = {"count": 0}
+
+    def check_failure(record):  # type: ignore[no-untyped-def]
+        calls["count"] += 1
+        raise sqlite3.IntegrityError("CHECK constraint failed: prompt_versions")
+
+    monkeypatch.setattr(store, "save_prompt_version", check_failure)
+    body = (
+        "Symbol: {{symbol}}\nTimeframe: {{timeframe}}\n"
+        "<market_data>{{metrics}}</market_data>\n<knowledge>{{knowledge}}</knowledge>\n"
+        "<schema>{{schema}}</schema>\nCHECK FAILURE\n"
+    )
+
+    # A CHECK/NOT NULL/trigger failure is a real bug, not a version race: it is
+    # neither retried nor rewritten as a 409 CONFLICT.
+    with pytest.raises(sqlite3.IntegrityError) as excinfo:
+        service.edit("analysis", body)
+
+    assert "CHECK constraint failed" in str(excinfo.value)
+    assert calls["count"] == 1
+
+
+def test_active_for_fails_closed_when_a_seeded_template_row_is_missing(
+    tmp_path: Path, caplog: pytest.LogCaptureFixture
+) -> None:
+    service, store = _service(tmp_path)
+
+    with caplog.at_level(logging.ERROR, logger="oft.application.prompt_service"):
+        monkeypatch_target = store.get_prompt_template
+        store.get_prompt_template = lambda prompt_id: None  # type: ignore[method-assign]
+        try:
+            with pytest.raises(PromptVersionMissingError):
+                service.active_for(PromptRole.ANALYSIS)
+            with pytest.raises(PromptVersionMissingError):
+                service.active_for(PromptRole.ENTRY_RECHECK)
+        finally:
+            store.get_prompt_template = monkeypatch_target  # type: ignore[method-assign]
+
+    assert any("seeded" in record.message for record in caplog.records)
+
+
+def test_active_for_fails_closed_when_the_active_version_row_is_missing(
+    tmp_path: Path,
+) -> None:
+    service, store = _service(tmp_path)
+    connection = sqlite3.connect(store.path)
+    try:
+        connection.execute(
+            "DELETE FROM prompt_versions WHERE prompt_id = 'analysis' AND version = 1"
+        )
+        connection.commit()
+    finally:
+        connection.close()
+
+    with pytest.raises(PromptVersionMissingError):
+        service.active_for(PromptRole.ANALYSIS)
+
+
+def test_active_for_uses_the_built_in_default_for_a_never_seeded_role_and_logs(
+    tmp_path: Path, caplog: pytest.LogCaptureFixture
+) -> None:
+    service, _store = _service(tmp_path)
+
+    with caplog.at_level(logging.INFO, logger="oft.application.prompt_service"):
+        active = service.active_for(PromptRole.MANAGEMENT)
+
+    assert active.prompt_id == "management"
+    assert active.version == 1
+    assert any("built-in" in record.message for record in caplog.records)
+
+
+def test_active_for_rejects_an_unknown_role_with_a_prompt_error(tmp_path: Path) -> None:
+    service, _store = _service(tmp_path)
+
+    with pytest.raises(PromptNotFoundError):
+        service.active_for("not_a_role")
+    with pytest.raises(PromptNotFoundError):
+        service.render_active("not_a_role", {})
+
+
+def test_activate_redacts_actor_and_reason_in_the_audit_chain(tmp_path: Path) -> None:
+    api_secret = "api-token-super-secret-value"
+    settings = Settings(env="test", port=8765, data_dir=tmp_path / "data", api_token=api_secret)
+    store = SqliteStore(settings)
+    store.initialize()
+    service = PromptService(
+        store=store,
+        clock=FixedClock(NOW),
+        secret_values=secret_values_from_settings(settings),
+    )
+    body = (
+        "Symbol: {{symbol}}\nTimeframe: {{timeframe}}\n"
+        "<market_data>{{metrics}}</market_data>\n<knowledge>{{knowledge}}</knowledge>\n"
+        "<schema>{{schema}}</schema>\nAUDIT REDACTION\n"
+    )
+    created = service.edit("analysis", body, author="operator")
+    service.activate("analysis", created.version, actor=api_secret, reason=f"token {api_secret}")
+
+    events = store.list_audit_events(limit=10)
+    event_types = {event.event_type for event in events}
+    assert {"PROMPT_VERSION_CREATED", "PROMPT_VERSION_ACTIVATED"} <= event_types
+    audit_text = "\n".join(event.payload_json for event in events)
+    assert api_secret not in audit_text
+    assert "[REDACTED]" in audit_text
+
+
+def test_system_prompt_lifecycle_pins_the_active_version_onto_user_versions(
+    tmp_path: Path,
+) -> None:
+    service, store = _service(tmp_path)
+    system_body = "You are a stricter order-flow system prompt."
+
+    system_draft = service.edit("analysis:system", system_body, author="ops")
+    assert system_draft.status == PromptStatus.DRAFT.value
+    service.activate("analysis:system", system_draft.version)
+
+    user_draft = service.edit(
+        "analysis",
+        "Symbol: {{symbol}}\nTimeframe: {{timeframe}}\n"
+        "<market_data>{{metrics}}</market_data>\n<knowledge>{{knowledge}}</knowledge>\n"
+        "<schema>{{schema}}</schema>\nPINNED\n",
+    )
+    assert user_draft.system_prompt_id == "analysis:system"
+    assert user_draft.system_prompt_version == 2
+    assert user_draft.system_prompt_hash == content_hash(system_body)
+
+    service.activate("analysis", user_draft.version)
+    rendered = service.render_active(
+        PromptRole.ANALYSIS,
+        {
+            "symbol": "BTCUSDT",
+            "timeframe": "4h",
+            "as_of": "2026-11-08T12:00:00.000Z",
+            "metrics": "{}",
+            "snapshot": "{}",
+            "knowledge": "",
+            "schema": "{}",
+        },
+    )
+    assert rendered.system == system_body
+    assert rendered.system_version == 2
+
+    restored = service.restore_default("analysis:system", author="ops")
+    assert restored.version == 3
+    assert restored.status == PromptStatus.DRAFT.value
+    # Restoring does not rewrite the already pinned user version.
+    pinned = store.get_prompt_version("analysis", user_draft.version)
+    assert pinned is not None
+    assert pinned.system_prompt_version == 2
+
+
+def test_pre_v16_decision_without_a_pinned_system_version_is_missing(tmp_path: Path) -> None:
+    service, store = _service(tmp_path)
+    connection = sqlite3.connect(store.path)
+    try:
+        connection.execute(
+            """
+            INSERT INTO prompt_versions (
+                prompt_id, version, body, body_hash, is_active, created_at,
+                status, author, reason, is_default
+            ) VALUES ('analysis', 9, ?, ?, 0, 't', 'DRAFT', 'raw', 'pre-v16', 0)
+            """,
+            (
+                DEFAULT_USER_BODIES[PromptRole.ANALYSIS],
+                content_hash(DEFAULT_USER_BODIES[PromptRole.ANALYSIS]),
+            ),
+        )
+        connection.commit()
+    finally:
+        connection.close()
+
+    resolution = service.resolve_decision(
+        {"provenance": {"prompt_id": "analysis", "prompt_version": 9, "prompt_hash": "abc"}}
+    )
+
+    assert resolution.status == "missing"
+    assert resolution.exact_replay is False
+    assert resolution.code == "PROMPT_VERSION_MISSING"
+
+
+def test_malformed_required_variables_json_is_logged_not_silent(
+    tmp_path: Path, caplog: pytest.LogCaptureFixture
+) -> None:
+    service, store = _service(tmp_path)
+    connection = sqlite3.connect(store.path)
+    try:
+        connection.execute(
+            """
+            INSERT INTO prompt_versions (
+                prompt_id, version, body, body_hash, is_active, created_at,
+                required_variables_json, status, author, reason, is_default
+            ) VALUES ('analysis', 8, ?, ?, 0, 't', 'not-json', 'DRAFT', 'raw', 'bad', 0)
+            """,
+            (
+                DEFAULT_USER_BODIES[PromptRole.ANALYSIS],
+                content_hash(DEFAULT_USER_BODIES[PromptRole.ANALYSIS]),
+            ),
+        )
+        connection.commit()
+    finally:
+        connection.close()
+
+    with caplog.at_level(logging.WARNING, logger="oft.application.prompt_service"):
+        detail = service.show("analysis")
+
+    assert any(version.version == 8 for version in detail.versions)
+    assert any("required_variables_json" in record.message for record in caplog.records)

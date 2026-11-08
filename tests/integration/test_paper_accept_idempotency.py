@@ -138,6 +138,43 @@ def test_entry_recheck_uses_the_scan_period_instead_of_a_hardcoded_4h(
     assert json.loads(decision.payload_json)["subject"]["timeframe"] == "8h"
 
 
+def test_entry_recheck_falls_back_to_the_source_report_timeframe(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    container, trigger_id = _container_and_trigger(tmp_path, period="8h")
+    # The scan row is unavailable, but the source report still records 8h.
+    monkeypatch.setattr(container.store, "get_scan", lambda scan_id: None)
+    provider = _CapturingProvider(container.llm_provider)
+    kill = KillSwitch(settings=container.settings, store=container.store, clock=container.clock)
+    service = EntryService(
+        store=container.store,
+        clock=container.clock,
+        provider=provider,  # type: ignore[arg-type]
+        settings=container.settings,
+        kill_switch=kill,
+    )
+
+    service.recheck(trigger_id)
+
+    prompts = [str(request.user_prompt) for request in provider.requests]  # type: ignore[attr-defined]
+    assert prompts
+    assert "Timeframe: 8h" in prompts[0]
+
+
+def test_entry_recheck_fails_closed_without_a_scan_period_or_report(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    container, trigger_id = _container_and_trigger(tmp_path)
+    monkeypatch.setattr(container.store, "get_scan", lambda scan_id: None)
+    monkeypatch.setattr(container.store, "get_report", lambda report_id: None)
+    service = _entry(container)
+
+    with pytest.raises(EntryRejected) as excinfo:
+        service.recheck(trigger_id)
+
+    assert excinfo.value.code == "DATA_UNAVAILABLE"
+
+
 def test_repeat_accept_with_the_same_key_creates_nothing_new(tmp_path: Path) -> None:
     container, trigger_id = _container_and_trigger(tmp_path)
     service = _entry(container)

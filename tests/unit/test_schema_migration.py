@@ -802,18 +802,49 @@ def test_prompt_versions_are_immutable_and_have_one_active_row_per_prompt(
                 "UPDATE prompt_versions SET body_hash = 'TAMPERED' "
                 "WHERE prompt_id = 'analysis' AND version = 1"
             )
+        # The whole pinned-system and validation contract is immutable too.
+        for column, value in (
+            ("system_prompt_id", "'other:system'"),
+            ("system_prompt_version", "99"),
+            ("system_body", "'TAMPERED'"),
+            ("system_body_hash", "'TAMPERED'"),
+            ("required_variables_json", "'[]'"),
+            ("knowledge_artifact_hash", "'TAMPERED'"),
+        ):
+            with pytest.raises(sqlite3.IntegrityError):
+                connection.execute(
+                    f"UPDATE prompt_versions SET {column} = {value} "
+                    "WHERE prompt_id = 'analysis' AND version = 1"
+                )
         # Only one row per prompt may be active.
         with pytest.raises(sqlite3.IntegrityError):
             connection.execute(
                 "INSERT INTO prompt_versions "
-                "(prompt_id, version, body, body_hash, is_active, created_at) "
-                "VALUES ('analysis', 99, 'BODY', 'HASH', 1, 't')"
+                "(prompt_id, version, body, body_hash, is_active, created_at, status) "
+                "VALUES ('analysis', 99, 'BODY', 'HASH', 1, 't', 'ACTIVE')"
             )
-        # Activation bookkeeping still works.
+        # Activation bookkeeping and drafts stay mutable.
         connection.execute(
             "UPDATE prompt_versions SET is_active = 0, status = 'SUPERSEDED' "
             "WHERE prompt_id = 'analysis' AND version = 1"
         )
+        connection.execute(
+            "UPDATE prompt_versions SET is_active = 0, status = 'DRAFT' "
+            "WHERE prompt_id = 'analysis' AND version = 1"
+        )
+        # The status enum and the is_active/status invariant are enforced.
+        with pytest.raises(sqlite3.IntegrityError):
+            connection.execute(
+                "INSERT INTO prompt_versions "
+                "(prompt_id, version, body, body_hash, is_active, created_at, status) "
+                "VALUES ('analysis', 100, 'BODY', 'HASH', 0, 't', 'BOGUS')"
+            )
+        with pytest.raises(sqlite3.IntegrityError):
+            connection.execute(
+                "INSERT INTO prompt_versions "
+                "(prompt_id, version, body, body_hash, is_active, created_at, status) "
+                "VALUES ('analysis', 101, 'BODY', 'HASH', 0, 't', 'ACTIVE')"
+            )
         connection.commit()
     finally:
         connection.close()

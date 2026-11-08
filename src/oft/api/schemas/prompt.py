@@ -4,9 +4,10 @@ from __future__ import annotations
 
 from typing import Any
 
-from pydantic import BaseModel, ConfigDict, Field
+from pydantic import BaseModel, ConfigDict, Field, field_validator
 
 from oft.api.schemas.trigger import Envelope
+from oft.domain.prompts import PromptKind, PromptRole, PromptStatus
 
 MAX_PROMPT_BODY_BYTES = 64 * 1024
 MAX_HASH_LENGTH = 128
@@ -20,6 +21,21 @@ class EditPromptRequest(BaseModel):
     reason: str = Field(default="", max_length=500)
     activate: bool = False
     knowledge_artifact_hash: str | None = Field(default=None, max_length=MAX_HASH_LENGTH)
+
+    @field_validator("body")
+    @classmethod
+    def _body_fits_utf8_bytes(cls, value: str) -> str:
+        # ``max_length`` counts code points; the persisted/LLM budget is bytes.
+        if len(value.encode("utf-8")) > MAX_PROMPT_BODY_BYTES:
+            raise ValueError(f"body must be at most {MAX_PROMPT_BODY_BYTES} UTF-8 bytes")
+        return value
+
+    @field_validator("knowledge_artifact_hash")
+    @classmethod
+    def _hash_fits_utf8_bytes(cls, value: str | None) -> str | None:
+        if value is not None and len(value.encode("utf-8")) > MAX_HASH_LENGTH:
+            raise ValueError(f"hash must be at most {MAX_HASH_LENGTH} UTF-8 bytes")
+        return value
 
 
 class ActivatePromptRequest(BaseModel):
@@ -40,7 +56,7 @@ class RestorePromptRequest(BaseModel):
 class PromptVersionData(BaseModel):
     prompt_id: str
     version: int
-    status: str
+    status: PromptStatus
     is_active: bool
     body: str
     body_hash: str
@@ -57,8 +73,8 @@ class PromptVersionData(BaseModel):
 
 class PromptSummaryData(BaseModel):
     prompt_id: str
-    role: str
-    kind: str
+    role: PromptRole
+    kind: PromptKind
     active_version: int
     version_count: int
     latest_version: int
@@ -72,8 +88,8 @@ class PromptListData(BaseModel):
 
 class PromptDetailData(BaseModel):
     prompt_id: str
-    role: str
-    kind: str
+    role: PromptRole
+    kind: PromptKind
     active_version: int
     created_at: str
     updated_at: str
@@ -115,7 +131,11 @@ _CATALOG_ERRORS = {
     401: ("AUTH_REQUIRED", "The local API credential is missing or invalid."),
     403: ("CSRF_INVALID", "The CSRF token or Origin check failed."),
     404: ("NOT_FOUND", "The prompt template does not exist."),
-    409: ("PROMPT_VERSION_MISSING", "The prompt version is missing or a concurrent edit won."),
+    409: (
+        "PROMPT_VERSION_MISSING",
+        "The prompt version is missing or not active (PROMPT_VERSION_MISSING), or a "
+        "concurrent edit took the next version (CONFLICT).",
+    ),
     422: ("PROMPT_VALIDATION_FAILED", "The template body failed validation."),
 }
 

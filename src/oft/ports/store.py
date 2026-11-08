@@ -6,6 +6,7 @@ from dataclasses import dataclass
 from typing import Any, Protocol
 
 from oft.domain.data_quality import DataGap
+from oft.domain.prompts import PromptRole, PromptStatus
 from oft.domain.symbols import SymbolContract
 
 
@@ -271,7 +272,7 @@ class PromptTemplateRecord:
     """One prompt template family and its explicitly selected active version."""
 
     prompt_id: str
-    role: str
+    role: PromptRole
     active_version: int
     created_at: str
     updated_at: str
@@ -293,7 +294,7 @@ class PromptVersionRecord:
     system_body_hash: str = ""
     required_variables_json: str = "[]"
     knowledge_artifact_hash: str | None = None
-    status: str = "DRAFT"
+    status: PromptStatus = PromptStatus.DRAFT
     author: str = ""
     reason: str = ""
     is_default: bool = False

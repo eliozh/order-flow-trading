@@ -128,15 +128,40 @@ def test_rendered_prompt_redacts_exact_configured_secret_values() -> None:
     assert rendered.count("[REDACTED]") == 2
 
 
-def test_hash_input_never_contains_a_secret() -> None:
-    system = "system prompt"
-    user = redact_secrets(
-        "token=sk-live-abcdefghijklmnop",
+def test_render_active_redacts_configured_secrets_even_without_caller_values(
+    tmp_path: Path,
+) -> None:
+    api_secret = "api-token-super-secret-value"
+    settings = Settings(env="test", port=8765, data_dir=tmp_path / "data", api_token=api_secret)
+    store = SqliteStore(settings)
+    store.initialize()
+    service = PromptService(
+        store=store,
+        clock=FixedClock(NOW),
+        secret_values=secret_values_from_settings(settings),
     )
-    digest = rendered_prompt_hash("analysis", 1, system, user)
 
-    assert "sk-live" not in system + user
-    assert len(digest) == 64
+    rendered = service.render_active(
+        PromptRole.ANALYSIS,
+        {
+            "symbol": "BTCUSDT",
+            "timeframe": "4h",
+            "as_of": "2026-11-08T12:00:00.000Z",
+            "metrics": f'{{"leaked_api": "{api_secret}"}}',
+            "snapshot": "{}",
+            "knowledge": "",
+            "schema": "{}",
+        },
+    )
+
+    # The service's own secrets are applied even when the caller passes none.
+    assert api_secret not in rendered.user
+    assert api_secret not in rendered.system
+    assert "[REDACTED]" in rendered.user
+    # The hash describes the redacted rendered prompt.
+    assert rendered.prompt_hash == rendered_prompt_hash(
+        rendered.prompt_id, rendered.version, rendered.system, rendered.user
+    )
 
 
 def test_render_requires_a_value_for_every_placeholder() -> None:

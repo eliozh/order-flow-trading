@@ -7,6 +7,7 @@ The daemon is the only writer. Diagnostic commands open the database with
 from __future__ import annotations
 
 import json
+import logging
 import os
 import sqlite3
 from contextlib import closing
@@ -59,6 +60,8 @@ from oft.ports.store import (
     SymbolUpsertResult,
     TriggerEventRecord,
 )
+
+_LOGGER = logging.getLogger(__name__)
 
 _SCHEMA_VERSION = 16
 STALE_RUNNING_SECONDS = 15 * 60
@@ -508,16 +511,21 @@ _SCHEMA_SQL = f"""
         system_body_hash TEXT NOT NULL DEFAULT '',
         required_variables_json TEXT NOT NULL DEFAULT '[]',
         knowledge_artifact_hash TEXT,
-        status TEXT NOT NULL DEFAULT 'ACTIVE',
+        status TEXT NOT NULL DEFAULT 'DRAFT'
+            CHECK (status IN ('DRAFT', 'ACTIVE', 'SUPERSEDED')),
         author TEXT NOT NULL DEFAULT '',
         reason TEXT NOT NULL DEFAULT '',
         is_default INTEGER NOT NULL DEFAULT 0,
-        PRIMARY KEY (prompt_id, version)
+        PRIMARY KEY (prompt_id, version),
+        CHECK ((status = 'ACTIVE') = (is_active = 1))
     );
     CREATE UNIQUE INDEX IF NOT EXISTS prompt_versions_one_active
         ON prompt_versions(prompt_id) WHERE is_active = 1;
-    CREATE TRIGGER IF NOT EXISTS prompt_versions_immutable
-        BEFORE UPDATE OF prompt_id, version, body, body_hash, created_at
+    DROP TRIGGER IF EXISTS prompt_versions_immutable;
+    CREATE TRIGGER prompt_versions_immutable
+        BEFORE UPDATE OF prompt_id, version, body, body_hash, created_at,
+            system_prompt_id, system_prompt_version, system_body,
+            system_body_hash, required_variables_json, knowledge_artifact_hash
         ON prompt_versions
     BEGIN
         SELECT RAISE(ABORT, 'prompt_versions rows are immutable');
@@ -1853,7 +1861,7 @@ class SqliteStore:
 
     def complete_idempotency(self, record: IdempotencyRecord) -> None:
         with closing(self._connect()) as connection, connection:
-            connection.execute(
+            cursor = connection.execute(
                 """
                 UPDATE idempotency_keys SET
                     request_hash = ?, response_status = ?, response_json = ?,
@@ -1870,6 +1878,38 @@ class SqliteStore:
                     record.key,
                 ),
             )
+            if cursor.rowcount != 1:
+                # The lease expired or was purged while the request ran. Re-insert
+                # the completed record so the response is not silently lost; the
+                # replay path must still be able to return it.
+                _LOGGER.warning(
+                    "idempotency lease for %s/%s vanished before completion; re-inserting",
+                    record.scope,
+                    record.key,
+                )
+                connection.execute(
+                    """
+                    INSERT INTO idempotency_keys (
+                        scope, key, request_hash, response_status, response_json,
+                        created_at, expires_at
+                    ) VALUES (?, ?, ?, ?, ?, ?, ?)
+                    ON CONFLICT(scope, key) DO UPDATE SET
+                        request_hash = excluded.request_hash,
+                        response_status = excluded.response_status,
+                        response_json = excluded.response_json,
+                        created_at = excluded.created_at,
+                        expires_at = excluded.expires_at
+                    """,
+                    (
+                        record.scope,
+                        record.key,
+                        record.request_hash,
+                        record.response_status,
+                        record.response_json,
+                        record.created_at,
+                        record.expires_at,
+                    ),
+                )
 
     def delete_idempotency(self, *, scope: str, key: str) -> None:
         with closing(self._connect()) as connection, connection:
@@ -3291,13 +3331,12 @@ class SqliteStore:
                 """
                 UPDATE prompt_versions
                 SET is_active = 0, status = ?
-                WHERE prompt_id = ? AND version <> ? AND status = ?
+                WHERE prompt_id = ? AND version <> ? AND is_active = 1
                 """,
                 (
                     PromptStatus.SUPERSEDED.value,
                     prompt_id,
                     version,
-                    PromptStatus.ACTIVE.value,
                 ),
             )
             connection.execute(
@@ -4099,7 +4138,7 @@ def _row_to_llm_call(row: sqlite3.Row) -> LLMCallRecord:
 def _row_to_prompt_template(row: sqlite3.Row) -> PromptTemplateRecord:
     return PromptTemplateRecord(
         prompt_id=row["prompt_id"],
-        role=row["role"],
+        role=PromptRole(row["role"]),
         active_version=row["active_version"],
         created_at=row["created_at"],
         updated_at=row["updated_at"],
@@ -4127,7 +4166,7 @@ def _row_to_prompt_version(row: sqlite3.Row) -> PromptVersionRecord:
         knowledge_artifact_hash=(
             row["knowledge_artifact_hash"] if "knowledge_artifact_hash" in keys else None
         ),
-        status=row["status"] if "status" in keys else PromptStatus.ACTIVE.value,
+        status=(PromptStatus(row["status"]) if "status" in keys else PromptStatus.ACTIVE),
         author=row["author"] if "author" in keys else "",
         reason=row["reason"] if "reason" in keys else "",
         is_default=bool(row["is_default"]) if "is_default" in keys else False,

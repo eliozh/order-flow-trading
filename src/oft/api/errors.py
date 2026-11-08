@@ -129,7 +129,8 @@ ERROR_CATALOG: dict[str, ErrorSpec] = {
         409,
         "LLM",
         False,
-        "A decision references a prompt version that no longer exists.",
+        "A decision references a prompt version that no longer exists or has no "
+        "pinned system version.",
     ),
     "KILL_SWITCH_ACTIVE": ErrorSpec(
         423, "RISK", False, "The kill switch blocks new orders and LLM-driven execution."
