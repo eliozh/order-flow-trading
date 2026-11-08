@@ -19,6 +19,7 @@ from typing import Any
 from oft.application.budget_ledger import BudgetEntry, BudgetLedger, stable_call_id
 from oft.application.execution_gateway import AuthContext, ExecutionGateway, GatewayError
 from oft.application.kill_switch import KillSwitch, KillSwitchActive, record_audit
+from oft.application.knowledge_service import KnowledgeService
 from oft.application.llm_validation import (
     ValidationIssue,
     ValidationOutcome,
@@ -28,6 +29,7 @@ from oft.application.llm_validation import (
     validate_output,
 )
 from oft.application.paper_broker import OrderIntent, PaperBroker
+from oft.application.prompt_builder import KnowledgeInjection, absent_injection
 from oft.application.prompt_service import (
     PromptService,
     RenderedPrompt,
@@ -99,6 +101,9 @@ class EntryService:
         self._broker = PaperBroker(settings=settings, store=store, clock=clock)
         self._secrets = secret_values_from_settings(settings) if settings is not None else ()
         self._prompts = PromptService(store=store, clock=clock, secret_values=self._secrets)
+        self._knowledge = (
+            KnowledgeService(settings=settings, clock=clock) if settings is not None else None
+        )
         self._gateway = ExecutionGateway(
             store=store,
             broker=self._broker,
@@ -119,7 +124,8 @@ class EntryService:
         opportunity = self._opportunity(payload["opportunity_id"])
         timeframe = self._timeframe(opportunity)
         now = utc_timestamp(self._clock.now())
-        rendered = self._prompt(payload, opportunity, timeframe)
+        knowledge = self._knowledge_injection()
+        rendered = self._prompt(payload, opportunity, timeframe, knowledge.text)
         system, user = rendered.system, rendered.user
         digest = hash_text(f"{system}\n{user}\n{schema_text()}")
         decision_id = f"DEC-ENTRY-{digest[:16].upper()}"
@@ -223,7 +229,15 @@ class EntryService:
             role=LLMRole.ENTRY_RECHECK.value,
             output=outcome.output,
             subject=subject,
-            provenance=self._provenance(first, digest, rendered, calls, budgets, now),
+            provenance=self._provenance(
+                first,
+                digest,
+                rendered,
+                calls,
+                budgets,
+                now,
+                knowledge.artifact_id,
+            ),
             validation_status=outcome.status,
             validation_errors=outcome.errors,
             rejected_reason=(
@@ -581,7 +595,18 @@ class EntryService:
             "the opportunity has no source scan period for the entry re-check",
         )
 
-    def _prompt(self, payload: dict[str, Any], opportunity: Any, timeframe: str) -> RenderedPrompt:
+    def _knowledge_injection(self) -> KnowledgeInjection:
+        if self._knowledge is None:
+            return absent_injection(PromptRole.ENTRY_RECHECK.value)
+        return self._knowledge.injection_for(PromptRole.ENTRY_RECHECK.value)
+
+    def _prompt(
+        self,
+        payload: dict[str, Any],
+        opportunity: Any,
+        timeframe: str,
+        knowledge: str,
+    ) -> RenderedPrompt:
         return self._prompts.render_active(
             PromptRole.ENTRY_RECHECK,
             {
@@ -590,7 +615,7 @@ class EntryService:
                 "side": payload["side"],
                 "trigger": json.dumps(payload["condition_results"], sort_keys=True),
                 "thesis": opportunity.thesis,
-                "knowledge": "",
+                "knowledge": knowledge,
                 "schema": schema_text(),
             },
             secret_values=self._secrets,
@@ -604,6 +629,7 @@ class EntryService:
         calls: list[LLMCallRecord],
         budgets: list[BudgetEntry],
         now: str,
+        knowledge_artifact_hash: str | None,
     ) -> dict[str, Any]:
         cost = budgets[0].payload if budgets else None
         return {
@@ -613,7 +639,7 @@ class EntryService:
             "prompt_id": rendered.prompt_id,
             "prompt_version": rendered.version,
             "prompt_hash": rendered.prompt_hash,
-            "knowledge_artifact_hash": rendered.knowledge_artifact_hash,
+            "knowledge_artifact_hash": knowledge_artifact_hash,
             "input_hash": digest,
             "schema_version": "1.0.0",
             "temperature": 0.0,

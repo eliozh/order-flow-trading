@@ -3,7 +3,12 @@
 .env
 .env.*
 !.env.example
+# Private knowledge artifacts (ADR-0009): never commit book text, derived
+# skills, or compiled playbooks. $OFT_DATA/knowledge/ is under data/ as well.
 books/
+/knowledge/
+/skills/
+/playbook/
 node_modules/
 dist/
 .venv/

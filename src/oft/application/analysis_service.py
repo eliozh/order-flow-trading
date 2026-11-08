@@ -14,6 +14,7 @@ from decimal import InvalidOperation
 from typing import Any
 
 from oft.application.budget_ledger import BudgetEntry, BudgetLedger, stable_call_id
+from oft.application.knowledge_service import KnowledgeService
 from oft.application.llm_validation import (
     ValidationIssue,
     ValidationOutcome,
@@ -23,6 +24,7 @@ from oft.application.llm_validation import (
     validate_output,
 )
 from oft.application.opportunity_service import OpportunityService
+from oft.application.prompt_builder import KnowledgeInjection, absent_injection
 from oft.application.prompt_service import (
     PromptService,
     RenderedPrompt,
@@ -121,6 +123,15 @@ class AnalysisService:
         self._opportunities = OpportunityService(store=store, clock=clock)
         self._secrets = secret_values_from_settings(settings) if settings is not None else ()
         self._prompts = PromptService(store=store, clock=clock, secret_values=self._secrets)
+        self._knowledge = (
+            KnowledgeService(settings=settings, clock=clock) if settings is not None else None
+        )
+
+    def _knowledge_injection(self) -> KnowledgeInjection:
+        """Mode A by default; a missing/inactive artifact is explicitly absent."""
+        if self._knowledge is None:
+            return absent_injection(PromptRole.ANALYSIS.value)
+        return self._knowledge.injection_for(PromptRole.ANALYSIS.value)
 
     def analyze(
         self,
@@ -133,6 +144,7 @@ class AnalysisService:
         report_id: str,
     ) -> AnalysisOutcome:
         now = utc_timestamp(self._clock.now())
+        knowledge = self._knowledge_injection()
         rendered = self._prompts.render_active(
             PromptRole.ANALYSIS,
             {
@@ -141,7 +153,7 @@ class AnalysisService:
                 "as_of": now,
                 "metrics": json.dumps(metrics, sort_keys=True, separators=(",", ":")),
                 "snapshot": json.dumps(snapshot, sort_keys=True, separators=(",", ":")),
-                "knowledge": "",
+                "knowledge": knowledge.text,
                 "schema": schema_text(),
             },
             secret_values=self._secrets,
@@ -245,6 +257,7 @@ class AnalysisService:
             calls=calls,
             budgets=budgets,
             now=now,
+            knowledge_artifact_hash=knowledge.artifact_id,
         )
         subject = {
             "symbol": symbol,
@@ -343,6 +356,7 @@ class AnalysisService:
             opportunity=opportunity,
             reference_price=_reference_price(snapshot),
             rendered=rendered,
+            knowledge=knowledge,
         )
         return AnalysisOutcome(
             decision_id=decision_id,
@@ -365,6 +379,7 @@ class AnalysisService:
         calls: list[LLMCallRecord],
         budgets: list[BudgetEntry],
         now: str,
+        knowledge_artifact_hash: str | None,
     ) -> dict[str, Any]:
         cost_payload = budgets[0].payload if budgets else None
         return {
@@ -374,7 +389,7 @@ class AnalysisService:
             "prompt_id": rendered.prompt_id,
             "prompt_version": rendered.version,
             "prompt_hash": rendered.prompt_hash,
-            "knowledge_artifact_hash": rendered.knowledge_artifact_hash,
+            "knowledge_artifact_hash": knowledge_artifact_hash,
             "input_hash": digest,
             "schema_version": "1.0.0",
             "temperature": 0.0,
@@ -424,6 +439,7 @@ def _llm_state(
     opportunity: Opportunity | None,
     reference_price: str,
     rendered: RenderedPrompt,
+    knowledge: KnowledgeInjection,
 ) -> dict[str, Any]:
     state: dict[str, Any] = {
         "configured": True,
@@ -432,6 +448,7 @@ def _llm_state(
         "prompt_id": provenance["prompt_id"],
         "prompt_version": provenance["prompt_version"],
         "prompt_hash": provenance["prompt_hash"],
+        "knowledge": knowledge.to_dict(),
         "system_prompt_id": rendered.system_prompt_id,
         "system_prompt_version": rendered.system_version,
         "system_prompt_hash": rendered.system_prompt_hash,
