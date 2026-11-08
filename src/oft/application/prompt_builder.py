@@ -25,6 +25,7 @@ from oft.domain.knowledge import (
     count_tokens,
     sections_for_topics,
     select_topics_for_context,
+    string_list,
 )
 
 MODE_A = "A"
@@ -160,24 +161,25 @@ def _budgeted_text(
     body_parts: list[str],
     rules_block: str | None,
     budget_tokens: int,
-) -> tuple[str, bool]:
+) -> tuple[str, bool, bool]:
     """Choose the richest header/rules combination that fits the budget.
 
-    Preference order: full header + rules, full header, compact header + rules,
-    compact header, body-only + rules, body-only, then an empty block. The
-    untrusted warning is dropped only when the full header cannot fit.
+    The caller reserves the full header's tokens before selecting body content,
+    so ``header`` normally fits. The return value is ``(text, rules_included,
+    full_header_included)``: the compact header is only a last resort, and when
+    even that cannot fit the untrusted header is reported as excluded.
     """
-    candidates: list[tuple[str, bool]] = []
-    for head in (header, compact_header, ""):
+    for head, is_full in ((header, True), (compact_header, False)):
+        if count_tokens(head) > budget_tokens:
+            continue
         if rules_block is not None:
-            parts = [head, *body_parts, rules_block] if head else [*body_parts, rules_block]
-            candidates.append((_compose(parts) if parts else "", True))
-        parts = [head, *body_parts] if head else list(body_parts)
-        candidates.append((_compose(parts) if parts else "", False))
-    for text, rules_included in candidates:
-        if count_tokens(text) <= budget_tokens:
-            return text, rules_included
-    return "", False
+            with_rules = _compose([head, *body_parts, rules_block])
+            if count_tokens(with_rules) <= budget_tokens:
+                return with_rules, True, is_full
+        try_rules = _compose([head, *body_parts])
+        if count_tokens(try_rules) <= budget_tokens:
+            return try_rules, False, is_full
+    return "", False, False
 
 
 def _role_rules(artifact: CompiledArtifact, role: str) -> tuple[list[str], list[str]]:
@@ -187,19 +189,7 @@ def _role_rules(artifact: CompiledArtifact, role: str) -> tuple[list[str], list[
     entry = roles.get(role)
     if not isinstance(entry, dict):
         return [], []
-    raw_rules = entry.get("rules")
-    rules = (
-        [str(rule) for rule in raw_rules if isinstance(rule, str)]
-        if isinstance(raw_rules, list)
-        else []
-    )
-    raw_ids = entry.get("section_ids")
-    ids = (
-        [str(item) for item in raw_ids if isinstance(item, str)]
-        if isinstance(raw_ids, list)
-        else []
-    )
-    return rules, ids
+    return string_list(entry.get("rules")), string_list(entry.get("section_ids"))
 
 
 def build_knowledge_injection(
@@ -240,6 +230,10 @@ def build_knowledge_injection(
     compact_header = (
         f"KNOWLEDGE_ARTIFACT: {artifact.artifact_id}\nKNOWLEDGE_MODE: {resolved_mode}\n"
     )
+    # Reserve the untrusted header before selecting body content so the header
+    # is never evicted in favour of playbook text.
+    header_tokens = count_tokens(header)
+    body_budget = max(0, budget_tokens - header_tokens)
     body_parts: list[str] = []
     selected_ids: list[str] = []
     excluded: list[ExcludedSection] = []
@@ -250,7 +244,7 @@ def build_knowledge_injection(
         )
         # Strict budget: never keep a section whose addition would overflow.
         candidate = _compose([*body_parts, block])
-        if count_tokens(candidate) > budget_tokens:
+        if count_tokens(candidate) > body_budget:
             excluded.append(
                 ExcludedSection(
                     section_id=section.section_id,
@@ -270,9 +264,18 @@ def build_knowledge_injection(
         if role_section_ids:
             rules_block += f"Role sections: {', '.join(role_section_ids)}\n"
 
-    text, rules_included = _budgeted_text(
+    text, rules_included, full_header_included = _budgeted_text(
         header, compact_header, body_parts, rules_block, budget_tokens
     )
+    if not full_header_included:
+        # The untrusted warning could not fit; record it instead of losing it.
+        excluded.append(
+            ExcludedSection(
+                section_id="HEADER",
+                reason="budget",
+                tokens=header_tokens,
+            )
+        )
     if rules_block is not None and not rules_included:
         # Role rules are optional; the playbook/header is never evicted for them.
         excluded.append(

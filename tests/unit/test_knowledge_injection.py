@@ -281,9 +281,9 @@ def test_an_oversized_single_section_is_excluded_and_recorded_for_budget() -> No
 
 
 def test_a_section_that_fits_the_budget_is_included_and_never_exceeds_it() -> None:
-    # The injection block is 9979 tokens; a 10000 budget must include it while
-    # still keeping the whole injected text within the budget.
-    artifact = _single_section_artifact(body="delta " * 6648)
+    # The injection block is 9907 tokens; with the 74-token untrusted header a
+    # 10000-token budget must include the section and keep the header.
+    artifact = _single_section_artifact(body="delta " * 6600)
 
     injection = build_knowledge_injection(artifact, role="ANALYSIS", budget_tokens=10_000)
 
@@ -293,6 +293,21 @@ def test_a_section_that_fits_the_budget_is_included_and_never_exceeds_it() -> No
     assert injection.excluded_sections == ()
     assert injection.dropped_section_ids == ()
     assert injection.warning is None
+    assert "UNTRUSTED" in injection.text
+
+
+def test_the_untrusted_header_is_never_evicted_for_body_content() -> None:
+    # The block fits the raw budget but not the budget minus the header. The
+    # section must be dropped rather than silently dropping the warning header.
+    artifact = _single_section_artifact(body="delta " * 6648)
+
+    injection = build_knowledge_injection(artifact, role="ANALYSIS", budget_tokens=10_000)
+
+    assert injection.selected_section_ids == ()
+    assert "K-delta-1" in injection.dropped_section_ids
+    assert injection.token_count <= 10_000
+    assert injection.warning == KNOWLEDGE_BUDGET_EXCEEDED
+    assert "UNTRUSTED" in injection.text
 
 
 def test_a_single_section_over_the_budget_is_excluded_not_truncated() -> None:
@@ -319,6 +334,8 @@ def test_a_budget_too_small_for_the_header_yields_an_empty_but_explicit_injectio
     assert injection.artifact_id == artifact.artifact_id
     assert injection.warning == KNOWLEDGE_BUDGET_EXCEEDED
     assert "K-delta-1" in injection.dropped_section_ids
+    # The untrusted header that could not fit is recorded, never silently lost.
+    assert "HEADER" in injection.dropped_section_ids
 
 
 def test_role_rules_without_section_ids_do_not_emit_a_role_sections_line() -> None:

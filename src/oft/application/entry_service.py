@@ -19,7 +19,7 @@ from typing import Any
 from oft.application.budget_ledger import BudgetEntry, BudgetLedger, stable_call_id
 from oft.application.execution_gateway import AuthContext, ExecutionGateway, GatewayError
 from oft.application.kill_switch import KillSwitch, KillSwitchActive, record_audit
-from oft.application.knowledge_service import KnowledgeService
+from oft.application.knowledge_service import KnowledgeService, knowledge_injection
 from oft.application.llm_validation import (
     ValidationIssue,
     ValidationOutcome,
@@ -29,7 +29,7 @@ from oft.application.llm_validation import (
     validate_output,
 )
 from oft.application.paper_broker import OrderIntent, PaperBroker
-from oft.application.prompt_builder import KnowledgeInjection, absent_injection
+from oft.application.prompt_builder import KnowledgeInjection
 from oft.application.prompt_service import (
     PromptService,
     RenderedPrompt,
@@ -237,6 +237,8 @@ class EntryService:
                 budgets,
                 now,
                 knowledge.artifact_id,
+                knowledge.status,
+                knowledge.reason,
             ),
             validation_status=outcome.status,
             validation_errors=outcome.errors,
@@ -596,9 +598,7 @@ class EntryService:
         )
 
     def _knowledge_injection(self) -> KnowledgeInjection:
-        if self._knowledge is None:
-            return absent_injection(PromptRole.ENTRY_RECHECK.value)
-        return self._knowledge.injection_for(PromptRole.ENTRY_RECHECK.value)
+        return knowledge_injection(self._knowledge, PromptRole.ENTRY_RECHECK.value)
 
     def _prompt(
         self,
@@ -630,6 +630,8 @@ class EntryService:
         budgets: list[BudgetEntry],
         now: str,
         knowledge_artifact_hash: str | None,
+        knowledge_status: str | None,
+        knowledge_reason: str | None,
     ) -> dict[str, Any]:
         cost = budgets[0].payload if budgets else None
         return {
@@ -640,6 +642,8 @@ class EntryService:
             "prompt_version": rendered.version,
             "prompt_hash": rendered.prompt_hash,
             "knowledge_artifact_hash": knowledge_artifact_hash,
+            "knowledge_status": knowledge_status,
+            "knowledge_reason": knowledge_reason,
             "input_hash": digest,
             "schema_version": "1.0.0",
             "temperature": 0.0,

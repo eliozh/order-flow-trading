@@ -640,6 +640,12 @@ class PromptService:
         version = provenance.get("prompt_version")
         recorded_hash = provenance.get("prompt_hash")
         recorded_hash = recorded_hash if isinstance(recorded_hash, str) else None
+        # Optional since the field was added after the first decisions were
+        # recorded; a pre-existing decision simply resolves to None here.
+        raw_knowledge_status = provenance.get("knowledge_status")
+        knowledge_status = raw_knowledge_status if isinstance(raw_knowledge_status, str) else None
+        raw_knowledge_reason = provenance.get("knowledge_reason")
+        knowledge_reason = raw_knowledge_reason if isinstance(raw_knowledge_reason, str) else None
         if not isinstance(prompt_id, str) or not isinstance(version, int) or version < 1:
             return PromptProvenance(
                 status="missing",
@@ -647,6 +653,8 @@ class PromptService:
                 version=version if isinstance(version, int) else 0,
                 exact_replay=False,
                 code=PROMPT_VERSION_MISSING,
+                knowledge_status=knowledge_status,
+                knowledge_reason=knowledge_reason,
             )
         record = self._store.get_prompt_version(prompt_id, version)
         if record is None:
@@ -656,6 +664,8 @@ class PromptService:
                 version=version,
                 exact_replay=False,
                 code=PROMPT_VERSION_MISSING,
+                knowledge_status=knowledge_status,
+                knowledge_reason=knowledge_reason,
             )
         # Exact replay also requires the pinned system-prompt version to still
         # exist. A row with no pinned system reference (pre-v16 upgrade) or a
@@ -677,6 +687,8 @@ class PromptService:
                 code=PROMPT_VERSION_MISSING,
                 prompt_hash=recorded_hash,
                 body_hash=record.body_hash,
+                knowledge_status=knowledge_status,
+                knowledge_reason=knowledge_reason,
             )
         # ``prompt_hash`` is the rendered hash the decision recorded; the
         # immutable template body hash is exposed separately. A decision with
@@ -691,6 +703,8 @@ class PromptService:
                 code=None,
                 prompt_hash=None,
                 body_hash=record.body_hash,
+                knowledge_status=knowledge_status,
+                knowledge_reason=knowledge_reason,
             )
         return PromptProvenance(
             status="available",
@@ -700,6 +714,8 @@ class PromptService:
             code=None,
             prompt_hash=recorded_hash,
             body_hash=record.body_hash,
+            knowledge_status=knowledge_status,
+            knowledge_reason=knowledge_reason,
         )
 
     # -- helpers ---------------------------------------------------------

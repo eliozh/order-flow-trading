@@ -10,6 +10,7 @@ import pytest
 from oft.domain.knowledge import (
     COMPILER_VERSION,
     DEFAULT_TAXONOMY,
+    KNOWLEDGE_MANIFEST_INVALID,
     LICENSE_NOTE,
     PLAYBOOK_TOKEN_BUDGET,
     RULES_TOKEN_BUDGET,
@@ -213,7 +214,7 @@ def test_parse_markdown_normalizes_line_endings_and_whitespace() -> None:
 def test_summarize_text_keeps_the_prefix_and_marks_the_cut() -> None:
     text = "First sentence. Second sentence. Third sentence."
 
-    summary = summarize_text(text, 4)
+    summary = summarize_text(text, 10)
 
     assert len(summary) < len(text)
     assert summary.startswith("First")
@@ -494,3 +495,67 @@ def test_build_rules_document_without_a_topic_index_keeps_rules_only() -> None:
     )
 
     assert document["roles"]["ANALYSIS"] == {"section_ids": [], "rules": ["keep me"]}
+
+
+def test_an_approved_manifest_requires_a_reviewer_and_a_timestamp() -> None:
+    payload = _compile().manifest.to_dict()
+
+    for forged in (
+        dict(payload, review_status="APPROVED"),
+        dict(payload, review_status="APPROVED", reviewed_by=""),
+        dict(payload, review_status="APPROVED", reviewed_by="reviewer"),
+    ):
+        with pytest.raises(KnowledgeError) as error:
+            validate_manifest(forged)
+        assert error.value.code == KNOWLEDGE_MANIFEST_INVALID
+
+    approved = validate_manifest(
+        dict(payload, review_status="APPROVED", reviewed_by="reviewer", reviewed_at=GENERATED_AT)
+    )
+    assert approved.review_status == "APPROVED"
+    assert approved.reviewed_by == "reviewer"
+
+
+def test_knowledge_sections_enforce_id_format_and_topic_consistency() -> None:
+    with pytest.raises(KnowledgeError):
+        KnowledgeSection("K-BAD-1", "bad", "Title", "body", "s")
+    with pytest.raises(KnowledgeError):
+        KnowledgeSection("K-delta-1", "risk", "Title", "body", "s")
+
+    section = KnowledgeSection("K-delta-1", "delta", "Title", "body", "s")
+    assert SECTION_ID_PATTERN.fullmatch(section.section_id) is not None
+
+
+def test_load_sections_ignores_headings_inside_fenced_code() -> None:
+    playbook = (
+        "# Order-flow playbook\n\n"
+        "## K-delta-1 — Delta context\n\n"
+        "body\n\n```\n## K-risk-1 — not a section\n```\n\ntail\n"
+    )
+
+    sections = load_sections(playbook)
+
+    assert [section.section_id for section in sections] == ["K-delta-1"]
+    assert "## K-risk-1" in sections[0].body
+
+
+def test_manifest_validation_rejects_duplicate_or_malformed_section_and_topic_lists() -> None:
+    payload = _compile().manifest.to_dict()
+    sections = list(payload["sections"])
+    invalid_payloads = (
+        dict(payload, sections=[*sections, sections[0]]),
+        dict(payload, sections=["not-a-section-id"]),
+        dict(payload, topics=["BAD TOPIC"]),
+        dict(payload, topics=["delta", "delta"]),
+    )
+
+    for invalid in invalid_payloads:
+        with pytest.raises(KnowledgeError) as error:
+            validate_manifest(invalid)
+        assert error.value.code == KNOWLEDGE_MANIFEST_INVALID
+
+
+def test_the_fixture_manifest_is_exactly_what_the_compiler_produces() -> None:
+    payload = json.loads((FIXTURES / "manifest.json").read_text(encoding="utf-8"))
+
+    assert _compile().manifest.to_dict() == payload

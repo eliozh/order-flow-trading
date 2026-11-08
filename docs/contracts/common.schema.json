@@ -352,6 +352,15 @@
         "prompt_version": { "type": "integer", "minimum": 1 },
         "prompt_hash": { "type": "string" },
         "knowledge_artifact_hash": { "type": ["string", "null"] },
+        "knowledge_status": {
+          "type": ["string", "null"],
+          "enum": ["ABSENT", "AVAILABLE", null],
+          "description": "Whether the knowledge artifact was actually injected. Optional for backward compatibility with decisions recorded before this field existed."
+        },
+        "knowledge_reason": {
+          "type": ["string", "null"],
+          "description": "Stable KNOWLEDGE_* reason code when the artifact was not injected (for example KNOWLEDGE_ABSENT vs KNOWLEDGE_ARTIFACT_MISMATCH); null when AVAILABLE. Optional for backward compatibility."
+        },
         "input_hash": { "type": "string" },
         "schema_version": { "$ref": "#/$defs/schemaVersion" },
         "temperature": { "type": "number" },

@@ -17,6 +17,7 @@ from oft.config import ConfigError, Settings, load_settings
 from oft.domain.knowledge import (
     KNOWLEDGE_ABSENT,
     KNOWLEDGE_ARTIFACT_MISMATCH,
+    KNOWLEDGE_LOCATION,
     KNOWLEDGE_MANIFEST_INVALID,
     KNOWLEDGE_NO_SECTIONS,
     KNOWLEDGE_NOT_ACTIVE,
@@ -38,6 +39,7 @@ _ERROR_CODES = {
     KNOWLEDGE_SOURCE_TOO_LARGE: "VALIDATION_FAILED",
     KNOWLEDGE_NO_SECTIONS: "VALIDATION_FAILED",
     KNOWLEDGE_MANIFEST_INVALID: "VALIDATION_FAILED",
+    KNOWLEDGE_LOCATION: "CONFLICT",
     KNOWLEDGE_ARTIFACT_MISMATCH: "CONFLICT",
     KNOWLEDGE_NOT_REVIEWED: "CONFLICT",
     KNOWLEDGE_NOT_ACTIVE: "CONFLICT",
@@ -178,6 +180,7 @@ def review_command(
     safe_rules = _sanitize_config(artifact.rules)
     if json_output:
         data = state.to_dict()
+        data["warning"] = PRIVATE_WARNING
         data["playbook"] = safe_playbook
         data["rules"] = safe_rules
         _emit_json(data)
@@ -207,7 +210,9 @@ def activate_command(
         _fail(exc, json_output)
         return
     if json_output:
-        _emit_json(state.to_dict())
+        data = state.to_dict()
+        data["warning"] = PRIVATE_WARNING
+        _emit_json(data)
         return
     _warn_private()
     typer.echo(f"Activated knowledge artifact {str(state.artifact_id)[:12]}…")

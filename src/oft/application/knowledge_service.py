@@ -9,6 +9,7 @@ compiles a budgeted playbook, and writes ``playbook.md``, ``topics.json``,
 from __future__ import annotations
 
 import json
+import logging
 import os
 from collections.abc import Mapping
 from dataclasses import dataclass, replace
@@ -24,6 +25,7 @@ from oft.application.prompt_builder import (
 from oft.config import Settings
 from oft.domain.knowledge import (
     KNOWLEDGE_ABSENT,
+    KNOWLEDGE_LOCATION,
     KNOWLEDGE_MANIFEST_INVALID,
     KNOWLEDGE_NOT_ACTIVE,
     KNOWLEDGE_NOT_REVIEWED,
@@ -39,6 +41,7 @@ from oft.domain.knowledge import (
     absent_state,
     available_state,
     compile_artifact,
+    count_tokens,
     load_sections,
     topic_definitions,
     validate_manifest,
@@ -47,6 +50,8 @@ from oft.domain.knowledge import (
 from oft.domain.time import utc_timestamp
 from oft.ports.clock import ClockPort
 from oft.ports.store import StorePort
+
+logger = logging.getLogger(__name__)
 
 PLAYBOOK_DIRNAME = "playbook"
 PLAYBOOK_FILE = "playbook.md"
@@ -215,6 +220,7 @@ class KnowledgeService:
         _write_json(target / TOPICS_FILE, artifact.topics)
         _write_json(target / RULES_FILE, artifact.rules)
         _write_json(target / MANIFEST_FILE, artifact.manifest.to_dict())
+        self._clear_active(target)
         self._record_location(configured, target)
         return KnowledgeBuildResult(
             artifact=artifact,
@@ -268,26 +274,47 @@ class KnowledgeService:
             {"playbook_dir": str(target.resolve()), "private": True},
         )
 
+    def _clear_active(self, directory: Path) -> None:
+        """Remove an active pointer; a freshly built manifest is always DRAFT."""
+        active = directory / ACTIVE_FILE
+        if active.exists():
+            active.unlink()
+
     def _resolve_playbook_dir(self) -> Path:
-        """Honor a persisted ``--output`` location; otherwise use the config root."""
+        """Honor a persisted ``--output`` location; otherwise use the config root.
+
+        A present-but-unusable pointer is an explicit ``KNOWLEDGE_LOCATION``
+        failure, never a silent fallback to the default directory: otherwise a
+        stale default artifact could be reported AVAILABLE after a custom
+        artifact (and its active pointer) disappears.
+        """
         pointer = self._paths.playbook / LOCATION_FILE
         if not pointer.is_file():
             return self._paths.playbook
         try:
             payload = _read_json(pointer)
-        except (OSError, UnicodeDecodeError, json.JSONDecodeError):
-            return self._paths.playbook
+        except (OSError, UnicodeDecodeError, json.JSONDecodeError) as exc:
+            raise KnowledgeError(KNOWLEDGE_LOCATION, f"cannot read {LOCATION_FILE}: {exc}") from exc
         value = payload.get("playbook_dir") if isinstance(payload, Mapping) else None
         if not isinstance(value, str) or not value.strip():
-            return self._paths.playbook
+            raise KnowledgeError(
+                KNOWLEDGE_LOCATION, f"{LOCATION_FILE} must contain a playbook_dir string"
+            )
         candidate = Path(value).expanduser()
         if not candidate.is_absolute():
             candidate = self._paths.playbook / candidate
         try:
             resolved = candidate.resolve()
-        except OSError:
-            return self._paths.playbook
-        return resolved if resolved.is_dir() else self._paths.playbook
+        except OSError as exc:
+            raise KnowledgeError(
+                KNOWLEDGE_LOCATION, f"cannot resolve the persisted playbook dir: {exc}"
+            ) from exc
+        if not resolved.is_dir():
+            raise KnowledgeError(
+                KNOWLEDGE_LOCATION,
+                f"the persisted playbook dir is not a directory: {resolved}",
+            )
+        return resolved
 
     def _playbook_paths(self) -> KnowledgePaths:
         playbook = self._resolve_playbook_dir()
@@ -333,10 +360,26 @@ class KnowledgeService:
                 KNOWLEDGE_MANIFEST_INVALID, "topics.json and rules.json must be objects"
             )
         verify_artifact(manifest, playbook, topics, rules)
+        if count_tokens(playbook) != manifest.token_count:
+            raise KnowledgeError(
+                KNOWLEDGE_MANIFEST_INVALID,
+                f"manifest token_count {manifest.token_count} does not match "
+                f"the playbook ({count_tokens(playbook)})",
+            )
         sections = load_sections(playbook)
         if not sections:
             raise KnowledgeError(
                 KNOWLEDGE_MANIFEST_INVALID, "the playbook contains no section headings"
+            )
+        section_ids = [section.section_id for section in sections]
+        if len(set(section_ids)) != len(section_ids):
+            raise KnowledgeError(
+                KNOWLEDGE_MANIFEST_INVALID, "the playbook contains duplicate section ids"
+            )
+        if tuple(section_ids) != manifest.sections:
+            raise KnowledgeError(
+                KNOWLEDGE_MANIFEST_INVALID,
+                "the playbook section ids do not match the manifest",
             )
         return CompiledArtifact(
             playbook=playbook,
@@ -351,9 +394,12 @@ class KnowledgeService:
             artifact = self.load_artifact()
         except KnowledgeError as exc:
             return absent_state(exc.code)
-        return available_state(artifact.manifest, active=self._is_active(artifact.artifact_id))
+        return available_state(artifact.manifest, active=self._is_active(artifact.manifest))
 
-    def _is_active(self, artifact_id: str) -> bool:
+    def _is_active(self, manifest: KnowledgeManifest) -> bool:
+        """An artifact is active only if approved and named by the active pointer."""
+        if manifest.review_status != REVIEW_APPROVED or not manifest.reviewed_by:
+            return False
         path = self._playbook_paths().active_file
         if not path.is_file():
             return False
@@ -361,7 +407,7 @@ class KnowledgeService:
             payload = _read_json(path)
         except (OSError, UnicodeDecodeError, json.JSONDecodeError):
             return False
-        return isinstance(payload, Mapping) and payload.get("artifact_id") == artifact_id
+        return isinstance(payload, Mapping) and payload.get("artifact_id") == manifest.artifact_id
 
     # -- review / activate ----------------------------------------------
 
@@ -382,7 +428,7 @@ class KnowledgeService:
             actor=reviewer,
             payload={"review_status": REVIEW_APPROVED, "private": True},
         )
-        return available_state(manifest, active=self._is_active(manifest.artifact_id))
+        return available_state(manifest, active=self._is_active(manifest))
 
     def activate(self, *, actor: str = "cli", reason: str = "") -> KnowledgeState:
         artifact = self.load_artifact()
@@ -393,8 +439,9 @@ class KnowledgeService:
                 "the knowledge artifact must be reviewed before it can be activated",
             )
         now = utc_timestamp(self._clock.now())
+        paths = self._playbook_paths()
         _write_json(
-            self._playbook_paths().active_file,
+            paths.active_file,
             {
                 "artifact_id": manifest.artifact_id,
                 "activated_at": now,
@@ -405,6 +452,9 @@ class KnowledgeService:
                 "private": True,
             },
         )
+        if paths.playbook != self._paths.playbook:
+            # A custom-output activation must not leave a stale default pointer.
+            self._clear_active(self._paths.playbook)
         self._audit(
             event_type="KNOWLEDGE_ACTIVATED",
             artifact_id=manifest.artifact_id,
@@ -425,6 +475,12 @@ class KnowledgeService:
         payload: dict[str, Any],
     ) -> None:
         if self._store is None:
+            logger.warning(
+                "knowledge audit event %s for artifact %s was not persisted: "
+                "no audit store is configured",
+                event_type,
+                artifact_id,
+            )
             return
         record_audit(
             self._store,
@@ -447,12 +503,30 @@ class KnowledgeService:
         try:
             artifact = self.load_artifact()
         except KnowledgeError as exc:
+            logger.warning(
+                "knowledge injection degraded to ABSENT for role %s: code=%s",
+                role,
+                exc.code,
+            )
             return absent_injection(str(role), reason=exc.code)
-        if not self._is_active(artifact.artifact_id):
+        if not self._is_active(artifact.manifest):
+            logger.warning(
+                "knowledge injection degraded to ABSENT for role %s: code=%s artifact_id=%s",
+                role,
+                KNOWLEDGE_NOT_ACTIVE,
+                artifact.artifact_id,
+            )
             return absent_injection(str(role), reason=KNOWLEDGE_NOT_ACTIVE)
         return build_knowledge_injection(
             artifact, role=str(role), mode=mode, calc_context=calc_context
         )
+
+
+def knowledge_injection(service: KnowledgeService | None, role: str) -> KnowledgeInjection:
+    """Return the role's injection, or an explicit absent block when unconfigured."""
+    if service is None:
+        return absent_injection(role)
+    return service.injection_for(role)
 
 
 __all__ = [
@@ -468,5 +542,6 @@ __all__ = [
     "KnowledgeBuildResult",
     "KnowledgePaths",
     "KnowledgeService",
+    "knowledge_injection",
     "knowledge_paths",
 ]

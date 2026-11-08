@@ -14,7 +14,7 @@ from decimal import InvalidOperation
 from typing import Any
 
 from oft.application.budget_ledger import BudgetEntry, BudgetLedger, stable_call_id
-from oft.application.knowledge_service import KnowledgeService
+from oft.application.knowledge_service import KnowledgeService, knowledge_injection
 from oft.application.llm_validation import (
     ValidationIssue,
     ValidationOutcome,
@@ -24,7 +24,7 @@ from oft.application.llm_validation import (
     validate_output,
 )
 from oft.application.opportunity_service import OpportunityService
-from oft.application.prompt_builder import KnowledgeInjection, absent_injection
+from oft.application.prompt_builder import KnowledgeInjection
 from oft.application.prompt_service import (
     PromptService,
     RenderedPrompt,
@@ -129,9 +129,7 @@ class AnalysisService:
 
     def _knowledge_injection(self) -> KnowledgeInjection:
         """Mode A by default; a missing/inactive artifact is explicitly absent."""
-        if self._knowledge is None:
-            return absent_injection(PromptRole.ANALYSIS.value)
-        return self._knowledge.injection_for(PromptRole.ANALYSIS.value)
+        return knowledge_injection(self._knowledge, PromptRole.ANALYSIS.value)
 
     def analyze(
         self,
@@ -258,6 +256,8 @@ class AnalysisService:
             budgets=budgets,
             now=now,
             knowledge_artifact_hash=knowledge.artifact_id,
+            knowledge_status=knowledge.status,
+            knowledge_reason=knowledge.reason,
         )
         subject = {
             "symbol": symbol,
@@ -380,6 +380,8 @@ class AnalysisService:
         budgets: list[BudgetEntry],
         now: str,
         knowledge_artifact_hash: str | None,
+        knowledge_status: str | None,
+        knowledge_reason: str | None,
     ) -> dict[str, Any]:
         cost_payload = budgets[0].payload if budgets else None
         return {
@@ -390,6 +392,8 @@ class AnalysisService:
             "prompt_version": rendered.version,
             "prompt_hash": rendered.prompt_hash,
             "knowledge_artifact_hash": knowledge_artifact_hash,
+            "knowledge_status": knowledge_status,
+            "knowledge_reason": knowledge_reason,
             "input_hash": digest,
             "schema_version": "1.0.0",
             "temperature": 0.0,

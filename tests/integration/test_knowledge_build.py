@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import shutil
 import subprocess
 from datetime import UTC, datetime
 from pathlib import Path
@@ -12,12 +13,18 @@ from typer.testing import CliRunner
 
 from oft.application.knowledge_service import (
     MAX_SOURCE_FILE_BYTES,
+    MAX_SOURCE_FILES,
     KnowledgeService,
 )
 from oft.cli.main import app as cli_app
 from oft.clock import FixedClock
 from oft.config import Settings
-from oft.domain.knowledge import KnowledgeError, artifact_hash
+from oft.domain.knowledge import (
+    KnowledgeError,
+    artifact_hash,
+    count_tokens,
+    render_section,
+)
 
 FIXTURES = Path(__file__).resolve().parents[2] / "tests" / "fixtures" / "knowledge"
 
@@ -343,6 +350,25 @@ def test_a_build_output_override_is_persisted_and_honored_by_lifecycle(
     assert service.injection_for("ANALYSIS").status == "AVAILABLE"
 
 
+def test_activating_a_custom_output_clears_the_default_active_pointer(tmp_path: Path) -> None:
+    data_dir = tmp_path / "data"
+    default_dir = data_dir / "knowledge" / "playbook"
+    service = _service(data_dir)
+    service.build(FIXTURES, created_at="2026-10-08T00:00:00.000Z")
+    service.review(reviewed_by="synthetic-reviewer")
+    service.activate(actor="tester", reason="default")
+    assert (default_dir / "active.json").is_file()
+
+    output = tmp_path / "custom-artifacts"
+    service.build(FIXTURES, output=output, created_at="2026-10-08T00:00:00.000Z")
+    service.review(reviewed_by="synthetic-reviewer")
+    assert service.activate(actor="tester", reason="custom").active is True
+
+    assert (output / "active.json").is_file()
+    # The default pointer must not survive a custom-output activation.
+    assert not (default_dir / "active.json").exists()
+
+
 def test_cli_build_output_override_can_be_reviewed_and_activated(
     tmp_path: Path, monkeypatch: object
 ) -> None:
@@ -474,3 +500,212 @@ def test_gitignore_and_the_synthetic_fixture_keep_knowledge_private() -> None:
     fixture = (FIXTURES / "synthetic_playbook.md").read_text(encoding="utf-8").lower()
     assert "synthetic test data" in fixture
     assert "not derived from any book" in fixture
+
+
+def test_a_corrupt_location_pointer_never_falls_back_to_the_default(tmp_path: Path) -> None:
+    data_dir = tmp_path / "data"
+    output = tmp_path / "custom-artifacts"
+    service = _service(data_dir)
+    service.build(FIXTURES, output=output, created_at="2026-10-08T00:00:00.000Z")
+    pointer = data_dir / "knowledge" / "playbook" / "location.json"
+    pointer.write_text("{not-json", encoding="utf-8")
+
+    state = service.load_state()
+    assert state.status == "ABSENT"
+    assert state.reason == "KNOWLEDGE_LOCATION"
+
+    injection = service.injection_for("ANALYSIS")
+    assert injection.status == "ABSENT"
+    assert injection.reason == "KNOWLEDGE_LOCATION"
+
+    with pytest.raises(KnowledgeError) as error:
+        service.review(reviewed_by="synthetic-reviewer")
+    assert error.value.code == "KNOWLEDGE_LOCATION"
+
+
+@pytest.mark.parametrize(
+    "payload",
+    [
+        {},
+        {"playbook_dir": ""},
+        {"playbook_dir": 5},
+        {"playbook_dir": "/definitely/not/a/real/knowledge/dir"},
+    ],
+)
+def test_a_malformed_or_missing_location_target_is_an_explicit_error(
+    tmp_path: Path, payload: dict[str, object]
+) -> None:
+    data_dir = tmp_path / "data"
+    service = _service(data_dir)
+    service.build(FIXTURES, created_at="2026-10-08T00:00:00.000Z")
+    pointer = data_dir / "knowledge" / "playbook" / "location.json"
+    pointer.write_text(json.dumps(payload), encoding="utf-8")
+
+    state = service.load_state()
+
+    assert state.status == "ABSENT"
+    assert state.reason == "KNOWLEDGE_LOCATION"
+
+
+def test_a_stale_location_pointer_never_reports_the_default_artifact_active(
+    tmp_path: Path,
+) -> None:
+    data_dir = tmp_path / "data"
+    service = _service(data_dir)
+    service.build(FIXTURES, created_at="2026-10-08T00:00:00.000Z")
+    service.review(reviewed_by="synthetic-reviewer")
+    service.activate(actor="tester", reason="approved")
+    assert service.load_state().active is True
+
+    custom = tmp_path / "custom-artifacts"
+    service.build(FIXTURES, output=custom, created_at="2026-10-08T00:00:00.000Z")
+    # The pointer now names a directory that no longer exists. The stale
+    # default active artifact must not be reported instead.
+    shutil.rmtree(custom)
+
+    state = service.load_state()
+    assert state.status == "ABSENT"
+    assert state.reason == "KNOWLEDGE_LOCATION"
+    assert state.active is False
+    assert state.exact_replay is False
+
+
+def test_rebuilding_after_activation_clears_the_active_pointer(tmp_path: Path) -> None:
+    data_dir = tmp_path / "data"
+    service = _service(data_dir)
+    service.build(FIXTURES, created_at="2026-10-08T00:00:00.000Z")
+    service.review(reviewed_by="synthetic-reviewer")
+    assert service.activate(actor="tester", reason="approved").active is True
+
+    rebuilt = service.build(FIXTURES, created_at="2026-10-08T00:00:00.000Z")
+    playbook_dir = data_dir / "knowledge" / "playbook"
+
+    assert rebuilt.artifact.artifact_id is not None
+    assert not (playbook_dir / "active.json").exists()
+    state = service.load_state()
+    assert state.status == "AVAILABLE"
+    assert state.active is False
+    assert state.review_status == "DRAFT"
+    assert state.exact_replay is False
+    assert service.injection_for("ANALYSIS").reason == "KNOWLEDGE_NOT_ACTIVE"
+
+
+def test_an_approved_manifest_without_a_reviewer_is_rejected_on_load(tmp_path: Path) -> None:
+    data_dir = tmp_path / "data"
+    service = _service(data_dir)
+    service.build(FIXTURES, created_at="2026-10-08T00:00:00.000Z")
+    manifest_path = data_dir / "knowledge" / "playbook" / "manifest.json"
+    manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+    manifest["review_status"] = "APPROVED"
+    manifest_path.write_text(json.dumps(manifest), encoding="utf-8")
+
+    state = service.load_state()
+
+    assert state.status == "ABSENT"
+    assert state.reason == "KNOWLEDGE_MANIFEST_INVALID"
+
+
+def test_a_tampered_playbook_is_reported_as_an_artifact_mismatch(tmp_path: Path) -> None:
+    data_dir = tmp_path / "data"
+    service = _service(data_dir)
+    service.build(FIXTURES, created_at="2026-10-08T00:00:00.000Z")
+    playbook_path = data_dir / "knowledge" / "playbook" / "playbook.md"
+    playbook_path.write_text(
+        playbook_path.read_text(encoding="utf-8") + "\ntampered\n", encoding="utf-8"
+    )
+
+    state = service.load_state()
+
+    assert state.status == "ABSENT"
+    assert state.reason == "KNOWLEDGE_ARTIFACT_MISMATCH"
+
+
+def test_a_header_only_playbook_is_not_a_valid_artifact(tmp_path: Path) -> None:
+    data_dir = tmp_path / "data"
+    service = _service(data_dir)
+    built = service.build(FIXTURES, created_at="2026-10-08T00:00:00.000Z")
+    playbook_dir = data_dir / "knowledge" / "playbook"
+    header_only = "# Order-flow playbook\n\n"
+    (playbook_dir / "playbook.md").write_text(header_only, encoding="utf-8")
+    manifest = built.artifact.manifest.to_dict()
+    manifest["artifact_id"] = artifact_hash(
+        header_only, built.artifact.topics, built.artifact.rules
+    )
+    manifest["token_count"] = count_tokens(header_only)
+    manifest["sections"] = []
+    (playbook_dir / "manifest.json").write_text(json.dumps(manifest), encoding="utf-8")
+
+    state = service.load_state()
+
+    assert state.status == "ABSENT"
+    assert state.reason == "KNOWLEDGE_MANIFEST_INVALID"
+
+
+def test_a_playbook_with_duplicate_section_ids_is_rejected(tmp_path: Path) -> None:
+    data_dir = tmp_path / "data"
+    service = _service(data_dir)
+    built = service.build(FIXTURES, created_at="2026-10-08T00:00:00.000Z")
+    playbook_dir = data_dir / "knowledge" / "playbook"
+    playbook = built.artifact.playbook + "\n" + render_section(built.artifact.sections[0])
+    (playbook_dir / "playbook.md").write_text(playbook, encoding="utf-8")
+    manifest = built.artifact.manifest.to_dict()
+    manifest["artifact_id"] = artifact_hash(playbook, built.artifact.topics, built.artifact.rules)
+    manifest["token_count"] = count_tokens(playbook)
+    (playbook_dir / "manifest.json").write_text(json.dumps(manifest), encoding="utf-8")
+
+    state = service.load_state()
+
+    assert state.status == "ABSENT"
+    assert state.reason == "KNOWLEDGE_MANIFEST_INVALID"
+
+
+def test_a_manifest_that_disagrees_with_the_playbook_is_rejected(tmp_path: Path) -> None:
+    data_dir = tmp_path / "data"
+    service = _service(data_dir)
+    service.build(FIXTURES, created_at="2026-10-08T00:00:00.000Z")
+    manifest_path = data_dir / "knowledge" / "playbook" / "manifest.json"
+    payload = json.loads(manifest_path.read_text(encoding="utf-8"))
+
+    payload["sections"] = payload["sections"][:-1]
+    manifest_path.write_text(json.dumps(payload), encoding="utf-8")
+    assert service.load_state().reason == "KNOWLEDGE_MANIFEST_INVALID"
+
+    payload = json.loads((data_dir / "knowledge" / "playbook" / "manifest.json").read_text())
+    payload["token_count"] += 1
+    manifest_path.write_text(json.dumps(payload), encoding="utf-8")
+    assert service.load_state().reason == "KNOWLEDGE_MANIFEST_INVALID"
+
+
+def test_build_caps_the_number_of_source_files(tmp_path: Path) -> None:
+    source = tmp_path / "source"
+    source.mkdir()
+    for index in range(MAX_SOURCE_FILES + 1):
+        (source / f"{index}.md").write_text("## Delta context\n\nbody\n", encoding="utf-8")
+
+    with pytest.raises(KnowledgeError) as error:
+        _service(tmp_path / "data").build(source)
+
+    assert error.value.code == "KNOWLEDGE_SOURCE_TOO_LARGE"
+
+
+def test_cli_review_and_activate_json_carry_the_private_warning(
+    tmp_path: Path, monkeypatch: object
+) -> None:
+    data_dir = tmp_path / "data"
+    _env(monkeypatch, data_dir)
+    runner = CliRunner()
+
+    built = runner.invoke(cli_app, ["knowledge", "build", "--source", str(FIXTURES), "--json"])
+    assert built.exit_code == 0, built.output
+
+    reviewed = runner.invoke(
+        cli_app, ["knowledge", "review", "--reviewed-by", "synthetic-reviewer", "--json"]
+    )
+    assert reviewed.exit_code == 0, reviewed.output
+    review_data = _json(reviewed.stdout)["data"]
+    assert "private" in str(review_data["warning"]).lower()
+    assert "private" in str(review_data["license_note"]).lower()
+
+    activated = runner.invoke(cli_app, ["knowledge", "activate", "--actor", "tester", "--json"])
+    assert activated.exit_code == 0, activated.output
+    assert "private" in str(_json(activated.stdout)["data"]["warning"]).lower()

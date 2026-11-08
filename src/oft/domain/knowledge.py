@@ -39,9 +39,12 @@ KNOWLEDGE_NOT_REVIEWED = "KNOWLEDGE_NOT_REVIEWED"
 KNOWLEDGE_NOT_ACTIVE = "KNOWLEDGE_NOT_ACTIVE"
 KNOWLEDGE_MODE_UNAVAILABLE = "KNOWLEDGE_MODE_UNAVAILABLE"
 KNOWLEDGE_BUDGET_EXCEEDED = "KNOWLEDGE_BUDGET_EXCEEDED"
+KNOWLEDGE_LOCATION = "KNOWLEDGE_LOCATION"
 
 REVIEW_DRAFT = "DRAFT"
 REVIEW_APPROVED = "APPROVED"
+
+SUMMARY_MARKER = "\n[summarized]"
 
 MIN_SECTION_TOKENS = 8
 _ARTIFACT_HASH_PATTERN = re.compile(r"^[0-9a-f]{64}$")
@@ -129,6 +132,22 @@ class KnowledgeSection:
     title: str
     body: str
     source: str
+
+    def __post_init__(self) -> None:
+        if SECTION_ID_PATTERN.fullmatch(self.section_id) is None:
+            raise KnowledgeError(
+                KNOWLEDGE_MANIFEST_INVALID,
+                f"invalid knowledge section id {self.section_id!r}",
+            )
+        if _TOPIC_PATTERN.fullmatch(self.topic) is None:
+            raise KnowledgeError(
+                KNOWLEDGE_MANIFEST_INVALID, f"invalid knowledge topic {self.topic!r}"
+            )
+        if self.section_id.split("-")[1] != self.topic:
+            raise KnowledgeError(
+                KNOWLEDGE_MANIFEST_INVALID,
+                f"section {self.section_id!r} does not belong to topic {self.topic!r}",
+            )
 
 
 @dataclass(frozen=True)
@@ -245,23 +264,42 @@ def count_tokens(text: str) -> int:
     return (len(text) + CHARS_PER_TOKEN - 1) // CHARS_PER_TOKEN
 
 
+def string_list(value: object) -> list[str]:
+    """Return the string members of a JSON value, dropping everything else."""
+    if not isinstance(value, list):
+        return []
+    return [item for item in value if isinstance(item, str)]
+
+
 def summarize_text(text: str, max_tokens: int) -> str:
-    """Deterministically keep the leading prose within ``max_tokens``.
+    """Deterministically keep the leading prose within ``max_tokens`` tokens.
 
     This is an extractive summary (first complete sentences/lines), never a
-    concatenation of later material without a budget.
+    concatenation of later material without a budget. The ``[summarized]``
+    marker is charged against the budget; when it leaves no room for prose, or
+    the marked summary would not actually be shorter, the normalized original
+    is returned unchanged.
     """
     normalized = _normalize_body(text)
     if count_tokens(normalized) <= max_tokens:
         return normalized
-    max_chars = max(CHARS_PER_TOKEN, max_tokens * CHARS_PER_TOKEN)
+    marker_tokens = count_tokens(SUMMARY_MARKER)
+    body_budget = max_tokens - marker_tokens
+    if body_budget < 1:
+        return normalized
+    max_chars = body_budget * CHARS_PER_TOKEN
     window = normalized[:max_chars]
     cut = max(window.rfind("\n\n"), window.rfind(". "), window.rfind("\n"))
     kept = window if cut <= 0 else window[: cut + 1]
     kept = kept.rstrip()
     if not kept:
         kept = window.rstrip()
-    return f"{kept}\n[summarized]"
+    if not kept:
+        return normalized
+    summary = f"{kept}{SUMMARY_MARKER}"
+    if len(summary) >= len(normalized):
+        return normalized
+    return summary
 
 
 def _normalize_body(text: str) -> str:
@@ -379,16 +417,12 @@ def topic_definitions(config: Mapping[str, Any] | None = None) -> tuple[TopicDef
             continue
         if not isinstance(title, str) or not title.strip():
             continue
-        keyword_values = (
-            tuple(str(keyword) for keyword in keywords if isinstance(keyword, str))
-            if isinstance(keywords, list)
-            else ()
-        )
+        keyword_values = tuple(string_list(keywords)) or (name.replace("_", " "),)
         definitions.append(
             TopicDefinition(
                 name=name,
                 title=title.strip(),
-                keywords=keyword_values or (name.replace("_", " "),),
+                keywords=keyword_values,
             )
         )
     return tuple(definitions) or DEFAULT_TAXONOMY
@@ -461,6 +495,38 @@ def _dedupe_dropped(items: Sequence[DroppedContent]) -> tuple[DroppedContent, ..
     return tuple(best.values())
 
 
+def _summarize_section(
+    section: KnowledgeSection, per_section: int
+) -> tuple[KnowledgeSection, DroppedContent | None]:
+    """Summarize one section to ``per_section`` tokens, recording lost tokens."""
+    heading_tokens = count_tokens(f"## {section.section_id} — {section.title}\n\n")
+    allowed = max(1, per_section - heading_tokens)
+    summary = summarize_text(section.body, allowed)
+    if summary.strip() == section.body.strip():
+        return section, None
+    lost = max(0, count_tokens(section.body) - count_tokens(summary))
+    dropped = (
+        DroppedContent(
+            title=section.title,
+            reason="summarized",
+            tokens=lost,
+            source=section.source,
+        )
+        if lost
+        else None
+    )
+    return replace(section, body=summary), dropped
+
+
+def _drop_section(section: KnowledgeSection) -> DroppedContent:
+    return DroppedContent(
+        title=section.title,
+        reason="budget",
+        tokens=count_tokens(render_section(section)),
+        source=section.source,
+    )
+
+
 def fit_sections_to_budget(
     sections: Sequence[KnowledgeSection], *, budget: int = PLAYBOOK_TOKEN_BUDGET
 ) -> BudgetResult:
@@ -476,27 +542,13 @@ def fit_sections_to_budget(
     for _ in range(16):
         summarized_sections: list[KnowledgeSection] = []
         for section in current:
-            rendered_tokens = count_tokens(render_section(section))
-            if rendered_tokens <= per_section:
+            if count_tokens(render_section(section)) <= per_section:
                 summarized_sections.append(section)
                 continue
-            heading_tokens = count_tokens(f"## {section.section_id} — {section.title}\n\n")
-            allowed = max(1, per_section - heading_tokens)
-            summary = summarize_text(section.body, allowed)
-            if summary.strip() == section.body.strip():
-                summarized_sections.append(section)
-                continue
-            lost = max(0, count_tokens(section.body) - count_tokens(summary))
-            summarized_sections.append(replace(section, body=summary))
-            if lost:
-                dropped.append(
-                    DroppedContent(
-                        title=section.title,
-                        reason="summarized",
-                        tokens=lost,
-                        source=section.source,
-                    )
-                )
+            updated, lost = _summarize_section(section, per_section)
+            summarized_sections.append(updated)
+            if lost is not None:
+                dropped.append(lost)
         current = summarized_sections
         if _total_tokens(current) <= budget:
             return BudgetResult(
@@ -505,15 +557,7 @@ def fit_sections_to_budget(
         per_section = max(MIN_SECTION_TOKENS, per_section * 3 // 4)
 
     while len(current) > 1 and _total_tokens(current) > budget:
-        removed = current.pop()
-        dropped.append(
-            DroppedContent(
-                title=removed.title,
-                reason="budget",
-                tokens=count_tokens(render_section(removed)),
-                source=removed.source,
-            )
-        )
+        dropped.append(_drop_section(current.pop()))
 
     # The summarize fallback can still leave a single section over budget (its
     # heading plus the ``[summarized]`` marker cannot be shrunk indefinitely).
@@ -521,31 +565,14 @@ def fit_sections_to_budget(
     # tiny budgets that cannot even hold the header.
     while current and _total_tokens(current) > budget:
         section = current[0]
-        heading_tokens = count_tokens(f"## {section.section_id} — {section.title}\n\n")
-        allowed = max(1, body_budget - heading_tokens)
-        summary = summarize_text(section.body, allowed)
-        if len(current) == 1 and summary.strip() != section.body.strip():
-            lost = max(0, count_tokens(section.body) - count_tokens(summary))
-            current[0] = replace(section, body=summary)
-            dropped.append(
-                DroppedContent(
-                    title=section.title,
-                    reason="summarized",
-                    tokens=lost,
-                    source=section.source,
-                )
-            )
+        updated, lost = _summarize_section(section, body_budget)
+        if len(current) == 1 and updated is not section:
+            current[0] = updated
+            if lost is not None:
+                dropped.append(lost)
             if _total_tokens(current) <= budget:
                 break
-        removed = current.pop()
-        dropped.append(
-            DroppedContent(
-                title=removed.title,
-                reason="budget",
-                tokens=count_tokens(render_section(removed)),
-                source=removed.source,
-            )
-        )
+        dropped.append(_drop_section(current.pop()))
 
     if _total_tokens(current) > budget:
         raise KnowledgeError(
@@ -608,26 +635,15 @@ def build_rules_document(
             if not isinstance(entry, Mapping):
                 continue
             raw_topics = entry.get("topics")
-            topic_names = (
-                [str(name) for name in raw_topics if isinstance(name, str)]
-                if isinstance(raw_topics, list)
-                else []
-            )
+            topic_names = string_list(raw_topics)
             section_ids: list[str] = []
             if isinstance(topics_section, Mapping):
                 for name in topic_names:
                     topic_entry = topics_section.get(name)
                     if not isinstance(topic_entry, Mapping):
                         continue
-                    ids = topic_entry.get("section_ids")
-                    if isinstance(ids, list):
-                        section_ids.extend(str(item) for item in ids if isinstance(item, str))
-            raw_rules = entry.get("rules")
-            rules = (
-                [str(rule) for rule in raw_rules if isinstance(rule, str)]
-                if isinstance(raw_rules, list)
-                else []
-            )
+                    section_ids.extend(string_list(topic_entry.get("section_ids")))
+            rules = string_list(entry.get("rules"))
             roles[role] = {
                 "section_ids": list(dict.fromkeys(section_ids)),
                 "rules": rules,
@@ -652,16 +668,8 @@ def fit_rules_to_budget(
             raw_ids = entry.get("section_ids")
             raw_rules = entry.get("rules")
             roles[str(role)] = {
-                "section_ids": (
-                    [str(item) for item in raw_ids if isinstance(item, str)]
-                    if isinstance(raw_ids, list)
-                    else []
-                ),
-                "rules": (
-                    [str(item) for item in raw_rules if isinstance(item, str)]
-                    if isinstance(raw_rules, list)
-                    else []
-                ),
+                "section_ids": string_list(raw_ids),
+                "rules": string_list(raw_rules),
             }
     document: dict[str, Any] = {
         "version": rules_document.get("version", 1),
@@ -809,8 +817,21 @@ def load_sections(playbook: str, *, source: str = "playbook.md") -> tuple[Knowle
             )
         )
 
+    fence: str | None = None
     for raw_line in playbook.replace("\r\n", "\n").split("\n"):
         line = raw_line.rstrip()
+        stripped = line.strip()
+        if fence is not None:
+            if stripped.startswith(fence):
+                fence = None
+            if current_id is not None:
+                body.append(line)
+            continue
+        if stripped.startswith("```") or stripped.startswith("~~~"):
+            fence = stripped[:3]
+            if current_id is not None:
+                body.append(line)
+            continue
         match = _SECTION_HEADING.match(line)
         if match is not None:
             _flush()
@@ -835,6 +856,76 @@ _MANIFEST_REQUIRED = (
     "token_count",
     "playbook_token_budget",
 )
+
+
+def _validate_source_skills(raw: object) -> list[dict[str, str]]:
+    if not isinstance(raw, list) or not raw:
+        raise KnowledgeError(KNOWLEDGE_MANIFEST_INVALID, "source_skills must be a non-empty list")
+    parsed: list[dict[str, str]] = []
+    for item in raw:
+        if not isinstance(item, Mapping):
+            raise KnowledgeError(KNOWLEDGE_MANIFEST_INVALID, "each source_skill must be an object")
+        slug = item.get("slug")
+        content_hash = item.get("content_hash")
+        if not isinstance(slug, str) or not isinstance(content_hash, str):
+            raise KnowledgeError(
+                KNOWLEDGE_MANIFEST_INVALID,
+                "each source_skill needs slug and content_hash strings",
+            )
+        parsed.append({"slug": slug, "content_hash": content_hash})
+    return parsed
+
+
+def _validate_review_fields(
+    data: Mapping[str, Any],
+) -> tuple[str | None, str, str | None]:
+    reviewed_by = data.get("reviewed_by")
+    if reviewed_by is not None and not isinstance(reviewed_by, str):
+        raise KnowledgeError(KNOWLEDGE_MANIFEST_INVALID, "reviewed_by must be a string or null")
+    review_status = data.get("review_status", REVIEW_DRAFT)
+    if review_status not in {REVIEW_DRAFT, REVIEW_APPROVED}:
+        raise KnowledgeError(KNOWLEDGE_MANIFEST_INVALID, "review_status must be DRAFT or APPROVED")
+    reviewed_at = data.get("reviewed_at")
+    if reviewed_at is not None and not isinstance(reviewed_at, str):
+        raise KnowledgeError(KNOWLEDGE_MANIFEST_INVALID, "reviewed_at must be a string or null")
+    if review_status == REVIEW_APPROVED:
+        # An approval claim is only real with a named reviewer and timestamp.
+        if not isinstance(reviewed_by, str) or not reviewed_by.strip():
+            raise KnowledgeError(
+                KNOWLEDGE_MANIFEST_INVALID,
+                "an APPROVED manifest requires a non-empty reviewed_by",
+            )
+        if not isinstance(reviewed_at, str) or not reviewed_at.strip():
+            raise KnowledgeError(
+                KNOWLEDGE_MANIFEST_INVALID, "an APPROVED manifest requires reviewed_at"
+            )
+    return reviewed_by, str(review_status), reviewed_at
+
+
+def _validate_section_ids(raw: object) -> tuple[str, ...]:
+    if not isinstance(raw, list) or any(not isinstance(item, str) for item in raw):
+        raise KnowledgeError(KNOWLEDGE_MANIFEST_INVALID, "sections must be a list of strings")
+    for item in raw:
+        if SECTION_ID_PATTERN.fullmatch(item) is None:
+            raise KnowledgeError(
+                KNOWLEDGE_MANIFEST_INVALID, f"manifest section id {item!r} is malformed"
+            )
+    if len(set(raw)) != len(raw):
+        raise KnowledgeError(KNOWLEDGE_MANIFEST_INVALID, "manifest section ids must be unique")
+    return tuple(raw)
+
+
+def _validate_topic_names(raw: object) -> tuple[str, ...]:
+    if not isinstance(raw, list) or any(not isinstance(item, str) for item in raw):
+        raise KnowledgeError(KNOWLEDGE_MANIFEST_INVALID, "topics must be a list of strings")
+    for item in raw:
+        if _TOPIC_PATTERN.fullmatch(item) is None:
+            raise KnowledgeError(
+                KNOWLEDGE_MANIFEST_INVALID, f"manifest topic name {item!r} is malformed"
+            )
+    if len(set(raw)) != len(raw):
+        raise KnowledgeError(KNOWLEDGE_MANIFEST_INVALID, "manifest topic names must be unique")
+    return tuple(raw)
 
 
 def validate_manifest(data: Mapping[str, Any]) -> KnowledgeManifest:
@@ -864,9 +955,7 @@ def validate_manifest(data: Mapping[str, Any]) -> KnowledgeManifest:
             KNOWLEDGE_MANIFEST_INVALID,
             "manifest license_note must state that the artifact is private",
         )
-    reviewed_by = data.get("reviewed_by")
-    if reviewed_by is not None and not isinstance(reviewed_by, str):
-        raise KnowledgeError(KNOWLEDGE_MANIFEST_INVALID, "reviewed_by must be a string or null")
+    reviewed_by, review_status, reviewed_at = _validate_review_fields(data)
     method = data.get("token_count_method")
     if method != TOKEN_COUNT_METHOD:
         raise KnowledgeError(
@@ -886,27 +975,7 @@ def validate_manifest(data: Mapping[str, Any]) -> KnowledgeManifest:
             KNOWLEDGE_MANIFEST_INVALID,
             f"token_count {token_count} exceeds the playbook budget {budget}",
         )
-    source_skills = data.get("source_skills")
-    if not isinstance(source_skills, list) or not source_skills:
-        raise KnowledgeError(KNOWLEDGE_MANIFEST_INVALID, "source_skills must be a non-empty list")
-    parsed_sources: list[dict[str, str]] = []
-    for item in source_skills:
-        if not isinstance(item, Mapping):
-            raise KnowledgeError(KNOWLEDGE_MANIFEST_INVALID, "each source_skill must be an object")
-        slug = item.get("slug")
-        content_hash = item.get("content_hash")
-        if not isinstance(slug, str) or not isinstance(content_hash, str):
-            raise KnowledgeError(
-                KNOWLEDGE_MANIFEST_INVALID,
-                "each source_skill needs slug and content_hash strings",
-            )
-        parsed_sources.append({"slug": slug, "content_hash": content_hash})
-    review_status = data.get("review_status", REVIEW_DRAFT)
-    if review_status not in {REVIEW_DRAFT, REVIEW_APPROVED}:
-        raise KnowledgeError(KNOWLEDGE_MANIFEST_INVALID, "review_status must be DRAFT or APPROVED")
-    reviewed_at = data.get("reviewed_at")
-    if reviewed_at is not None and not isinstance(reviewed_at, str):
-        raise KnowledgeError(KNOWLEDGE_MANIFEST_INVALID, "reviewed_at must be a string or null")
+    parsed_sources = _validate_source_skills(data.get("source_skills"))
     summarized = data.get("summarized", False)
     if not isinstance(summarized, bool):
         raise KnowledgeError(KNOWLEDGE_MANIFEST_INVALID, "summarized must be a bool")
@@ -918,14 +987,8 @@ def validate_manifest(data: Mapping[str, Any]) -> KnowledgeManifest:
         if not isinstance(item, Mapping):
             raise KnowledgeError(KNOWLEDGE_MANIFEST_INVALID, "each dropped item must be an object")
         dropped.append(dict(item))
-    sections_raw = data.get("sections", [])
-    if not isinstance(sections_raw, list) or any(
-        not isinstance(item, str) for item in sections_raw
-    ):
-        raise KnowledgeError(KNOWLEDGE_MANIFEST_INVALID, "sections must be a list of strings")
-    topics_raw = data.get("topics", [])
-    if not isinstance(topics_raw, list) or any(not isinstance(item, str) for item in topics_raw):
-        raise KnowledgeError(KNOWLEDGE_MANIFEST_INVALID, "topics must be a list of strings")
+    sections = _validate_section_ids(data.get("sections", []))
+    topics = _validate_topic_names(data.get("topics", []))
     return KnowledgeManifest(
         artifact_id=artifact_id,
         compiler_version=compiler_version,
@@ -936,12 +999,12 @@ def validate_manifest(data: Mapping[str, Any]) -> KnowledgeManifest:
         token_count_method=str(method),
         token_count=token_count,
         playbook_token_budget=budget,
-        review_status=str(review_status),
+        review_status=review_status,
         reviewed_at=reviewed_at,
         summarized=summarized,
         dropped=tuple(dropped),
-        sections=tuple(sections_raw),
-        topics=tuple(topics_raw),
+        sections=sections,
+        topics=topics,
     )
 
 
@@ -1009,10 +1072,8 @@ def sections_for_topics(
         if not isinstance(entry, Mapping):
             continue
         ids = entry.get("section_ids")
-        if not isinstance(ids, list):
-            continue
-        for item in ids:
-            if isinstance(item, str) and item not in section_ids:
+        for item in string_list(ids):
+            if item not in section_ids:
                 section_ids.append(item)
     return tuple(section_ids)
 
@@ -1051,6 +1112,7 @@ __all__ = [
     "KNOWLEDGE_ABSENT",
     "KNOWLEDGE_ARTIFACT_MISMATCH",
     "KNOWLEDGE_BUDGET_EXCEEDED",
+    "KNOWLEDGE_LOCATION",
     "KNOWLEDGE_MANIFEST_INVALID",
     "KNOWLEDGE_MODE_UNAVAILABLE",
     "KNOWLEDGE_NOT_ACTIVE",
@@ -1065,6 +1127,7 @@ __all__ = [
     "REVIEW_DRAFT",
     "RULES_TOKEN_BUDGET",
     "SECTION_ID_PATTERN",
+    "SUMMARY_MARKER",
     "TOKEN_COUNT_METHOD",
     "BudgetResult",
     "CompiledArtifact",
@@ -1091,6 +1154,7 @@ __all__ = [
     "render_section",
     "sections_for_topics",
     "select_topics_for_context",
+    "string_list",
     "summarize_text",
     "topic_definitions",
     "validate_manifest",

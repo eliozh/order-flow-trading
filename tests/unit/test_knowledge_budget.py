@@ -111,13 +111,30 @@ def test_default_budget_matches_the_adr_limit() -> None:
     assert PLAYBOOK_TOKEN_BUDGET == 10_000
 
 
-def test_summarize_text_does_not_increase_the_text() -> None:
+def test_summarize_text_keeps_the_prefix_and_marks_the_cut() -> None:
+    text = "First sentence. Second sentence. Third sentence."
+
+    summary = summarize_text(text, 10)
+
+    assert len(summary) < len(text)
+    assert summary.startswith("First")
+    assert "[summarized]" in summary
+
+
+def test_summarize_text_reserves_space_for_the_marker() -> None:
     text = "Alpha sentence. Beta sentence. Gamma sentence. Delta sentence."
 
-    summary = summarize_text(text, 3)
+    for limit in (5, 6, 8, 12):
+        summary = summarize_text(text, limit)
+        assert count_tokens(summary) <= limit
 
-    assert len(summary) <= len(text)
-    assert summary.endswith("[summarized]")
+
+def test_summarize_text_returns_the_original_when_no_shorter_summary_fits() -> None:
+    text = "Alpha sentence. Beta sentence."
+
+    # The marker alone costs four tokens, so a three-token budget cannot
+    # produce a shorter marked summary and the original is returned instead.
+    assert summarize_text(text, 3) == text
 
 
 def test_summarize_text_returns_short_text_unchanged() -> None:
@@ -163,3 +180,24 @@ def test_a_tiny_budget_still_produces_a_valid_reloadable_manifest() -> None:
     # The manifest validates on reload: token_count never exceeds the budget.
     reloaded = validate_manifest(artifact.manifest.to_dict())
     assert reloaded.token_count == artifact.manifest.token_count
+
+
+def test_a_budget_smaller_than_the_playbook_header_is_rejected() -> None:
+    from oft.domain.knowledge import KnowledgeError
+
+    with pytest.raises(KnowledgeError) as error:
+        compile_artifact(
+            [("doc", "## Delta context\n\nBody.\n")],
+            generated_at=GENERATED_AT,
+            taxonomy=topic_definitions(
+                {
+                    "topics": [
+                        {"name": name, "title": title, "keywords": list(keywords)}
+                        for name, title, keywords in TAXONOMY
+                    ]
+                }
+            ),
+            budget=1,
+        )
+
+    assert error.value.code == "KNOWLEDGE_BUDGET_EXCEEDED"
