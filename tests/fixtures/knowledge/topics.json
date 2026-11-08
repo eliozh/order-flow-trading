@@ -1,0 +1,88 @@
+{
+  "version": 1,
+  "topics": [
+    {
+      "name": "market_structure",
+      "title": "Market structure and auction theory",
+      "keywords": ["market structure", "auction", "acceptance", "rejection"]
+    },
+    {
+      "name": "absorption",
+      "title": "Absorption and exhaustion",
+      "keywords": ["absorption", "exhaustion", "trapped"]
+    },
+    {
+      "name": "cvd",
+      "title": "Cumulative volume delta",
+      "keywords": ["cvd", "cumulative volume delta"]
+    },
+    {
+      "name": "delta",
+      "title": "Delta interpretation",
+      "keywords": ["delta"]
+    },
+    {
+      "name": "footprint",
+      "title": "Footprint reading",
+      "keywords": ["footprint", "imbalance", "stacked imbalance"]
+    },
+    {
+      "name": "volume_profile",
+      "title": "Volume profile",
+      "keywords": ["volume profile", "poc", "point of control", "value area"]
+    },
+    {
+      "name": "open_interest",
+      "title": "Open interest",
+      "keywords": ["open interest"]
+    },
+    {
+      "name": "funding",
+      "title": "Funding context",
+      "keywords": ["funding"]
+    },
+    {
+      "name": "liquidations",
+      "title": "Liquidations and stop runs",
+      "keywords": ["liquidation", "stop run", "stop-run"]
+    },
+    {
+      "name": "entry",
+      "title": "Entry and invalidation",
+      "keywords": ["entry", "invalidation"]
+    },
+    {
+      "name": "management",
+      "title": "Trade management",
+      "keywords": ["trade management", "management"]
+    },
+    {
+      "name": "risk",
+      "title": "Risk",
+      "keywords": ["risk", "position size"]
+    },
+    {
+      "name": "psychology",
+      "title": "Psychology and discipline",
+      "keywords": ["psychology", "discipline", "revenge"]
+    },
+    {
+      "name": "anti_patterns",
+      "title": "Anti-patterns and review checklists",
+      "keywords": ["anti-pattern", "anti pattern", "checklist", "review"]
+    }
+  ],
+  "calc_context": {
+    "regime": {
+      "TRENDING_UP": ["market_structure", "delta"],
+      "RANGE": ["volume_profile", "absorption"]
+    },
+    "value_area": {
+      "ABOVE": ["volume_profile", "absorption"],
+      "BELOW": ["volume_profile", "liquidations"]
+    },
+    "funding": {
+      "HIGH": ["funding", "open_interest"]
+    }
+  }
+}

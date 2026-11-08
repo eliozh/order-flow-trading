@@ -1,0 +1,59 @@
+{
+  "artifact_id": "149591a7e252080fb28c487cccc8454e2675315a034ad7e82c57a55b0fbd6202",
+  "compiler_version": "knowledge-compiler.v1",
+  "created_at": "2026-10-08T00:00:00.000Z",
+  "dropped": [
+    {
+      "reason": "out_of_taxonomy",
+      "source": "synthetic_playbook",
+      "title": "Cooking recipes",
+      "tokens": 43
+    }
+  ],
+  "license_note": "private; do not distribute",
+  "playbook_token_budget": 10000,
+  "review_status": "DRAFT",
+  "reviewed_at": null,
+  "reviewed_by": null,
+  "sections": [
+    "K-market_structure-1",
+    "K-absorption-1",
+    "K-cvd-1",
+    "K-delta-1",
+    "K-footprint-1",
+    "K-volume_profile-1",
+    "K-open_interest-1",
+    "K-funding-1",
+    "K-liquidations-1",
+    "K-entry-1",
+    "K-management-1",
+    "K-risk-1",
+    "K-psychology-1",
+    "K-anti_patterns-1"
+  ],
+  "source_skills": [
+    {
+      "content_hash": "d03bca33ab0016fdfc6081694f18584cbe44d555d74e662719fab7636a0a1860",
+      "slug": "synthetic_playbook"
+    }
+  ],
+  "summarized": false,
+  "token_count": 1069,
+  "token_count_method": "chars_div_4",
+  "topics": [
+    "market_structure",
+    "absorption",
+    "cvd",
+    "delta",
+    "footprint",
+    "volume_profile",
+    "open_interest",
+    "funding",
+    "liquidations",
+    "entry",
+    "management",
+    "risk",
+    "psychology",
+    "anti_patterns"
+  ]
+}

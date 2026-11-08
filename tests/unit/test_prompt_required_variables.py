@@ -56,6 +56,51 @@ def test_every_default_body_is_valid() -> None:
         validate_body(DEFAULT_USER_BODIES[role], role=role)
 
 
+def test_knowledge_placeholder_must_be_inside_knowledge_delimiters() -> None:
+    undelimited = (
+        DEFAULT_USER_BODIES[PromptRole.ANALYSIS]
+        .replace("<knowledge>", "")
+        .replace("</knowledge>", "")
+    )
+
+    with pytest.raises(PromptValidationError) as excinfo:
+        validate_body(undelimited, role=PromptRole.ANALYSIS)
+
+    assert excinfo.value.variable == "knowledge"
+    assert "knowledge" in excinfo.value.message
+
+
+def test_a_spaced_knowledge_placeholder_inside_the_delimiters_is_accepted() -> None:
+    body = DEFAULT_USER_BODIES[PromptRole.ANALYSIS].replace("{{knowledge}}", "{{ knowledge }}")
+
+    assert "knowledge" in validate_body(body, role=PromptRole.ANALYSIS)
+
+
+def test_every_knowledge_placeholder_must_be_delimited() -> None:
+    # A second, undelimited placeholder smuggled after the delimited one would
+    # otherwise inject raw knowledge text outside the data region.
+    smuggled = DEFAULT_USER_BODIES[PromptRole.ANALYSIS] + "\n{{knowledge}}\n"
+
+    with pytest.raises(PromptValidationError) as excinfo:
+        validate_body(smuggled, role=PromptRole.ANALYSIS)
+    assert excinfo.value.variable == "knowledge"
+
+    # A placeholder before the opening tag is equally rejected.
+    leading = DEFAULT_USER_BODIES[PromptRole.ANALYSIS].replace(
+        "<knowledge>\n{{knowledge}}\n</knowledge>", "{{knowledge}}"
+    )
+    with pytest.raises(PromptValidationError):
+        validate_body(leading, role=PromptRole.ANALYSIS)
+
+
+def test_multiple_delimited_knowledge_placeholders_are_accepted() -> None:
+    body = (
+        DEFAULT_USER_BODIES[PromptRole.ANALYSIS] + "\n<knowledge>\n{{ knowledge }}\n</knowledge>\n"
+    )
+
+    validate_body(body, role=PromptRole.ANALYSIS)
+
+
 def test_unknown_variable_is_rejected_and_named() -> None:
     with pytest.raises(PromptValidationError) as excinfo:
         validate_body("{{openai_api_key}} {{symbol}}", role=PromptRole.ANALYSIS)

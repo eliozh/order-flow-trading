@@ -11,6 +11,7 @@ from oft.cli.commands.backfill import backfill_app
 from oft.cli.commands.daemon import daemon_app
 from oft.cli.commands.doctor import doctor_command, emit_error
 from oft.cli.commands.kill import kill_app
+from oft.cli.commands.knowledge import knowledge_app
 from oft.cli.commands.open import open_command
 from oft.cli.commands.opp import opp_app
 from oft.cli.commands.paper import paper_app
@@ -46,6 +47,7 @@ app.add_typer(opp_app, name="opp")
 app.add_typer(trigger_app, name="trigger")
 app.add_typer(paper_app, name="paper")
 app.add_typer(prompt_app, name="prompt")
+app.add_typer(knowledge_app, name="knowledge")
 app.add_typer(kill_app, name="kill")
 
 _LOOPBACK_HOSTS = frozenset({"127.0.0.1", "localhost", "::1"})

@@ -40,6 +40,7 @@ REDACTED = "[REDACTED]"
 SYSTEM_PROMPT_SUFFIX = ":system"
 
 _PLACEHOLDER = re.compile(r"\{\{\s*([a-z][a-z0-9_]*)\s*\}\}")
+_KNOWLEDGE_TAG = re.compile(r"<\s*(/?)knowledge\s*>")
 
 # Required variables are the activation contract (ADR-0009). Optional
 # variables are allowed in a body but do not have to be present.
@@ -273,7 +274,35 @@ def validate_body(body: str, *, role: PromptRole, system: bool = False) -> tuple
     for name in REQUIRED_VARIABLES[role]:
         if name not in variables:
             raise PromptValidationError(f"missing required variable {{{{{name}}}}}", variable=name)
+    if "knowledge" in variables:
+        # Knowledge text is untrusted data: every interpolation of it must sit
+        # inside `<knowledge>...</knowledge>`, so a body that also places the
+        # placeholder outside the tags (a smuggling attempt) is rejected.
+        spans = [(match.start(), match.end()) for match in matches if match.group(1) == "knowledge"]
+        intervals = _knowledge_tag_intervals(body)
+        if not all(
+            any(start >= opening and end <= closing for opening, closing in intervals)
+            for start, end in spans
+        ):
+            raise PromptValidationError(
+                "the {{knowledge}} variable must appear inside "
+                "<knowledge>...</knowledge> delimiters",
+                variable="knowledge",
+            )
     return variables
+
+
+def _knowledge_tag_intervals(body: str) -> tuple[tuple[int, int], ...]:
+    """Content spans of each ``<knowledge>...</knowledge>`` pair, in order."""
+    intervals: list[tuple[int, int]] = []
+    opening: int | None = None
+    for tag in _KNOWLEDGE_TAG.finditer(body):
+        if not tag.group(1):
+            opening = tag.end()
+        elif opening is not None:
+            intervals.append((opening, tag.start()))
+            opening = None
+    return tuple(intervals)
 
 
 def content_hash(body: str) -> str:
@@ -337,6 +366,8 @@ class PromptProvenance:
     code: str | None = None
     prompt_hash: str | None = None
     body_hash: str | None = None
+    knowledge_status: str | None = None
+    knowledge_reason: str | None = None
 
 
 def provenance_status(prompt_id: str, version: int, available_versions: Sequence[int]) -> str:

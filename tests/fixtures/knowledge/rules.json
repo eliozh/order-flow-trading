@@ -1,0 +1,20 @@
+{
+  "version": 1,
+  "roles": {
+    "ANALYSIS": {
+      "topics": ["market_structure", "delta", "volume_profile", "anti_patterns"],
+      "rules": [
+        "Cite the section IDs you relied on.",
+        "Do not treat an imbalance or divergence as a complete thesis.",
+        "If no actionable setup exists, return MARKET_ANALYSIS."
+      ]
+    },
+    "ENTRY_RECHECK": {
+      "topics": ["entry", "risk", "anti_patterns"],
+      "rules": [
+        "The trigger was decided by code; judge only whether the entry is still valid.",
+        "If the invalidation is unclear, return NO_ENTRY."
+      ]
+    }
+  }
+}
