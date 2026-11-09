@@ -24,6 +24,7 @@ from typer.testing import CliRunner
 from oft.adapters.sqlite_store import database_path
 from oft.api.app import create_app
 from oft.application.opportunity_service import (
+    OpportunityConflictError,
     OpportunityContractError,
     OpportunityNotFound,
     OpportunityService,
@@ -613,6 +614,70 @@ def test_a_first_insert_reports_success(tmp_path: Path) -> None:
 
     assert container.store.save_opportunity(record) is True
     assert container.store.save_opportunity(record) is False
+
+
+def test_an_identical_replay_returns_the_stored_opportunity(tmp_path: Path) -> None:
+    container, opportunity = _create(
+        _settings(tmp_path),
+        draft=_multi_condition_draft(),
+        snapshot=_snapshot(),
+        available=_full_available(),
+    )
+    service = OpportunityService(store=container.store, clock=container.clock)
+
+    replayed = service.create_from_decision(
+        opportunity_draft=_multi_condition_draft(),
+        subject={"symbol": "BTCUSDT"},
+        decision_id="DEC-1",
+        scan_id="SCAN-1",
+        report_id="RPT-1",
+        confidence=0.7,
+        provenance=_provenance(),
+        data_quality=_data_quality(),
+        at=NOW_ISO,
+        available_data=_full_available(),
+    )
+
+    assert replayed.to_contract() == opportunity.to_contract()
+    assert len(container.store.list_opportunities()) == 1
+    assert len(container.store.list_opportunity_events(opportunity.opportunity_id)) == 1
+    assert len(container.store.list_conditions(opportunity.opportunity_id)) == 5
+
+
+def test_a_changed_replay_raises_a_conflict_and_leaves_the_row_untouched(
+    tmp_path: Path,
+) -> None:
+    container, opportunity = _create(
+        _settings(tmp_path),
+        draft=_multi_condition_draft(),
+        snapshot=_snapshot(),
+        available=_full_available(),
+    )
+    original = container.store.get_opportunity(opportunity.opportunity_id)
+    assert original is not None
+    original_events = container.store.list_opportunity_events(opportunity.opportunity_id)
+    original_conditions = container.store.list_conditions(opportunity.opportunity_id)
+    changed = _multi_condition_draft().model_copy(update={"thesis": "changed after acceptance"})
+    service = OpportunityService(store=container.store, clock=container.clock)
+
+    with pytest.raises(OpportunityConflictError) as excinfo:
+        service.create_from_decision(
+            opportunity_draft=changed,
+            subject={"symbol": "BTCUSDT"},
+            decision_id="DEC-1",
+            scan_id="SCAN-1",
+            report_id="RPT-1",
+            confidence=0.7,
+            provenance=_provenance(),
+            data_quality=_data_quality(),
+            at=NOW_ISO,
+            available_data=_full_available(),
+        )
+
+    assert excinfo.value.code == "CONFLICT"
+    assert container.store.get_opportunity(opportunity.opportunity_id) == original
+    assert container.store.list_opportunity_events(opportunity.opportunity_id) == original_events
+    assert container.store.list_conditions(opportunity.opportunity_id) == original_conditions
 
 
 def test_migration_v18_backfills_valid_payloads_and_skips_malformed_ones(

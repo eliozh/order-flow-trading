@@ -54,6 +54,12 @@ class OpportunityNotFound(Exception):
     code = "NOT_FOUND"
 
 
+class OpportunityConflictError(Exception):
+    """A replay of an existing opportunity id carries different content."""
+
+    code = "CONFLICT"
+
+
 class OpportunityService:
     def __init__(self, *, store: StorePort, clock: ClockPort) -> None:
         self._store = store
@@ -157,7 +163,7 @@ class OpportunityService:
             at=at,
         )
         created = opportunity.state_history[0]
-        self._store.save_opportunity(
+        persisted = self._store.save_opportunity(
             _record(opportunity),
             OpportunityEventRecord(
                 opportunity_id=opportunity.opportunity_id,
@@ -170,7 +176,37 @@ class OpportunityService:
             ),
             _condition_records(opportunity),
         )
-        return opportunity
+        if persisted:
+            return opportunity
+        # A duplicate create is an atomic no-op in the store. It is only an
+        # idempotent replay when the stored payload is byte-identical to what
+        # this call would have written; otherwise the create did NOT persist
+        # and must never be reported as a success.
+        stored_record = self._store.get_opportunity(opportunity.opportunity_id)
+        if stored_record is None:
+            raise OpportunityConflictError(
+                f"opportunity {opportunity.opportunity_id} already exists "
+                "but its stored payload could not be loaded"
+            )
+        stored = _to_domain(stored_record)
+        submitted = json.dumps(opportunity.to_contract(), sort_keys=True)
+        persisted_contract = json.dumps(stored.to_contract(), sort_keys=True)
+        if submitted == persisted_contract:
+            _LOGGER.info(
+                "opportunity_create_idempotent_replay",
+                opportunity_id=opportunity.opportunity_id,
+                decision_id=decision_id,
+            )
+            return stored
+        _LOGGER.warning(
+            "opportunity_create_conflict",
+            opportunity_id=opportunity.opportunity_id,
+            decision_id=decision_id,
+            reason="stored payload differs from the replayed decision",
+        )
+        raise OpportunityConflictError(
+            f"opportunity {opportunity.opportunity_id} already exists with different content"
+        )
 
     def expire_due(self, now: str | None = None) -> tuple[Opportunity, ...]:
         """Transition every OPEN opportunity whose ``expires_at`` has passed.
@@ -803,6 +839,7 @@ def opportunity_summary(opportunity: Opportunity) -> dict[str, Any]:
 
 __all__ = [
     "ConditionDraftError",
+    "OpportunityConflictError",
     "OpportunityContractError",
     "OpportunityNotFound",
     "OpportunityService",
