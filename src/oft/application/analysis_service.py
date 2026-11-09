@@ -10,18 +10,18 @@ from __future__ import annotations
 import hashlib
 import json
 from dataclasses import dataclass
-from decimal import InvalidOperation
+from decimal import Decimal, InvalidOperation
 from typing import Any
 
-from oft.application.budget_ledger import BudgetEntry, BudgetLedger, stable_call_id
+from oft.application.budget_ledger import BudgetEntry, BudgetLedger
 from oft.application.knowledge_service import KnowledgeService, knowledge_injection
+from oft.application.llm_orchestrator import LLMOrchestrator, LLMRuntimeRegistry
 from oft.application.llm_validation import (
     ValidationIssue,
     ValidationOutcome,
     decision_envelope,
     hash_text,
     schema_text,
-    validate_output,
 )
 from oft.application.opportunity_service import OpportunityService
 from oft.application.prompt_builder import KnowledgeInjection
@@ -42,7 +42,14 @@ from oft.domain.prompts import (
 )
 from oft.domain.time import utc_timestamp
 from oft.ports.clock import ClockPort
-from oft.ports.llm import LLMPort, LLMRequest, LLMResult, LLMRole, LLMUsage
+from oft.ports.llm import (
+    LLMPort,
+    LLMRequest,
+    LLMResult,
+    LLMRole,
+    LLMUsage,
+    sanitize_provider_id,
+)
 from oft.ports.store import DecisionRecord, LLMCallRecord, StorePort
 
 PROMPT_ID = "analysis"
@@ -106,6 +113,50 @@ def _reference_price(snapshot: dict[str, Any]) -> str:
     return str(price) if price is not None else "0"
 
 
+_USAGE_FIELDS = (
+    "input_tokens",
+    "output_tokens",
+    "cache_read_tokens",
+    "cache_write_tokens",
+    "reasoning_tokens",
+)
+
+
+def _total_usage(calls: list[LLMCallRecord]) -> dict[str, int]:
+    """Sum usage across every call row of a decision (including repairs)."""
+    totals = dict.fromkeys(_USAGE_FIELDS, 0)
+    for call in calls:
+        try:
+            payload = json.loads(call.usage_json or "{}")
+        except (json.JSONDecodeError, TypeError, ValueError):
+            continue
+        if not isinstance(payload, dict):
+            continue
+        for field in _USAGE_FIELDS:
+            value = payload.get(field)
+            if isinstance(value, int) and not isinstance(value, bool):
+                totals[field] += value
+    return LLMUsage(**totals).to_contract()
+
+
+def _total_cost(budgets: list[BudgetEntry]) -> tuple[str, str, bool]:
+    """Sum cost across every budget row of a decision (including repairs)."""
+    if not budgets:
+        return "0", "stub/v1", True
+    amount = Decimal("0")
+    price_version = "stub/v1"
+    unpriced = False
+    for entry in budgets:
+        payload = entry.payload
+        try:
+            amount += Decimal(str(payload.get("cost_usd", "0")))
+        except (InvalidOperation, TypeError, ValueError):
+            continue
+        price_version = str(payload.get("price_version") or price_version)
+        unpriced = unpriced or bool(payload.get("unpriced", True))
+    return format(amount, "f"), price_version, unpriced
+
+
 class AnalysisService:
     def __init__(
         self,
@@ -115,16 +166,26 @@ class AnalysisService:
         provider: LLMPort,
         budget: BudgetLedger | None = None,
         settings: Settings | None = None,
+        runtime: LLMRuntimeRegistry | None = None,
     ) -> None:
         self._store = store
         self._clock = clock
         self._provider = provider
-        self._budget = budget or BudgetLedger(store=store)
+        self._settings = settings
+        self._budget = budget or BudgetLedger(store=store, settings=settings)
         self._opportunities = OpportunityService(store=store, clock=clock)
         self._secrets = secret_values_from_settings(settings) if settings is not None else ()
         self._prompts = PromptService(store=store, clock=clock, secret_values=self._secrets)
         self._knowledge = (
             KnowledgeService(settings=settings, clock=clock) if settings is not None else None
+        )
+        self._orchestrator = LLMOrchestrator(
+            store=store,
+            clock=clock,
+            provider=provider,
+            settings=settings,
+            budget=self._budget,
+            runtime=runtime,
         )
 
     def _knowledge_injection(self) -> KnowledgeInjection:
@@ -161,7 +222,7 @@ class AnalysisService:
         decision_id = f"DEC-ANALYSIS-{digest[:16].upper()}"
         request = LLMRequest(
             role=LLMRole.ANALYSIS,
-            model="fixture",
+            model="fixture" if self._settings is None else "",
             system_prompt=system,
             user_prompt=user,
             schema_json=schema_text(),
@@ -170,86 +231,22 @@ class AnalysisService:
             prompt_version=rendered.version,
             prompt_hash=rendered.prompt_hash,
             request_id=f"REQ-{digest[:12].upper()}",
+            system_prompt_id=rendered.system_prompt_id,
+            system_prompt_version=rendered.system_version,
+            system_prompt_hash=rendered.system_prompt_hash,
         )
-        calls: list[LLMCallRecord] = []
-        budgets: list[BudgetEntry] = []
-
-        from dataclasses import replace
-
-        def call_provider(attempt: int, prompt: str) -> LLMResult:
-            attempt_request = replace(request, user_prompt=prompt)
-            result: LLMResult = self._provider.complete(attempt_request)
-            call_id = stable_call_id(decision_id, attempt)
-            call_record = LLMCallRecord(
-                call_id=call_id,
-                decision_id=decision_id,
-                role=LLMRole.ANALYSIS.value,
-                provider=result.provider,
-                model=result.model,
-                prompt_id=rendered.prompt_id,
-                prompt_version=rendered.version,
-                prompt_hash=rendered_prompt_hash(
-                    rendered.prompt_id, rendered.version, system, prompt
-                ),
-                input_hash=digest,
-                attempt=attempt,
-                request_id=result.request_id,
-                status="OK",
-                raw_output_hash=hash_text(result.raw_text),
-                usage_json=json.dumps(result.usage.to_contract(), sort_keys=True),
-                latency_ms=result.latency_ms,
-                error_code=None,
-                created_at=now,
-                system_prompt_id=rendered.system_prompt_id,
-                system_prompt_version=rendered.system_version,
-                system_prompt_hash=rendered.system_prompt_hash,
-            )
-            self._store.save_llm_call(call_record)
-            calls.append(call_record)
-            estimate = self._provider.estimate_cost(attempt_request, request.model)
-            budgets.append(
-                self._budget.record_call(
-                    call_id=call_id,
-                    decision_id=decision_id,
-                    role=LLMRole.ANALYSIS.value,
-                    result=result,
-                    occurred_at=now,
-                    unpriced=estimate.unpriced,
-                    cost_usd=estimate.amount_usd,
-                    price_version=estimate.price_version,
-                    usage=result.usage,
-                )
-            )
-            return result
-
-        first = call_provider(1, user)
-        if first.refusal:
-            outcome = ValidationOutcome(
-                status="REJECTED",
-                output=None,
-                errors=(ValidationIssue("output", "LLM_REFUSED", "the model refused the request"),),
-                raw_output_hash=hash_text(first.raw_text),
-            )
-        elif first.truncated:
-            outcome = ValidationOutcome(
-                status="REJECTED",
-                output=None,
-                errors=(
-                    ValidationIssue(
-                        "output", "LLM_OUTPUT_TRUNCATED", "the model output was truncated"
-                    ),
-                ),
-                raw_output_hash=hash_text(first.raw_text),
-            )
-        else:
-            outcome = validate_output(
-                first.raw_text,
-                role=LLMRole.ANALYSIS.value,
-                repair=lambda message: call_provider(2, _repair_prompt(user, message)).raw_text,
-            )
+        orchestration = self._orchestrator.complete_with_validation(
+            request=request,
+            decision_id=decision_id,
+            role=LLMRole.ANALYSIS,
+        )
+        final = orchestration.final_result
+        outcome = orchestration.outcome
+        calls = list(orchestration.calls)
+        budgets = list(orchestration.budgets)
 
         provenance = self._provenance(
-            result=first,
+            result=final,
             digest=digest,
             rendered=rendered,
             calls=calls,
@@ -383,7 +380,7 @@ class AnalysisService:
         knowledge_status: str | None,
         knowledge_reason: str | None,
     ) -> dict[str, Any]:
-        cost_payload = budgets[0].payload if budgets else None
+        amount_usd, price_version, unpriced = _total_cost(budgets)
         return {
             "provider": result.provider,
             "model": result.model,
@@ -398,24 +395,17 @@ class AnalysisService:
             "schema_version": "1.0.0",
             "temperature": 0.0,
             "seed": None,
-            "request_id": result.request_id,
+            "request_id": sanitize_provider_id(result.request_id, self._secrets),
             "latency_ms": result.latency_ms,
-            "usage": json.loads(calls[0].usage_json) if calls else LLMUsage().to_contract(),
+            "usage": _total_usage(calls),
             "cost": {
-                "amount_usd": cost_payload["cost_usd"] if cost_payload else "0",
+                "amount_usd": amount_usd,
                 "currency": "USD",
-                "price_version": cost_payload["price_version"] if cost_payload else "stub/v1",
-                "unpriced": bool(cost_payload["unpriced"]) if cost_payload else True,
+                "price_version": price_version,
+                "unpriced": unpriced,
             },
             "recorded_at": now,
         }
-
-
-def _repair_prompt(user: str, message: str) -> str:
-    return (
-        f"{user}\n\nYour previous output failed validation: {message}. "
-        "Return only a corrected JSON object matching the schema."
-    )
 
 
 def _rejection_reason(outcome: ValidationOutcome) -> str:

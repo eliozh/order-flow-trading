@@ -1,0 +1,31 @@
+{
+  "id": "ds_fixture",
+  "choices": [
+    {
+      "index": 0,
+      "message": {
+        "role": "assistant",
+        "content": null,
+        "tool_calls": [
+          {
+            "id": "call_fixture",
+            "type": "function",
+            "function": {
+              "name": "analysis_decision",
+              "arguments": "{\"analysis\": {\"absorption\": null, \"exhaustion\": null, \"key_zones\": [], \"market_structure\": \"Balanced range.\", \"metrics_cited\": [], \"narrative\": \"The market is balanced; no trigger condition is proposed.\", \"regime\": \"RANGE\"}, \"caveats\": [\"No actionable setup\"], \"confidence\": 0.61, \"decision_type\": \"MARKET_ANALYSIS\", \"entry_recheck\": null, \"opportunity\": null, \"position_management\": null, \"rationale\": \"Range rotation with neutral delta and no confirmed edge.\", \"subject\": {\"as_of\": \"2026-11-06T12:00:00.000Z\", \"symbol\": \"BTCUSDT\", \"timeframe\": \"4h\"}}"
+            }
+          }
+        ]
+      },
+      "finish_reason": "tool_calls"
+    }
+  ],
+  "usage": {
+    "prompt_tokens": 1000,
+    "completion_tokens": 200,
+    "prompt_cache_hit_tokens": 100,
+    "completion_tokens_details": {
+      "reasoning_tokens": 20
+    }
+  }
+}

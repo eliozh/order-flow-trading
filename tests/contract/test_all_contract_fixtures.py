@@ -292,6 +292,8 @@ def test_every_json_fixture_has_a_known_schema_mapping() -> None:
             continue  # external exchangeInfo shape, validated above
         if path.parent.name == "llm":
             continue  # provider fixtures validated by tests/contract/test_llm_decision_contract.py
+        if path.parent.parent.name == "providers" and path.parent.parent.parent.name == "llm":
+            continue  # recorded provider bodies under tests/fixtures/llm/providers/<provider>
         if path.parent.name == "knowledge":
             continue  # private knowledge artifacts are not API contract fixtures
         if name.startswith(tuple(SECTION_BY_PREFIX)) or name.startswith("bars_"):

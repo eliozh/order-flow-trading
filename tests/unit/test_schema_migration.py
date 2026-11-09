@@ -81,7 +81,7 @@ def test_v1_database_upgrades_to_v2_with_effective_checks(tmp_path: Path) -> Non
     finally:
         connection.close()
 
-    assert versions == {1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16}
+    assert versions == {1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17}
 
 
 _V2_BACKFILL = """
@@ -139,7 +139,7 @@ def test_v2_database_gains_the_backfill_heartbeat_column(tmp_path: Path) -> None
 
     assert "updated_at" in columns
     assert updated_at == "2026-11-06T00:00:00.000Z"
-    assert versions == {1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16}
+    assert versions == {1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17}
 
 
 def test_v5_checks_indexes_and_foreign_keys(tmp_path: Path) -> None:
@@ -236,7 +236,7 @@ def test_v5_database_migrates_manifest_metrics_columns(tmp_path: Path) -> None:
 
     assert {"metric_version", "input_manifest_hash", "window_start", "window_end"} <= columns
     assert legacy == ("/tmp/legacy.parquet", None, None)
-    assert versions == {1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16}
+    assert versions == {1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17}
 
 
 def test_v6_database_migrates_starred_columns(tmp_path: Path) -> None:
@@ -295,7 +295,7 @@ def test_v6_database_migrates_starred_columns(tmp_path: Path) -> None:
 
     assert {"starred", "starred_at"} <= columns
     assert row == ("BTCUSDT", 0, None)
-    assert versions == {1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16}
+    assert versions == {1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17}
 
 
 def test_manifest_run_metadata_columns_are_added_idempotently(tmp_path: Path) -> None:
@@ -312,7 +312,7 @@ def test_manifest_run_metadata_columns_are_added_idempotently(tmp_path: Path) ->
         connection.close()
 
     assert {"run_id", "last_n", "recomputed_from", "parent_run_id"} <= columns
-    assert versions == {1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16}
+    assert versions == {1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17}
 
 
 _V12_JOB_RUNS = """
@@ -378,7 +378,7 @@ def test_v12_database_gains_the_job_run_scope_symbol_column(tmp_path: Path) -> N
 
     assert "symbol" in columns
     assert symbol is None  # pre-v13 batch rows keep a null (batch) scope
-    assert versions == {1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16}
+    assert versions == {1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17}
 
 
 _V13_JOB_RUNS = """
@@ -629,7 +629,7 @@ def test_v9_database_upgrades_to_v10_with_ledgers_and_indexes(tmp_path: Path) ->
     finally:
         connection.close()
 
-    assert versions == {1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16}
+    assert versions == {1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17}
     assert "llm_json" in report_columns
     assert {
         "llm_calls",
@@ -781,7 +781,7 @@ def test_v15_prompt_and_llm_rows_upgrade_to_v16_and_seed_only_missing_families(
         "entry_recheck:system",
     }
     assert tuple(llm_defaults) == ("", 1, "")
-    assert versions == {1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16}
+    assert versions == {1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17}
 
 
 def test_prompt_versions_are_immutable_and_have_one_active_row_per_prompt(
@@ -848,3 +848,203 @@ def test_prompt_versions_are_immutable_and_have_one_active_row_per_prompt(
         connection.commit()
     finally:
         connection.close()
+
+
+_V16_BUDGET = """
+CREATE TABLE schema_migrations (
+    version INTEGER PRIMARY KEY,
+    applied_at TEXT NOT NULL
+);
+INSERT INTO schema_migrations (version, applied_at)
+    VALUES (1,'t'),(2,'t'),(3,'t'),(4,'t'),(5,'t'),(6,'t'),(7,'t'),
+           (8,'t'),(9,'t'),(10,'t'),(11,'t'),(12,'t'),(13,'t'),(14,'t'),
+           (15,'t'),(16,'t');
+CREATE TABLE llm_calls (
+    call_id TEXT PRIMARY KEY,
+    decision_id TEXT,
+    role TEXT NOT NULL,
+    provider TEXT NOT NULL,
+    model TEXT NOT NULL,
+    prompt_id TEXT NOT NULL,
+    prompt_version INTEGER NOT NULL,
+    prompt_hash TEXT NOT NULL,
+    input_hash TEXT NOT NULL,
+    attempt INTEGER NOT NULL,
+    request_id TEXT NOT NULL,
+    status TEXT NOT NULL,
+    raw_output_hash TEXT NOT NULL,
+    usage_json TEXT NOT NULL,
+    latency_ms INTEGER NOT NULL,
+    error_code TEXT,
+    created_at TEXT NOT NULL
+);
+INSERT INTO llm_calls VALUES (
+    'CALL-16', NULL, 'ANALYSIS', 'stub', 'fixture', 'analysis', 1, 'PH', 'IH',
+    1, 'REQ-16', 'OK', 'RH', '{}', 0, NULL, 't'
+);
+CREATE TABLE budget_ledger (
+    record_id TEXT PRIMARY KEY,
+    call_id TEXT NOT NULL UNIQUE REFERENCES llm_calls(call_id),
+    decision_id TEXT,
+    occurred_at TEXT NOT NULL,
+    provider TEXT NOT NULL,
+    model TEXT NOT NULL,
+    cost_usd TEXT NOT NULL,
+    price_version TEXT NOT NULL,
+    unpriced INTEGER NOT NULL CHECK (unpriced IN (0, 1)),
+    budget_state TEXT NOT NULL,
+    period_day TEXT NOT NULL,
+    payload_json TEXT NOT NULL
+);
+INSERT INTO budget_ledger VALUES (
+    'BUD-16', 'CALL-16', NULL, '2026-11-04T09:30:00.000Z', 'stub', 'fixture',
+    '0', 'none/v1', 1, 'OK', '2026-11-04', '{}'
+);
+"""
+
+
+def test_v16_database_gains_budget_periods_settings_and_provider_capabilities(
+    tmp_path: Path,
+) -> None:
+    settings = Settings(env="test", port=8765, data_dir=tmp_path / "data")
+    settings.data_dir.mkdir(parents=True)
+    connection = sqlite3.connect(database_path(settings))
+    try:
+        connection.executescript(_V16_BUDGET)
+        connection.commit()
+    finally:
+        connection.close()
+
+    store = SqliteStore(settings)
+    store.initialize()
+    store.initialize()  # idempotent
+
+    connection = sqlite3.connect(database_path(settings))
+    try:
+        columns = {row[1] for row in connection.execute("PRAGMA table_info(budget_ledger)")}
+        tables = {
+            row[0]
+            for row in connection.execute("SELECT name FROM sqlite_master WHERE type = 'table'")
+        }
+        indexes = {
+            row[0]
+            for row in connection.execute("SELECT name FROM sqlite_master WHERE type = 'index'")
+        }
+        backfilled = connection.execute(
+            "SELECT period_day, period_week, period_month, role "
+            "FROM budget_ledger WHERE record_id = 'BUD-16'"
+        ).fetchone()
+        versions = {row[0] for row in connection.execute("SELECT version FROM schema_migrations")}
+    finally:
+        connection.close()
+
+    assert {"period_week", "period_month", "role"} <= columns
+    assert {"budget_settings", "provider_capabilities"} <= tables
+    assert {"budget_ledger_week", "budget_ledger_month"} <= indexes
+    # 2026-11-04 is ISO week 2026-W45.
+    assert tuple(backfilled) == ("2026-11-04", "2026-W45", "2026-11", "")
+    assert versions == {1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17}
+
+
+def _v16_budget_connection(settings: Settings) -> sqlite3.Connection:
+    settings.data_dir.mkdir(parents=True)
+    connection = sqlite3.connect(database_path(settings))
+    connection.executescript(_V16_BUDGET)
+    connection.commit()
+    return connection
+
+
+def test_pre_existing_empty_columns_are_backfilled(tmp_path: Path) -> None:
+    """A partially migrated v16 DB still gains its week/month buckets (M5)."""
+    settings = Settings(env="test", port=8765, data_dir=tmp_path / "data")
+    connection = _v16_budget_connection(settings)
+    try:
+        connection.execute(
+            "ALTER TABLE budget_ledger ADD COLUMN period_week TEXT NOT NULL DEFAULT ''"
+        )
+        connection.execute(
+            "ALTER TABLE budget_ledger ADD COLUMN period_month TEXT NOT NULL DEFAULT ''"
+        )
+        connection.execute("ALTER TABLE budget_ledger ADD COLUMN role TEXT NOT NULL DEFAULT ''")
+        connection.commit()
+    finally:
+        connection.close()
+
+    SqliteStore(settings).initialize()
+
+    connection = sqlite3.connect(database_path(settings))
+    try:
+        row = connection.execute(
+            "SELECT period_week, period_month FROM budget_ledger WHERE record_id = 'BUD-16'"
+        ).fetchone()
+    finally:
+        connection.close()
+    assert tuple(row) == ("2026-W45", "2026-11")
+
+
+def test_a_malformed_occurred_at_does_not_abort_the_migration(tmp_path: Path) -> None:
+    """One unparsable legacy row keeps its defaults instead of blocking boot (M6)."""
+    settings = Settings(env="test", port=8765, data_dir=tmp_path / "data")
+    connection = _v16_budget_connection(settings)
+    try:
+        connection.execute(
+            "INSERT INTO llm_calls VALUES "
+            "('CALL-BAD', NULL, 'ANALYSIS', 'stub', 'fixture', 'analysis', 1, 'PH', "
+            "'IH', 1, 'REQ-BAD', 'OK', 'RH', '{}', 0, NULL, 't')"
+        )
+        connection.execute(
+            "INSERT INTO budget_ledger VALUES "
+            "('BUD-BAD', 'CALL-BAD', NULL, 'not-a-timestamp', 'stub', 'fixture', "
+            "'0', 'none/v1', 1, 'OK', '2026-11-05', '{}')"
+        )
+        connection.commit()
+    finally:
+        connection.close()
+
+    SqliteStore(settings).initialize()  # must not raise
+
+    connection = sqlite3.connect(database_path(settings))
+    try:
+        good = connection.execute(
+            "SELECT period_week, period_month FROM budget_ledger WHERE record_id = 'BUD-16'"
+        ).fetchone()
+        bad = connection.execute(
+            "SELECT period_week, period_month, period_day "
+            "FROM budget_ledger WHERE record_id = 'BUD-BAD'"
+        ).fetchone()
+    finally:
+        connection.close()
+    assert tuple(good) == ("2026-W45", "2026-11")
+    assert tuple(bad) == ("", "", "2026-11-05")
+
+
+def test_migration_backfills_utc_boundary_days(tmp_path: Path) -> None:
+    """A non-UTC offset buckets by UTC day/week (M4)."""
+    settings = Settings(env="test", port=8765, data_dir=tmp_path / "data")
+    connection = _v16_budget_connection(settings)
+    try:
+        connection.execute(
+            "INSERT INTO llm_calls VALUES "
+            "('CALL-UTC', NULL, 'ANALYSIS', 'stub', 'fixture', 'analysis', 1, 'PH', "
+            "'IH', 1, 'REQ-UTC', 'OK', 'RH', '{}', 0, NULL, 't')"
+        )
+        connection.execute(
+            "INSERT INTO budget_ledger VALUES "
+            "('BUD-UTC', 'CALL-UTC', NULL, '2026-11-08T23:30:00-05:00', 'stub', "
+            "'fixture', '0', 'none/v1', 1, 'OK', '', '{}')"
+        )
+        connection.commit()
+    finally:
+        connection.close()
+
+    SqliteStore(settings).initialize()
+
+    connection = sqlite3.connect(database_path(settings))
+    try:
+        row = connection.execute(
+            "SELECT period_day, period_week, period_month "
+            "FROM budget_ledger WHERE record_id = 'BUD-UTC'"
+        ).fetchone()
+    finally:
+        connection.close()
+    assert tuple(row) == ("2026-11-09", "2026-W46", "2026-11")

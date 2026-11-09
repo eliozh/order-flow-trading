@@ -1,0 +1,16 @@
+{
+  "id": "msg_fixture",
+  "type": "message",
+  "role": "assistant",
+  "content": [
+    {
+      "type": "text",
+      "text": ""
+    }
+  ],
+  "stop_reason": "refusal",
+  "usage": {
+    "input_tokens": 1000,
+    "output_tokens": 0
+  }
+}

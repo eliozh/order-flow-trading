@@ -1,0 +1,16 @@
+{
+  "id": "msg_fixture",
+  "type": "message",
+  "role": "assistant",
+  "content": [
+    {
+      "type": "text",
+      "text": "{\"decision_type\":"
+    }
+  ],
+  "stop_reason": "max_tokens",
+  "usage": {
+    "input_tokens": 1000,
+    "output_tokens": 200
+  }
+}

@@ -109,6 +109,21 @@ ERROR_CATALOG: dict[str, ErrorSpec] = {
     "LLM_PROVIDER_NOT_CONFIGURED": ErrorSpec(
         412, "LLM", False, "No LLM provider/key is configured for this role."
     ),
+    "LLM_AUTH_FAILED": ErrorSpec(502, "LLM", False, "The LLM provider rejected the API key."),
+    "LLM_MODEL_NOT_CONFIGURED": ErrorSpec(
+        412, "LLM", False, "No model is configured for this LLM role."
+    ),
+    "LLM_TIMEOUT": ErrorSpec(504, "LLM", True, "The LLM call exceeded its timeout."),
+    "LLM_RATE_LIMITED": ErrorSpec(429, "LLM", True, "The LLM provider rate-limited the request."),
+    "UPSTREAM_UNAVAILABLE": ErrorSpec(
+        502, "UPSTREAM", True, "An upstream service is unreachable or returned an invalid response."
+    ),
+    "LLM_SCHEMA_UNSUPPORTED": ErrorSpec(
+        422,
+        "LLM",
+        False,
+        "The LLM provider cannot enforce the requested structured output schema.",
+    ),
     "LLM_SCHEMA_INVALID": ErrorSpec(
         422,
         "LLM",

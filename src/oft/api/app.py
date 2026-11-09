@@ -31,7 +31,9 @@ from oft.api.auth import (
 )
 from oft.api.envelope import new_request_id
 from oft.api.errors import ApiError, error_response
+from oft.api.routes.budget import router as budget_router
 from oft.api.routes.data import router as data_router
+from oft.api.routes.llm import router as llm_router
 from oft.api.routes.opportunities import router as opportunities_router
 from oft.api.routes.paper import router as paper_router
 from oft.api.routes.prompts import router as prompts_router
@@ -43,6 +45,7 @@ from oft.api.routes.triggers import router as triggers_router
 from oft.api.routes.watchlist import router as watchlist_router
 from oft.bootstrap import build_container
 from oft.config import ConfigError, Settings, load_settings
+from oft.domain.pricing import PriceTableError
 from oft.domain.prompts import PromptError
 from oft.logging import configure_logging
 from oft.ports.clock import ClockPort
@@ -231,6 +234,8 @@ def create_app(settings: Settings | None = None, *, clock: ClockPort | None = No
     app.include_router(paper_router)
     app.include_router(prompts_router)
     app.include_router(data_router)
+    app.include_router(llm_router)
+    app.include_router(budget_router)
 
     @app.exception_handler(ApiError)
     async def _api_error(_request: Request, exc: ApiError) -> JSONResponse:
@@ -257,6 +262,10 @@ def create_app(settings: Settings | None = None, *, clock: ClockPort | None = No
 
     @app.exception_handler(ConfigError)
     async def _config_error(_request: Request, exc: ConfigError) -> JSONResponse:
+        return error_response(exc.code, message=exc.message)
+
+    @app.exception_handler(PriceTableError)
+    async def _price_table_error(_request: Request, exc: PriceTableError) -> JSONResponse:
         return error_response(exc.code, message=exc.message)
 
     @app.exception_handler(PromptError)

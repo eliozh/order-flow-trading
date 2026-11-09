@@ -10,7 +10,14 @@ from collections.abc import Mapping
 from pathlib import Path
 
 from oft.config import DEFAULT_LLM_FIXTURES_DIR
-from oft.ports.llm import CostEstimate, LLMRequest, LLMResult, LLMRole, ProviderCapabilities
+from oft.ports.llm import (
+    CostEstimate,
+    LLMRequest,
+    LLMResult,
+    LLMRole,
+    ProbeOutcome,
+    ProviderCapabilities,
+)
 
 _DEFAULT_FIXTURES: dict[LLMRole, str] = {
     LLMRole.ANALYSIS: "opportunity_valid.json",
@@ -60,3 +67,11 @@ class LLMStub:
 
     def estimate_cost(self, request: LLMRequest, model: str) -> CostEstimate:
         return CostEstimate(amount_usd="0", price_version="stub/v1", unpriced=True)
+
+    def probe(self, *, model: str, role: LLMRole = LLMRole.ANALYSIS) -> ProbeOutcome:
+        """The fixture provider always enforces the canonical schema."""
+        return ProbeOutcome(
+            strict_schema=True,
+            degraded=False,
+            notes="deterministic fixture provider; no network or credential",
+        )

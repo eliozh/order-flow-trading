@@ -1,0 +1,26 @@
+{
+  "id": "resp_fixture",
+  "status": "completed",
+  "output": [
+    {
+      "type": "message",
+      "role": "assistant",
+      "content": [
+        {
+          "type": "output_text",
+          "text": "{\"analysis\": {\"absorption\": null, \"exhaustion\": null, \"key_zones\": [], \"market_structure\": \"Balanced range.\", \"metrics_cited\": [], \"narrative\": \"The market is balanced; no trigger condition is proposed.\", \"regime\": \"RANGE\"}, \"caveats\": [\"No actionable setup\"], \"confidence\": 0.61, \"decision_type\": \"MARKET_ANALYSIS\", \"entry_recheck\": null, \"opportunity\": null, \"position_management\": null, \"rationale\": \"Range rotation with neutral delta and no confirmed edge.\", \"subject\": {\"as_of\": \"2026-11-06T12:00:00.000Z\", \"symbol\": \"BTCUSDT\", \"timeframe\": \"4h\"}}"
+        }
+      ]
+    }
+  ],
+  "usage": {
+    "input_tokens": 1000,
+    "output_tokens": 200,
+    "input_tokens_details": {
+      "cached_tokens": 100
+    },
+    "output_tokens_details": {
+      "reasoning_tokens": 20
+    }
+  }
+}

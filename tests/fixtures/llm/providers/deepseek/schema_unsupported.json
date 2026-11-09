@@ -1,0 +1,6 @@
+{
+  "error": {
+    "message": "tools[0].function.parameters: strict schema is not supported",
+    "type": "invalid_request_error"
+  }
+}

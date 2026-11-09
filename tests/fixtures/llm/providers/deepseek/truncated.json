@@ -1,0 +1,27 @@
+{
+  "id": "ds_fixture",
+  "choices": [
+    {
+      "index": 0,
+      "message": {
+        "role": "assistant",
+        "content": null,
+        "tool_calls": [
+          {
+            "id": "call_fixture",
+            "type": "function",
+            "function": {
+              "name": "analysis_decision",
+              "arguments": "{\"decision_type\":"
+            }
+          }
+        ]
+      },
+      "finish_reason": "length"
+    }
+  ],
+  "usage": {
+    "prompt_tokens": 1000,
+    "completion_tokens": 200
+  }
+}

@@ -1,0 +1,16 @@
+{
+  "id": "msg_fixture",
+  "type": "message",
+  "role": "assistant",
+  "content": [
+    {
+      "type": "text",
+      "text": "not-json"
+    }
+  ],
+  "stop_reason": "end_turn",
+  "usage": {
+    "input_tokens": 1000,
+    "output_tokens": 5
+  }
+}

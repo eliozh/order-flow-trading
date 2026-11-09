@@ -4,15 +4,18 @@ from __future__ import annotations
 
 import json
 from datetime import UTC, datetime
+from decimal import Decimal
 from pathlib import Path
 
 import pytest
 
 from oft.adapters.sqlite_store import SqliteStore
 from oft.application.analysis_service import AnalysisService
+from oft.application.budget_ledger import BudgetLedger
 from oft.application.llm_validation import MAX_RAW_OUTPUT_CHARS, validate_output
 from oft.clock import FixedClock
 from oft.config import Settings
+from oft.domain.pricing import ModelPrice, PriceTable
 from oft.ports.llm import CostEstimate, LLMRequest, LLMResult, LLMUsage, ProviderCapabilities
 
 FIXTURES = Path(__file__).resolve().parents[1] / "fixtures" / "llm"
@@ -255,3 +258,101 @@ def test_opportunity_conversion_failure_degrades_to_a_rejected_decision(
     assert decision is not None
     assert decision.validation_status == "REJECTED"
     assert store.list_opportunities() == ()
+
+
+class _UsagePerAttemptProvider:
+    """Attempt 1 fails schema, attempt 2 repairs; each bills distinct usage."""
+
+    provider = "stub"
+
+    def __init__(self) -> None:
+        self.calls = 0
+
+    def capabilities(self) -> ProviderCapabilities:
+        return ProviderCapabilities(provider="stub", strict_schema=True)
+
+    def complete(self, request: LLMRequest) -> LLMResult:
+        self.calls += 1
+        if self.calls == 1:
+            return LLMResult(
+                provider="stub",
+                model="fixture",
+                raw_text=_text("invalid_schema.json"),
+                usage=LLMUsage(input_tokens=1_000_000, output_tokens=0),
+                latency_ms=5,
+                request_id="provider-attempt-1",
+            )
+        return LLMResult(
+            provider="stub",
+            model="fixture",
+            raw_text=_text("opportunity_valid.json"),
+            usage=LLMUsage(input_tokens=0, output_tokens=1_000_000),
+            latency_ms=9,
+            request_id="provider-attempt-2",
+        )
+
+    def estimate_cost(self, request: LLMRequest, model: str) -> CostEstimate:
+        raise NotImplementedError
+
+
+def _usage_price_table() -> PriceTable:
+    return PriceTable(
+        version="2026-11-09",
+        models={
+            ("stub", "fixture"): ModelPrice(
+                provider="stub",
+                model="fixture",
+                input_per_mtok=Decimal("2.50"),
+                output_per_mtok=Decimal("10.00"),
+                cache_read_per_mtok=Decimal("1.00"),
+                cache_write_per_mtok=Decimal("1.00"),
+                source_url="",
+                as_of="2026-11-09",
+            )
+        },
+    )
+
+
+def test_repaired_decision_provenance_uses_the_final_call_and_sums_attempts(
+    tmp_path: Path,
+) -> None:
+    settings = Settings(env="test", port=8765, data_dir=tmp_path / "data")
+    store = SqliteStore(settings)
+    store.initialize()
+    service = AnalysisService(
+        store=store,
+        clock=FixedClock(NOW),
+        provider=_UsagePerAttemptProvider(),
+        budget=BudgetLedger(store=store, price_table=_usage_price_table()),
+    )
+
+    outcome = service.analyze(
+        symbol="BTCUSDT",
+        timeframe="4h",
+        metrics={
+            "metric_version": "orderflow_metrics.v1",
+            "data_quality": "COMPLETE",
+            "quality_reasons": [],
+            "gaps": [],
+        },
+        snapshot={"snapshot_id": "SNAP-1", "as_of": "2026-11-06T12:00:00.000Z"},
+        scan_id="SCAN-1",
+        report_id="RPT-1",
+    )
+
+    assert outcome.validation_status == "REPAIRED"
+    provenance = outcome.decision["provenance"]
+    # The final accepted call owns the request id and latency, not the rejection.
+    assert provenance["request_id"] == "provider-attempt-2"
+    assert provenance["latency_ms"] == 9
+    assert provenance["usage"]["input_tokens"] == 1_000_000
+    assert provenance["usage"]["output_tokens"] == 1_000_000
+    assert provenance["usage"]["total_tokens"] == 2_000_000
+    assert provenance["cost"]["amount_usd"] == "12.50000000"
+    assert provenance["cost"]["unpriced"] is False
+
+    budgets = store.list_budget_records(decision_id=outcome.decision_id)
+    assert len(budgets) == 2
+    assert sum((Decimal(record.cost_usd) for record in budgets), Decimal("0")) == Decimal(
+        "12.50000000"
+    )

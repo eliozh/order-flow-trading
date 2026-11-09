@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+from collections.abc import Callable
 from dataclasses import dataclass
 from typing import Any, Protocol
 
@@ -28,6 +29,15 @@ class LeaseLostError(Exception):
     def __init__(self, message: str = "backfill lease lost") -> None:
         super().__init__(message)
         self.message = message
+
+
+class BudgetRecordConflictError(Exception):
+    """The atomic call/budget write could not persist its budget ledger row.
+
+    Raised inside the ``save_call_and_budget`` transaction when the budget
+    insert resolves to a no-op (a planted or colliding ``record_id``), so the
+    caller can never receive a phantom ``BudgetEntry`` that was not stored.
+    """
 
 
 @dataclass(frozen=True)
@@ -316,6 +326,37 @@ class BudgetRecord:
     budget_state: str
     period_day: str
     payload_json: str
+    period_week: str = ""
+    period_month: str = ""
+    role: str = ""
+
+
+@dataclass(frozen=True)
+class BudgetSettingsRecord:
+    """Operator overrides for the ADR-0005 budget thresholds (one row)."""
+
+    daily_usd: str
+    weekly_usd: str
+    monthly_usd: str
+    warn_pct: float
+    updated_at: str
+    id: str = "default"
+
+
+@dataclass(frozen=True)
+class ProviderCapabilityRecord:
+    """The last recorded capability probe for one provider."""
+
+    provider: str
+    model: str
+    strict_schema: bool
+    degraded: bool
+    max_output_tokens: int
+    status: str
+    error_code: str | None
+    notes: str
+    latency_ms: int
+    checked_at: str
 
 
 @dataclass(frozen=True)
@@ -703,11 +744,46 @@ class StorePort(Protocol):
 
     # -- Budget ledger ---------------------------------------------------
 
-    def save_budget_record(self, record: BudgetRecord) -> None: ...
+    def save_call_and_budget(
+        self,
+        call: LLMCallRecord,
+        budget: BudgetRecord,
+        compute: Callable[[dict[str, dict[str, Any]]], tuple[str, list[AuditEventDraft]]],
+    ) -> tuple[LLMCallRecord, BudgetRecord]:
+        """Insert one call row, one budget row, and any threshold audits atomically.
+
+        Runs under one ``BEGIN IMMEDIATE`` transaction so a concurrent or
+        cross-process writer cannot miss a crossing or split the rows. The store
+        allocates a unique call id (suffix ``-<8 hex>`` to both rows) when the
+        base id already exists. ``compute`` receives the in-transaction prior
+        per-period totals and returns ``(budget_state, audit_drafts)``; a call
+        that crosses several periods yields one draft per crossed period.
+        """
+        ...
+
+    def save_budget_record(self, record: BudgetRecord) -> bool: ...
 
     def list_budget_records(
         self, *, decision_id: str | None = None
     ) -> tuple[BudgetRecord, ...]: ...
+
+    def last_budget_record(self) -> BudgetRecord | None: ...
+
+    def list_budget_records_for_period(self, period: str, key: str) -> tuple[BudgetRecord, ...]: ...
+
+    def budget_totals(self, *, day: str, week: str, month: str) -> dict[str, dict[str, Any]]: ...
+
+    def get_budget_settings(self) -> BudgetSettingsRecord | None: ...
+
+    def save_budget_settings(self, record: BudgetSettingsRecord) -> None: ...
+
+    # -- Provider capability probes --------------------------------------
+
+    def save_provider_capability(self, record: ProviderCapabilityRecord) -> None: ...
+
+    def get_provider_capability(self, provider: str) -> ProviderCapabilityRecord | None: ...
+
+    def list_provider_capabilities(self) -> tuple[ProviderCapabilityRecord, ...]: ...
 
     # -- Opportunity ledger ----------------------------------------------
 

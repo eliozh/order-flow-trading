@@ -78,6 +78,7 @@ def _entry_service(request: Request, trigger_id: str) -> EntryService:
         provider=container.provider_for(_scan_provider(container, trigger_id)),
         settings=container.settings,
         kill_switch=kill_switch,
+        runtime=container.llm_runtime,
     )
 
 
