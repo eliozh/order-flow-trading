@@ -28,6 +28,7 @@ import structlog
 from oft.adapters.parquet_store import read_liquidations
 from oft.application.analysis_service import AnalysisService
 from oft.application.freshness import check_live_source
+from oft.application.llm_orchestrator import LLMRuntimeRegistry, provider_configured
 from oft.application.metric_service import MetricInputs, MetricRequest, MetricService
 from oft.application.resampling_service import BarResampleRequest, ResamplingService
 from oft.config import Settings
@@ -63,9 +64,6 @@ LLM_DISABLED_REASON = (
 LLM_PROVIDER_NOT_CONFIGURED_REASON = (
     "LLM_PROVIDER_NOT_CONFIGURED: no provider is configured, so this report is "
     "CALC-only. Configure a provider to enable narrative analysis."
-)
-LLM_PROVIDER_UNAVAILABLE_REASON = (
-    "LLM provider is configured but this build only ships the deterministic stub."
 )
 
 
@@ -121,6 +119,9 @@ class ScanContainer(Protocol):
 
     @property
     def llm_provider(self) -> LLMPort | None: ...
+
+    @property
+    def llm_runtime(self) -> LLMRuntimeRegistry | None: ...
 
     def provider_for(self, requested: str | None = None) -> LLMPort | None: ...
 
@@ -769,13 +770,6 @@ class ScanService:
                 None,
                 (),
             )
-        if provider_name != "stub":
-            return (
-                {"configured": False, "reason": LLM_PROVIDER_UNAVAILABLE_REASON},
-                None,
-                None,
-                (),
-            )
         provider = container.provider_for(provider_name)
         if provider is None:
             return (
@@ -784,13 +778,26 @@ class ScanService:
                 None,
                 (),
             )
-        service = AnalysisService(
-            store=container.store,
-            clock=container.clock,
-            provider=provider,
-            settings=container.settings,
-        )
+        if not provider_configured(container.settings, provider_name):
+            # A named provider without a key must not call out and degrade with
+            # an auth error; report the explicit configuration reason (M16).
+            return (
+                {"configured": False, "reason": LLM_PROVIDER_NOT_CONFIGURED_REASON},
+                None,
+                None,
+                (),
+            )
         try:
+            # Constructing the service (and loading the price table lazily) is
+            # inside the guarded block so a corrupt operator table degrades the
+            # scan to CALC instead of failing it (M11).
+            service = AnalysisService(
+                store=container.store,
+                clock=container.clock,
+                provider=provider,
+                settings=container.settings,
+                runtime=container.llm_runtime,
+            )
             outcome = service.analyze(
                 symbol=request.symbol,
                 timeframe=request.period,
@@ -806,12 +813,14 @@ class ScanService:
                 scan_id=scan_id,
                 error=type(exc).__name__,
             )
+            error_code = str(getattr(exc, "code", "") or "")
+            prefix = "CONFIG_INVALID" if error_code == "CONFIG_INVALID" else "LLM_STAGE_FAILED"
             return (
                 {
                     "configured": True,
                     "provider": provider_name,
                     "validation_status": "REJECTED",
-                    "reason": f"LLM_STAGE_FAILED: {exc}",
+                    "reason": f"{prefix}: {exc}",
                     "opportunity_ids": [],
                 },
                 None,

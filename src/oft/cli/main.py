@@ -8,10 +8,12 @@ from typing import Annotated, Any
 import typer
 
 from oft.cli.commands.backfill import backfill_app
+from oft.cli.commands.budget import budget_app
 from oft.cli.commands.daemon import daemon_app
 from oft.cli.commands.doctor import doctor_command, emit_error
 from oft.cli.commands.kill import kill_app
 from oft.cli.commands.knowledge import knowledge_app
+from oft.cli.commands.llm import llm_app
 from oft.cli.commands.open import open_command
 from oft.cli.commands.opp import opp_app
 from oft.cli.commands.paper import paper_app
@@ -49,6 +51,8 @@ app.add_typer(paper_app, name="paper")
 app.add_typer(prompt_app, name="prompt")
 app.add_typer(knowledge_app, name="knowledge")
 app.add_typer(kill_app, name="kill")
+app.add_typer(llm_app, name="llm")
+app.add_typer(budget_app, name="budget")
 
 _LOOPBACK_HOSTS = frozenset({"127.0.0.1", "localhost", "::1"})
 

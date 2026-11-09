@@ -369,11 +369,14 @@ def test_same_fixed_clock_scan_twice_is_idempotent(tmp_path: Path) -> None:
 
     assert first.scan.status == "DONE"
     assert second.scan.status == "DONE"
-    # Same fixed-clock inputs produce the same decision/call/budget ids; the
-    # writes replay idempotently instead of raising IntegrityError.
+    # The decision id replays idempotently, but each invocation is a real,
+    # billed provider call: it must be recorded under a unique call id rather
+    # than silently dropped (M3).
     assert len(container.store.list_decisions(role="ANALYSIS")) == 1
-    assert len(container.store.list_llm_calls(role="ANALYSIS")) == 1
-    assert len(container.store.list_budget_records()) == 1
+    calls = container.store.list_llm_calls(role="ANALYSIS")
+    assert len(calls) == 2
+    assert calls[0].call_id != calls[1].call_id
+    assert len(container.store.list_budget_records()) == 2
 
 
 def test_trigger_evaluation_is_stale_when_the_report_mark_is_old(tmp_path: Path) -> None:

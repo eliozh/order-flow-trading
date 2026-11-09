@@ -1,0 +1,293 @@
+"""Capability probe validation and call/budget recording (M7, M8, M9)."""
+
+from __future__ import annotations
+
+import json
+from datetime import UTC, datetime
+from pathlib import Path
+from typing import Any
+
+import httpx
+import pytest
+
+from oft.adapters.llm_openai import OpenAIAdapter
+from oft.adapters.sqlite_store import SqliteStore
+from oft.application.llm_orchestrator import CapabilityProbeService
+from oft.clock import FixedClock
+from oft.config import Settings
+from oft.ports.llm import ProbeOutcome
+
+NOW = datetime(2026, 11, 9, 12, 0, 0, tzinfo=UTC)
+FIXTURES = Path(__file__).resolve().parents[1] / "fixtures" / "llm" / "providers" / "openai"
+
+
+def _adapter(body: dict[str, Any], status: int = 200) -> OpenAIAdapter:
+    return OpenAIAdapter(
+        api_key="sk-SENTINEL-DO-NOT-LEAK",
+        base_url="https://api.openai.test",
+        transport=httpx.MockTransport(lambda _request: httpx.Response(status, json=body)),
+    )
+
+
+@pytest.mark.parametrize(
+    ("case", "code"),
+    [
+        ("refusal", "LLM_REFUSED"),
+        ("truncated", "LLM_OUTPUT_TRUNCATED"),
+        ("empty_content", "LLM_OUTPUT_TRUNCATED"),
+        ("malformed", "LLM_SCHEMA_INVALID"),
+    ],
+)
+def test_a_200_probe_body_is_validated_not_assumed_strict(case: str, code: str) -> None:
+    body = json.loads((FIXTURES / f"{case}.json").read_text(encoding="utf-8"))
+
+    outcome = _adapter(body).probe(model="gpt-fixture")
+
+    assert outcome.strict_schema is False
+    assert outcome.error_code == code
+
+
+def test_a_successful_probe_reports_the_advertised_output_capability() -> None:
+    body = {
+        "id": "resp_probe",
+        "status": "completed",
+        "output": [
+            {
+                "type": "message",
+                "role": "assistant",
+                "content": [{"type": "output_text", "text": '{"ok": "ok"}'}],
+            }
+        ],
+        "usage": {"input_tokens": 10, "output_tokens": 5},
+    }
+    adapter = _adapter(body)
+
+    outcome = adapter.probe(model="gpt-fixture")
+
+    assert outcome.error_code is None
+    assert outcome.max_output_tokens == adapter.capabilities().max_output_tokens
+    assert outcome.max_output_tokens != 64
+    assert outcome.usage is not None
+    assert outcome.raw_output_hash
+    assert outcome.request_id
+
+
+class _ProbeAdapter:
+    def __init__(self, outcome: ProbeOutcome) -> None:
+        self._outcome = outcome
+
+    def probe(self, *, model: str, role: Any = None) -> ProbeOutcome:
+        return self._outcome
+
+
+def test_the_probe_call_and_budget_row_are_persisted(tmp_path: Path) -> None:
+    settings = Settings(
+        env="test",
+        port=8765,
+        data_dir=tmp_path / "data",
+        openai_api_key="sk-SENTINEL-DO-NOT-LEAK",
+        llm_provider="openai",
+        llm_model_analysis="gpt-fixture",
+    )
+    store = SqliteStore(settings)
+    store.initialize()
+    from oft.ports.llm import LLMUsage
+
+    outcome = ProbeOutcome(
+        strict_schema=True,
+        notes="strict schema accepted",
+        max_output_tokens=4096,
+        latency_ms=12,
+        usage=LLMUsage(input_tokens=10, output_tokens=5),
+        raw_output_hash="hash",
+        request_id="req-probe",
+    )
+    service = CapabilityProbeService(
+        settings=settings,
+        store=store,
+        clock=FixedClock(NOW),
+        adapter_factory=lambda _settings, _name: _ProbeAdapter(outcome),
+    )
+
+    service.run("openai")
+
+    calls = store.list_llm_calls(role="CAPABILITY_PROBE")
+    budgets = store.list_budget_records()
+    assert len(calls) == 1
+    assert calls[0].attempt == 1
+    assert calls[0].status == "OK"
+    assert calls[0].request_id == "req-probe"
+    assert len(budgets) == 1
+    assert budgets[0].role == "CAPABILITY_PROBE"
+    # A probe is not a decision.
+    assert store.list_decisions() == ()
+
+
+def _price_table(tmp_path: Path) -> Path:
+    prices = tmp_path / "prices.json"
+    prices.write_text(
+        json.dumps(
+            {
+                "version": "v",
+                "models": [
+                    {
+                        "provider": "openai",
+                        "model": "gpt-fixture",
+                        "input_per_mtok": "2.50",
+                        "output_per_mtok": "10.00",
+                        "cache_read_per_mtok": "1.00",
+                        "cache_write_per_mtok": "1.00",
+                        "source_url": "",
+                        "as_of": "2026-11-09",
+                    }
+                ],
+            }
+        ),
+        encoding="utf-8",
+    )
+    return prices
+
+
+def _probe_with(tmp_path: Path, outcome: ProbeOutcome) -> SqliteStore:
+    settings = Settings(
+        env="test",
+        port=8765,
+        data_dir=tmp_path / "data",
+        llm_provider="openai",
+        llm_model_analysis="gpt-fixture",
+        openai_api_key="sk-test",
+        llm_price_table=_price_table(tmp_path),
+    )
+    store = SqliteStore(settings)
+    store.initialize()
+    CapabilityProbeService(
+        settings=settings,
+        store=store,
+        clock=FixedClock(NOW),
+        adapter_factory=lambda _settings, _name: _ProbeAdapter(outcome),
+    ).run("openai")
+    return store
+
+
+def test_a_probe_without_reported_usage_is_unpriced_and_audited(tmp_path: Path) -> None:
+    """A probe that carried no usage object is never priced at $0 (F6)."""
+    from oft.ports.llm import LLMUsage
+
+    store = _probe_with(
+        tmp_path,
+        ProbeOutcome(
+            strict_schema=True,
+            notes="strict schema accepted",
+            max_output_tokens=4096,
+            latency_ms=5,
+            usage=LLMUsage(input_tokens=10, output_tokens=5),
+            usage_reported=False,
+        ),
+    )
+
+    budget = store.list_budget_records()[0]
+    assert budget.unpriced is True
+    assert budget.cost_usd == "0"
+    assert budget.price_version == "none/v1"
+    events = [e for e in store.list_audit_events() if e.event_type == "LLM_USAGE_MISSING"]
+    assert len(events) == 1
+
+
+def test_a_probe_with_reported_usage_is_priced(tmp_path: Path) -> None:
+    from oft.ports.llm import LLMUsage
+
+    store = _probe_with(
+        tmp_path,
+        ProbeOutcome(
+            strict_schema=True,
+            notes="strict schema accepted",
+            max_output_tokens=4096,
+            latency_ms=5,
+            usage=LLMUsage(input_tokens=1_000_000, output_tokens=0),
+            usage_reported=True,
+        ),
+    )
+
+    budget = store.list_budget_records()[0]
+    assert budget.unpriced is False
+    assert budget.cost_usd == "2.50000000"
+
+
+def _runtime_with_open_breaker() -> Any:
+    from oft.application.llm_orchestrator import LLMRuntimeRegistry
+
+    runtime = LLMRuntimeRegistry(clock=FixedClock(NOW))
+    for _ in range(3):
+        runtime.breaker.record_failure("openai")
+    return runtime
+
+
+def test_a_probe_blocked_by_an_open_circuit_records_no_request(tmp_path: Path) -> None:
+    """No provider request means no call row, budget row, or usage audit (silent-3 N1)."""
+    from oft.application.budget_service import BudgetService
+
+    settings = Settings(
+        env="test",
+        port=8765,
+        data_dir=tmp_path / "data",
+        llm_provider="openai",
+        llm_model_analysis="gpt-fixture",
+        openai_api_key="sk-test",
+    )
+    store = SqliteStore(settings)
+    store.initialize()
+    outcome = ProbeOutcome(strict_schema=True, usage_reported=True)
+    service = CapabilityProbeService(
+        settings=settings,
+        store=store,
+        clock=FixedClock(NOW),
+        adapter_factory=lambda _settings, _name: _ProbeAdapter(outcome),
+        runtime=_runtime_with_open_breaker(),
+    )
+    before = BudgetService(store=store).usage("day", at="2026-11-09T12:00:00.000Z")
+
+    record = service.run("openai")
+
+    assert record.status == "FAILED"
+    assert record.error_code == "LLM_RATE_LIMITED"
+    assert store.list_llm_calls() == ()
+    assert store.list_budget_records() == ()
+    audits = [
+        event for event in store.list_audit_events() if event.event_type == "LLM_USAGE_MISSING"
+    ]
+    assert audits == []
+    after = BudgetService(store=store).usage("day", at="2026-11-09T12:00:00.000Z")
+    assert after["call_count"] == before["call_count"] == 0
+
+
+def test_a_provider_echoed_key_is_redacted_and_capped_in_the_probe_row(
+    tmp_path: Path,
+) -> None:
+    sentinel = "sk-SENTINEL-DO-NOT-LEAK"
+    outcome = ProbeOutcome(
+        strict_schema=True,
+        notes="strict schema accepted",
+        request_id=sentinel + "A" * 500,
+        usage_reported=False,
+    )
+    settings = Settings(
+        env="test",
+        port=8765,
+        data_dir=tmp_path / "data",
+        llm_provider="openai",
+        llm_model_analysis="gpt-fixture",
+        openai_api_key=sentinel,
+    )
+    store = SqliteStore(settings)
+    store.initialize()
+
+    CapabilityProbeService(
+        settings=settings,
+        store=store,
+        clock=FixedClock(NOW),
+        adapter_factory=lambda _settings, _name: _ProbeAdapter(outcome),
+    ).run("openai")
+
+    call = store.list_llm_calls(role="CAPABILITY_PROBE")[0]
+    assert sentinel not in call.request_id
+    assert len(call.request_id) <= 200

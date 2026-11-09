@@ -16,17 +16,20 @@ from dataclasses import dataclass, replace
 from decimal import Decimal
 from typing import Any
 
-from oft.application.budget_ledger import BudgetEntry, BudgetLedger, stable_call_id
+from oft.application.budget_ledger import BudgetEntry, BudgetLedger
 from oft.application.execution_gateway import AuthContext, ExecutionGateway, GatewayError
 from oft.application.kill_switch import KillSwitch, KillSwitchActive, record_audit
 from oft.application.knowledge_service import KnowledgeService, knowledge_injection
+from oft.application.llm_orchestrator import (
+    LLMConfigurationError,
+    LLMOrchestrator,
+    LLMRuntimeRegistry,
+    provider_configured,
+)
 from oft.application.llm_validation import (
-    ValidationIssue,
-    ValidationOutcome,
     decision_envelope,
     hash_text,
     schema_text,
-    validate_output,
 )
 from oft.application.paper_broker import OrderIntent, PaperBroker
 from oft.application.prompt_builder import KnowledgeInjection
@@ -37,7 +40,8 @@ from oft.application.prompt_service import (
 )
 from oft.application.trigger_service import TriggerNotFound
 from oft.domain.oms import OrderSide, OrderType, PositionSide
-from oft.domain.prompts import PromptRole, rendered_prompt_hash
+from oft.domain.pricing import PriceTableError
+from oft.domain.prompts import PromptRole
 from oft.domain.risk import (
     DEFAULT_CAPS,
     RiskRequest,
@@ -46,7 +50,15 @@ from oft.domain.risk import (
 )
 from oft.domain.time import utc_timestamp
 from oft.ports.clock import ClockPort
-from oft.ports.llm import LLMPort, LLMRequest, LLMResult, LLMRole, LLMUsage
+from oft.ports.llm import (
+    LLMAdapterError,
+    LLMPort,
+    LLMRequest,
+    LLMResult,
+    LLMRole,
+    LLMUsage,
+    sanitize_provider_id,
+)
 from oft.ports.store import (
     DecisionRecord,
     LLMCallRecord,
@@ -91,13 +103,26 @@ class EntryService:
         provider: LLMPort | None,
         settings: Any,
         kill_switch: KillSwitch,
+        runtime: LLMRuntimeRegistry | None = None,
     ) -> None:
         self._store = store
         self._clock = clock
         self._provider = provider
         self._settings = settings
         self._kill_switch = kill_switch
-        self._budget = BudgetLedger(store=store)
+        self._budget = BudgetLedger(store=store, settings=settings)
+        self._orchestrator = (
+            LLMOrchestrator(
+                store=store,
+                clock=clock,
+                provider=provider,
+                settings=settings,
+                budget=self._budget,
+                runtime=runtime,
+            )
+            if provider is not None
+            else None
+        )
         self._broker = PaperBroker(settings=settings, store=store, clock=clock)
         self._secrets = secret_values_from_settings(settings) if settings is not None else ()
         self._prompts = PromptService(store=store, clock=clock, secret_values=self._secrets)
@@ -119,6 +144,18 @@ class EntryService:
                 "LLM_PROVIDER_NOT_CONFIGURED",
                 "No LLM provider is configured; the entry re-check cannot run.",
             )
+        provider_name = str(getattr(self._provider, "provider", "") or "")
+        if not provider_name:
+            capabilities = getattr(self._provider, "capabilities", None)
+            if callable(capabilities):
+                provider_name = str(getattr(capabilities(), "provider", "") or "")
+        if not provider_configured(self._settings, provider_name):
+            # A named provider without a key fails closed without a call (M16).
+            raise EntryRejected(
+                "LLM_PROVIDER_NOT_CONFIGURED",
+                f"No {provider_name or 'LLM'} API key is configured; "
+                "the entry re-check cannot run.",
+            )
         trigger = self._trigger(trigger_id)
         payload: dict[str, Any] = json.loads(trigger.payload_json)
         opportunity = self._opportunity(payload["opportunity_id"])
@@ -131,7 +168,9 @@ class EntryService:
         decision_id = f"DEC-ENTRY-{digest[:16].upper()}"
         request = LLMRequest(
             role=LLMRole.ENTRY_RECHECK,
-            model="fixture",
+            # Empty model: the orchestrator resolves ``llm_model_entry_recheck``
+            # (with the stub falling back to ``llm_model``).
+            model="",
             system_prompt=system,
             user_prompt=user,
             schema_json=schema_text(),
@@ -140,78 +179,26 @@ class EntryService:
             prompt_version=rendered.version,
             prompt_hash=rendered.prompt_hash,
             request_id=f"REQ-{digest[:12].upper()}",
+            system_prompt_id=rendered.system_prompt_id,
+            system_prompt_version=rendered.system_version,
+            system_prompt_hash=rendered.system_prompt_hash,
         )
-        calls: list[LLMCallRecord] = []
-        budgets: list[BudgetEntry] = []
-        provider = self._provider
-
-        def call_provider(attempt: int, prompt: str) -> LLMResult:
-            result: LLMResult = provider.complete(replace(request, user_prompt=prompt))
-            call_id = stable_call_id(decision_id, attempt)
-            call = LLMCallRecord(
-                call_id=call_id,
+        orchestrator = self._orchestrator
+        assert orchestrator is not None
+        try:
+            orchestration = orchestrator.complete_with_validation(
+                request=request,
                 decision_id=decision_id,
-                role=LLMRole.ENTRY_RECHECK.value,
-                provider=result.provider,
-                model=result.model,
-                prompt_id=rendered.prompt_id,
-                prompt_version=rendered.version,
-                prompt_hash=rendered_prompt_hash(
-                    rendered.prompt_id, rendered.version, system, prompt
-                ),
-                input_hash=digest,
-                attempt=attempt,
-                request_id=result.request_id,
-                status="OK",
-                raw_output_hash=hash_text(result.raw_text),
-                usage_json=json.dumps(result.usage.to_contract(), sort_keys=True),
-                latency_ms=result.latency_ms,
-                error_code=None,
-                created_at=now,
-                system_prompt_id=rendered.system_prompt_id,
-                system_prompt_version=rendered.system_version,
-                system_prompt_hash=rendered.system_prompt_hash,
+                role=LLMRole.ENTRY_RECHECK,
             )
-            self._store.save_llm_call(call)
-            calls.append(call)
-            budgets.append(
-                self._budget.record_call(
-                    call_id=call_id,
-                    decision_id=decision_id,
-                    role=LLMRole.ENTRY_RECHECK.value,
-                    result=result,
-                    occurred_at=now,
-                )
-            )
-            return result
-
-        first = call_provider(1, user)
-        if first.refusal:
-            outcome = ValidationOutcome(
-                status="REJECTED",
-                output=None,
-                errors=(ValidationIssue("output", "LLM_REFUSED", "the model refused"),),
-                raw_output_hash=hash_text(first.raw_text),
-            )
-        elif first.truncated:
-            outcome = ValidationOutcome(
-                status="REJECTED",
-                output=None,
-                errors=(ValidationIssue("output", "LLM_OUTPUT_TRUNCATED", "output truncated"),),
-                raw_output_hash=hash_text(first.raw_text),
-            )
-        else:
-            outcome = validate_output(
-                first.raw_text,
-                role=LLMRole.ENTRY_RECHECK.value,
-                repair=lambda message: (
-                    call_provider(
-                        2,
-                        f"{user}\n\nYour previous output failed validation: {message}. "
-                        "Return only a corrected JSON object matching the schema.",
-                    ).raw_text
-                ),
-            )
+        except (LLMConfigurationError, LLMAdapterError, PriceTableError) as exc:
+            # Map provider/config/pricing failures to the catalog code instead of
+            # letting the route turn them into a 500 INTERNAL_ERROR (H2).
+            raise EntryRejected(exc.code, exc.message) from exc
+        first = orchestration.first_result
+        outcome = orchestration.outcome
+        calls = list(orchestration.calls)
+        budgets = list(orchestration.budgets)
 
         subject = {
             "symbol": payload["symbol"],
@@ -648,7 +635,7 @@ class EntryService:
             "schema_version": "1.0.0",
             "temperature": 0.0,
             "seed": None,
-            "request_id": result.request_id,
+            "request_id": sanitize_provider_id(result.request_id, self._secrets),
             "latency_ms": result.latency_ms,
             "usage": json.loads(calls[0].usage_json) if calls else LLMUsage().to_contract(),
             "cost": {

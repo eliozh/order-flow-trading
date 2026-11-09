@@ -311,6 +311,22 @@
       "userAction": "Replace or rotate the provider key."
     },
     {
+      "code": "LLM_MODEL_NOT_CONFIGURED",
+      "httpStatus": 412,
+      "category": "LLM",
+      "retryable": false,
+      "summary": "No model is configured for this LLM role.",
+      "userAction": "Set the role model in settings; no default model is shipped."
+    },
+    {
+      "code": "LLM_SCHEMA_UNSUPPORTED",
+      "httpStatus": 422,
+      "category": "LLM",
+      "retryable": false,
+      "summary": "The LLM provider cannot enforce the requested structured output schema.",
+      "userAction": "Use a provider or mode that supports structured output; the capability probe records the degradation."
+    },
+    {
       "code": "LLM_TIMEOUT",
       "httpStatus": 504,
       "category": "LLM",

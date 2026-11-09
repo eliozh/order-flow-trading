@@ -1,0 +1,23 @@
+{
+  "id": "resp_fixture",
+  "status": "incomplete",
+  "incomplete_details": {
+    "reason": "max_output_tokens"
+  },
+  "output": [
+    {
+      "type": "message",
+      "role": "assistant",
+      "content": [
+        {
+          "type": "output_text",
+          "text": "{\"decision_type\":"
+        }
+      ]
+    }
+  ],
+  "usage": {
+    "input_tokens": 1000,
+    "output_tokens": 200
+  }
+}

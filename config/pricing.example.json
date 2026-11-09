@@ -1,0 +1,36 @@
+{
+  "_comment": "Placeholder shape for OFT_LLM_PRICE_TABLE. Copy this file, replace every value with the provider's published price, and set source_url/as_of. No real prices are bundled and no default model is shipped.",
+  "version": "example/v1",
+  "models": [
+    {
+      "provider": "openai",
+      "model": "example-openai-model",
+      "input_per_mtok": "0.00",
+      "output_per_mtok": "0.00",
+      "cache_read_per_mtok": "0.00",
+      "cache_write_per_mtok": "0.00",
+      "source_url": "https://example.invalid/pricing/openai",
+      "as_of": "2026-11-09"
+    },
+    {
+      "provider": "anthropic",
+      "model": "example-anthropic-model",
+      "input_per_mtok": "0.00",
+      "output_per_mtok": "0.00",
+      "cache_read_per_mtok": "0.00",
+      "cache_write_per_mtok": "0.00",
+      "source_url": "https://example.invalid/pricing/anthropic",
+      "as_of": "2026-11-09"
+    },
+    {
+      "provider": "deepseek",
+      "model": "example-deepseek-model",
+      "input_per_mtok": "0.00",
+      "output_per_mtok": "0.00",
+      "cache_read_per_mtok": "0.00",
+      "cache_write_per_mtok": "0.00",
+      "source_url": "https://example.invalid/pricing/deepseek",
+      "as_of": "2026-11-09"
+    }
+  ]
+}

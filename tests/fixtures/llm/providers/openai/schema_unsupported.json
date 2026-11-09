@@ -1,0 +1,7 @@
+{
+  "error": {
+    "message": "Invalid schema: additionalProperties is not supported",
+    "type": "invalid_request_error",
+    "code": "invalid_json_schema"
+  }
+}
