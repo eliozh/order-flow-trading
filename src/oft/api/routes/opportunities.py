@@ -4,7 +4,7 @@ from __future__ import annotations
 
 from typing import Any
 
-from fastapi import APIRouter, Path, Query, Request
+from fastapi import APIRouter, Path, Query, Request, Response
 
 from oft.api.envelope import new_request_id, success_envelope
 from oft.api.errors import ApiError
@@ -85,4 +85,50 @@ def read_opportunity_timeline(
         request_id=new_request_id(),
         provenance="CALC",
         data_quality="COMPLETE" if events else "MISSING",
+    )
+
+
+@router.get("/api/v1/opportunities/{opportunity_id}/conditions")
+def read_opportunity_conditions(
+    request: Request,
+    opportunity_id: str = Path(min_length=1, max_length=64, pattern=r"^[A-Za-z0-9._:-]+$"),
+) -> dict[str, Any]:
+    """Display-only evaluation of every condition; nothing is persisted."""
+    container = request.app.state.container
+    service = OpportunityService(store=container.store, clock=container.clock)
+    try:
+        payload = service.evaluate_display(opportunity_id)
+    except OpportunityNotFound as exc:
+        raise ApiError("NOT_FOUND", str(exc)) from exc
+    return success_envelope(
+        payload,
+        request_id=new_request_id(),
+        generated_at=str(payload["as_of"]),
+        provenance="CALC",
+        data_quality=str(payload["data_quality"]),
+    )
+
+
+@router.get("/api/v1/opportunities/{opportunity_id}/export")
+def export_opportunity(
+    request: Request,
+    response: Response,
+    opportunity_id: str = Path(min_length=1, max_length=64, pattern=r"^[A-Za-z0-9._:-]+$"),
+) -> dict[str, Any]:
+    """The contract envelope as a downloadable attachment (read-only)."""
+    container = request.app.state.container
+    service = OpportunityService(store=container.store, clock=container.clock)
+    try:
+        opportunity = service.show(opportunity_id)
+    except OpportunityNotFound as exc:
+        raise ApiError("NOT_FOUND", str(exc)) from exc
+    response.headers["Content-Disposition"] = (
+        f'attachment; filename="opportunity-{opportunity_id}.json"'
+    )
+    return success_envelope(
+        opportunity_payload(opportunity),
+        request_id=new_request_id(),
+        generated_at=opportunity.updated_at,
+        provenance="MIXED",
+        data_quality=str(opportunity.data_quality.get("status", "COMPLETE")),
     )

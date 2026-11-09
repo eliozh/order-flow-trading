@@ -1,0 +1,129 @@
+{
+  "decision_type": "OPPORTUNITY_PROPOSAL",
+  "subject": {
+    "symbol": "BTCUSDT",
+    "timeframe": "1h",
+    "as_of": "2026-11-06T12:00:00.000Z"
+  },
+  "confidence": 0.63,
+  "rationale": "Open interest is building while funding stays negative.",
+  "caveats": ["Liquidations are live-only; history is absent"],
+  "analysis": {
+    "market_structure": "New longs entering into a negative-funding tape.",
+    "regime": "TRENDING_UP",
+    "absorption": null,
+    "exhaustion": null,
+    "key_zones": [
+      {
+        "role": "SUPPORT",
+        "price_low": "68500.00",
+        "price_high": "69000.00",
+        "note": "funding squeeze base"
+      }
+    ],
+    "narrative": "OI expands quickly while funding is still negative.",
+    "metrics_cited": [
+      {
+        "metric": "OI_DELTA",
+        "value": "2.50",
+        "unit": "PCT",
+        "as_of": "2026-11-06T12:00:00.000Z",
+        "ref": "open_interest.delta_over_window",
+        "note": "OI expansion"
+      }
+    ]
+  },
+  "opportunity": {
+    "side": "LONG",
+    "zone_low": "68500.00",
+    "zone_high": "70000.00",
+    "entry_preference": "STOP",
+    "trigger_conditions": [
+      {
+        "draft_id": "c1",
+        "type": "OI_DELTA_ABOVE",
+        "params": {
+          "price": null,
+          "price_low": null,
+          "price_high": null,
+          "threshold": "2.5",
+          "unit": "PCT",
+          "comparator": ">=",
+          "lookback_bars": 3,
+          "session_states": [],
+          "note": "OI expansion"
+        },
+        "window": {
+          "start": "2026-11-06T09:00:00.000Z",
+          "end": "2026-11-06T12:00:00.000Z"
+        },
+        "required_data": ["OPEN_INTEREST"],
+        "description": "open interest grows quickly"
+      },
+      {
+        "draft_id": "c2",
+        "type": "FUNDING_BELOW",
+        "params": {
+          "price": null,
+          "price_low": null,
+          "price_high": null,
+          "threshold": "-0.0001",
+          "unit": "RATE",
+          "comparator": null,
+          "lookback_bars": null,
+          "session_states": [],
+          "note": "shorts still pay longs"
+        },
+        "window": {
+          "start": "2026-11-06T09:00:00.000Z",
+          "end": "2026-11-06T12:00:00.000Z"
+        },
+        "required_data": ["FUNDING"],
+        "description": "funding remains negative"
+      },
+      {
+        "draft_id": "c3",
+        "type": "LIQUIDATION_NOTIONAL_ABOVE",
+        "params": {
+          "price": null,
+          "price_low": null,
+          "price_high": null,
+          "threshold": "250000",
+          "unit": "USD",
+          "comparator": null,
+          "lookback_bars": null,
+          "session_states": [],
+          "note": "short squeeze fuel"
+        },
+        "window": {
+          "start": "2026-11-06T09:00:00.000Z",
+          "end": "2026-11-06T12:00:00.000Z"
+        },
+        "required_data": ["LIQUIDATIONS"],
+        "description": "liquidation notional above the threshold"
+      }
+    ],
+    "invalidation_conditions": [
+      {
+        "type": "FUNDING_ABOVE",
+        "description": "funding flips positive",
+        "price": null,
+        "threshold": "0.0005",
+        "window_end": "2026-12-01T00:00:00.000Z"
+      }
+    ],
+    "expires_at": "2027-01-01T00:00:00.000Z",
+    "risk_request": {
+      "entry_price": "69000.00",
+      "stop_price": "68500.00",
+      "take_profits": ["71000.00"],
+      "risk_pct": 0.6,
+      "leverage": 2.0,
+      "max_notional_usd": "900.00"
+    },
+    "thesis": "Negative funding with expanding open interest.",
+    "data_needs": ["OPEN_INTEREST", "FUNDING", "LIQUIDATIONS"]
+  },
+  "entry_recheck": null,
+  "position_management": null
+}

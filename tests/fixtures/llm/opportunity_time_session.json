@@ -1,0 +1,115 @@
+{
+  "decision_type": "OPPORTUNITY_PROPOSAL",
+  "subject": {
+    "symbol": "XAUUSDT",
+    "timeframe": "1h",
+    "as_of": "2026-11-06T12:00:00.000Z"
+  },
+  "confidence": 0.58,
+  "rationale": "Only enter while the TradFi session is regular and inside the window.",
+  "caveats": ["No trading outside the cash session"],
+  "analysis": {
+    "market_structure": "Session-bound range continuation.",
+    "regime": "RANGE",
+    "absorption": null,
+    "exhaustion": null,
+    "key_zones": [
+      {
+        "role": "SUPPORT",
+        "price_low": "3950.00",
+        "price_high": "3970.00",
+        "note": "session low"
+      }
+    ],
+    "narrative": "The idea is only valid during the regular cash session.",
+    "metrics_cited": [
+      {
+        "metric": "SESSION_STATE",
+        "value": null,
+        "unit": "STATE",
+        "as_of": "2026-11-06T12:00:00.000Z",
+        "ref": "session",
+        "note": "regular session required"
+      }
+    ]
+  },
+  "opportunity": {
+    "side": "LONG",
+    "zone_low": "3950.00",
+    "zone_high": "4050.00",
+    "entry_preference": "LIMIT",
+    "trigger_conditions": [
+      {
+        "draft_id": "c1",
+        "type": "SESSION_STATE",
+        "params": {
+          "price": null,
+          "price_low": null,
+          "price_high": null,
+          "threshold": null,
+          "unit": "STATE",
+          "comparator": null,
+          "lookback_bars": null,
+          "session_states": ["REGULAR", "PRE_MARKET"],
+          "note": "cash session only"
+        },
+        "window": {
+          "start": "2026-11-06T12:00:00.000Z",
+          "end": "2026-11-06T13:00:00.000Z"
+        },
+        "required_data": ["SESSION"],
+        "description": "the recorded session is regular"
+      },
+      {
+        "draft_id": "c2",
+        "type": "TIME_WINDOW",
+        "params": {
+          "price": null,
+          "price_low": null,
+          "price_high": null,
+          "threshold": null,
+          "unit": null,
+          "comparator": null,
+          "lookback_bars": null,
+          "session_states": [],
+          "note": "only during the first hour"
+        },
+        "window": {
+          "start": "2026-11-06T12:00:00.000Z",
+          "end": "2026-11-06T13:00:00.000Z"
+        },
+        "required_data": ["SESSION"],
+        "description": "inside the UTC entry window"
+      }
+    ],
+    "invalidation_conditions": [
+      {
+        "type": "TIME_EXPIRED",
+        "description": "the session window closes",
+        "price": null,
+        "threshold": null,
+        "window_end": "2026-11-06T13:00:00.000Z"
+      },
+      {
+        "type": "MANUAL",
+        "description": "human rejects the idea",
+        "price": null,
+        "threshold": null,
+        "window_end": null
+      }
+    ],
+    "expires_at": "2027-01-01T00:00:00.000Z",
+    "risk_request": {
+      "entry_price": "4000.00",
+      "stop_price": "3950.00",
+      "take_profits": ["4100.00"],
+      "risk_pct": 0.3,
+      "leverage": 1.0,
+      "max_notional_usd": "500.00"
+    },
+    "thesis": "Session-bound range continuation.",
+    "data_needs": ["SESSION"]
+  },
+  "entry_recheck": null,
+  "position_management": null
+}

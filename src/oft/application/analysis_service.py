@@ -23,7 +23,10 @@ from oft.application.llm_validation import (
     hash_text,
     schema_text,
 )
-from oft.application.opportunity_service import OpportunityService
+from oft.application.opportunity_service import (
+    OpportunityService,
+    available_data_from_snapshot,
+)
 from oft.application.prompt_builder import KnowledgeInjection
 from oft.application.prompt_service import (
     PromptService,
@@ -303,6 +306,7 @@ class AnalysisService:
                     },
                     data_quality=_data_quality(metrics, snapshot),
                     at=now,
+                    available_data=available_data_from_snapshot(snapshot),
                 )
             except (ConditionDraftError, InvalidOperation, KeyError, TypeError, ValueError) as exc:
                 # ADR-0005: reject, never crash. A proposed opportunity that

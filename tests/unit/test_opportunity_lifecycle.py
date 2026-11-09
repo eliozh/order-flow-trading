@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+from dataclasses import replace
 from decimal import Decimal
 
 import pytest
@@ -29,7 +30,7 @@ def _draft(**overrides: object) -> ConditionDraft:
             "price_high": "70100.00",
             "threshold": None,
             "unit": "PRICE",
-            "comparator": "BETWEEN",
+            "comparator": None,
             "lookback_bars": None,
             "session_states": [],
             "note": "retest of the range high",
@@ -79,7 +80,7 @@ def test_invalid_zone_order_rejects_the_draft() -> None:
             "price_high": "69900.00",
             "threshold": None,
             "unit": "PRICE",
-            "comparator": "BETWEEN",
+            "comparator": None,
             "lookback_bars": None,
             "session_states": [],
             "note": "",
@@ -101,7 +102,7 @@ def test_missing_required_zone_parameter_rejects_the_draft() -> None:
             "price_high": "70100.00",
             "threshold": None,
             "unit": "PRICE",
-            "comparator": "BETWEEN",
+            "comparator": None,
             "lookback_bars": None,
             "session_states": [],
             "note": "",
@@ -114,7 +115,7 @@ def test_missing_required_zone_parameter_rejects_the_draft() -> None:
 
 def test_unsupported_condition_type_is_rejected() -> None:
     with pytest.raises(ConditionDraftError):
-        validate_condition_drafts((_draft(type="CVD_ABOVE"),))
+        validate_condition_drafts((_draft(type="NOT_A_CONDITION"),))
 
 
 def test_non_numeric_zone_parameter_is_rejected() -> None:
@@ -125,7 +126,7 @@ def test_non_numeric_zone_parameter_is_rejected() -> None:
             "price_high": "70100.00",
             "threshold": None,
             "unit": "PRICE",
-            "comparator": "BETWEEN",
+            "comparator": None,
             "lookback_bars": None,
             "session_states": [],
             "note": "",
@@ -144,7 +145,7 @@ def test_non_positive_zone_parameter_is_rejected() -> None:
             "price_high": "70100.00",
             "threshold": None,
             "unit": "PRICE",
-            "comparator": "BETWEEN",
+            "comparator": None,
             "lookback_bars": None,
             "session_states": [],
             "note": "",
@@ -265,6 +266,14 @@ def test_expiry_is_utc_and_enforced() -> None:
     assert opportunity.is_expired("2026-11-30T00:00:00.000Z") is False
     assert opportunity.is_expired("2026-12-01T00:00:00.000Z") is True
     assert opportunity.is_expired("2026-12-02T00:00:00.000Z") is True
+
+
+def test_expiry_comparison_treats_offset_less_timestamps_as_utc() -> None:
+    opportunity = replace(_opportunity(), expires_at="2026-12-01T00:00:00")
+
+    assert opportunity.is_expired("2026-11-30T00:00:00.000Z") is False
+    assert opportunity.is_expired("2026-12-01T00:00:00.000Z") is True
+    assert opportunity.is_expired("2026-12-01T00:00:00") is True
 
 
 def test_new_opportunity_rejects_an_inverted_zone() -> None:

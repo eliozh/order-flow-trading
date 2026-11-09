@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from collections.abc import Callable
+from collections.abc import Callable, Sequence
 from dataclasses import dataclass
 from typing import Any, Protocol
 
@@ -382,6 +382,26 @@ class OpportunityEventRecord:
     to_state: str
     reason_code: str
     note: str
+
+
+@dataclass(frozen=True)
+class ConditionRecord:
+    """The persisted mirror of one contract condition (queryable)."""
+
+    condition_id: str
+    opportunity_id: str
+    kind: str
+    seq: int
+    type: str
+    params_json: str
+    window_start: str
+    window_end: str
+    required_data_json: str
+    evaluable: bool
+    unavailable_reason: str | None = None
+    last_value: str | None = None
+    last_evaluated_at: str | None = None
+    last_result: bool | None = None
 
 
 @dataclass(frozen=True)
@@ -788,7 +808,10 @@ class StorePort(Protocol):
     # -- Opportunity ledger ----------------------------------------------
 
     def save_opportunity(
-        self, record: OpportunityRecord, event: OpportunityEventRecord | None = None
+        self,
+        record: OpportunityRecord,
+        event: OpportunityEventRecord | None = None,
+        conditions: Sequence[ConditionRecord] = (),
     ) -> None: ...
 
     def transition_opportunity(
@@ -801,11 +824,29 @@ class StorePort(Protocol):
         self, *, state: str | None = None, limit: int = 100, offset: int = 0
     ) -> tuple[OpportunityRecord, ...]: ...
 
+    def list_due_opportunities(
+        self, now: str, *, limit: int = 1000
+    ) -> tuple[OpportunityRecord, ...]: ...
+
     def count_opportunities(self, *, state: str | None = None) -> int: ...
 
     def list_opportunity_events(
         self, opportunity_id: str
     ) -> tuple[OpportunityEventRecord, ...]: ...
+
+    def list_conditions(
+        self, opportunity_id: str, kind: str | None = None
+    ) -> tuple[ConditionRecord, ...]: ...
+
+    def update_condition_evaluation(
+        self,
+        opportunity_id: str,
+        condition_id: str,
+        *,
+        last_value: str | None,
+        last_evaluated_at: str | None,
+        last_result: bool | None,
+    ) -> bool: ...
 
     # -- Triggers and risk verdicts --------------------------------------
 

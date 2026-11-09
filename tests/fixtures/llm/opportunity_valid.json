@@ -48,7 +48,7 @@
           "price_high": "70100.00",
           "threshold": null,
           "unit": "PRICE",
-          "comparator": "BETWEEN",
+          "comparator": null,
           "lookback_bars": null,
           "session_states": [],
           "note": "retest of the range high"

@@ -1,0 +1,136 @@
+{
+  "decision_type": "OPPORTUNITY_PROPOSAL",
+  "subject": {
+    "symbol": "BTCUSDT",
+    "timeframe": "4h",
+    "as_of": "2026-11-06T12:00:00.000Z"
+  },
+  "confidence": 0.74,
+  "rationale": "Range-high retest with price and zone confirmations.",
+  "caveats": ["Thin overnight liquidity"],
+  "analysis": {
+    "market_structure": "Balanced range between value-area low and range high.",
+    "regime": "RANGE",
+    "absorption": null,
+    "exhaustion": null,
+    "key_zones": [
+      {
+        "role": "RESISTANCE",
+        "price_low": "70000.00",
+        "price_high": "70100.00",
+        "note": "range high"
+      }
+    ],
+    "narrative": "Price is rotating inside the range.",
+    "metrics_cited": [
+      {
+        "metric": "DELTA",
+        "value": "1.50",
+        "unit": "BASE",
+        "as_of": "2026-11-06T12:00:00.000Z",
+        "ref": "cvd.points[0]",
+        "note": "positive delta"
+      }
+    ]
+  },
+  "opportunity": {
+    "side": "LONG",
+    "zone_low": "69000.00",
+    "zone_high": "71000.00",
+    "entry_preference": "LIMIT",
+    "trigger_conditions": [
+      {
+        "draft_id": "c1",
+        "type": "PRICE_CROSS_ABOVE",
+        "params": {
+          "price": "70100.00",
+          "price_low": null,
+          "price_high": null,
+          "threshold": null,
+          "unit": "PRICE",
+          "comparator": null,
+          "lookback_bars": null,
+          "session_states": [],
+          "note": "range high reclaimed"
+        },
+        "window": {
+          "start": "2026-11-01T00:00:00.000Z",
+          "end": "2026-12-01T00:00:00.000Z"
+        },
+        "required_data": ["MARK_PRICE", "CONTRACT_SPECS"],
+        "description": "price crosses above the range high"
+      },
+      {
+        "draft_id": "c2",
+        "type": "PRICE_INSIDE_ZONE",
+        "params": {
+          "price": null,
+          "price_low": "69900.00",
+          "price_high": "70100.00",
+          "threshold": null,
+          "unit": "PRICE",
+          "comparator": null,
+          "lookback_bars": null,
+          "session_states": [],
+          "note": "retest of the range high"
+        },
+        "window": {
+          "start": "2026-11-01T00:00:00.000Z",
+          "end": "2026-12-01T00:00:00.000Z"
+        },
+        "required_data": ["MARK_PRICE", "CONTRACT_SPECS"],
+        "description": "price is inside the retest zone"
+      },
+      {
+        "draft_id": "c3",
+        "type": "PRICE_TOUCH_ZONE",
+        "params": {
+          "price": null,
+          "price_low": "69900.00",
+          "price_high": "70100.00",
+          "threshold": null,
+          "unit": "PRICE",
+          "comparator": null,
+          "lookback_bars": null,
+          "session_states": [],
+          "note": "first touch of the retest zone"
+        },
+        "window": {
+          "start": "2026-11-01T00:00:00.000Z",
+          "end": "2026-12-01T00:00:00.000Z"
+        },
+        "required_data": ["MARK_PRICE", "CONTRACT_SPECS"],
+        "description": "price touches the retest zone"
+      }
+    ],
+    "invalidation_conditions": [
+      {
+        "type": "PRICE_CROSS_BELOW",
+        "description": "range low lost",
+        "price": "69000.00",
+        "threshold": null,
+        "window_end": null
+      },
+      {
+        "type": "PRICE_OUTSIDE_ZONE",
+        "description": "price leaves the opportunity zone",
+        "price": null,
+        "threshold": null,
+        "window_end": "2026-12-01T00:00:00.000Z"
+      }
+    ],
+    "expires_at": "2027-01-01T00:00:00.000Z",
+    "risk_request": {
+      "entry_price": "70000.00",
+      "stop_price": "69000.00",
+      "take_profits": ["72000.00"],
+      "risk_pct": 0.8,
+      "leverage": 2.0,
+      "max_notional_usd": "1000.00"
+    },
+    "thesis": "Range high retest with a protected stop.",
+    "data_needs": ["MARK_PRICE", "CONTRACT_SPECS"]
+  },
+  "entry_recheck": null,
+  "position_management": null
+}
