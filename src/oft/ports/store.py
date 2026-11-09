@@ -812,7 +812,15 @@ class StorePort(Protocol):
         record: OpportunityRecord,
         event: OpportunityEventRecord | None = None,
         conditions: Sequence[ConditionRecord] = (),
-    ) -> None: ...
+    ) -> bool:
+        """Persist a new opportunity, event, and condition mirror atomically.
+
+        Returns ``True`` when the row was inserted. A duplicate create is an
+        idempotent no-op that leaves the payload and mirror untouched and
+        returns ``False``; existing opportunities change only via
+        :meth:`transition_opportunity`.
+        """
+        ...
 
     def transition_opportunity(
         self, record: OpportunityRecord, event: OpportunityEventRecord

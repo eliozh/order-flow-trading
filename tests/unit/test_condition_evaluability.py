@@ -8,10 +8,12 @@ import pytest
 
 from oft.application.opportunity_service import (
     _bar_series,
+    _bar_timestamps,
     _footprint_imbalance,
     _liquidation_notional,
     _open_interest_delta_pct,
     _optional_decimal,
+    _parse_timestamp,
     _session_state,
     available_data_from_snapshot,
     evaluation_context_from_snapshot,
@@ -257,6 +259,59 @@ def test_invalidation_mapping_without_available_data_assumes_complete() -> None:
     assert mapped.evaluable is True
 
 
+def test_mapped_invalidation_with_missing_data_records_the_same_reason_as_a_trigger() -> None:
+    mapped = map_invalidation_draft(
+        "PRICE_CROSS_BELOW",
+        price="69000.00",
+        threshold=None,
+        window_end=None,
+        created_at=CREATED_AT,
+        expires_at=EXPIRES_AT,
+        zone_low="69000.00",
+        zone_high="71000.00",
+        # MARK_PRICE is present but the contract spec (tick size) is not.
+        available_data={"MARK_PRICE"},
+    )
+
+    assert mapped.evaluable is False
+    assert mapped.unavailable_reason == "missing required data: CONTRACT_SPECS"
+
+
+def test_mapped_metric_invalidation_with_missing_data_records_the_reason() -> None:
+    mapped = map_invalidation_draft(
+        "DELTA_ABOVE",
+        price=None,
+        threshold="10",
+        window_end=None,
+        created_at=CREATED_AT,
+        expires_at=EXPIRES_AT,
+        zone_low="69000.00",
+        zone_high="71000.00",
+        available_data={"MARK_PRICE"},
+    )
+
+    assert mapped.evaluable is False
+    assert mapped.unavailable_reason == "missing required data: METRICS_5M"
+
+
+def test_funding_invalidation_maps_a_threshold_only_condition() -> None:
+    mapped = map_invalidation_draft(
+        "FUNDING_ABOVE",
+        price=None,
+        threshold="0.0003",
+        window_end=None,
+        created_at=CREATED_AT,
+        expires_at=EXPIRES_AT,
+        zone_low="69000.00",
+        zone_high="71000.00",
+        available_data={"FUNDING"},
+    )
+
+    assert mapped.type is ConditionType.FUNDING_ABOVE
+    assert mapped.params == {"threshold": "0.0003"}
+    assert mapped.evaluable is True
+
+
 def test_invalidation_unknown_type_is_rejected() -> None:
     with pytest.raises(ConditionParamsError):
         map_invalidation_draft(
@@ -337,6 +392,28 @@ def test_bar_series_rejects_non_lists_missing_values_and_non_mappings() -> None:
     assert _bar_series([{"close": None}], "close") is None
     assert _bar_series([], "close") == ()
     assert _bar_series([{"close": "1"}], "close") == (Decimal("1"),)
+
+
+def test_bar_timestamps_reject_missing_malformed_and_empty_values() -> None:
+    assert _bar_timestamps(None) is None
+    assert _bar_timestamps([]) is None
+    assert _bar_timestamps([{"bar_start": "2026-11-06T12:00:00.000Z"}, "oops"]) is None
+    assert _bar_timestamps([{"bar_start": None}]) is None
+    assert _bar_timestamps([{"bar_start": ""}]) is None
+    assert _bar_timestamps([{"bar_start": "2026-11-06T12:00:00.000Z"}]) == (
+        "2026-11-06T12:00:00.000Z",
+    )
+
+
+def test_parse_timestamp_accepts_naive_and_rejects_malformed_values() -> None:
+    from datetime import UTC
+
+    assert _parse_timestamp(None) is None
+    assert _parse_timestamp("") is None
+    assert _parse_timestamp("not-a-timestamp") is None
+    naive = _parse_timestamp("2026-11-06T12:00:00")
+    assert naive is not None and naive.tzinfo is UTC
+    assert naive == _parse_timestamp(CREATED_AT)
 
 
 def test_footprint_imbalance_edge_cases() -> None:
@@ -433,8 +510,36 @@ def test_session_state_edge_cases() -> None:
     assert _session_state({}) is None
     assert _session_state({"session": {}}) is None
     assert _session_state({"session": {"is_no_trading": True}}) == "NO_TRADING"
-    assert _session_state({"session": {"underlying_session": "WAT"}}) == "UNKNOWN"
+    # A raw label that is not a measured regime is absent, never coerced to the
+    # measured value "UNKNOWN" (which could then satisfy SESSION_STATE).
+    assert _session_state({"session": {"underlying_session": "WAT"}}) is None
+    assert _session_state({"session": {"underlying_session": "unknown"}}) is None
+    assert _session_state({"session": {"underlying_session": ""}}) is None
+    assert _session_state({"session": {"underlying_session": "UNKNOWN"}}) is None
     assert _session_state({"session": {"underlying_session": 5}}) is None
+
+
+def test_unrecognized_session_labels_never_satisfy_a_session_condition() -> None:
+    condition = Condition(
+        condition_id="C-1",
+        draft_id="c1",
+        type=ConditionType.SESSION_STATE.value,
+        params={"session_states": ["UNKNOWN"]},
+        window_start=CREATED_AT,
+        window_end=EXPIRES_AT,
+        required_data=("SESSION",),
+        evaluable=True,
+    )
+    context = evaluation_context_from_snapshot(
+        {"session": {"underlying_session": "WAT", "is_no_trading": False}},
+        as_of=CREATED_AT,
+    )
+    result = evaluate_condition(condition, context)
+
+    assert context.session_state is None
+    assert result.met is False
+    assert result.evaluable is False
+    assert result.data_quality == "MISSING"
 
 
 def test_placeholder_session_is_treated_as_absent() -> None:

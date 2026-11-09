@@ -19,7 +19,9 @@ from oft.cli.commands.doctor import emit_error, exit_code_for
 from oft.config import ConfigError, load_settings
 
 opp_app = typer.Typer(
-    help="Opportunity ledger commands (read-only; only code changes state).",
+    help=(
+        "Opportunity ledger commands (no LLM or manual state override; only code changes state)."
+    ),
     no_args_is_help=True,
     add_completion=False,
 )
@@ -257,7 +259,10 @@ def opp_expire_due(
 ) -> None:
     """Expire every OPEN opportunity whose ``expires_at`` has passed (code-only)."""
     settings = _settings_or_exit(json_output)
-    container = build_container(settings)
+    # This command writes opportunity state, so it takes the writer path:
+    # ``initialize=True`` creates/migrates the data dir instead of reporting a
+    # false "nothing due" (or raising a raw SQL error) on an unupgraded DB.
+    container = build_container(settings, initialize=True)
     service = OpportunityService(store=container.store, clock=container.clock)
     expired = service.expire_due()
     if json_output:

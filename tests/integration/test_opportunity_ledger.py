@@ -4,16 +4,19 @@ from __future__ import annotations
 
 import inspect
 import json
+import logging
 import socket
 import sqlite3
 import threading
 import time
 from collections.abc import Iterator
+from dataclasses import replace
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from typing import Any
 
 import pytest
+import structlog
 import uvicorn
 from fastapi.testclient import TestClient
 from typer.testing import CliRunner
@@ -21,6 +24,7 @@ from typer.testing import CliRunner
 from oft.adapters.sqlite_store import database_path
 from oft.api.app import create_app
 from oft.application.opportunity_service import (
+    OpportunityContractError,
     OpportunityNotFound,
     OpportunityService,
     available_data_from_snapshot,
@@ -30,7 +34,12 @@ from oft.cli.main import app as cli_app
 from oft.clock import FixedClock
 from oft.config import Settings
 from oft.domain.llm_output import OpportunityDraft
-from oft.domain.opportunities import ConditionDraftError, OpportunityTransitionError
+from oft.domain.opportunities import (
+    _ALLOWED_TRANSITIONS,
+    ConditionDraftError,
+    OpportunityState,
+    OpportunityTransitionError,
+)
 from oft.ports.store import (
     ConditionRecord,
     OpportunityEventRecord,
@@ -555,6 +564,57 @@ def test_resaving_an_opportunity_does_not_duplicate_condition_rows(
     assert len(container.store.list_conditions(opportunity.opportunity_id)) == 5
 
 
+def test_a_duplicate_create_leaves_the_payload_and_mirror_untouched(
+    tmp_path: Path,
+) -> None:
+    container, opportunity = _create(
+        _settings(tmp_path),
+        draft=_multi_condition_draft(),
+        snapshot=_snapshot(),
+        available=_full_available(),
+    )
+    original = container.store.get_opportunity(opportunity.opportunity_id)
+    assert original is not None
+    original_rows = container.store.list_conditions(opportunity.opportunity_id)
+
+    payload = _opportunity_payload(container, opportunity.opportunity_id)
+    payload["state"] = "TRIGGERED"
+    payload["thesis"] = "a later write must not win"
+    rewritten = OpportunityRecord(
+        opportunity_id=opportunity.opportunity_id,
+        symbol=payload["symbol"],
+        state="TRIGGERED",
+        created_at=payload["created_at"],
+        updated_at=NOW_ISO,
+        payload_json=json.dumps(payload, sort_keys=True),
+    )
+    tampered = tuple(
+        replace(row, params_json=json.dumps({"threshold": "999"})) for row in original_rows
+    )
+
+    inserted = container.store.save_opportunity(rewritten, conditions=tampered)
+
+    assert inserted is False
+    stored = container.store.get_opportunity(opportunity.opportunity_id)
+    assert stored == original
+    assert container.store.list_conditions(opportunity.opportunity_id) == original_rows
+
+
+def test_a_first_insert_reports_success(tmp_path: Path) -> None:
+    container = build_container(_settings(tmp_path), initialize=True, clock=FixedClock(NOW))
+    record = OpportunityRecord(
+        opportunity_id="OPP-FRESH",
+        symbol="BTCUSDT",
+        state="OPEN",
+        created_at=NOW_ISO,
+        updated_at=NOW_ISO,
+        payload_json=json.dumps({"opportunity_id": "OPP-FRESH"}),
+    )
+
+    assert container.store.save_opportunity(record) is True
+    assert container.store.save_opportunity(record) is False
+
+
 def test_migration_v18_backfills_valid_payloads_and_skips_malformed_ones(
     tmp_path: Path,
 ) -> None:
@@ -627,6 +687,112 @@ def test_migration_v18_skips_a_payload_whose_id_mismatches_the_row(
     assert container.store.list_conditions("OPP-MISMATCH") == ()
     assert container.store.list_conditions("OPP-ELSEWHERE") == ()
     assert len(container.store.list_conditions(opportunity.opportunity_id)) == 5
+
+
+def _two_opportunities(settings: Settings) -> tuple[Any, Any, Any]:
+    container, first = _create(
+        settings,
+        draft=_multi_condition_draft(),
+        snapshot=_snapshot(),
+        available=_full_available(),
+    )
+    service = OpportunityService(store=container.store, clock=container.clock)
+    second = service.create_from_decision(
+        opportunity_draft=_multi_condition_draft(),
+        subject={"symbol": "BTCUSDT"},
+        decision_id="DEC-SECOND",
+        scan_id="SCAN-1",
+        report_id="RPT-1",
+        confidence=0.7,
+        provenance=_provenance(),
+        data_quality=_data_quality(),
+        at=NOW_ISO,
+        available_data=_full_available(),
+    )
+    return container, first, second
+
+
+def _mutate_payload(payload: dict[str, Any], mutation: str) -> None:
+    item = payload["trigger_conditions"][0]
+    if mutation == "trigger-not-a-list":
+        payload["trigger_conditions"] = "not-a-list"
+    elif mutation == "invalidation-not-a-list":
+        payload["invalidation_conditions"] = {}
+    elif mutation == "item-not-an-object":
+        payload["trigger_conditions"][0] = ["not-an-object"]
+    elif mutation == "missing-condition-id":
+        del item["condition_id"]
+    elif mutation == "non-string-condition-id":
+        item["condition_id"] = 7
+    elif mutation == "missing-type":
+        del item["type"]
+    elif mutation == "non-string-type":
+        item["type"] = 7
+    elif mutation == "params-not-an-object":
+        item["params"] = "not-an-object"
+    elif mutation == "window-not-an-object":
+        item["window"] = "not-an-object"
+    elif mutation == "required-data-not-a-list":
+        item["required_data"] = "not-a-list"
+    elif mutation == "missing-evaluable":
+        del item["evaluable"]
+    elif mutation == "non-boolean-evaluable":
+        item["evaluable"] = "yes"
+    elif mutation == "bad-window-bounds":
+        item["window"] = {"start": "not-a-timestamp", "end": FUTURE}
+    else:  # pragma: no cover - guards the parametrisation itself
+        raise AssertionError(f"unknown mutation {mutation!r}")
+
+
+@pytest.mark.parametrize(
+    "mutation",
+    [
+        "trigger-not-a-list",
+        "invalidation-not-a-list",
+        "item-not-an-object",
+        "missing-condition-id",
+        "non-string-condition-id",
+        "missing-type",
+        "non-string-type",
+        "params-not-an-object",
+        "window-not-an-object",
+        "required-data-not-a-list",
+        "missing-evaluable",
+        "non-boolean-evaluable",
+        "bad-window-bounds",
+    ],
+)
+def test_v18_backfill_skips_a_structurally_malformed_payload(
+    tmp_path: Path, mutation: str, caplog: pytest.LogCaptureFixture
+) -> None:
+    settings = _settings(tmp_path)
+    container, bad, good = _two_opportunities(settings)
+    payload = _opportunity_payload(container, bad.opportunity_id)
+    _mutate_payload(payload, mutation)
+    db = database_path(settings)
+    connection = sqlite3.connect(db)
+    try:
+        connection.execute(
+            "UPDATE opportunities SET payload_json = ? WHERE opportunity_id = ?",
+            (json.dumps(payload), bad.opportunity_id),
+        )
+        connection.execute("DELETE FROM opportunity_conditions")
+        connection.execute("DELETE FROM schema_migrations WHERE version = 18")
+        connection.commit()
+    finally:
+        connection.close()
+
+    with caplog.at_level(logging.WARNING, logger="oft.adapters.sqlite_store"):
+        container.store.initialize()  # boot must survive every malformed shape
+
+    assert container.store.list_conditions(bad.opportunity_id) == ()
+    assert len(container.store.list_conditions(good.opportunity_id)) == 5
+    skipped = [
+        record
+        for record in caplog.records
+        if record.getMessage() == "opportunity_condition_backfill_skipped"
+    ]
+    assert [record.opportunity_id for record in skipped] == [bad.opportunity_id]
 
 
 def test_v18_mirror_and_query_indexes_exist(tmp_path: Path) -> None:
@@ -1097,6 +1263,112 @@ def test_expires_at_is_normalised_and_each_due_row_expires_once(
     assert service.expire_due(NOW_ISO) == ()
 
 
+def _insert_raw_opportunity(
+    db: Path, opportunity_id: str, payload_json: str, *, expires_at: str | None
+) -> None:
+    connection = sqlite3.connect(db)
+    try:
+        connection.execute(
+            "INSERT INTO opportunities "
+            "(opportunity_id, symbol, state, created_at, updated_at, payload_json, expires_at) "
+            "VALUES (?, ?, 'OPEN', ?, ?, ?, ?)",
+            (opportunity_id, "BTCUSDT", NOW_ISO, NOW_ISO, payload_json, expires_at),
+        )
+        connection.commit()
+    finally:
+        connection.close()
+
+
+def test_expiry_backfill_logs_and_skips_rows_it_cannot_normalise(
+    tmp_path: Path, caplog: pytest.LogCaptureFixture
+) -> None:
+    settings = _settings(tmp_path)
+    container = build_container(settings, initialize=True, clock=FixedClock(NOW))
+    db = database_path(settings)
+    rows = {
+        "OPP-BAD-JSON": "{not-json",
+        "OPP-NON-OBJECT": json.dumps([1, 2, 3]),
+        "OPP-NO-EXPIRY": json.dumps({"opportunity_id": "OPP-NO-EXPIRY"}),
+        "OPP-BAD-TIMESTAMP": json.dumps(
+            {"opportunity_id": "OPP-BAD-TIMESTAMP", "expires_at": "not-a-timestamp"}
+        ),
+    }
+    for opportunity_id, payload_json in rows.items():
+        _insert_raw_opportunity(db, opportunity_id, payload_json, expires_at=None)
+
+    with caplog.at_level(logging.WARNING, logger="oft.adapters.sqlite_store"):
+        container.store.initialize()
+
+    connection = sqlite3.connect(db)
+    try:
+        stored = dict(
+            connection.execute(
+                "SELECT opportunity_id, expires_at FROM opportunities "
+                "WHERE opportunity_id IN (?, ?, ?, ?)",
+                tuple(rows),
+            ).fetchall()
+        )
+    finally:
+        connection.close()
+
+    # Every row is logged with its id and a reason instead of being silently
+    # left with a NULL expiry that the due selector can never match.
+    assert stored == dict.fromkeys(rows)
+    skipped = {
+        record.opportunity_id: record.reason
+        for record in caplog.records
+        if record.getMessage() == "opportunity_expires_at_backfill_skipped"
+    }
+    assert set(skipped) == set(rows)
+    assert "JSON" in skipped["OPP-BAD-JSON"]
+    assert "object" in skipped["OPP-NON-OBJECT"]
+    assert "expires_at" in skipped["OPP-NO-EXPIRY"]
+    assert "timestamp" in skipped["OPP-BAD-TIMESTAMP"]
+
+
+def test_expiry_backfill_rebuilds_a_present_but_null_column(tmp_path: Path) -> None:
+    settings = _settings(tmp_path)
+    container = build_container(settings, initialize=True, clock=FixedClock(NOW))
+    db = database_path(settings)
+    _insert_raw_opportunity(
+        db,
+        "OPP-NULL-OFFSET",
+        json.dumps(
+            {
+                "opportunity_id": "OPP-NULL-OFFSET",
+                "expires_at": "2026-11-06T17:30:00+05:30",
+            }
+        ),
+        expires_at=None,
+    )
+    _insert_raw_opportunity(
+        db,
+        "OPP-NULL-SECONDS",
+        json.dumps({"opportunity_id": "OPP-NULL-SECONDS", "expires_at": "2026-01-01T00:00:00Z"}),
+        expires_at=None,
+    )
+
+    container.store.initialize()
+
+    connection = sqlite3.connect(db)
+    try:
+        stored = dict(
+            connection.execute(
+                "SELECT opportunity_id, expires_at FROM opportunities "
+                "WHERE opportunity_id IN ('OPP-NULL-OFFSET', 'OPP-NULL-SECONDS')"
+            ).fetchall()
+        )
+    finally:
+        connection.close()
+
+    assert stored == {
+        "OPP-NULL-OFFSET": "2026-11-06T12:00:00.000Z",
+        "OPP-NULL-SECONDS": PAST,
+    }
+    due = container.store.list_due_opportunities(NOW_ISO)
+    assert {row.opportunity_id for row in due} == {"OPP-NULL-OFFSET", "OPP-NULL-SECONDS"}
+
+
 def test_expire_due_skips_a_row_that_lost_the_transition_race(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
@@ -1277,12 +1549,138 @@ def test_display_evaluation_is_side_effect_free(tmp_path: Path) -> None:
     assert all(row.last_evaluated_at is None for row in rows)
 
 
+def test_would_trigger_reports_a_met_trigger_set_alongside_a_met_invalidation(
+    tmp_path: Path,
+) -> None:
+    container, opportunity = _create(
+        _settings(tmp_path),
+        draft=_draft(
+            triggers=[
+                _trigger("PRICE_TOUCH_ZONE", draft_id="c1", price_low="99", price_high="101")
+            ],
+            # The mapped zone is the opportunity zone; the recorded last price
+            # (100) is outside it, so the invalidation itself is met.
+            invalidations=[_invalidation("PRICE_OUTSIDE_ZONE")],
+        ),
+        snapshot=_snapshot(),
+        available=_full_available(),
+    )
+    service = OpportunityService(store=container.store, clock=container.clock)
+
+    display = service.evaluate_display(opportunity.opportunity_id)
+
+    invalidation = next(item for item in display["evaluations"] if item["condition_id"] == "I-1")
+    triggers = [item for item in display["evaluations"] if item["condition_id"] == "C-1"]
+    assert triggers[0]["met"] is True
+    assert invalidation["met"] is True
+    assert invalidation["evaluable"] is True
+    # ``would_trigger`` is the trigger-set decision; a met invalidation is
+    # reported separately and does not silently flip the trigger result.
+    assert display["would_trigger"] is True
+
+
 def test_show_unknown_opportunity_raises_not_found(tmp_path: Path) -> None:
     container = build_container(_settings(tmp_path), initialize=True, clock=FixedClock(NOW))
     service = OpportunityService(store=container.store, clock=container.clock)
 
     with pytest.raises(OpportunityNotFound, match="does not exist"):
         service.show("OPP-MISSING")
+
+
+def _corrupted_payload_json(payload: dict[str, Any], corruption: str) -> str:
+    if corruption == "non-object-payload":
+        return json.dumps([1, 2, 3])
+    if corruption == "missing-zone":
+        del payload["zone"]
+    elif corruption == "unknown-state":
+        payload["state"] = "NOT_A_STATE"
+    elif corruption == "invalid-decimal":
+        payload["zone"]["low"] = "not-a-decimal"
+    elif corruption == "condition-missing-type":
+        del payload["trigger_conditions"][0]["type"]
+    else:  # pragma: no cover - guards the parametrisation itself
+        raise AssertionError(f"unknown corruption {corruption!r}")
+    return json.dumps(payload)
+
+
+@pytest.mark.parametrize(
+    "corruption",
+    [
+        "non-object-payload",
+        "missing-zone",
+        "unknown-state",
+        "invalid-decimal",
+        "condition-missing-type",
+    ],
+)
+def test_show_reports_a_typed_error_for_a_corrupt_contract_payload(
+    tmp_path: Path, corruption: str
+) -> None:
+    settings = _settings(tmp_path)
+    container, opportunity = _create(
+        settings,
+        draft=_multi_condition_draft(),
+        snapshot=_snapshot(),
+        available=_full_available(),
+    )
+    payload = _opportunity_payload(container, opportunity.opportunity_id)
+    corrupted = _corrupted_payload_json(payload, corruption)
+    connection = sqlite3.connect(database_path(settings))
+    try:
+        connection.execute(
+            "UPDATE opportunities SET payload_json = ? WHERE opportunity_id = ?",
+            (corrupted, opportunity.opportunity_id),
+        )
+        connection.commit()
+    finally:
+        connection.close()
+    service = OpportunityService(store=container.store, clock=container.clock)
+
+    with pytest.raises(OpportunityContractError) as excinfo:
+        service.show(opportunity.opportunity_id)
+
+    assert excinfo.value.code == "DATA_UNAVAILABLE"
+
+
+def test_api_returns_data_unavailable_for_a_corrupt_contract_payload(tmp_path: Path) -> None:
+    settings = _settings(tmp_path)
+    container, opportunity = _create(
+        settings,
+        draft=_multi_condition_draft(),
+        snapshot=_snapshot(),
+        available=_full_available(),
+    )
+    payload = _opportunity_payload(container, opportunity.opportunity_id)
+    corrupted = _corrupted_payload_json(payload, "invalid-decimal")
+    connection = sqlite3.connect(database_path(settings))
+    try:
+        connection.execute(
+            "UPDATE opportunities SET payload_json = ? WHERE opportunity_id = ?",
+            (corrupted, opportunity.opportunity_id),
+        )
+        connection.commit()
+    finally:
+        connection.close()
+    app = create_app(settings, clock=FixedClock(NOW))
+    auth = _auth(app)
+
+    with TestClient(app) as client:
+        shown = client.get(f"/api/v1/opportunities/{opportunity.opportunity_id}", headers=auth)
+        conditions = client.get(
+            f"/api/v1/opportunities/{opportunity.opportunity_id}/conditions",
+            headers=auth,
+        )
+        exported = client.get(
+            f"/api/v1/opportunities/{opportunity.opportunity_id}/export",
+            headers=auth,
+        )
+
+    assert shown.status_code == 503
+    assert shown.json()["error"]["code"] == "DATA_UNAVAILABLE"
+    assert conditions.status_code == 503
+    assert conditions.json()["error"]["code"] == "DATA_UNAVAILABLE"
+    assert exported.status_code == 503
+    assert exported.json()["error"]["code"] == "DATA_UNAVAILABLE"
 
 
 def test_timeline_falls_back_to_the_payload_history(tmp_path: Path) -> None:
@@ -1352,6 +1750,47 @@ def test_code_only_invalidate_and_trigger_transitions(tmp_path: Path) -> None:
     assert invalidated.state.value == "INVALIDATED"
     assert triggered.state.value == "TRIGGERED"
     assert service.show(first.opportunity_id).state_history[-1].reason_code == "REJECTED"
+
+
+def test_sql_state_guard_is_derived_from_the_domain_transition_map(tmp_path: Path) -> None:
+    container = build_container(_settings(tmp_path), initialize=True, clock=FixedClock(NOW))
+    checked = 0
+    allowed_pairs = 0
+    for from_state in OpportunityState:
+        for to_state in OpportunityState:
+            opportunity_id = f"OPP-{from_state.value}-{to_state.value}"
+            record = OpportunityRecord(
+                opportunity_id=opportunity_id,
+                symbol="BTCUSDT",
+                state=from_state.value,
+                created_at=NOW_ISO,
+                updated_at=NOW_ISO,
+                payload_json=json.dumps({"opportunity_id": opportunity_id}),
+            )
+            assert container.store.save_opportunity(record) is True
+            target = replace(record, state=to_state.value)
+            event = OpportunityEventRecord(
+                opportunity_id=opportunity_id,
+                seq=2,
+                at=NOW_ISO,
+                from_state=from_state.value,
+                to_state=to_state.value,
+                reason_code="TEST",
+                note="",
+            )
+            expected = to_state in _ALLOWED_TRANSITIONS.get(from_state, frozenset())
+
+            result = container.store.transition_opportunity(target, event)
+
+            assert result is expected, (from_state.value, to_state.value)
+            stored = container.store.get_opportunity(opportunity_id)
+            assert stored is not None
+            assert stored.state == (to_state.value if expected else from_state.value)
+            checked += 1
+            allowed_pairs += int(expected)
+
+    assert checked == len(OpportunityState) ** 2
+    assert allowed_pairs == sum(len(allowed) for allowed in _ALLOWED_TRANSITIONS.values())
 
 
 def test_a_lost_race_surfaces_as_a_transition_error(
@@ -1446,6 +1885,66 @@ def test_display_evaluation_with_malformed_snapshot_is_unevaluable(tmp_path: Pat
     assert all(
         item["unavailable_reason"] == "report unavailable" for item in display["evaluations"]
     )
+
+
+def test_display_evaluation_with_a_non_object_snapshot_is_unevaluable(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from oft.application import opportunity_service as opportunity_service_module
+
+    settings = _settings(tmp_path)
+    container = build_container(settings, initialize=True, clock=FixedClock(NOW))
+    container.store.save_scan(_scan_record())
+    container.store.save_report(
+        ReportRecord(
+            report_id="RPT-LIST",
+            scan_id="SCAN-1",
+            symbol="BTCUSDT",
+            timeframe="4h",
+            generated_at=NOW_ISO,
+            metrics_manifest_json="[]",
+            llm_decision_id=None,
+            narrative_ref=None,
+            data_quality="COMPLETE",
+            snapshot_json=json.dumps([1, 2, 3]),
+            metrics_json="{}",
+        )
+    )
+    service = OpportunityService(store=container.store, clock=container.clock)
+    opportunity = service.create_from_decision(
+        opportunity_draft=_draft(
+            triggers=[
+                _trigger("PRICE_TOUCH_ZONE", draft_id="c1", price_low="99", price_high="101")
+            ],
+            invalidations=[],
+        ),
+        subject={"symbol": "BTCUSDT"},
+        decision_id="DEC-LIST",
+        scan_id="SCAN-1",
+        report_id="RPT-LIST",
+        confidence=0.7,
+        provenance=_provenance(),
+        data_quality=_data_quality(),
+        at=NOW_ISO,
+        available_data=_full_available(),
+    )
+
+    with structlog.testing.capture_logs() as logs:
+        # A cached module logger may still hold a pre-reconfiguration processor
+        # list; bind a fresh one inside the capture to keep this deterministic.
+        monkeypatch.setattr(
+            opportunity_service_module,
+            "_LOGGER",
+            structlog.get_logger("test.opportunity_service"),
+        )
+        display = service.evaluate_display(opportunity.opportunity_id)
+
+    assert display["would_trigger"] is False
+    assert display["data_quality"] == "MISSING"
+    assert all(
+        item["unavailable_reason"] == "report unavailable" for item in display["evaluations"]
+    )
+    assert any(log.get("event") == "opportunity_report_snapshot_unavailable" for log in logs)
 
 
 def test_invalid_invalidation_parameters_are_rejected(tmp_path: Path) -> None:
@@ -1782,6 +2281,64 @@ def test_cli_show_renders_unavailable_reasons() -> None:
     assert "historical liquidations are unavailable" in rendered
     assert "I-1 TIME_WINDOW evaluable=False" in rendered
     assert "manual invalidation is code-only" in rendered
+
+
+def test_cli_expire_due_initialises_a_fresh_and_an_older_schema_data_dir(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    runner = CliRunner()
+    monkeypatch.setenv("OFT_ENV", "test")
+    monkeypatch.setenv("OFT_PORT", "8765")
+
+    fresh = _settings(tmp_path / "fresh")
+    monkeypatch.setenv("OFT_DATA", str(fresh.data_dir))
+    fresh_result = runner.invoke(cli_app, ["opp", "expire-due"])
+
+    assert fresh_result.exit_code == 0, fresh_result.output
+    assert fresh_result.exception is None
+    assert database_path(fresh).exists()
+    assert "No opportunities expired." in fresh_result.output
+
+    previous = _settings(tmp_path / "previous")
+    # A pre-fix schema row must still carry a real contract payload: the writer
+    # path re-materialises it, and a corrupt payload is now skipped with a log.
+    source = _settings(tmp_path / "source")
+    source_container, due = _create(
+        source,
+        draft=_draft(
+            triggers=[
+                _trigger("PRICE_TOUCH_ZONE", draft_id="c1", price_low="99", price_high="101")
+            ],
+            invalidations=[],
+            expires_at=PAST,
+        ),
+        snapshot=_snapshot(),
+        available=_full_available(),
+    )
+    source_record = source_container.store.get_opportunity(due.opportunity_id)
+    assert source_record is not None
+    _build_pre_fix_v18_database(
+        previous,
+        payloads={due.opportunity_id: source_record.payload_json},
+        condition_rows=[],
+    )
+    monkeypatch.setenv("OFT_DATA", str(previous.data_dir))
+    migrated = runner.invoke(cli_app, ["opp", "expire-due"])
+
+    assert migrated.exit_code == 0, migrated.output
+    assert migrated.exception is None
+    assert f"{due.opportunity_id} → EXPIRED" in migrated.output
+    connection = sqlite3.connect(database_path(previous))
+    try:
+        columns = {row[1] for row in connection.execute("PRAGMA table_info(opportunities)")}
+        state = connection.execute(
+            "SELECT state FROM opportunities WHERE opportunity_id = ?",
+            (due.opportunity_id,),
+        ).fetchone()[0]
+    finally:
+        connection.close()
+    assert "expires_at" in columns
+    assert state == "EXPIRED"
 
 
 def test_cli_has_no_manual_trigger_or_state_override_command() -> None:

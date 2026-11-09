@@ -9,6 +9,7 @@ from fastapi import APIRouter, Path, Query, Request, Response
 from oft.api.envelope import new_request_id, success_envelope
 from oft.api.errors import ApiError
 from oft.application.opportunity_service import (
+    OpportunityContractError,
     OpportunityNotFound,
     OpportunityService,
     opportunity_payload,
@@ -30,9 +31,12 @@ def list_opportunities(
 ) -> dict[str, Any]:
     container = request.app.state.container
     service = OpportunityService(store=container.store, clock=container.clock)
-    items = service.list(state=state, limit=limit, offset=offset)
+    try:
+        items = service.list(state=state, limit=limit, offset=offset)
+        total = service.count(state=state)
+    except OpportunityContractError as exc:
+        raise ApiError("DATA_UNAVAILABLE", str(exc)) from exc
     payloads = [opportunity_summary(item) for item in items]
-    total = service.count(state=state)
     has_next = offset + len(payloads) < total
     return success_envelope(
         {"items": payloads, "total": total},
@@ -60,6 +64,8 @@ def read_opportunity(
         opportunity = service.show(opportunity_id)
     except OpportunityNotFound as exc:
         raise ApiError("NOT_FOUND", str(exc)) from exc
+    except OpportunityContractError as exc:
+        raise ApiError("DATA_UNAVAILABLE", str(exc)) from exc
     return success_envelope(
         opportunity_payload(opportunity),
         request_id=new_request_id(),
@@ -80,6 +86,8 @@ def read_opportunity_timeline(
         events = service.timeline(opportunity_id)
     except OpportunityNotFound as exc:
         raise ApiError("NOT_FOUND", str(exc)) from exc
+    except OpportunityContractError as exc:
+        raise ApiError("DATA_UNAVAILABLE", str(exc)) from exc
     return success_envelope(
         {"opportunity_id": opportunity_id, "items": list(events)},
         request_id=new_request_id(),
@@ -100,6 +108,8 @@ def read_opportunity_conditions(
         payload = service.evaluate_display(opportunity_id)
     except OpportunityNotFound as exc:
         raise ApiError("NOT_FOUND", str(exc)) from exc
+    except OpportunityContractError as exc:
+        raise ApiError("DATA_UNAVAILABLE", str(exc)) from exc
     return success_envelope(
         payload,
         request_id=new_request_id(),
@@ -122,6 +132,8 @@ def export_opportunity(
         opportunity = service.show(opportunity_id)
     except OpportunityNotFound as exc:
         raise ApiError("NOT_FOUND", str(exc)) from exc
+    except OpportunityContractError as exc:
+        raise ApiError("DATA_UNAVAILABLE", str(exc)) from exc
     response.headers["Content-Disposition"] = (
         f'attachment; filename="opportunity-{opportunity_id}.json"'
     )

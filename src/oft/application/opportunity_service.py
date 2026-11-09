@@ -29,6 +29,7 @@ from oft.domain.opportunities import (
     ConditionDraft,
     ConditionDraftError,
     Opportunity,
+    OpportunityContractError,
     OpportunityState,
     OpportunityTransitionError,
     assign_conditions,
@@ -44,6 +45,9 @@ from oft.ports.store import (
 )
 
 _LOGGER = structlog.get_logger(__name__)
+# UNKNOWN is a contract enum value, not a measured regime: a recorder that
+# cannot tell the session must leave SESSION absent rather than evaluable.
+_MEASURED_SESSION_STATES = SESSION_STATES - {"UNKNOWN"}
 
 
 class OpportunityNotFound(Exception):
@@ -187,7 +191,11 @@ class OpportunityService:
                         at=at,
                     )
                 )
-            except (OpportunityTransitionError, OpportunityNotFound) as exc:
+            except (
+                OpportunityTransitionError,
+                OpportunityNotFound,
+                OpportunityContractError,
+            ) as exc:
                 _LOGGER.warning(
                     "opportunity_expire_due_skipped",
                     opportunity_id=record.opportunity_id,
@@ -592,11 +600,12 @@ def _session_state(snapshot: Mapping[str, Any]) -> str | None:
         # The placeholder written by the metrics-only snapshot builder is an
         # unmeasured field, never a recorded trading regime.
         return None
-    if raw == "UNKNOWN":
+    # Only a known measured regime counts. Every other label (UNKNOWN,
+    # "unknown", empty, garbage) is absent: coercing it to the measured value
+    # "UNKNOWN" would let unmeasured data satisfy a SESSION_STATE condition.
+    if not isinstance(raw, str) or raw not in _MEASURED_SESSION_STATES:
         return None
-    if isinstance(raw, str) and raw in SESSION_STATES:
-        return raw
-    return "UNKNOWN" if isinstance(raw, str) else None
+    return raw
 
 
 def evaluation_context_from_snapshot(
@@ -691,8 +700,28 @@ def _record(opportunity: Opportunity) -> OpportunityRecord:
 
 
 def _to_domain(record: OpportunityRecord) -> Opportunity:
-    payload = json.loads(record.payload_json)
-    return _opportunity_from_contract(payload)
+    """Reconstruct the domain object, failing with a typed data error.
+
+    Persisted JSON is untrusted: a truncated or hand-edited row must never
+    surface as a raw ``KeyError``/``ValueError``/``InvalidOperation`` out of a
+    read path.
+    """
+    try:
+        payload = json.loads(record.payload_json)
+        if not isinstance(payload, dict):
+            raise TypeError("the persisted payload is not an object")
+        return _opportunity_from_contract(payload)
+    except (
+        json.JSONDecodeError,
+        KeyError,
+        TypeError,
+        ValueError,
+        AttributeError,
+        InvalidOperation,
+    ) as exc:
+        raise OpportunityContractError(
+            f"opportunity {record.opportunity_id} has a corrupt contract payload"
+        ) from exc
 
 
 def _opportunity_from_contract(payload: dict[str, Any]) -> Opportunity:
@@ -774,6 +803,7 @@ def opportunity_summary(opportunity: Opportunity) -> dict[str, Any]:
 
 __all__ = [
     "ConditionDraftError",
+    "OpportunityContractError",
     "OpportunityNotFound",
     "OpportunityService",
     "opportunity_payload",

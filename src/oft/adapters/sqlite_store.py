@@ -24,6 +24,7 @@ from oft.domain.audit import build_audit_entry
 from oft.domain.budget_periods import budget_record_id, period_parts
 from oft.domain.conditions import ConditionParamsError, normalize_timestamp
 from oft.domain.data_quality import DataGap, GapSeverity
+from oft.domain.opportunities import _ALLOWED_TRANSITIONS, OpportunityState
 from oft.domain.prompts import (
     DEFAULT_SYSTEM_BODIES,
     DEFAULT_USER_BODIES,
@@ -1467,16 +1468,46 @@ def _ensure_opportunities_expires_at(connection: sqlite3.Connection) -> None:
                 try:
                     payload = json.loads(str(payload_json))
                 except (json.JSONDecodeError, TypeError, ValueError):
+                    _LOGGER.warning(
+                        "opportunity_expires_at_backfill_skipped",
+                        extra={
+                            "opportunity_id": opportunity_id,
+                            "reason": "payload_json is not valid JSON",
+                        },
+                    )
                     continue
                 if not isinstance(payload, dict):
+                    _LOGGER.warning(
+                        "opportunity_expires_at_backfill_skipped",
+                        extra={
+                            "opportunity_id": opportunity_id,
+                            "reason": "payload_json is not an object",
+                        },
+                    )
                     continue
                 raw = payload.get("expires_at")
                 if not isinstance(raw, str):
+                    _LOGGER.warning(
+                        "opportunity_expires_at_backfill_skipped",
+                        extra={
+                            "opportunity_id": opportunity_id,
+                            "reason": "payload has no string expires_at",
+                        },
+                    )
                     continue
                 value = raw
             try:
                 normalized = normalize_timestamp(value)
             except (TypeError, ValueError):
+                # A row left NULL here is never selected by
+                # ``list_due_opportunities``, so the skip must be diagnosable.
+                _LOGGER.warning(
+                    "opportunity_expires_at_backfill_skipped",
+                    extra={
+                        "opportunity_id": opportunity_id,
+                        "reason": "expires_at is not a valid timestamp",
+                    },
+                )
                 continue
             if normalized != current:
                 connection.execute(
@@ -4099,7 +4130,17 @@ class SqliteStore:
         record: OpportunityRecord,
         event: OpportunityEventRecord | None = None,
         conditions: Sequence[ConditionRecord] = (),
-    ) -> None:
+    ) -> bool:
+        """Persist a new opportunity, its creation event, and its condition mirror.
+
+        The three writes share one transaction: either the row, the event, and
+        every condition are committed, or none are. A duplicate create (an
+        ``opportunity_id`` that already exists) is an idempotent no-op: the
+        stored payload, event, and mirror rows are left untouched and
+        ``False`` is returned. An existing opportunity is changed only through
+        :meth:`transition_opportunity`, so the payload and the mirror can never
+        disagree because of a later "create".
+        """
         connection = self._connect()
         try:
             connection.execute("BEGIN IMMEDIATE")
@@ -4121,7 +4162,7 @@ class SqliteStore:
                     expires_at = None
             else:
                 expires_at = None
-            connection.execute(
+            cursor = connection.execute(
                 """
                 INSERT INTO opportunities (
                     opportunity_id, symbol, state, created_at, updated_at, payload_json,
@@ -4139,6 +4180,12 @@ class SqliteStore:
                     expires_at if isinstance(expires_at, str) else None,
                 ),
             )
+            if cursor.rowcount == 0:
+                # The row already exists: do not rewrite the event or the
+                # condition mirror. All-or-nothing means a duplicate create
+                # changes nothing, not just the row.
+                connection.commit()
+                return False
             if event is not None:
                 # The CREATED row is part of the same unit: the timeline must not
                 # lose the creation event once a transition event exists.
@@ -4159,8 +4206,9 @@ class SqliteStore:
                     ),
                 )
             for condition in conditions:
-                # Re-saving the same opportunity replaces its mirror rows; it
-                # never duplicates them.
+                # Reached only for a freshly inserted row, so the mirror always
+                # matches the payload exactly. A later re-save with a shorter
+                # list is not supported (use a transition, not a create).
                 connection.execute(
                     """
                     INSERT OR REPLACE INTO opportunity_conditions (
@@ -4188,6 +4236,7 @@ class SqliteStore:
                     ),
                 )
             connection.commit()
+            return True
         except BaseException:
             connection.rollback()
             raise
@@ -4197,15 +4246,21 @@ class SqliteStore:
     def transition_opportunity(
         self, record: OpportunityRecord, event: OpportunityEventRecord
     ) -> bool:
-        # OPEN may move to any terminal state; TRIGGERED may only be invalidated
-        # (a human reject or NO_ENTRY re-check). The domain transition() is the
-        # authority; this condition pins the same rule in one atomic statement.
-        allowed_from: tuple[str, ...]
-        if record.state == "INVALIDATED":
-            allowed_from = ("OPEN", "TRIGGERED")
-        elif record.state in {"TRIGGERED", "EXPIRED"}:
-            allowed_from = ("OPEN",)
-        else:
+        # The domain ``_ALLOWED_TRANSITIONS`` map is the single authority; this
+        # guard is derived from it so a future transition change can never
+        # drift from the SQL condition. The UPDATE is one atomic statement.
+        try:
+            target = OpportunityState(record.state)
+        except ValueError:
+            return False
+        allowed_from = tuple(
+            sorted(
+                source.value
+                for source, targets in _ALLOWED_TRANSITIONS.items()
+                if target in targets
+            )
+        )
+        if not allowed_from:
             return False
         placeholders = ", ".join("?" for _ in allowed_from)
         with closing(self._connect()) as connection, connection:

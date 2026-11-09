@@ -604,6 +604,7 @@ def test_cvd_divergence_requires_opposite_directions() -> None:
     met = evaluate_condition(
         divergence,
         context(
+            bar_timestamps=SERIES_BARS,
             price_series=(Decimal("99"), Decimal("100"), Decimal("102")),
             cvd_series=(Decimal("10"), Decimal("9"), Decimal("8")),
         ),
@@ -611,6 +612,7 @@ def test_cvd_divergence_requires_opposite_directions() -> None:
     same = evaluate_condition(
         divergence,
         context(
+            bar_timestamps=SERIES_BARS,
             price_series=(Decimal("99"), Decimal("100"), Decimal("102")),
             cvd_series=(Decimal("8"), Decimal("9"), Decimal("10")),
         ),
@@ -626,6 +628,7 @@ def test_cvd_divergence_requires_equal_length_series() -> None:
     result = evaluate_condition(
         condition(ConditionType.CVD_DIVERGENCE, lookback_bars=3),
         context(
+            bar_timestamps=SERIES_BARS,
             price_series=(Decimal("99"), Decimal("100"), Decimal("101")),
             cvd_series=(Decimal("9"), Decimal("8")),
         ),
@@ -641,6 +644,7 @@ def test_cvd_divergence_requires_enough_bars() -> None:
     result = evaluate_condition(
         condition(ConditionType.CVD_DIVERGENCE, lookback_bars=3),
         context(
+            bar_timestamps=BARS_EARLY,
             price_series=(Decimal("99"), Decimal("100")),
             cvd_series=(Decimal("9"), Decimal("8")),
         ),
@@ -654,6 +658,7 @@ def test_cvd_divergence_does_not_call_a_flat_series_divergent() -> None:
     result = evaluate_condition(
         condition(ConditionType.CVD_DIVERGENCE, lookback_bars=3),
         context(
+            bar_timestamps=SERIES_BARS,
             price_series=(Decimal("100"), Decimal("100"), Decimal("100")),
             cvd_series=(Decimal("8"), Decimal("9"), Decimal("10")),
         ),
@@ -661,6 +666,115 @@ def test_cvd_divergence_does_not_call_a_flat_series_divergent() -> None:
 
     assert result.met is False
     assert result.evaluable is True
+
+
+def test_cvd_divergence_never_uses_bars_after_as_of() -> None:
+    # The four bars end at 12:05, after as_of 12:00. Slicing the raw tail would
+    # include the future bar and read same-direction price and CVD; the
+    # windowed tail (<= as_of) diverges.
+    result = evaluate_condition(
+        condition(ConditionType.CVD_DIVERGENCE, lookback_bars=3),
+        context(
+            bar_timestamps=(*SERIES_BARS, "2026-11-06T12:05:00.000Z"),
+            price_series=(Decimal("99"), Decimal("100"), Decimal("102"), Decimal("50")),
+            cvd_series=(Decimal("10"), Decimal("9"), Decimal("8"), Decimal("5")),
+        ),
+    )
+
+    assert result.evaluable is True
+    assert result.met is True
+
+
+def test_cvd_divergence_never_uses_bars_outside_the_condition_window() -> None:
+    # The 12:10 bar is before as_of but after the condition window end; it
+    # would flip the last-3 comparison to a false divergence.
+    date_window = Condition(
+        condition_id="C-1",
+        draft_id="c1",
+        type=ConditionType.CVD_DIVERGENCE.value,
+        params={"lookback_bars": 3},
+        window_start="2026-11-06T11:50:00.000Z",
+        window_end="2026-11-06T12:05:00.000Z",
+        required_data=("METRICS_5M",),
+        evaluable=True,
+    )
+    result = evaluate_condition(
+        date_window,
+        context(
+            as_of="2026-11-06T12:20:00.000Z",
+            bar_timestamps=(
+                "2026-11-06T11:50:00.000Z",
+                "2026-11-06T11:55:00.000Z",
+                "2026-11-06T12:00:00.000Z",
+                "2026-11-06T12:10:00.000Z",
+            ),
+            price_series=(Decimal("99"), Decimal("100"), Decimal("102"), Decimal("50")),
+            cvd_series=(Decimal("8"), Decimal("9"), Decimal("10"), Decimal("20")),
+        ),
+    )
+
+    assert result.evaluable is True
+    assert result.met is False
+
+
+def test_cvd_divergence_slices_surplus_bars_to_the_lookback() -> None:
+    # The whole five-bar window trends down in both series; only the last three
+    # bars (price up, CVD down) diverge.
+    ctx = context(
+        bar_timestamps=(
+            "2026-11-06T11:30:00.000Z",
+            "2026-11-06T11:40:00.000Z",
+            "2026-11-06T11:45:00.000Z",
+            "2026-11-06T11:50:00.000Z",
+            "2026-11-06T11:55:00.000Z",
+        ),
+        price_series=(
+            Decimal("200"),
+            Decimal("150"),
+            Decimal("99"),
+            Decimal("100"),
+            Decimal("102"),
+        ),
+        cvd_series=(Decimal("50"), Decimal("30"), Decimal("10"), Decimal("9"), Decimal("8")),
+    )
+
+    last_three = evaluate_condition(condition(ConditionType.CVD_DIVERGENCE, lookback_bars=3), ctx)
+    whole_window = evaluate_condition(condition(ConditionType.CVD_DIVERGENCE, lookback_bars=5), ctx)
+
+    assert last_three.evaluable is True
+    assert last_three.met is True
+    assert whole_window.evaluable is True
+    assert whole_window.met is False
+
+
+def test_cvd_divergence_without_bar_timestamps_is_unevaluable() -> None:
+    result = evaluate_condition(
+        condition(ConditionType.CVD_DIVERGENCE, lookback_bars=3),
+        context(
+            bar_timestamps=None,
+            price_series=(Decimal("99"), Decimal("100"), Decimal("102")),
+            cvd_series=(Decimal("10"), Decimal("9"), Decimal("8")),
+        ),
+    )
+
+    assert result.met is False
+    assert result.evaluable is False
+    assert "timestamps" in (result.unavailable_reason or "")
+
+
+def test_cvd_divergence_with_malformed_bar_timestamps_is_unevaluable() -> None:
+    result = evaluate_condition(
+        condition(ConditionType.CVD_DIVERGENCE, lookback_bars=3),
+        context(
+            bar_timestamps=("not-a-timestamp", "also-bad", "still-bad"),
+            price_series=(Decimal("99"), Decimal("100"), Decimal("102")),
+            cvd_series=(Decimal("10"), Decimal("9"), Decimal("8")),
+        ),
+    )
+
+    assert result.met is False
+    assert result.evaluable is False
+    assert "malformed" in (result.unavailable_reason or "")
 
 
 def test_session_state_matches_the_recorded_state() -> None:
@@ -1213,6 +1327,42 @@ def test_bars_outside_the_condition_window_are_never_used() -> None:
     assert "lookback_bars" in (result.unavailable_reason or "")
 
 
+def test_a_lookback_series_without_bar_timestamps_is_unevaluable() -> None:
+    result = evaluate_condition(
+        condition(ConditionType.DELTA_ABOVE, threshold="1", lookback_bars=1),
+        context(bar_timestamps=None, delta_series=(Decimal("10"),)),
+    )
+
+    assert result.met is False
+    assert result.evaluable is False
+    assert "timestamps" in (result.unavailable_reason or "")
+
+
+def test_malformed_bar_timestamps_make_a_lookback_unevaluable() -> None:
+    result = evaluate_condition(
+        condition(ConditionType.DELTA_ABOVE, threshold="1", lookback_bars=1),
+        context(bar_timestamps=("not-a-timestamp",), delta_series=(Decimal("10"),)),
+    )
+
+    assert result.met is False
+    assert result.evaluable is False
+    assert result.data_quality == "PARTIAL"
+
+
+def test_a_zero_open_interest_baseline_is_unevaluable() -> None:
+    result = evaluate_condition(
+        condition(ConditionType.OI_DELTA_ABOVE, threshold="1", lookback_bars=2),
+        context(
+            bar_timestamps=BARS_EARLY,
+            oi_series=(Decimal("0"), Decimal("10")),
+        ),
+    )
+
+    assert result.met is False
+    assert result.evaluable is False
+    assert "open interest" in (result.unavailable_reason or "")
+
+
 # -- timestamps, comparators, and inversion semantics -----------------------
 
 
@@ -1282,3 +1432,11 @@ def test_normalize_timestamp_produces_utc_z_strings() -> None:
     assert normalize_timestamp("2026-11-06T17:30:00+05:30") == "2026-11-06T12:00:00.000Z"
     assert normalize_timestamp("2026-11-06T12:00:00") == "2026-11-06T12:00:00.000Z"
     assert normalize_timestamp("2026-11-06T12:00:00.123Z") == "2026-11-06T12:00:00.123Z"
+
+
+def test_normalize_timestamp_truncates_sub_millisecond_input_to_millis() -> None:
+    # TEXT expiry comparisons are lexicographic: a six-digit fraction would
+    # sort after a three-digit instant that is actually later.
+    assert normalize_timestamp("2026-11-06T12:00:00.123456Z") == "2026-11-06T12:00:00.123Z"
+    assert normalize_timestamp("2026-11-06T12:00:00.123999Z") == "2026-11-06T12:00:00.123Z"
+    assert normalize_timestamp("2026-11-06T12:00:00.9Z") == "2026-11-06T12:00:00.900Z"

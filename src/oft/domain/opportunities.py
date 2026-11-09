@@ -1,8 +1,8 @@
 """Structured opportunity ledger and the code-only state machine (ADR-0006).
 
-Only the deterministic trigger evaluator (code) may move an opportunity out of
-``OPEN``. The LLM supplies drafts; code assigns condition IDs, validates the
-required parameters, and appends immutable history entries.
+Only code -- never the LLM -- may move an opportunity out of ``OPEN``. The LLM
+supplies drafts; code assigns condition IDs, validates the required parameters,
+and appends immutable history entries.
 """
 
 from __future__ import annotations
@@ -51,6 +51,17 @@ class OpportunityTransitionError(Exception):
     """The requested state change is not allowed by the state machine."""
 
     code = "POSITION_STATE_INVALID"
+
+
+class OpportunityContractError(Exception):
+    """A persisted opportunity payload cannot be reconstructed.
+
+    Persisted JSON is untrusted input: a truncated, hand-edited, or otherwise
+    corrupt row must surface as a typed data error, never as an unhandled
+    ``KeyError``/``ValueError``/``InvalidOperation`` out of a read path.
+    """
+
+    code = "DATA_UNAVAILABLE"
 
 
 class ConditionDraftError(ConditionParamsError):

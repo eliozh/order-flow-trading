@@ -313,7 +313,7 @@ def _price_cross(params: Mapping[str, Any], context: EvaluationContext, *, above
         )
     last_price = context.last_price
     tick_size = context.tick_size
-    if last_price is None or tick_size is None:
+    if last_price is None or tick_size is None:  # pragma: no cover - required-data gate
         return _Outcome(
             met=False,
             observed_value=None,
@@ -350,6 +350,11 @@ def _eval_inside_zone(
 def _eval_touch_zone(
     params: Mapping[str, Any], _start: str, _end: str, context: EvaluationContext
 ) -> _Outcome:
+    # PRICE_TOUCH_ZONE is the contract's alias for "the recorded price is in
+    # the zone": the only price feed is the instantaneous mark price, so a
+    # touch and an inside observation are indistinguishable here. It shares
+    # the inside-zone evaluator deliberately; adding a separate intrabar touch
+    # feed would require new data, not a new evaluator.
     return _zone(params, context, mode="inside")
 
 
@@ -362,7 +367,7 @@ def _eval_outside_zone(
 def _zone(params: Mapping[str, Any], context: EvaluationContext, *, mode: str) -> _Outcome:
     last_price = context.last_price
     tick_size = context.tick_size
-    if last_price is None or tick_size is None:
+    if last_price is None or tick_size is None:  # pragma: no cover - required-data gate
         return _Outcome(
             met=False,
             observed_value=None,
@@ -402,7 +407,7 @@ def _threshold_evaluator(field_name: str, default_comparator: str) -> Evaluator:
     ) -> _Outcome:
         value = getattr(context, field_name)
         threshold = Decimal(_required_decimal(params.get("threshold"), "threshold"))
-        if value is None:
+        if value is None:  # pragma: no cover - required-data gate
             return _Outcome(
                 met=False,
                 observed_value=None,
@@ -442,7 +447,7 @@ def _windowed_value(
         return None, f"{label} has a gap in the per-bar series"
     if timestamps is None or len(timestamps) != len(series):
         return None, f"{label} bar timestamps are unavailable"
-    if context.as_of is None:
+    if context.as_of is None:  # pragma: no cover - evaluate_condition gates as_of first
         return None, "as_of is unavailable"
     try:
         window_start = _parse(start)
@@ -510,7 +515,7 @@ def _lookback_evaluator(
                 unavailable_reason=reason,
                 data_quality="PARTIAL",
             )
-        if value is None:
+        if value is None:  # pragma: no cover - _windowed_value always pairs None with a reason
             return _Outcome(
                 met=False,
                 observed_value=None,
@@ -532,8 +537,16 @@ def _lookback_evaluator(
 
 
 def _eval_cvd_divergence(
-    params: Mapping[str, Any], _start: str, _end: str, context: EvaluationContext
+    params: Mapping[str, Any], start: str, end: str, context: EvaluationContext
 ) -> _Outcome:
+    """Compare the last ``lookback_bars`` bars of the windowed price/CVD series.
+
+    The series are aligned to ``bar_timestamps``; only bars inside
+    ``[window_start, window_end)`` and at or before ``as_of`` participate, and
+    the last ``lookback_bars`` of that selection are used. Future or
+    out-of-window bars can never influence the result, and a filtered series
+    shorter than the lookback is unevaluable rather than truncated.
+    """
     lookback = _required_int(params.get("lookback_bars"), "lookback_bars", 3)
     if context.price_series is None or context.cvd_series is None:
         return _Outcome(
@@ -555,20 +568,61 @@ def _eval_cvd_divergence(
             unavailable_reason="price_series and cvd_series have different lengths",
             data_quality="PARTIAL",
         )
-    if len(context.price_series) < lookback:
+    timestamps = context.bar_timestamps
+    if timestamps is None or len(timestamps) != len(context.price_series):
+        return _Outcome(
+            met=False,
+            observed_value=None,
+            threshold=None,
+            note="bar timestamps are unavailable",
+            evaluable=False,
+            unavailable_reason="CVD divergence bar timestamps are unavailable",
+            data_quality="PARTIAL",
+        )
+    if context.as_of is None:  # pragma: no cover - evaluate_condition gates as_of first
+        return _Outcome(
+            met=False,
+            observed_value=None,
+            threshold=None,
+            note="as_of is unavailable",
+            evaluable=False,
+            unavailable_reason="as_of is unavailable",
+            data_quality="PARTIAL",
+        )
+    try:
+        window_start = _parse(start)
+        window_end = _parse(end)
+        as_of = _parse(context.as_of)
+        selected = [
+            (price, cvd)
+            for price, cvd, raw in zip(
+                context.price_series, context.cvd_series, timestamps, strict=True
+            )
+            if window_start <= _parse(raw) < window_end and _parse(raw) <= as_of
+        ]
+    except (TypeError, ValueError):
+        return _Outcome(
+            met=False,
+            observed_value=None,
+            threshold=None,
+            note="bar timestamps are malformed",
+            evaluable=False,
+            unavailable_reason="CVD divergence bar timestamps are malformed",
+            data_quality="PARTIAL",
+        )
+    if len(selected) < lookback:
         return _Outcome(
             met=False,
             observed_value=None,
             threshold=None,
             note="not enough bars for the requested lookback",
             evaluable=False,
-            unavailable_reason=f"lookback_bars {lookback} exceeds the available series",
+            unavailable_reason=f"lookback_bars {lookback} exceeds the available bars",
             data_quality="PARTIAL",
         )
-    price_window = context.price_series[-lookback:]
-    cvd_window = context.cvd_series[-lookback:]
-    price_change = price_window[-1] - price_window[0]
-    cvd_change = cvd_window[-1] - cvd_window[0]
+    window = selected[-lookback:]
+    price_change = window[-1][0] - window[0][0]
+    cvd_change = window[-1][1] - window[0][1]
     price_direction = _direction(price_change)
     cvd_direction = _direction(cvd_change)
     met = price_direction * cvd_direction == -1
@@ -599,7 +653,7 @@ def _direction_word(direction: int) -> str:
 def _eval_session_state(
     params: Mapping[str, Any], _start: str, _end: str, context: EvaluationContext
 ) -> _Outcome:
-    if context.session_state is None:
+    if context.session_state is None:  # pragma: no cover - required-data gate
         return _Outcome(
             met=False,
             observed_value=None,
@@ -626,7 +680,7 @@ def _eval_session_state(
 def _eval_time_window(
     params: Mapping[str, Any], start: str, end: str, context: EvaluationContext
 ) -> _Outcome:
-    if not context.as_of:
+    if not context.as_of:  # pragma: no cover - evaluate_condition gates as_of first
         return _Outcome(
             met=False,
             observed_value=None,
@@ -668,15 +722,17 @@ def _eval_time_window(
 
 
 def normalize_timestamp(value: str) -> str:
-    """Normalise an ISO timestamp to a UTC ``...Z`` string.
+    """Normalise an ISO timestamp to canonical UTC ``...Z`` with millisecond precision.
 
     Offset-less values are UTC (semantic validation allows them). Persisting
-    one textual form keeps TEXT range comparisons correct.
+    one fixed-width textual form keeps TEXT range comparisons correct: the
+    fraction is always exactly three digits, and any sub-millisecond component
+    is truncated (never rendered as a longer fraction, which would break
+    lexicographic ordering).
     """
     parsed = _parse(value).astimezone(UTC)
-    if parsed.microsecond % 1000 == 0:
-        return parsed.strftime("%Y-%m-%dT%H:%M:%S.") + f"{parsed.microsecond // 1000:03d}Z"
-    return parsed.strftime("%Y-%m-%dT%H:%M:%S.%fZ")
+    milliseconds = parsed.microsecond // 1000
+    return parsed.strftime("%Y-%m-%dT%H:%M:%S.") + f"{milliseconds:03d}Z"
 
 
 def _parse(value: str) -> datetime:
@@ -885,7 +941,8 @@ def contract_required_data(condition_type: ConditionType) -> tuple[str, ...]:
     data for evaluation, so it records the price data it is displayed against
     only to satisfy ``minItems: 1``. The registry's empty required-data set
     remains authoritative: ``creation_evaluable`` and ``evaluate_condition``
-    read ``CONDITION_SPECS``, so a ``TIME_WINDOW`` is always evaluable.
+    read ``CONDITION_SPECS``, so a ``TIME_WINDOW`` is evaluable whenever
+    ``as_of`` is present.
     """
     required = CONDITION_SPECS[condition_type].required_data
     if required:
@@ -1057,10 +1114,14 @@ def map_invalidation_draft(
         raise ConditionParamsError(f"unsupported invalidation type {draft_type!r}", field="type")
     end = window_end or expires_at
 
-    def mapped_evaluable(condition_type: ConditionType) -> bool:
+    def mapped_state(condition_type: ConditionType) -> tuple[bool, str | None]:
+        """Evaluability and the same missing-data reason triggers carry."""
         if available_data is None:
-            return True
-        return creation_evaluable(condition_type, available_data)
+            return True, None
+        if creation_evaluable(condition_type, available_data):
+            return True, None
+        missing = sorted(CONDITION_SPECS[condition_type].required_data - frozenset(available_data))
+        return False, "missing required data: " + ", ".join(missing)
 
     if draft_type == "MANUAL":
         return MappedCondition(
@@ -1073,14 +1134,15 @@ def map_invalidation_draft(
             unavailable_reason="manual invalidation is code-only",
         )
     if draft_type == "TIME_EXPIRED":
+        evaluable, reason = mapped_state(ConditionType.TIME_WINDOW)
         return MappedCondition(
             type=ConditionType.TIME_WINDOW,
             params={"original_type": "TIME_EXPIRED"},
             window_start=normalize_timestamp(created_at),
             window_end=normalize_timestamp(end),
             required_data=contract_required_data(ConditionType.TIME_WINDOW),
-            evaluable=mapped_evaluable(ConditionType.TIME_WINDOW),
-            unavailable_reason=None,
+            evaluable=evaluable,
+            unavailable_reason=reason,
         )
     if draft_type == "PRICE_OUTSIDE_ZONE":
         raw: dict[str, Any] = {"price_low": zone_low, "price_high": zone_high}
@@ -1098,14 +1160,15 @@ def map_invalidation_draft(
     else:
         raw = {"threshold": threshold}
     validated = validate_draft(draft_type, raw)
+    evaluable, reason = mapped_state(validated.type)
     return MappedCondition(
         type=validated.type,
         params=validated.params,
         window_start=normalize_timestamp(created_at),
         window_end=normalize_timestamp(end),
         required_data=validated.required_data,
-        evaluable=mapped_evaluable(validated.type),
-        unavailable_reason=None,
+        evaluable=evaluable,
+        unavailable_reason=reason,
     )
 
 
