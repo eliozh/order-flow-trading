@@ -26,11 +26,12 @@ from oft.application.trigger_service import TriggerService
 from oft.clock import FixedClock
 from oft.config import ConfigError, Settings, load_settings
 from oft.domain.time import utc_timestamp
-from oft.domain.trigger import TriggerSnapshot
+from oft.domain.trigger import TriggerSnapshot, evaluate_trigger
 from oft.ports.store import (
     JobRunRecord,
     OpportunityEventRecord,
     OpportunityRecord,
+    TriggerEventRecord,
 )
 
 NOW = datetime(2026, 11, 6, 12, 0, 0, tzinfo=UTC)
@@ -218,6 +219,57 @@ def test_no_catch_up_and_restart_reconstructs_open_opportunities(tmp_path: Path)
     assert len(store.list_trigger_events()) == 2
 
 
+def test_the_job_reconciles_an_open_opportunity_with_an_existing_pending_trigger(
+    tmp_path: Path,
+) -> None:
+    """The crash window: a PENDING_RECHECK trigger committed, OPEN did not."""
+    store = _store(tmp_path)
+    opportunity_id = _insert_opportunity(store)
+    opportunity = OpportunityService(store=store, clock=FixedClock(NOW)).show(opportunity_id)
+    snapshot = _snapshot()
+    evaluation = evaluate_trigger(
+        opportunity.trigger_conditions,
+        snapshot,
+        symbol=opportunity.symbol,
+        now=NOW_TEXT,
+        snapshot_id=snapshot.snapshot_id,
+    )
+    key = f"TRG-{opportunity_id}-{evaluation.snapshot_hash[:16].upper()}"
+    trigger_id = "TRG-PENDING"
+    assert store.save_trigger_event(
+        TriggerEventRecord(
+            trigger_id=trigger_id,
+            opportunity_id=opportunity_id,
+            symbol=opportunity.symbol,
+            status="PENDING_RECHECK",
+            idempotency_key=key,
+            triggered_at=NOW_TEXT,
+            payload_json=json.dumps({"trigger_id": trigger_id}),
+            snapshot_hash=evaluation.snapshot_hash,
+            as_of=snapshot.as_of,
+            data_quality="COMPLETE",
+            condition_count=1,
+        )
+    )
+    assert (
+        OpportunityService(store=store, clock=FixedClock(NOW)).show(opportunity_id).state.value
+        == "OPEN"
+    )
+
+    outcome = _runner(store).run_tick(NOW)
+
+    assert outcome.claimed is True
+    assert outcome.counts.triggered == 0
+    assert outcome.counts.skipped == 1
+    assert len(store.list_trigger_events()) == 1
+    stored = OpportunityService(store=store, clock=FixedClock(NOW)).show(opportunity_id)
+    assert stored.state.value == "TRIGGERED"
+    timeline = OpportunityService(store=store, clock=FixedClock(NOW)).timeline(opportunity_id)
+    assert [event["to_state"] for event in timeline] == ["OPEN", "TRIGGERED"]
+    assert timeline[-1]["reason_code"] == "TRIGGER_MET"
+    assert timeline[-1]["note"] == trigger_id
+
+
 def test_a_failed_tick_records_a_failed_run(tmp_path: Path) -> None:
     store = _store(tmp_path)
 
@@ -237,7 +289,6 @@ def test_a_failed_tick_records_a_failed_run(tmp_path: Path) -> None:
 
 def test_the_trigger_scheduler_is_single_instance_with_coalescing() -> None:
     scheduler = TriggerDaemonScheduler(
-        clock=FixedClock(NOW),
         interval_seconds=15,
         job=lambda: None,
     )
@@ -251,14 +302,20 @@ def test_the_trigger_scheduler_is_single_instance_with_coalescing() -> None:
 
 
 def test_trigger_interval_config_is_validated() -> None:
+    from oft.config import CONFIG_INVALID
+
     with pytest.raises(ValidationError):
         Settings(trigger_interval_seconds=4)
     with pytest.raises(ValidationError):
         Settings(trigger_interval_seconds=61)
     with pytest.raises(ValidationError):
         Settings(trigger_stale_after_seconds=0)
-    with pytest.raises(ConfigError):
+    with pytest.raises(ConfigError) as interval_error:
         load_settings(trigger_interval_seconds=0)
+    with pytest.raises(ConfigError) as stale_error:
+        load_settings(trigger_stale_after_seconds=0)
+    assert interval_error.value.code == CONFIG_INVALID
+    assert stale_error.value.code == CONFIG_INVALID
     assert Settings().trigger_interval_seconds == 15
     assert Settings().trigger_stale_after_seconds == 60
 
@@ -584,6 +641,27 @@ def test_cli_trigger_evaluate_all_rejects_override_flags(
     assert client.calls == []
 
 
+def test_cli_trigger_evaluate_all_rejects_a_positional_opportunity(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    from typer.testing import CliRunner
+
+    from oft.cli.commands import trigger as trigger_command
+    from oft.cli.main import app as cli_app
+
+    _cli_environment(monkeypatch, tmp_path)
+    client = _RecordingClient({"data": {}})
+    monkeypatch.setattr(
+        trigger_command.ApiClient, "from_settings", lambda settings, **kwargs: client
+    )
+
+    result = CliRunner().invoke(cli_app, ["trigger", "evaluate", "OPP-1", "--all"])
+
+    assert result.exit_code == 1
+    assert "omit the positional opportunity_id" in result.output
+    assert client.calls == []
+
+
 def test_align_interval_rejects_a_naive_instant() -> None:
     with pytest.raises(ValueError, match="timezone-aware"):
         align_interval(datetime(2026, 11, 6, 12, 0, 0), 15)
@@ -712,6 +790,7 @@ def test_evaluate_all_envelope_is_degraded_for_a_stale_or_partial_batch(
     outcomes = [
         TriggerBatchOutcome(open=2, evaluated=1, triggered=0, stale=1, open_total=2),
         TriggerBatchOutcome(open=1, evaluated=1, triggered=1, open_total=1),
+        TriggerBatchOutcome(open=1, evaluated=1, triggered=0, open_total=3, capped=True),
     ]
 
     class _StubService:
@@ -729,8 +808,63 @@ def test_evaluate_all_envelope_is_degraded_for_a_stale_or_partial_batch(
             "/api/v1/triggers/evaluate-all",
             headers={**auth, "Idempotency-Key": "evaluate-all-complete"},
         ).json()
+        capped = client.post(
+            "/api/v1/triggers/evaluate-all",
+            headers={**auth, "Idempotency-Key": "evaluate-all-capped"},
+        ).json()
 
     assert degraded["meta"]["data_quality"] == "PARTIAL"
     assert degraded["data"]["stale"] == 1
     assert degraded["data"]["open_total"] == 2
     assert complete["meta"]["data_quality"] == "COMPLETE"
+    # Every loaded row was fresh, but rows were skipped: still DEGRADED.
+    assert capped["data"]["capped"] is True
+    assert capped["meta"]["data_quality"] == "PARTIAL"
+
+
+def test_daemon_start_reaps_stale_trigger_runs_and_logs_the_count(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from types import SimpleNamespace
+
+    from oft.cli.commands import daemon as daemon_module
+
+    class _RecordingLogger:
+        def __init__(self) -> None:
+            self.warnings: list[tuple[str, dict[str, object]]] = []
+
+        def warning(self, event: str, **kwargs: object) -> None:
+            self.warnings.append((event, kwargs))
+
+    class _StubScheduler:
+        def __init__(self, **kwargs: object) -> None:
+            self.kwargs = kwargs
+            self.started = False
+
+        def start(self) -> None:
+            self.started = True
+
+        def shutdown(self, **kwargs: object) -> None:
+            pass
+
+    logger = _RecordingLogger()
+    monkeypatch.setattr(daemon_module, "_LOGGER", logger)
+    monkeypatch.setattr(daemon_module, "TriggerDaemonScheduler", _StubScheduler)
+    store = _store(tmp_path)
+    past = NOW - timedelta(minutes=30)
+    claim = JobLedger(store=store, clock=FixedClock(past)).claim(
+        TRIGGER_JOB_TYPE,
+        utc_timestamp(align_interval(past, 15)),
+        source="trigger",
+    )
+    assert claim.claimed is True
+    settings = Settings(env="test", port=8765, data_dir=tmp_path / "data")
+    container = SimpleNamespace(store=store, clock=FixedClock(NOW), settings=settings)
+
+    scheduler = daemon_module._start_trigger_scheduler(settings, container=container)
+
+    assert scheduler.started is True
+    assert scheduler.kwargs["interval_seconds"] == settings.trigger_interval_seconds
+    runs = store.list_job_runs(TRIGGER_JOB_TYPE)
+    assert [(run.status, run.error_code) for run in runs] == [("FAILED", "LEASE_EXPIRED")]
+    assert logger.warnings == [("trigger_stale_runs_reaped", {"count": 1})]

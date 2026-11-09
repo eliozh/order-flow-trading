@@ -186,15 +186,26 @@ def test_visible_bars_drops_bars_after_the_ceiling() -> None:
     assert visible == [{"bar_start": BEFORE, "bar_end": BEFORE_END}]
 
 
-def test_visible_bars_passes_non_list_input_through() -> None:
-    assert visible_bars("not-a-list", AS_OF_INSTANT) == "not-a-list"
+def test_visible_bars_fails_closed_for_non_list_input() -> None:
+    assert visible_bars("not-a-list", AS_OF_INSTANT) == []
     assert visible_bars([{"bar_start": BEFORE}], AS_OF_INSTANT) == []
 
 
-def test_visible_bars_returns_the_input_when_a_bar_is_malformed() -> None:
+def test_visible_bars_fails_closed_when_a_bar_is_not_an_object() -> None:
     bars = [{"bar_end": BEFORE_END}, "not-a-bar"]
 
-    assert visible_bars(bars, AS_OF_INSTANT) == bars
+    assert visible_bars(bars, AS_OF_INSTANT) == []
+
+
+def test_a_non_mapping_element_never_leaks_a_future_bar() -> None:
+    # The future bar must not survive merely because another element is
+    # malformed: fail closed with an empty list.
+    bars = [
+        {"bar_start": AFTER, "bar_end": AFTER_END},
+        "not-a-bar",
+    ]
+
+    assert visible_bars(bars, AS_OF_INSTANT) == []
 
 
 def test_a_snapshot_with_only_the_visible_bar_cannot_satisfy_a_two_bar_lookback() -> None:

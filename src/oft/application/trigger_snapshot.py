@@ -52,16 +52,18 @@ def visible_bars(bars: object, ceiling: datetime) -> object:
     """Drop every bar that closes after ``ceiling`` (no lookahead).
 
     A bar whose ``bar_end`` is missing or malformed cannot be proven to be at
-    or before the ceiling and is excluded. A non-list ``bars`` value is passed
-    through so the shared context builder reports the series as absent.
+    or before the ceiling and is excluded. Fail closed: a non-list ``bars``
+    value or any non-object element yields an empty list. Previously a
+    malformed element returned the whole unfiltered list, which could leak
+    future bars to any consumer that trusts this helper alone.
     """
     if not isinstance(bars, list):
-        return bars
+        return []
     visible: list[object] = []
     for bar in bars:
         if not isinstance(bar, Mapping):
-            # Leave malformed input for the context builder to report absent.
-            return bars
+            _LOGGER.warning("trigger_bar_dropped", reason="bar is not an object")
+            return []
         end = _aware_instant(bar.get("bar_end"))
         if end is None:
             continue

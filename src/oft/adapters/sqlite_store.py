@@ -561,7 +561,8 @@ _SCHEMA_SQL = f"""
     );
     CREATE INDEX IF NOT EXISTS positions_state ON positions(state);
     -- Slice 11 replay/pagination indexes. ``fills(order_id)`` is mandatory:
-    -- it is an FK and the accept replay looks the fill up by order.
+    -- it is an FK and the accept replay looks the fill up by order. The
+    -- trigger indexes below are current as of schema v19 (trigger provenance).
     CREATE INDEX IF NOT EXISTS fills_order_id ON fills(order_id);
     CREATE INDEX IF NOT EXISTS budget_ledger_decision ON budget_ledger(decision_id);
     CREATE INDEX IF NOT EXISTS llm_calls_role ON llm_calls(role);
@@ -1660,7 +1661,12 @@ def _enable_wal(connection: sqlite3.Connection) -> None:
 
 
 def initialize_database(settings: Settings) -> None:
-    """Create the data directory and the walking-skeleton schema."""
+    """Create the data directory and the schema, currently v19.
+
+    v19 adds the trigger snapshot provenance columns (``snapshot_hash``,
+    ``as_of``, ``data_quality``, ``condition_count``) and backfills them from
+    recorded payloads.
+    """
     settings.data_dir.mkdir(parents=True, exist_ok=True)
     settings.data_dir.chmod(0o700)
     db_path = database_path(settings)

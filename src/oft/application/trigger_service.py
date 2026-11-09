@@ -1,10 +1,10 @@
 """Deterministic trigger evaluation, snapshot freezing, and batch re-check queue.
 
 Only code produces trigger events. The evaluator uses one frozen snapshot per
-symbol per tick, records the condition results and hash, and keeps one trigger
-per ``(opportunity, snapshot_hash)`` via a unique idempotency key. A stale or
-unavailable snapshot never triggers. No order, fill, position, or LLM call is
-made in this module.
+``(symbol, report_id)`` per tick, records the condition results and hash, and
+keeps one trigger per ``(opportunity, snapshot_hash)`` via a unique idempotency
+key. A stale or unavailable snapshot never triggers. No order, fill, position,
+or LLM call is made in this module.
 """
 
 from __future__ import annotations
@@ -77,7 +77,7 @@ class TriggerRun:
 
 @dataclass(frozen=True)
 class TriggerBatchOutcome:
-    """Counts from one batch evaluation of every OPEN opportunity."""
+    """Counts from one batch evaluation of up to ``batch_cap`` OPEN opportunities."""
 
     open: int = 0
     evaluated: int = 0
@@ -135,7 +135,6 @@ class TriggerService:
         price: Decimal | None = None,
         as_of: str | None = None,
         snapshot_id: str | None = None,
-        data_quality: str = "COMPLETE",
         stale_after_seconds: int | None = None,
     ) -> TriggerRun:
         opportunity = self._opportunities.show(opportunity_id)
@@ -159,61 +158,39 @@ class TriggerService:
                 opportunity=expired,
             )
         budget = self._stale_after_seconds if stale_after_seconds is None else stale_after_seconds
+        # Always resolve the frozen source report snapshot first, even when a
+        # manual override is supplied. A STALE source can never be laundered
+        # into a fresh snapshot, and a missing/corrupt report is unavailable
+        # rather than a hollow price-only snapshot.
+        frozen = self._provider.snapshot_for(opportunity)
+        if frozen is None:
+            return self._unavailable_run(opportunity, now)
+        if snapshot_id is not None:
+            frozen = replace(frozen, snapshot_id=snapshot_id)
         if price is None and as_of is None:
-            frozen = self._provider.snapshot_for(opportunity)
-            if frozen is None:
-                return self._unavailable_run(opportunity, now)
-            if snapshot_id is not None:
-                frozen = replace(frozen, snapshot_id=snapshot_id)
             return self._evaluate_and_record(
                 opportunity,
                 frozen,
                 now=now,
                 stale_after_seconds=budget,
             )
-
-        # The provider is only consulted for a field the caller did not
-        # supply; supplying both must not emit a spurious unavailable warning.
-        report_snapshot = (
-            self._provider.snapshot_for(opportunity) if price is None or as_of is None else None
-        )
-        if (
-            report_snapshot is not None
-            and contract_data_quality(report_snapshot.data_quality) == "STALE"
-        ):
+        if contract_data_quality(frozen.data_quality) == "STALE":
             # Never let a manual override launder a STALE report into a fresh
             # snapshot: the job path blocks it, and so must this one.
-            reasons = "; ".join(report_snapshot.quality_reasons) or "data quality is STALE"
+            reasons = "; ".join(frozen.quality_reasons) or "data quality is STALE"
             raise TriggerError(
                 "VALIDATION_FAILED",
                 f"cannot override a STALE source snapshot: {reasons}",
             )
-        resolved_as_of = as_of or (report_snapshot.as_of if report_snapshot is not None else None)
-        resolved_price = (
-            price
-            if price is not None
-            else (report_snapshot.last_price if report_snapshot is not None else None)
+        # Only the overridden fields change; every tick/series/metric and the
+        # source quality stay exactly as recorded in the frozen report.
+        frozen = replace(
+            frozen,
+            as_of=as_of if as_of is not None else frozen.as_of,
+            last_price=price if price is not None else frozen.last_price,
         )
-        if resolved_as_of is None or resolved_price is None:
+        if frozen.last_price is None:
             return self._unavailable_run(opportunity, now)
-        resolved_id = snapshot_id or (
-            report_snapshot.snapshot_id if report_snapshot is not None else ""
-        )
-        frozen = TriggerSnapshot(
-            symbol=opportunity.symbol,
-            as_of=resolved_as_of,
-            last_price=resolved_price,
-            # Preserve the source report's quality for every field not
-            # overridden; only a fully manual snapshot falls back to the
-            # caller's label.
-            data_quality=(
-                report_snapshot.data_quality if report_snapshot is not None else data_quality
-            ),
-            quality_reasons=(
-                report_snapshot.quality_reasons if report_snapshot is not None else ()
-            ),
-            snapshot_id=resolved_id,
-        )
         return self._evaluate_and_record(
             opportunity,
             frozen,
@@ -224,18 +201,21 @@ class TriggerService:
     # -- batch/job path --------------------------------------------------
 
     def evaluate_all(self, now: str | None = None) -> TriggerBatchOutcome:
-        """Expire due opportunities, then evaluate every remaining OPEN one.
+        """Expire due opportunities, then evaluate up to ``batch_cap`` OPEN ones.
 
-        Exactly one snapshot per symbol is fetched per tick. The batch is
-        idempotent: an existing ``(opportunity, snapshot_hash)`` trigger is
-        returned, never duplicated. A concurrent state transition is logged and
-        skipped. The database is the queue, so a restart reconstructs it.
+        The batch is bounded by ``batch_cap``: when more OPEN opportunities
+        exist, ``open_total``/``capped`` report the truncation and the rest are
+        left for a later tick. Exactly one snapshot per ``(symbol,
+        report_id)`` is fetched per tick. The batch is idempotent: an existing
+        ``(opportunity, snapshot_hash)`` trigger is returned, never duplicated.
+        A concurrent state transition is logged and skipped. The database is
+        the queue, so a restart reconstructs it.
         """
         at = now or utc_timestamp(self._clock.now())
         self._opportunities.expire_due(at)
         records = self._store.list_opportunities(state="OPEN", limit=self._batch_cap)
         open_total = self._store.count_opportunities(state="OPEN")
-        capped = len(records) >= self._batch_cap
+        capped = open_total > len(records)
         if capped:
             _LOGGER.warning(
                 "trigger_batch_capped",
@@ -443,7 +423,10 @@ class TriggerService:
             "trigger_transition_conflict",
             opportunity_id=opportunity.opportunity_id,
             trigger_id=trigger_id,
-            reason="the opportunity is no longer OPEN",
+            reason=(
+                "the opportunity is no longer OPEN or the trigger insert hit "
+                "an unexpected constraint"
+            ),
         )
         return TriggerRun(
             trigger=None,
@@ -455,7 +438,15 @@ class TriggerService:
     def _reload(self, opportunity: Opportunity) -> Opportunity:
         try:
             return self._opportunities.show(opportunity.opportunity_id)
-        except (OpportunityNotFound, OpportunityContractError):
+        except (OpportunityNotFound, OpportunityContractError) as exc:
+            # A lost race can delete or corrupt the row. Return the
+            # pre-transition object so the caller still has a value, but never
+            # hide the read failure.
+            _LOGGER.warning(
+                "trigger_reload_failed",
+                opportunity_id=opportunity.opportunity_id,
+                error=str(exc),
+            )
             return opportunity
 
     def _unavailable_run(self, opportunity: Opportunity, now: str) -> TriggerRun:

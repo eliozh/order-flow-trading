@@ -230,7 +230,12 @@ def evaluate_all_triggers(
         "capped": outcome.capped,
         "trigger_ids": list(outcome.trigger_ids),
     }
-    degraded = outcome.unavailable > 0 or outcome.stale > 0 or outcome.evaluated < outcome.open
+    degraded = (
+        outcome.unavailable > 0
+        or outcome.stale > 0
+        or outcome.evaluated < outcome.open
+        or outcome.capped
+    )
     envelope = success_envelope(
         data,
         request_id=new_request_id(),

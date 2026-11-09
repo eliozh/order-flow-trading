@@ -496,19 +496,21 @@ def test_a_manual_override_preserves_the_source_report_quality(tmp_path: Path) -
     assert payload["snapshot"]["data_quality"] == "PARTIAL"
 
 
-class _ExplodingProvider:
-    def snapshot_for(self, opportunity: object) -> TriggerSnapshot:
-        raise AssertionError("the provider must not be consulted")
-
-
-def test_both_overrides_never_consult_the_provider(tmp_path: Path) -> None:
+def test_both_overrides_resolve_the_source_report_snapshot(tmp_path: Path) -> None:
     store = _store(tmp_path)
     opportunity_id = _insert_opportunity(store, trigger_conditions=_time_window_conditions())
-    service = TriggerService(
-        store=store,
-        clock=FixedClock(NOW),
-        provider=_ExplodingProvider(),  # type: ignore[arg-type]
+    provider = _QualityProvider(
+        TriggerSnapshot(
+            symbol="BTCUSDT",
+            as_of=NOW_TEXT,
+            last_price=Decimal("70000.00"),
+            tick_size=Decimal("0.10"),
+            data_quality="PARTIAL",
+            quality_reasons=("funding unavailable",),
+            snapshot_id="SNAP-PARTIAL",
+        )
     )
+    service = TriggerService(store=store, clock=FixedClock(NOW), provider=provider)
 
     run = service.evaluate(
         opportunity_id,
@@ -516,8 +518,79 @@ def test_both_overrides_never_consult_the_provider(tmp_path: Path) -> None:
         as_of="2026-11-06T11:59:30.000Z",
     )
 
+    # The source report is always resolved, even when both overrides are
+    # supplied: the provider is the STALE-quality gate.
+    assert provider.calls == 1
     assert run.created is True
     assert run.trigger is not None
+    assert run.evaluation.data_quality == "PARTIAL"
+
+
+def test_both_overrides_on_a_stale_source_are_rejected(tmp_path: Path) -> None:
+    store = _store(tmp_path)
+    opportunity_id = _insert_opportunity(store, trigger_conditions=_time_window_conditions())
+    provider = _QualityProvider(
+        TriggerSnapshot(
+            symbol="BTCUSDT",
+            as_of=NOW_TEXT,
+            last_price=Decimal("70000.00"),
+            data_quality="STALE",
+            quality_reasons=("metrics older than budget",),
+            snapshot_id="SNAP-STALE",
+        )
+    )
+    service = TriggerService(store=store, clock=FixedClock(NOW), provider=provider)
+
+    with pytest.raises(TriggerError) as caught:
+        service.evaluate(
+            opportunity_id,
+            price=Decimal("70000.00"),
+            as_of="2026-11-06T11:59:30.000Z",
+        )
+
+    assert caught.value.code == "VALIDATION_FAILED"
+    assert "STALE" in caught.value.message
+    assert provider.calls == 1
+    assert store.list_trigger_events() == ()
+
+
+def test_a_price_only_override_keeps_the_source_tick_size_and_evaluates(
+    tmp_path: Path,
+) -> None:
+    """A ``--price`` override must merge into, not replace, the report snapshot."""
+    store = _store(tmp_path)
+    # PRICE_TOUCH_ZONE requires CONTRACT_SPECS (tick_size) and MARK_PRICE.
+    opportunity_id = _insert_opportunity(store)
+    provider = _QualityProvider(
+        TriggerSnapshot(
+            symbol="BTCUSDT",
+            as_of=NOW_TEXT,
+            last_price=Decimal("69000.00"),  # outside the 69900-70100 zone
+            tick_size=Decimal("0.10"),
+            data_quality="COMPLETE",
+            snapshot_id="SNAP-FULL",
+        )
+    )
+    service = TriggerService(store=store, clock=FixedClock(NOW), provider=provider)
+
+    run = service.evaluate(opportunity_id, price=Decimal("70000.00"))
+
+    assert run.created is True
+    assert run.evaluation.results[0].evaluable is True
+    assert run.evaluation.results[0].met is True
+
+
+def test_snapshot_id_override_replaces_the_frozen_id(tmp_path: Path) -> None:
+    store = _store(tmp_path)
+    opportunity_id = _insert_opportunity(store)
+
+    run = _service(store).evaluate(opportunity_id, snapshot_id="SNAP-OVERRIDE")
+
+    assert run.created is True
+    assert run.trigger is not None
+    assert run.evaluation.snapshot_id == "SNAP-OVERRIDE"
+    payload = json.loads(run.trigger.payload_json)
+    assert payload["snapshot"]["market_snapshot_id"] == "SNAP-OVERRIDE"
 
 
 def test_manual_override_without_a_report_cannot_resolve_as_of(tmp_path: Path) -> None:
@@ -624,6 +697,20 @@ def test_two_opportunities_on_one_symbol_use_their_own_report_snapshot(
     assert snapshot_ids == {"SNAP-RPT-1", "SNAP-RPT-2"}
 
 
+def test_two_opportunities_sharing_one_report_fetch_one_snapshot(tmp_path: Path) -> None:
+    store = _store(tmp_path)
+    _insert_opportunity(store, "OPP-A", report_id="RPT-1")
+    _insert_opportunity(store, "OPP-B", report_id="RPT-1")
+    provider = _PerReportProvider()
+    service = TriggerService(store=store, clock=FixedClock(NOW), provider=provider)
+
+    outcome = service.evaluate_all(NOW_TEXT)
+
+    # Cache key is ``(symbol, report_id)``: one provider call serves both.
+    assert provider.calls == [("BTCUSDT", "RPT-1")]
+    assert outcome.triggered == 2
+
+
 def test_one_corrupt_open_payload_does_not_abort_the_tick(tmp_path: Path) -> None:
     store = _store(tmp_path)
     _insert_opportunity(store, "OPP-GOOD")
@@ -679,6 +766,69 @@ def test_the_batch_logs_and_reports_the_true_open_count_when_capped(
     assert outcome.capped is True
     capped = [kwargs for event, kwargs in logger.warnings if event == "trigger_batch_capped"]
     assert capped == [{"loaded": 1, "open_total": 2, "batch_cap": 1}]
+
+
+def test_a_batch_exactly_at_the_cap_is_not_capped(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from oft.application import trigger_service as trigger_module
+
+    class _RecordingLogger:
+        def __init__(self) -> None:
+            self.warnings: list[tuple[str, dict[str, Any]]] = []
+
+        def warning(self, event: str, **kwargs: Any) -> None:
+            self.warnings.append((event, kwargs))
+
+    logger = _RecordingLogger()
+    monkeypatch.setattr(trigger_module, "_LOGGER", logger)
+    store = _store(tmp_path)
+    _insert_opportunity(store, "OPP-A")
+    service = TriggerService(
+        store=store,
+        clock=FixedClock(NOW),
+        provider=FixedProvider(_snapshot()),
+        batch_cap=1,
+    )
+
+    outcome = service.evaluate_all(NOW_TEXT)
+
+    assert outcome.open == outcome.open_total == 1
+    assert outcome.capped is False
+    assert not [event for event, _ in logger.warnings if event == "trigger_batch_capped"]
+
+
+def test_reload_logs_and_falls_back_when_the_row_disappeared(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from oft.application import trigger_service as trigger_module
+    from oft.application.opportunity_service import OpportunityNotFound
+
+    class _RecordingLogger:
+        def __init__(self) -> None:
+            self.warnings: list[tuple[str, dict[str, Any]]] = []
+
+        def warning(self, event: str, **kwargs: Any) -> None:
+            self.warnings.append((event, kwargs))
+
+    class _VanishedOpportunities:
+        def show(self, opportunity_id: str) -> Any:
+            raise OpportunityNotFound(opportunity_id)
+
+    logger = _RecordingLogger()
+    monkeypatch.setattr(trigger_module, "_LOGGER", logger)
+    store = _store(tmp_path)
+    opportunity_id = _insert_opportunity(store)
+    opportunity = OpportunityService(store=store, clock=FixedClock(NOW)).show(opportunity_id)
+    service = _service(store)
+    monkeypatch.setattr(service, "_opportunities", _VanishedOpportunities())
+
+    returned = service._reload(opportunity)
+
+    assert returned is opportunity
+    assert logger.warnings[0][0] == "trigger_reload_failed"
+    assert logger.warnings[0][1]["opportunity_id"] == opportunity_id
+    assert "OPP-1" in str(logger.warnings[0][1]["error"])
 
 
 def test_trigger_list_orders_equal_timestamps_by_trigger_id(tmp_path: Path) -> None:

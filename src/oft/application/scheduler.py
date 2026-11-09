@@ -4,6 +4,10 @@ The durable job ledger in :mod:`oft.application.jobs` is the source of truth;
 this module only computes *when* a scan window becomes due. All instants are
 UTC. A period change is recorded as pending and takes effect at the next
 boundary of the currently active schedule (ADR-0007).
+
+It also hosts the independent 15 s trigger interval scheduler
+(:class:`TriggerDaemonScheduler`), whose ledger claim is likewise the source of
+truth.
 """
 
 from __future__ import annotations
@@ -419,7 +423,6 @@ class TriggerDaemonScheduler:
     def __init__(
         self,
         *,
-        clock: ClockPort,
         interval_seconds: int,
         job: Callable[[], Any],
         timezone: str = "UTC",

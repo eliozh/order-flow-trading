@@ -131,6 +131,13 @@ def trigger_evaluate(
     """
     settings = _settings_or_exit(json_output)
     client = ApiClient.from_settings(settings)
+    if evaluate_all and opportunity_id is not None:
+        emit_error(
+            "VALIDATION_FAILED",
+            "--all evaluates every OPEN opportunity; omit the positional opportunity_id",
+            json_output=json_output,
+        )
+        raise typer.Exit(code=exit_code_for("VALIDATION_FAILED"))
     if evaluate_all and (price is not None or as_of is not None or snapshot_id is not None):
         emit_error(
             "VALIDATION_FAILED",
