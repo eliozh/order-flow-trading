@@ -127,6 +127,16 @@ class ApiClient:
             "GET", f"/api/v1/opportunities/{quote(opportunity_id, safe='')}/timeline"
         )
 
+    def get_opportunity_conditions(self, opportunity_id: str) -> dict[str, Any]:
+        return self._request(
+            "GET", f"/api/v1/opportunities/{quote(opportunity_id, safe='')}/conditions"
+        )
+
+    def export_opportunity(self, opportunity_id: str) -> dict[str, Any]:
+        return self._request(
+            "GET", f"/api/v1/opportunities/{quote(opportunity_id, safe='')}/export"
+        )
+
     # -- Triggers --------------------------------------------------------
 
     def list_triggers(

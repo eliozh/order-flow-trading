@@ -1,20 +1,28 @@
 """Structured opportunity ledger and the code-only state machine (ADR-0006).
 
-Only the deterministic trigger evaluator (code) may move an opportunity out of
-``OPEN``. The LLM supplies drafts; code assigns condition IDs, validates the
-required parameters, and appends immutable history entries.
+Only code -- never the LLM -- may move an opportunity out of ``OPEN``. The LLM
+supplies drafts; code assigns condition IDs, validates the required parameters,
+and appends immutable history entries.
 """
 
 from __future__ import annotations
 
-from collections.abc import Iterable, Mapping
+from collections.abc import Collection, Iterable, Mapping
 from dataclasses import dataclass, replace
-from datetime import datetime
-from decimal import Decimal, InvalidOperation
+from datetime import UTC, datetime
+from decimal import Decimal
 from enum import StrEnum
 from typing import Any
 
-SUPPORTED_CONDITION_TYPES = frozenset({"PRICE_TOUCH_ZONE"})
+from oft.domain.conditions import (
+    ConditionParamsError,
+    condition_spec,
+    contract_required_data,
+    creation_evaluable,
+    normalize_timestamp,
+    validate_draft,
+)
+
 OPEN = "OPEN"
 
 
@@ -45,15 +53,19 @@ class OpportunityTransitionError(Exception):
     code = "POSITION_STATE_INVALID"
 
 
-class ConditionDraftError(Exception):
+class OpportunityContractError(Exception):
+    """A persisted opportunity payload cannot be reconstructed.
+
+    Persisted JSON is untrusted input: a truncated, hand-edited, or otherwise
+    corrupt row must surface as a typed data error, never as an unhandled
+    ``KeyError``/``ValueError``/``InvalidOperation`` out of a read path.
+    """
+
+    code = "DATA_UNAVAILABLE"
+
+
+class ConditionDraftError(ConditionParamsError):
     """A draft condition is unsupported or missing required parameters."""
-
-    code = "VALIDATION_FAILED"
-
-    def __init__(self, message: str, *, field: str = "") -> None:
-        super().__init__(message)
-        self.message = message
-        self.field = field
 
 
 @dataclass(frozen=True)
@@ -169,18 +181,10 @@ class Opportunity:
 
 
 def _parse(value: str) -> datetime:
-    return datetime.fromisoformat(value.replace("Z", "+00:00"))
-
-
-def _decimal(value: object, field: str) -> Decimal:
-    if not isinstance(value, str) or not value.strip():
-        raise ConditionDraftError(f"{field} is required for PRICE_TOUCH_ZONE", field=field)
-    try:
-        parsed = Decimal(value)
-    except InvalidOperation as exc:
-        raise ConditionDraftError(f"{field} must be an exact decimal", field=field) from exc
-    if not parsed.is_finite() or parsed <= 0:
-        raise ConditionDraftError(f"{field} must be a positive decimal", field=field)
+    """Parse an ISO timestamp, treating an offset-less value as UTC."""
+    parsed = datetime.fromisoformat(value.replace("Z", "+00:00"))
+    if parsed.tzinfo is None:
+        parsed = parsed.replace(tzinfo=UTC)
     return parsed
 
 
@@ -188,20 +192,29 @@ def validate_condition_drafts(drafts: Iterable[ConditionDraft]) -> tuple[Conditi
     """Validate every draft against the closed condition registry."""
     validated: list[ConditionDraft] = []
     for draft in drafts:
-        if draft.type not in SUPPORTED_CONDITION_TYPES:
-            raise ConditionDraftError(
-                f"condition type {draft.type} is not supported in this slice",
-                field="type",
-            )
-        low = _decimal(draft.params.get("price_low"), "price_low")
-        high = _decimal(draft.params.get("price_high"), "price_high")
-        if low >= high:
-            raise ConditionDraftError(
-                "price_low must be strictly below price_high",
-                field="price_low",
-            )
-        validated.append(draft)
+        try:
+            canonical = validate_draft(draft.type, draft.params)
+        except ConditionParamsError as exc:
+            raise ConditionDraftError(exc.message, field=exc.field) from exc
+        validated.append(replace(draft, type=canonical.type.value, params=dict(canonical.params)))
     return tuple(validated)
+
+
+def _creation_state(
+    draft: ConditionDraft,
+    *,
+    available_data: Collection[str] | None,
+) -> tuple[tuple[str, ...], bool, str | None]:
+    spec = condition_spec(draft.type)
+    required_data = contract_required_data(spec.type)
+    if available_data is None:
+        return required_data, True, None
+    evaluable = creation_evaluable(spec.type, available_data)
+    reason = None
+    if not evaluable:
+        missing = sorted(spec.required_data - frozenset(available_data))
+        reason = "missing required data: " + ", ".join(missing)
+    return required_data, evaluable, reason
 
 
 def assign_conditions(
@@ -209,21 +222,26 @@ def assign_conditions(
     *,
     prefix: str = "C",
     start: int = 1,
+    available_data: Collection[str] | None = None,
 ) -> tuple[Condition, ...]:
     """Assign code-owned IDs after validating the drafts."""
     validated = validate_condition_drafts(drafts)
     conditions: list[Condition] = []
     for index, draft in enumerate(validated, start=start):
+        required_data, evaluable, unavailable_reason = _creation_state(
+            draft, available_data=available_data
+        )
         conditions.append(
             Condition(
                 condition_id=f"{prefix}-{index}",
                 draft_id=draft.draft_id,
                 type=draft.type,
                 params=dict(draft.params),
-                window_start=str(draft.window.get("start", "")),
-                window_end=str(draft.window.get("end", "")),
-                required_data=tuple(draft.required_data),
-                evaluable=True,
+                window_start=normalize_timestamp(str(draft.window.get("start", ""))),
+                window_end=normalize_timestamp(str(draft.window.get("end", ""))),
+                required_data=required_data,
+                evaluable=evaluable,
+                unavailable_reason=unavailable_reason,
                 description=draft.description,
             )
         )

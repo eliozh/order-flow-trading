@@ -11,7 +11,7 @@ import logging
 import os
 import sqlite3
 import uuid
-from collections.abc import Callable
+from collections.abc import Callable, Sequence
 from contextlib import closing
 from dataclasses import replace
 from datetime import UTC, date, datetime, timedelta
@@ -22,7 +22,9 @@ from typing import Any
 from oft.config import Settings
 from oft.domain.audit import build_audit_entry
 from oft.domain.budget_periods import budget_record_id, period_parts
+from oft.domain.conditions import ConditionParamsError, normalize_timestamp
 from oft.domain.data_quality import DataGap, GapSeverity
+from oft.domain.opportunities import _ALLOWED_TRANSITIONS, OpportunityState
 from oft.domain.prompts import (
     DEFAULT_SYSTEM_BODIES,
     DEFAULT_USER_BODIES,
@@ -43,6 +45,7 @@ from oft.ports.store import (
     BudgetRecord,
     BudgetRecordConflictError,
     BudgetSettingsRecord,
+    ConditionRecord,
     DecisionRecord,
     FillRecord,
     IdempotencyRecord,
@@ -80,7 +83,7 @@ def _zero_budget_totals() -> dict[str, dict[str, Any]]:
     }
 
 
-_SCHEMA_VERSION = 17
+_SCHEMA_VERSION = 18
 STALE_RUNNING_SECONDS = 15 * 60
 _BACKFILL_RUN_STATUSES = ("RUNNING", "COMPLETE", "PARTIAL", "FAILED", "BLOCKED", "STALE")
 _BACKFILL_RUNS_DEFINITION = """
@@ -246,6 +249,48 @@ _SYMBOL_INDEXES = (
     "symbols_tradifi",
     "symbols_tradifi_symbol",
     "symbols_contract_tradifi_symbol",
+)
+_OPPORTUNITY_CONDITIONS_TABLE = """
+    CREATE TABLE IF NOT EXISTS opportunity_conditions (
+        condition_id TEXT NOT NULL,
+        opportunity_id TEXT NOT NULL REFERENCES opportunities(opportunity_id),
+        kind TEXT NOT NULL CHECK (kind IN ('TRIGGER','INVALIDATION')),
+        seq INTEGER NOT NULL,
+        type TEXT NOT NULL,
+        params_json TEXT NOT NULL,
+        window_start TEXT NOT NULL,
+        window_end TEXT NOT NULL,
+        required_data_json TEXT NOT NULL,
+        evaluable INTEGER NOT NULL CHECK (evaluable IN (0, 1)),
+        unavailable_reason TEXT,
+        last_value TEXT,
+        last_evaluated_at TEXT,
+        last_result INTEGER CHECK (last_result IN (0, 1) OR last_result IS NULL),
+        PRIMARY KEY (opportunity_id, condition_id)
+    );
+"""
+_OPPORTUNITY_CONDITIONS_INDEXES = (
+    "CREATE INDEX IF NOT EXISTS opportunity_conditions_opportunity "
+    "ON opportunity_conditions(opportunity_id, kind, seq);",
+    "CREATE INDEX IF NOT EXISTS opportunity_conditions_type ON opportunity_conditions(type);",
+    "CREATE INDEX IF NOT EXISTS opportunity_conditions_evaluable "
+    "ON opportunity_conditions(evaluable);",
+    "CREATE INDEX IF NOT EXISTS opportunity_conditions_condition_id "
+    "ON opportunity_conditions(condition_id);",
+    "CREATE INDEX IF NOT EXISTS opportunities_state_updated ON opportunities(state, updated_at);",
+    "CREATE INDEX IF NOT EXISTS opportunities_symbol_state ON opportunities(symbol, state);",
+    "CREATE INDEX IF NOT EXISTS opportunities_expires_at ON opportunities(expires_at);",
+    "CREATE INDEX IF NOT EXISTS opportunity_events_opportunity_at "
+    "ON opportunity_events(opportunity_id, at);",
+)
+_OPPORTUNITY_CONDITIONS_DDL = _OPPORTUNITY_CONDITIONS_TABLE + "\n".join(
+    _OPPORTUNITY_CONDITIONS_INDEXES
+)
+_OPPORTUNITY_CONDITION_INDEX_NAMES = (
+    "opportunity_conditions_opportunity",
+    "opportunity_conditions_type",
+    "opportunity_conditions_evaluable",
+    "opportunity_conditions_condition_id",
 )
 _SCHEMA_SQL = f"""
     CREATE TABLE IF NOT EXISTS schema_migrations (
@@ -437,7 +482,8 @@ _SCHEMA_SQL = f"""
         ),
         created_at TEXT NOT NULL,
         updated_at TEXT NOT NULL,
-        payload_json TEXT NOT NULL
+        payload_json TEXT NOT NULL,
+        expires_at TEXT
     );
     CREATE INDEX IF NOT EXISTS opportunities_state ON opportunities(state);
     CREATE TABLE IF NOT EXISTS opportunity_events (
@@ -577,6 +623,7 @@ _SCHEMA_SQL = f"""
         value TEXT NOT NULL,
         updated_at TEXT NOT NULL
     );
+{_OPPORTUNITY_CONDITIONS_DDL}
 """
 
 
@@ -1215,6 +1262,260 @@ def _seed_prompt_defaults(connection: sqlite3.Connection) -> None:
         )
 
 
+def _condition_rows_from_payload(
+    payload: dict[str, Any], *, opportunity_id: str
+) -> list[tuple[Any, ...]]:
+    """Flatten one opportunity contract payload into condition rows.
+
+    The DB row's ``opportunity_id`` is authoritative; a payload whose embedded
+    id disagrees is treated as malformed so the backfill skips it.
+    """
+    if payload.get("opportunity_id") != opportunity_id:
+        raise ValueError("payload opportunity_id does not match the row")
+    rows: list[tuple[Any, ...]] = []
+    for kind, key in (
+        ("TRIGGER", "trigger_conditions"),
+        ("INVALIDATION", "invalidation_conditions"),
+    ):
+        items = payload.get(key, [])
+        if not isinstance(items, list):
+            raise ValueError(f"{key} is not a list")
+        for seq, item in enumerate(items, start=1):
+            if not isinstance(item, dict):
+                raise ValueError(f"{key}[{seq}] is not an object")
+            condition_id = item["condition_id"]
+            condition_type = item["type"]
+            params = item["params"]
+            window = item["window"]
+            required_data = item["required_data"]
+            evaluable = item["evaluable"]
+            if not isinstance(condition_id, str) or not condition_id:
+                raise ValueError("condition_id is missing")
+            if not isinstance(condition_type, str) or not condition_type:
+                raise ValueError("condition type is missing")
+            if not isinstance(params, dict) or not isinstance(window, dict):
+                raise ValueError("params/window must be objects")
+            if not isinstance(required_data, list):
+                raise ValueError("required_data must be a list")
+            if not isinstance(evaluable, bool):
+                raise ValueError("evaluable must be a boolean")
+            window_start = window["start"]
+            window_end = window["end"]
+            if not isinstance(window_start, str) or not isinstance(window_end, str):
+                raise ValueError("window bounds must be timestamps")
+            last_result = item.get("last_result")
+            try:
+                normalized_start = normalize_timestamp(window_start)
+                normalized_end = normalize_timestamp(window_end)
+            except (TypeError, ValueError) as exc:
+                raise ValueError("window bounds must be timestamps") from exc
+            rows.append(
+                (
+                    condition_id,
+                    opportunity_id,
+                    kind,
+                    seq,
+                    condition_type,
+                    json.dumps(params, sort_keys=True),
+                    normalized_start,
+                    normalized_end,
+                    json.dumps(required_data, sort_keys=True),
+                    int(evaluable),
+                    item.get("unavailable_reason"),
+                    item.get("last_value"),
+                    item.get("last_evaluated_at"),
+                    None if last_result is None else int(bool(last_result)),
+                )
+            )
+    return rows
+
+
+def _backfill_opportunity_conditions(connection: sqlite3.Connection) -> None:
+    """Materialise the condition mirror from every opportunity payload.
+
+    Callers own the transaction: SQL/programming errors roll it back and
+    surface, while only a malformed payload is skipped with a warning.
+    """
+    rows = connection.execute("SELECT opportunity_id, payload_json FROM opportunities").fetchall()
+    for row in rows:
+        opportunity_id = str(row[0])
+        try:
+            payload = json.loads(str(row[1]))
+            if not isinstance(payload, dict):
+                raise ValueError("payload is not an object")
+            condition_rows = _condition_rows_from_payload(payload, opportunity_id=opportunity_id)
+        except (
+            json.JSONDecodeError,
+            KeyError,
+            TypeError,
+            ValueError,
+            ConditionParamsError,
+        ) as exc:
+            # Only a malformed payload is skipped. SQL and programming
+            # failures below surface and roll the migration back.
+            _LOGGER.warning(
+                "opportunity_condition_backfill_skipped",
+                extra={"opportunity_id": opportunity_id, "error": str(exc)},
+            )
+            continue
+        for condition_row in condition_rows:
+            connection.execute(
+                """
+                INSERT OR REPLACE INTO opportunity_conditions (
+                    condition_id, opportunity_id, kind, seq, type,
+                    params_json, window_start, window_end, required_data_json,
+                    evaluable, unavailable_reason, last_value,
+                    last_evaluated_at, last_result
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                """,
+                condition_row,
+            )
+
+
+def _migrate_v18(connection: sqlite3.Connection) -> None:
+    """Create the condition mirror table and backfill it from payload rows."""
+    if not _table_exists(connection, "opportunities"):
+        return
+    connection.executescript(_OPPORTUNITY_CONDITIONS_DDL)
+    with connection:
+        _backfill_opportunity_conditions(connection)
+
+
+def _opportunity_conditions_pk(
+    connection: sqlite3.Connection,
+) -> tuple[str, ...]:
+    rows = connection.execute("PRAGMA table_info(opportunity_conditions)").fetchall()
+    keyed = sorted((row for row in rows if int(row[5]) > 0), key=lambda row: int(row[5]))
+    return tuple(str(row[1]) for row in keyed)
+
+
+def _rebuild_opportunity_conditions(connection: sqlite3.Connection) -> None:
+    """Rebuild a v18 table whose primary key predates the composite fix.
+
+    Any transaction left open by a prior repair is committed first: SQLite
+    cannot start a transaction within a transaction, and the rebuild must stay
+    one atomic unit (DDL included).
+    """
+    if connection.in_transaction:
+        connection.commit()
+    connection.execute("BEGIN IMMEDIATE")
+    try:
+        for index_name in _OPPORTUNITY_CONDITION_INDEX_NAMES:
+            connection.execute(f"DROP INDEX IF EXISTS {index_name}")
+        connection.execute(
+            "ALTER TABLE opportunity_conditions RENAME TO opportunity_conditions_v18_old"
+        )
+        connection.execute(_OPPORTUNITY_CONDITIONS_TABLE)
+        for statement in _OPPORTUNITY_CONDITIONS_INDEXES[: len(_OPPORTUNITY_CONDITION_INDEX_NAMES)]:
+            connection.execute(statement)
+        connection.execute(
+            """
+            INSERT INTO opportunity_conditions (
+                condition_id, opportunity_id, kind, seq, type, params_json,
+                window_start, window_end, required_data_json, evaluable,
+                unavailable_reason, last_value, last_evaluated_at, last_result
+            )
+            SELECT
+                condition_id, opportunity_id, kind, seq, type, params_json,
+                window_start, window_end, required_data_json, evaluable,
+                unavailable_reason, last_value, last_evaluated_at, last_result
+            FROM opportunity_conditions_v18_old
+            """
+        )
+        # The pre-fix global PK may already have destroyed mirror rows (two
+        # opportunities holding the same condition id). Re-materialise every
+        # opportunity from its payload inside the same transaction.
+        _backfill_opportunity_conditions(connection)
+        connection.execute("DROP TABLE opportunity_conditions_v18_old")
+        connection.execute("COMMIT")
+    except Exception:
+        connection.execute("ROLLBACK")
+        raise
+
+
+def _ensure_opportunity_conditions_shape(connection: sqlite3.Connection) -> None:
+    """Repair a v18 database stamped before the composite primary key landed."""
+    if not _table_exists(connection, "opportunity_conditions"):
+        return
+    if _opportunity_conditions_pk(connection) == ("opportunity_id", "condition_id"):
+        return
+    _rebuild_opportunity_conditions(connection)
+
+
+def _ensure_opportunities_expires_at(connection: sqlite3.Connection) -> None:
+    """Add and normalise the queryable expiry column used by the due selector.
+
+    Values are canonical UTC with fixed millisecond precision so the TEXT
+    range comparison in ``list_due_opportunities`` matches every instant
+    regardless of the offset/precision the payload was written with. A prior
+    boot may have added the column but crashed before backfilling it, so rows
+    with a NULL column are rebuilt from ``payload_json`` too.
+    """
+    if not _table_exists(connection, "opportunities"):
+        return
+    columns = {row[1] for row in connection.execute("PRAGMA table_info(opportunities)")}
+    # ``with connection`` commits (or rolls back) the backfill before the
+    # composite-PK rebuild runs; never leave an implicit transaction open.
+    with connection:
+        if "expires_at" not in columns:
+            connection.execute("ALTER TABLE opportunities ADD COLUMN expires_at TEXT")
+        rows = connection.execute(
+            "SELECT opportunity_id, payload_json, expires_at FROM opportunities"
+        ).fetchall()
+        for opportunity_id, payload_json, current in rows:
+            value = current
+            if value is None:
+                try:
+                    payload = json.loads(str(payload_json))
+                except (json.JSONDecodeError, TypeError, ValueError):
+                    _LOGGER.warning(
+                        "opportunity_expires_at_backfill_skipped",
+                        extra={
+                            "opportunity_id": opportunity_id,
+                            "reason": "payload_json is not valid JSON",
+                        },
+                    )
+                    continue
+                if not isinstance(payload, dict):
+                    _LOGGER.warning(
+                        "opportunity_expires_at_backfill_skipped",
+                        extra={
+                            "opportunity_id": opportunity_id,
+                            "reason": "payload_json is not an object",
+                        },
+                    )
+                    continue
+                raw = payload.get("expires_at")
+                if not isinstance(raw, str):
+                    _LOGGER.warning(
+                        "opportunity_expires_at_backfill_skipped",
+                        extra={
+                            "opportunity_id": opportunity_id,
+                            "reason": "payload has no string expires_at",
+                        },
+                    )
+                    continue
+                value = raw
+            try:
+                normalized = normalize_timestamp(value)
+            except (TypeError, ValueError):
+                # A row left NULL here is never selected by
+                # ``list_due_opportunities``, so the skip must be diagnosable.
+                _LOGGER.warning(
+                    "opportunity_expires_at_backfill_skipped",
+                    extra={
+                        "opportunity_id": opportunity_id,
+                        "reason": "expires_at is not a valid timestamp",
+                    },
+                )
+                continue
+            if normalized != current:
+                connection.execute(
+                    "UPDATE opportunities SET expires_at = ? WHERE opportunity_id = ?",
+                    (normalized, opportunity_id),
+                )
+
+
 def initialize_database(settings: Settings) -> None:
     """Create the data directory and the walking-skeleton schema."""
     settings.data_dir.mkdir(parents=True, exist_ok=True)
@@ -1226,6 +1527,7 @@ def initialize_database(settings: Settings) -> None:
         connection.execute("PRAGMA foreign_keys=ON")
         connection.execute("PRAGMA busy_timeout=5000")
         connection.execute("PRAGMA synchronous=NORMAL")
+        _ensure_opportunities_expires_at(connection)
         if _schema_version(connection) < 2 and _table_exists(connection, "symbols"):
             _migrate_symbols_v2(connection)
         if _schema_version(connection) < 4 and _table_exists(connection, "backfill_runs"):
@@ -1262,6 +1564,9 @@ def initialize_database(settings: Settings) -> None:
             _migrate_prompts_v16(connection)
         if _schema_version(connection) < 17:
             _migrate_v17(connection)
+        if _schema_version(connection) < 18:
+            _migrate_v18(connection)
+        _ensure_opportunity_conditions_shape(connection)
         with connection:
             connection.executescript(_SCHEMA_SQL)
             connection.execute(
@@ -1330,7 +1635,11 @@ def initialize_database(settings: Settings) -> None:
             )
             connection.execute(
                 "INSERT OR IGNORE INTO schema_migrations (version, applied_at) VALUES (?, ?)",
-                (_SCHEMA_VERSION, "2026-11-09T00:00:00.000Z"),
+                (17, "2026-11-09T00:00:00.000Z"),
+            )
+            connection.execute(
+                "INSERT OR IGNORE INTO schema_migrations (version, applied_at) VALUES (?, ?)",
+                (_SCHEMA_VERSION, "2026-11-09T12:00:00.000Z"),
             )
             _seed_prompt_defaults(connection)
     finally:
@@ -3817,16 +4126,48 @@ class SqliteStore:
     # -- Opportunity ledger ----------------------------------------------
 
     def save_opportunity(
-        self, record: OpportunityRecord, event: OpportunityEventRecord | None = None
-    ) -> None:
+        self,
+        record: OpportunityRecord,
+        event: OpportunityEventRecord | None = None,
+        conditions: Sequence[ConditionRecord] = (),
+    ) -> bool:
+        """Persist a new opportunity, its creation event, and its condition mirror.
+
+        The three writes share one transaction: either the row, the event, and
+        every condition are committed, or none are. A duplicate create (an
+        ``opportunity_id`` that already exists) is an idempotent no-op: the
+        stored payload, event, and mirror rows are left untouched and
+        ``False`` is returned. An existing opportunity is changed only through
+        :meth:`transition_opportunity`, so the payload and the mirror can never
+        disagree because of a later "create".
+        """
         connection = self._connect()
         try:
             connection.execute("BEGIN IMMEDIATE")
-            connection.execute(
+            try:
+                payload = json.loads(record.payload_json)
+            except (json.JSONDecodeError, TypeError, ValueError):
+                payload = {}
+            expires_at = payload.get("expires_at") if isinstance(payload, dict) else None
+            if isinstance(expires_at, str):
+                try:
+                    expires_at = normalize_timestamp(expires_at)
+                except (TypeError, ValueError):
+                    # A malformed expiry is stored as absent rather than
+                    # compared lexicographically in a different format.
+                    _LOGGER.warning(
+                        "opportunity_expires_at_unparseable",
+                        extra={"opportunity_id": record.opportunity_id},
+                    )
+                    expires_at = None
+            else:
+                expires_at = None
+            cursor = connection.execute(
                 """
                 INSERT INTO opportunities (
-                    opportunity_id, symbol, state, created_at, updated_at, payload_json
-                ) VALUES (?, ?, ?, ?, ?, ?)
+                    opportunity_id, symbol, state, created_at, updated_at, payload_json,
+                    expires_at
+                ) VALUES (?, ?, ?, ?, ?, ?, ?)
                 ON CONFLICT(opportunity_id) DO NOTHING
                 """,
                 (
@@ -3836,8 +4177,15 @@ class SqliteStore:
                     record.created_at,
                     record.updated_at,
                     record.payload_json,
+                    expires_at if isinstance(expires_at, str) else None,
                 ),
             )
+            if cursor.rowcount == 0:
+                # The row already exists: do not rewrite the event or the
+                # condition mirror. All-or-nothing means a duplicate create
+                # changes nothing, not just the row.
+                connection.commit()
+                return False
             if event is not None:
                 # The CREATED row is part of the same unit: the timeline must not
                 # lose the creation event once a transition event exists.
@@ -3857,7 +4205,38 @@ class SqliteStore:
                         event.note,
                     ),
                 )
+            for condition in conditions:
+                # Reached only for a freshly inserted row, so the mirror always
+                # matches the payload exactly. A later re-save with a shorter
+                # list is not supported (use a transition, not a create).
+                connection.execute(
+                    """
+                    INSERT OR REPLACE INTO opportunity_conditions (
+                        condition_id, opportunity_id, kind, seq, type,
+                        params_json, window_start, window_end, required_data_json,
+                        evaluable, unavailable_reason, last_value,
+                        last_evaluated_at, last_result
+                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    """,
+                    (
+                        condition.condition_id,
+                        condition.opportunity_id,
+                        condition.kind,
+                        condition.seq,
+                        condition.type,
+                        condition.params_json,
+                        condition.window_start,
+                        condition.window_end,
+                        condition.required_data_json,
+                        int(condition.evaluable),
+                        condition.unavailable_reason,
+                        condition.last_value,
+                        condition.last_evaluated_at,
+                        (None if condition.last_result is None else int(condition.last_result)),
+                    ),
+                )
             connection.commit()
+            return True
         except BaseException:
             connection.rollback()
             raise
@@ -3867,15 +4246,21 @@ class SqliteStore:
     def transition_opportunity(
         self, record: OpportunityRecord, event: OpportunityEventRecord
     ) -> bool:
-        # OPEN may move to any terminal state; TRIGGERED may only be invalidated
-        # (a human reject or NO_ENTRY re-check). The domain transition() is the
-        # authority; this condition pins the same rule in one atomic statement.
-        allowed_from: tuple[str, ...]
-        if record.state == "INVALIDATED":
-            allowed_from = ("OPEN", "TRIGGERED")
-        elif record.state in {"TRIGGERED", "EXPIRED"}:
-            allowed_from = ("OPEN",)
-        else:
+        # The domain ``_ALLOWED_TRANSITIONS`` map is the single authority; this
+        # guard is derived from it so a future transition change can never
+        # drift from the SQL condition. The UPDATE is one atomic statement.
+        try:
+            target = OpportunityState(record.state)
+        except ValueError:
+            return False
+        allowed_from = tuple(
+            sorted(
+                source.value
+                for source, targets in _ALLOWED_TRANSITIONS.items()
+                if target in targets
+            )
+        )
+        if not allowed_from:
             return False
         placeholders = ", ".join("?" for _ in allowed_from)
         with closing(self._connect()) as connection, connection:
@@ -3945,6 +4330,28 @@ class SqliteStore:
             connection.close()
         return tuple(_row_to_opportunity(row) for row in rows)
 
+    def list_due_opportunities(
+        self, now: str, *, limit: int = 1000
+    ) -> tuple[OpportunityRecord, ...]:
+        """OPEN rows whose ``expires_at`` has passed, oldest first.
+
+        Selecting in SQL keeps a due row from starving behind newer OPEN rows.
+        """
+        connection = self._connect_read_only()
+        if connection is None:
+            return ()
+        try:
+            normalized_now = normalize_timestamp(now)
+            rows = connection.execute(
+                "SELECT * FROM opportunities "
+                "WHERE state = ? AND expires_at <= ? "
+                "ORDER BY expires_at ASC LIMIT ?",
+                ("OPEN", normalized_now, limit),
+            ).fetchall()
+        finally:
+            connection.close()
+        return tuple(_row_to_opportunity(row) for row in rows)
+
     def count_opportunities(self, *, state: str | None = None) -> int:
         connection = self._connect_read_only()
         if connection is None:
@@ -3972,6 +4379,65 @@ class SqliteStore:
         finally:
             connection.close()
         return tuple(_row_to_opportunity_event(row) for row in rows)
+
+    def list_conditions(
+        self, opportunity_id: str, kind: str | None = None
+    ) -> tuple[ConditionRecord, ...]:
+        connection = self._connect_read_only()
+        if connection is None:
+            return ()
+        try:
+            if kind is None:
+                rows = connection.execute(
+                    "SELECT * FROM opportunity_conditions WHERE opportunity_id = ? "
+                    "ORDER BY kind, seq",
+                    (opportunity_id,),
+                ).fetchall()
+            else:
+                rows = connection.execute(
+                    "SELECT * FROM opportunity_conditions "
+                    "WHERE opportunity_id = ? AND kind = ? ORDER BY seq",
+                    (opportunity_id, kind),
+                ).fetchall()
+        finally:
+            connection.close()
+        return tuple(_row_to_condition(row) for row in rows)
+
+    def update_condition_evaluation(
+        self,
+        opportunity_id: str,
+        condition_id: str,
+        *,
+        last_value: str | None,
+        last_evaluated_at: str | None,
+        last_result: bool | None,
+    ) -> bool:
+        # Condition IDs restart per opportunity, so the address is composite.
+        with closing(self._connect()) as connection, connection:
+            cursor = connection.execute(
+                """
+                UPDATE opportunity_conditions
+                SET last_value = ?, last_evaluated_at = ?, last_result = ?
+                WHERE opportunity_id = ? AND condition_id = ?
+                """,
+                (
+                    last_value,
+                    last_evaluated_at,
+                    None if last_result is None else int(last_result),
+                    opportunity_id,
+                    condition_id,
+                ),
+            )
+            if cursor.rowcount == 0:
+                _LOGGER.warning(
+                    "opportunity_condition_evaluation_missing",
+                    extra={
+                        "opportunity_id": opportunity_id,
+                        "condition_id": condition_id,
+                    },
+                )
+                return False
+        return True
 
     # -- Triggers and risk verdicts --------------------------------------
 
@@ -4659,6 +5125,25 @@ def _row_to_opportunity_event(row: sqlite3.Row) -> OpportunityEventRecord:
         to_state=row["to_state"],
         reason_code=row["reason_code"],
         note=row["note"],
+    )
+
+
+def _row_to_condition(row: sqlite3.Row) -> ConditionRecord:
+    return ConditionRecord(
+        condition_id=row["condition_id"],
+        opportunity_id=row["opportunity_id"],
+        kind=row["kind"],
+        seq=row["seq"],
+        type=row["type"],
+        params_json=row["params_json"],
+        window_start=row["window_start"],
+        window_end=row["window_end"],
+        required_data_json=row["required_data_json"],
+        evaluable=bool(row["evaluable"]),
+        unavailable_reason=row["unavailable_reason"],
+        last_value=row["last_value"],
+        last_evaluated_at=row["last_evaluated_at"],
+        last_result=None if row["last_result"] is None else bool(row["last_result"]),
     )
 
 

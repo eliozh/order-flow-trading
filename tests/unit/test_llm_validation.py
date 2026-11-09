@@ -237,6 +237,23 @@ def test_code_assigns_provenance_and_subject_even_when_the_model_omits_them(
     assert decision["subject"]["environment"] == "PAPER"
 
 
+def test_an_accepted_opportunity_draft_is_persisted_open(tmp_path: Path) -> None:
+    outcome, store = _analyze(tmp_path, _SequencedProvider(["opportunity_valid.json"]))
+
+    assert outcome.validation_status == "VALID"
+    assert outcome.opportunity is not None
+    record = store.get_opportunity(outcome.opportunity.opportunity_id)
+    assert record is not None
+    assert record.state == "OPEN"
+    payload = json.loads(record.payload_json)
+    assert payload["state"] == "OPEN"
+    assert [entry["to_state"] for entry in payload["state_history"]] == ["OPEN"]
+    # No LLM-facing path transitioned it: only code may leave OPEN.
+    assert store.list_opportunities(state="TRIGGERED") == ()
+    assert store.list_opportunities(state="INVALIDATED") == ()
+    assert store.list_opportunities(state="EXPIRED") == ()
+
+
 def test_opportunity_conversion_failure_degrades_to_a_rejected_decision(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:

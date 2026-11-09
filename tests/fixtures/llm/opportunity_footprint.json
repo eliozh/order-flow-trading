@@ -1,0 +1,115 @@
+{
+  "decision_type": "OPPORTUNITY_PROPOSAL",
+  "subject": {
+    "symbol": "BTCUSDT",
+    "timeframe": "15m",
+    "as_of": "2026-11-06T12:00:00.000Z"
+  },
+  "confidence": 0.66,
+  "rationale": "Footprint imbalance and expanding volume confirm demand.",
+  "caveats": ["Footprint is a derived, sampled view"],
+  "analysis": {
+    "market_structure": "Demand absorption on the bid side of the footprint.",
+    "regime": "TRENDING_UP",
+    "absorption": "Bid-side footprint imbalance.",
+    "exhaustion": null,
+    "key_zones": [
+      {
+        "role": "SUPPORT",
+        "price_low": "69700.00",
+        "price_high": "69900.00",
+        "note": "footprint demand"
+      }
+    ],
+    "narrative": "Bid-side imbalance is strong while volume expands.",
+    "metrics_cited": [
+      {
+        "metric": "FOOTPRINT_IMBALANCE",
+        "value": "0.70",
+        "unit": "RATIO",
+        "as_of": "2026-11-06T12:00:00.000Z",
+        "ref": "footprint.bars[0].cells[0]",
+        "note": "bid-side imbalance"
+      }
+    ]
+  },
+  "opportunity": {
+    "side": "LONG",
+    "zone_low": "69700.00",
+    "zone_high": "70600.00",
+    "entry_preference": "LIMIT",
+    "trigger_conditions": [
+      {
+        "draft_id": "c1",
+        "type": "FOOTPRINT_IMBALANCE_ABOVE",
+        "params": {
+          "price": null,
+          "price_low": null,
+          "price_high": null,
+          "threshold": "0.65",
+          "unit": "RATIO",
+          "comparator": null,
+          "lookback_bars": null,
+          "session_states": [],
+          "note": "strong bid imbalance"
+        },
+        "window": {
+          "start": "2026-11-06T11:00:00.000Z",
+          "end": "2026-11-06T12:00:00.000Z"
+        },
+        "required_data": ["FOOTPRINT"],
+        "description": "footprint imbalance above the threshold"
+      },
+      {
+        "draft_id": "c2",
+        "type": "VOLUME_ABOVE",
+        "params": {
+          "price": null,
+          "price_low": null,
+          "price_high": null,
+          "threshold": "1000",
+          "unit": "BASE",
+          "comparator": null,
+          "lookback_bars": 3,
+          "session_states": [],
+          "note": "expansion confirmation"
+        },
+        "window": {
+          "start": "2026-11-06T11:00:00.000Z",
+          "end": "2026-11-06T12:00:00.000Z"
+        },
+        "required_data": ["METRICS_5M"],
+        "description": "volume above the threshold"
+      }
+    ],
+    "invalidation_conditions": [
+      {
+        "type": "OI_DELTA_BELOW",
+        "description": "open interest collapses",
+        "price": null,
+        "threshold": "-2.5",
+        "window_end": "2026-12-01T00:00:00.000Z"
+      },
+      {
+        "type": "TIME_EXPIRED",
+        "description": "idea goes stale",
+        "price": null,
+        "threshold": null,
+        "window_end": "2026-11-20T00:00:00.000Z"
+      }
+    ],
+    "expires_at": "2027-01-01T00:00:00.000Z",
+    "risk_request": {
+      "entry_price": "69900.00",
+      "stop_price": "69700.00",
+      "take_profits": ["70800.00"],
+      "risk_pct": 0.4,
+      "leverage": 2.0,
+      "max_notional_usd": "800.00"
+    },
+    "thesis": "Footprint demand with volume expansion.",
+    "data_needs": ["FOOTPRINT", "METRICS_5M"]
+  },
+  "entry_recheck": null,
+  "position_management": null
+}

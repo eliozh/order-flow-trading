@@ -1,0 +1,157 @@
+{
+  "decision_type": "OPPORTUNITY_PROPOSAL",
+  "subject": {
+    "symbol": "BTCUSDT",
+    "timeframe": "5m",
+    "as_of": "2026-11-06T12:00:00.000Z"
+  },
+  "confidence": 0.68,
+  "rationale": "Positive delta with a falling CVD points to absorption.",
+  "caveats": ["5m noise"],
+  "analysis": {
+    "market_structure": "Impulse leg with a hidden seller.",
+    "regime": "TRENDING_UP",
+    "absorption": "Ask-side absorption at the highs.",
+    "exhaustion": null,
+    "key_zones": [
+      {
+        "role": "SUPPORT",
+        "price_low": "69500.00",
+        "price_high": "69600.00",
+        "note": "breakout base"
+      }
+    ],
+    "narrative": "Delta is positive while CVD is falling.",
+    "metrics_cited": [
+      {
+        "metric": "DELTA",
+        "value": "120.00",
+        "unit": "BASE",
+        "as_of": "2026-11-06T12:00:00.000Z",
+        "ref": "cvd.summary.delta",
+        "note": "buyers active"
+      }
+    ]
+  },
+  "opportunity": {
+    "side": "LONG",
+    "zone_low": "69500.00",
+    "zone_high": "71000.00",
+    "entry_preference": "MARKET",
+    "trigger_conditions": [
+      {
+        "draft_id": "c1",
+        "type": "DELTA_ABOVE",
+        "params": {
+          "price": null,
+          "price_low": null,
+          "price_high": null,
+          "threshold": "100",
+          "unit": "BASE",
+          "comparator": null,
+          "lookback_bars": 3,
+          "session_states": [],
+          "note": "aggressive buying"
+        },
+        "window": {
+          "start": "2026-11-06T11:45:00.000Z",
+          "end": "2026-11-06T12:00:00.000Z"
+        },
+        "required_data": ["METRICS_5M"],
+        "description": "window delta above the threshold"
+      },
+      {
+        "draft_id": "c2",
+        "type": "CVD_BELOW",
+        "params": {
+          "price": null,
+          "price_low": null,
+          "price_high": null,
+          "threshold": "-50",
+          "unit": "BASE",
+          "comparator": "<=",
+          "lookback_bars": 3,
+          "session_states": [],
+          "note": "CVD divergence confirmation"
+        },
+        "window": {
+          "start": "2026-11-06T11:45:00.000Z",
+          "end": "2026-11-06T12:00:00.000Z"
+        },
+        "required_data": ["METRICS_5M"],
+        "description": "CVD below the divergence threshold"
+      },
+      {
+        "draft_id": "c3",
+        "type": "CVD_DIVERGENCE",
+        "params": {
+          "price": null,
+          "price_low": null,
+          "price_high": null,
+          "threshold": null,
+          "unit": null,
+          "comparator": null,
+          "lookback_bars": 3,
+          "session_states": [],
+          "note": "price up, CVD down"
+        },
+        "window": {
+          "start": "2026-11-06T11:45:00.000Z",
+          "end": "2026-11-06T12:00:00.000Z"
+        },
+        "required_data": ["METRICS_5M"],
+        "description": "price and CVD diverge"
+      },
+      {
+        "draft_id": "c4",
+        "type": "CVD_ABOVE",
+        "params": {
+          "price": null,
+          "price_low": null,
+          "price_high": null,
+          "threshold": "50",
+          "unit": "BASE",
+          "comparator": ">",
+          "lookback_bars": 3,
+          "session_states": [],
+          "note": "CVD turns positive"
+        },
+        "window": {
+          "start": "2026-11-06T11:45:00.000Z",
+          "end": "2026-11-06T12:00:00.000Z"
+        },
+        "required_data": ["METRICS_5M"],
+        "description": "CVD crosses above the threshold"
+      }
+    ],
+    "invalidation_conditions": [
+      {
+        "type": "DELTA_BELOW",
+        "description": "sellers regain control",
+        "price": null,
+        "threshold": "-200",
+        "window_end": "2026-12-01T00:00:00.000Z"
+      },
+      {
+        "type": "MANUAL",
+        "description": "human rejects the idea",
+        "price": null,
+        "threshold": null,
+        "window_end": null
+      }
+    ],
+    "expires_at": "2027-01-01T00:00:00.000Z",
+    "risk_request": {
+      "entry_price": "70000.00",
+      "stop_price": "69500.00",
+      "take_profits": ["71500.00"],
+      "risk_pct": 0.5,
+      "leverage": 3.0,
+      "max_notional_usd": "1500.00"
+    },
+    "thesis": "Absorption at the highs with positive delta.",
+    "data_needs": ["METRICS_5M"]
+  },
+  "entry_recheck": null,
+  "position_management": null
+}
