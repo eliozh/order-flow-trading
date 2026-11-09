@@ -208,7 +208,7 @@ def evaluate_all_triggers(
     response: Response,
     idempotency_key: str | None = Header(default=None, alias="Idempotency-Key"),
 ) -> Any:
-    """Evaluate every OPEN opportunity exactly as the 15 s job does."""
+    """Evaluate the bounded page of OPEN opportunities exactly as the 15 s job does."""
     key = require_idempotency_key(idempotency_key)
     request_hash = hashlib.sha256(b"trigger-evaluate-all").hexdigest()
     replay = reserve(request, key=key, request_hash=request_hash)

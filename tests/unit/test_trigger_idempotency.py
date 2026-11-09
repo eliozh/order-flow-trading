@@ -258,20 +258,21 @@ def _time_window_conditions() -> list[dict[str, object]]:
     ]
 
 
-def test_manual_price_and_as_of_override_creates_a_trigger_with_the_supplied_as_of(
-    tmp_path: Path,
-) -> None:
+def test_an_as_of_override_equal_to_the_source_is_accepted(tmp_path: Path) -> None:
     store = _store(tmp_path)
     opportunity_id = _insert_opportunity(store, trigger_conditions=_time_window_conditions())
-    supplied_as_of = "2026-11-06T11:59:30.000Z"  # 30 s old: inside the 60 s budget
-    service = _service(store)
+    # The same instant expressed with a non-UTC offset: both normalize to 12:00Z.
+    equal_as_of = "2026-11-06T13:00:00+01:00"
+    service = _service(store)  # provider snapshot: SNAP-TEST @ NOW_TEXT (12:00Z)
 
-    run = service.evaluate(opportunity_id, price=Decimal("70000.00"), as_of=supplied_as_of)
+    run = service.evaluate(opportunity_id, price=Decimal("70000.00"), as_of=equal_as_of)
 
     assert run.created is True
     assert run.trigger is not None
     payload = json.loads(run.trigger.payload_json)
-    assert payload["snapshot"]["as_of"] == supplied_as_of
+    # Equality is an assertion, not a new ceiling: the source report's canonical
+    # as_of is preserved so the manual and job paths hash the same snapshot.
+    assert payload["snapshot"]["as_of"] == NOW_TEXT
     assert payload["snapshot"]["market_snapshot_id"]
     assert payload["trigger_source"] == "CODE"
 
@@ -286,35 +287,75 @@ def test_manual_evaluation_falls_back_to_the_provider_for_the_missing_override(
     by_as_of = _insert_opportunity(
         store, "OPP-AS-OF-ONLY", trigger_conditions=_time_window_conditions()
     )
-    supplied_as_of = "2026-11-06T11:59:30.000Z"
+    equal_as_of = NOW_TEXT
     service = _service(store)  # provider snapshot: SNAP-TEST @ NOW_TEXT
 
     price_run = service.evaluate(by_price, price=Decimal("70000.00"))
-    as_of_run = service.evaluate(by_as_of, as_of=supplied_as_of)
+    as_of_run = service.evaluate(by_as_of, as_of=equal_as_of)
 
     assert price_run.created is True
     assert price_run.trigger is not None
     assert json.loads(price_run.trigger.payload_json)["snapshot"]["as_of"] == NOW_TEXT
     assert as_of_run.created is True
     assert as_of_run.trigger is not None
-    assert json.loads(as_of_run.trigger.payload_json)["snapshot"]["as_of"] == supplied_as_of
+    assert json.loads(as_of_run.trigger.payload_json)["snapshot"]["as_of"] == NOW_TEXT
 
 
-def test_manual_stale_as_of_yields_stale_and_creates_no_trigger(tmp_path: Path) -> None:
+def test_an_as_of_override_earlier_than_the_source_is_rejected(tmp_path: Path) -> None:
+    """An earlier ceiling would retain bars observed after it (lookahead)."""
     store = _store(tmp_path)
     opportunity_id = _insert_opportunity(store, trigger_conditions=_time_window_conditions())
-    service = _service(store)
-
-    run = service.evaluate(
-        opportunity_id,
-        price=Decimal("70000.00"),
-        as_of="2026-11-06T11:00:00.000Z",  # one hour old: beyond the 60 s budget
+    provider = FixedProvider(
+        TriggerSnapshot(
+            symbol="BTCUSDT",
+            as_of=NOW_TEXT,
+            last_price=Decimal("70000.00"),
+            tick_size=Decimal("0.10"),
+            bar_timestamps=("2026-11-06T11:59:00.000Z", "2026-11-06T12:00:00.000Z"),
+            price_series=(Decimal("69990.00"), Decimal("70000.00")),
+            data_quality="COMPLETE",
+            snapshot_id="SNAP-SERIES",
+        )
     )
+    service = TriggerService(store=store, clock=FixedClock(NOW), provider=provider)
 
-    assert run.trigger is None
-    assert run.created is False
-    assert run.evaluation.stale is True
-    assert any("stale snapshot" in reason for reason in run.evaluation.reasons)
+    with pytest.raises(TriggerError) as caught:
+        service.evaluate(
+            opportunity_id,
+            price=Decimal("70000.00"),
+            # 30 s earlier than the report: the 12:00Z bar would leak.
+            as_of="2026-11-06T11:59:30.000Z",
+        )
+
+    assert caught.value.code == "VALIDATION_FAILED"
+    assert "earlier" in caught.value.message
+    assert "source report as_of" in caught.value.message
+    assert store.list_trigger_events() == ()
+
+
+def test_an_as_of_override_later_than_the_source_is_rejected(tmp_path: Path) -> None:
+    """A later ceiling would present the frozen stale series as fresh."""
+    store = _store(tmp_path)
+    opportunity_id = _insert_opportunity(store, trigger_conditions=_time_window_conditions())
+    provider = FixedProvider(
+        TriggerSnapshot(
+            symbol="BTCUSDT",
+            as_of="2026-11-06T11:00:00.000Z",  # one hour old, but COMPLETE
+            last_price=Decimal("70000.00"),
+            tick_size=Decimal("0.10"),
+            data_quality="COMPLETE",
+            snapshot_id="SNAP-OLD",
+        )
+    )
+    service = TriggerService(store=store, clock=FixedClock(NOW), provider=provider)
+
+    with pytest.raises(TriggerError) as caught:
+        # Relabelling the hour-old report as 12:00Z would make it look fresh.
+        service.evaluate(opportunity_id, price=Decimal("70000.00"), as_of=NOW_TEXT)
+
+    assert caught.value.code == "VALIDATION_FAILED"
+    assert "later" in caught.value.message
+    assert "source report as_of" in caught.value.message
     assert store.list_trigger_events() == ()
 
 
@@ -487,7 +528,7 @@ def test_a_manual_override_preserves_the_source_report_quality(tmp_path: Path) -
     )
     service = TriggerService(store=store, clock=FixedClock(NOW), provider=provider)
 
-    run = service.evaluate(opportunity_id, as_of="2026-11-06T11:59:30.000Z")
+    run = service.evaluate(opportunity_id, as_of=NOW_TEXT)
 
     assert run.created is True
     assert run.trigger is not None
@@ -515,7 +556,7 @@ def test_both_overrides_resolve_the_source_report_snapshot(tmp_path: Path) -> No
     run = service.evaluate(
         opportunity_id,
         price=Decimal("70000.00"),
-        as_of="2026-11-06T11:59:30.000Z",
+        as_of=NOW_TEXT,
     )
 
     # The source report is always resolved, even when both overrides are
@@ -545,7 +586,7 @@ def test_both_overrides_on_a_stale_source_are_rejected(tmp_path: Path) -> None:
         service.evaluate(
             opportunity_id,
             price=Decimal("70000.00"),
-            as_of="2026-11-06T11:59:30.000Z",
+            as_of=NOW_TEXT,
         )
 
     assert caught.value.code == "VALIDATION_FAILED"

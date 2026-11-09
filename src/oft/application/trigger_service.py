@@ -3,8 +3,9 @@
 Only code produces trigger events. The evaluator uses one frozen snapshot per
 ``(symbol, report_id)`` per tick, records the condition results and hash, and
 keeps one trigger per ``(opportunity, snapshot_hash)`` via a unique idempotency
-key. A stale or unavailable snapshot never triggers. No order, fill, position,
-or LLM call is made in this module.
+key. A stale or unavailable snapshot never triggers. A manual ``as_of`` override
+is an equality assertion against the source report's ``as_of``; it can never
+move the ceiling. No order, fill, position, or LLM call is made in this module.
 """
 
 from __future__ import annotations
@@ -12,6 +13,7 @@ from __future__ import annotations
 import hashlib
 import json
 from dataclasses import dataclass, replace
+from datetime import UTC, datetime
 from decimal import Decimal
 from typing import Any
 
@@ -94,6 +96,14 @@ def _digest(value: str) -> str:
     return hashlib.sha256(value.encode("utf-8")).hexdigest()[:16].upper()
 
 
+def _utc_instant(value: str) -> datetime:
+    """Parse an ISO-8601 timestamp and normalize it to UTC for comparison."""
+    parsed = datetime.fromisoformat(value.replace("Z", "+00:00"))
+    if parsed.tzinfo is None:
+        parsed = parsed.replace(tzinfo=UTC)
+    return parsed.astimezone(UTC)
+
+
 def _condition_contract(result: ConditionResult, *, fallback_at: str) -> dict[str, Any]:
     """Map one condition result to the ``trigger-event`` contract item."""
     return {
@@ -137,6 +147,17 @@ class TriggerService:
         snapshot_id: str | None = None,
         stale_after_seconds: int | None = None,
     ) -> TriggerRun:
+        """Evaluate one opportunity on demand, optionally with manual overrides.
+
+        ``price`` replaces the frozen snapshot's ``last_price`` for the same
+        instant. ``as_of`` is accepted only when it equals the source report's
+        ``as_of`` after both are normalized to UTC: an earlier value would retain
+        bars observed after the new ceiling (lookahead), and a later value would
+        present the frozen series as fresher than it is, so either raises
+        ``VALIDATION_FAILED``. ``snapshot_id`` may replace the frozen id. A STALE
+        source is rejected on every override path; a missing or corrupt report is
+        ``DATA_UNAVAILABLE`` rather than a hollow snapshot.
+        """
         opportunity = self._opportunities.show(opportunity_id)
         now = utc_timestamp(self._clock.now())
         if opportunity.state is not OpportunityState.OPEN:
@@ -182,13 +203,34 @@ class TriggerService:
                 "VALIDATION_FAILED",
                 f"cannot override a STALE source snapshot: {reasons}",
             )
-        # Only the overridden fields change; every tick/series/metric and the
-        # source quality stay exactly as recorded in the frozen report.
-        frozen = replace(
-            frozen,
-            as_of=as_of if as_of is not None else frozen.as_of,
-            last_price=price if price is not None else frozen.last_price,
-        )
+        if as_of is not None:
+            # ``as_of`` is an assertion, not a new ceiling: the preserved
+            # series and metrics were only ever valid at the report's as_of.
+            try:
+                requested = _utc_instant(as_of)
+                source = _utc_instant(frozen.as_of)
+            except (TypeError, ValueError) as exc:
+                raise TriggerError(
+                    "VALIDATION_FAILED",
+                    f"as_of override is not a valid ISO-8601 timestamp: {as_of!r}",
+                ) from exc
+            if requested != source:
+                earlier = requested < source
+                consequence = (
+                    "an earlier as_of would retain bars after the new ceiling (lookahead)"
+                    if earlier
+                    else "a later as_of would present the stale series as fresh"
+                )
+                raise TriggerError(
+                    "VALIDATION_FAILED",
+                    f"as_of override {as_of} is "
+                    f"{'earlier' if earlier else 'later'} than the source report as_of "
+                    f"{frozen.as_of}: {consequence}; only an equal as_of may be supplied",
+                )
+        # Only the overridden fields change; every tick/series/metric, the as_of
+        # ceiling and the source quality stay exactly as recorded in the report.
+        if price is not None:
+            frozen = replace(frozen, last_price=price)
         if frozen.last_price is None:
             return self._unavailable_run(opportunity, now)
         return self._evaluate_and_record(
@@ -417,8 +459,9 @@ class TriggerService:
                 created=False,
             )
         # A concurrent writer moved the opportunity to a non-OPEN terminal
-        # state (or removed it) before the transaction: the trigger insert was
-        # rolled back, so this snapshot never produced a trigger.
+        # state (or removed it) before the transaction, or the insert hit an
+        # unexpected constraint: the trigger insert was rolled back, so this
+        # snapshot never produced a trigger.
         _LOGGER.warning(
             "trigger_transition_conflict",
             opportunity_id=opportunity.opportunity_id,
