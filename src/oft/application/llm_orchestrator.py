@@ -1,9 +1,9 @@
 """Provider orchestration: role/model resolution, retries, repair, breaker (D5).
 
 The application layer owns the policy; adapters only translate transport. One
-repair follows a schema failure, transport/5xx/429 failures retry once, refusals
-and truncations are never retried, and a final rejection is recorded locally as
-an ``LLM_REJECTED`` audit event (never Telegram).
+repair follows a schema failure, transport/5xx/429/timeout failures retry once,
+refusals and truncations are never retried, and a final rejection is recorded
+locally as an ``LLM_REJECTED`` audit event (never Telegram).
 """
 
 from __future__ import annotations
@@ -17,6 +17,8 @@ from collections.abc import Callable
 from dataclasses import dataclass, replace
 from datetime import datetime, timedelta
 from typing import Any, cast
+
+import structlog
 
 from oft.application.budget_ledger import BudgetEntry, BudgetLedger, stable_call_id
 from oft.application.llm_validation import (
@@ -55,6 +57,8 @@ ENTRY_RECHECK_TIMEOUT_SECONDS = 45.0
 _RETRY_BASE_SECONDS = 0.5
 _RETRY_ATTEMPTS = 2
 _MAX_JITTER_SECONDS = 0.25
+
+LOGGER = structlog.get_logger(__name__)
 _REAL_PROVIDER_KEYS = {
     "openai": "openai_api_key",
     "anthropic": "anthropic_api_key",
@@ -323,7 +327,12 @@ def _redact_value(value: Any, secrets: tuple[str, ...]) -> Any:
 
 
 class LLMOrchestrator:
-    """Owns every call-level policy and every ``llm_calls``/budget row."""
+    """Owns call-level policy and the ``llm_calls``/budget rows for model calls.
+
+    ``CapabilityProbeService`` writes its own probe rows, and an error row
+    (``_record_error_call``) has no matching budget row because no billable
+    result exists.
+    """
 
     def __init__(
         self,
@@ -490,8 +499,25 @@ class LLMOrchestrator:
         provider = self._provider_name
         timeout = timeout_for_role(request.role)
         attempt_request = replace(request, timeout_seconds=timeout)
+        last_error: LLMAdapterError | None = None
         for retry_index in range(_RETRY_ATTEMPTS):
-            permit = self.breaker.before_call(provider)
+            try:
+                permit = self.breaker.before_call(provider)
+            except CircuitOpenError:
+                if last_error is None:
+                    raise
+                # The breaker opened between retries. Preserve the real failure
+                # that tripped it: record the attempt and surface its typed code
+                # instead of a misleading 429 (S4).
+                self._record_error_call(
+                    request=attempt_request,
+                    attempt=attempt,
+                    decision_id=decision_id,
+                    now=now,
+                    calls=calls,
+                    error_code=last_error.code,
+                )
+                raise last_error from None
             try:
                 semaphore = self._semaphore(provider)
                 if not semaphore.acquire(timeout=timeout):
@@ -543,6 +569,7 @@ class LLMOrchestrator:
                 assert error is not None
                 if error.retryable and retry_index + 1 < _RETRY_ATTEMPTS:
                     permit.failure()
+                    last_error = error
                     # The slot is already released, so a rate-limited DeepSeek
                     # call does not block the only concurrency slot while it
                     # backs off.
@@ -599,10 +626,12 @@ class LLMOrchestrator:
         return result
 
     def _unique_call_id(self, decision_id: str, attempt: int) -> str:
-        """A call id that never collides with an already-recorded invocation.
+        """Allocate a call id that does not collide with a recorded invocation.
 
-        Re-invoking the same decision is a real, billed call; a deterministic id
-        plus ``ON CONFLICT DO NOTHING`` would silently drop it (M2/M3).
+        The success path allocates under the store's ``BEGIN IMMEDIATE``
+        transaction, which is collision-free. Error rows use
+        ``ON CONFLICT DO NOTHING``, so a concurrent error row for the same
+        decision/attempt may silently drop a duplicate rather than be billed.
         """
         base = stable_call_id(decision_id, attempt)
         existing = {call.call_id for call in self._store.list_llm_calls(decision_id=decision_id)}
@@ -679,7 +708,10 @@ class LLMOrchestrator:
             return {}
         try:
             estimate = estimate_cost(request, request.model)
-        except (AttributeError, NotImplementedError, TypeError, ValueError):
+        except (AttributeError, NotImplementedError, TypeError, ValueError) as exc:
+            # Fall back to the operator table, but never silently: a broken
+            # estimate seam must be visible in the logs (S3).
+            LOGGER.warning("llm_estimate_cost_failed", error=type(exc).__name__)
             return {}
         unpriced = getattr(estimate, "unpriced", True)
         if unpriced:
@@ -881,6 +913,10 @@ class CapabilityProbeService:
             )
         outcome = self._probe(adapter, probe, name, model, resolved_role)
         checked_at = utc_timestamp(self._clock.now())
+        # Provider-controlled error text must never reach SQLite, the API, or a
+        # terminal unfiltered: apply the same printable/redacted/200-cap rule
+        # as provider ids (D1).
+        notes = sanitize_provider_id(outcome.notes, self._secrets())
         record = ProviderCapabilityRecord(
             provider=name,
             model=model,
@@ -889,7 +925,7 @@ class CapabilityProbeService:
             max_output_tokens=int(outcome.max_output_tokens),
             status="FAILED" if outcome.error_code else "OK",
             error_code=outcome.error_code,
-            notes=outcome.notes,
+            notes=notes,
             latency_ms=int(outcome.latency_ms),
             checked_at=checked_at,
         )

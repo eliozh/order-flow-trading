@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import json
 from collections.abc import Callable
+from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any
 
@@ -257,3 +258,68 @@ def test_error_bodies_are_redacted_before_they_reach_the_message() -> None:
 
     assert sentinel not in caught.value.message
     assert "[REDACTED]" in caught.value.message
+
+
+@pytest.mark.parametrize("provider", sorted(ADAPTERS))
+def test_the_outbound_request_body_never_contains_the_key(provider: str) -> None:
+    captured: list[httpx.Request] = []
+
+    _adapter(provider, _transport(provider, "valid", captured.append)).complete(_request())
+
+    body = captured[0].content
+    assert b"sk-SENTINEL-DO-NOT-LEAK" not in body
+    assert b"sk-SENTINEL" not in body
+
+
+def test_anthropic_tool_use_is_truncated_and_rejected() -> None:
+    result = _adapter("anthropic", _transport("anthropic", "tool_use")).complete(_request())
+
+    assert result.raw_text == ""
+    assert result.truncated is True
+    assert validate_output(result.raw_text, role="ANALYSIS").status == "REJECTED"
+
+
+def test_anthropic_text_plus_tool_use_is_not_accepted_as_valid() -> None:
+    result = _adapter("anthropic", _transport("anthropic", "text_and_tool_use")).complete(
+        _request()
+    )
+
+    # The valid-looking text is suppressed: the unexpected tool_use wins.
+    assert result.raw_text == ""
+    assert result.truncated is True
+    assert validate_output(result.raw_text, role="ANALYSIS").status == "REJECTED"
+
+
+def test_anthropic_tool_use_is_never_repaired(tmp_path: Path) -> None:
+    from oft.adapters.sqlite_store import SqliteStore
+    from oft.application.budget_ledger import BudgetLedger
+    from oft.application.llm_orchestrator import LLMOrchestrator
+    from oft.clock import FixedClock
+    from oft.config import Settings
+
+    requests: list[httpx.Request] = []
+    body, meta = _fixture("anthropic", "tool_use")
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        requests.append(request)
+        return httpx.Response(meta["status"], json=body, headers=meta["headers"])
+
+    settings = Settings(env="test", port=8765, data_dir=tmp_path / "data")
+    store = SqliteStore(settings)
+    store.initialize()
+    orchestrator = LLMOrchestrator(
+        store=store,
+        clock=FixedClock(datetime(2026, 11, 9, tzinfo=UTC)),
+        provider=_adapter("anthropic", httpx.MockTransport(handler)),
+        budget=BudgetLedger(store=store),
+        sleep=lambda _seconds: None,
+        jitter=lambda: 0.0,
+    )
+
+    result = orchestrator.complete_with_validation(
+        request=_request(), decision_id="DEC-TOOL-USE", role=LLMRole.ANALYSIS
+    )
+
+    assert result.outcome.status == "REJECTED"
+    assert result.outcome.errors[0].code == "LLM_OUTPUT_TRUNCATED"
+    assert len(requests) == 1

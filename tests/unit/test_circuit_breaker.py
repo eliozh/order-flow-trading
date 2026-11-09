@@ -14,6 +14,7 @@ from oft.adapters.llm_common import (
     LLMRateLimited,
     LLMSchemaUnsupported,
     LLMTimeoutError,
+    LLMTransportError,
 )
 from oft.adapters.sqlite_store import SqliteStore
 from oft.application.budget_ledger import BudgetLedger
@@ -190,7 +191,8 @@ def test_llm_auth_error_is_not_counted_by_the_breaker() -> None:
     breaker = CircuitBreaker(clock=_MutableClock(NOW))
     breaker.record_failure("openai", auth=True)
     assert breaker.consecutive_failures("openai") == 0
-    assert issubclass(LLMAuthError, Exception)
+    assert breaker.is_open("openai") is False
+    breaker.before_call("openai")  # still admissible
 
 
 class _RaisingProvider:
@@ -318,3 +320,35 @@ def test_a_semaphore_timeout_releases_the_half_open_probe(tmp_path: Path) -> Non
         )
 
     breaker.before_call("openai")
+
+
+def test_a_breaker_opening_between_retries_keeps_the_real_error(
+    tmp_path: Path,
+) -> None:
+    """The failure that opened the circuit is recorded and re-raised (S4)."""
+    store = _store(tmp_path)
+    provider = _RaisingProvider(LLMTransportError("boom", status=503, retryable=True))
+    orchestrator = LLMOrchestrator(
+        store=store,
+        clock=_MutableClock(NOW),
+        provider=provider,
+        budget=BudgetLedger(store=store),
+        sleep=lambda _seconds: None,
+        jitter=lambda: 0.0,
+    )
+    # Two prior failures: the retryable 5xx on attempt 1 trips the breaker.
+    orchestrator.breaker.record_failure("openai")
+    orchestrator.breaker.record_failure("openai")
+
+    with pytest.raises(LLMTransportError) as caught:
+        orchestrator.complete_with_validation(
+            request=_request(), decision_id="DEC-OPEN-RETRY", role=LLMRole.ANALYSIS
+        )
+
+    assert caught.value.code == "UPSTREAM_UNAVAILABLE"
+    assert caught.value.status == 503
+    assert provider.calls == 1
+    calls = store.list_llm_calls(decision_id="DEC-OPEN-RETRY")
+    assert len(calls) == 1
+    assert calls[0].status == "ERROR"
+    assert calls[0].error_code == "UPSTREAM_UNAVAILABLE"

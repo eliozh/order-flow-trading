@@ -10,6 +10,7 @@ from typing import Any
 import httpx
 import pytest
 
+from oft.adapters.llm_anthropic import AnthropicAdapter
 from oft.adapters.llm_openai import OpenAIAdapter
 from oft.adapters.sqlite_store import SqliteStore
 from oft.application.llm_orchestrator import CapabilityProbeService
@@ -27,6 +28,31 @@ def _adapter(body: dict[str, Any], status: int = 200) -> OpenAIAdapter:
         base_url="https://api.openai.test",
         transport=httpx.MockTransport(lambda _request: httpx.Response(status, json=body)),
     )
+
+
+def test_anthropic_successful_probe_is_strict() -> None:
+    body = {
+        "id": "msg_probe",
+        "type": "message",
+        "role": "assistant",
+        "content": [{"type": "text", "text": '{"ok": "ok"}'}],
+        "stop_reason": "end_turn",
+        "usage": {"input_tokens": 10, "output_tokens": 5},
+    }
+    adapter = AnthropicAdapter(
+        api_key="sk-SENTINEL-DO-NOT-LEAK",
+        base_url="https://api.anthropic.test",
+        transport=httpx.MockTransport(lambda _request: httpx.Response(200, json=body)),
+    )
+
+    outcome = adapter.probe(model="claude-fixture")
+
+    assert outcome.error_code is None
+    assert outcome.strict_schema is True
+    assert outcome.degraded is False
+    assert outcome.notes == "strict schema accepted"
+    assert outcome.max_output_tokens == adapter.capabilities().max_output_tokens
+    assert outcome.request_id == "msg_probe"
 
 
 @pytest.mark.parametrize(

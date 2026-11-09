@@ -10,7 +10,7 @@ from __future__ import annotations
 import hashlib
 import json
 from dataclasses import dataclass
-from decimal import InvalidOperation
+from decimal import Decimal, InvalidOperation
 from typing import Any
 
 from oft.application.budget_ledger import BudgetEntry, BudgetLedger
@@ -113,6 +113,50 @@ def _reference_price(snapshot: dict[str, Any]) -> str:
     return str(price) if price is not None else "0"
 
 
+_USAGE_FIELDS = (
+    "input_tokens",
+    "output_tokens",
+    "cache_read_tokens",
+    "cache_write_tokens",
+    "reasoning_tokens",
+)
+
+
+def _total_usage(calls: list[LLMCallRecord]) -> dict[str, int]:
+    """Sum usage across every call row of a decision (including repairs)."""
+    totals = dict.fromkeys(_USAGE_FIELDS, 0)
+    for call in calls:
+        try:
+            payload = json.loads(call.usage_json or "{}")
+        except (json.JSONDecodeError, TypeError, ValueError):
+            continue
+        if not isinstance(payload, dict):
+            continue
+        for field in _USAGE_FIELDS:
+            value = payload.get(field)
+            if isinstance(value, int) and not isinstance(value, bool):
+                totals[field] += value
+    return LLMUsage(**totals).to_contract()
+
+
+def _total_cost(budgets: list[BudgetEntry]) -> tuple[str, str, bool]:
+    """Sum cost across every budget row of a decision (including repairs)."""
+    if not budgets:
+        return "0", "stub/v1", True
+    amount = Decimal("0")
+    price_version = "stub/v1"
+    unpriced = False
+    for entry in budgets:
+        payload = entry.payload
+        try:
+            amount += Decimal(str(payload.get("cost_usd", "0")))
+        except (InvalidOperation, TypeError, ValueError):
+            continue
+        price_version = str(payload.get("price_version") or price_version)
+        unpriced = unpriced or bool(payload.get("unpriced", True))
+    return format(amount, "f"), price_version, unpriced
+
+
 class AnalysisService:
     def __init__(
         self,
@@ -196,13 +240,13 @@ class AnalysisService:
             decision_id=decision_id,
             role=LLMRole.ANALYSIS,
         )
-        first = orchestration.first_result
+        final = orchestration.final_result
         outcome = orchestration.outcome
         calls = list(orchestration.calls)
         budgets = list(orchestration.budgets)
 
         provenance = self._provenance(
-            result=first,
+            result=final,
             digest=digest,
             rendered=rendered,
             calls=calls,
@@ -336,7 +380,7 @@ class AnalysisService:
         knowledge_status: str | None,
         knowledge_reason: str | None,
     ) -> dict[str, Any]:
-        cost_payload = budgets[0].payload if budgets else None
+        amount_usd, price_version, unpriced = _total_cost(budgets)
         return {
             "provider": result.provider,
             "model": result.model,
@@ -353,12 +397,12 @@ class AnalysisService:
             "seed": None,
             "request_id": sanitize_provider_id(result.request_id, self._secrets),
             "latency_ms": result.latency_ms,
-            "usage": json.loads(calls[0].usage_json) if calls else LLMUsage().to_contract(),
+            "usage": _total_usage(calls),
             "cost": {
-                "amount_usd": cost_payload["cost_usd"] if cost_payload else "0",
+                "amount_usd": amount_usd,
                 "currency": "USD",
-                "price_version": cost_payload["price_version"] if cost_payload else "stub/v1",
-                "unpriced": bool(cost_payload["unpriced"]) if cost_payload else True,
+                "price_version": price_version,
+                "unpriced": unpriced,
             },
             "recorded_at": now,
         }

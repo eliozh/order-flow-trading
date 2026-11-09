@@ -3553,7 +3553,7 @@ class SqliteStore:
         self,
         call: LLMCallRecord,
         budget: BudgetRecord,
-        compute: Callable[[dict[str, dict[str, Any]]], tuple[str, AuditEventDraft | None]],
+        compute: Callable[[dict[str, dict[str, Any]]], tuple[str, list[AuditEventDraft]]],
     ) -> tuple[LLMCallRecord, BudgetRecord]:
         """Atomically write the call row, budget row, and threshold audit (M2).
 
@@ -3583,7 +3583,7 @@ class SqliteStore:
                 week=final_budget.period_week,
                 month=final_budget.period_month,
             )
-            state, audit = compute(prior)
+            state, audits = compute(prior)
             final_budget = replace(
                 final_budget,
                 budget_state=state,
@@ -3603,9 +3603,9 @@ class SqliteStore:
                 raise BudgetRecordConflictError(
                     f"budget record {final_budget.record_id!r} was not persisted"
                 )
-            if audit is not None:
+            for audit in audits:
                 # The id may have been reallocated after the caller built the
-                # draft; point the audit at the row that actually committed.
+                # draft; point every audit at the row that actually committed.
                 self._insert_audit_event(
                     connection,
                     replace(

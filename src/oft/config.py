@@ -64,8 +64,8 @@ class Settings(BaseSettings):
     """Application settings.
 
     Safe defaults: paper environment, loopback binding, and no credentials.
-    Credentials are optional and default to ``None``; the walking skeleton
-    never reads them.
+    Credentials are optional and default to ``None``; the LLM path reads
+    provider keys in this build.
     """
 
     model_config = SettingsConfigDict(

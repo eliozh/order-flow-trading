@@ -64,7 +64,8 @@ class AnthropicAdapter(HttpProviderAdapter):
                     value = block.get("text")
                     texts.append(value if isinstance(value, str) else "")
                 elif block.get("type") == "tool_use":
-                    # We never send tools; a tool_use block is a schema violation.
+                    # We never send tools; an unexpected tool_use block makes the
+                    # output unusable and is treated as truncated, never repaired.
                     tool_use = True
         stop_reason = body.get("stop_reason")
         usage_body = body.get("usage")

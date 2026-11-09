@@ -71,7 +71,7 @@ class BudgetEntry:
 
 
 class BudgetConfigError(Exception):
-    """An operator threshold is invalid or a period name is unknown."""
+    """An operator threshold/period is invalid or pricing overrides are inconsistent."""
 
     code = "VALIDATION_FAILED"
 
@@ -504,10 +504,10 @@ class BudgetService:
 
         def compute(
             prior: dict[str, dict[str, Any]],
-        ) -> tuple[str, AuditEventDraft | None]:
+        ) -> tuple[str, list[AuditEventDraft]]:
             states, spends, crossing, budget_state = self._states(prior, current_cost, thresholds)
-            audit = (
-                self._threshold_draft(
+            audits = (
+                self._threshold_drafts(
                     record=draft,
                     states=states,
                     spends=spends,
@@ -516,9 +516,9 @@ class BudgetService:
                     crossing=crossing,
                 )
                 if crossing
-                else None
+                else []
             )
-            return budget_state, audit
+            return budget_state, audits
 
         stored_call, stored_budget = self._store.save_call_and_budget(call, draft, compute)
         entry_payload = _loads_payload(stored_budget.payload_json, fallback=payload)
@@ -586,15 +586,14 @@ class BudgetService:
         spends: Mapping[str, Decimal],
         thresholds: BudgetThresholds,
         occurred_at: str,
-        crossing: list[str],
+        period: str,
     ) -> AuditEventDraft:
-        triggering = max(crossing, key=lambda name: _STATE_RANK[states[name]])
         payload = {
-            "period": triggering,
-            "period_key": budget_period(record.occurred_at)[triggering],
-            "spend_usd": _money(spends[triggering]),
-            "threshold_usd": _text(thresholds.threshold_for(triggering)),
-            "state": states[triggering],
+            "period": period,
+            "period_key": budget_period(record.occurred_at)[period],
+            "spend_usd": _money(spends[period]),
+            "threshold_usd": _text(thresholds.threshold_for(period)),
+            "state": states[period],
             "provider": record.provider,
             "model": record.model,
         }
@@ -606,6 +605,29 @@ class BudgetService:
             created_at=occurred_at,
         )
 
+    def _threshold_drafts(
+        self,
+        *,
+        record: BudgetRecord,
+        states: Mapping[str, str],
+        spends: Mapping[str, Decimal],
+        thresholds: BudgetThresholds,
+        occurred_at: str,
+        crossing: list[str],
+    ) -> list[AuditEventDraft]:
+        """One audit per crossed period; a call may cross several at once (S1)."""
+        return [
+            self._threshold_draft(
+                record=record,
+                states=states,
+                spends=spends,
+                thresholds=thresholds,
+                occurred_at=occurred_at,
+                period=period,
+            )
+            for period in crossing
+        ]
+
     def _emit_threshold_audit(
         self,
         *,
@@ -616,16 +638,16 @@ class BudgetService:
         occurred_at: str,
         crossing: list[str],
     ) -> None:
-        draft = self._threshold_draft(
+        for draft in self._threshold_drafts(
             record=record,
             states=states,
             spends=spends,
             thresholds=thresholds,
             occurred_at=occurred_at,
             crossing=crossing,
-        )
-        self._store.append_audit_event(draft)
-        LOGGER.warning("budget_threshold", **draft.payload)
+        ):
+            self._store.append_audit_event(draft)
+            LOGGER.warning("budget_threshold", **draft.payload)
 
     # -- rollups ---------------------------------------------------------
 

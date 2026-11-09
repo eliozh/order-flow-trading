@@ -32,7 +32,6 @@ from oft.api.schemas.trigger import (
 )
 from oft.application.entry_service import EntryRejected, EntryService
 from oft.application.kill_switch import KillSwitch
-from oft.application.llm_orchestrator import LLMConfigurationError
 from oft.application.opportunity_service import OpportunityNotFound
 from oft.application.trigger_service import (
     TriggerError,
@@ -40,9 +39,7 @@ from oft.application.trigger_service import (
     TriggerService,
     trigger_summary,
 )
-from oft.domain.pricing import PriceTableError
 from oft.domain.time import utc_timestamp
-from oft.ports.llm import LLMAdapterError
 
 router = APIRouter()
 
@@ -214,9 +211,6 @@ def recheck_trigger(
     except EntryRejected as exc:
         release(request, key=key)
         raise ApiError(exc.code, exc.message) from exc
-    except (LLMConfigurationError, LLMAdapterError, PriceTableError) as exc:
-        release(request, key=key)
-        raise ApiError(exc.code, exc.message) from exc
     except TriggerNotFound as exc:
         release(request, key=key)
         raise ApiError("NOT_FOUND", str(exc)) from exc
@@ -244,8 +238,6 @@ def accept_trigger(
     try:
         result = _entry_service(request, trigger_id).accept(trigger_id, idempotency_key=key)
     except EntryRejected as exc:
-        raise ApiError(exc.code, exc.message) from exc
-    except (LLMConfigurationError, LLMAdapterError, PriceTableError) as exc:
         raise ApiError(exc.code, exc.message) from exc
     except TriggerNotFound as exc:
         raise ApiError("NOT_FOUND", str(exc)) from exc

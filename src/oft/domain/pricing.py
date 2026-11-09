@@ -74,7 +74,11 @@ def _decimal_text(value: Decimal) -> str:
 
 @dataclass(frozen=True)
 class PriceTable:
-    """An immutable, versioned price table keyed by ``(provider, model)``."""
+    """A versioned price table keyed by ``(provider, model)``.
+
+    ``models`` is a caller-owned mutable mapping; do not mutate it after
+    construction or the key/row identity invariant no longer holds.
+    """
 
     version: str
     models: Mapping[tuple[str, str], ModelPrice]

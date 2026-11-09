@@ -43,7 +43,7 @@ LLM_ROLE_NAMES: tuple[str, ...] = ("ANALYSIS", "ENTRY_RECHECK", "MANAGEMENT", "R
 
 
 def build_llm_adapter(settings: Settings, name: str | None) -> LLMPort | None:
-    """The single provider-construction seam; tests monkeypatch this function."""
+    """The provider-construction seam; tests monkeypatch this function."""
     normalized = (name or "").strip().lower()
     if normalized == "stub":
         return LLMStub(fixtures_dir=settings.llm_fixtures_dir)
@@ -76,7 +76,7 @@ set_default_adapter_factory(_adapter_factory_seam)
 
 
 def resolve_llm_provider(settings: Settings, requested: str | None = None) -> LLMPort | None:
-    """Resolve one provider name to an adapter; the only construction point.
+    """Resolve one provider name to an adapter through the construction seam.
 
     An unknown or missing name resolves to ``None`` so callers can report
     ``LLM_PROVIDER_NOT_CONFIGURED``.

@@ -91,6 +91,37 @@ def test_a_503_maps_to_a_retryable_transport_error_with_a_redacted_message(provi
     assert "[REDACTED]" in caught.value.message
 
 
+@pytest.mark.parametrize("provider", sorted(ADAPTERS))
+def test_a_plain_400_maps_to_a_non_retryable_transport_error(provider: str) -> None:
+    with pytest.raises(LLMTransportError) as caught:
+        _adapter(provider, _error_transport(400)).complete(_request())
+
+    assert caught.value.retryable is False
+    assert caught.value.status == 400
+    assert caught.value.code == "UPSTREAM_UNAVAILABLE"
+    assert SENTINEL not in caught.value.message
+
+
+@pytest.mark.parametrize("provider", sorted(ADAPTERS))
+def test_a_408_maps_to_a_retryable_transport_error(provider: str) -> None:
+    with pytest.raises(LLMTransportError) as caught:
+        _adapter(provider, _error_transport(408)).complete(_request())
+
+    assert caught.value.retryable is True
+    assert caught.value.status == 408
+    assert caught.value.code == "UPSTREAM_UNAVAILABLE"
+
+
+@pytest.mark.parametrize("provider", sorted(ADAPTERS))
+def test_another_4xx_maps_to_a_non_retryable_transport_error(provider: str) -> None:
+    with pytest.raises(LLMTransportError) as caught:
+        _adapter(provider, _error_transport(404)).complete(_request())
+
+    assert caught.value.retryable is False
+    assert caught.value.status == 404
+    assert caught.value.code == "UPSTREAM_UNAVAILABLE"
+
+
 @pytest.mark.parametrize("status", [429, 503])
 def test_the_orchestrator_retries_once_and_succeeds_on_the_second_request(
     tmp_path: Path, status: int

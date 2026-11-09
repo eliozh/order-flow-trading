@@ -748,15 +748,16 @@ class StorePort(Protocol):
         self,
         call: LLMCallRecord,
         budget: BudgetRecord,
-        compute: Callable[[dict[str, dict[str, Any]]], tuple[str, AuditEventDraft | None]],
+        compute: Callable[[dict[str, dict[str, Any]]], tuple[str, list[AuditEventDraft]]],
     ) -> tuple[LLMCallRecord, BudgetRecord]:
-        """Insert one call row, one budget row, and any threshold audit atomically.
+        """Insert one call row, one budget row, and any threshold audits atomically.
 
         Runs under one ``BEGIN IMMEDIATE`` transaction so a concurrent or
         cross-process writer cannot miss a crossing or split the rows. The store
         allocates a unique call id (suffix ``-<8 hex>`` to both rows) when the
         base id already exists. ``compute`` receives the in-transaction prior
-        per-period totals and returns ``(budget_state, audit_draft_or_none)``.
+        per-period totals and returns ``(budget_state, audit_drafts)``; a call
+        that crosses several periods yields one draft per crossed period.
         """
         ...
 

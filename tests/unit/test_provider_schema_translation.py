@@ -169,25 +169,36 @@ def test_redact_ignores_empty_secrets_and_leaves_ordinary_text() -> None:
 
 
 @pytest.mark.parametrize(
-    "schema",
+    ("schema", "expected"),
     [
-        {"anyOf": [{"type": "string"}, {"type": "null"}, {"type": "integer"}]},
-        {"anyOf": [{"type": "string"}, {"type": "null", "description": "d"}]},
-        {"type": "object", "properties": {"p": {"type": "string"}}, "required": ["p"]},
-        {"properties": "not-a-dict"},
-        {"items": [{"type": "string"}]},
-        {"anyOf": ["string", {"type": "null"}]},
-        {"type": "object", "unknown_keyword": 1},
+        (
+            {"anyOf": [{"type": "string"}, {"type": "null"}, {"type": "integer"}]},
+            {"anyOf": [{"type": "string"}, {"type": "null"}, {"type": "integer"}]},
+        ),
+        (
+            {"anyOf": [{"type": "string"}, {"type": "null", "description": "d"}]},
+            {"anyOf": [{"type": "string"}, {"type": "null", "description": "d"}]},
+        ),
+        (
+            {"type": "object", "properties": {"p": {"type": "string"}}, "required": ["p"]},
+            {
+                "type": "object",
+                "properties": {"p": {"type": "string"}},
+                "required": ["p"],
+            },
+        ),
+        ({"properties": "not-a-dict"}, {"properties": "not-a-dict"}),
+        ({"items": [{"type": "string"}]}, {"items": [{"type": "string"}]}),
+        ({"anyOf": ["string", {"type": "null"}]}, {"anyOf": ["string", {"type": "null"}]}),
+        ({"type": "object", "unknown_keyword": 1}, {"type": "object"}),
     ],
 )
-def test_deepseek_translation_handles_awkward_shapes(schema: dict[str, Any]) -> None:
+def test_deepseek_translation_handles_awkward_shapes(
+    schema: dict[str, Any], expected: dict[str, Any]
+) -> None:
     translated = translate_schema(schema, "deepseek")
 
-    assert isinstance(translated, dict)
-    # Field names survive even when a pointer cannot be resolved.
-    for key in ("properties", "required"):
-        if key in schema and isinstance(schema[key], dict):
-            assert translated.get(key) is not None
+    assert translated == expected
 
 
 @pytest.mark.parametrize(

@@ -11,7 +11,8 @@ import pytest
 from fastapi.testclient import TestClient
 
 from oft.adapters.llm_deepseek import DeepSeekAdapter
-from oft.adapters.sqlite_store import database_path
+from oft.adapters.llm_openai import OpenAIAdapter
+from oft.adapters.sqlite_store import SqliteStore, database_path
 from oft.api.app import create_app
 from oft.config import Settings
 from oft.ports.llm import ProbeOutcome
@@ -211,6 +212,93 @@ def test_provider_listing_masks_keys_and_shows_the_degraded_chip(
     assert SENTINEL not in after.text
     db_bytes = database_path(settings).read_bytes()
     assert SENTINEL.encode() not in db_bytes
+
+
+def _hostile_probe_adapter() -> Any:
+    body = b"invalid request: \x1b[2J\x1b[1;31mFAKE ALERT\x1b[0m"
+    return OpenAIAdapter(
+        api_key=SENTINEL,
+        base_url="https://api.openai.test",
+        transport=httpx.MockTransport(lambda _request: httpx.Response(400, content=body)),
+    )
+
+
+def test_probe_notes_are_printable_and_capped_in_api_and_store(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setattr("oft.bootstrap.build_llm_adapter", lambda *_: _hostile_probe_adapter())
+    client, settings, auth = _client(tmp_path)
+    try:
+        probed = client.post(
+            "/api/v1/llm/test", json={"provider": "openai", "role": "ANALYSIS"}, headers=auth
+        )
+        listed = client.get("/api/v1/llm/providers", headers=auth)
+    finally:
+        client.close()
+
+    assert probed.status_code == 200, probed.text
+    notes = probed.json()["data"]["notes"]
+    assert notes
+    assert all(character.isprintable() for character in notes)
+    assert len(notes) <= 200
+    assert "\x1b" not in probed.text
+
+    listing = {item["provider"]: item for item in listed.json()["data"]["items"]}
+    listed_notes = listing["openai"]["capability"]["notes"]
+    assert all(character.isprintable() for character in listed_notes)
+    assert "\x1b" not in listed.text
+
+    store = SqliteStore(settings)
+    store.initialize()
+    capability = store.get_provider_capability("openai")
+    assert capability is not None
+    assert all(character.isprintable() for character in capability.notes)
+    assert len(capability.notes) <= 200
+
+
+def test_api_provider_output_never_exposes_a_key_prefix_or_length_marker(
+    tmp_path: Path,
+) -> None:
+    client, _settings_, auth = _client(tmp_path)
+    try:
+        response = client.get("/api/v1/llm/providers", headers=auth)
+    finally:
+        client.close()
+
+    assert response.status_code == 200, response.text
+    text = response.text
+    assert SENTINEL not in text
+    assert SENTINEL[:10] not in text
+    for marker in ("key_preview", "key_prefix", "key_length", "key_len"):
+        assert marker not in text
+
+
+class _SchemaUnsupportedProbeAdapter:
+    def probe(self, *, model: str, role: Any = None) -> ProbeOutcome:
+        return ProbeOutcome(
+            strict_schema=False,
+            notes="the provider cannot enforce the schema",
+            error_code="LLM_SCHEMA_UNSUPPORTED",
+            latency_ms=1,
+        )
+
+
+def test_llm_test_returns_422_for_a_schema_unsupported_probe(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setattr(
+        "oft.bootstrap.build_llm_adapter", lambda *_: _SchemaUnsupportedProbeAdapter()
+    )
+    client, _settings_, auth = _client(tmp_path)
+    try:
+        response = client.post(
+            "/api/v1/llm/test", json={"provider": "openai", "role": "ANALYSIS"}, headers=auth
+        )
+    finally:
+        client.close()
+
+    assert response.status_code == 422, response.text
+    assert response.json()["error"]["code"] == "LLM_SCHEMA_UNSUPPORTED"
 
 
 def test_llm_test_requires_a_key_and_a_role_model(

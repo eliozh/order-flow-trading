@@ -502,9 +502,45 @@ def test_the_call_budget_and_threshold_audit_commit_together(tmp_path: Path) -> 
     assert [call.call_id for call in calls] == ["CALL-ATOMIC"]
     assert len(budgets) == 1
     assert budgets[0].record_id == entry.record.record_id
+    # The persisted row carries the crossed state, not the draft's "OK" (T8).
+    assert entry.record.budget_state == "WARN"
+    assert budgets[0].budget_state == "WARN"
+    assert entry.payload["budget_state"] == "WARN"
     assert stored_call.call_id == "CALL-ATOMIC"
     assert len(events) == 1
     assert events[0]["state"] == "WARN"
+
+
+def test_a_call_crossing_two_periods_emits_one_audit_per_period(tmp_path: Path) -> None:
+    """A day+month crossing on one call is never collapsed to one event (S1)."""
+    store = _store(tmp_path)
+    service = BudgetService(store=store, price_table=_table())
+    # 12.50 crosses the 80% warn line (12.00) for both day and month.
+    service.set_thresholds(daily_usd="15.00", monthly_usd="15.00", updated_at=NOW)
+
+    _stored_call, entry = service.record_billed_call(
+        call=_llm_call("CALL-MULTI", decision_id="DEC-MULTI"),
+        result=_result(),
+        occurred_at=NOW,
+    )
+
+    events = _threshold_events(store)
+    assert sorted(event["period"] for event in events) == ["day", "month"]
+    assert all(event["state"] == "WARN" for event in events)
+    assert {event["period_key"] for event in events} == {"2026-11-09", "2026-11"}
+    assert entry.record.budget_state == "WARN"
+    assert len(store.list_budget_records(decision_id="DEC-MULTI")) == 1
+
+
+def test_a_legacy_call_crossing_two_periods_emits_both_audits(tmp_path: Path) -> None:
+    store = _store(tmp_path)
+    service = BudgetService(store=store, price_table=_table())
+    service.set_thresholds(daily_usd="15.00", monthly_usd="15.00", updated_at=NOW)
+
+    _record(store, service, "CALL-MULTI-LEGACY")
+
+    events = _threshold_events(store)
+    assert sorted(event["period"] for event in events) == ["day", "month"]
 
 
 def test_a_repeated_billed_call_is_fully_recorded_under_a_unique_id(
