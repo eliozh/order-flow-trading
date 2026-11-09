@@ -19,6 +19,7 @@ from typing import TYPE_CHECKING, Any
 
 from apscheduler.schedulers.background import BackgroundScheduler
 from apscheduler.triggers.date import DateTrigger
+from apscheduler.triggers.interval import IntervalTrigger
 
 from oft.domain.time import utc_timestamp
 from oft.ports.clock import ClockPort
@@ -402,3 +403,52 @@ class ScanDaemonScheduler:
             self._job(window)
         finally:
             self._schedule_next()
+
+
+TRIGGER_JOB_ID = "trigger_evaluate"
+
+
+class TriggerDaemonScheduler:
+    """The 15 s interval scheduler; the durable ledger decides whether work runs.
+
+    ``max_instances=1`` and ``coalesce=True`` skip an overlapping tick, and a
+    small misfire grace avoids replaying missed windows. Only the current
+    window is ever claimed by :class:`oft.application.jobs.TriggerJobRunner`.
+    """
+
+    def __init__(
+        self,
+        *,
+        clock: ClockPort,
+        interval_seconds: int,
+        job: Callable[[], Any],
+        timezone: str = "UTC",
+    ) -> None:
+        if interval_seconds <= 0:
+            raise ValueError("interval_seconds must be positive")
+        self._interval_seconds = interval_seconds
+        self._scheduler = BackgroundScheduler(timezone=timezone)
+        self._scheduler.add_job(
+            job,
+            trigger=IntervalTrigger(seconds=interval_seconds, timezone=timezone),
+            id=TRIGGER_JOB_ID,
+            replace_existing=True,
+            max_instances=1,
+            coalesce=True,
+            misfire_grace_time=max(1, min(MISFIRE_GRACE_SECONDS, interval_seconds)),
+        )
+
+    @property
+    def scheduler(self) -> BackgroundScheduler:
+        return self._scheduler
+
+    @property
+    def interval_seconds(self) -> int:
+        return self._interval_seconds
+
+    def start(self) -> None:
+        self._scheduler.start()
+
+    def shutdown(self, *, wait: bool = False) -> None:
+        if self._scheduler.running:
+            self._scheduler.shutdown(wait=wait)

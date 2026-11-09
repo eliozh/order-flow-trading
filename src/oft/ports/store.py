@@ -4,7 +4,7 @@ from __future__ import annotations
 
 from collections.abc import Callable, Sequence
 from dataclasses import dataclass
-from typing import Any, Protocol
+from typing import Any, Literal, Protocol
 
 from oft.domain.data_quality import DataGap
 from oft.domain.prompts import PromptRole, PromptStatus
@@ -415,6 +415,10 @@ class TriggerEventRecord:
     idempotency_key: str
     triggered_at: str
     payload_json: str
+    snapshot_hash: str = ""
+    as_of: str = ""
+    data_quality: str = ""
+    condition_count: int = 0
 
 
 @dataclass(frozen=True)
@@ -860,6 +864,25 @@ class StorePort(Protocol):
 
     def save_trigger_event(self, record: TriggerEventRecord) -> bool: ...
 
+    def save_trigger_and_transition(
+        self,
+        record: TriggerEventRecord,
+        opportunity: OpportunityRecord,
+        event: OpportunityEventRecord,
+    ) -> Literal["inserted", "existing", "conflict"]:
+        """Insert a trigger and move its opportunity to TRIGGERED atomically.
+
+        One ``BEGIN IMMEDIATE`` transaction inserts the trigger
+        (``ON CONFLICT(idempotency_key) DO NOTHING``) and, when the insert
+        happened, applies the ``OPEN -> TRIGGERED`` guard plus the history
+        event. A failed guard rolls the trigger insert back and returns
+        ``conflict``. When the trigger already exists, an opportunity that is
+        still ``OPEN`` is transitioned idempotently in the same transaction
+        (``existing``); an already ``TRIGGERED`` opportunity is ``existing``;
+        any other state is ``conflict``.
+        """
+        ...
+
     def update_trigger_event(self, record: TriggerEventRecord) -> bool: ...
 
     def get_trigger_event(self, trigger_id: str) -> TriggerEventRecord | None: ...
@@ -867,10 +890,17 @@ class StorePort(Protocol):
     def get_trigger_by_idempotency(self, idempotency_key: str) -> TriggerEventRecord | None: ...
 
     def list_trigger_events(
-        self, *, opportunity_id: str | None = None, limit: int = 100, offset: int = 0
+        self,
+        *,
+        opportunity_id: str | None = None,
+        status: str | None = None,
+        limit: int = 100,
+        offset: int = 0,
     ) -> tuple[TriggerEventRecord, ...]: ...
 
-    def count_trigger_events(self, *, opportunity_id: str | None = None) -> int: ...
+    def count_trigger_events(
+        self, *, opportunity_id: str | None = None, status: str | None = None
+    ) -> int: ...
 
     def save_risk_verdict(self, record: RiskVerdictRecord) -> None: ...
 

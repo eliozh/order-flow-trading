@@ -32,6 +32,9 @@ def trigger_list(
     opportunity_id: Annotated[
         str | None, typer.Option("--opportunity", help="Filter to one opportunity.")
     ] = None,
+    status: Annotated[
+        str | None, typer.Option("--status", help="Filter by trigger status.")
+    ] = None,
     limit: Annotated[int, typer.Option("--limit", help="Rows to show.")] = 100,
     json_output: Annotated[bool, typer.Option("--json", help="Emit JSON.")] = False,
 ) -> None:
@@ -39,7 +42,9 @@ def trigger_list(
     settings = _settings_or_exit(json_output)
     try:
         envelope = ApiClient.from_settings(settings).list_triggers(
-            opportunity_id=opportunity_id, limit=limit
+            opportunity_id=opportunity_id,
+            status=status,
+            limit=limit,
         )
     except ApiClientError as exc:
         emit_error(exc.code, exc.message, json_output=json_output)
@@ -104,7 +109,11 @@ def trigger_show(
 
 @trigger_app.command("evaluate")
 def trigger_evaluate(
-    opportunity_id: str,
+    opportunity_id: Annotated[str | None, typer.Argument(help="Opportunity to evaluate.")] = None,
+    evaluate_all: Annotated[
+        bool,
+        typer.Option("--all", help="Evaluate every OPEN opportunity (the job path)."),
+    ] = False,
     price: Annotated[
         str | None, typer.Option("--price", help="Override the snapshot reference price.")
     ] = None,
@@ -116,8 +125,51 @@ def trigger_evaluate(
     ] = None,
     json_output: Annotated[bool, typer.Option("--json", help="Emit JSON.")] = False,
 ) -> None:
-    """Evaluate PRICE_TOUCH_ZONE for one opportunity; only code can trigger."""
+    """Evaluate one opportunity's conditions, or every OPEN opportunity with --all.
+
+    Only code can trigger; the evaluator is the same one the 15 s job uses.
+    """
     settings = _settings_or_exit(json_output)
+    client = ApiClient.from_settings(settings)
+    if evaluate_all and (price is not None or as_of is not None or snapshot_id is not None):
+        emit_error(
+            "VALIDATION_FAILED",
+            "--all cannot be combined with --price, --as-of, or --snapshot-id",
+            json_output=json_output,
+        )
+        raise typer.Exit(code=exit_code_for("VALIDATION_FAILED"))
+    if evaluate_all:
+        try:
+            envelope = client.evaluate_all_triggers(idempotency_key=f"cli-all-{uuid.uuid4().hex}")
+        except ApiClientError as exc:
+            emit_error(exc.code, exc.message, json_output=json_output)
+            raise typer.Exit(code=exit_code_for(exc.code)) from exc
+        if json_output:
+            typer.echo(json.dumps(envelope, indent=2))
+            return
+        data = envelope.get("data") or {}
+        counts_line = (
+            "TRIGGER EVALUATE"
+            f" open={data.get('open', 0)}"
+            f" evaluated={data.get('evaluated', 0)}"
+            f" triggered={data.get('triggered', 0)}"
+            f" skipped={data.get('skipped', 0)}"
+            f" stale={data.get('stale', 0)}"
+            f" unavailable={data.get('unavailable', 0)}"
+        )
+        if data.get("open_total") and int(data["open_total"]) != int(data.get("open", 0)):
+            counts_line += f" open_total={data['open_total']}"
+        typer.echo(counts_line)
+        if data.get("trigger_ids"):
+            typer.echo("triggers " + " ".join(str(item) for item in data["trigger_ids"]))
+        return
+    if opportunity_id is None:
+        emit_error(
+            "VALIDATION_FAILED",
+            "opportunity_id is required unless --all is used",
+            json_output=json_output,
+        )
+        raise typer.Exit(code=exit_code_for("VALIDATION_FAILED"))
     payload: dict[str, Any] = {"opportunity_id": opportunity_id}
     if price is not None:
         payload["price"] = price
@@ -126,9 +178,7 @@ def trigger_evaluate(
     if snapshot_id is not None:
         payload["snapshot_id"] = snapshot_id
     try:
-        envelope = ApiClient.from_settings(settings).evaluate_trigger(
-            payload, idempotency_key=f"cli-{uuid.uuid4().hex}"
-        )
+        envelope = client.evaluate_trigger(payload, idempotency_key=f"cli-{uuid.uuid4().hex}")
     except ApiClientError as exc:
         emit_error(exc.code, exc.message, json_output=json_output)
         raise typer.Exit(code=exit_code_for(exc.code)) from exc

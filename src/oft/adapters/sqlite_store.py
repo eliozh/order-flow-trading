@@ -10,6 +10,7 @@ import json
 import logging
 import os
 import sqlite3
+import time
 import uuid
 from collections.abc import Callable, Sequence
 from contextlib import closing
@@ -17,7 +18,7 @@ from dataclasses import replace
 from datetime import UTC, date, datetime, timedelta
 from decimal import ROUND_DOWN, ROUND_HALF_UP, Decimal, InvalidOperation
 from pathlib import Path
-from typing import Any
+from typing import Any, Literal
 
 from oft.config import Settings
 from oft.domain.audit import build_audit_entry
@@ -83,7 +84,13 @@ def _zero_budget_totals() -> dict[str, dict[str, Any]]:
     }
 
 
-_SCHEMA_VERSION = 18
+_SCHEMA_VERSION = 19
+_BUSY_TIMEOUT_MS = 5000
+# ``PRAGMA journal_mode=WAL`` needs an exclusive lock and does not reliably
+# consult the busy handler, so a concurrent initializer can still see
+# SQLITE_BUSY with the timeout installed. Retry the switch briefly.
+_WAL_SWITCH_ATTEMPTS = 5
+_WAL_SWITCH_BACKOFF_SECONDS = 0.05
 STALE_RUNNING_SECONDS = 15 * 60
 _BACKFILL_RUN_STATUSES = ("RUNNING", "COMPLETE", "PARTIAL", "FAILED", "BLOCKED", "STALE")
 _BACKFILL_RUNS_DEFINITION = """
@@ -503,10 +510,16 @@ _SCHEMA_SQL = f"""
         status TEXT NOT NULL,
         idempotency_key TEXT NOT NULL UNIQUE,
         triggered_at TEXT NOT NULL,
-        payload_json TEXT NOT NULL
+        payload_json TEXT NOT NULL,
+        snapshot_hash TEXT NOT NULL DEFAULT '',
+        as_of TEXT NOT NULL DEFAULT '',
+        data_quality TEXT NOT NULL DEFAULT '',
+        condition_count INTEGER NOT NULL DEFAULT 0
     );
     CREATE INDEX IF NOT EXISTS trigger_events_opportunity
         ON trigger_events(opportunity_id);
+    CREATE INDEX IF NOT EXISTS trigger_events_opportunity_triggered
+        ON trigger_events(opportunity_id, triggered_at);
     CREATE TABLE IF NOT EXISTS risk_verdicts (
         risk_verdict_id TEXT PRIMARY KEY,
         trigger_id TEXT NOT NULL REFERENCES trigger_events(trigger_id),
@@ -639,6 +652,21 @@ def _schema_version(connection: sqlite3.Connection) -> int:
         return 0
     row = connection.execute("SELECT MAX(version) FROM schema_migrations").fetchone()
     return int(row[0]) if row is not None and row[0] is not None else 0
+
+
+def _migration_recorded(connection: sqlite3.Connection, version: int) -> bool:
+    """Whether one specific migration version row exists.
+
+    ``MAX(version)`` alone is insufficient: a repair test (or an operator
+    recovery) can remove one version while newer rows remain. Each idempotent
+    backfill is re-run when its own version row is absent.
+    """
+    if not _table_exists(connection, "schema_migrations"):
+        return False
+    row = connection.execute(
+        "SELECT 1 FROM schema_migrations WHERE version = ?", (version,)
+    ).fetchone()
+    return row is not None
 
 
 def _migrate_symbols_v2(connection: sqlite3.Connection) -> None:
@@ -1102,6 +1130,12 @@ _BUDGET_LEDGER_ADDITIONS = (
     ("period_month", "TEXT NOT NULL DEFAULT ''"),
     ("role", "TEXT NOT NULL DEFAULT ''"),
 )
+_TRIGGER_EVENT_ADDITIONS = (
+    ("snapshot_hash", "TEXT NOT NULL DEFAULT ''"),
+    ("as_of", "TEXT NOT NULL DEFAULT ''"),
+    ("data_quality", "TEXT NOT NULL DEFAULT ''"),
+    ("condition_count", "INTEGER NOT NULL DEFAULT 0"),
+)
 
 
 def _period_parts(occurred_at: str) -> tuple[str, str, str]:
@@ -1359,14 +1393,28 @@ def _backfill_opportunity_conditions(connection: sqlite3.Connection) -> None:
             )
             continue
         for condition_row in condition_rows:
+            # Re-running the backfill (an operator repair deletes the v18
+            # version row) must not wipe evaluation state recorded since the
+            # row was created. Update only the static contract columns and
+            # keep ``last_value/last_evaluated_at/last_result`` untouched.
             connection.execute(
                 """
-                INSERT OR REPLACE INTO opportunity_conditions (
+                INSERT INTO opportunity_conditions (
                     condition_id, opportunity_id, kind, seq, type,
                     params_json, window_start, window_end, required_data_json,
                     evaluable, unavailable_reason, last_value,
                     last_evaluated_at, last_result
                 ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                ON CONFLICT(opportunity_id, condition_id) DO UPDATE SET
+                    kind = excluded.kind,
+                    seq = excluded.seq,
+                    type = excluded.type,
+                    params_json = excluded.params_json,
+                    window_start = excluded.window_start,
+                    window_end = excluded.window_end,
+                    required_data_json = excluded.required_data_json,
+                    evaluable = excluded.evaluable,
+                    unavailable_reason = excluded.unavailable_reason
                 """,
                 condition_row,
             )
@@ -1379,6 +1427,68 @@ def _migrate_v18(connection: sqlite3.Connection) -> None:
     connection.executescript(_OPPORTUNITY_CONDITIONS_DDL)
     with connection:
         _backfill_opportunity_conditions(connection)
+
+
+def _migrate_v19(connection: sqlite3.Connection) -> None:
+    """Add trigger snapshot provenance columns and backfill from payloads (v19).
+
+    The four columns make the trigger row queryable without parsing JSON. A
+    malformed payload is skipped with a log and keeps the column defaults; it
+    never aborts boot. Add-columns and the backfill run under one
+    ``BEGIN IMMEDIATE`` transaction, so two concurrent ``initialize_database``
+    calls during a v18 -> v19 upgrade cannot both observe the column missing
+    and raise ``duplicate column name``: the loser waits for the write lock and
+    then re-reads ``PRAGMA table_info`` inside its own transaction.
+    """
+    if not _table_exists(connection, "trigger_events"):
+        return
+    if connection.in_transaction:
+        connection.commit()
+    connection.execute("BEGIN IMMEDIATE")
+    try:
+        _add_missing_columns(connection, "trigger_events", _TRIGGER_EVENT_ADDITIONS)
+        rows = connection.execute(
+            "SELECT trigger_id, payload_json FROM trigger_events "
+            "WHERE snapshot_hash = '' OR as_of = ''"
+        ).fetchall()
+        for row in rows:
+            trigger_id = str(row[0])
+            try:
+                payload = json.loads(str(row[1]))
+                if not isinstance(payload, dict):
+                    raise ValueError("payload is not an object")
+                snapshot = payload.get("snapshot")
+                if not isinstance(snapshot, dict):
+                    raise ValueError("snapshot is not an object")
+                results = payload.get("condition_results")
+                condition_count = len(results) if isinstance(results, list) else 0
+                snapshot_hash = snapshot.get("snapshot_hash")
+                as_of = snapshot.get("as_of")
+                data_quality = snapshot.get("data_quality")
+                connection.execute(
+                    """
+                    UPDATE trigger_events
+                    SET snapshot_hash = ?, as_of = ?, data_quality = ?,
+                        condition_count = ?
+                    WHERE trigger_id = ?
+                    """,
+                    (
+                        snapshot_hash if isinstance(snapshot_hash, str) else "",
+                        as_of if isinstance(as_of, str) else "",
+                        data_quality if isinstance(data_quality, str) else "",
+                        condition_count,
+                        trigger_id,
+                    ),
+                )
+            except (json.JSONDecodeError, TypeError, ValueError) as exc:
+                _LOGGER.warning(
+                    "trigger_event_backfill_skipped",
+                    extra={"trigger_id": trigger_id, "error": str(exc)},
+                )
+        connection.execute("COMMIT")
+    except Exception:
+        connection.execute("ROLLBACK")
+        raise
 
 
 def _opportunity_conditions_pk(
@@ -1400,6 +1510,12 @@ def _rebuild_opportunity_conditions(connection: sqlite3.Connection) -> None:
         connection.commit()
     connection.execute("BEGIN IMMEDIATE")
     try:
+        # Re-check under the write lock: a concurrent initializer may have
+        # already performed this rebuild after the unlocked check that led
+        # here, in which case rebuilding again would be wasted work.
+        if _opportunity_conditions_pk(connection) == ("opportunity_id", "condition_id"):
+            connection.execute("COMMIT")
+            return
         for index_name in _OPPORTUNITY_CONDITION_INDEX_NAMES:
             connection.execute(f"DROP INDEX IF EXISTS {index_name}")
         connection.execute(
@@ -1453,10 +1569,15 @@ def _ensure_opportunities_expires_at(connection: sqlite3.Connection) -> None:
     """
     if not _table_exists(connection, "opportunities"):
         return
-    columns = {row[1] for row in connection.execute("PRAGMA table_info(opportunities)")}
-    # ``with connection`` commits (or rolls back) the backfill before the
-    # composite-PK rebuild runs; never leave an implicit transaction open.
+    if connection.in_transaction:
+        connection.commit()
+    # Acquire the write lock before re-reading the table shape: a concurrent
+    # initializer may add ``expires_at`` between an unlocked check and the
+    # ALTER, which would otherwise raise "duplicate column name". The context
+    # manager commits (or rolls back) the ALTER and the backfill together.
+    connection.execute("BEGIN IMMEDIATE")
     with connection:
+        columns = {row[1] for row in connection.execute("PRAGMA table_info(opportunities)")}
         if "expires_at" not in columns:
             connection.execute("ALTER TABLE opportunities ADD COLUMN expires_at TEXT")
         rows = connection.execute(
@@ -1516,6 +1637,28 @@ def _ensure_opportunities_expires_at(connection: sqlite3.Connection) -> None:
                 )
 
 
+def _enable_wal(connection: sqlite3.Connection) -> None:
+    """Switch the connection's database to WAL, tolerating a concurrent boot.
+
+    ``PRAGMA journal_mode=WAL`` takes an exclusive lock and, unlike ordinary
+    writes, can return ``SQLITE_BUSY`` without invoking the busy handler even
+    after ``busy_timeout`` is set. A short bounded retry lets the other
+    initializer finish its switch instead of failing with ``database is
+    locked``. Any other ``OperationalError`` propagates unchanged.
+    """
+    for attempt in range(1, _WAL_SWITCH_ATTEMPTS + 1):
+        try:
+            connection.execute("PRAGMA journal_mode=WAL")
+            return
+        except sqlite3.OperationalError as exc:
+            message = str(exc).lower()
+            if "locked" not in message and "busy" not in message:
+                raise
+            if attempt == _WAL_SWITCH_ATTEMPTS:
+                raise
+            time.sleep(_WAL_SWITCH_BACKOFF_SECONDS * attempt)
+
+
 def initialize_database(settings: Settings) -> None:
     """Create the data directory and the walking-skeleton schema."""
     settings.data_dir.mkdir(parents=True, exist_ok=True)
@@ -1523,10 +1666,15 @@ def initialize_database(settings: Settings) -> None:
     db_path = database_path(settings)
     connection = sqlite3.connect(db_path)
     try:
-        connection.execute("PRAGMA journal_mode=WAL")
+        # Install the busy handler *before* any lock-taking pragma. The WAL
+        # switch needs an exclusive lock; configuring it first let a
+        # concurrent initializer fail with SQLITE_BUSY before the handler
+        # existed. ``_enable_wal`` additionally retries the switch, because
+        # that pragma does not always consult the handler.
+        connection.execute(f"PRAGMA busy_timeout={_BUSY_TIMEOUT_MS}")
         connection.execute("PRAGMA foreign_keys=ON")
-        connection.execute("PRAGMA busy_timeout=5000")
         connection.execute("PRAGMA synchronous=NORMAL")
+        _enable_wal(connection)
         _ensure_opportunities_expires_at(connection)
         if _schema_version(connection) < 2 and _table_exists(connection, "symbols"):
             _migrate_symbols_v2(connection)
@@ -1564,11 +1712,19 @@ def initialize_database(settings: Settings) -> None:
             _migrate_prompts_v16(connection)
         if _schema_version(connection) < 17:
             _migrate_v17(connection)
-        if _schema_version(connection) < 18:
+        if _schema_version(connection) < 18 or not _migration_recorded(connection, 18):
             _migrate_v18(connection)
+        if _schema_version(connection) < 19 or not _migration_recorded(connection, 19):
+            _migrate_v19(connection)
         _ensure_opportunity_conditions_shape(connection)
         with connection:
-            connection.executescript(_SCHEMA_SQL)
+            # ``_SCHEMA_SQL`` drops and recreates the immutability trigger, a
+            # check-then-DDL pair. Run the whole batch inside one write
+            # transaction so concurrent initializers cannot interleave the
+            # DROP and the CREATE and observe "trigger ... already exists"
+            # (or race any other DDL). ``executescript`` commits any pending
+            # transaction first, hence BEGIN/COMMIT live inside the script.
+            connection.executescript(f"BEGIN IMMEDIATE;\n{_SCHEMA_SQL}\nCOMMIT;")
             connection.execute(
                 "INSERT OR IGNORE INTO schema_migrations (version, applied_at) VALUES (?, ?)",
                 (1, "2026-11-06T00:00:00.000Z"),
@@ -1636,6 +1792,10 @@ def initialize_database(settings: Settings) -> None:
             connection.execute(
                 "INSERT OR IGNORE INTO schema_migrations (version, applied_at) VALUES (?, ?)",
                 (17, "2026-11-09T00:00:00.000Z"),
+            )
+            connection.execute(
+                "INSERT OR IGNORE INTO schema_migrations (version, applied_at) VALUES (?, ?)",
+                (18, "2026-11-09T06:00:00.000Z"),
             )
             connection.execute(
                 "INSERT OR IGNORE INTO schema_migrations (version, applied_at) VALUES (?, ?)",
@@ -1910,8 +2070,8 @@ class SqliteStore:
         settings.data_dir.mkdir(parents=True, exist_ok=True)
         connection = sqlite3.connect(self._path)
         connection.row_factory = sqlite3.Row
+        connection.execute(f"PRAGMA busy_timeout={_BUSY_TIMEOUT_MS}")
         connection.execute("PRAGMA foreign_keys=ON")
-        connection.execute("PRAGMA busy_timeout=5000")
         return connection
 
     def _connect_read_only(self) -> sqlite3.Connection | None:
@@ -1919,7 +2079,7 @@ class SqliteStore:
             return None
         connection = sqlite3.connect(f"file:{self._path}?mode=ro", uri=True)
         connection.row_factory = sqlite3.Row
-        connection.execute("PRAGMA busy_timeout=5000")
+        connection.execute(f"PRAGMA busy_timeout={_BUSY_TIMEOUT_MS}")
         return connection
 
     def save_scan(self, record: ScanRecord) -> None:
@@ -4246,9 +4406,22 @@ class SqliteStore:
     def transition_opportunity(
         self, record: OpportunityRecord, event: OpportunityEventRecord
     ) -> bool:
-        # The domain ``_ALLOWED_TRANSITIONS`` map is the single authority; this
-        # guard is derived from it so a future transition change can never
-        # drift from the SQL condition. The UPDATE is one atomic statement.
+        with closing(self._connect()) as connection, connection:
+            return self._apply_transition(connection, record, event)
+
+    def _apply_transition(
+        self,
+        connection: sqlite3.Connection,
+        record: OpportunityRecord,
+        event: OpportunityEventRecord,
+    ) -> bool:
+        """Apply the domain ``_ALLOWED_TRANSITIONS`` guard and history event.
+
+        The guard is derived from the domain map so a future transition change
+        can never drift from the SQL condition. Callers own the transaction;
+        this returns ``False`` when the current stored state is not a legal
+        source state (the UPDATE matched no row).
+        """
         try:
             target = OpportunityState(record.state)
         except ValueError:
@@ -4263,38 +4436,37 @@ class SqliteStore:
         if not allowed_from:
             return False
         placeholders = ", ".join("?" for _ in allowed_from)
-        with closing(self._connect()) as connection, connection:
-            cursor = connection.execute(
-                f"""
-                UPDATE opportunities SET state = ?, updated_at = ?, payload_json = ?
-                WHERE opportunity_id = ? AND state IN ({placeholders})
-                """,
-                (
-                    record.state,
-                    record.updated_at,
-                    record.payload_json,
-                    record.opportunity_id,
-                    *allowed_from,
-                ),
-            )
-            if cursor.rowcount == 0:
-                return False
-            connection.execute(
-                """
-                INSERT INTO opportunity_events (
-                    opportunity_id, seq, at, from_state, to_state, reason_code, note
-                ) VALUES (?, ?, ?, ?, ?, ?, ?)
-                """,
-                (
-                    event.opportunity_id,
-                    event.seq,
-                    event.at,
-                    event.from_state,
-                    event.to_state,
-                    event.reason_code,
-                    event.note,
-                ),
-            )
+        cursor = connection.execute(
+            f"""
+            UPDATE opportunities SET state = ?, updated_at = ?, payload_json = ?
+            WHERE opportunity_id = ? AND state IN ({placeholders})
+            """,
+            (
+                record.state,
+                record.updated_at,
+                record.payload_json,
+                record.opportunity_id,
+                *allowed_from,
+            ),
+        )
+        if cursor.rowcount == 0:
+            return False
+        connection.execute(
+            """
+            INSERT INTO opportunity_events (
+                opportunity_id, seq, at, from_state, to_state, reason_code, note
+            ) VALUES (?, ?, ?, ?, ?, ?, ?)
+            """,
+            (
+                event.opportunity_id,
+                event.seq,
+                event.at,
+                event.from_state,
+                event.to_state,
+                event.reason_code,
+                event.note,
+            ),
+        )
         return True
 
     def get_opportunity(self, opportunity_id: str) -> OpportunityRecord | None:
@@ -4445,10 +4617,12 @@ class SqliteStore:
         with closing(self._connect()) as connection, connection:
             cursor = connection.execute(
                 """
-                INSERT OR IGNORE INTO trigger_events (
+                INSERT INTO trigger_events (
                     trigger_id, opportunity_id, symbol, status, idempotency_key,
-                    triggered_at, payload_json
-                ) VALUES (?, ?, ?, ?, ?, ?, ?)
+                    triggered_at, payload_json, snapshot_hash, as_of,
+                    data_quality, condition_count
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                ON CONFLICT(idempotency_key) DO NOTHING
                 """,
                 (
                     record.trigger_id,
@@ -4458,9 +4632,99 @@ class SqliteStore:
                     record.idempotency_key,
                     record.triggered_at,
                     record.payload_json,
+                    record.snapshot_hash,
+                    record.as_of,
+                    record.data_quality,
+                    record.condition_count,
                 ),
             )
         return cursor.rowcount == 1
+
+    def save_trigger_and_transition(
+        self,
+        record: TriggerEventRecord,
+        opportunity: OpportunityRecord,
+        event: OpportunityEventRecord,
+    ) -> Literal["inserted", "existing", "conflict"]:
+        connection = self._connect()
+        try:
+            if connection.in_transaction:
+                connection.commit()
+            connection.execute("BEGIN IMMEDIATE")
+            cursor = connection.execute(
+                """
+                INSERT INTO trigger_events (
+                    trigger_id, opportunity_id, symbol, status, idempotency_key,
+                    triggered_at, payload_json, snapshot_hash, as_of,
+                    data_quality, condition_count
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                ON CONFLICT(idempotency_key) DO NOTHING
+                """,
+                (
+                    record.trigger_id,
+                    record.opportunity_id,
+                    record.symbol,
+                    record.status,
+                    record.idempotency_key,
+                    record.triggered_at,
+                    record.payload_json,
+                    record.snapshot_hash,
+                    record.as_of,
+                    record.data_quality,
+                    record.condition_count,
+                ),
+            )
+            inserted = cursor.rowcount == 1
+            stored = connection.execute(
+                "SELECT state FROM opportunities WHERE opportunity_id = ?",
+                (opportunity.opportunity_id,),
+            ).fetchone()
+            if stored is None:
+                connection.execute("ROLLBACK")
+                return "conflict"
+            state = str(stored["state"])
+            if inserted:
+                if not self._apply_transition(connection, opportunity, event):
+                    # The opportunity left OPEN between the service read and
+                    # this transaction: never leave an orphan trigger row.
+                    connection.execute("ROLLBACK")
+                    return "conflict"
+                connection.execute("COMMIT")
+                return "inserted"
+            existing = connection.execute(
+                "SELECT 1 FROM trigger_events WHERE idempotency_key = ?",
+                (record.idempotency_key,),
+            ).fetchone()
+            if existing is None:
+                # The only conflict target is the idempotency key, so this is
+                # an unexpected constraint outcome: never report a phantom row.
+                connection.execute("ROLLBACK")
+                _LOGGER.warning(
+                    "trigger_insert_missing_duplicate",
+                    extra={
+                        "trigger_id": record.trigger_id,
+                        "idempotency_key": record.idempotency_key,
+                    },
+                )
+                return "conflict"
+            if state == "TRIGGERED":
+                connection.execute("COMMIT")
+                return "existing"
+            if state == "OPEN":
+                # Crash replay: the trigger committed but the transition did
+                # not. Complete the OPEN -> TRIGGERED move idempotently.
+                if not self._apply_transition(connection, opportunity, event):
+                    connection.execute("ROLLBACK")
+                    return "conflict"
+                connection.execute("COMMIT")
+                return "existing"
+            connection.execute("ROLLBACK")
+            return "conflict"
+        except BaseException:
+            connection.rollback()
+            raise
+        finally:
+            connection.close()
 
     def update_trigger_event(self, record: TriggerEventRecord) -> bool:
         with closing(self._connect()) as connection, connection:
@@ -4498,38 +4762,55 @@ class SqliteStore:
         return _row_to_trigger_event(row) if row is not None else None
 
     def list_trigger_events(
-        self, *, opportunity_id: str | None = None, limit: int = 100, offset: int = 0
+        self,
+        *,
+        opportunity_id: str | None = None,
+        status: str | None = None,
+        limit: int = 100,
+        offset: int = 0,
     ) -> tuple[TriggerEventRecord, ...]:
         connection = self._connect_read_only()
         if connection is None:
             return ()
-        if opportunity_id is None:
-            query = "SELECT * FROM trigger_events ORDER BY triggered_at DESC LIMIT ? OFFSET ?"
-            params: tuple[object, ...] = (limit, offset)
-        else:
-            query = (
-                "SELECT * FROM trigger_events WHERE opportunity_id = ? "
-                "ORDER BY triggered_at DESC LIMIT ? OFFSET ?"
-            )
-            params = (opportunity_id, limit, offset)
+        clauses: list[str] = []
+        params: list[object] = []
+        if opportunity_id is not None:
+            clauses.append("opportunity_id = ?")
+            params.append(opportunity_id)
+        if status is not None:
+            clauses.append("status = ?")
+            params.append(status)
+        where = f" WHERE {' AND '.join(clauses)}" if clauses else ""
+        query = (
+            f"SELECT * FROM trigger_events{where} "
+            "ORDER BY triggered_at DESC, trigger_id DESC LIMIT ? OFFSET ?"
+        )
+        params.extend((limit, offset))
         try:
-            rows = connection.execute(query, params).fetchall()
+            rows = connection.execute(query, tuple(params)).fetchall()
         finally:
             connection.close()
         return tuple(_row_to_trigger_event(row) for row in rows)
 
-    def count_trigger_events(self, *, opportunity_id: str | None = None) -> int:
+    def count_trigger_events(
+        self, *, opportunity_id: str | None = None, status: str | None = None
+    ) -> int:
         connection = self._connect_read_only()
         if connection is None:
             return 0
+        clauses: list[str] = []
+        params: list[object] = []
+        if opportunity_id is not None:
+            clauses.append("opportunity_id = ?")
+            params.append(opportunity_id)
+        if status is not None:
+            clauses.append("status = ?")
+            params.append(status)
+        where = f" WHERE {' AND '.join(clauses)}" if clauses else ""
         try:
-            if opportunity_id is None:
-                row = connection.execute("SELECT COUNT(*) AS total FROM trigger_events").fetchone()
-            else:
-                row = connection.execute(
-                    "SELECT COUNT(*) AS total FROM trigger_events WHERE opportunity_id = ?",
-                    (opportunity_id,),
-                ).fetchone()
+            row = connection.execute(
+                f"SELECT COUNT(*) AS total FROM trigger_events{where}", tuple(params)
+            ).fetchone()
         finally:
             connection.close()
         return int(row["total"]) if row is not None else 0
@@ -5156,6 +5437,10 @@ def _row_to_trigger_event(row: sqlite3.Row) -> TriggerEventRecord:
         idempotency_key=row["idempotency_key"],
         triggered_at=row["triggered_at"],
         payload_json=row["payload_json"],
+        snapshot_hash=row["snapshot_hash"],
+        as_of=row["as_of"],
+        data_quality=row["data_quality"],
+        condition_count=int(row["condition_count"]),
     )
 
 
