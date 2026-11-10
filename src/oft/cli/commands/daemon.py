@@ -9,18 +9,27 @@ from datetime import datetime
 from pathlib import Path
 from typing import Annotated, Any
 
+import structlog
 import typer
 
 from oft.api.envelope import new_request_id, success_envelope
-from oft.application.jobs import JobLedger, ScheduledScanRunner
+from oft.application.jobs import (
+    TRIGGER_JOB_TYPE,
+    JobLedger,
+    ScheduledScanRunner,
+    TriggerJobRunner,
+)
 from oft.application.scheduler import (
     ScanDaemonScheduler,
     ScheduleState,
+    TriggerDaemonScheduler,
     resolve_schedule_settings,
 )
 from oft.cli.commands.doctor import emit_error
 from oft.config import ConfigError, Settings, load_settings
 from oft.domain.time import utc_timestamp
+
+_LOGGER = structlog.get_logger(__name__)
 
 daemon_app = typer.Typer(
     help="Daemon lifecycle (local API/UI, live ingestion, and the scan scheduler).",
@@ -191,7 +200,7 @@ def daemon_start(
         ),
     ] = None,
 ) -> None:
-    """Start the daemon, live ingestion, and the UTC scan scheduler."""
+    """Start the daemon, live ingestion, and the UTC scan and trigger schedulers."""
     # Imported lazily: ``main`` imports this module to register the command tree.
     from oft.cli.main import _resolve_serve_settings, _run_live_ingestion, _run_uvicorn
 
@@ -210,9 +219,11 @@ def daemon_start(
     container = build_container(settings, initialize=True)
     _run_live_ingestion(settings, replay_file, symbols, container=container)
     scheduler = _start_scheduler(settings, state, container=container)
+    trigger_scheduler = _start_trigger_scheduler(settings, container=container)
     try:
         _run_uvicorn(settings)
     finally:
+        trigger_scheduler.shutdown()
         scheduler.shutdown()
         pid_path(settings).unlink(missing_ok=True)
 
@@ -254,6 +265,47 @@ def _start_scheduler(
     write_pid(settings)
     if settings.env != "test":
         _catch_up_on_start(resolved, state)
+    scheduler.start()
+    return scheduler
+
+
+def _start_trigger_scheduler(
+    settings: Settings,
+    *,
+    container: Any,
+) -> TriggerDaemonScheduler:
+    """Start the separate interval scheduler for trigger evaluation.
+
+    The scan and trigger cadences are independent (ADR-0007). The runner claims
+    only the current interval window in the durable ledger, so an overlapping
+    tick or a restart never replays missed windows.
+    """
+    from oft.application.trigger_service import TriggerService
+
+    # A killed process can leave a trigger tick RUNNING forever; the runner
+    # only ever claims the current window, so repair expired leases at start.
+    reaped = container.store.fail_stale_job_runs(
+        job_type=TRIGGER_JOB_TYPE,
+        now=utc_timestamp(container.clock.now()),
+    )
+    if reaped:
+        _LOGGER.warning("trigger_stale_runs_reaped", count=reaped)
+    ledger = JobLedger(store=container.store, clock=container.clock)
+    service = TriggerService(
+        store=container.store,
+        clock=container.clock,
+        stale_after_seconds=settings.trigger_stale_after_seconds,
+    )
+    runner = TriggerJobRunner(
+        service=service,
+        ledger=ledger,
+        clock=container.clock,
+        interval_seconds=settings.trigger_interval_seconds,
+    )
+    scheduler = TriggerDaemonScheduler(
+        interval_seconds=settings.trigger_interval_seconds,
+        job=runner.run_tick,
+    )
     scheduler.start()
     return scheduler
 

@@ -2,7 +2,11 @@
 
 from __future__ import annotations
 
+import json
+import logging
 import sqlite3
+import threading
+from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 
 import pytest
@@ -81,7 +85,7 @@ def test_v1_database_upgrades_to_v2_with_effective_checks(tmp_path: Path) -> Non
     finally:
         connection.close()
 
-    assert versions == {1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18}
+    assert versions == {1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19}
 
 
 _V2_BACKFILL = """
@@ -139,7 +143,7 @@ def test_v2_database_gains_the_backfill_heartbeat_column(tmp_path: Path) -> None
 
     assert "updated_at" in columns
     assert updated_at == "2026-11-06T00:00:00.000Z"
-    assert versions == {1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18}
+    assert versions == {1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19}
 
 
 def test_v5_checks_indexes_and_foreign_keys(tmp_path: Path) -> None:
@@ -236,7 +240,7 @@ def test_v5_database_migrates_manifest_metrics_columns(tmp_path: Path) -> None:
 
     assert {"metric_version", "input_manifest_hash", "window_start", "window_end"} <= columns
     assert legacy == ("/tmp/legacy.parquet", None, None)
-    assert versions == {1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18}
+    assert versions == {1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19}
 
 
 def test_v6_database_migrates_starred_columns(tmp_path: Path) -> None:
@@ -295,7 +299,7 @@ def test_v6_database_migrates_starred_columns(tmp_path: Path) -> None:
 
     assert {"starred", "starred_at"} <= columns
     assert row == ("BTCUSDT", 0, None)
-    assert versions == {1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18}
+    assert versions == {1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19}
 
 
 def test_manifest_run_metadata_columns_are_added_idempotently(tmp_path: Path) -> None:
@@ -312,7 +316,7 @@ def test_manifest_run_metadata_columns_are_added_idempotently(tmp_path: Path) ->
         connection.close()
 
     assert {"run_id", "last_n", "recomputed_from", "parent_run_id"} <= columns
-    assert versions == {1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18}
+    assert versions == {1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19}
 
 
 _V12_JOB_RUNS = """
@@ -378,7 +382,7 @@ def test_v12_database_gains_the_job_run_scope_symbol_column(tmp_path: Path) -> N
 
     assert "symbol" in columns
     assert symbol is None  # pre-v13 batch rows keep a null (batch) scope
-    assert versions == {1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18}
+    assert versions == {1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19}
 
 
 _V13_JOB_RUNS = """
@@ -629,7 +633,7 @@ def test_v9_database_upgrades_to_v10_with_ledgers_and_indexes(tmp_path: Path) ->
     finally:
         connection.close()
 
-    assert versions == {1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18}
+    assert versions == {1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19}
     assert "llm_json" in report_columns
     assert {
         "llm_calls",
@@ -781,7 +785,7 @@ def test_v15_prompt_and_llm_rows_upgrade_to_v16_and_seed_only_missing_families(
         "entry_recheck:system",
     }
     assert tuple(llm_defaults) == ("", 1, "")
-    assert versions == {1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18}
+    assert versions == {1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19}
 
 
 def test_prompt_versions_are_immutable_and_have_one_active_row_per_prompt(
@@ -943,7 +947,7 @@ def test_v16_database_gains_budget_periods_settings_and_provider_capabilities(
     assert {"budget_ledger_week", "budget_ledger_month"} <= indexes
     # 2026-11-04 is ISO week 2026-W45.
     assert tuple(backfilled) == ("2026-11-04", "2026-W45", "2026-11", "")
-    assert versions == {1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18}
+    assert versions == {1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19}
 
 
 def _v16_budget_connection(settings: Settings) -> sqlite3.Connection:
@@ -1048,3 +1052,214 @@ def test_migration_backfills_utc_boundary_days(tmp_path: Path) -> None:
     finally:
         connection.close()
     assert tuple(row) == ("2026-11-09", "2026-W46", "2026-11")
+
+
+_V18_TRIGGERS = """
+CREATE TABLE schema_migrations (
+    version INTEGER PRIMARY KEY,
+    applied_at TEXT NOT NULL
+);
+INSERT INTO schema_migrations (version, applied_at)
+    VALUES (1,'t'),(2,'t'),(3,'t'),(4,'t'),(5,'t'),(6,'t'),(7,'t'),(8,'t'),
+           (9,'t'),(10,'t'),(11,'t'),(12,'t'),(13,'t'),(14,'t'),(15,'t'),
+           (16,'t'),(17,'t'),(18,'t');
+CREATE TABLE trigger_events (
+    trigger_id TEXT PRIMARY KEY,
+    opportunity_id TEXT NOT NULL,
+    symbol TEXT NOT NULL,
+    status TEXT NOT NULL,
+    idempotency_key TEXT NOT NULL UNIQUE,
+    triggered_at TEXT NOT NULL,
+    payload_json TEXT NOT NULL
+);
+INSERT INTO trigger_events VALUES (
+    'TRG-V18', 'OPP-V18', 'BTCUSDT', 'PENDING_RECHECK', 'TRG-OPP-V18-KEY',
+    '2026-11-09T10:00:00.000Z',
+    '{"snapshot": {"market_snapshot_id": "SNAP-V18",
+      "snapshot_hash": "HASH-V18", "as_of": "2026-11-09T10:00:00.000Z",
+      "data_quality": "PARTIAL"}, "condition_results": [{}, {}]}'
+);
+INSERT INTO trigger_events VALUES (
+    'TRG-BAD', 'OPP-BAD', 'BTCUSDT', 'PENDING_RECHECK', 'TRG-OPP-BAD-KEY',
+    '2026-11-09T10:00:00.000Z', 'not-json'
+);
+"""
+
+
+def test_v18_trigger_events_gain_snapshot_provenance_and_backfill(
+    tmp_path: Path, caplog: pytest.LogCaptureFixture
+) -> None:
+    settings = Settings(env="test", port=8765, data_dir=tmp_path / "data")
+    settings.data_dir.mkdir(parents=True)
+    connection = sqlite3.connect(database_path(settings))
+    try:
+        connection.executescript(_V18_TRIGGERS)
+        connection.commit()
+    finally:
+        connection.close()
+
+    store = SqliteStore(settings)
+    with caplog.at_level(logging.WARNING, logger="oft.adapters.sqlite_store"):
+        store.initialize()
+    store.initialize()  # idempotent
+
+    connection = sqlite3.connect(database_path(settings))
+    try:
+        columns = {row[1] for row in connection.execute("PRAGMA table_info(trigger_events)")}
+        indexes = {
+            row[0]
+            for row in connection.execute(
+                "SELECT name FROM sqlite_master WHERE type = 'index' "
+                "AND tbl_name = 'trigger_events'"
+            )
+        }
+        good = connection.execute(
+            "SELECT snapshot_hash, as_of, data_quality, condition_count "
+            "FROM trigger_events WHERE trigger_id = 'TRG-V18'"
+        ).fetchone()
+        bad = connection.execute(
+            "SELECT snapshot_hash, as_of, data_quality, condition_count "
+            "FROM trigger_events WHERE trigger_id = 'TRG-BAD'"
+        ).fetchone()
+        versions = {row[0] for row in connection.execute("SELECT version FROM schema_migrations")}
+    finally:
+        connection.close()
+
+    assert {"snapshot_hash", "as_of", "data_quality", "condition_count"} <= columns
+    assert "trigger_events_opportunity_triggered" in indexes
+    assert tuple(good) == ("HASH-V18", "2026-11-09T10:00:00.000Z", "PARTIAL", 2)
+    # A malformed legacy payload is skipped with its defaults, never aborting boot.
+    assert tuple(bad) == ("", "", "", 0)
+    assert versions == {1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19}
+    skipped = [
+        record
+        for record in caplog.records
+        if record.getMessage() == "trigger_event_backfill_skipped"
+    ]
+    assert [record.trigger_id for record in skipped] == ["TRG-BAD"]
+
+
+def test_concurrent_initializes_upgrade_v19_idempotently(tmp_path: Path) -> None:
+    """Concurrent bootstraps must neither race the WAL switch nor the v19 DDL.
+
+    A barrier starts all workers at once so the WAL switch, the trigger
+    drop/create pair, and the v19 BEGIN IMMEDIATE upgrade are genuinely
+    contended. No test-side retry or sleep is used: the initializer itself must
+    serialize the work, so a failure is a real regression rather than luck.
+    """
+    settings = Settings(env="test", port=8765, data_dir=tmp_path / "data")
+    settings.data_dir.mkdir(parents=True)
+    connection = sqlite3.connect(database_path(settings))
+    try:
+        connection.executescript(_V18_TRIGGERS)
+        connection.commit()
+    finally:
+        connection.close()
+
+    worker_count = 8
+    barrier = threading.Barrier(worker_count)
+    errors: list[BaseException] = []
+
+    def boot() -> None:
+        barrier.wait(timeout=30)
+        try:
+            SqliteStore(settings).initialize()
+        except BaseException as exc:  # pragma: no cover - surfaced by the assert
+            errors.append(exc)
+
+    with ThreadPoolExecutor(max_workers=worker_count) as pool:
+        list(pool.map(lambda _index: boot(), range(worker_count)))
+
+    assert errors == []
+    connection = sqlite3.connect(database_path(settings))
+    try:
+        columns = {row[1] for row in connection.execute("PRAGMA table_info(trigger_events)")}
+        good = connection.execute(
+            "SELECT snapshot_hash, as_of, data_quality, condition_count "
+            "FROM trigger_events WHERE trigger_id = 'TRG-V18'"
+        ).fetchone()
+        versions = {
+            row[0]
+            for row in connection.execute(
+                "SELECT version FROM schema_migrations WHERE version = 19"
+            )
+        }
+        highest_version = connection.execute(
+            "SELECT MAX(version) FROM schema_migrations"
+        ).fetchone()[0]
+        immutable_triggers = connection.execute(
+            "SELECT COUNT(*) FROM sqlite_master "
+            "WHERE type = 'trigger' AND name = 'prompt_versions_immutable'"
+        ).fetchone()[0]
+        journal_mode = connection.execute("PRAGMA journal_mode").fetchone()[0]
+    finally:
+        connection.close()
+    assert {"snapshot_hash", "as_of", "data_quality", "condition_count"} <= columns
+    assert tuple(good) == ("HASH-V18", "2026-11-09T10:00:00.000Z", "PARTIAL", 2)
+    # Exactly one recorded v19 upgrade, and the schema did not gain stray rows.
+    assert versions == {19}
+    assert highest_version == 19
+    assert immutable_triggers == 1
+    assert journal_mode.lower() == "wal"
+
+
+def test_replaying_the_v18_backfill_preserves_evaluation_columns(tmp_path: Path) -> None:
+    settings = Settings(env="test", port=8765, data_dir=tmp_path / "data")
+    SqliteStore(settings).initialize()
+    payload = {
+        "opportunity_id": "OPP-18",
+        "trigger_conditions": [
+            {
+                "condition_id": "C-1",
+                "type": "PRICE_TOUCH_ZONE",
+                "params": {"price_low": "69900.00", "price_high": "70100.00"},
+                "window": {
+                    "start": "2026-11-01T00:00:00.000Z",
+                    "end": "2026-12-01T00:00:00.000Z",
+                },
+                "required_data": ["MARK_PRICE"],
+                "evaluable": True,
+            }
+        ],
+        "invalidation_conditions": [],
+    }
+    connection = sqlite3.connect(database_path(settings))
+    try:
+        connection.execute(
+            "INSERT INTO opportunities "
+            "(opportunity_id, symbol, state, created_at, updated_at, payload_json, expires_at) "
+            "VALUES (?, ?, ?, ?, ?, ?, NULL)",
+            (
+                "OPP-18",
+                "BTCUSDT",
+                "OPEN",
+                "2026-11-06T12:00:00.000Z",
+                "2026-11-06T12:00:00.000Z",
+                json.dumps(payload),
+            ),
+        )
+        connection.execute(
+            "INSERT INTO opportunity_conditions "
+            "(condition_id, opportunity_id, kind, seq, type, params_json, "
+            "window_start, window_end, required_data_json, evaluable, "
+            "unavailable_reason, last_value, last_evaluated_at, last_result) "
+            "VALUES ('C-1', 'OPP-18', 'TRIGGER', 1, 'PRICE_TOUCH_ZONE', '{}', "
+            "'2026-11-01T00:00:00.000Z', '2026-12-01T00:00:00.000Z', '[]', 1, "
+            "NULL, '70000.00', '2026-11-06T12:00:00.000Z', 1)"
+        )
+        connection.execute("DELETE FROM schema_migrations WHERE version = 18")
+        connection.commit()
+    finally:
+        connection.close()
+
+    SqliteStore(settings).initialize()
+
+    connection = sqlite3.connect(database_path(settings))
+    try:
+        row = connection.execute(
+            "SELECT last_value, last_evaluated_at, last_result "
+            "FROM opportunity_conditions WHERE opportunity_id = 'OPP-18' AND condition_id = 'C-1'"
+        ).fetchone()
+    finally:
+        connection.close()
+    assert tuple(row) == ("70000.00", "2026-11-06T12:00:00.000Z", 1)

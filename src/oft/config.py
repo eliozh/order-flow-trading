@@ -120,6 +120,10 @@ class Settings(BaseSettings):
     paper_slippage_bps: str = "2"
     paper_taker_fee_bps: str = "5"
 
+    # Trigger evaluation cadence (ADR-0007: 15 s default, 5-60 s configurable).
+    trigger_interval_seconds: int = Field(default=15, ge=5, le=60)
+    trigger_stale_after_seconds: int = Field(default=60, ge=1)
+
     api_token: SecretStr | None = None
     binance_api_key: SecretStr | None = None
     binance_api_secret: SecretStr | None = None

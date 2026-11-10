@@ -46,7 +46,11 @@ router = APIRouter()
 
 def _trigger_service(request: Request) -> TriggerService:
     container = request.app.state.container
-    return TriggerService(store=container.store, clock=container.clock)
+    return TriggerService(
+        store=container.store,
+        clock=container.clock,
+        stale_after_seconds=container.settings.trigger_stale_after_seconds,
+    )
 
 
 def _scan_provider(container: Any, trigger_id: str) -> str | None:
@@ -86,15 +90,21 @@ def _entry_service(request: Request, trigger_id: str) -> EntryService:
 def list_triggers(
     request: Request,
     opportunity_id: str | None = Query(default=None, max_length=64),
+    status: str | None = Query(default=None, max_length=32),
     limit: int = Query(default=100, ge=1, le=500),
     offset: int = Query(default=0, ge=0),
 ) -> dict[str, Any]:
     service = _trigger_service(request)
     items = [
         trigger_summary(payload)
-        for payload in service.list(opportunity_id=opportunity_id, limit=limit, offset=offset)
+        for payload in service.list(
+            opportunity_id=opportunity_id,
+            status=status,
+            limit=limit,
+            offset=offset,
+        )
     ]
-    total = service.count(opportunity_id=opportunity_id)
+    total = service.count(opportunity_id=opportunity_id, status=status)
     has_next = offset + len(items) < total
     return success_envelope(
         {"items": items, "total": total},
@@ -189,6 +199,51 @@ def evaluate_trigger(
     )
     complete(request, key=key, request_hash=request_hash, envelope=envelope, status=status)
     response.status_code = status
+    return envelope
+
+
+@router.post("/api/v1/triggers/evaluate-all", response_model=Envelope[dict[str, Any]])
+def evaluate_all_triggers(
+    request: Request,
+    response: Response,
+    idempotency_key: str | None = Header(default=None, alias="Idempotency-Key"),
+) -> Any:
+    """Evaluate the bounded page of OPEN opportunities exactly as the 15 s job does."""
+    key = require_idempotency_key(idempotency_key)
+    request_hash = hashlib.sha256(b"trigger-evaluate-all").hexdigest()
+    replay = reserve(request, key=key, request_hash=request_hash)
+    if replay is not None:
+        return replay
+    try:
+        outcome = _trigger_service(request).evaluate_all()
+    except BaseException:
+        release(request, key=key)
+        raise
+    data = {
+        "open": outcome.open,
+        "open_total": outcome.open_total,
+        "evaluated": outcome.evaluated,
+        "triggered": outcome.triggered,
+        "skipped": outcome.skipped,
+        "stale": outcome.stale,
+        "unavailable": outcome.unavailable,
+        "capped": outcome.capped,
+        "trigger_ids": list(outcome.trigger_ids),
+    }
+    degraded = (
+        outcome.unavailable > 0
+        or outcome.stale > 0
+        or outcome.evaluated < outcome.open
+        or outcome.capped
+    )
+    envelope = success_envelope(
+        data,
+        request_id=new_request_id(),
+        provenance="CALC",
+        data_quality="PARTIAL" if degraded else "COMPLETE",
+    )
+    complete(request, key=key, request_hash=request_hash, envelope=envelope, status=200)
+    response.status_code = 200
     return envelope
 
 

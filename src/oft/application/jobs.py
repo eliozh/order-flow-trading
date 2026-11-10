@@ -14,9 +14,11 @@ import threading
 import uuid
 from contextlib import suppress
 from dataclasses import dataclass
-from datetime import date, datetime, timedelta
+from datetime import UTC, date, datetime, timedelta
 from decimal import Decimal, InvalidOperation
 from typing import Any, Protocol
+
+import structlog
 
 from oft.application.scan_service import (
     ScanAlreadyRunning,
@@ -25,6 +27,7 @@ from oft.application.scan_service import (
     ScanService,
 )
 from oft.application.scheduler import CatchUpPlan, plan_catch_up
+from oft.application.trigger_service import TriggerBatchOutcome, TriggerService
 from oft.domain.time import utc_timestamp
 from oft.ports.clock import ClockPort
 from oft.ports.store import (
@@ -37,6 +40,9 @@ from oft.ports.store import (
 
 SCAN_JOB_TYPE = "scan"
 SCAN_LOCK_NAME = "scan"
+TRIGGER_JOB_TYPE = "trigger_evaluate"
+TRIGGER_JOB_SOURCE = "trigger"
+DEFAULT_TRIGGER_INTERVAL_SECONDS = 15
 DEFAULT_LEASE_SECONDS = 900
 HEARTBEAT_SECONDS = 300
 RUNNING = "RUNNING"
@@ -44,6 +50,7 @@ DONE = "DONE"
 FAILED = "FAILED"
 PARTIAL = "PARTIAL"
 MISSED = "MISSED"
+_LOGGER = structlog.get_logger(__name__)
 _TERMINAL_SCAN_STAGES = frozenset({"DONE", "DEGRADED", "FAILED"})
 _FAILED_STAGE_BY_CODE = {
     "DATA_UNAVAILABLE": "DATA",
@@ -893,8 +900,136 @@ class ScheduledScanRunner:
         )
 
 
+@dataclass(frozen=True)
+class TriggerJobOutcome:
+    """Result of one ``trigger_evaluate`` tick."""
+
+    claimed: bool
+    run: JobRunRecord | None = None
+    counts: TriggerBatchOutcome = TriggerBatchOutcome()
+    reason: str = ""
+    error: str | None = None
+
+
+def align_interval(instant: datetime, interval_seconds: int) -> datetime:
+    """Floor an instant to the containing interval boundary in UTC.
+
+    A naive instant is rejected rather than interpreted in the host local
+    timezone: a silently shifted window would claim the wrong job run.
+    """
+    if interval_seconds <= 0:
+        raise ValueError("interval_seconds must be positive")
+    if instant.tzinfo is None or instant.utcoffset() is None:
+        raise ValueError("trigger scheduling instants must be timezone-aware UTC")
+    epoch = int(instant.astimezone(UTC).timestamp())
+    return datetime.fromtimestamp((epoch // interval_seconds) * interval_seconds, tz=UTC)
+
+
+def _counts_message(counts: TriggerBatchOutcome) -> str:
+    return (
+        f"open={counts.open} evaluated={counts.evaluated} "
+        f"triggered={counts.triggered} skipped={counts.skipped} "
+        f"stale={counts.stale} unavailable={counts.unavailable}"
+    )
+
+
+class TriggerJobRunner:
+    """One interval tick: claim the current window, evaluate, finish the run.
+
+    The ledger is the single source of truth. Only the current interval window
+    is ever claimed, so a restart starts at the next boundary and missed
+    windows are never replayed (ADR-0007). An overlapping tick loses the claim
+    and records nothing new.
+    """
+
+    def __init__(
+        self,
+        *,
+        service: TriggerService,
+        ledger: JobLedger,
+        clock: ClockPort,
+        interval_seconds: int = DEFAULT_TRIGGER_INTERVAL_SECONDS,
+    ) -> None:
+        if interval_seconds <= 0:
+            raise ValueError("interval_seconds must be positive")
+        self._service = service
+        self._ledger = ledger
+        self._clock = clock
+        self._interval_seconds = interval_seconds
+
+    @property
+    def interval_seconds(self) -> int:
+        return self._interval_seconds
+
+    def run_tick(self, now: datetime | None = None) -> TriggerJobOutcome:
+        instant = now or self._clock.now()
+        window_start = utc_timestamp(align_interval(instant, self._interval_seconds))
+        claim = self._ledger.claim(
+            TRIGGER_JOB_TYPE,
+            window_start,
+            trigger_source="SCHEDULED",
+            source=TRIGGER_JOB_SOURCE,
+        )
+        if not claim.claimed or claim.run is None:
+            return TriggerJobOutcome(claimed=False, run=claim.run, reason=claim.reason)
+        run = claim.run
+        try:
+            counts = self._service.evaluate_all(utc_timestamp(instant))
+        except Exception as exc:  # noqa: BLE001 - a failed tick must not kill the daemon
+            message = str(exc)
+            # Log before finishing: a rejected or raising finish write must not
+            # mask the original tick failure.
+            _LOGGER.warning("trigger_job_failed", run_id=run.run_id, error=message)
+            self._finish_safely(
+                run,
+                FAILED,
+                error_code=str(getattr(exc, "code", "JOB_FAILED")),
+                message=message,
+            )
+            failed = self._ledger.store.get_job_run(run.run_id) or run
+            return TriggerJobOutcome(claimed=True, run=failed, reason="failed", error=message)
+        finished_ok = self._finish_safely(run, DONE, message=_counts_message(counts))
+        finished = self._ledger.store.get_job_run(run.run_id) or run
+        return TriggerJobOutcome(
+            claimed=True,
+            run=finished,
+            counts=counts,
+            reason="done" if finished_ok else "finish_rejected",
+        )
+
+    def _finish_safely(
+        self,
+        run: JobRunRecord,
+        status: str,
+        *,
+        error_code: str | None = None,
+        message: str | None = None,
+    ) -> bool:
+        """Finish the run, never letting a ledger write replace the real error."""
+        try:
+            finished = self._ledger.finish(
+                run.run_id,
+                status,
+                error_code=error_code,
+                message=message,
+                owner=run.lease_owner,
+            )
+        except Exception as exc:  # noqa: BLE001 - the tick outcome must survive
+            _LOGGER.warning(
+                "trigger_job_finish_failed",
+                run_id=run.run_id,
+                status=status,
+                error=str(exc),
+            )
+            return False
+        if not finished:
+            _LOGGER.warning("trigger_job_finish_rejected", run_id=run.run_id, status=status)
+        return bool(finished)
+
+
 __all__ = [
     "DEFAULT_LEASE_SECONDS",
+    "DEFAULT_TRIGGER_INTERVAL_SECONDS",
     "DONE",
     "FAILED",
     "JobClaim",
@@ -907,4 +1042,9 @@ __all__ = [
     "SCAN_LOCK_NAME",
     "ScheduledScanOutcome",
     "ScheduledScanRunner",
+    "TRIGGER_JOB_SOURCE",
+    "TRIGGER_JOB_TYPE",
+    "TriggerJobOutcome",
+    "TriggerJobRunner",
+    "align_interval",
 ]

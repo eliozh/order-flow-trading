@@ -140,12 +140,22 @@ class ApiClient:
     # -- Triggers --------------------------------------------------------
 
     def list_triggers(
-        self, *, opportunity_id: str | None = None, limit: int = 100
+        self,
+        *,
+        opportunity_id: str | None = None,
+        status: str | None = None,
+        limit: int = 100,
     ) -> dict[str, Any]:
         query = f"?limit={limit}"
         if opportunity_id:
             query += f"&opportunity_id={quote(opportunity_id, safe='')}"
+        if status:
+            query += f"&status={quote(status, safe='')}"
         return self._request("GET", f"/api/v1/triggers{query}")
+
+    def evaluate_all_triggers(self, *, idempotency_key: str | None = None) -> dict[str, Any]:
+        headers = {"Idempotency-Key": idempotency_key} if idempotency_key else None
+        return self._request("POST", "/api/v1/triggers/evaluate-all", {}, extra_headers=headers)
 
     def get_trigger(self, trigger_id: str) -> dict[str, Any]:
         return self._request("GET", f"/api/v1/triggers/{quote(trigger_id, safe='')}")
