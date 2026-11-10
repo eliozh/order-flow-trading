@@ -7,17 +7,138 @@ typed ``RESUME`` token (ADR-0006).
 
 from __future__ import annotations
 
+import json
 import os
+from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
 from oft.config import Settings
+from oft.domain.audit import AUDIT_HEAD_KEY, GENESIS_HASH, build_audit_entry
 from oft.domain.time import utc_timestamp
 from oft.ports.clock import ClockPort
 from oft.ports.store import AuditEventDraft, AuditEventRecord, StorePort
 
 KILL_SWITCH_KEY = "kill_switch"
 RESUME_TOKEN = "RESUME"
+
+
+@dataclass(frozen=True)
+class AuditChainVerification:
+    """The result of re-deriving every hash in the append-only chain (D7)."""
+
+    ok: bool
+    checked: int
+    first_broken_seq: int | None
+    message: str
+
+
+def verify_audit_chain(store: StorePort) -> AuditChainVerification:
+    """Verify seq continuity, previous-hash links, and recomputed event hashes."""
+    initialized = getattr(store, "audit_store_initialized", None)
+    if callable(initialized) and not initialized():
+        # A missing database reads as an empty event tuple, which is not the
+        # same thing as a valid empty chain (S5). Report the truth.
+        return AuditChainVerification(
+            ok=False,
+            checked=0,
+            first_broken_seq=None,
+            message="AUDIT_CHAIN_UNAVAILABLE: the audit store is not initialized",
+        )
+    try:
+        events = store.list_audit_events_ascending()
+    except Exception as exc:  # pragma: no cover - defensive boundary
+        return AuditChainVerification(
+            ok=False,
+            checked=0,
+            first_broken_seq=None,
+            message=f"AUDIT_CHAIN_UNAVAILABLE: the audit store could not be read ({exc})",
+        )
+    expected_previous = GENESIS_HASH
+    checked = 0
+    for expected_seq, event in enumerate(events, start=1):
+        if event.seq != expected_seq:
+            return AuditChainVerification(
+                ok=False,
+                checked=checked,
+                first_broken_seq=event.seq,
+                message=(f"AUDIT_CHAIN_BROKEN at seq {event.seq}: expected seq {expected_seq}"),
+            )
+        if event.previous_hash != expected_previous:
+            return AuditChainVerification(
+                ok=False,
+                checked=checked,
+                first_broken_seq=event.seq,
+                message=f"AUDIT_CHAIN_BROKEN at seq {event.seq}: previous hash mismatch",
+            )
+        try:
+            body = json.loads(event.payload_json)
+        except (json.JSONDecodeError, TypeError, ValueError):
+            return AuditChainVerification(
+                ok=False,
+                checked=checked,
+                first_broken_seq=event.seq,
+                message=f"AUDIT_CHAIN_BROKEN at seq {event.seq}: payload is unreadable",
+            )
+        if not isinstance(body, dict):
+            return AuditChainVerification(
+                ok=False,
+                checked=checked,
+                first_broken_seq=event.seq,
+                message=f"AUDIT_CHAIN_BROKEN at seq {event.seq}: payload is not an object",
+            )
+        recomputed = build_audit_entry(
+            previous_seq=expected_seq - 1,
+            previous_hash=event.previous_hash,
+            event_type=event.event_type,
+            actor=body.get("actor") or {},
+            subject=body.get("subject") or {},
+            payload=body.get("payload") or {},
+            created_at=event.created_at,
+        )
+        if recomputed.event_hash != event.event_hash:
+            return AuditChainVerification(
+                ok=False,
+                checked=checked,
+                first_broken_seq=event.seq,
+                message=f"AUDIT_CHAIN_BROKEN at seq {event.seq}: event hash does not recompute",
+            )
+        expected_previous = event.event_hash
+        checked += 1
+    # Compare the stored high-water mark: deleting the newest rows leaves the
+    # upward seq scan intact but cannot hide the missing tail (S4).
+    raw_head = store.get_system_state(AUDIT_HEAD_KEY)
+    if raw_head is not None:
+        try:
+            head = json.loads(raw_head)
+            head_seq = int(head["seq"])
+            head_hash = str(head["event_hash"])
+        except (json.JSONDecodeError, KeyError, TypeError, ValueError):
+            return AuditChainVerification(
+                ok=False,
+                checked=checked,
+                first_broken_seq=None,
+                message="AUDIT_CHAIN_BROKEN: the stored audit head is unreadable",
+            )
+        last = events[-1] if events else None
+        actual_seq = last.seq if last is not None else 0
+        actual_hash = last.event_hash if last is not None else GENESIS_HASH
+        if head_seq != actual_seq or head_hash != actual_hash:
+            return AuditChainVerification(
+                ok=False,
+                checked=checked,
+                first_broken_seq=head_seq,
+                message=(
+                    f"AUDIT_CHAIN_BROKEN at seq {head_seq}: the stored audit head "
+                    "does not match the chain (tail truncation)"
+                ),
+            )
+    return AuditChainVerification(
+        ok=True,
+        checked=checked,
+        first_broken_seq=None,
+        message=f"AUDIT_CHAIN_OK ({checked} events)",
+    )
 
 
 class KillSwitchActive(Exception):

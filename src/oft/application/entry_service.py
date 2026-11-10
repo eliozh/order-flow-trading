@@ -1,11 +1,11 @@
 """Entry re-check, deterministic risk verdict, and the human paper accept/reject.
 
-The LLM only proposes an entry. The risk gate recomputes every cap it has an
-input for from current account state; the daily-loss cap is not evaluated here
-because this slice has no realized-PnL source, and the verdict records that
-input as unevaluated (slice-18 follow-up). The execution gateway submits the
-reduced/approved intent; the paper broker fills it deterministically. No path
-bypasses the gateway.
+The LLM only proposes an entry. The risk gate recomputes every percentage-based
+cap from current account equity and the trigger snapshot, persisting the verdict
+and an ordered decision card (TRIGGER -> LLM -> RISK -> HUMAN). There is no
+realized-PnL source yet, so the daily-loss input is recorded as stale rather
+than treated as zero. The execution gateway submits the reduced/approved intent;
+the paper broker fills it deterministically. No path bypasses the gateway.
 """
 
 from __future__ import annotations
@@ -31,6 +31,7 @@ from oft.application.llm_validation import (
     hash_text,
     schema_text,
 )
+from oft.application.paper_account import PaperAccountService
 from oft.application.paper_broker import OrderIntent, PaperBroker
 from oft.application.prompt_builder import KnowledgeInjection
 from oft.application.prompt_service import (
@@ -39,13 +40,19 @@ from oft.application.prompt_service import (
     secret_values_from_settings,
 )
 from oft.application.trigger_service import TriggerNotFound
+from oft.config import Settings
 from oft.domain.oms import OrderSide, OrderType, PositionSide
 from oft.domain.pricing import PriceTableError
 from oft.domain.prompts import PromptRole
 from oft.domain.risk import (
     DEFAULT_CAPS,
+    RISK_CAPS_STATE_KEY,
+    RiskCaps,
     RiskRequest,
+    RiskVerdict,
+    apply_persisted_caps,
     evaluate_risk,
+    validate_caps,
     verdict_to_contract,
 )
 from oft.domain.time import utc_timestamp
@@ -62,6 +69,7 @@ from oft.ports.llm import (
 from oft.ports.store import (
     DecisionRecord,
     LLMCallRecord,
+    OrderRecord,
     RiskVerdictRecord,
     StorePort,
     TriggerEventRecord,
@@ -69,6 +77,10 @@ from oft.ports.store import (
 
 ENTRY_PROMPT_ID = "entry_recheck"
 ENTRY_PROMPT_VERSION = 1
+
+# The only states in which a human may still act on the trigger. Everything
+# else (ACCEPTED/REJECTED/BLOCKED/EXPIRED) is terminal for this slice.
+_PRE_ACCEPT_STATUSES = frozenset({"PENDING_RECHECK", "RECHECKED"})
 
 _USAGE_FIELDS = (
     "input_tokens",
@@ -137,6 +149,74 @@ def _digest(value: str) -> str:
     return hashlib.sha256(value.encode("utf-8")).hexdigest()[:16].upper()
 
 
+def _decimal_or_none(value: object) -> Decimal | None:
+    """Parse a verdict value; ``None`` and the contract's "0" mean absent."""
+    if value is None or value == "0":
+        return None
+    try:
+        return Decimal(str(value))
+    except (ArithmeticError, TypeError, ValueError):
+        return None
+
+
+class RiskCapsError(Exception):
+    """A persisted risk-caps document is unreadable or invalid (fail closed)."""
+
+    code = "VALIDATION_FAILED"
+
+    def __init__(self, message: str) -> None:
+        super().__init__(message)
+        self.message = message
+
+
+def caps_from_settings(settings: Settings | None) -> RiskCaps:
+    """The configured caps, or the documented defaults when settings are absent."""
+    if settings is None:
+        return DEFAULT_CAPS
+    return RiskCaps(
+        per_trade_risk_pct=float(settings.risk_per_trade_pct),
+        max_concurrent_positions=int(settings.risk_max_concurrent_positions),
+        daily_loss_pct=float(settings.risk_daily_loss_pct),
+        max_leverage=float(settings.risk_max_leverage),
+        max_notional_pct=float(settings.risk_max_notional_pct),
+        max_slippage_bps=float(settings.risk_max_slippage_bps),
+        max_spread_bps=float(settings.risk_max_spread_bps),
+        stale_mark_seconds=int(settings.risk_stale_mark_seconds),
+    )
+
+
+def effective_caps(settings: Settings | None, store: StorePort) -> tuple[RiskCaps, str]:
+    """Return ``(caps, source)``; persisted fields override the config base (D1).
+
+    The merge is field by field: a partial operator row may tighten one cap and
+    must not silently reset the others to the hardcoded dataclass defaults.
+    """
+    base = caps_from_settings(settings)
+    raw = store.get_system_state(RISK_CAPS_STATE_KEY)
+    if raw is None:
+        return base, "config"
+    try:
+        payload = json.loads(raw)
+        if not isinstance(payload, dict):
+            raise ValueError("persisted risk caps must be a JSON object")
+        merged = apply_persisted_caps(base, payload)
+        errors = validate_caps(merged)
+        if errors:
+            raise ValueError("persisted risk caps are invalid: " + "; ".join(errors))
+    except (json.JSONDecodeError, TypeError, ValueError) as exc:
+        raise RiskCapsError(str(exc)) from exc
+    return merged, "persisted"
+
+
+@dataclass(frozen=True)
+class _RiskEvaluation:
+    verdict: RiskVerdict
+    payload: dict[str, Any]
+    verdict_id: str
+    reference_price: Decimal
+    mark_as_of: str
+
+
 class EntryService:
     def __init__(
         self,
@@ -167,6 +247,11 @@ class EntryService:
             else None
         )
         self._broker = PaperBroker(settings=settings, store=store, clock=clock)
+        self._paper = (
+            PaperAccountService(settings=settings, store=store, clock=clock)
+            if settings is not None
+            else None
+        )
         self._secrets = secret_values_from_settings(settings) if settings is not None else ()
         self._prompts = PromptService(store=store, clock=clock, secret_values=self._secrets)
         self._knowledge = (
@@ -182,6 +267,16 @@ class EntryService:
     # -- re-check --------------------------------------------------------
 
     def recheck(self, trigger_id: str) -> dict[str, Any]:
+        trigger = self._trigger(trigger_id)
+        payload: dict[str, Any] = json.loads(trigger.payload_json)
+        status = str(payload.get("status"))
+        if payload.get("created_order_id") or status not in _PRE_ACCEPT_STATUSES:
+            # Never regress an accepted/terminal trigger or rewrite a decision
+            # once an order exists (F1).
+            raise EntryRejected(
+                "CONFLICT",
+                f"trigger {trigger_id} is {status}; a re-check is not allowed",
+            )
         if self._provider is None:
             raise EntryRejected(
                 "LLM_PROVIDER_NOT_CONFIGURED",
@@ -199,8 +294,6 @@ class EntryService:
                 f"No {provider_name or 'LLM'} API key is configured; "
                 "the entry re-check cannot run.",
             )
-        trigger = self._trigger(trigger_id)
-        payload: dict[str, Any] = json.loads(trigger.payload_json)
         opportunity = self._opportunity(payload["opportunity_id"])
         timeframe = self._timeframe(opportunity)
         now = utc_timestamp(self._clock.now())
@@ -289,18 +382,70 @@ class EntryService:
                 payload_json=json.dumps(envelope, sort_keys=True),
             )
         )
-        no_entry = (
-            outcome.valid
-            and outcome.output is not None
-            and outcome.output.entry_recheck is not None
-            and outcome.output.entry_recheck.decision == "NO_ENTRY"
-        )
+        entry_payload = envelope.get("entry_recheck") or {}
+        no_entry = outcome.valid and entry_payload.get("decision") == "NO_ENTRY"
         next_status = "REJECTED" if (not outcome.valid or no_entry) else "RECHECKED"
         updated = dict(payload)
         updated["entry_decision_id"] = decision_id
         updated["status"] = next_status
         if not outcome.valid:
             updated["rejection_reason"] = envelope["rejected_reason"]
+
+        risk_stage: dict[str, Any] = {
+            "verdict": "NOT_EVALUATED",
+            "binding_cap": "NONE",
+            "reasons": ["no entry intent to evaluate"],
+            "provenance": "CALC",
+        }
+        error_code: str | None = None
+        intent = entry_payload.get("order_intent")
+        if outcome.valid and not no_entry and intent is not None:
+            try:
+                evaluation = self._evaluate_and_persist_risk(
+                    trigger_id=trigger_id,
+                    trigger_payload=updated,
+                    decision_id=decision_id,
+                    intent=intent,
+                    seed=f"{trigger_id}:{decision_id}:recheck",
+                )
+                updated["risk_verdict"] = evaluation.payload
+                risk_stage = {**evaluation.payload, "provenance": "CALC"}
+            except RiskCapsError as exc:
+                # A corrupt operator override is a validation failure, not a
+                # stale-data risk block; surface it as a typed error so the
+                # route maps it to 422 instead of a 500 (F5).
+                raise EntryRejected(exc.code, exc.message) from exc
+            except EntryRejected as exc:
+                # A gate-input failure (missing contract/mark, malformed intent)
+                # is not a risk BLOCK: the gate never produced a verdict. Mark
+                # the trigger terminal, persist no verdict, audit the real error
+                # code, and emit no accept guidance (S4).
+                error_code = exc.code
+                next_status = "REJECTED"
+                updated["status"] = next_status
+                updated["rejection_reason"] = f"{exc.code}: {exc.message}"
+                updated.pop("risk_verdict", None)
+                risk_stage = {
+                    "verdict": "NOT_EVALUATED",
+                    "binding_cap": "NONE",
+                    "reasons": [f"{exc.code}: {exc.message}"],
+                    "error_code": exc.code,
+                    "provenance": "CALC",
+                }
+        elif no_entry:
+            risk_stage["reasons"] = ["entry re-check returned NO_ENTRY"]
+        elif not outcome.valid:
+            risk_stage["reasons"] = [str(envelope.get("rejected_reason") or "invalid decision")]
+
+        data_quality = self._data_quality(risk_stage, outcome.valid and not no_entry)
+        card = self._decision_card(
+            trigger_id=trigger_id,
+            trigger_payload=updated,
+            envelope=envelope,
+            risk_stage=risk_stage,
+            data_quality=data_quality,
+            error_code=error_code,
+        )
         record = replace(
             trigger,
             status=next_status,
@@ -316,10 +461,12 @@ class EntryService:
                 "validation_status": outcome.status,
                 "decision_id": decision_id,
                 "status": next_status,
+                "risk_verdict": risk_stage.get("verdict"),
+                "error_code": error_code,
             },
             at=now,
         )
-        return updated
+        return card
 
     # -- human actions ---------------------------------------------------
 
@@ -332,8 +479,21 @@ class EntryService:
     ) -> EntryResult:
         trigger = self._trigger(trigger_id)
         payload: dict[str, Any] = json.loads(trigger.payload_json)
-        if payload["status"] == "ACCEPTED" and payload.get("created_order_id"):
-            return self._replay(payload["created_order_id"], payload)
+        status = str(payload.get("status"))
+        created_order_id = payload.get("created_order_id")
+        if created_order_id:
+            # A trigger has at most one paper entry. Only the original key may
+            # replay the original result; any other key is a conflict and must
+            # never create a second order (F1).
+            original = self._store.get_order(str(created_order_id))
+            if original is not None and original.idempotency_key == idempotency_key:
+                return self._replay(str(created_order_id), payload)
+            raise EntryRejected(
+                "CONFLICT",
+                f"an order already exists for trigger {trigger_id}",
+            )
+        if status not in _PRE_ACCEPT_STATUSES:
+            raise EntryRejected("CONFLICT", f"trigger is {status}")
         existing_order = self._store.get_order_by_idempotency(idempotency_key)
         if existing_order is not None:
             existing_payload = json.loads(existing_order.payload_json)
@@ -347,16 +507,15 @@ class EntryService:
                     "the idempotency key belongs to a different trigger",
                 )
             return self._replay(existing_order.order_id, payload)
-        if payload["status"] in {"REJECTED", "BLOCKED", "EXPIRED"}:
-            raise EntryRejected("CONFLICT", f"trigger is {payload['status']}")
 
         try:
             self._kill_switch.require_clear()
         except KillSwitchActive as exc:
             raise EntryRejected(exc.code, exc.message) from exc
         if payload.get("entry_decision_id") is None:
-            payload = self.recheck(trigger_id)
+            self.recheck(trigger_id)
             trigger = self._trigger(trigger_id)
+            payload = json.loads(trigger.payload_json)
         decision = self._store.get_decision(str(payload["entry_decision_id"]))
         if decision is None or decision.validation_status not in {"VALID", "REPAIRED"}:
             reason = "entry decision is rejected or missing"
@@ -377,135 +536,111 @@ class EntryService:
             )
             raise EntryRejected("ORDER_REJECTED", "entry intent is missing")
 
-        opportunity = self._opportunity(payload["opportunity_id"])
-        reference_price, mark_as_of = self._mark(opportunity)
-        side = PositionSide.LONG if payload["side"] == "LONG" else PositionSide.SHORT
-        # The broker fills at the reference mark adjusted by the configured
-        # slippage, so the risk caps are always sized from the mark. The
-        # LLM-supplied entry_price is advisory only and never feeds the risk math.
-        risk_entry_price = reference_price
-        contract = self._store.get_symbol(payload["symbol"])
-        if contract is None:
-            # Fail closed: without tick/step/min-notional the gate would size and
-            # round as if every filter were zero, which is unsafe.
-            raise EntryRejected(
-                "DATA_UNAVAILABLE",
-                f"the symbol contract for {payload['symbol']} is missing",
-            )
         now = utc_timestamp(self._clock.now())
-        account = self._broker.account()
-        position_count = len(self._store.list_positions(state="OPEN"))
+        # Crash-window recovery: the order committed but the trigger update was
+        # lost. Reconcile before any re-evaluation (equity has already changed,
+        # so a fresh verdict would no longer match). Never a second order (D6).
+        existing_entry = self._store.get_entry_order_for_trigger(trigger_id)
+        if existing_entry is not None:
+            if existing_entry.idempotency_key == idempotency_key:
+                return self._replay(existing_entry.order_id, payload)
+            return self._adopt_entry(trigger, existing_entry, now=now, actor_id=actor_id)
+
+        side = PositionSide.LONG if payload["side"] == "LONG" else PositionSide.SHORT
+        bound = self._bound_recheck_verdict(trigger_id, decision.decision_id, payload)
+        reference_price, mark_as_of = self._mark(self._opportunity(payload["opportunity_id"]))
+        if bound is not None:
+            # Submit strictly within the verdict the human saw on the card (S2).
+            if bound.expires_at <= now:
+                raise EntryRejected(
+                    "CONFLICT", "the risk verdict has expired; run the re-check again"
+                )
+            verdict_payload = json.loads(bound.payload_json)
+            risk_verdict_id = bound.risk_verdict_id
+            verdict_value = str(verdict_payload.get("verdict"))
+            binding_cap = str(verdict_payload.get("binding_cap"))
+            allowed = verdict_payload.get("allowed") or {}
+            requested = verdict_payload.get("requested") or {}
+            try:
+                allowed_quantity = _decimal_or_none(allowed.get("quantity"))
+                allowed_leverage = float(allowed["leverage"])
+                risk_amount_usd = Decimal(str(allowed["risk_amount_usd"]))
+                risk_pct = float(requested["risk_pct"])
+                stop_price = _decimal_or_none(requested.get("stop_price"))
+            except (KeyError, TypeError, ValueError, ArithmeticError) as exc:
+                raise EntryRejected(
+                    "CONFLICT",
+                    f"the persisted risk verdict is invalid; run the re-check again: {exc}",
+                ) from exc
+        else:
+            # Legacy/manually constructed trigger without a persisted re-check
+            # verdict: recompute (never used by the production recheck path).
+            try:
+                evaluation = self._evaluate_and_persist_risk(
+                    trigger_id=trigger_id,
+                    trigger_payload=payload,
+                    decision_id=decision.decision_id,
+                    intent=intent,
+                    seed=f"{trigger_id}:{decision.decision_id}:{idempotency_key}",
+                )
+            except RiskCapsError as exc:
+                raise EntryRejected(exc.code, exc.message) from exc
+            verdict = evaluation.verdict
+            verdict_payload = evaluation.payload
+            risk_verdict_id = evaluation.verdict_id
+            reference_price = evaluation.reference_price
+            mark_as_of = evaluation.mark_as_of
+            verdict_value = verdict.verdict.value
+            binding_cap = verdict.binding_cap.value
+            allowed_quantity = verdict.allowed_quantity
+            allowed_leverage = verdict.allowed_leverage
+            risk_amount_usd = verdict.risk_amount_usd
+            stop_price = verdict.stop_price
+            risk_pct = float(verdict_payload["requested"]["risk_pct"])
+
         try:
-            # size_mode is exclusive: only the governing sizing field is read,
-            # and a persisted intent that violates the mode is rejected rather
-            # than silently sized by the other field. Parsing lives inside this
-            # guard so malformed persisted numerics become EntryRejected.
-            size_mode = intent.get("size_mode")
-            if size_mode == "RISK_PCT":
-                if intent.get("risk_pct") is None:
-                    raise EntryRejected("ORDER_REJECTED", "size_mode RISK_PCT requires risk_pct")
-                risk_pct = float(intent["risk_pct"])
-                notional = None
-            elif size_mode == "QUOTE_NOTIONAL":
-                if intent.get("quote_notional_usd") is None:
-                    raise EntryRejected(
-                        "ORDER_REJECTED",
-                        "size_mode QUOTE_NOTIONAL requires quote_notional_usd",
-                    )
-                risk_pct = DEFAULT_CAPS.per_trade_risk_pct
-                notional = Decimal(str(intent["quote_notional_usd"]))
-            else:
-                raise EntryRejected("ORDER_REJECTED", f"unknown size_mode: {size_mode!r}")
-            stop_price = Decimal(str(intent["stop_price"])) if intent.get("stop_price") else None
-            leverage = float(intent["leverage"]) if intent.get("leverage") is not None else 1.0
             take_profits = tuple(Decimal(str(value)) for value in intent.get("take_profits", []))
-            verdict = evaluate_risk(
-                request=RiskRequest(
-                    symbol=payload["symbol"],
-                    side=side.value,
-                    entry_price=risk_entry_price,
-                    stop_price=stop_price,
-                    quantity=None,
-                    risk_pct=risk_pct,
-                    leverage=leverage,
-                    notional_usd=notional,
-                ),
-                caps=DEFAULT_CAPS,
-                equity=Decimal(account.balance),
-                open_positions=position_count,
-                # No realized-PnL source exists in this slice, so the daily-loss
-                # cap is passed as unavailable and recorded as unevaluated
-                # instead of a silent zero (slice-18 follow-up).
-                daily_loss_usd=None,
-                mark_price=reference_price,
-                mark_as_of=mark_as_of,
-                now=now,
-                tick_size=contract.tick_size,
-                step_size=contract.step_size,
-                min_notional=contract.min_notional,
-            )
-        except (KeyError, TypeError, ValueError, ArithmeticError) as exc:
-            # A malformed persisted intent must not surface as an unhandled 500.
+        except (TypeError, ValueError, ArithmeticError) as exc:
             raise EntryRejected("ORDER_REJECTED", f"the entry intent is invalid: {exc}") from exc
-        risk_verdict_id = f"RISK-{_digest(f'{trigger_id}:{decision.decision_id}')}"
-        requested_payload = {
-            "entry_price": str(risk_entry_price),
-            "stop_price": str(stop_price) if stop_price is not None else "0",
-            "quantity": None,
-            "risk_pct": risk_pct,
-            "leverage": leverage,
-            "notional_usd": str(notional) if notional is not None else None,
-        }
-        verdict_payload = verdict_to_contract(verdict, requested_payload=requested_payload)
-        self._store.save_risk_verdict(
-            RiskVerdictRecord(
-                risk_verdict_id=risk_verdict_id,
-                trigger_id=trigger_id,
-                decision_id=decision.decision_id,
-                verdict=verdict.verdict.value,
-                binding_cap=verdict.binding_cap.value,
-                computed_at=verdict.computed_at,
-                expires_at=verdict.expires_at,
-                payload_json=json.dumps(verdict_payload, sort_keys=True),
-            )
-        )
-        record_audit(
-            self._store,
-            event_type="RISK_VERDICT",
-            actor={"kind": "SYSTEM", "id": "risk_gate"},
-            subject={"kind": "RISK_VERDICT", "id": risk_verdict_id},
-            payload={"verdict": verdict.verdict, "binding_cap": verdict.binding_cap},
-            at=now,
-        )
-        if verdict.verdict == "BLOCK" or verdict.allowed_quantity is None:
+
+        if verdict_value == "BLOCK" or allowed_quantity is None:
             self._update_trigger(
                 trigger,
                 status="BLOCKED",
-                rejection_reason=f"risk blocked: {verdict.binding_cap}",
+                rejection_reason=f"risk blocked: {binding_cap}",
                 risk_verdict=verdict_payload,
             )
             raise EntryRejected(
                 "RISK_BLOCKED",
-                f"risk gate blocked the entry ({verdict.binding_cap})",
+                f"risk gate blocked the entry ({binding_cap})",
             )
         approval_id = f"APR-{_digest(f'{trigger_id}:{idempotency_key}')}"
         order_intent = OrderIntent(
             symbol=payload["symbol"],
             side=OrderSide.BUY if side is PositionSide.LONG else OrderSide.SELL,
             order_type=OrderType.MARKET,
-            quantity=verdict.allowed_quantity,
+            quantity=allowed_quantity,
             price=None,
             stop_price=stop_price,
             take_profits=take_profits,
-            leverage=verdict.allowed_leverage,
+            leverage=allowed_leverage,
             decision_id=decision.decision_id,
             risk_verdict_id=risk_verdict_id,
             approval_id=approval_id,
             idempotency_key=idempotency_key,
             position_side=side,
-            risk_amount_usd=verdict.risk_amount_usd,
+            risk_amount_usd=risk_amount_usd,
             risk_pct=risk_pct,
+            trigger_id=trigger_id,
         )
+        # Re-check under the write window: a concurrent accept may have
+        # committed between our first lookup and here (equity then changed, so
+        # the verdict binding would fail for no real reason).
+        raced = self._store.get_entry_order_for_trigger(trigger_id)
+        if raced is not None:
+            if raced.idempotency_key == idempotency_key:
+                return self._replay(raced.order_id, payload)
+            return self._adopt_entry(trigger, raced, now=now, actor_id=actor_id)
         try:
             result = self._gateway.submit(
                 order_intent,
@@ -514,6 +649,15 @@ class EntryService:
                 mark_as_of=mark_as_of,
             )
         except GatewayError as exc:
+            # If an entry order exists for this trigger, it is the only order
+            # this trigger may ever have: replay/adopt it instead of surfacing
+            # a race-specific error (D6). A real block with no order still
+            # raises below.
+            entry = self._store.get_entry_order_for_trigger(trigger_id)
+            if entry is not None:
+                if entry.idempotency_key == idempotency_key:
+                    return self._replay(entry.order_id, payload)
+                return self._adopt_entry(trigger, entry, now=now, actor_id=actor_id)
             raise EntryRejected(exc.code, exc.message) from exc
 
         human_action = {
@@ -561,13 +705,14 @@ class EntryService:
         now = utc_timestamp(self._clock.now())
         payload["status"] = "REJECTED"
         payload["rejection_reason"] = reason
-        payload["human_action"] = {
+        human_action = {
             "action": "REJECT",
             "actor": {"kind": "USER", "id": actor_id},
             "at": now,
             "reason": reason,
             "confirmation_token_used": False,
         }
+        payload["human_action"] = human_action
         record = replace(
             trigger,
             status="REJECTED",
@@ -599,6 +744,7 @@ class EntryService:
         return OpportunityService(store=self._store, clock=self._clock).show(opportunity_id)
 
     def _mark(self, opportunity: Any) -> tuple[Decimal, str]:
+        """The reference mark and its timestamp."""
         report_id = str(opportunity.source.get("report_id", ""))
         report = self._store.get_report(report_id) if report_id else None
         if report is None:
@@ -611,6 +757,234 @@ class EntryService:
         if not isinstance(as_of, str) or not as_of:
             raise EntryRejected("DATA_UNAVAILABLE", "the snapshot has no as_of timestamp")
         return Decimal(str(value)), as_of
+
+    def _evaluate_and_persist_risk(
+        self,
+        *,
+        trigger_id: str,
+        trigger_payload: dict[str, Any],
+        decision_id: str,
+        intent: dict[str, Any],
+        seed: str,
+    ) -> _RiskEvaluation:
+        """Recompute the deterministic caps and persist the verdict (D2)."""
+        opportunity = self._opportunity(trigger_payload["opportunity_id"])
+        reference_price, mark_as_of = self._mark(opportunity)
+        contract = self._store.get_symbol(trigger_payload["symbol"])
+        if contract is None:
+            # Fail closed: without tick/step/min-notional the gate would size and
+            # round as if every filter were zero, which is unsafe.
+            raise EntryRejected(
+                "DATA_UNAVAILABLE",
+                f"the symbol contract for {trigger_payload['symbol']} is missing",
+            )
+        now = utc_timestamp(self._clock.now())
+        if self._paper is not None:
+            summary = self._paper.summary()
+            equity = Decimal(str(summary["equity"]))
+            open_positions = int(summary["open_positions"])
+        else:
+            account = self._broker.account()
+            equity = Decimal(account.balance)
+            open_positions = len(self._store.list_positions(state="OPEN", limit=None))
+        caps, _source = effective_caps(self._settings, self._store)
+        side = str(trigger_payload["side"])
+        try:
+            # size_mode is exclusive: only the governing sizing field is read,
+            # and a persisted intent that violates the mode is rejected rather
+            # than silently sized by the other field.
+            size_mode = intent.get("size_mode")
+            if size_mode == "RISK_PCT":
+                if intent.get("risk_pct") is None:
+                    raise EntryRejected("ORDER_REJECTED", "size_mode RISK_PCT requires risk_pct")
+                risk_pct = float(intent["risk_pct"])
+                notional = None
+            elif size_mode == "QUOTE_NOTIONAL":
+                if intent.get("quote_notional_usd") is None:
+                    raise EntryRejected(
+                        "ORDER_REJECTED",
+                        "size_mode QUOTE_NOTIONAL requires quote_notional_usd",
+                    )
+                risk_pct = caps.per_trade_risk_pct
+                notional = Decimal(str(intent["quote_notional_usd"]))
+            else:
+                raise EntryRejected("ORDER_REJECTED", f"unknown size_mode: {size_mode!r}")
+            stop_price = Decimal(str(intent["stop_price"])) if intent.get("stop_price") else None
+            leverage = float(intent["leverage"]) if intent.get("leverage") is not None else 1.0
+            expected_slippage_bps = self._expected_slippage_bps(intent, reference_price)
+            spread_bps = self._spread_bps(trigger_payload)
+            # No realized-PnL source exists in this slice, so the daily-loss cap
+            # is passed as unavailable and recorded as unevaluated instead of a
+            # silent zero (D1).
+            daily_loss_usd: Decimal | None = None
+            verdict = evaluate_risk(
+                request=RiskRequest(
+                    symbol=trigger_payload["symbol"],
+                    side=side,
+                    entry_price=reference_price,
+                    stop_price=stop_price,
+                    quantity=None,
+                    risk_pct=risk_pct,
+                    leverage=leverage,
+                    notional_usd=notional,
+                ),
+                caps=caps,
+                equity=equity,
+                open_positions=open_positions,
+                daily_loss_usd=daily_loss_usd,
+                mark_price=reference_price,
+                mark_as_of=mark_as_of,
+                now=now,
+                tick_size=contract.tick_size,
+                step_size=contract.step_size,
+                min_notional=contract.min_notional,
+                spread_bps=spread_bps,
+                expected_slippage_bps=expected_slippage_bps,
+            )
+        except (KeyError, TypeError, ValueError, ArithmeticError) as exc:
+            # A malformed persisted intent must not surface as an unhandled 500.
+            raise EntryRejected("ORDER_REJECTED", f"the entry intent is invalid: {exc}") from exc
+
+        risk_verdict_id = f"RISK-{_digest(seed)}"
+        requested_payload = {
+            "entry_price": str(reference_price),
+            "stop_price": str(stop_price) if stop_price is not None else "0",
+            "quantity": None,
+            "risk_pct": risk_pct,
+            "leverage": leverage,
+            "notional_usd": str(notional) if notional is not None else None,
+        }
+        verdict_payload = verdict_to_contract(verdict, requested_payload=requested_payload)
+        self._store.save_risk_verdict(
+            RiskVerdictRecord(
+                risk_verdict_id=risk_verdict_id,
+                trigger_id=trigger_id,
+                decision_id=decision_id,
+                verdict=verdict.verdict.value,
+                binding_cap=verdict.binding_cap.value,
+                computed_at=verdict.computed_at,
+                expires_at=verdict.expires_at,
+                payload_json=json.dumps(verdict_payload, sort_keys=True),
+                spread_bps=spread_bps,
+                expected_slippage_bps=expected_slippage_bps,
+                daily_loss_usd=None if daily_loss_usd is None else str(daily_loss_usd),
+            )
+        )
+        record_audit(
+            self._store,
+            event_type="RISK_VERDICT",
+            actor={"kind": "SYSTEM", "id": "risk_gate"},
+            subject={"kind": "RISK_VERDICT", "id": risk_verdict_id},
+            payload={"verdict": verdict.verdict, "binding_cap": verdict.binding_cap},
+            at=now,
+        )
+        return _RiskEvaluation(
+            verdict=verdict,
+            payload=verdict_payload,
+            verdict_id=risk_verdict_id,
+            reference_price=reference_price,
+            mark_as_of=mark_as_of,
+        )
+
+    def _expected_slippage_bps(
+        self, intent: dict[str, Any], reference_price: Decimal
+    ) -> float | None:
+        """``|advisory entry - mark| / mark * 10000``; 0 when equal (D2)."""
+        advisory = intent.get("entry_price")
+        if advisory in (None, "") or reference_price <= 0:
+            return None
+        try:
+            advisory_price = Decimal(str(advisory))
+        except (ArithmeticError, TypeError, ValueError):
+            return None
+        return float(abs(advisory_price - reference_price) / reference_price * Decimal("10000"))
+
+    def _spread_bps(self, trigger_payload: dict[str, Any]) -> float | None:
+        """The spread measured in the trigger snapshot, else ``None`` (D2).
+
+        Only the trigger snapshot is authoritative; a value in the report
+        snapshot is not a substitute and is never silently trusted.
+
+        The frozen trigger contract's snapshot carries no bid/ask/spread today,
+        so production always returns ``None``: ``spread_bps`` is named in
+        ``stale_inputs`` and the card reports ``data_quality=PARTIAL``. The 15
+        bps cap is wired but inert until a live book feed supplies bid/ask (no
+        contract change in this slice).
+        """
+        source = trigger_payload.get("snapshot")
+        if not isinstance(source, dict):
+            return None
+        raw = source.get("spread_bps")
+        if raw is not None:
+            try:
+                return float(raw)
+            except (TypeError, ValueError):
+                return None
+        bid = source.get("bid")
+        ask = source.get("ask")
+        if bid is not None and ask is not None:
+            try:
+                bid_price = Decimal(str(bid))
+                ask_price = Decimal(str(ask))
+            except (ArithmeticError, TypeError, ValueError):
+                return None
+            mid = (bid_price + ask_price) / Decimal("2")
+            if bid_price > 0 and ask_price >= bid_price and mid > 0:
+                return float((ask_price - bid_price) / mid * Decimal("10000"))
+        return None
+
+    def _data_quality(self, risk_stage: dict[str, Any], evaluated: bool) -> str:
+        """PARTIAL whenever a named gate input is stale (honesty over optimism)."""
+        stale = risk_stage.get("stale_inputs") or []
+        if not evaluated or stale or risk_stage.get("error_code"):
+            return "PARTIAL"
+        return "COMPLETE"
+
+    def _decision_card(
+        self,
+        *,
+        trigger_id: str,
+        trigger_payload: dict[str, Any],
+        envelope: dict[str, Any],
+        risk_stage: dict[str, Any],
+        data_quality: str,
+        error_code: str | None,
+    ) -> dict[str, Any]:
+        entry = envelope.get("entry_recheck") or {}
+        decision_id = envelope.get("decision_id")
+        return {
+            "decision_id": decision_id,
+            "trigger_id": trigger_id,
+            "status": trigger_payload.get("status"),
+            "rejection_reason": trigger_payload.get("rejection_reason"),
+            "data_quality": data_quality,
+            "error_code": error_code,
+            "stage_order": ["TRIGGER", "LLM", "RISK", "HUMAN"],
+            "trigger": {
+                "trigger_id": trigger_id,
+                "opportunity_id": trigger_payload.get("opportunity_id"),
+                "symbol": trigger_payload.get("symbol"),
+                "side": trigger_payload.get("side"),
+                "status": trigger_payload.get("status"),
+                "trigger_source": trigger_payload.get("trigger_source"),
+                "triggered_at": trigger_payload.get("triggered_at"),
+                "snapshot": trigger_payload.get("snapshot"),
+                "condition_results": trigger_payload.get("condition_results", []),
+                "provenance": "CALC",
+            },
+            "llm": {
+                "decision_id": decision_id,
+                "decision": entry.get("decision"),
+                "validation_status": envelope.get("validation_status"),
+                "confidence": envelope.get("confidence"),
+                "rationale": envelope.get("rationale"),
+                "reasons": entry.get("reasons", []),
+                "provenance": "LLM",
+            },
+            "risk": risk_stage,
+            "human_action": None,
+            "entry_decision_id": decision_id,
+        }
 
     def _timeframe(self, opportunity: Any) -> str:
         """The scan period this opportunity came from (never a hardcoded literal)."""
@@ -727,6 +1101,70 @@ class EntryService:
             # A repeat reject may find the opportunity already terminal; that is
             # the only transition failure we tolerate. Anything else propagates.
             return
+
+    def _bound_recheck_verdict(
+        self, trigger_id: str, decision_id: str, payload: dict[str, Any]
+    ) -> RiskVerdictRecord | None:
+        """The persisted verdict the human-approved card was rendered from (S2).
+
+        The verdict id is deterministic (``trigger:decision:recheck``), so the
+        binding does not require a new field on the closed trigger contract.
+        """
+        if not isinstance(payload.get("risk_verdict"), dict):
+            return None
+        verdict_id = f"RISK-{_digest(f'{trigger_id}:{decision_id}:recheck')}"
+        record = self._store.get_risk_verdict(verdict_id)
+        if record is None or record.decision_id != decision_id:
+            raise EntryRejected(
+                "CONFLICT",
+                "the risk verdict for this re-check is not persisted; run the re-check again",
+            )
+        return record
+
+    def _adopt_entry(
+        self,
+        trigger: TriggerEventRecord,
+        entry: OrderRecord,
+        *,
+        now: str,
+        actor_id: str,
+    ) -> EntryResult:
+        """Reconcile a committed order whose trigger update was lost (DB-1)."""
+        order_payload = json.loads(entry.payload_json)
+        verdict_record = self._store.get_risk_verdict(
+            str(order_payload.get("risk_verdict_id") or "")
+        )
+        verdict_payload: dict[str, Any] = (
+            json.loads(verdict_record.payload_json) if verdict_record is not None else {}
+        )
+        human_action = {
+            "action": "ACCEPT",
+            "actor": {"kind": "USER", "id": actor_id},
+            "at": now,
+            "reason": "reconciled the already-committed paper order",
+            "confirmation_token_used": False,
+        }
+        updated_payload = self._update_trigger(
+            trigger,
+            status="ACCEPTED",
+            risk_verdict=verdict_payload or None,
+            human_action=human_action,
+            created_order_id=entry.order_id,
+            entry_decision_id=entry.decision_id,
+        )
+        record_audit(
+            self._store,
+            event_type="TRIGGER_ACCEPTED",
+            actor={"kind": "USER", "id": actor_id},
+            subject={"kind": "TRIGGER", "id": trigger.trigger_id},
+            payload={
+                "order_id": entry.order_id,
+                "environment": "PAPER",
+                "reconciled": True,
+            },
+            at=now,
+        )
+        return self._replay(entry.order_id, updated_payload)
 
     def _replay(self, order_id: str, trigger_payload: dict[str, Any]) -> EntryResult:
         order = self._store.get_order(order_id)

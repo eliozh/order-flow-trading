@@ -276,7 +276,7 @@ def recheck_trigger(
         result,
         request_id=new_request_id(),
         provenance="MIXED",
-        data_quality="COMPLETE",
+        data_quality="PARTIAL" if result.get("data_quality") == "PARTIAL" else "COMPLETE",
     )
     complete(request, key=key, request_hash=request_hash, envelope=envelope, status=200)
     return envelope

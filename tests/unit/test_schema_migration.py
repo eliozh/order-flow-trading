@@ -85,7 +85,7 @@ def test_v1_database_upgrades_to_v2_with_effective_checks(tmp_path: Path) -> Non
     finally:
         connection.close()
 
-    assert versions == {1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19}
+    assert versions == {1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20}
 
 
 _V2_BACKFILL = """
@@ -143,7 +143,7 @@ def test_v2_database_gains_the_backfill_heartbeat_column(tmp_path: Path) -> None
 
     assert "updated_at" in columns
     assert updated_at == "2026-11-06T00:00:00.000Z"
-    assert versions == {1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19}
+    assert versions == {1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20}
 
 
 def test_v5_checks_indexes_and_foreign_keys(tmp_path: Path) -> None:
@@ -240,7 +240,7 @@ def test_v5_database_migrates_manifest_metrics_columns(tmp_path: Path) -> None:
 
     assert {"metric_version", "input_manifest_hash", "window_start", "window_end"} <= columns
     assert legacy == ("/tmp/legacy.parquet", None, None)
-    assert versions == {1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19}
+    assert versions == {1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20}
 
 
 def test_v6_database_migrates_starred_columns(tmp_path: Path) -> None:
@@ -299,7 +299,7 @@ def test_v6_database_migrates_starred_columns(tmp_path: Path) -> None:
 
     assert {"starred", "starred_at"} <= columns
     assert row == ("BTCUSDT", 0, None)
-    assert versions == {1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19}
+    assert versions == {1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20}
 
 
 def test_manifest_run_metadata_columns_are_added_idempotently(tmp_path: Path) -> None:
@@ -316,7 +316,7 @@ def test_manifest_run_metadata_columns_are_added_idempotently(tmp_path: Path) ->
         connection.close()
 
     assert {"run_id", "last_n", "recomputed_from", "parent_run_id"} <= columns
-    assert versions == {1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19}
+    assert versions == {1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20}
 
 
 _V12_JOB_RUNS = """
@@ -382,7 +382,7 @@ def test_v12_database_gains_the_job_run_scope_symbol_column(tmp_path: Path) -> N
 
     assert "symbol" in columns
     assert symbol is None  # pre-v13 batch rows keep a null (batch) scope
-    assert versions == {1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19}
+    assert versions == {1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20}
 
 
 _V13_JOB_RUNS = """
@@ -633,7 +633,7 @@ def test_v9_database_upgrades_to_v10_with_ledgers_and_indexes(tmp_path: Path) ->
     finally:
         connection.close()
 
-    assert versions == {1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19}
+    assert versions == {1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20}
     assert "llm_json" in report_columns
     assert {
         "llm_calls",
@@ -785,7 +785,7 @@ def test_v15_prompt_and_llm_rows_upgrade_to_v16_and_seed_only_missing_families(
         "entry_recheck:system",
     }
     assert tuple(llm_defaults) == ("", 1, "")
-    assert versions == {1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19}
+    assert versions == {1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20}
 
 
 def test_prompt_versions_are_immutable_and_have_one_active_row_per_prompt(
@@ -947,7 +947,7 @@ def test_v16_database_gains_budget_periods_settings_and_provider_capabilities(
     assert {"budget_ledger_week", "budget_ledger_month"} <= indexes
     # 2026-11-04 is ISO week 2026-W45.
     assert tuple(backfilled) == ("2026-11-04", "2026-W45", "2026-11", "")
-    assert versions == {1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19}
+    assert versions == {1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20}
 
 
 def _v16_budget_connection(settings: Settings) -> sqlite3.Connection:
@@ -1130,7 +1130,7 @@ def test_v18_trigger_events_gain_snapshot_provenance_and_backfill(
     assert tuple(good) == ("HASH-V18", "2026-11-09T10:00:00.000Z", "PARTIAL", 2)
     # A malformed legacy payload is skipped with its defaults, never aborting boot.
     assert tuple(bad) == ("", "", "", 0)
-    assert versions == {1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19}
+    assert versions == {1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20}
     skipped = [
         record
         for record in caplog.records
@@ -1196,9 +1196,9 @@ def test_concurrent_initializes_upgrade_v19_idempotently(tmp_path: Path) -> None
         connection.close()
     assert {"snapshot_hash", "as_of", "data_quality", "condition_count"} <= columns
     assert tuple(good) == ("HASH-V18", "2026-11-09T10:00:00.000Z", "PARTIAL", 2)
-    # Exactly one recorded v19 upgrade, and the schema did not gain stray rows.
+    # Exactly one recorded v19 upgrade; v20 is recorded on the same boot.
     assert versions == {19}
-    assert highest_version == 19
+    assert highest_version == 20
     assert immutable_triggers == 1
     assert journal_mode.lower() == "wal"
 
@@ -1263,3 +1263,24 @@ def test_replaying_the_v18_backfill_preserves_evaluation_columns(tmp_path: Path)
     finally:
         connection.close()
     assert tuple(row) == ("70000.00", "2026-11-06T12:00:00.000Z", 1)
+
+
+def test_v20_orders_bind_to_their_trigger_and_index_the_ledger(tmp_path: Path) -> None:
+    settings = Settings(env="test", port=8765, data_dir=tmp_path / "data")
+    SqliteStore(settings).initialize()
+
+    connection = sqlite3.connect(database_path(settings))
+    try:
+        order_columns = {row[1] for row in connection.execute("PRAGMA table_info(orders)")}
+        verdict_columns = {row[1] for row in connection.execute("PRAGMA table_info(risk_verdicts)")}
+        order_indexes = {row[1] for row in connection.execute("PRAGMA index_list(orders)")}
+        verdict_indexes = {row[1] for row in connection.execute("PRAGMA index_list(risk_verdicts)")}
+        position_indexes = {row[1] for row in connection.execute("PRAGMA index_list(positions)")}
+    finally:
+        connection.close()
+
+    assert {"trigger_id", "decision_id", "purpose"} <= order_columns
+    assert {"spread_bps", "expected_slippage_bps", "daily_loss_usd"} <= verdict_columns
+    assert "orders_one_entry_per_trigger" in order_indexes
+    assert "risk_verdicts_trigger_id" in verdict_indexes
+    assert "positions_account_id" in position_indexes

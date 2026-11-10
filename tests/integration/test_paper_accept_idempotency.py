@@ -3,6 +3,8 @@
 from __future__ import annotations
 
 import json
+import threading
+from concurrent.futures import ThreadPoolExecutor
 from dataclasses import replace
 from datetime import UTC, date, datetime, timedelta
 from decimal import Decimal
@@ -11,7 +13,7 @@ from pathlib import Path
 import pytest
 
 from oft.adapters.llm_stub import LLMStub
-from oft.application.entry_service import EntryRejected, EntryService
+from oft.application.entry_service import EntryRejected, EntryResult, EntryService
 from oft.application.execution_gateway import AuthContext, ExecutionGateway, GatewayError
 from oft.application.kill_switch import KillSwitch, KillSwitchActive
 from oft.application.paper_broker import OrderIntent, PaperBroker
@@ -21,7 +23,7 @@ from oft.bootstrap import build_container
 from oft.clock import FixedClock
 from oft.config import Settings
 from oft.domain.oms import OrderSide, OrderType, PositionSide
-from oft.domain.risk import DEFAULT_CAPS, RiskRequest, verdict_inputs_hash
+from oft.domain.risk import RiskRequest, verdict_inputs_hash
 from oft.domain.time import utc_timestamp
 from oft.ports.llm import LLMRole
 from oft.ports.store import (
@@ -205,6 +207,35 @@ def test_replay_finds_the_fill_by_order_id_not_a_recent_page(tmp_path: Path) -> 
     assert second.fill == first.fill
 
 
+def test_a_second_distinct_intent_creates_a_new_order(tmp_path: Path) -> None:
+    settings = _settings(tmp_path)
+    container = build_container(settings, initialize=True, clock=FixedClock(NOW))
+    container.backfill.run(symbol="BTCUSDT", data_type="aggTrades", start=START, end=END)
+    for period in ("4h", "8h"):
+        ScanService(container=container, lock=container.scan_lock).run(
+            ScanRequest(symbol="BTCUSDT", period=period, metrics_only=False, provider="stub")
+        )
+    opportunities = container.store.list_opportunities(state="OPEN")
+    assert len(opportunities) == 2
+    service = _entry(container)
+    order_ids: list[str] = []
+    for opportunity in opportunities:
+        run = TriggerService(store=container.store, clock=container.clock).evaluate(
+            opportunity.opportunity_id
+        )
+        assert run.trigger is not None
+        result = service.accept(
+            run.trigger.trigger_id, idempotency_key=f"accept-{opportunity.opportunity_id}"
+        )
+        assert result.order is not None
+        order_ids.append(str(result.order["order_id"]))
+
+    assert len(set(order_ids)) == 2
+    assert len(container.store.list_orders()) == 2
+    assert len(container.store.list_fills()) == 2
+    assert len(container.store.list_positions(state="OPEN")) == 2
+
+
 def test_cross_trigger_idempotency_key_is_a_conflict(tmp_path: Path) -> None:
     container, trigger_a = _container_and_trigger(tmp_path)
     service = _entry(container)
@@ -282,18 +313,22 @@ def test_reject_after_trigger_invalidates_the_triggered_opportunity(tmp_path: Pa
     assert events[-1].to_state == "INVALIDATED"
 
 
-def test_far_llm_entry_price_cannot_enlarge_the_risk_caps(tmp_path: Path) -> None:
+def test_far_llm_entry_price_is_blocked_by_the_slippage_cap(tmp_path: Path) -> None:
     container, trigger_id = _container_and_trigger(tmp_path)
     service = _entry_with_fixture(container, "entry_recheck_far_mark.json")
 
-    result = service.accept(trigger_id, idempotency_key="accept-far-mark")
+    with pytest.raises(EntryRejected) as excinfo:
+        service.accept(trigger_id, idempotency_key="accept-far-mark")
 
-    allowed = result.risk_verdict["allowed"]
-    allowed_quantity = Decimal(str(allowed["quantity"]))
-    allowed_notional = Decimal(str(allowed["notional_usd"]))
-    # Sized from the fill reference (~70k), not the advisory entry_price of 2.
-    assert allowed_quantity <= Decimal("0.01")
-    assert allowed_notional <= DEFAULT_CAPS.max_notional_usd
+    # The advisory entry price (2.00) is ~99,971 bps away from the ~70k mark,
+    # so the percentage-based gate blocks it instead of sizing from it.
+    assert excinfo.value.code == "RISK_BLOCKED"
+    assert container.store.list_orders() == ()
+    trigger = container.store.get_trigger_event(trigger_id)
+    assert trigger is not None
+    verdict = json.loads(trigger.payload_json)["risk_verdict"]
+    assert verdict["binding_cap"] == "SLIPPAGE"
+    assert verdict["verdict"] == "BLOCK"
 
 
 def test_limit_entry_type_is_rejected_and_creates_no_order(tmp_path: Path) -> None:
@@ -414,6 +449,24 @@ def test_gateway_requires_human_approval(tmp_path: Path) -> None:
     assert excinfo.value.code == "ORDER_REJECTED"
 
 
+def test_gateway_rejects_a_non_paper_intent(tmp_path: Path) -> None:
+    container, _trigger_id = _container_and_trigger(tmp_path)
+    gateway, _kill, _broker = _gateway(container)
+    intent = replace(_intent(), environment="LIVE")
+
+    with pytest.raises(GatewayError) as excinfo:
+        gateway.submit(
+            intent,
+            AuthContext(actor_id="cli", approval_id="APR-X"),
+            mark_price=Decimal("70000.00"),
+            mark_as_of="2026-11-06T12:00:00.000Z",
+        )
+
+    assert excinfo.value.code == "ORDER_REJECTED"
+    assert "PAPER" in excinfo.value.message
+    assert container.store.list_orders() == ()
+
+
 # -- N1: NO_ENTRY and missing-intent accept branches -----------------------
 
 
@@ -531,6 +584,9 @@ def test_gateway_returns_duplicate_for_a_used_idempotency_key(tmp_path: Path) ->
         leverage=float(verdict_payload["allowed"]["leverage"]),
         risk_pct=float(verdict_payload["requested"]["risk_pct"]),
         risk_amount_usd=Decimal(verdict_payload["allowed"]["risk_amount_usd"]),
+        # The stored intent hash binds the take-profits too; reproduce them so
+        # this is a genuine same-intent retry rather than a conflict.
+        take_profits=(Decimal("72000.00"),),
     )
 
     with pytest.raises(GatewayError) as excinfo:
@@ -542,6 +598,42 @@ def test_gateway_returns_duplicate_for_a_used_idempotency_key(tmp_path: Path) ->
         )
 
     assert excinfo.value.code == "ORDER_DUPLICATE"
+
+
+def test_gateway_rejects_a_different_intent_under_a_used_key(tmp_path: Path) -> None:
+    container, trigger_id = _container_and_trigger(tmp_path)
+    accepted = _entry(container).accept(trigger_id, idempotency_key="conflict-key")
+    order = container.store.list_orders()[0]
+    order_payload = json.loads(order.payload_json)
+    verdict = container.store.get_risk_verdict(order.risk_verdict_id)
+    assert verdict is not None
+    verdict_payload = json.loads(verdict.payload_json)
+    gateway, _kill, _broker = _gateway(container)
+    intent = _intent(
+        symbol=order.symbol,
+        quantity=accepted.order["quantity"],
+        decision_id=verdict.decision_id,
+        risk_verdict_id=order.risk_verdict_id,
+        approval_id=order_payload["approval_id"],
+        idempotency_key=order.idempotency_key,
+        stop_price=Decimal(order_payload["stop_price"]),
+        leverage=float(verdict_payload["allowed"]["leverage"]),
+        risk_pct=float(verdict_payload["requested"]["risk_pct"]),
+        risk_amount_usd=Decimal(verdict_payload["allowed"]["risk_amount_usd"]),
+        # A different take-profit set is a different intent under the same key.
+        take_profits=(Decimal("99999.00"),),
+    )
+
+    with pytest.raises(GatewayError) as excinfo:
+        gateway.submit(
+            intent,
+            AuthContext(actor_id="cli", approval_id=order_payload["approval_id"]),
+            mark_price=Decimal("70000.00"),
+            mark_as_of="2026-11-06T12:00:00.000Z",
+        )
+
+    assert excinfo.value.code == "IDEMPOTENCY_CONFLICT"
+    assert len(container.store.list_orders()) == 1
 
 
 # -- N3: the gateway binds the intent to the verdict -----------------------
@@ -809,9 +901,19 @@ def test_zero_risk_pct_is_not_silently_replaced(tmp_path: Path) -> None:
     _persist_entry_decision(container, trigger_id, intent=intent)
     service = _entry(container)
 
-    result = service.accept(trigger_id, idempotency_key="accept-zero-risk")
+    # A 0% proposal sizes to zero; it must block at MIN_NOTIONAL rather than
+    # being silently upsized to the per-trade cap.
+    with pytest.raises(EntryRejected) as excinfo:
+        service.accept(trigger_id, idempotency_key="accept-zero-risk")
 
-    assert result.risk_verdict["requested"]["risk_pct"] == 0.0
+    assert excinfo.value.code == "RISK_BLOCKED"
+    trigger = container.store.get_trigger_event(trigger_id)
+    assert trigger is not None
+    verdict = json.loads(trigger.payload_json)["risk_verdict"]
+    assert verdict["requested"]["risk_pct"] == 0.0
+    assert verdict["verdict"] == "BLOCK"
+    assert verdict["binding_cap"] == "MIN_NOTIONAL"
+    assert container.store.list_orders() == ()
 
 
 def test_missing_symbol_contract_fails_closed(
@@ -911,6 +1013,127 @@ def test_malformed_persisted_intent_numerics_are_rejected_not_raised(
     assert container.store.list_orders() == ()
 
 
+# -- D6: the database enforces one paper entry per trigger -----------------
+
+
+def _run_concurrently(attempts: int, action) -> list[object]:  # type: ignore[no-untyped-def]
+    barrier = threading.Barrier(attempts)
+
+    def run(index: int) -> object:
+        barrier.wait()
+        try:
+            return action(index)
+        except EntryRejected as exc:
+            return exc.code
+
+    with ThreadPoolExecutor(max_workers=attempts) as pool:
+        return list(pool.map(run, range(attempts)))
+
+
+def test_six_concurrent_distinct_keys_create_exactly_one_entry(tmp_path: Path) -> None:
+    container, trigger_id = _container_and_trigger(tmp_path)
+    service = _entry(container)
+    service.recheck(trigger_id)
+
+    results = _run_concurrently(
+        6,
+        lambda index: service.accept(trigger_id, idempotency_key=f"accept-race-{index}"),
+    )
+
+    orders = container.store.list_orders()
+    assert len(orders) == 1
+    assert len(container.store.list_fills()) == 1
+    assert len(container.store.list_positions(state="OPEN")) == 1
+    replayed = set()
+    for result in results:
+        if isinstance(result, EntryResult):
+            assert result.order is not None
+            replayed.add(str(result.order["order_id"]))
+    assert replayed == {orders[0].order_id}
+    assert orders[0].trigger_id == trigger_id
+    assert orders[0].purpose == "ENTRY"
+
+
+def test_concurrent_same_key_requests_replay_the_single_order(tmp_path: Path) -> None:
+    container, trigger_id = _container_and_trigger(tmp_path)
+    service = _entry(container)
+    service.recheck(trigger_id)
+
+    results = _run_concurrently(
+        6,
+        lambda _index: service.accept(trigger_id, idempotency_key="same-key-race"),
+    )
+
+    assert all(isinstance(result, EntryResult) for result in results)
+    order_ids = {
+        str(result.order["order_id"])
+        for result in results
+        if isinstance(result, EntryResult) and result.order is not None
+    }
+    orders = container.store.list_orders()
+    assert len(orders) == 1
+    assert order_ids == {orders[0].order_id}
+    assert len(container.store.list_fills()) == 1
+    assert len(container.store.list_positions(state="OPEN")) == 1
+
+
+def test_crash_after_the_order_commit_reconciles_on_retry(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    container, trigger_id = _container_and_trigger(tmp_path)
+    service = _entry(container)
+    service.recheck(trigger_id)
+    original_update = container.store.update_trigger_event
+
+    def _crash_after_commit(record):  # type: ignore[no-untyped-def]
+        raise RuntimeError("simulated crash after the OMS commit")
+
+    monkeypatch.setattr(container.store, "update_trigger_event", _crash_after_commit)
+    with pytest.raises(RuntimeError):
+        service.accept(trigger_id, idempotency_key="crash-first")
+    monkeypatch.setattr(container.store, "update_trigger_event", original_update)
+
+    committed = container.store.list_orders()
+    assert len(committed) == 1
+    assert committed[0].trigger_id == trigger_id
+    stale = container.store.get_trigger_event(trigger_id)
+    assert stale is not None
+    assert stale.status == "RECHECKED"
+    assert json.loads(stale.payload_json)["created_order_id"] is None
+
+    result = service.accept(trigger_id, idempotency_key="crash-retry")
+
+    assert result.order is not None
+    assert result.order["order_id"] == committed[0].order_id
+    assert len(container.store.list_orders()) == 1
+    assert len(container.store.list_fills()) == 1
+    assert len(container.store.list_positions(state="OPEN")) == 1
+    healed = container.store.get_trigger_event(trigger_id)
+    assert healed is not None
+    assert healed.status == "ACCEPTED"
+    assert json.loads(healed.payload_json)["created_order_id"] == committed[0].order_id
+
+
+def test_reject_surfaces_the_human_reason(tmp_path: Path) -> None:
+    container, trigger_id = _container_and_trigger(tmp_path)
+    service = _entry(container)
+
+    payload = service.reject(trigger_id, reason="spread too wide for the stop")
+
+    assert payload["rejection_reason"] == "spread too wide for the stop"
+    assert payload["human_action"]["reason"] == "spread too wide for the stop"
+    stored = container.store.get_trigger_event(trigger_id)
+    assert stored is not None
+    stored_payload = json.loads(stored.payload_json)
+    assert stored_payload["rejection_reason"] == "spread too wide for the stop"
+    audit = [
+        event
+        for event in container.store.list_audit_events(limit=10)
+        if event.event_type == "TRIGGER_REJECTED"
+    ]
+    assert "spread too wide for the stop" in audit[0].payload_json
+
+
 # -- helpers ---------------------------------------------------------------
 
 
@@ -936,6 +1159,7 @@ def _intent(
     risk_pct: float = 0.8,
     risk_amount_usd: Decimal = Decimal("10.00"),
     position_side: PositionSide = PositionSide.LONG,
+    take_profits: tuple[Decimal, ...] = (),
 ) -> OrderIntent:
     return OrderIntent(
         symbol=symbol,
@@ -944,7 +1168,7 @@ def _intent(
         quantity=Decimal(quantity),
         price=None,
         stop_price=stop_price,
-        take_profits=(),
+        take_profits=take_profits,
         leverage=leverage,
         decision_id=decision_id,
         risk_verdict_id=risk_verdict_id,
@@ -1011,8 +1235,15 @@ def _persist_verdict(
 
 def _matching_inputs_hash(container) -> str:
     """The digest the gateway recomputes for ``_persist_verdict``'s request."""
+    from oft.application.paper_account import compute_equity
+
     broker = PaperBroker(settings=container.settings, store=container.store, clock=container.clock)
     account = broker.account()
+    positions = container.store.list_positions(state="OPEN")
+    equity, _view = compute_equity(
+        Decimal(account.balance),
+        [json.loads(record.payload_json) for record in positions],
+    )
     request = RiskRequest(
         symbol="BTCUSDT",
         side="LONG",
@@ -1025,8 +1256,8 @@ def _matching_inputs_hash(container) -> str:
     )
     return verdict_inputs_hash(
         request,
-        equity=Decimal(account.balance),
-        open_positions=len(container.store.list_positions(state="OPEN")),
+        equity=equity,
+        open_positions=len(positions),
     )
 
 

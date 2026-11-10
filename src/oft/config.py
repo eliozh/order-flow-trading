@@ -50,6 +50,17 @@ class Environment(StrEnum):
 
 _VALID_LOG_LEVELS = frozenset({"DEBUG", "INFO", "WARNING", "ERROR", "CRITICAL"})
 
+# The canonical secret-field list shared by config, doctor, and prompt redaction.
+SECRET_FIELDS: tuple[str, ...] = (
+    "api_token",
+    "binance_api_key",
+    "binance_api_secret",
+    "openai_api_key",
+    "anthropic_api_key",
+    "deepseek_api_key",
+    "telegram_bot_token",
+)
+
 # A key may only be sent to the provider's official host or loopback unless the
 # operator opts into a custom host (S8).
 _OFFICIAL_LLM_HOSTS: dict[str, frozenset[str]] = {
@@ -119,6 +130,17 @@ class Settings(BaseSettings):
     paper_initial_balance: str = "10000.00"
     paper_slippage_bps: str = "2"
     paper_taker_fee_bps: str = "5"
+
+    # Percentage-based risk caps (ADR-0006, slice 18). These are the ``config``
+    # source; an operator row in ``system_state.risk_caps`` takes precedence.
+    risk_per_trade_pct: float = Field(default=0.8, gt=0, le=100, allow_inf_nan=False)
+    risk_max_concurrent_positions: int = Field(default=3, ge=1)
+    risk_daily_loss_pct: float = Field(default=3.0, gt=0, le=100, allow_inf_nan=False)
+    risk_max_leverage: float = Field(default=5.0, gt=0, le=125, allow_inf_nan=False)
+    risk_max_notional_pct: float = Field(default=20.0, gt=0, le=100, allow_inf_nan=False)
+    risk_max_slippage_bps: float = Field(default=25.0, gt=0, le=10000, allow_inf_nan=False)
+    risk_max_spread_bps: float = Field(default=15.0, gt=0, le=10000, allow_inf_nan=False)
+    risk_stale_mark_seconds: int = Field(default=60, ge=1)
 
     # Trigger evaluation cadence (ADR-0007: 15 s default, 5-60 s configurable).
     trigger_interval_seconds: int = Field(default=15, ge=5, le=60)
@@ -266,15 +288,7 @@ class Settings(BaseSettings):
     def _expand_optional_path(cls, value: Path | None) -> Path | None:
         return value.expanduser() if value is not None else None
 
-    @field_validator(
-        "api_token",
-        "binance_api_key",
-        "binance_api_secret",
-        "openai_api_key",
-        "anthropic_api_key",
-        "deepseek_api_key",
-        "telegram_bot_token",
-    )
+    @field_validator(*SECRET_FIELDS)
     @classmethod
     def _empty_secret_is_unset(cls, value: SecretStr | None) -> SecretStr | None:
         if value is not None and not value.get_secret_value().strip():

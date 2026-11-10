@@ -5,6 +5,7 @@ from __future__ import annotations
 import json
 import uuid
 from typing import Annotated, Any
+from urllib.parse import quote
 
 import typer
 
@@ -226,6 +227,76 @@ def _render_entry(data: dict[str, Any]) -> str:
         f"balance {account.get('balance', '-')} {account.get('currency', '')}".rstrip(),
     ]
     return "\n".join(lines)
+
+
+def _render_decision_card(card: dict[str, Any]) -> str:
+    """Render the decision card in its immutable TRIGGER -> LLM -> RISK -> HUMAN order."""
+    trigger = card.get("trigger") or {}
+    llm = card.get("llm") or {}
+    risk = card.get("risk") or {}
+    human = card.get("human_action")
+    status = card.get("status")
+    verdict = risk.get("verdict")
+    lines = [
+        f"TRIGGER {trigger.get('trigger_id', '-')} · {trigger.get('symbol', '-')}"
+        f" · {trigger.get('side', '-')} · {trigger.get('status', '-')} · CALC",
+        f"LLM {llm.get('decision', '-')} · {llm.get('validation_status', '-')}"
+        f" · confidence {llm.get('confidence', '-')} · LLM",
+        f"RISK {verdict or '-'} · binding {risk.get('binding_cap', '-')} · CALC",
+        f"STATUS {status or '-'} · data_quality {card.get('data_quality', '-')}",
+    ]
+    reasons = risk.get("reasons") or []
+    for reason in reasons:
+        lines.append(f"  reason: {reason}")
+    stale = risk.get("stale_inputs") or []
+    if stale:
+        lines.append("  stale: " + ", ".join(str(name) for name in stale))
+    if human is not None:
+        lines.append(
+            f"HUMAN {human.get('action', '-')} by {(human.get('actor') or {}).get('id', '-')}"
+            f" · {human.get('reason') or 'accepted'}"
+        )
+        return "\n".join(lines)
+    rejection_reason = card.get("rejection_reason") or risk.get("reasons")
+    actionable = status in {None, "RECHECKED"} and verdict in {"ALLOW", "REDUCE"}
+    if actionable:
+        lines.append(
+            f"HUMAN pending · accept: oft trigger accept {trigger.get('trigger_id', '<id>')}"
+            f" | reject: oft trigger reject {trigger.get('trigger_id', '<id>')} --reason <why>"
+        )
+    elif status in {"REJECTED", "BLOCKED", "EXPIRED"}:
+        reason = rejection_reason[0] if isinstance(rejection_reason, list) else rejection_reason
+        lines.append(f"HUMAN not available · {reason or status}")
+    else:
+        lines.append(f"HUMAN not available · risk {verdict or 'not evaluated'}")
+    return "\n".join(lines)
+
+
+@trigger_app.command("recheck")
+def trigger_recheck(
+    trigger_id: str,
+    idempotency_key: Annotated[
+        str | None,
+        typer.Option("--idempotency-key", help="Reuse a key to replay the same re-check."),
+    ] = None,
+    json_output: Annotated[bool, typer.Option("--json", help="Emit JSON.")] = False,
+) -> None:
+    """Run the entry re-check and render the ordered decision card."""
+    settings = _settings_or_exit(json_output)
+    key = idempotency_key or f"cli-recheck-{uuid.uuid4().hex}"
+    client = ApiClient.from_settings(settings)
+    try:
+        envelope = client._request(
+            "POST",
+            f"/api/v1/triggers/{quote(trigger_id, safe='')}/recheck",
+            {},
+            extra_headers={"Idempotency-Key": key},
+        )
+    except ApiClientError as exc:
+        emit_error(exc.code, exc.message, json_output=json_output)
+        raise typer.Exit(code=exit_code_for(exc.code)) from exc
+    data = envelope.get("data") or {}
+    typer.echo(json.dumps(envelope, indent=2) if json_output else _render_decision_card(data))
 
 
 @trigger_app.command("accept")

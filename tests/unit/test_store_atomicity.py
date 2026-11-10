@@ -14,6 +14,7 @@ from oft.ports.store import (
     FillRecord,
     IdempotencyRecord,
     ManifestEntry,
+    OmsConflictError,
     OrderRecord,
     PaperAccountRecord,
     PositionRecord,
@@ -151,7 +152,9 @@ def test_order_fill_position_and_audit_commit_together(tmp_path: Path) -> None:
     assert len(store.list_audit_events()) == 1
 
     # A failed OMS write must roll back the audit row written in the same unit.
-    with pytest.raises(sqlite3.IntegrityError):
+    # A duplicate order now surfaces as the typed OMS conflict, never a raw
+    # sqlite IntegrityError (DB-2).
+    with pytest.raises(OmsConflictError) as excinfo:
         store.save_order_fill_position(
             order=order,
             fill=fill,
@@ -159,6 +162,7 @@ def test_order_fill_position_and_audit_commit_together(tmp_path: Path) -> None:
             account=account,
             audit=_audit("2"),
         )
+    assert excinfo.value.constraint == "idempotency_key"
 
     audit_events = store.list_audit_events()
     assert len(audit_events) == 1

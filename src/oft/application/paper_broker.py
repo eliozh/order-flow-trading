@@ -26,7 +26,6 @@ from oft.domain.oms import (
     order_from_intent,
     position_from_fill,
 )
-from oft.domain.time import utc_timestamp
 from oft.ports.clock import ClockPort
 from oft.ports.store import (
     AuditEventDraft,
@@ -69,6 +68,7 @@ class OrderIntent:
     environment: str = "PAPER"
     purpose: str = "entry"
     account_id: str = _DEFAULT_ACCOUNT_ID
+    trigger_id: str | None = None
 
     def hash(self) -> str:
         return intent_hash(
@@ -107,21 +107,14 @@ class PaperBroker:
         self._clock = clock
         self._slippage = Decimal(settings.paper_slippage_bps) / Decimal("10000")
         self._taker_fee = Decimal(settings.paper_taker_fee_bps) / Decimal("10000")
-        self._initial_balance = Decimal(settings.paper_initial_balance)
 
     def account(self) -> PaperAccountRecord:
-        existing = self._store.get_paper_account(_DEFAULT_ACCOUNT_ID)
-        if existing is not None:
-            return existing
-        now = utc_timestamp(self._clock.now())
-        return PaperAccountRecord(
-            account_id=_DEFAULT_ACCOUNT_ID,
-            environment="PAPER",
-            currency="USDT",
-            initial_balance=str(self._initial_balance),
-            balance=str(self._initial_balance),
-            updated_at=now,
-        )
+        """Delegate to the account service so the seed and read model agree."""
+        from oft.application.paper_account import PaperAccountService
+
+        return PaperAccountService(
+            settings=self._settings, store=self._store, clock=self._clock
+        ).ensure()
 
     def submit(
         self,
@@ -132,6 +125,10 @@ class PaperBroker:
         now: str,
         audit_actor: dict[str, Any] | None = None,
     ) -> BrokerResult:
+        # Defense in depth (S5): the gateway enforces PAPER, but the broker must
+        # not fill a live/test intent even if a future caller reaches it.
+        if intent.environment != "PAPER":
+            raise BrokerError("the paper broker only accepts PAPER orders")
         if intent.quantity <= 0:
             raise BrokerError("quantity must be positive")
         if mark_price <= 0:
@@ -146,7 +143,13 @@ class PaperBroker:
         balance_delta = str(-(quote_quantity + fee))
 
         digest = intent.hash()
-        client_id = client_order_id(intent.environment, intent.symbol, intent.purpose, digest)
+        # D6: the deterministic client id binds the decision and the intent.
+        client_id = client_order_id(
+            intent.environment,
+            intent.symbol,
+            intent.purpose,
+            f"{intent.decision_id}|{digest}",
+        )
         order_id = deterministic_id("ORD", f"{client_id}:order")
         fill_id = deterministic_id("FIL", f"{client_id}:fill")
         position_id = deterministic_id("POS", f"{client_id}:position")
@@ -209,7 +212,7 @@ class PaperBroker:
             updated_at=now,
         )
         commit = self._store.save_order_fill_position(
-            order=_order_record(order),
+            order=_order_record(order, intent),
             fill=_fill_record(fill),
             position=_position_record(position),
             account=updated_account,
@@ -255,7 +258,7 @@ def _complete_fill(order: Order, fill: Fill, *, at: str) -> Order:
     )
 
 
-def _order_record(order: Order) -> OrderRecord:
+def _order_record(order: Order, intent: OrderIntent) -> OrderRecord:
     return OrderRecord(
         order_id=order.order_id,
         client_order_id=order.client_order_id,
@@ -267,6 +270,9 @@ def _order_record(order: Order) -> OrderRecord:
         created_at=order.created_at,
         updated_at=order.updated_at,
         payload_json=json.dumps(order.to_contract(), sort_keys=True),
+        trigger_id=intent.trigger_id,
+        decision_id=intent.decision_id,
+        purpose=intent.purpose.upper(),
     )
 
 

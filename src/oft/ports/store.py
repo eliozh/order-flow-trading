@@ -40,6 +40,20 @@ class BudgetRecordConflictError(Exception):
     """
 
 
+class OmsConflictError(Exception):
+    """A unique order constraint rejected the paper OMS insert.
+
+    ``constraint`` names which invariant fired so the gateway can reconcile
+    (``trigger_entry`` -> one entry per trigger, ``idempotency_key`` -> replay
+    or conflict, ``client_order_id`` -> duplicate intent).
+    """
+
+    def __init__(self, constraint: str) -> None:
+        super().__init__(f"order unique constraint violated: {constraint}")
+        self.constraint = constraint
+        self.message = f"order unique constraint violated: {constraint}"
+
+
 @dataclass(frozen=True)
 class SymbolUpsertResult:
     """Row counts from one idempotent symbol-registry ingest."""
@@ -423,7 +437,11 @@ class TriggerEventRecord:
 
 @dataclass(frozen=True)
 class RiskVerdictRecord:
-    """A persisted deterministic risk verdict."""
+    """A persisted deterministic risk verdict.
+
+    The measured gate inputs are stored alongside the contract-valid payload so
+    the gateway can re-derive ``inputs_hash`` without re-measuring them (D1).
+    """
 
     risk_verdict_id: str
     trigger_id: str
@@ -433,6 +451,9 @@ class RiskVerdictRecord:
     computed_at: str
     expires_at: str
     payload_json: str
+    spread_bps: float | None = None
+    expected_slippage_bps: float | None = None
+    daily_loss_usd: str | None = None
 
 
 @dataclass(frozen=True)
@@ -447,6 +468,9 @@ class OrderRecord:
     created_at: str
     updated_at: str
     payload_json: str
+    trigger_id: str | None = None
+    decision_id: str | None = None
+    purpose: str = "ENTRY"
 
 
 @dataclass(frozen=True)
@@ -925,6 +949,10 @@ class StorePort(Protocol):
 
     def get_order_by_client_order_id(self, client_order_id: str) -> OrderRecord | None: ...
 
+    def get_entry_order_for_trigger(self, trigger_id: str) -> OrderRecord | None:
+        """The one entry order bound to a trigger, if any (D6)."""
+        ...
+
     def list_orders(self, *, limit: int = 100, offset: int = 0) -> tuple[OrderRecord, ...]: ...
 
     def count_orders(self) -> int: ...
@@ -936,7 +964,7 @@ class StorePort(Protocol):
     def get_fill_by_order_id(self, order_id: str) -> FillRecord | None: ...
 
     def list_positions(
-        self, *, state: str | None = None, limit: int = 100, offset: int = 0
+        self, *, state: str | None = None, limit: int | None = 100, offset: int = 0
     ) -> tuple[PositionRecord, ...]: ...
 
     def count_positions(self, *, state: str | None = None) -> int: ...
@@ -947,6 +975,10 @@ class StorePort(Protocol):
 
     def save_paper_account(self, record: PaperAccountRecord) -> None: ...
 
+    def seed_paper_account(self, record: PaperAccountRecord) -> PaperAccountRecord:
+        """Insert the seed row once; never overwrite a live balance (D3)."""
+        ...
+
     # -- Audit and system state ------------------------------------------
 
     def save_audit_event(self, record: AuditEventRecord) -> None: ...
@@ -955,8 +987,24 @@ class StorePort(Protocol):
 
     def list_audit_events(self, *, limit: int = 100) -> tuple[AuditEventRecord, ...]: ...
 
+    def list_audit_events_ascending(
+        self, *, limit: int | None = None
+    ) -> tuple[AuditEventRecord, ...]:
+        """Every event in chain order, for tamper verification (D7)."""
+        ...
+
     def last_audit_event(self) -> AuditEventRecord | None: ...
+
+    def audit_store_initialized(self) -> bool:
+        """Whether the database exists and carries the ``audit_events`` table (D7)."""
+        ...
 
     def get_system_state(self, key: str) -> str | None: ...
 
     def set_system_state(self, key: str, value: str, *, updated_at: str) -> None: ...
+
+    def save_risk_caps(
+        self, *, value: str, updated_at: str, audit: AuditEventDraft
+    ) -> AuditEventRecord:
+        """Persist the caps document and its ``RISK_CAPS_UPDATED`` audit atomically."""
+        ...
