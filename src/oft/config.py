@@ -219,6 +219,18 @@ class Settings(BaseSettings):
             raise ValueError("budget thresholds must be positive decimals")
         return value
 
+    @field_validator("paper_slippage_bps", "paper_taker_fee_bps")
+    @classmethod
+    def _bounded_paper_bps(cls, value: str) -> str:
+        """Paper slippage/fee are local sim constants; bound them (L4)."""
+        try:
+            parsed = Decimal(str(value))
+        except (InvalidOperation, TypeError, ValueError) as exc:
+            raise ValueError("paper bps settings must be decimal strings") from exc
+        if not parsed.is_finite() or parsed < 0 or parsed > 10000:
+            raise ValueError("paper bps settings must be finite and within 0..10000 bps")
+        return value
+
     @field_validator("llm_openai_base_url", "llm_anthropic_base_url", "llm_deepseek_base_url")
     @classmethod
     def _validate_base_url(cls, value: str, info: ValidationInfo) -> str:

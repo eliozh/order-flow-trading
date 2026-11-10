@@ -254,22 +254,27 @@ def test_position_requires_a_positive_size() -> None:
 
 def test_position_requires_positive_quantity() -> None:
     with pytest.raises(ValueError):
-        Fill(
-            fill_id="FIL-1",
-            order_id="ORD-1",
-            environment="PAPER",
+        Position(
+            position_id="POS-1",
             account_id="ACC-PAPER",
+            environment="PAPER",
             symbol="BTCUSDT",
-            side=OrderSide.BUY,
-            price=Decimal("70000.00"),
-            quantity=Decimal("-1"),
-            quote_quantity=Decimal("0"),
-            fee=Decimal("0"),
-            fee_asset="USDT",
-            maker=False,
-            filled_at="t",
-            received_at="t",
-            source="PAPER",
+            side=PositionSide.LONG,
+            state="OPEN",
+            size=Decimal("0"),
+            entry_price=Decimal("1"),
+            avg_entry_price=Decimal("1"),
+            mark_price=Decimal("1"),
+            notional_usd=Decimal("0.01"),
+            stop_price=None,
+            target_prices=(),
+            leverage=2,
+            margin_usd=Decimal("0.005"),
+            risk_amount_usd=Decimal("0"),
+            risk_pct=0.0,
+            fees_usd=Decimal("0"),
+            opened_at="t",
+            updated_at="t",
         )
 
 

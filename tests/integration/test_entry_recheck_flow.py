@@ -119,6 +119,8 @@ def test_no_entry_card_has_no_risk_stage_and_creates_no_order(tmp_path: Path) ->
 
     assert card["llm"]["decision"] == "NO_ENTRY"
     assert card["risk"]["verdict"] == "NOT_EVALUATED"
+    # The card must surface why no entry was produced.
+    assert "NO_ENTRY" in " ".join(card["risk"]["reasons"])
     assert container.store.list_orders() == ()
     with pytest.raises(EntryRejected):
         service.accept(trigger_id, idempotency_key="accept-no-entry-card")
@@ -195,6 +197,110 @@ def test_api_recheck_returns_the_ordered_card(tmp_path: Path) -> None:
     assert card["trigger"]["provenance"] == "CALC"
     assert card["llm"]["provenance"] == "LLM"
     assert card["risk"]["provenance"] == "CALC"
+
+
+def test_api_accept_envelope_is_partial_when_the_verdict_is_partial(
+    tmp_path: Path,
+) -> None:
+    settings, _container, _service, trigger_id = _setup(tmp_path)
+    app = create_app(settings, clock=FixedClock(NOW))
+    auth = {"Authorization": f"Bearer {app.state.api_token}"}
+
+    with TestClient(app) as client:
+        response = client.post(
+            f"/api/v1/triggers/{trigger_id}/accept",
+            headers={**auth, "Idempotency-Key": "api-accept-partial"},
+        )
+
+    assert response.status_code == 201, response.text
+    body = response.json()
+    assert body["data"]["risk_verdict"]["stale_inputs"]
+    assert body["meta"]["data_quality"] == "PARTIAL"
+
+
+def test_api_reject_envelope_is_partial_when_the_verdict_is_partial(
+    tmp_path: Path,
+) -> None:
+    settings, _container, _service, trigger_id = _setup(tmp_path)
+    app = create_app(settings, clock=FixedClock(NOW))
+    auth = {"Authorization": f"Bearer {app.state.api_token}"}
+
+    with TestClient(app) as client:
+        recheck = client.post(
+            f"/api/v1/triggers/{trigger_id}/recheck",
+            headers={**auth, "Idempotency-Key": "api-recheck-before-reject"},
+        )
+        assert recheck.status_code == 200, recheck.text
+        response = client.post(
+            f"/api/v1/triggers/{trigger_id}/reject",
+            headers={**auth, "Idempotency-Key": "api-reject-partial"},
+            json={"reason": "setup no longer valid"},
+        )
+
+    assert response.status_code == 200, response.text
+    body = response.json()
+    assert body["data"]["risk_verdict"]["stale_inputs"]
+    assert body["meta"]["data_quality"] == "PARTIAL"
+
+
+def test_paper_equity_api_is_partial_for_a_missing_mark(tmp_path: Path) -> None:
+    settings, _container, _service, _trigger_id = _setup(tmp_path)
+    with closing(sqlite3.connect(settings.data_dir / "oft.db")) as connection:
+        connection.execute(
+            "INSERT INTO positions "
+            "(position_id, account_id, environment, symbol, state, opened_at, payload_json) "
+            "VALUES (?, ?, ?, ?, ?, ?, ?)",
+            (
+                "POS-NO-MARK",
+                "ACC-PAPER",
+                "PAPER",
+                "BTCUSDT",
+                "OPEN",
+                "2026-10-08T00:00:00.000Z",
+                json.dumps({"size": "0.01", "mark_price": None}),
+            ),
+        )
+        connection.commit()
+
+    app = create_app(settings, clock=FixedClock(NOW))
+    auth = {"Authorization": f"Bearer {app.state.api_token}"}
+    with TestClient(app) as client:
+        response = client.get("/api/v1/paper/equity", headers=auth)
+
+    assert response.status_code == 200, response.text
+    body = response.json()
+    assert body["meta"]["data_quality"] == "PARTIAL"
+    assert body["data"]["stale_inputs"] == ["mark"]
+    # Equity fell back to cash; no mark was invented.
+    assert body["data"]["equity"] == body["data"]["cash_balance"]
+
+
+def test_a_missing_mark_is_named_in_the_verdict_stale_inputs(tmp_path: Path) -> None:
+    settings, container, service, trigger_id = _setup(tmp_path)
+    with closing(sqlite3.connect(settings.data_dir / "oft.db")) as connection:
+        connection.execute(
+            "INSERT INTO positions "
+            "(position_id, account_id, environment, symbol, state, opened_at, payload_json) "
+            "VALUES (?, ?, ?, ?, ?, ?, ?)",
+            (
+                "POS-NO-MARK",
+                "ACC-PAPER",
+                "PAPER",
+                "BTCUSDT",
+                "OPEN",
+                "2026-10-08T00:00:00.000Z",
+                json.dumps({"size": "0.01", "mark_price": None}),
+            ),
+        )
+        connection.commit()
+
+    card = service.recheck(trigger_id)
+
+    # A degraded (cash-only) equity must be named, never silently used.
+    assert "mark" in card["risk"]["stale_inputs"]
+    assert "equity" in card["risk"]["stale_inputs"]
+    assert card["data_quality"] == "PARTIAL"
+    assert container.store.list_orders() == ()
 
 
 # -- full-invalid re-check: no verdict, no order, no accept guidance --------
@@ -386,6 +492,88 @@ def test_the_renderer_shows_the_rejection_reason_without_accept_guidance() -> No
 # -- F1: a terminal trigger can never produce a second paper entry ---------
 
 
+def _crash_accept_after_commit(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> tuple[Any, EntryService, str, str]:
+    """Accept, crash after the OMS commit, and leave the trigger update lost."""
+    _settings, container, service, trigger_id = _setup(tmp_path)
+    service.recheck(trigger_id)
+    original_update = container.store.update_trigger_event
+
+    def _crash(record, **_kwargs):  # type: ignore[no-untyped-def]
+        raise RuntimeError("simulated crash after the OMS commit")
+
+    monkeypatch.setattr(container.store, "update_trigger_event", _crash)
+    with pytest.raises(RuntimeError):
+        service.accept(trigger_id, idempotency_key="crash-first")
+    monkeypatch.setattr(container.store, "update_trigger_event", original_update)
+    committed = container.store.list_orders()
+    assert len(committed) == 1
+    return container, service, trigger_id, committed[0].order_id
+
+
+def test_recheck_reconciles_a_committed_order_whose_trigger_update_was_lost(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    container, service, trigger_id, order_id = _crash_accept_after_commit(tmp_path, monkeypatch)
+    calls = {"count": 0}
+    original_complete = service._provider.complete  # type: ignore[union-attr]
+
+    def _counting_complete(request):  # type: ignore[no-untyped-def]
+        calls["count"] += 1
+        return original_complete(request)
+
+    monkeypatch.setattr(service._provider, "complete", _counting_complete)
+
+    card = service.recheck(trigger_id)
+
+    # Recheck must adopt the committed order without another LLM call or a
+    # decision/verdict rewrite.
+    assert calls["count"] == 0
+    assert card["status"] == "ACCEPTED"
+    assert card["reconciled"] is True
+    assert card["order"]["order_id"] == order_id
+    assert card["position"] is not None
+    healed = container.store.get_trigger_event(trigger_id)
+    assert healed is not None
+    assert healed.status == "ACCEPTED"
+    stored = json.loads(healed.payload_json)
+    assert stored["created_order_id"] == order_id
+    assert stored["human_action"]["action"] == "ACCEPT"
+    assert len(container.store.list_orders()) == 1
+    assert len(container.store.list_fills()) == 1
+    assert len(container.store.list_positions(state="OPEN")) == 1
+
+
+def test_reject_refuses_a_committed_order_whose_trigger_update_was_lost(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    container, service, trigger_id, order_id = _crash_accept_after_commit(tmp_path, monkeypatch)
+    trigger = container.store.get_trigger_event(trigger_id)
+    assert trigger is not None
+    opportunity = container.store.get_opportunity(trigger.opportunity_id)
+    assert opportunity is not None
+
+    with pytest.raises(EntryRejected) as excinfo:
+        service.reject(trigger_id, reason="human says no")
+
+    assert excinfo.value.code == "CONFLICT"
+    # The rejection must not invalidate the opportunity or hide the exposure.
+    still = container.store.get_trigger_event(trigger_id)
+    assert still is not None
+    assert still.status == "RECHECKED"
+    assert json.loads(still.payload_json)["created_order_id"] is None
+    unchanged_opportunity = container.store.get_opportunity(trigger.opportunity_id)
+    assert unchanged_opportunity is not None
+    assert unchanged_opportunity.state == "TRIGGERED"
+    assert [order.order_id for order in container.store.list_orders()] == [order_id]
+    assert len(container.store.list_positions(state="OPEN")) == 1
+    assert not any(
+        event.event_type == "TRIGGER_REJECTED"
+        for event in container.store.list_audit_events(limit=50)
+    )
+
+
 def test_recheck_after_accept_is_a_conflict_and_changes_nothing(tmp_path: Path) -> None:
     _settings, container, service, trigger_id = _setup(tmp_path)
     service.accept(trigger_id, idempotency_key="accept-first")
@@ -409,7 +597,37 @@ def test_recheck_after_accept_is_a_conflict_and_changes_nothing(tmp_path: Path) 
     assert len(orders_before) == 1
 
 
-def test_a_second_accept_with_a_new_key_never_creates_a_second_order(tmp_path: Path) -> None:
+def test_reject_after_accept_is_a_conflict_and_keeps_the_exposure(
+    tmp_path: Path,
+) -> None:
+    _settings, container, service, trigger_id = _setup(tmp_path)
+    accepted = service.accept(trigger_id, idempotency_key="accept-then-reject")
+    trigger = container.store.get_trigger_event(trigger_id)
+    assert trigger is not None
+    opportunity_id = trigger.opportunity_id
+
+    with pytest.raises(EntryRejected) as excinfo:
+        service.reject(trigger_id, reason="too late")
+
+    assert excinfo.value.code == "CONFLICT"
+    after = container.store.get_trigger_event(trigger_id)
+    assert after is not None
+    assert after.status == "ACCEPTED"
+    stored = json.loads(after.payload_json)
+    assert stored["created_order_id"] == accepted.order["order_id"]
+    assert stored["human_action"]["action"] == "ACCEPT"
+    opportunity = container.store.get_opportunity(opportunity_id)
+    assert opportunity is not None
+    assert opportunity.state == "TRIGGERED"
+    assert len(container.store.list_orders()) == 1
+    assert len(container.store.list_positions(state="OPEN")) == 1
+    assert not any(
+        event.event_type == "TRIGGER_REJECTED"
+        for event in container.store.list_audit_events(limit=50)
+    )
+
+
+def test_accept_then_accept_with_a_new_key_never_creates_a_second_order(tmp_path: Path) -> None:
     _settings, container, service, trigger_id = _setup(tmp_path)
     first = service.accept(trigger_id, idempotency_key="accept-one")
 
@@ -436,7 +654,7 @@ def test_the_same_key_still_replays_the_original_order(tmp_path: Path) -> None:
     assert len(container.store.list_orders()) == 1
 
 
-def test_recheck_then_accept_still_creates_exactly_one_order(tmp_path: Path) -> None:
+def test_recheck_then_accept_still_creates_at_most_one_order(tmp_path: Path) -> None:
     _settings, container, service, trigger_id = _setup(tmp_path)
     service.recheck(trigger_id)
     rechecked = container.store.get_trigger_event(trigger_id)

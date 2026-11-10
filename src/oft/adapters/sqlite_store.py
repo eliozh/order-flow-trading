@@ -550,7 +550,7 @@ _SCHEMA_SQL = f"""
         decision_id TEXT,
         purpose TEXT NOT NULL DEFAULT 'ENTRY'
     );
-    -- D6: exactly one ENTRY order per trigger, enforced by the database, not a
+    -- D6: at most one ENTRY order per trigger, enforced by the database, not a
     -- read-then-act guard. A retry that races a committed order fails here.
     CREATE UNIQUE INDEX IF NOT EXISTS orders_one_entry_per_trigger
         ON orders(trigger_id, environment, purpose)
@@ -4824,14 +4824,37 @@ class SqliteStore:
         finally:
             connection.close()
 
-    def update_trigger_event(self, record: TriggerEventRecord) -> bool:
+    def update_trigger_event(
+        self,
+        record: TriggerEventRecord,
+        *,
+        expected_status: str | None = None,
+        require_no_order: bool = False,
+        require_no_entry_order: bool = False,
+    ) -> bool:
+        clauses = ["trigger_id = ?"]
+        params: list[object] = [record.status, record.payload_json, record.trigger_id]
+        if expected_status is not None:
+            clauses.append("status = ?")
+            params.append(expected_status)
+        if require_no_order:
+            # ``created_order_id`` is a payload field (the frozen trigger
+            # contract), not a column; the compare-and-set reads it from JSON.
+            clauses.append("json_extract(payload_json, '$.created_order_id') IS NULL")
+        if require_no_entry_order:
+            # Atomic with the update: a concurrent accept that committed its
+            # order before this statement makes the write lose.
+            clauses.append(
+                "NOT EXISTS (SELECT 1 FROM orders o WHERE o.trigger_id = trigger_events.trigger_id "
+                "AND o.purpose = 'ENTRY' AND o.environment = 'PAPER')"
+            )
         with closing(self._connect()) as connection, connection:
             cursor = connection.execute(
-                """
+                f"""
                 UPDATE trigger_events SET status = ?, payload_json = ?
-                WHERE trigger_id = ?
+                WHERE {" AND ".join(clauses)}
                 """,
-                (record.status, record.payload_json, record.trigger_id),
+                tuple(params),
             )
         return cursor.rowcount == 1
 
@@ -5134,6 +5157,7 @@ class SqliteStore:
         try:
             row = connection.execute(
                 "SELECT * FROM orders WHERE trigger_id = ? AND purpose = 'ENTRY' "
+                "AND environment = 'PAPER' "
                 "ORDER BY created_at ASC, order_id ASC LIMIT 1",
                 (trigger_id,),
             ).fetchone()
@@ -5304,26 +5328,6 @@ class SqliteStore:
         return stored if stored is not None else record
 
     # -- Audit and system state ------------------------------------------
-
-    def save_audit_event(self, record: AuditEventRecord) -> None:
-        with closing(self._connect()) as connection, connection:
-            connection.execute(
-                """
-                INSERT INTO audit_events (
-                    event_id, seq, event_type, created_at, previous_hash,
-                    event_hash, payload_json
-                ) VALUES (?, ?, ?, ?, ?, ?, ?)
-                """,
-                (
-                    record.event_id,
-                    record.seq,
-                    record.event_type,
-                    record.created_at,
-                    record.previous_hash,
-                    record.event_hash,
-                    record.payload_json,
-                ),
-            )
 
     def append_audit_event(self, draft: AuditEventDraft) -> AuditEventRecord:
         connection = self._connect()

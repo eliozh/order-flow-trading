@@ -27,6 +27,17 @@ def _decimal_or_none(value: object) -> Decimal | None:
     return Decimal(str(value))
 
 
+def _decimal_or_zero(value: object) -> Decimal | None:
+    """Parse a measured decimal; only ``None`` means "not measured".
+
+    ``daily_loss_usd`` is persisted as SQL ``NULL`` when unmeasured and as the
+    string ``"0"`` for a measured zero, so the digest stays stable (P4).
+    """
+    if value is None:
+        return None
+    return Decimal(str(value))
+
+
 class GatewayError(Exception):
     def __init__(self, code: str, message: str) -> None:
         super().__init__(message)
@@ -182,7 +193,7 @@ class ExecutionGateway:
             open_positions=len(positions),
             spread_bps=record.spread_bps,
             expected_slippage_bps=record.expected_slippage_bps,
-            daily_loss_usd=_decimal_or_none(record.daily_loss_usd),
+            daily_loss_usd=_decimal_or_zero(record.daily_loss_usd),
         )
         if digest != payload.get("inputs_hash"):
             raise GatewayError(

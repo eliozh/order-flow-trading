@@ -226,6 +226,9 @@ def _render_entry(data: dict[str, Any]) -> str:
         f" size {position.get('size', '-')}",
         f"balance {account.get('balance', '-')} {account.get('currency', '')}".rstrip(),
     ]
+    stale = verdict.get("stale_inputs") or []
+    if stale:
+        lines.append("stale: " + ", ".join(str(name) for name in stale))
     return "\n".join(lines)
 
 
@@ -327,7 +330,7 @@ def trigger_reject(
     idempotency_key: Annotated[str | None, typer.Option("--idempotency-key")] = None,
     json_output: Annotated[bool, typer.Option("--json", help="Emit JSON.")] = False,
 ) -> None:
-    """Reject a pending trigger; the opportunity becomes INVALIDATED and no order exists."""
+    """Reject a pending trigger; the opportunity is INVALIDATED only if no entry order exists."""
     settings = _settings_or_exit(json_output)
     key = idempotency_key or f"cli-reject-{uuid.uuid4().hex}"
     try:

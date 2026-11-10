@@ -108,7 +108,21 @@ def verify_audit_chain(store: StorePort) -> AuditChainVerification:
     # Compare the stored high-water mark: deleting the newest rows leaves the
     # upward seq scan intact but cannot hide the missing tail (S4).
     raw_head = store.get_system_state(AUDIT_HEAD_KEY)
-    if raw_head is not None:
+    if raw_head is None:
+        if events:
+            # A pre-v20 chain upgraded in place has events but no anchor until
+            # the first v20-era write; the tail cannot be verified, so this is
+            # never reported as OK (S8).
+            return AuditChainVerification(
+                ok=False,
+                checked=checked,
+                first_broken_seq=None,
+                message=(
+                    "AUDIT_CHAIN_UNAVAILABLE: the stored audit head is missing "
+                    "for a non-empty chain"
+                ),
+            )
+    else:
         try:
             head = json.loads(raw_head)
             head_seq = int(head["seq"])

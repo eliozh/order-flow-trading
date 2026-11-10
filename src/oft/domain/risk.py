@@ -1,15 +1,17 @@
 """Deterministic risk gate (ADR-0006).
 
-The gate recomputes every cap it has an input for from code-owned inputs. Caps
-are percentage-based and derived from current equity: per-trade risk, notional,
-daily loss, leverage, spread, and expected slippage. The LLM's proposal is only
-one of the terms in ``effective_size = min(proposal, per-trade risk, max
-notional, max leverage)``; the verdict records which cap bound the size.
-Exchange tick/step rounding and the minimum-notional filter are post-hoc
-adjustments and blocks applied to the chosen size, not terms in the minimum; the
-contract's ``EXCHANGE_BRACKET`` cap is unused because no exchange bracket data is
-ingested. A missing daily-loss, spread, or slippage measurement is recorded in
-``stale_inputs`` and never treated as an evaluated zero.
+The gate recomputes every cap it has an input for from code-owned inputs.
+Percentage caps (per-trade risk, max notional, daily loss) are derived from
+current equity; leverage, spread, slippage, and the stale-mark budget are fixed
+bounds and are not equity-derived. The LLM's proposal is only one of the terms
+in ``effective_size = min(proposal, per-trade risk, max notional, max
+leverage)``; the verdict records which cap bound the size. Tick rounding happens
+before sizing (the rounded entry drives the stop distance and the quantity
+terms), while step rounding and the minimum-notional filter are applied to the
+chosen size. The contract's ``EXCHANGE_BRACKET`` cap is unused because no
+exchange bracket data is ingested. A missing daily-loss, spread, or slippage
+measurement, and a degraded (cash-only) equity basis, are recorded in
+``stale_inputs`` and never treated as an evaluated value or a silent zero.
 """
 
 from __future__ import annotations
@@ -399,12 +401,16 @@ def evaluate_risk(
     min_notional: Decimal,
     spread_bps: float | None = None,
     expected_slippage_bps: float | None = None,
+    equity_stale_inputs: tuple[str, ...] = (),
 ) -> RiskVerdict:
     """Recompute the caps and return ALLOW/REDUCE/BLOCK with the binding cap.
 
     ``daily_loss_usd``, ``spread_bps``, and ``expected_slippage_bps`` are
     ``None`` when the caller has no measurement. A missing input is named in
     ``stale_inputs`` and never treated as an evaluated zero (D1).
+    ``equity_stale_inputs`` names a degraded equity basis (for example a missing
+    position mark that forced ``equity = cash``) and is merged into the same
+    stale list.
     """
     digest = _inputs_hash(
         request,
@@ -418,6 +424,7 @@ def evaluate_risk(
         daily_loss_usd=daily_loss_usd,
         spread_bps=spread_bps,
         expected_slippage_bps=expected_slippage_bps,
+        equity_stale_inputs=equity_stale_inputs,
     )
     daily_loss_limit = equity * Decimal(str(caps.daily_loss_pct)) / Decimal("100")
     max_notional = equity * Decimal(str(caps.max_notional_pct)) / Decimal("100")
@@ -622,6 +629,7 @@ def _stale_inputs(
     daily_loss_usd: Decimal | None,
     spread_bps: float | None,
     expected_slippage_bps: float | None,
+    equity_stale_inputs: tuple[str, ...] = (),
 ) -> tuple[str, ...]:
     """Name every input the caller could not measure; never a silent zero."""
     names: list[str] = []
@@ -631,6 +639,9 @@ def _stale_inputs(
         names.append("spread_bps")
     if expected_slippage_bps is None:
         names.append("expected_slippage_bps")
+    for name in equity_stale_inputs:
+        if name not in names:
+            names.append(name)
     return tuple(names)
 
 

@@ -907,7 +907,24 @@ class StorePort(Protocol):
         """
         ...
 
-    def update_trigger_event(self, record: TriggerEventRecord) -> bool: ...
+    def update_trigger_event(
+        self,
+        record: TriggerEventRecord,
+        *,
+        expected_status: str | None = None,
+        require_no_order: bool = False,
+        require_no_entry_order: bool = False,
+    ) -> bool:
+        """Conditionally write a trigger payload (compare-and-set).
+
+        ``expected_status`` restricts the update to the row currently in that
+        state, ``require_no_order`` requires the stored payload to carry no
+        ``created_order_id``, and ``require_no_entry_order`` refuses the write
+        when an ENTRY order already exists for the trigger. Returns ``False``
+        (zero rows) when the precondition no longer holds; callers must surface
+        a typed conflict instead of overwriting a concurrent transition.
+        """
+        ...
 
     def get_trigger_event(self, trigger_id: str) -> TriggerEventRecord | None: ...
 
@@ -980,8 +997,6 @@ class StorePort(Protocol):
         ...
 
     # -- Audit and system state ------------------------------------------
-
-    def save_audit_event(self, record: AuditEventRecord) -> None: ...
 
     def append_audit_event(self, draft: AuditEventDraft) -> AuditEventRecord: ...
 

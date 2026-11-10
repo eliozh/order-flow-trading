@@ -86,6 +86,13 @@ def _entry_service(request: Request, trigger_id: str) -> EntryService:
     )
 
 
+def _verdict_quality(verdict: Any) -> str:
+    """An envelope is COMPLETE only when the embedded verdict has no stale inputs."""
+    if isinstance(verdict, dict) and verdict.get("stale_inputs"):
+        return "PARTIAL"
+    return "COMPLETE"
+
+
 @router.get("/api/v1/triggers")
 def list_triggers(
     request: Request,
@@ -311,7 +318,7 @@ def accept_trigger(
         },
         request_id=new_request_id(),
         provenance="MIXED",
-        data_quality="COMPLETE",
+        data_quality=_verdict_quality(result.risk_verdict),
         idempotent_replay=result.idempotent_replay,
     )
 
@@ -343,7 +350,7 @@ def reject_trigger(
         result,
         request_id=new_request_id(),
         provenance="CALC",
-        data_quality="COMPLETE",
+        data_quality=_verdict_quality(result.get("risk_verdict")),
     )
     complete(request, key=key, request_hash=request_hash, envelope=envelope, status=200)
     return envelope

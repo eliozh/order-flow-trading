@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import sqlite3
 import threading
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import replace
@@ -29,6 +30,7 @@ from oft.ports.llm import LLMRole
 from oft.ports.store import (
     DecisionRecord,
     OpportunityRecord,
+    OrderRecord,
     RiskVerdictRecord,
     TriggerEventRecord,
 )
@@ -1030,7 +1032,7 @@ def _run_concurrently(attempts: int, action) -> list[object]:  # type: ignore[no
         return list(pool.map(run, range(attempts)))
 
 
-def test_six_concurrent_distinct_keys_create_exactly_one_entry(tmp_path: Path) -> None:
+def test_six_concurrent_distinct_keys_create_at_most_one_entry(tmp_path: Path) -> None:
     container, trigger_id = _container_and_trigger(tmp_path)
     service = _entry(container)
     service.recheck(trigger_id)
@@ -1085,7 +1087,7 @@ def test_crash_after_the_order_commit_reconciles_on_retry(
     service.recheck(trigger_id)
     original_update = container.store.update_trigger_event
 
-    def _crash_after_commit(record):  # type: ignore[no-untyped-def]
+    def _crash_after_commit(record, **_kwargs):  # type: ignore[no-untyped-def]
         raise RuntimeError("simulated crash after the OMS commit")
 
     monkeypatch.setattr(container.store, "update_trigger_event", _crash_after_commit)
@@ -1132,6 +1134,534 @@ def test_reject_surfaces_the_human_reason(tmp_path: Path) -> None:
         if event.event_type == "TRIGGER_REJECTED"
     ]
     assert "spread too wide for the stop" in audit[0].payload_json
+
+
+# -- S6/P1: crash-window reconciliation from recheck and reject -------------
+
+
+def _crash_after_commit(container, trigger_id: str, service: EntryService) -> str:
+    service.recheck(trigger_id)
+
+    def _crash(record, **_kwargs):  # type: ignore[no-untyped-def]
+        raise RuntimeError("simulated crash after the OMS commit")
+
+    from unittest import mock
+
+    with (
+        mock.patch.object(container.store, "update_trigger_event", _crash),
+        pytest.raises(RuntimeError),
+    ):
+        service.accept(trigger_id, idempotency_key="crash-first")
+    orders = container.store.list_orders()
+    assert len(orders) == 1
+    return orders[0].order_id
+
+
+def test_recheck_adopts_a_committed_order_without_an_llm_call(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    container, trigger_id = _container_and_trigger(tmp_path)
+    service = _entry(container)
+    order_id = _crash_after_commit(container, trigger_id, service)
+    calls: list[object] = []
+    monkeypatch.setattr(
+        service._provider,  # type: ignore[union-attr]
+        "complete",
+        lambda request: calls.append(request),  # type: ignore[arg-type]
+    )
+
+    card = service.recheck(trigger_id)
+
+    assert calls == []
+    assert card["status"] == "ACCEPTED"
+    assert card["order"]["order_id"] == order_id
+    healed = container.store.get_trigger_event(trigger_id)
+    assert healed is not None
+    assert healed.status == "ACCEPTED"
+    assert len(container.store.list_orders()) == 1
+
+
+def test_reject_conflicts_with_a_committed_order_and_keeps_it_open(tmp_path: Path) -> None:
+    container, trigger_id = _container_and_trigger(tmp_path)
+    service = _entry(container)
+    order_id = _crash_after_commit(container, trigger_id, service)
+    trigger = container.store.get_trigger_event(trigger_id)
+    assert trigger is not None
+
+    with pytest.raises(EntryRejected) as excinfo:
+        service.reject(trigger_id, reason="human says no")
+
+    assert excinfo.value.code == "CONFLICT"
+    still = container.store.get_trigger_event(trigger_id)
+    assert still is not None
+    assert still.status == "RECHECKED"
+    opportunity = container.store.get_opportunity(trigger.opportunity_id)
+    assert opportunity is not None
+    assert opportunity.state == "TRIGGERED"
+    assert [order.order_id for order in container.store.list_orders()] == [order_id]
+    assert len(container.store.list_positions(state="OPEN")) == 1
+    assert not any(
+        event.event_type == "TRIGGER_REJECTED"
+        for event in container.store.list_audit_events(limit=50)
+    )
+
+
+# -- M1: conditional trigger writes (compare-and-set) -----------------------
+
+
+def test_an_in_flight_accept_cannot_overwrite_a_human_reject(tmp_path: Path) -> None:
+    container, trigger_id = _container_and_trigger(tmp_path)
+    service = _entry(container)
+    service.recheck(trigger_id)
+    stale = container.store.get_trigger_event(trigger_id)
+    assert stale is not None
+    service.reject(trigger_id, reason="human wins the race")
+    audits_before = len(container.store.list_audit_events(limit=100))
+
+    with pytest.raises(EntryRejected) as excinfo:
+        service._update_trigger(
+            stale,
+            status="ACCEPTED",
+            expected_status="RECHECKED",
+            require_no_order=True,
+        )
+
+    assert excinfo.value.code == "CONFLICT"
+    after = container.store.get_trigger_event(trigger_id)
+    assert after is not None
+    assert after.status == "REJECTED"
+    payload = json.loads(after.payload_json)
+    assert payload["human_action"]["action"] == "REJECT"
+    # The lost compare-and-set wrote no audit event.
+    assert len(container.store.list_audit_events(limit=100)) == audits_before
+
+
+def test_a_reject_cannot_land_after_the_order_commit(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    container, trigger_id = _container_and_trigger(tmp_path)
+    service = _entry(container)
+    service.recheck(trigger_id)
+    committed = threading.Event()
+    original_submit = service._gateway.submit
+
+    def _submit_then_signal(*args, **kwargs):  # type: ignore[no-untyped-def]
+        result = original_submit(*args, **kwargs)
+        committed.set()
+        return result
+
+    monkeypatch.setattr(service._gateway, "submit", _submit_then_signal)
+    outcomes: list[object] = []
+
+    def _accept() -> None:
+        try:
+            outcomes.append(service.accept(trigger_id, idempotency_key="race-accept"))
+        except EntryRejected as exc:
+            outcomes.append(exc.code)
+
+    def _reject() -> None:
+        assert committed.wait(timeout=5)
+        try:
+            outcomes.append(service.reject(trigger_id, reason="too late"))
+        except EntryRejected as exc:
+            outcomes.append(exc.code)
+
+    with ThreadPoolExecutor(max_workers=2) as pool:
+        futures = [pool.submit(_accept), pool.submit(_reject)]
+        for future in futures:
+            future.result(timeout=10)
+
+    assert "CONFLICT" in outcomes
+    trigger = container.store.get_trigger_event(trigger_id)
+    assert trigger is not None
+    assert trigger.status == "ACCEPTED"
+    assert json.loads(trigger.payload_json)["human_action"]["action"] == "ACCEPT"
+    assert len(container.store.list_orders()) == 1
+    assert len(container.store.list_positions(state="OPEN")) == 1
+
+
+# -- item 9: accept re-checks the status after the inline re-check ----------
+
+
+def test_accept_after_an_inline_recheck_that_rejected_is_a_conflict(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    container, trigger_id = _container_and_trigger(tmp_path)
+    service = _entry(container)
+    original = service._evaluate_and_persist_risk
+    calls = {"count": 0}
+
+    def _transient_failure(**kwargs):  # type: ignore[no-untyped-def]
+        calls["count"] += 1
+        if calls["count"] == 1:
+            raise EntryRejected("DATA_UNAVAILABLE", "transient gate-input failure")
+        return original(**kwargs)
+
+    monkeypatch.setattr(service, "_evaluate_and_persist_risk", _transient_failure)
+
+    with pytest.raises(EntryRejected) as excinfo:
+        service.accept(trigger_id, idempotency_key="accept-inline-reject")
+
+    # The inline re-check marked the trigger REJECTED; accept must stop there
+    # instead of running a second evaluation and creating an order (P3).
+    assert excinfo.value.code == "DATA_UNAVAILABLE"
+    assert calls["count"] == 1
+    assert container.store.list_orders() == ()
+    trigger = container.store.get_trigger_event(trigger_id)
+    assert trigger is not None
+    assert trigger.status == "REJECTED"
+
+
+# -- item 10: crash-window adoption/replay fail closed on a missing verdict --
+
+
+def test_adoption_fails_closed_when_the_order_verdict_is_missing(
+    tmp_path: Path,
+) -> None:
+    container, trigger_id = _container_and_trigger(tmp_path)
+    service = _entry(container)
+    _crash_after_commit(container, trigger_id, service)
+    order = container.store.list_orders()[0]
+    with sqlite3.connect(container.settings.data_dir / "oft.db") as connection:
+        connection.execute(
+            "DELETE FROM risk_verdicts WHERE risk_verdict_id = ?",
+            (order.risk_verdict_id,),
+        )
+
+    with pytest.raises(EntryRejected) as excinfo:
+        service.accept(trigger_id, idempotency_key="crash-retry-missing-verdict")
+
+    assert excinfo.value.code == "CONFLICT"
+    assert "verdict" in excinfo.value.message
+    trigger = container.store.get_trigger_event(trigger_id)
+    assert trigger is not None
+    assert trigger.status == "RECHECKED"
+    assert len(container.store.list_orders()) == 1
+
+
+def test_replay_fails_closed_when_the_order_verdict_is_missing(tmp_path: Path) -> None:
+    container, trigger_id = _container_and_trigger(tmp_path)
+    service = _entry(container)
+    accepted = service.accept(trigger_id, idempotency_key="replay-missing-verdict")
+    order = container.store.list_orders()[0]
+    with sqlite3.connect(container.settings.data_dir / "oft.db") as connection:
+        connection.execute(
+            "DELETE FROM risk_verdicts WHERE risk_verdict_id = ?",
+            (order.risk_verdict_id,),
+        )
+
+    with pytest.raises(EntryRejected) as excinfo:
+        service.accept(trigger_id, idempotency_key="replay-missing-verdict")
+
+    assert excinfo.value.code == "CONFLICT"
+    assert accepted.order is not None
+    assert len(container.store.list_orders()) == 1
+
+
+# -- item 7: adoption is PAPER-scoped --------------------------------------
+
+
+def test_adoption_refuses_a_non_paper_entry_order(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    container, trigger_id = _container_and_trigger(tmp_path)
+    service = _entry(container)
+    service.recheck(trigger_id)
+    live = OrderRecord(
+        order_id="ORD-LIVE",
+        client_order_id="client-live",
+        environment="LIVE",
+        symbol="BTCUSDT",
+        status="FILLED",
+        risk_verdict_id="RISK-X",
+        idempotency_key="idem-live",
+        created_at="2026-11-06T12:00:00.000Z",
+        updated_at="2026-11-06T12:00:00.000Z",
+        payload_json=json.dumps({"order_id": "ORD-LIVE", "position_id": None}),
+        trigger_id=trigger_id,
+        decision_id="DEC-X",
+        purpose="ENTRY",
+    )
+    monkeypatch.setattr(container.store, "get_entry_order_for_trigger", lambda _tid: live)
+
+    with pytest.raises(EntryRejected) as excinfo:
+        service.accept(trigger_id, idempotency_key="accept-live-order")
+
+    assert excinfo.value.code == "CONFLICT"
+    assert "PAPER" in excinfo.value.message
+    assert container.store.list_orders() == ()
+
+
+def test_get_entry_order_for_trigger_ignores_non_paper_rows(tmp_path: Path) -> None:
+    container, trigger_id = _container_and_trigger(tmp_path)
+    with sqlite3.connect(container.settings.data_dir / "oft.db") as connection:
+        connection.execute(
+            "INSERT INTO orders (order_id, client_order_id, environment, symbol, status, "
+            "risk_verdict_id, idempotency_key, created_at, updated_at, payload_json, "
+            "trigger_id, decision_id, purpose) "
+            "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+            (
+                "ORD-LIVE",
+                "client-live",
+                "LIVE",
+                "BTCUSDT",
+                "FILLED",
+                "RISK-X",
+                "idem-live",
+                "2026-11-06T12:00:00.000Z",
+                "2026-11-06T12:00:00.000Z",
+                "{}",
+                trigger_id,
+                "DEC-X",
+                "ENTRY",
+            ),
+        )
+        connection.commit()
+
+    assert container.store.get_entry_order_for_trigger(trigger_id) is None
+
+
+# -- item 8: a measured zero daily loss is not "absent" --------------------
+
+
+def test_gateway_keeps_a_stored_zero_daily_loss_in_the_inputs_digest(
+    tmp_path: Path,
+) -> None:
+    container, trigger_id = _container_and_trigger(tmp_path)
+    gateway, _kill, _broker = _gateway(container)
+    verdict_id = _persist_verdict(
+        container,
+        trigger_id=trigger_id,
+        decision_id="DEC-X",
+        daily_loss_usd="0",
+        inputs_hash=_matching_inputs_hash(container, daily_loss_usd=Decimal("0")),
+    )
+    intent = _intent(risk_verdict_id=verdict_id, decision_id="DEC-X", quantity="0.010")
+
+    result = gateway.submit(
+        intent,
+        AuthContext(actor_id="cli", approval_id="APR-X"),
+        mark_price=Decimal("70000.00"),
+        mark_as_of="2026-11-06T12:00:00.000Z",
+    )
+
+    assert result.order.order_id
+    assert len(container.store.list_orders()) == 1
+
+
+# -- P4: untested gateway last-line branches ------------------------------
+
+
+def test_gateway_blocks_leverage_above_the_verdict(tmp_path: Path) -> None:
+    container, trigger_id = _container_and_trigger(tmp_path)
+    gateway, _kill, _broker = _gateway(container)
+    verdict_id = _persist_verdict(
+        container, trigger_id=trigger_id, decision_id="DEC-X", allowed_leverage=2.0
+    )
+    intent = _intent(risk_verdict_id=verdict_id, decision_id="DEC-X", leverage=3.0)
+
+    with pytest.raises(GatewayError) as excinfo:
+        gateway.submit(
+            intent,
+            AuthContext(actor_id="cli", approval_id="APR-X"),
+            mark_price=Decimal("70000.00"),
+            mark_as_of="2026-11-06T12:00:00.000Z",
+        )
+
+    assert excinfo.value.code == "RISK_BLOCKED"
+    assert "leverage" in excinfo.value.message
+
+
+def test_gateway_blocks_a_missing_trigger(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    container, trigger_id = _container_and_trigger(tmp_path)
+    gateway, _kill, _broker = _gateway(container)
+    verdict_id = _persist_verdict(container, trigger_id=trigger_id, decision_id="DEC-X")
+    intent = _intent(risk_verdict_id=verdict_id, decision_id="DEC-X")
+    monkeypatch.setattr(container.store, "get_trigger_event", lambda tid: None)
+
+    with pytest.raises(GatewayError) as excinfo:
+        gateway.submit(
+            intent,
+            AuthContext(actor_id="cli", approval_id="APR-X"),
+            mark_price=Decimal("70000.00"),
+            mark_as_of="2026-11-06T12:00:00.000Z",
+        )
+
+    assert excinfo.value.code == "RISK_BLOCKED"
+    assert "trigger" in excinfo.value.message
+
+
+def test_gateway_blocks_a_symbol_mismatch(tmp_path: Path) -> None:
+    container, trigger_id = _container_and_trigger(tmp_path)
+    gateway, _kill, _broker = _gateway(container)
+    verdict_id = _persist_verdict(container, trigger_id=trigger_id, decision_id="DEC-X")
+    intent = _intent(risk_verdict_id=verdict_id, decision_id="DEC-X", symbol="ETHUSDT")
+
+    with pytest.raises(GatewayError) as excinfo:
+        gateway.submit(
+            intent,
+            AuthContext(actor_id="cli", approval_id="APR-X"),
+            mark_price=Decimal("70000.00"),
+            mark_as_of="2026-11-06T12:00:00.000Z",
+        )
+
+    assert excinfo.value.code == "RISK_BLOCKED"
+    assert "symbol" in excinfo.value.message
+
+
+def test_gateway_blocks_unparseable_verdict_inputs(tmp_path: Path) -> None:
+    container, trigger_id = _container_and_trigger(tmp_path)
+    gateway, _kill, _broker = _gateway(container)
+    verdict_id = _persist_verdict(
+        container,
+        trigger_id=trigger_id,
+        decision_id="DEC-X",
+        requested={
+            "entry_price": "not-a-price",
+            "stop_price": "69000.00",
+            "quantity": None,
+            "risk_pct": 0.8,
+            "leverage": 2.0,
+            "notional_usd": None,
+        },
+    )
+    intent = _intent(risk_verdict_id=verdict_id, decision_id="DEC-X")
+
+    with pytest.raises(GatewayError) as excinfo:
+        gateway.submit(
+            intent,
+            AuthContext(actor_id="cli", approval_id="APR-X"),
+            mark_price=Decimal("70000.00"),
+            mark_as_of="2026-11-06T12:00:00.000Z",
+        )
+
+    assert excinfo.value.code == "RISK_BLOCKED"
+    assert "inputs" in excinfo.value.message
+
+
+def test_gateway_blocks_an_intent_without_a_protective_stop(tmp_path: Path) -> None:
+    container, trigger_id = _container_and_trigger(tmp_path)
+    gateway, _kill, _broker = _gateway(container)
+    verdict_id = _persist_verdict(
+        container,
+        trigger_id=trigger_id,
+        decision_id="DEC-X",
+        requested={
+            "entry_price": "70000.00",
+            "stop_price": "0",
+            "quantity": None,
+            "risk_pct": 0.8,
+            "leverage": 2.0,
+            "notional_usd": None,
+        },
+        inputs_hash=_matching_inputs_hash(container, stop_price=None),
+    )
+    intent = _intent(risk_verdict_id=verdict_id, decision_id="DEC-X", stop_price=None)
+
+    with pytest.raises(GatewayError) as excinfo:
+        gateway.submit(
+            intent,
+            AuthContext(actor_id="cli", approval_id="APR-X"),
+            mark_price=Decimal("70000.00"),
+            mark_as_of="2026-11-06T12:00:00.000Z",
+        )
+
+    assert excinfo.value.code == "RISK_BLOCKED"
+    assert "stop" in excinfo.value.message
+
+
+def test_gateway_blocks_a_missing_mark_price(tmp_path: Path) -> None:
+    container, trigger_id = _container_and_trigger(tmp_path)
+    gateway, _kill, _broker = _gateway(container)
+    verdict_id = _persist_verdict(
+        container,
+        trigger_id=trigger_id,
+        decision_id="DEC-X",
+        inputs_hash=_matching_inputs_hash(container),
+    )
+    intent = _intent(risk_verdict_id=verdict_id, decision_id="DEC-X", quantity="0.010")
+
+    with pytest.raises(GatewayError) as excinfo:
+        gateway.submit(
+            intent,
+            AuthContext(actor_id="cli", approval_id="APR-X"),
+            mark_price=Decimal("0"),
+            mark_as_of="2026-11-06T12:00:00.000Z",
+        )
+
+    assert excinfo.value.code == "RISK_BLOCKED"
+    assert "mark price" in excinfo.value.message
+
+
+def test_gateway_maps_a_database_idempotency_conflict(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    container, trigger_a = _container_and_trigger(tmp_path)
+    _entry(container).accept(trigger_a, idempotency_key="db-conflict-key")
+    stamp = utc_timestamp(container.clock.now())
+    container.store.save_opportunity(
+        OpportunityRecord(
+            opportunity_id="OPP-OTHER",
+            symbol="BTCUSDT",
+            state="OPEN",
+            created_at=stamp,
+            updated_at=stamp,
+            payload_json=json.dumps({"opportunity_id": "OPP-OTHER"}),
+        )
+    )
+    container.store.save_trigger_event(
+        TriggerEventRecord(
+            trigger_id="TRG-OTHER",
+            opportunity_id="OPP-OTHER",
+            symbol="BTCUSDT",
+            status="RECHECKED",
+            idempotency_key="TRG-OTHER-KEY",
+            triggered_at="2026-11-06T12:00:00.000Z",
+            payload_json=json.dumps(
+                {
+                    "status": "RECHECKED",
+                    "opportunity_id": "OPP-OTHER",
+                    "symbol": "BTCUSDT",
+                    "side": "LONG",
+                }
+            ),
+        )
+    )
+    verdict_id = _persist_verdict(
+        container,
+        trigger_id="TRG-OTHER",
+        decision_id="DEC-X",
+        inputs_hash=_matching_inputs_hash(container),
+    )
+    gateway, _kill, _broker = _gateway(container)
+    intent = _intent(
+        risk_verdict_id=verdict_id,
+        decision_id="DEC-X",
+        quantity="0.010",
+        idempotency_key="db-conflict-key",
+        take_profits=(Decimal("99999.00"),),
+    )
+    original = container.store.get_order_by_idempotency
+    calls = {"count": 0}
+
+    def _pass_the_precheck(key: str):  # type: ignore[no-untyped-def]
+        calls["count"] += 1
+        if calls["count"] == 1:
+            return None
+        return original(key)
+
+    monkeypatch.setattr(container.store, "get_order_by_idempotency", _pass_the_precheck)
+
+    with pytest.raises(GatewayError) as excinfo:
+        gateway.submit(
+            intent,
+            AuthContext(actor_id="cli", approval_id="APR-X"),
+            mark_price=Decimal("70000.00"),
+            mark_as_of="2026-11-06T12:00:00.000Z",
+        )
+
+    assert excinfo.value.code == "IDEMPOTENCY_CONFLICT"
+    assert len(container.store.list_orders()) == 1
 
 
 # -- helpers ---------------------------------------------------------------
@@ -1191,19 +1721,25 @@ def _persist_verdict(
     allowed_risk_usd: str = "20.00",
     expires_in: int = 30,
     inputs_hash: str = "deadbeef",
+    daily_loss_usd: str | None = None,
+    requested: dict | None = None,
 ) -> str:
     now = utc_timestamp(container.clock.now())
     expires_at = utc_timestamp(container.clock.now() + timedelta(seconds=expires_in))
     payload = {
         "verdict": verdict,
-        "requested": {
-            "entry_price": "70000.00",
-            "stop_price": "69000.00",
-            "quantity": None,
-            "risk_pct": 0.8,
-            "leverage": 2.0,
-            "notional_usd": None,
-        },
+        "requested": (
+            requested
+            if requested is not None
+            else {
+                "entry_price": "70000.00",
+                "stop_price": "69000.00",
+                "quantity": None,
+                "risk_pct": 0.8,
+                "leverage": 2.0,
+                "notional_usd": None,
+            }
+        ),
         "allowed": {
             "quantity": allowed_quantity,
             "notional_usd": None if allowed_quantity is None else "1400.00",
@@ -1228,12 +1764,18 @@ def _persist_verdict(
             computed_at=now,
             expires_at=expires_at,
             payload_json=json.dumps(payload),
+            daily_loss_usd=daily_loss_usd,
         )
     )
     return verdict_id
 
 
-def _matching_inputs_hash(container) -> str:
+def _matching_inputs_hash(
+    container,
+    *,
+    stop_price: Decimal | None = Decimal("69000.00"),
+    daily_loss_usd: Decimal | None = None,
+) -> str:
     """The digest the gateway recomputes for ``_persist_verdict``'s request."""
     from oft.application.paper_account import compute_equity
 
@@ -1248,7 +1790,7 @@ def _matching_inputs_hash(container) -> str:
         symbol="BTCUSDT",
         side="LONG",
         entry_price=Decimal("70000.00"),
-        stop_price=Decimal("69000.00"),
+        stop_price=stop_price,
         quantity=None,
         risk_pct=0.8,
         leverage=2.0,
@@ -1258,6 +1800,7 @@ def _matching_inputs_hash(container) -> str:
         request,
         equity=equity,
         open_positions=len(positions),
+        daily_loss_usd=daily_loss_usd,
     )
 
 

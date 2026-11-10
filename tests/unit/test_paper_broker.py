@@ -301,6 +301,37 @@ def test_compute_equity_ignores_a_missing_size_as_stale() -> None:
     assert view.available is False
 
 
+def test_compute_equity_treats_non_finite_size_or_mark_as_stale() -> None:
+    for position in (
+        {"size": "NaN", "mark_price": "70000"},
+        {"size": "0.01", "mark_price": "Infinity"},
+        {"size": "-Infinity", "mark_price": "70000"},
+    ):
+        equity, view = compute_equity(Decimal("100.00"), [position])
+
+        assert equity == Decimal("100.00"), position
+        assert view.stale_inputs == ("mark",), position
+        assert view.available is False, position
+
+
+def test_paper_bps_settings_must_be_bounded_finite_decimals(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from oft.config import ConfigError, load_settings
+
+    for name, value in (
+        ("OFT_PAPER_SLIPPAGE_BPS", "nan"),
+        ("OFT_PAPER_SLIPPAGE_BPS", "inf"),
+        ("OFT_PAPER_SLIPPAGE_BPS", "-1"),
+        ("OFT_PAPER_TAKER_FEE_BPS", "10001"),
+    ):
+        monkeypatch.setenv(name, value)
+        with pytest.raises(ConfigError) as excinfo:
+            load_settings()
+        assert excinfo.value.code == "CONFIG_INVALID"
+        monkeypatch.delenv(name)
+
+
 def test_compute_equity_names_mark_once_for_several_unmarked_positions() -> None:
     equity, view = compute_equity(
         Decimal("100.00"),

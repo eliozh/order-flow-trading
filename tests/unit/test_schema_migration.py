@@ -1284,3 +1284,55 @@ def test_v20_orders_bind_to_their_trigger_and_index_the_ledger(tmp_path: Path) -
     assert "orders_one_entry_per_trigger" in order_indexes
     assert "risk_verdicts_trigger_id" in verdict_indexes
     assert "positions_account_id" in position_indexes
+
+
+def test_v19_orders_survive_the_v20_upgrade_with_a_null_trigger_id(tmp_path: Path) -> None:
+    settings = Settings(env="test", port=8765, data_dir=tmp_path / "data")
+    SqliteStore(settings).initialize()
+    connection = sqlite3.connect(database_path(settings))
+    try:
+        connection.execute(
+            "INSERT INTO orders (order_id, client_order_id, environment, symbol, status, "
+            "risk_verdict_id, idempotency_key, created_at, updated_at, payload_json, "
+            "trigger_id, decision_id, purpose) "
+            "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, NULL, NULL, 'ENTRY')",
+            (
+                "ORD-LEGACY",
+                "client-legacy",
+                "PAPER",
+                "BTCUSDT",
+                "FILLED",
+                "RISK-LEGACY",
+                "idem-legacy",
+                "2026-11-01T00:00:00.000Z",
+                "2026-11-01T00:00:00.000Z",
+                "{}",
+            ),
+        )
+        # Roll the recorded schema back to v19 and remove the v20 additions.
+        connection.execute("DROP INDEX IF EXISTS orders_one_entry_per_trigger")
+        connection.execute("DROP INDEX IF EXISTS risk_verdicts_trigger_id")
+        connection.execute("DROP INDEX IF EXISTS positions_account_id")
+        connection.execute("ALTER TABLE orders DROP COLUMN trigger_id")
+        connection.execute("ALTER TABLE orders DROP COLUMN decision_id")
+        connection.execute("ALTER TABLE orders DROP COLUMN purpose")
+        connection.execute("ALTER TABLE risk_verdicts DROP COLUMN spread_bps")
+        connection.execute("ALTER TABLE risk_verdicts DROP COLUMN expected_slippage_bps")
+        connection.execute("ALTER TABLE risk_verdicts DROP COLUMN daily_loss_usd")
+        connection.execute("DELETE FROM schema_migrations WHERE version = 20")
+        connection.commit()
+    finally:
+        connection.close()
+
+    SqliteStore(settings).initialize()
+
+    connection = sqlite3.connect(database_path(settings))
+    try:
+        row = connection.execute(
+            "SELECT order_id, trigger_id, purpose FROM orders WHERE order_id = 'ORD-LEGACY'"
+        ).fetchone()
+        indexes = {item[1] for item in connection.execute("PRAGMA index_list(orders)")}
+    finally:
+        connection.close()
+    assert tuple(row) == ("ORD-LEGACY", None, "ENTRY")
+    assert "orders_one_entry_per_trigger" in indexes

@@ -31,7 +31,7 @@ from oft.application.llm_validation import (
     hash_text,
     schema_text,
 )
-from oft.application.paper_account import PaperAccountService
+from oft.application.paper_account import PaperAccountService, compute_equity
 from oft.application.paper_broker import OrderIntent, PaperBroker
 from oft.application.prompt_builder import KnowledgeInjection
 from oft.application.prompt_service import (
@@ -79,7 +79,9 @@ ENTRY_PROMPT_ID = "entry_recheck"
 ENTRY_PROMPT_VERSION = 1
 
 # The only states in which a human may still act on the trigger. Everything
-# else (ACCEPTED/REJECTED/BLOCKED/EXPIRED) is terminal for this slice.
+# else (ACCEPTED/REJECTED/BLOCKED/EXPIRED) is terminal for this slice. The
+# accept/reject/recheck paths also consult the OMS ledger, so a crashed accept
+# (order committed, trigger update lost) is reconciled instead of overwritten.
 _PRE_ACCEPT_STATUSES = frozenset({"PENDING_RECHECK", "RECHECKED"})
 
 _USAGE_FIELDS = (
@@ -270,6 +272,15 @@ class EntryService:
         trigger = self._trigger(trigger_id)
         payload: dict[str, Any] = json.loads(trigger.payload_json)
         status = str(payload.get("status"))
+        existing_entry = self._store.get_entry_order_for_trigger(trigger_id)
+        if (
+            existing_entry is not None
+            and payload.get("created_order_id") != existing_entry.order_id
+        ):
+            # Crash window: the OMS commit succeeded but the trigger update was
+            # lost. Adopt the committed order; never run another LLM call or
+            # rewrite the decision/verdict (F1/S6).
+            return self._reconcile_recheck(trigger, existing_entry)
         if payload.get("created_order_id") or status not in _PRE_ACCEPT_STATUSES:
             # Never regress an accepted/terminal trigger or rewrite a decision
             # once an order exists (F1).
@@ -451,7 +462,12 @@ class EntryService:
             status=next_status,
             payload_json=json.dumps(updated, sort_keys=True),
         )
-        self._store.update_trigger_event(record)
+        self._write_trigger(
+            record,
+            expected_status=status,
+            require_no_order=True,
+            require_no_entry_order=True,
+        )
         record_audit(
             self._store,
             event_type="ENTRY_RECHECK",
@@ -512,27 +528,62 @@ class EntryService:
             self._kill_switch.require_clear()
         except KillSwitchActive as exc:
             raise EntryRejected(exc.code, exc.message) from exc
+        # Crash-window recovery, before any re-evaluation: an entry order that
+        # exists is the only entry this trigger may ever have (D6).
+        early_entry = self._store.get_entry_order_for_trigger(trigger_id)
+        if early_entry is not None:
+            if early_entry.idempotency_key == idempotency_key:
+                return self._replay(early_entry.order_id, payload)
+            now = utc_timestamp(self._clock.now())
+            return self._adopt_entry(trigger, early_entry, now=now, actor_id=actor_id)
         if payload.get("entry_decision_id") is None:
-            self.recheck(trigger_id)
+            card = self.recheck(trigger_id)
             trigger = self._trigger(trigger_id)
             payload = json.loads(trigger.payload_json)
+            status = str(payload.get("status"))
+            # The inline re-check can terminally REJECT the trigger; never fall
+            # through to the legacy recompute path from a terminal state (P3).
+            if status not in _PRE_ACCEPT_STATUSES:
+                reason = str(
+                    payload.get("rejection_reason")
+                    or card.get("rejection_reason")
+                    or "the entry re-check rejected the trigger"
+                )
+                error_code = card.get("error_code")
+                if error_code is not None:
+                    raise EntryRejected(str(error_code), reason)
+                # NO_ENTRY or an invalid decision follows the same path as the
+                # explicit decision checks below: invalidate, then reject.
+                self._invalidate_opportunity(payload["opportunity_id"], reason)
+                raise EntryRejected("ORDER_REJECTED", reason)
         decision = self._store.get_decision(str(payload["entry_decision_id"]))
         if decision is None or decision.validation_status not in {"VALID", "REPAIRED"}:
             reason = "entry decision is rejected or missing"
-            self._update_trigger(trigger, status="REJECTED", rejection_reason=reason)
+            self._update_trigger(
+                trigger,
+                status="REJECTED",
+                rejection_reason=reason,
+                expected_status=status,
+            )
             raise EntryRejected("ORDER_REJECTED", reason)
         decision_payload = json.loads(decision.payload_json)
         recheck = decision_payload.get("entry_recheck") or {}
         if recheck.get("decision") == "NO_ENTRY":
             self._update_trigger(
-                trigger, status="REJECTED", rejection_reason="entry re-check returned NO_ENTRY"
+                trigger,
+                status="REJECTED",
+                rejection_reason="entry re-check returned NO_ENTRY",
+                expected_status=status,
             )
             self._invalidate_opportunity(payload["opportunity_id"], "NO_ENTRY")
             raise EntryRejected("ORDER_REJECTED", "entry re-check returned NO_ENTRY")
         intent = recheck.get("order_intent")
         if intent is None:
             self._update_trigger(
-                trigger, status="REJECTED", rejection_reason="entry intent is missing"
+                trigger,
+                status="REJECTED",
+                rejection_reason="entry intent is missing",
+                expected_status=status,
             )
             raise EntryRejected("ORDER_REJECTED", "entry intent is missing")
 
@@ -609,6 +660,8 @@ class EntryService:
                 status="BLOCKED",
                 rejection_reason=f"risk blocked: {binding_cap}",
                 risk_verdict=verdict_payload,
+                expected_status=status,
+                require_no_entry_order=True,
             )
             raise EntryRejected(
                 "RISK_BLOCKED",
@@ -674,6 +727,7 @@ class EntryService:
             human_action=human_action,
             created_order_id=result.order.order_id,
             entry_decision_id=decision.decision_id,
+            expected_status=status,
         )
         record_audit(
             self._store,
@@ -698,10 +752,23 @@ class EntryService:
         )
 
     def reject(self, trigger_id: str, *, reason: str, actor_id: str = "cli") -> dict[str, Any]:
+        """Reject a pending trigger and invalidate its opportunity.
+
+        A committed entry order always wins: the crash window (order committed,
+        trigger update lost) is refused with a typed ``CONFLICT`` instead of
+        writing ``REJECTED`` over a live paper position. The write itself is a
+        compare-and-set, so a concurrent accept cannot be clobbered.
+        """
         trigger = self._trigger(trigger_id)
         payload: dict[str, Any] = json.loads(trigger.payload_json)
+        if self._store.get_entry_order_for_trigger(trigger_id) is not None:
+            raise EntryRejected(
+                "CONFLICT",
+                f"an entry order already exists for trigger {trigger_id}; it cannot be rejected",
+            )
         if payload["status"] == "ACCEPTED":
             raise EntryRejected("CONFLICT", "an accepted trigger cannot be rejected")
+        previous_status = str(payload["status"])
         now = utc_timestamp(self._clock.now())
         payload["status"] = "REJECTED"
         payload["rejection_reason"] = reason
@@ -718,7 +785,12 @@ class EntryService:
             status="REJECTED",
             payload_json=json.dumps(payload, sort_keys=True),
         )
-        self._store.update_trigger_event(record)
+        self._write_trigger(
+            record,
+            expected_status=previous_status,
+            require_no_order=True,
+            require_no_entry_order=True,
+        )
         self._invalidate_opportunity(payload["opportunity_id"], reason)
         record_audit(
             self._store,
@@ -779,14 +851,25 @@ class EntryService:
                 f"the symbol contract for {trigger_payload['symbol']} is missing",
             )
         now = utc_timestamp(self._clock.now())
+        equity_stale: tuple[str, ...] = ()
         if self._paper is not None:
             summary = self._paper.summary()
             equity = Decimal(str(summary["equity"]))
             open_positions = int(summary["open_positions"])
+            equity_stale = tuple(str(name) for name in summary.get("stale_inputs") or ())
         else:
             account = self._broker.account()
-            equity = Decimal(account.balance)
-            open_positions = len(self._store.list_positions(state="OPEN", limit=None))
+            positions = self._store.list_positions(state="OPEN", limit=None)
+            equity, equity_view = compute_equity(
+                Decimal(account.balance),
+                [json.loads(record.payload_json) for record in positions],
+            )
+            open_positions = len(positions)
+            equity_stale = equity_view.stale_inputs
+        if equity_stale:
+            # A degraded (cash-only) equity basis must be named as a gate input,
+            # never silently used for percentage sizing (S7).
+            equity_stale = tuple(dict.fromkeys((*equity_stale, "equity")))
         caps, _source = effective_caps(self._settings, self._store)
         side = str(trigger_payload["side"])
         try:
@@ -840,6 +923,7 @@ class EntryService:
                 min_notional=contract.min_notional,
                 spread_bps=spread_bps,
                 expected_slippage_bps=expected_slippage_bps,
+                equity_stale_inputs=equity_stale,
             )
         except (KeyError, TypeError, ValueError, ArithmeticError) as exc:
             # A malformed persisted intent must not surface as an unhandled 500.
@@ -889,7 +973,12 @@ class EntryService:
     def _expected_slippage_bps(
         self, intent: dict[str, Any], reference_price: Decimal
     ) -> float | None:
-        """``|advisory entry - mark| / mark * 10000``; 0 when equal (D2)."""
+        """``|advisory entry - mark| / mark * 10000``; 0 when equal (D2).
+
+        This is informational: it measures how far the LLM's advisory entry sits
+        from the code-owned mark. It is not the broker's simulated fill
+        slippage, which is the bounded ``OFT_PAPER_SLIPPAGE_BPS`` setting.
+        """
         advisory = intent.get("entry_price")
         if advisory in (None, "") or reference_price <= 0:
             return None
@@ -1074,6 +1163,9 @@ class EntryService:
         human_action: dict[str, Any] | None = None,
         created_order_id: str | None = None,
         entry_decision_id: str | None = None,
+        expected_status: str | None = None,
+        require_no_order: bool = True,
+        require_no_entry_order: bool = False,
     ) -> dict[str, Any]:
         payload: dict[str, Any] = json.loads(trigger.payload_json)
         payload["status"] = status
@@ -1087,8 +1179,38 @@ class EntryService:
         if entry_decision_id is not None:
             payload["entry_decision_id"] = entry_decision_id
         record = replace(trigger, status=status, payload_json=json.dumps(payload, sort_keys=True))
-        self._store.update_trigger_event(record)
+        self._write_trigger(
+            record,
+            expected_status=expected_status,
+            require_no_order=require_no_order,
+            require_no_entry_order=require_no_entry_order,
+        )
         return payload
+
+    def _write_trigger(
+        self,
+        record: TriggerEventRecord,
+        *,
+        expected_status: str | None = None,
+        require_no_order: bool = False,
+        require_no_entry_order: bool = False,
+    ) -> None:
+        """Compare-and-set the trigger row; a lost race is a typed conflict.
+
+        Nothing is audited by this method, so a zero-row write leaves the ledger
+        untouched (M1).
+        """
+        updated = self._store.update_trigger_event(
+            record,
+            expected_status=expected_status,
+            require_no_order=require_no_order,
+            require_no_entry_order=require_no_entry_order,
+        )
+        if not updated:
+            raise EntryRejected(
+                "CONFLICT",
+                "the trigger changed while the action was in flight; re-read and retry",
+            )
 
     def _invalidate_opportunity(self, opportunity_id: str, reason: str) -> None:
         from oft.application.opportunity_service import OpportunityService
@@ -1121,6 +1243,68 @@ class EntryService:
             )
         return record
 
+    def _reconcile_recheck(self, trigger: TriggerEventRecord, entry: OrderRecord) -> dict[str, Any]:
+        """Adopt a committed crash-window order from ``recheck`` (S6).
+
+        No LLM call runs and the stored decision/verdict is never rewritten; the
+        committed order and its position are surfaced in the card.
+        """
+        now = utc_timestamp(self._clock.now())
+        result = self._adopt_entry(trigger, entry, now=now, actor_id="recheck")
+        return self._reconciled_card(trigger.trigger_id, result)
+
+    def _reconciled_card(self, trigger_id: str, result: EntryResult) -> dict[str, Any]:
+        trigger = self._trigger(trigger_id)
+        payload: dict[str, Any] = json.loads(trigger.payload_json)
+        verdict = result.risk_verdict or {}
+        stale = verdict.get("stale_inputs") or []
+        risk_stage: dict[str, Any] = (
+            {**verdict, "provenance": "CALC"}
+            if verdict
+            else {
+                "verdict": "NOT_EVALUATED",
+                "binding_cap": "NONE",
+                "reasons": ["no risk verdict was persisted for the committed order"],
+                "provenance": "CALC",
+            }
+        )
+        return {
+            "decision_id": result.decision_id,
+            "trigger_id": trigger_id,
+            "status": result.status,
+            "rejection_reason": payload.get("rejection_reason"),
+            "data_quality": "PARTIAL" if stale else "COMPLETE",
+            "error_code": None,
+            "stage_order": ["TRIGGER", "LLM", "RISK", "HUMAN"],
+            "trigger": {
+                "trigger_id": trigger_id,
+                "opportunity_id": payload.get("opportunity_id"),
+                "symbol": payload.get("symbol"),
+                "side": payload.get("side"),
+                "status": result.status,
+                "trigger_source": payload.get("trigger_source"),
+                "triggered_at": payload.get("triggered_at"),
+                "snapshot": payload.get("snapshot"),
+                "condition_results": payload.get("condition_results", []),
+                "provenance": "CALC",
+            },
+            "llm": {
+                "decision_id": result.decision_id,
+                "decision": None,
+                "validation_status": None,
+                "confidence": None,
+                "provenance": "LLM",
+            },
+            "risk": risk_stage,
+            "human_action": payload.get("human_action"),
+            "entry_decision_id": result.decision_id,
+            "reconciled": True,
+            "order": result.order,
+            "fill": result.fill,
+            "position": result.position,
+            "account": result.account,
+        }
+
     def _adopt_entry(
         self,
         trigger: TriggerEventRecord,
@@ -1130,13 +1314,24 @@ class EntryService:
         actor_id: str,
     ) -> EntryResult:
         """Reconcile a committed order whose trigger update was lost (DB-1)."""
+        if entry.environment != "PAPER" or entry.purpose != "ENTRY":
+            raise EntryRejected(
+                "CONFLICT",
+                "the existing order is not a PAPER entry and cannot be adopted",
+            )
         order_payload = json.loads(entry.payload_json)
         verdict_record = self._store.get_risk_verdict(
             str(order_payload.get("risk_verdict_id") or "")
         )
-        verdict_payload: dict[str, Any] = (
-            json.loads(verdict_record.payload_json) if verdict_record is not None else {}
-        )
+        if verdict_record is None:
+            # Fail closed: the gateway refuses any order without a verdict, so an
+            # adopted order must never surface as ACCEPTED with none (S9).
+            raise EntryRejected(
+                "CONFLICT",
+                f"the risk verdict for order {entry.order_id} is missing; "
+                "the committed order cannot be reconciled",
+            )
+        verdict_payload = json.loads(verdict_record.payload_json)
         human_action = {
             "action": "ACCEPT",
             "actor": {"kind": "USER", "id": actor_id},
@@ -1147,10 +1342,11 @@ class EntryService:
         updated_payload = self._update_trigger(
             trigger,
             status="ACCEPTED",
-            risk_verdict=verdict_payload or None,
+            risk_verdict=verdict_payload,
             human_action=human_action,
             created_order_id=entry.order_id,
             entry_decision_id=entry.decision_id,
+            expected_status=trigger.status,
         )
         record_audit(
             self._store,
@@ -1171,13 +1367,21 @@ class EntryService:
         if order is None:
             raise EntryRejected("ORDER_NOT_FOUND", f"Order {order_id} does not exist.")
         order_payload = json.loads(order.payload_json)
+        verdict_id = str(order_payload.get("risk_verdict_id") or "")
+        verdict_record = self._store.get_risk_verdict(verdict_id) if verdict_id else None
+        if verdict_record is None:
+            raise EntryRejected(
+                "CONFLICT",
+                f"the risk verdict for order {order_id} is missing; it cannot be replayed",
+            )
+        verdict_payload = json.loads(verdict_record.payload_json)
         position_id = order_payload.get("position_id")
         fill = self._store.get_fill_by_order_id(order_id)
         position = self._store.get_position(position_id) if position_id else None
         account = self._broker.account()
         return EntryResult(
-            decision_id=str(trigger_payload.get("entry_decision_id") or ""),
-            risk_verdict=trigger_payload.get("risk_verdict") or {},
+            decision_id=str(trigger_payload.get("entry_decision_id") or order.decision_id or ""),
+            risk_verdict=verdict_payload,
             order=order_payload,
             fill=json.loads(fill.payload_json) if fill is not None else None,
             position=json.loads(position.payload_json) if position else None,

@@ -185,6 +185,25 @@ def test_verify_audit_chain_detects_a_truncated_tail(tmp_path: Path) -> None:
     assert result.checked == 1
 
 
+def test_verify_audit_chain_never_reports_ok_for_a_headless_upgraded_chain(
+    tmp_path: Path,
+) -> None:
+    settings, store, _kill = _client(tmp_path)
+    _audit_pair(store)
+    # A pre-v20 database upgraded in place has events but no high-water mark;
+    # truncating the tail must not silently pass.
+    with sqlite3.connect(settings.data_dir / "oft.db") as connection:
+        connection.execute("DELETE FROM system_state WHERE key = 'audit_head'")
+        connection.commit()
+    _tamper(settings, "DELETE FROM audit_events WHERE seq = 2")
+
+    result = verify_audit_chain(store)
+
+    assert result.ok is False
+    assert "AUDIT_CHAIN_UNAVAILABLE" in result.message
+    assert "AUDIT_CHAIN_OK" not in result.message
+
+
 def test_verify_audit_chain_detects_a_previous_hash_mismatch(tmp_path: Path) -> None:
     settings, store, _kill = _client(tmp_path)
     _audit_pair(store)

@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import json
 import socket
+import sqlite3
 import threading
 import time
 from collections.abc import Iterator
@@ -128,6 +129,16 @@ def test_cli_paper_loop_matches_the_api(llm_daemon: Settings) -> None:
     trigger_id = evaluate["data"]["trigger"]["trigger_id"]
     assert evaluate["data"]["trigger"]["trigger_source"] == "CODE"
 
+    rechecked = _json(runner.invoke(cli_app, ["trigger", "recheck", trigger_id, "--json"]))
+    assert rechecked["data"]["status"] == "RECHECKED"
+    assert rechecked["data"]["stage_order"] == ["TRIGGER", "LLM", "RISK", "HUMAN"]
+    assert rechecked["meta"]["data_quality"] == "PARTIAL"
+    rechecked_text = runner.invoke(cli_app, ["trigger", "recheck", trigger_id])
+    assert rechecked_text.exit_code == 0, rechecked_text.output
+    assert "STATUS RECHECKED" in rechecked_text.output
+    assert "data_quality PARTIAL" in rechecked_text.output
+    assert "stale:" in rechecked_text.output
+
     accepted = _json(
         runner.invoke(
             cli_app,
@@ -201,3 +212,29 @@ def test_cli_paper_loop_matches_the_api(llm_daemon: Settings) -> None:
         )
     )
     assert metrics_only["data"]["report"]["llm"]["configured"] is False
+
+
+def test_paper_equity_text_mode_shows_stale_inputs(llm_daemon: Settings) -> None:
+    runner = CliRunner()
+    with sqlite3.connect(llm_daemon.data_dir / "oft.db") as connection:
+        connection.execute(
+            "INSERT INTO positions "
+            "(position_id, account_id, environment, symbol, state, opened_at, payload_json) "
+            "VALUES (?, ?, ?, ?, ?, ?, ?)",
+            (
+                "POS-NO-MARK",
+                "ACC-PAPER",
+                "PAPER",
+                "BTCUSDT",
+                "OPEN",
+                "2026-11-06T12:00:00.000Z",
+                json.dumps({"size": "0.01", "mark_price": None}),
+            ),
+        )
+        connection.commit()
+
+    result = runner.invoke(cli_app, ["paper", "equity"])
+
+    assert result.exit_code == 0, result.output
+    assert "equity" in result.output
+    assert "stale: mark" in result.output

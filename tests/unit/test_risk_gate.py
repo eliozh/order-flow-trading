@@ -463,6 +463,30 @@ def test_notional_pct_boundary(pct: float) -> None:
     assert verdict.allowed_quantity * Decimal("70000.00") <= limit
 
 
+def test_the_notional_cap_equality_is_the_boundary() -> None:
+    from dataclasses import replace
+
+    # 7% of 10,000 = 700 USD / 70,000 = exactly 0.01 at a 0.001 step.
+    caps = replace(DEFAULT_CAPS, max_notional_pct=7.0)
+    verdict = _evaluate(
+        request=_request(quantity=Decimal("10"), stop_price=Decimal("69999.00")),
+        caps=caps,
+    )
+
+    assert verdict.binding_cap == "MAX_NOTIONAL"
+    assert verdict.allowed_quantity == Decimal("0.010")
+    assert verdict.allowed_notional_usd == _equity_limit(7.0)
+
+
+def test_degraded_equity_inputs_are_named_stale() -> None:
+    verdict = _evaluate(equity_stale_inputs=("mark", "equity"))
+
+    assert "mark" in verdict.stale_inputs
+    assert "equity" in verdict.stale_inputs
+    # The degraded-equity names are merged with the other measured-input names.
+    assert "spread_bps" in verdict.stale_inputs
+
+
 @pytest.mark.parametrize("positions", [0, 1, 2])
 def test_below_max_positions_is_not_blocked(positions: int) -> None:
     verdict = _evaluate(open_positions=positions)
@@ -618,6 +642,14 @@ def test_caps_round_trip_through_the_state_document() -> None:
     assert restored == caps
 
 
+def test_caps_from_state_json_round_trips_a_full_document() -> None:
+    caps = RiskCaps(per_trade_risk_pct=0.5, max_concurrent_positions=2, max_spread_bps=10.0)
+
+    restored = RiskCaps.from_state_json(json.dumps(caps.to_state()))
+
+    assert restored == caps
+
+
 def test_caps_from_state_rejects_a_non_object() -> None:
     with pytest.raises(ValueError):
         RiskCaps.from_state_json("[]")
@@ -756,6 +788,37 @@ def test_risk_show_reports_config_defaults(tmp_path: Path, monkeypatch: pytest.M
     assert data["caps"]["per_trade_risk_pct"] == 0.8
     assert data["caps"]["max_notional_pct"] == 20.0
     assert data["defaults"]["stale_mark_seconds"] == 60
+
+
+def test_risk_show_human_output_lists_the_caps(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    result = _risk_cli(monkeypatch, tmp_path, "show")
+
+    assert result.exit_code == 0, result.output
+    assert "risk caps · source config" in result.output
+    assert "per_trade_risk_pct" in result.output
+    assert "defaults:" in result.output
+
+
+def test_risk_validate_human_output_reports_pass(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    result = _risk_cli(monkeypatch, tmp_path, "validate")
+
+    assert result.exit_code == 0, result.output
+    assert "PASS · risk caps valid · source config" in result.output
+
+
+def test_risk_set_without_any_cap_is_a_validation_failure(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    result = _risk_cli(monkeypatch, tmp_path, "set")
+
+    assert result.exit_code != 0
+    assert "no risk cap was provided to set" in result.output
+    _, store = _risk_store(tmp_path)
+    assert store.get_system_state("risk_caps") is None
 
 
 def test_risk_set_tightening_persists_and_audits(
