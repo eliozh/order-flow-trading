@@ -330,8 +330,7 @@ function ReportBand({
 export function LlmBand(props: LlmBandProps) {
   const headingId = useId()
   const title =
-    props.title ??
-    (props.llm !== undefined ? 'LLM analysis' : 'LLM rationale (untrusted)')
+    props.title ?? (props.llm !== undefined ? 'LLM analysis' : 'LLM rationale (untrusted)')
 
   if (props.mode === 'ledger') {
     return (
