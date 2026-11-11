@@ -8,6 +8,8 @@ export interface RouteMatch {
   scanId: string | null
   isReports: boolean
   reportId: string | null
+  isOpportunities: boolean
+  opportunityId: string | null
 }
 
 function decodeSegment(segment: string): string {
@@ -33,6 +35,7 @@ export function resolveRoute(pathname: string): RouteMatch {
   const inspectorSymbol = symbolMatch !== null && !isSearch ? decodeSegment(symbolMatch[1]) : null
   const scanMatch = /^\/scans\/([^/]+)$/.exec(path)
   const reportMatch = /^\/reports\/([^/]+)$/.exec(path)
+  const opportunityMatch = /^\/opportunities\/([^/]+)$/.exec(path)
   return {
     path,
     inspectorSymbol,
@@ -43,5 +46,7 @@ export function resolveRoute(pathname: string): RouteMatch {
     scanId: scanMatch !== null ? decodeSegment(scanMatch[1]) : null,
     isReports: path === '/reports' || path.startsWith('/reports/'),
     reportId: reportMatch !== null ? decodeSegment(reportMatch[1]) : null,
+    isOpportunities: path === '/opportunities' || path.startsWith('/opportunities/'),
+    opportunityId: opportunityMatch !== null ? decodeSegment(opportunityMatch[1]) : null,
   }
 }

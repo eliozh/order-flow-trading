@@ -33,6 +33,10 @@ The PRD's hard rule is enforced by four contracts plus the architecture:
 
 `llm-output.schema.json` is provider-safe: every object lists all properties in `required` and sets `additionalProperties: false`; it uses a flat `decision_type` with nullable role payloads instead of deep unions; it avoids numeric/string-length/array constraints that providers cannot enforce. Provider adapters may strip unsupported keywords (e.g. `format`) but may never add fields or relax `additionalProperties`. Semantic checks that JSON Schema cannot express (confidence range, stop side, zone order, decision-type/payload match) run in code after schema validation.
 
+### Report payload (composed read model)
+
+`GET /api/v1/reports/{id}` is a composition, not a fifth contract: `snapshot` is `market-snapshot.schema.json`, `metrics` is `orderflow-metrics.schema.json`, and `llm` reuses the persisted decision/provenance fields from `llm-decision.schema.json` behind a `configured` flag. A metrics-only report returns `llm = {configured: false, reason}` while the CALC report stays valid. The web report renders the LLM narrative as untrusted text and never renders raw prompts, provider keys, or HTML.
+
 ## Validation pipeline
 
 ```

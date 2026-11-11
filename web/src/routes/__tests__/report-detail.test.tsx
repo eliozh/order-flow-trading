@@ -1,7 +1,14 @@
 import { render, screen, within } from '@testing-library/react'
 import { describe, expect, it } from 'vitest'
 
-import type { ApiMeta, MetricsDocument, ReportData, ReportEnvelope } from '../../api/reports'
+import type {
+  ApiMeta,
+  MetricsDocument,
+  ReportData,
+  ReportEnvelope,
+  LlmState,
+} from '../../api/reports'
+import type { OpportunityData, OpportunityEnvelope } from '../../api/opportunities'
 import { ReportDetailPage } from '../report-detail'
 
 const meta: ApiMeta = {
@@ -113,7 +120,11 @@ function metrics(measured: boolean): MetricsDocument {
           ]
         : [],
       delta_over_window: measured ? '2' : '0',
-      last: { ts: '2026-10-01T00:00:00.000Z', open_interest: '100', open_interest_value: '7000000' },
+      last: {
+        ts: '2026-10-01T00:00:00.000Z',
+        open_interest: '100',
+        open_interest_value: '7000000',
+      },
     },
     funding: {
       current_rate: measured ? '0.0001' : '0',
@@ -140,8 +151,42 @@ function metrics(measured: boolean): MetricsDocument {
   }
 }
 
-function report(measured: boolean): ReportData {
-  const document = metrics(measured)
+const VALID_LLM: LlmState = {
+  configured: true,
+  reason: null,
+  provider: 'stub',
+  model: 'fixture',
+  prompt_id: 'analysis',
+  prompt_version: 1,
+  prompt_hash: 'c'.repeat(64),
+  knowledge: {
+    status: 'AVAILABLE',
+    mode: 'FULL',
+    artifact_id: 'KNW-ARTIFACT-1234',
+    selected_section_ids: ['S-1'],
+    selected_topics: ['orderflow'],
+    token_count: 120,
+    budget_tokens: 10000,
+    dropped_section_ids: [],
+    excluded_sections: [],
+    warning: null,
+    reason: null,
+    exact_replay: true,
+  },
+  validation_status: 'VALID',
+  decision_type: 'OPPORTUNITY_PROPOSAL',
+  confidence: 0.72,
+  narrative:
+    'Price is rotating inside the range with a positive cumulative delta. This is advisory prose, not a measurement.',
+  rationale: 'Range high retest.',
+  opportunity_ids: ['OPP-1'],
+  cost: { amount_usd: '0.012', currency: 'USD', price_version: 'stub/v1', unpriced: false },
+  usage: { total_tokens: 1200 },
+  reference_price: '70002.00',
+}
+
+function report(llm: LlmState = { configured: false, reason: 'LLM not configured.' }): ReportData {
+  const document = metrics(false)
   return {
     report_id: 'RPT-BTCUSDT-20261106-120000-ABCD1234',
     scan_id: 'SCAN-20261106-ABCD1234',
@@ -149,9 +194,13 @@ function report(measured: boolean): ReportData {
     timeframe: '4h',
     generated_at: '2026-11-06T12:00:00.000Z',
     data_quality: 'MISSING',
-    llm_decision_id: null,
-    narrative_ref: null,
-    llm: { configured: false, reason: 'LLM not configured.' },
+    llm_decision_id: llm.configured ? 'DEC-1' : null,
+    narrative_ref: llm.configured ? 'NAR-1' : null,
+    llm,
+    llm_stage: llm.configured ? 'DONE' : 'SKIPPED',
+    llm_tokens: llm.usage?.total_tokens ?? 0,
+    cost_usd: llm.cost?.amount_usd ?? '0',
+    cost_unpriced: llm.cost?.unpriced ?? false,
     metrics_manifest: [],
     snapshot: {
       schema_version: '1.0.0',
@@ -194,15 +243,75 @@ function report(measured: boolean): ReportData {
   }
 }
 
-function envelope(measured: boolean): ReportEnvelope {
-  return { ok: true, data: report(measured), error: null, meta }
+function opportunity(overrides: Partial<OpportunityData> = {}): OpportunityData {
+  return {
+    schema_version: '1.0.0',
+    opportunity_id: 'OPP-1',
+    symbol: 'BTCUSDT',
+    side: 'LONG',
+    state: 'OPEN',
+    created_at: '2026-11-06T12:00:00.000Z',
+    updated_at: '2026-11-06T12:00:00.000Z',
+    zone: { low: '69000.00', high: '71000.00' },
+    entry_preference: 'MARKET',
+    trigger_conditions: [],
+    invalidation_conditions: [],
+    expires_at: '2027-01-01T00:00:00.000Z',
+    thesis: 'Range high retest with positive delta.',
+    confidence: 0.72,
+    risk_request: {
+      entry_price: '70000.00',
+      stop_price: '69000.00',
+      quantity: null,
+      risk_pct: 0.8,
+      leverage: 2,
+      notional_usd: '1000.00',
+    },
+    source: { scan_id: 'SCAN-1', report_id: 'RPT-1', decision_id: 'DEC-1' },
+    provenance: {
+      llm: { provider: 'stub', model: 'fixture', prompt_id: 'analysis', prompt_version: 1 },
+      calc_snapshot_id: 'SNAP-1',
+      calc_snapshot_hash: 'd'.repeat(64),
+      calc_metric_version: 'orderflow.v1',
+    },
+    data_quality: {
+      status: 'PARTIAL',
+      reasons: [],
+      gaps: [],
+      last_event_at: null,
+      coverage_start: null,
+    },
+    state_history: [
+      {
+        from_state: null,
+        to_state: 'OPEN',
+        at: '2026-11-06T12:00:00.000Z',
+        reason_code: 'CREATED',
+        note: 'created from a validated LLM draft',
+      },
+    ],
+    ...overrides,
+  }
 }
 
-async function renderReport(measured: boolean) {
+function envelope(data: ReportData = report()): ReportEnvelope {
+  return { ok: true, data, error: null, meta }
+}
+
+function opportunityEnvelope(item: OpportunityData): OpportunityEnvelope {
+  return { ok: true, data: item, error: null, meta }
+}
+
+async function renderReport(
+  data: ReportData = report(),
+  fetchOpportunityFn = async (id: string) =>
+    opportunityEnvelope(opportunity({ opportunity_id: id })),
+) {
   render(
     <ReportDetailPage
       reportId="RPT-BTCUSDT-20261106-120000-ABCD1234"
-      fetchReportFn={async () => envelope(measured)}
+      fetchReportFn={async () => envelope(data)}
+      fetchOpportunityFn={fetchOpportunityFn}
     />,
   )
   await screen.findByRole('heading', { name: /CALC/ })
@@ -218,7 +327,7 @@ function row(label: string): HTMLElement {
 
 describe('ReportDetail unmeasured sections', () => {
   it('shows not measured instead of zero for absent OI and funding', async () => {
-    await renderReport(false)
+    await renderReport(report())
 
     expect(within(row('OI Δ')).getByText('not measured')).toBeInTheDocument()
     expect(within(row('OI Δ')).getByText(/MISSING · no measured open-interest/)).toHaveClass(
@@ -231,7 +340,10 @@ describe('ReportDetail unmeasured sections', () => {
   })
 
   it('shows measured OI, funding rate, and next funding time when present', async () => {
-    await renderReport(true)
+    const measured = report()
+    measured.metrics = metrics(true)
+    measured.snapshot.orderflow = measured.metrics
+    await renderReport(measured)
 
     expect(within(row('OI Δ')).getByText('2')).toBeInTheDocument()
     expect(screen.getByRole('table', { name: /deterministic metric summary/i })).toHaveClass(
@@ -241,6 +353,129 @@ describe('ReportDetail unmeasured sections', () => {
     const funding = within(row('Funding'))
     expect(funding.getByText('0.0001')).toBeInTheDocument()
     expect(funding.getByText(/next 2026-10-01 08:00 UTC/)).toBeInTheDocument()
+  })
+})
+
+describe('ReportDetail CALC and LLM band order', () => {
+  it('renders the CALC band before the LLM band', async () => {
+    await renderReport(report(VALID_LLM))
+
+    const calc = screen.getByRole('heading', { name: /CALC/ })
+    const llm = screen.getByRole('heading', { name: /LLM/ })
+    expect(calc.compareDocumentPosition(llm) & Node.DOCUMENT_POSITION_FOLLOWING).toBeTruthy()
+  })
+
+  it('renders the LLM narrative as text with provider, model, prompt, confidence, cost, and knowledge hash', async () => {
+    await renderReport(report(VALID_LLM))
+
+    expect(screen.getByText(VALID_LLM.narrative ?? '')).toBeInTheDocument()
+    expect(screen.getByText(/untrusted model text, not a measurement/i)).toBeInTheDocument()
+    expect(screen.getByText('stub')).toBeInTheDocument()
+    expect(screen.getByText('fixture')).toBeInTheDocument()
+    expect(screen.getByText(/analysis v1/)).toBeInTheDocument()
+    expect(screen.getByText('0.72 · high')).toBeInTheDocument()
+    expect(screen.getByText('$0.012')).toBeInTheDocument()
+    expect(screen.getByText(/KNW-ARTIFACT-1234/)).toBeInTheDocument()
+    expect(screen.getByText(/1,?200 tokens/)).toBeInTheDocument()
+    expect(screen.getByRole('note', { name: /Provenance LLM/i })).toBeInTheDocument()
+  })
+
+  it('never claims narrative is a measurement', async () => {
+    await renderReport(report(VALID_LLM))
+
+    expect(screen.queryByText(/narrative measurement/i)).not.toBeInTheDocument()
+    expect(screen.getAllByText(/not a measurement/i).length).toBeGreaterThan(0)
+  })
+})
+
+describe('ReportDetail narrative failure states', () => {
+  it('shows the failing schema field and no narrative without blanking the CALC report', async () => {
+    const rejected: LlmState = {
+      ...VALID_LLM,
+      validation_status: 'REJECTED',
+      reason: 'SCHEMA_INVALID: opportunity.risk_request.stop_price required',
+      narrative: 'This rejected narrative must not be displayed.',
+      opportunity_ids: [],
+    }
+    const data = report(rejected)
+    data.llm_stage = 'FAILED'
+    await renderReport(data)
+
+    const band = screen.getByRole('region', { name: /LLM/i })
+    expect(within(band).getByText('REJECTED')).toHaveClass('chip', 'chip--danger')
+    expect(within(band).getByText(/SCHEMA_INVALID/)).toBeInTheDocument()
+    expect(within(band).getByText(/No narrative was produced/i)).toBeInTheDocument()
+    expect(
+      within(band).queryByText('This rejected narrative must not be displayed.'),
+    ).not.toBeInTheDocument()
+    expect(screen.getByRole('heading', { name: /CALC/ })).toBeInTheDocument()
+    expect(screen.getByRole('heading', { name: /CALC/ })).toBeInTheDocument()
+    expect(screen.getByRole('table', { name: /deterministic metric summary/i })).toBeInTheDocument()
+  })
+
+  it('shows the disabled reason and keeps the report usable when LLM is off', async () => {
+    await renderReport(report())
+
+    const band = screen.getByRole('region', { name: /LLM/i })
+    expect(within(band).getByText('LLM not configured.')).toBeInTheDocument()
+    expect(within(band).queryByText(/not a measurement/i)).not.toBeInTheDocument()
+    expect(screen.getByRole('table', { name: /deterministic metric summary/i })).toBeInTheDocument()
+  })
+})
+
+describe('ReportDetail opportunity cards', () => {
+  it('links each proposed opportunity to its ledger detail and exposes no accept action', async () => {
+    const data = report(VALID_LLM)
+    data.llm.opportunity_ids = ['OPP-1']
+    await renderReport(data)
+
+    const link = await screen.findByRole('link', { name: /View OPP-1/i })
+    expect(link).toHaveAttribute('href', '/opportunities/OPP-1')
+    const card = link.closest('article')
+    if (!card) {
+      throw new Error('missing opportunity card')
+    }
+    expect(within(card).getByRole('heading', { name: /BTCUSDT/ })).toBeInTheDocument()
+    expect(within(card).getByText(/69000\.00 – 71000\.00/)).toBeInTheDocument()
+    expect(within(card).getByText('0.72')).toBeInTheDocument()
+    expect(screen.queryByRole('button', { name: /accept|reject/i })).not.toBeInTheDocument()
+    expect(screen.queryByRole('link', { name: /accept|reject/i })).not.toBeInTheDocument()
+  })
+
+  it('keeps a link-only card when the opportunity detail cannot be loaded', async () => {
+    const data = report(VALID_LLM)
+    data.llm.opportunity_ids = ['OPP-9']
+    await renderReport(data, async () => {
+      throw new Error('ledger unavailable')
+    })
+
+    expect(await screen.findByRole('link', { name: /View OPP-9/i })).toHaveAttribute(
+      'href',
+      '/opportunities/OPP-9',
+    )
+    expect(screen.getByText(/details unavailable/i)).toBeInTheDocument()
+  })
+})
+
+describe('ReportDetail narrative safety', () => {
+  it('renders markup-like narrative as inert text, never as HTML', async () => {
+    const hostile = '<img src=x onerror="alert(1)"><script>alert(2)</script>'
+    const data = report({ ...VALID_LLM, narrative: hostile, opportunity_ids: [] })
+
+    const { container } = render(
+      <ReportDetailPage
+        reportId="RPT-XSS"
+        fetchReportFn={async () => envelope(data)}
+        fetchOpportunityFn={async () => {
+          throw new Error('unused')
+        }}
+      />,
+    )
+    await screen.findByRole('heading', { name: /CALC/ })
+
+    expect(screen.getByText(hostile)).toBeInTheDocument()
+    expect(container.querySelector('img')).toBeNull()
+    expect(container.querySelector('script')).toBeNull()
   })
 })
 
@@ -259,7 +494,7 @@ describe('ReportDetail loading and error states', () => {
     const { unmount } = render(
       <ReportDetailPage
         reportId="RPT-EMPTY"
-        fetchReportFn={async () => ({ ...envelope(false), data: null })}
+        fetchReportFn={async () => ({ ...envelope(), data: null })}
       />,
     )
     expect(await screen.findByRole('alert')).toHaveTextContent(/Report unavailable/)

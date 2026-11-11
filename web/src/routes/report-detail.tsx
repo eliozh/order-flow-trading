@@ -7,15 +7,23 @@ import {
   type ReportData,
   type ReportEnvelope,
 } from '../api/reports'
+import {
+  fetchOpportunity,
+  type OpportunityData,
+  type OpportunityEnvelope,
+} from '../api/opportunities'
 import { addDecimals } from '../api/decimal'
 import { Chart } from '../components/chart'
 import { DataQualityBadge } from '../components/data-quality'
+import { LlmBand } from '../components/llm-band'
+import { OpportunityCard } from '../components/opportunity-card'
 import { ProvenanceStamp } from '../components/provenance'
 import { useCompact } from '../hooks/use-compact'
 
 interface ReportDetailPageProps {
   reportId: string
   fetchReportFn?: (reportId: string) => Promise<ReportEnvelope>
+  fetchOpportunityFn?: (opportunityId: string) => Promise<OpportunityEnvelope>
   isCompact?: boolean
 }
 
@@ -23,6 +31,12 @@ interface ReportState {
   state: 'loading' | 'ready' | 'error'
   report?: ReportData
   message?: string
+}
+
+interface OpportunityCardState {
+  opportunity_id: string
+  opportunity?: OpportunityData
+  error?: string
 }
 
 function footprintTotal(report: ReportData, barStart: string | undefined): string {
@@ -36,15 +50,18 @@ function footprintTotal(report: ReportData, barStart: string | undefined): strin
 export function ReportDetailPage({
   reportId,
   fetchReportFn = fetchReport,
+  fetchOpportunityFn = fetchOpportunity,
   isCompact,
 }: ReportDetailPageProps) {
   const [load, setLoad] = useState<ReportState>({ state: 'loading' })
   const [selectedBarStart, setSelectedBarStart] = useState<string | undefined>(undefined)
+  const [cards, setCards] = useState<OpportunityCardState[]>([])
   const compact = useCompact(isCompact)
 
   useEffect(() => {
     let active = true
     setLoad({ state: 'loading' })
+    setCards([])
     fetchReportFn(reportId)
       .then((envelope) => {
         if (!active) {
@@ -55,6 +72,24 @@ export function ReportDetailPage({
           return
         }
         setLoad({ state: 'ready', report: envelope.data })
+        const ids = envelope.data.llm.opportunity_ids ?? []
+        setCards(ids.map((opportunityId) => ({ opportunity_id: opportunityId })))
+        void Promise.all(
+          ids.map(async (opportunityId): Promise<OpportunityCardState> => {
+            try {
+              const detail = await fetchOpportunityFn(opportunityId)
+              return detail.data
+                ? { opportunity_id: opportunityId, opportunity: detail.data }
+                : { opportunity_id: opportunityId, error: 'Details unavailable.' }
+            } catch {
+              return { opportunity_id: opportunityId, error: 'Details unavailable.' }
+            }
+          }),
+        ).then((loaded) => {
+          if (active) {
+            setCards(loaded)
+          }
+        })
       })
       .catch((error: unknown) => {
         if (active) {
@@ -67,7 +102,7 @@ export function ReportDetailPage({
     return () => {
       active = false
     }
-  }, [reportId, fetchReportFn])
+  }, [reportId, fetchReportFn, fetchOpportunityFn])
 
   if (load.state === 'loading') {
     return (
@@ -235,27 +270,46 @@ export function ReportDetailPage({
         onSelectBar={setSelectedBarStart}
       />
 
-      <section className="band band--llm-disabled" aria-labelledby="llm-heading">
-        <div className="band-head">
-          <ProvenanceStamp kind="LLM" />
-          <h2 id="llm-heading">LLM analysis</h2>
-          <span className="chip chip--warn">disabled</span>
-        </div>
-        <p>{report.llm.reason}</p>
-        <p className="panel-foot">
-          Decision <code>{report.llm_decision_id ?? 'null'}</code> · narrative{' '}
-          <code>{report.narrative_ref ?? 'null'}</code>. No raw HTML, no fabricated narrative.
-        </p>
-      </section>
+      <LlmBand
+        llm={report.llm}
+        decisionId={report.llm_decision_id}
+        narrativeRef={report.narrative_ref}
+      />
+
+      {cards.length > 0 && (
+        <section className="panel" aria-labelledby="report-opps-heading">
+          <div className="panel-head">
+            <h2 id="report-opps-heading">Opportunities</h2>
+            <a className="btn sm" href="/opportunities">
+              Open ledger
+            </a>
+          </div>
+          <div className="card-grid">
+            {cards.map((card) => (
+              <OpportunityCard
+                key={card.opportunity_id}
+                opportunityId={card.opportunity_id}
+                opportunity={card.opportunity}
+              />
+            ))}
+          </div>
+          <p className="panel-foot">
+            Read-only report: there is no accept or reject action here. Acceptance happens in entry
+            review after the code-owned trigger.
+          </p>
+        </section>
+      )}
 
       <section className="panel" aria-labelledby="provenance-heading">
         <div className="panel-head">
           <h2 id="provenance-heading">Provenance</h2>
         </div>
         <p className="panel-foot">
-          CALC blocks are computed by code from market data and are reproducible. The LLM band is
-          disabled because no provider is configured in this build. Missing data is stamped
-          MISSING/PARTIAL instead of being estimated into the chart.
+          CALC blocks are computed by code from market data and are reproducible. The LLM band is{' '}
+          {report.llm.configured
+            ? 'model-generated and not reproducible across models; provider, model, prompt version, and cost are shown above.'
+            : 'disabled because no provider is configured in this build.'}{' '}
+          Missing data is stamped MISSING/PARTIAL instead of being estimated into the chart.
         </p>
       </section>
     </section>

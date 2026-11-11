@@ -204,9 +204,88 @@ export interface MetricManifestEntry {
   run_id: string | null
 }
 
+/** The knowledge artifact injected into one LLM call. Never contains the raw prompt. */
+export interface LlmKnowledgeState {
+  status: string
+  mode?: string
+  artifact_id?: string | null
+  selected_section_ids?: string[]
+  selected_topics?: string[]
+  token_count?: number
+  budget_tokens?: number
+  dropped_section_ids?: string[]
+  excluded_sections?: { section_id: string; reason: string; tokens: number }[]
+  warning?: string | null
+  reason?: string | null
+  exact_replay?: boolean
+}
+
+export interface LlmCostState {
+  amount_usd?: string | null
+  currency?: string
+  price_version?: string
+  unpriced?: boolean
+}
+
+export interface LlmUsageState {
+  input_tokens?: number
+  output_tokens?: number
+  cache_read_tokens?: number
+  cache_write_tokens?: number
+  reasoning_tokens?: number
+  total_tokens?: number
+}
+
+export type ConfidenceBand = 'high' | 'medium' | 'low'
+
+/** Contract bands: 0.70+ high, 0.40–0.69 medium, below 0.40 low. */
+export function confidenceBand(confidence: number | null | undefined): ConfidenceBand | null {
+  if (confidence === null || confidence === undefined || Number.isNaN(confidence)) {
+    return null
+  }
+  if (confidence >= 0.7) {
+    return 'high'
+  }
+  if (confidence >= 0.4) {
+    return 'medium'
+  }
+  return 'low'
+}
+
+/**
+ * The rich LLM band returned by `GET /api/v1/reports/{id}`.
+ *
+ * When no provider runs, the payload is only `{configured: false, reason}`;
+ * every other field is optional so the CALC report stays renderable.
+ */
 export interface LlmState {
   configured: boolean
-  reason: string
+  reason?: string | null
+  provider?: string
+  model?: string
+  prompt_id?: string
+  prompt_version?: number
+  prompt_hash?: string
+  knowledge?: LlmKnowledgeState
+  system_prompt_id?: string
+  system_prompt_version?: number
+  system_prompt_hash?: string
+  validation_status?: string | null
+  decision_type?: string | null
+  confidence?: number | null
+  narrative?: string | null
+  rationale?: string | null
+  opportunity_ids?: string[]
+  cost?: LlmCostState
+  usage?: LlmUsageState
+  reference_price?: string | null
+}
+
+/** The compact LLM cell returned by `GET /api/v1/reports`. */
+export interface LlmSummaryState {
+  configured: boolean
+  validation_status: string | null
+  opportunity_ids: string[]
 }
 
 export interface ReportData {
@@ -219,6 +298,12 @@ export interface ReportData {
   llm_decision_id: string | null
   narrative_ref: string | null
   llm: LlmState
+  llm_stage: string
+  llm_tokens: number
+  cost_usd: string
+  cost_unpriced: boolean
+  window_policy?: unknown
+  delivery?: { configured: boolean; reason: string }
   metrics_manifest: MetricManifestEntry[]
   snapshot: MarketSnapshot
   metrics: MetricsDocument
@@ -232,6 +317,12 @@ export interface ReportSummary {
   generated_at: string
   data_quality: string
   llm_decision_id: string | null
+  narrative_ref: string | null
+  llm_stage: string
+  llm_tokens: number
+  cost_usd: string
+  cost_unpriced: boolean
+  llm: LlmSummaryState
 }
 
 export interface ReportListData {
