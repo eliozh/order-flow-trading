@@ -1,6 +1,5 @@
-/* eslint-disable jsx-a11y/no-autofocus -- focus starts on the least destructive control (cancel or reason) */
-/* eslint-disable jsx-a11y/no-noninteractive-element-interactions -- role=dialog closes on Escape */
-import { useEffect, useRef, useState } from 'react'
+import { useCallback, useEffect, useRef, useState } from 'react'
+import { createPortal } from 'react-dom'
 
 import { isAbortError } from '../api/abort'
 import {
@@ -35,8 +34,17 @@ interface TriggerDetailPageProps {
     key: string,
     signal?: AbortSignal,
   ) => Promise<DecisionCardEnvelope>
-  acceptFn?: (triggerId: string, key: string) => Promise<TriggerAcceptEnvelope>
-  rejectFn?: (triggerId: string, reason: string, key: string) => Promise<TriggerRejectEnvelope>
+  acceptFn?: (
+    triggerId: string,
+    key: string,
+    signal?: AbortSignal,
+  ) => Promise<TriggerAcceptEnvelope>
+  rejectFn?: (
+    triggerId: string,
+    reason: string,
+    key: string,
+    signal?: AbortSignal,
+  ) => Promise<TriggerRejectEnvelope>
   fetchOpportunityFn?: (opportunityId: string, signal?: AbortSignal) => Promise<OpportunityEnvelope>
   isCompact?: boolean
 }
@@ -48,6 +56,45 @@ interface DetailState {
   opportunity?: OpportunityData | null
   recheckError?: string | null
   message?: string
+}
+
+const RECHECK_STORAGE_PREFIX = 'oft.entry.recheck.'
+const memoryRecheckKeys = new Map<string, string>()
+
+function sessionStore(): Storage | null {
+  if (typeof window === 'undefined') {
+    return null
+  }
+  try {
+    return window.sessionStorage
+  } catch {
+    return null
+  }
+}
+
+function storedRecheckKey(triggerId: string): string | null {
+  const store = sessionStore()
+  if (store) {
+    return store.getItem(`${RECHECK_STORAGE_PREFIX}${triggerId}`)
+  }
+  return memoryRecheckKeys.get(triggerId) ?? null
+}
+
+/** One recheck key per trigger for the browser session, so a refresh replays. */
+function recheckKeyFor(triggerId: string): string {
+  return storedRecheckKey(triggerId) ?? rotateRecheckKey(triggerId)
+}
+
+/** A deliberate new re-check gets a fresh key and becomes the session key. */
+function rotateRecheckKey(triggerId: string): string {
+  const key = idempotencyKey(`web-recheck-${triggerId}`)
+  const store = sessionStore()
+  if (store) {
+    store.setItem(`${RECHECK_STORAGE_PREFIX}${triggerId}`, key)
+  } else {
+    memoryRecheckKeys.set(triggerId, key)
+  }
+  return key
 }
 
 function errorMessage(error: unknown): string {
@@ -117,6 +164,87 @@ function recordField(
   return typeof value === 'string' || typeof value === 'number' ? String(value) : null
 }
 
+function focusables(panel: HTMLElement | null): HTMLElement[] {
+  if (!panel) {
+    return []
+  }
+  return Array.from(
+    panel.querySelectorAll<HTMLElement>(
+      'button:not([disabled]), [href], input:not([disabled]), select:not([disabled]), textarea:not([disabled]), [tabindex]:not([tabindex="-1"])',
+    ),
+  )
+}
+
+/** Modal focus contract shared by the accept and reject dialogs. */
+function useDialogFocus(open: boolean, onClose: () => void) {
+  const panelRef = useRef<HTMLDivElement>(null)
+  const restoreRef = useRef<HTMLElement | null>(null)
+
+  useEffect(() => {
+    if (!open || typeof document === 'undefined') {
+      return
+    }
+    restoreRef.current =
+      document.activeElement instanceof HTMLElement ? document.activeElement : null
+    const panel = panelRef.current
+    const initial =
+      panel?.querySelector<HTMLElement>('[data-autofocus]') ?? focusables(panel)[0] ?? panel
+    initial?.focus()
+
+    const shell = document.querySelector('.app-shell')
+    const shellWasInert = shell?.hasAttribute('inert') ?? false
+    shell?.setAttribute('inert', '')
+    const previousOverflow = document.body.style.overflow
+    document.body.style.overflow = 'hidden'
+
+    function onKeyDown(event: KeyboardEvent): void {
+      if (event.key === 'Escape') {
+        event.preventDefault()
+        onClose()
+        return
+      }
+      if (event.key !== 'Tab') {
+        return
+      }
+      const items = focusables(panel)
+      if (items.length === 0) {
+        event.preventDefault()
+        panel?.focus()
+        return
+      }
+      const first = items[0]
+      const last = items[items.length - 1]
+      if (
+        event.shiftKey &&
+        (document.activeElement === first || document.activeElement === panel)
+      ) {
+        event.preventDefault()
+        last.focus()
+      } else if (!event.shiftKey && document.activeElement === last) {
+        event.preventDefault()
+        first.focus()
+      }
+    }
+
+    document.addEventListener('keydown', onKeyDown, true)
+    return () => {
+      document.removeEventListener('keydown', onKeyDown, true)
+      document.body.style.overflow = previousOverflow
+      if (!shellWasInert) {
+        shell?.removeAttribute('inert')
+      }
+      const target = restoreRef.current
+      if (target && target.isConnected) {
+        target.focus()
+      } else {
+        document.getElementById('trigger-detail-heading')?.focus()
+      }
+    }
+  }, [open, onClose])
+
+  return panelRef
+}
+
 export function TriggerDetailPage({
   triggerId,
   getTriggerFn = getTrigger,
@@ -127,7 +255,6 @@ export function TriggerDetailPage({
   isCompact,
 }: TriggerDetailPageProps) {
   const [load, setLoad] = useState<DetailState>({ state: 'loading' })
-  const [reload, setReload] = useState(0)
   const [acceptOpen, setAcceptOpen] = useState(false)
   const [rejectOpen, setRejectOpen] = useState(false)
   const [reason, setReason] = useState('')
@@ -136,11 +263,35 @@ export function TriggerDetailPage({
   const [actionError, setActionError] = useState<string | null>(null)
   const [accepted, setAccepted] = useState<TriggerAcceptData | null>(null)
   const [rejected, setRejected] = useState<TriggerRejectData | null>(null)
+  const [rechecking, setRechecking] = useState(false)
+  const [announcement, setAnnouncement] = useState('')
   const compact = useCompact(isCompact)
 
-  const recheckKey = useRef(idempotencyKey(`web-recheck-${triggerId}`))
-  const acceptKey = useRef(idempotencyKey(`web-accept-${triggerId}`))
-  const rejectKey = useRef(idempotencyKey(`web-reject-${triggerId}`))
+  // Keys are lazy-initialised: `idempotencyKey` never runs during render.
+  const acceptKeyRef = useRef<string | null>(null)
+  const rejectKeyRef = useRef<string | null>(null)
+  const actionController = useRef<AbortController | null>(null)
+  const recheckController = useRef<AbortController | null>(null)
+  const mounted = useRef(true)
+
+  useEffect(() => {
+    mounted.current = true
+    return () => {
+      mounted.current = false
+      actionController.current?.abort()
+      recheckController.current?.abort()
+    }
+  }, [])
+
+  function acceptKey(): string {
+    acceptKeyRef.current ??= idempotencyKey(`web-accept-${triggerId}`)
+    return acceptKeyRef.current
+  }
+
+  function rejectKey(): string {
+    rejectKeyRef.current ??= idempotencyKey(`web-reject-${triggerId}`)
+    return rejectKeyRef.current
+  }
 
   useEffect(() => {
     const controller = new AbortController()
@@ -151,14 +302,15 @@ export function TriggerDetailPage({
       if (!trigger) {
         throw new Error('The trigger response was empty.')
       }
-      if (reload > 0) {
-        recheckKey.current = idempotencyKey(`web-recheck-${triggerId}`)
-      }
+      // A paid re-check runs only for a fresh pending trigger with no stored
+      // entry decision, and never on a read-only/compact surface.
+      const autoRecheck =
+        trigger.status === 'PENDING_RECHECK' && !trigger.entry_decision_id && !compact
       let card: DecisionCardData
       let recheckError: string | null = null
-      if (isPendingStatus(trigger.status)) {
+      if (autoRecheck) {
         try {
-          const envelope = await recheckFn(triggerId, recheckKey.current, controller.signal)
+          const envelope = await recheckFn(triggerId, recheckKeyFor(triggerId), controller.signal)
           if (!envelope.data) {
             throw new Error('The re-check response was empty.')
           }
@@ -187,6 +339,11 @@ export function TriggerDetailPage({
         return
       }
       setLoad({ state: 'ready', trigger, card, opportunity, recheckError })
+      if (autoRecheck) {
+        setAnnouncement(
+          recheckError === null ? 'LLM 复核已完成。' : `LLM 复核失败：${recheckError}`,
+        )
+      }
     }
     run().catch((error: unknown) => {
       if (controller.signal.aborted || isAbortError(error)) {
@@ -197,7 +354,119 @@ export function TriggerDetailPage({
     return () => {
       controller.abort()
     }
-  }, [triggerId, getTriggerFn, recheckFn, fetchOpportunityFn, reload])
+  }, [triggerId, getTriggerFn, recheckFn, fetchOpportunityFn, compact])
+
+  const closeAccept = useCallback((): void => {
+    actionController.current?.abort()
+    setAcceptOpen(false)
+  }, [])
+  const closeReject = useCallback((): void => {
+    actionController.current?.abort()
+    setRejectOpen(false)
+  }, [])
+  const acceptPanelRef = useDialogFocus(acceptOpen, closeAccept)
+  const rejectPanelRef = useDialogFocus(rejectOpen, closeReject)
+
+  async function manualRecheck(): Promise<void> {
+    const controller = new AbortController()
+    recheckController.current = controller
+    setRechecking(true)
+    setActionError(null)
+    try {
+      const envelope = await recheckFn(triggerId, rotateRecheckKey(triggerId), controller.signal)
+      if (controller.signal.aborted) {
+        return
+      }
+      const card = envelope.data
+      if (!card) {
+        throw new Error('The re-check response was empty.')
+      }
+      setLoad((previous) =>
+        previous.state === 'ready' ? { ...previous, card, recheckError: null } : previous,
+      )
+      setAnnouncement('LLM 重新复核已完成。')
+    } catch (error: unknown) {
+      if (controller.signal.aborted || isAbortError(error)) {
+        return
+      }
+      const errorText = errorMessage(error)
+      setLoad((previous) =>
+        previous.state === 'ready' ? { ...previous, recheckError: errorText } : previous,
+      )
+      setAnnouncement(`LLM 复核失败：${errorText}`)
+    } finally {
+      if (mounted.current) {
+        setRechecking(false)
+      }
+    }
+  }
+
+  async function confirmAccept(): Promise<void> {
+    const controller = new AbortController()
+    actionController.current = controller
+    setActing(true)
+    setActionError(null)
+    try {
+      const envelope = await acceptFn(triggerId, acceptKey(), controller.signal)
+      if (controller.signal.aborted) {
+        return
+      }
+      const data = envelope.data
+      if (!data) {
+        throw new Error('The accept response was empty.')
+      }
+      setAccepted(data)
+      setAcceptOpen(false)
+      setAnnouncement(`已接受（Paper）：服务端状态 ${data.status}。`)
+    } catch (error: unknown) {
+      if (controller.signal.aborted || isAbortError(error)) {
+        return
+      }
+      const errorText = errorMessage(error)
+      setActionError(errorText)
+      setAnnouncement(`接受失败：${errorText}`)
+    } finally {
+      if (mounted.current) {
+        setActing(false)
+      }
+    }
+  }
+
+  async function confirmReject(): Promise<void> {
+    if (reason.trim().length === 0) {
+      setReasonError('错误：请输入拒绝理由。')
+      return
+    }
+    const controller = new AbortController()
+    actionController.current = controller
+    setActing(true)
+    setActionError(null)
+    setReasonError(null)
+    try {
+      const envelope = await rejectFn(triggerId, reason.trim(), rejectKey(), controller.signal)
+      if (controller.signal.aborted) {
+        return
+      }
+      const data = envelope.data
+      if (!data) {
+        throw new Error('The reject response was empty.')
+      }
+      setRejected(data)
+      setRejectOpen(false)
+      setAnnouncement('已拒绝：机会转为 INVALIDATED，拒绝理由已记录。')
+    } catch (error: unknown) {
+      if (controller.signal.aborted || isAbortError(error)) {
+        return
+      }
+      const errorText = errorMessage(error)
+      setActionError(errorText)
+      setAnnouncement(`拒绝失败：${errorText}`)
+    } finally {
+      if (mounted.current) {
+        setActing(false)
+      }
+    }
+  }
 
   if (load.state === 'loading') {
     return (
@@ -209,7 +478,7 @@ export function TriggerDetailPage({
         <div className="page-head">
           <div>
             <p className="kicker">入场复核 / 决策卡</p>
-            <h1 id="trigger-detail-heading" className="mono">
+            <h1 id="trigger-detail-heading" className="mono" tabIndex={-1}>
               {triggerId}
             </h1>
           </div>
@@ -226,7 +495,7 @@ export function TriggerDetailPage({
       <section className="system-page" aria-labelledby="trigger-detail-heading">
         <div className="panel" role="alert">
           <div className="panel-head">
-            <h1 id="trigger-detail-heading" className="mono">
+            <h1 id="trigger-detail-heading" className="mono" tabIndex={-1}>
               未找到该决策
             </h1>
           </div>
@@ -247,20 +516,17 @@ export function TriggerDetailPage({
   const displayCard: DecisionCardData = accepted
     ? {
         ...load.card,
-        status: 'ACCEPTED',
-        human_action: {
-          action: 'ACCEPT',
-          at: new Date().toISOString(),
-          reason: null,
-        },
+        decision_id: accepted.decision_id ?? load.card.decision_id,
+        status: accepted.status,
+        risk: accepted.risk_verdict ?? load.card.risk,
+        human_action: { action: 'ACCEPT', reason: null },
       }
     : rejected
       ? {
           ...load.card,
-          status: 'REJECTED',
+          status: rejected.status ?? load.card.status,
           human_action: rejected.human_action ?? {
             action: 'REJECT',
-            at: new Date().toISOString(),
             reason: rejected.rejection_reason ?? reason,
           },
         }
@@ -270,45 +536,6 @@ export function TriggerDetailPage({
     !rejected &&
     isPendingStatus(displayCard.status ?? trigger.status) &&
     displayCard.human_action === null
-
-  async function confirmAccept(): Promise<void> {
-    setActing(true)
-    setActionError(null)
-    try {
-      const envelope = await acceptFn(triggerId, acceptKey.current)
-      if (!envelope.data) {
-        throw new Error('The accept response was empty.')
-      }
-      setAccepted(envelope.data)
-      setAcceptOpen(false)
-    } catch (error: unknown) {
-      setActionError(errorMessage(error))
-    } finally {
-      setActing(false)
-    }
-  }
-
-  async function confirmReject(): Promise<void> {
-    if (reason.trim().length === 0) {
-      setReasonError('错误：请输入拒绝理由。')
-      return
-    }
-    setActing(true)
-    setActionError(null)
-    setReasonError(null)
-    try {
-      const envelope = await rejectFn(triggerId, reason.trim(), rejectKey.current)
-      if (!envelope.data) {
-        throw new Error('The reject response was empty.')
-      }
-      setRejected(envelope.data)
-      setRejectOpen(false)
-    } catch (error: unknown) {
-      setActionError(errorMessage(error))
-    } finally {
-      setActing(false)
-    }
-  }
 
   const orderId = recordField(accepted?.order, 'order_id')
   const fillId = recordField(accepted?.fill, 'fill_id')
@@ -329,20 +556,43 @@ export function TriggerDetailPage({
             </a>{' '}
             / 决策卡
           </p>
-          <h1 id="trigger-detail-heading" className="mono">
+          <h1 id="trigger-detail-heading" className="mono" tabIndex={-1}>
             {triggerId}
           </h1>
           <p className="page-sub">
-            {trigger.symbol} · {trigger.side} · status {displayCard.status ?? trigger.status} ·
-            environment {trigger.environment}
+            {trigger.symbol} · {trigger.side} · <span lang="en">status</span>{' '}
+            <span lang="en">{displayCard.status ?? trigger.status}</span> ·{' '}
+            <span lang="en">environment</span> <span lang="en">{trigger.environment}</span>
           </p>
         </div>
         <div className="report-stamps">
-          <span className="chip chip--calc">CALC</span>
-          <span className="chip">LLM</span>
-          <span className="env-chip env-chip--paper">{trigger.environment}</span>
+          <span className="chip chip--calc" lang="en">
+            CALC
+          </span>
+          <span className="chip" lang="en">
+            LLM
+          </span>
+          <span className="env-chip env-chip--paper" lang="en">
+            {trigger.environment}
+          </span>
+          {!compact && isPendingStatus(trigger.status) && (
+            <button
+              type="button"
+              className="control-btn"
+              disabled={rechecking}
+              onClick={() => {
+                void manualRecheck()
+              }}
+            >
+              {rechecking ? '重新复核中…' : '重新复核'}
+            </button>
+          )}
         </div>
       </div>
+
+      <p className="visually-hidden" role="status" aria-live="polite" data-testid="action-live">
+        {announcement}
+      </p>
 
       {compact && (
         <p className="readonly-note" role="note">
@@ -362,8 +612,9 @@ export function TriggerDetailPage({
             <button
               type="button"
               className="btn"
+              disabled={rechecking}
               onClick={() => {
-                setReload((value) => value + 1)
+                void manualRecheck()
               }}
             >
               重试 LLM 复核
@@ -372,15 +623,27 @@ export function TriggerDetailPage({
         </div>
       )}
 
+      {actionError !== null && !acceptOpen && !rejectOpen && (
+        <div className="panel" role="alert">
+          <div className="panel-head">
+            <h2>操作失败</h2>
+          </div>
+          <p className="panel-foot">{actionError} — 未创建任何订单，也未改变决策状态。</p>
+        </div>
+      )}
+
       {accepted && (
         <div className="panel" role="status">
           <div className="panel-head">
             <h2>已接受（Paper）</h2>
-            <span className="chip chip--ok">ACCEPTED</span>
+            <span className="chip chip--ok" lang="en">
+              {accepted.status}
+            </span>
           </div>
           <p className="panel-foot">
-            订单 {orderId ?? '—'} · fill {fillId ?? '—'} · position {positionId ?? '—'} · 最终规模{' '}
-            {finalSize ?? '—'} {trigger.symbol}。风控上限已应用；LLM 不能绕过风险上限。
+            订单 {orderId ?? '—'} · <span lang="en">fill</span> {fillId ?? '—'} ·{' '}
+            <span lang="en">position</span> {positionId ?? '—'} · 最终规模 {finalSize ?? '—'}{' '}
+            {trigger.symbol}。风控上限已应用；LLM 不能绕过风险上限。状态与审计时间以服务端返回为准。
           </p>
           <div className="action-row" style={{ padding: '0 16px 16px' }}>
             <a className="btn" href="/paper">
@@ -394,7 +657,9 @@ export function TriggerDetailPage({
         <div className="panel" role="status">
           <div className="panel-head">
             <h2>已拒绝</h2>
-            <span className="chip chip--danger">INVALIDATED</span>
+            <span className="chip chip--danger" lang="en">
+              INVALIDATED
+            </span>
           </div>
           <p className="panel-foot">
             机会已转为失效状态；拒绝理由已记录，LLM 决策保留供复盘。未发送任何订单。
@@ -428,194 +693,166 @@ export function TriggerDetailPage({
         }
       />
 
-      {acceptOpen && (
-        <div
-          role="dialog"
-          aria-modal="true"
-          aria-labelledby="accept-title"
-          style={{
-            position: 'fixed',
-            inset: 0,
-            zIndex: 20,
-            display: 'flex',
-            alignItems: 'center',
-            justifyContent: 'center',
-            padding: 16,
-            background: '#07080ab8',
-          }}
-          onKeyDown={(event) => {
-            if (event.key === 'Escape') {
-              setAcceptOpen(false)
-            }
-          }}
-        >
+      {acceptOpen &&
+        typeof document !== 'undefined' &&
+        createPortal(
           <div
-            style={{
-              width: 'min(560px, 100%)',
-              border: '1px solid var(--oft-border-strong)',
-              background: 'var(--oft-bg-raised)',
-              padding: 16,
-            }}
+            className="dialog-overlay"
+            role="dialog"
+            aria-modal="true"
+            aria-labelledby="accept-title"
+            aria-describedby="accept-consequences"
           >
-            <h2 id="accept-title" style={{ marginTop: 0 }}>
-              接受（Paper）确认
-            </h2>
-            <dl className="kv" style={{ padding: 0 }}>
-              <dt>最终规模</dt>
-              <dd className="mono">
-                {finalSize ?? '—'} {trigger.symbol}
-              </dd>
-              <dt>绑定上限</dt>
-              <dd className="mono">{displayCard.risk?.binding_cap ?? 'N/A'}</dd>
-              <dt>单笔风险</dt>
-              <dd className="mono">
-                请求 {displayCard.risk?.requested?.risk_pct ?? '—'}% · allowed{' '}
-                {displayCard.risk?.allowed?.risk_amount_usd ?? '—'} USDT
-              </dd>
-              <dt>杠杆</dt>
-              <dd className="mono">
-                请求 {displayCard.risk?.requested?.leverage ?? '—'}x · allowed{' '}
-                {displayCard.risk?.allowed?.leverage ?? '—'}x
-              </dd>
-            </dl>
-            <p className="panel-foot" style={{ borderTop: 0, padding: 0 }}>
-              最终规模取 LLM 提议与配置上限中的更严者；LLM 不能绕过风险上限。接受会向 Paper
-              模拟引擎提交订单，不会发送到 Binance。
-            </p>
-            {actionError !== null && (
-              <p role="alert" className="status-message--error" style={{ marginTop: 12 }}>
-                {actionError}
-              </p>
-            )}
-            <div className="action-row" style={{ justifyContent: 'flex-end', marginTop: 16 }}>
-              <button
-                type="button"
-                className="btn"
-                autoFocus
-                onClick={() => {
-                  setAcceptOpen(false)
-                  setActionError(null)
-                }}
-              >
-                取消
-              </button>
-              <button
-                type="button"
-                className="btn"
-                disabled={acting}
-                onClick={() => {
+            <div className="dialog-panel" ref={acceptPanelRef} tabIndex={-1}>
+              <form
+                onSubmit={(event) => {
+                  event.preventDefault()
                   void confirmAccept()
                 }}
               >
-                确认接受（Paper）
-              </button>
+                <h2 id="accept-title" style={{ marginTop: 0 }}>
+                  接受（Paper）确认
+                </h2>
+                <dl className="kv" style={{ padding: 0 }}>
+                  <dt>最终规模</dt>
+                  <dd className="mono">
+                    {finalSize ?? '—'} {trigger.symbol}
+                  </dd>
+                  <dt>绑定上限</dt>
+                  <dd className="mono">{displayCard.risk?.binding_cap ?? 'N/A'}</dd>
+                  <dt>单笔风险</dt>
+                  <dd className="mono">
+                    请求 {displayCard.risk?.requested?.risk_pct ?? '—'}% · allowed{' '}
+                    {displayCard.risk?.allowed?.risk_amount_usd ?? '—'} USDT
+                  </dd>
+                  <dt>杠杆</dt>
+                  <dd className="mono">
+                    请求 {displayCard.risk?.requested?.leverage ?? '—'}x · allowed{' '}
+                    {displayCard.risk?.allowed?.leverage ?? '—'}x
+                  </dd>
+                </dl>
+                <p
+                  className="panel-foot"
+                  id="accept-consequences"
+                  style={{ borderTop: 0, padding: 0 }}
+                >
+                  最终规模取 LLM 提议与配置上限中的更严者；LLM 不能绕过风险上限。接受会向 Paper
+                  模拟引擎提交订单，不会发送到 Binance。
+                </p>
+                {actionError !== null && (
+                  <p role="alert" className="status-message--error" style={{ marginTop: 12 }}>
+                    {actionError}
+                  </p>
+                )}
+                <div className="action-row" style={{ justifyContent: 'flex-end', marginTop: 16 }}>
+                  <button type="button" className="btn" data-autofocus onClick={closeAccept}>
+                    取消
+                  </button>
+                  <button type="submit" className="btn" disabled={acting}>
+                    确认接受（Paper）
+                  </button>
+                </div>
+              </form>
             </div>
-          </div>
-        </div>
-      )}
+          </div>,
+          document.body,
+        )}
 
-      {rejectOpen && (
-        <div
-          role="dialog"
-          aria-modal="true"
-          aria-labelledby="reject-title"
-          style={{
-            position: 'fixed',
-            inset: 0,
-            zIndex: 20,
-            display: 'flex',
-            alignItems: 'center',
-            justifyContent: 'center',
-            padding: 16,
-            background: '#07080ab8',
-          }}
-          onKeyDown={(event) => {
-            if (event.key === 'Escape') {
-              setRejectOpen(false)
-            }
-          }}
-        >
+      {rejectOpen &&
+        typeof document !== 'undefined' &&
+        createPortal(
           <div
-            style={{
-              width: 'min(560px, 100%)',
-              border: '1px solid var(--oft-border-strong)',
-              background: 'var(--oft-bg-raised)',
-              padding: 16,
-            }}
+            className="dialog-overlay"
+            role="dialog"
+            aria-modal="true"
+            aria-labelledby="reject-title"
+            aria-describedby="reject-consequences"
           >
-            <h2 id="reject-title" style={{ marginTop: 0 }}>
-              拒绝入场复核
-            </h2>
-            <p className="status-message">
-              机会转为 INVALIDATED，拒绝理由写入台账；LLM 决策保留供复盘。不会触发任何订单。
-            </p>
-            <label
-              htmlFor="reject-reason"
-              style={{ display: 'block', margin: '12px 0 6px', fontSize: 12 }}
-            >
-              拒绝理由（必填）
-            </label>
-            <input
-              id="reject-reason"
-              className="mono"
-              value={reason}
-              autoFocus
-              required
-              aria-required="true"
-              autoCapitalize="off"
-              spellCheck={false}
-              onChange={(event) => setReason(event.target.value)}
-              style={{
-                width: '100%',
-                minHeight: 32,
-                padding: '4px 10px',
-                border: '1px solid var(--oft-border-control)',
-                background: 'var(--oft-bg-inset, #07080a)',
-                color: 'var(--oft-text-primary)',
-              }}
-            />
-            <p className="panel-foot" style={{ borderTop: 0, padding: '6px 0 0' }}>
-              可使用自由文本；不会触发任何订单。
-            </p>
-            {reasonError !== null && (
-              <p role="alert" className="status-message--error">
-                {reasonError}
-              </p>
-            )}
-            {actionError !== null && (
-              <p role="alert" className="status-message--error">
-                {actionError}
-              </p>
-            )}
-            <div className="action-row" style={{ justifyContent: 'flex-end', marginTop: 16 }}>
-              <button
-                type="button"
-                className="btn"
-                onClick={() => {
-                  setRejectOpen(false)
-                  setActionError(null)
-                }}
-              >
-                取消
-              </button>
-              <button
-                type="button"
-                className="btn"
-                disabled={acting}
-                style={{
-                  borderColor: 'var(--oft-status-danger)',
-                  color: 'var(--oft-status-danger)',
-                }}
-                onClick={() => {
+            <div className="dialog-panel" ref={rejectPanelRef} tabIndex={-1}>
+              <form
+                onSubmit={(event) => {
+                  event.preventDefault()
                   void confirmReject()
                 }}
               >
-                拒绝并标记 invalidated
-              </button>
+                <h2 id="reject-title" style={{ marginTop: 0 }}>
+                  拒绝入场复核
+                </h2>
+                <p className="status-message" id="reject-consequences">
+                  机会转为 <span lang="en">INVALIDATED</span>
+                  ，拒绝理由写入台账；LLM 决策保留供复盘。不会触发任何订单。
+                </p>
+                <label
+                  htmlFor="reject-reason"
+                  style={{ display: 'block', margin: '12px 0 6px', fontSize: 12 }}
+                >
+                  拒绝理由（必填）
+                </label>
+                <input
+                  id="reject-reason"
+                  className="mono"
+                  value={reason}
+                  data-autofocus
+                  required
+                  aria-required="true"
+                  aria-invalid={reasonError !== null}
+                  aria-describedby={
+                    reasonError === null ? 'reject-reason-hint' : 'reject-reason-error'
+                  }
+                  autoCapitalize="off"
+                  spellCheck={false}
+                  onChange={(event) => setReason(event.target.value)}
+                  onInvalid={(event) => {
+                    event.preventDefault()
+                    setReasonError('错误：请输入拒绝理由。')
+                  }}
+                  style={{
+                    width: '100%',
+                    minHeight: 44,
+                    padding: '4px 10px',
+                    border: '1px solid var(--oft-border-control)',
+                    background: 'var(--oft-bg-inset, #07080a)',
+                    color: 'var(--oft-text-primary)',
+                  }}
+                />
+                <p
+                  className="panel-foot"
+                  id="reject-reason-hint"
+                  style={{ borderTop: 0, padding: '6px 0 0' }}
+                >
+                  可使用自由文本；不会触发任何订单。
+                </p>
+                {reasonError !== null && (
+                  <p id="reject-reason-error" role="alert" className="status-message--error">
+                    {reasonError}
+                  </p>
+                )}
+                {actionError !== null && (
+                  <p role="alert" className="status-message--error">
+                    {actionError}
+                  </p>
+                )}
+                <div className="action-row" style={{ justifyContent: 'flex-end', marginTop: 16 }}>
+                  <button type="button" className="btn" onClick={closeReject}>
+                    取消
+                  </button>
+                  <button
+                    type="submit"
+                    className="btn"
+                    disabled={acting}
+                    style={{
+                      borderColor: 'var(--oft-status-danger)',
+                      color: 'var(--oft-status-danger)',
+                    }}
+                  >
+                    拒绝并标记 <span lang="en">invalidated</span>
+                  </button>
+                </div>
+              </form>
             </div>
-          </div>
-        </div>
-      )}
+          </div>,
+          document.body,
+        )}
     </section>
   )
 }

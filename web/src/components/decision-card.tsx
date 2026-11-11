@@ -1,7 +1,7 @@
 import { useId } from 'react'
 
 import type { DecisionCard as DecisionCardData, TriggerConditionResult } from '../api/triggers'
-import { acceptBlockedReason, isStaleMark, riskVerdictChip } from '../api/triggers'
+import { acceptBlockedReason, isPendingStatus, isStaleMark, riskVerdictChip } from '../api/triggers'
 import { confidenceBand } from '../api/reports'
 import { ProvenanceStamp } from './provenance'
 import { RiskPanel } from './risk-panel'
@@ -120,7 +120,7 @@ export function DecisionCard({
   const blockedReason = acceptDisabledReason ?? acceptBlockedReason(risk)
   const humanAction = card.human_action
   const status = card.status ?? card.trigger.status ?? null
-  const actionable = status === 'PENDING_RECHECK' || status === 'RECHECKED'
+  const actionable = isPendingStatus(status ?? '')
   const narrative =
     typeof card.llm.rationale === 'string' && card.llm.rationale.length > 0
       ? card.llm.rationale
@@ -136,8 +136,12 @@ export function DecisionCard({
       <section className="band" aria-labelledby={triggerId}>
         <div className="band-head">
           <ProvenanceStamp kind="CALC" />
-          <h2 id={triggerId}>1 · Trigger（代码判定）</h2>
-          <span className="chip chip--ok">CODE</span>
+          <h2 id={triggerId}>
+            1 · <span lang="en">Trigger</span>（代码判定）
+          </h2>
+          <span className="chip chip--ok" lang="en">
+            CODE
+          </span>
         </div>
         <dl className="kv">
           <dt>Opportunity</dt>
@@ -189,7 +193,9 @@ export function DecisionCard({
       <section className="band band--llm" aria-labelledby={llmId}>
         <div className="band-head">
           <ProvenanceStamp kind="LLM" />
-          <h2 id={llmId}>2 · LLM 入场判断</h2>
+          <h2 id={llmId}>
+            2 · <span lang="en">LLM</span> 入场判断
+          </h2>
           <span className="chip chip--calc">{card.llm.decision ?? 'N/A'}</span>
           <span className="chip">
             confidence <Confidence confidence={card.llm.confidence} />
@@ -198,33 +204,41 @@ export function DecisionCard({
         {narrative ? (
           <>
             <p className="prose">{narrative}</p>
-            <p className="band-note">
+            <p className="band-note" lang="en">
               Untrusted model text, not a measurement. It cannot change a threshold or bypass the
               CALC risk gate.
             </p>
           </>
         ) : (
-          <p className="llm-empty">No rationale was produced for this decision.</p>
+          <p className="llm-empty" lang="en">
+            No rationale was produced for this decision.
+          </p>
+        )}
+        {metadataFromAnalysis && (
+          <p className="band-note" id="analysis-provenance-note">
+            来源说明：以下 <span lang="en">Provider / Model / Prompt / Tokens / Cost</span>{' '}
+            属于关联的扫描分析决策，不是本次入场复核的调用。
+          </p>
         )}
         <dl className="band-meta">
           <div>
-            <dt>Provider</dt>
+            <dt lang="en">Provider</dt>
             <dd>{providerName}</dd>
           </div>
           <div>
-            <dt>Model</dt>
+            <dt lang="en">Model</dt>
             <dd>{modelName}</dd>
           </div>
           <div>
-            <dt>Prompt</dt>
+            <dt lang="en">Prompt</dt>
             <dd>{promptLabel(analysis, card.llm)}</dd>
           </div>
           <div>
-            <dt>Tokens</dt>
+            <dt lang="en">Tokens</dt>
             <dd>{tokensLabel(analysis, card.llm)}</dd>
           </div>
           <div>
-            <dt>Cost</dt>
+            <dt lang="en">Cost</dt>
             <dd>{costLabel(analysis, card.llm)}</dd>
           </div>
         </dl>
@@ -240,7 +254,9 @@ export function DecisionCard({
       <section className="band" aria-labelledby={riskId}>
         <div className="band-head">
           <ProvenanceStamp kind="CALC" />
-          <h2 id={riskId}>3 · Risk gate（取更严者）</h2>
+          <h2 id={riskId}>
+            3 · <span lang="en">Risk gate</span>（取更严者）
+          </h2>
           <span className={verdictChip.className}>{verdictChip.label}</span>
         </div>
         <RiskPanel verdict={risk} symbol={card.trigger.symbol} />
@@ -248,7 +264,9 @@ export function DecisionCard({
 
       <section className="panel" aria-labelledby={humanId}>
         <div className="panel-head">
-          <h2 id={humanId}>4 · Human action</h2>
+          <h2 id={humanId}>
+            4 · <span lang="en">Human action</span>
+          </h2>
           <span className="env-chip env-chip--paper">environment {environment}</span>
         </div>
         <div style={{ padding: 16 }}>
@@ -290,17 +308,24 @@ export function DecisionCard({
               </button>
               <button
                 type="button"
-                className="btn"
+                className={blockedReason !== null ? 'btn btn--muted' : 'btn'}
                 style={{
                   minHeight: 44,
                   minWidth: 88,
-                  borderColor: 'var(--oft-accent)',
-                  color: 'var(--oft-bg-canvas)',
-                  background: 'var(--oft-accent)',
+                  borderColor:
+                    blockedReason !== null ? 'var(--oft-border-control)' : 'var(--oft-accent)',
+                  color: blockedReason !== null ? 'var(--oft-text-muted)' : 'var(--oft-bg-canvas)',
+                  background: blockedReason !== null ? 'var(--oft-bg-panel)' : 'var(--oft-accent)',
                 }}
-                disabled={blockedReason !== null || acting}
+                disabled={acting}
+                aria-disabled={blockedReason !== null}
                 aria-describedby={acceptWhyId}
-                onClick={onAccept}
+                onClick={() => {
+                  if (blockedReason !== null) {
+                    return
+                  }
+                  onAccept?.()
+                }}
               >
                 {acting ? '处理中…' : '接受（Paper）'}
               </button>

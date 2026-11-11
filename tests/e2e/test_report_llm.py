@@ -190,7 +190,7 @@ def test_report_detail_is_calc_first_read_only_and_has_no_action() -> None:
             path.read_text(encoding="utf-8") for path in (DIST / "assets").glob("*.js")
         )
         assert "data-readonly" in bundle
-        assert "max-width: 768px" in bundle
+        assert "max-width: 480px" in bundle
         assert "Read-only at this width" in bundle
 
 

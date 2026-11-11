@@ -262,10 +262,10 @@ def test_web_trigger_sources_render_text_only_and_keep_the_card_order() -> None:
     triggers = (WEB_SRC / "routes" / "triggers.tsx").read_text(encoding="utf-8")
 
     # Mandatory order: Trigger -> LLM -> Risk -> Human.
-    assert card.index("1 · Trigger") < card.index("2 · LLM")
-    assert card.index("2 · LLM") < card.index("3 · Risk gate")
-    assert card.index("3 · Risk gate") < card.index("4 · Human action")
-    assert "Risk gate" in card
+    stage_positions = [card.index(f"{index} ·") for index in (1, 2, 3, 4)]
+    assert stage_positions == sorted(stage_positions)
+    for label in ("Trigger", "LLM", "Risk gate", "Human action"):
+        assert label in card
     assert "BLOCK" in (WEB_SRC / "api" / "triggers.ts").read_text(encoding="utf-8")
     # Accept is disabled by the shared gate, not by a hidden element.
     assert "acceptBlockedReason" in card

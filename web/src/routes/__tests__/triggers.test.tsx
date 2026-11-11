@@ -1,5 +1,5 @@
 import { fireEvent, render, screen, waitFor, within } from '@testing-library/react'
-import { describe, expect, it, vi } from 'vitest'
+import { afterEach, describe, expect, it, vi } from 'vitest'
 
 import type { ApiMeta } from '../../api/status'
 import type { OpportunityData, OpportunityEnvelope } from '../../api/opportunities'
@@ -295,21 +295,65 @@ describe('TriggersPage queue', () => {
     expect(screen.getByText(/待处理 1/)).toBeInTheDocument()
     expect(screen.getByText(/已处理 1/)).toBeInTheDocument()
 
-    const rows = within(table).getAllByRole('row').slice(1)
-    expect(rows[0]).toHaveTextContent('TRG-1042')
-    expect(rows[0]).toHaveTextContent('BTCUSDT')
-    expect(rows[0]).toHaveTextContent('▲ LONG')
-    expect(rows[0]).toHaveTextContent('18m')
-    expect(rows[0]).toHaveTextContent('0.72')
-    expect(rows[0]).toHaveTextContent('high')
-    expect(rows[0]).toHaveTextContent('PASS')
-    expect(rows[0]).toHaveTextContent('PAPER')
-    expect(rows[0]).toHaveTextContent('PENDING')
+    const rowFor = (text: string) =>
+      within(table)
+        .getAllByRole('row')
+        .find((row) => row.textContent?.includes(text))
 
-    expect(rows[1]).toHaveTextContent('TRG-1039')
-    expect(rows[1]).toHaveTextContent('▼ SHORT')
-    expect(rows[1]).toHaveTextContent('REDUCE')
-    expect(rows[1]).toHaveTextContent('ACCEPTED')
+    await waitFor(() => expect(rowFor('TRG-1042')).toHaveTextContent('0.72'))
+    expect(rowFor('TRG-1042')).toHaveTextContent('BTCUSDT')
+    expect(rowFor('TRG-1042')).toHaveTextContent('▲ LONG')
+    expect(rowFor('TRG-1042')).toHaveTextContent('18m')
+    expect(rowFor('TRG-1042')).toHaveTextContent('high')
+    expect(rowFor('TRG-1042')).toHaveTextContent('PASS')
+    expect(rowFor('TRG-1042')).toHaveTextContent('PAPER')
+    expect(rowFor('TRG-1042')).toHaveTextContent('PENDING')
+
+    // Resolved rows render from the summary alone: no detail fan-out, so no
+    // fabricated confidence/risk/environment values.
+    expect(rowFor('TRG-1039')).toHaveTextContent('▼ SHORT')
+    expect(rowFor('TRG-1039')).toHaveTextContent('ACCEPTED')
+    expect(rowFor('TRG-1039')).not.toHaveTextContent('REDUCE')
+  })
+
+  it('renders summary rows before the detail hydration settles', async () => {
+    let resolveDetail: ((value: TriggerDetailEnvelope) => void) | undefined
+    const detailPromise = new Promise<TriggerDetailEnvelope>((resolve) => {
+      resolveDetail = resolve
+    })
+    render(
+      <TriggersPage
+        nowMs={Date.parse('2026-11-06T05:00:00.000Z')}
+        fetchTriggersFn={async () => listEnvelope([pending, accepted])}
+        fetchTriggerDetailFn={() => detailPromise}
+        fetchOpportunityFn={opportunityFetcher()}
+      />,
+    )
+
+    const table = await screen.findByRole('table', { name: /入场复核队列/i })
+    expect(within(table).getByText('TRG-1042')).toBeInTheDocument()
+    expect(within(table).getByText('TRG-1039')).toBeInTheDocument()
+    // The table is not blocked on every row detail request.
+    expect(within(table).queryByText('0.72')).not.toBeInTheDocument()
+
+    resolveDetail?.(triggerEnvelope(pending))
+    expect(await within(table).findByText('0.72')).toBeInTheDocument()
+  })
+
+  it('skips detail fetches for resolved rows', async () => {
+    const detailFn = vi.fn(detailFetcher([pending]))
+    render(
+      <TriggersPage
+        nowMs={Date.parse('2026-11-06T05:00:00.000Z')}
+        fetchTriggersFn={async () => listEnvelope([accepted, pending])}
+        fetchTriggerDetailFn={detailFn}
+        fetchOpportunityFn={opportunityFetcher()}
+      />,
+    )
+
+    await screen.findByRole('table', { name: /入场复核队列/i })
+    await waitFor(() => expect(detailFn).toHaveBeenCalledTimes(1))
+    expect(detailFn.mock.calls[0][0]).toBe('TRG-1042')
   })
 
   it('distinguishes an empty queue from a failed one', async () => {
@@ -343,17 +387,27 @@ describe('TriggersPage queue', () => {
 })
 
 describe('TriggerDetailPage decision card', () => {
+  afterEach(() => {
+    sessionStorage.clear()
+  })
+
   function renderDetail(
     options: {
       trigger?: TriggerPayload
       card?: DecisionCard
       recheck?: (id: string, key: string, signal?: AbortSignal) => Promise<DecisionCardEnvelope>
-      accept?: (id: string, key: string) => Promise<TriggerAcceptEnvelope>
-      reject?: (id: string, reason: string, key: string) => Promise<TriggerRejectEnvelope>
+      accept?: (id: string, key: string, signal?: AbortSignal) => Promise<TriggerAcceptEnvelope>
+      reject?: (
+        id: string,
+        reason: string,
+        key: string,
+        signal?: AbortSignal,
+      ) => Promise<TriggerRejectEnvelope>
       compact?: boolean
     } = {},
   ) {
-    const trigger = options.trigger ?? payload()
+    const trigger =
+      options.trigger ?? payload({ status: 'PENDING_RECHECK', entry_decision_id: null })
     const decision = options.card ?? card()
     const getTriggerFn = vi.fn(async () => triggerEnvelope(trigger))
     const recheckFn = vi.fn(options.recheck ?? (async () => cardEnvelope(decision)))
@@ -390,18 +444,20 @@ describe('TriggerDetailPage decision card', () => {
         })),
     )
 
-    render(
-      <TriggerDetailPage
-        triggerId={trigger.trigger_id}
-        isCompact={options.compact}
-        getTriggerFn={getTriggerFn}
-        recheckFn={recheckFn}
-        acceptFn={acceptFn}
-        rejectFn={rejectFn}
-        fetchOpportunityFn={opportunityFetcher()}
-      />,
+    const view = render(
+      <div className="app-shell">
+        <TriggerDetailPage
+          triggerId={trigger.trigger_id}
+          isCompact={options.compact}
+          getTriggerFn={getTriggerFn}
+          recheckFn={recheckFn}
+          acceptFn={acceptFn}
+          rejectFn={rejectFn}
+          fetchOpportunityFn={opportunityFetcher()}
+        />
+      </div>,
     )
-    return { getTriggerFn, recheckFn, acceptFn, rejectFn }
+    return { getTriggerFn, recheckFn, acceptFn, rejectFn, unmount: view.unmount }
   }
 
   it('renders the mandatory Trigger -> LLM -> Risk -> Human order', async () => {
@@ -426,7 +482,7 @@ describe('TriggerDetailPage decision card', () => {
 
     expect(screen.getByText('0.72 · high')).toBeInTheDocument()
     expect(screen.getByText(/请求 0.80%/)).toBeInTheDocument()
-    expect(screen.getByText(/allowed 0.018/)).toBeInTheDocument()
+    expect(screen.getByTestId('cap-final-size')).toHaveTextContent('0.018')
     expect(screen.getByTestId('binding-cap')).toHaveTextContent('PER_TRADE_RISK')
     expect(screen.getByText(/更严者/)).toBeInTheDocument()
   })
@@ -474,7 +530,8 @@ describe('TriggerDetailPage decision card', () => {
     await screen.findByRole('heading', { name: /4 · Human action/ })
 
     const accept = screen.getByRole('button', { name: /接受（Paper）/ })
-    expect(accept).toBeDisabled()
+    expect(accept).toHaveAttribute('aria-disabled', 'true')
+    expect(accept).not.toBeDisabled()
     expect(screen.getAllByText(/BLOCK/).length).toBeGreaterThan(0)
     expect(screen.getAllByText(/STALE_MARK/).length).toBeGreaterThan(0)
     expect(screen.getByText(/接受不可用/)).toBeInTheDocument()
@@ -493,7 +550,10 @@ describe('TriggerDetailPage decision card', () => {
     })
     await screen.findByRole('heading', { name: /4 · Human action/ })
 
-    expect(screen.getByRole('button', { name: /接受（Paper）/ })).toBeDisabled()
+    expect(screen.getByRole('button', { name: /接受（Paper）/ })).toHaveAttribute(
+      'aria-disabled',
+      'true',
+    )
     expect(screen.getByText(/最终规模为 0/)).toBeInTheDocument()
   })
 
@@ -594,5 +654,154 @@ describe('TriggerDetailPage decision card', () => {
     expect(screen.getByText(/DEC-1/)).toBeInTheDocument()
     expect(screen.getByText(/risk blocked/)).toBeInTheDocument()
     expect(screen.getByText(/REJECTED/)).toBeInTheDocument()
+  })
+
+  it('does not auto-recheck an already RECHECKED trigger with a stored entry decision', async () => {
+    const { recheckFn } = renderDetail({
+      trigger: payload({ status: 'RECHECKED', entry_decision_id: 'DEC-1' }),
+    })
+    await screen.findByRole('heading', { name: /4 · Human action/ })
+
+    expect(recheckFn).not.toHaveBeenCalled()
+  })
+
+  it('does not auto-recheck on a compact/read-only view', async () => {
+    const { recheckFn } = renderDetail({ compact: true })
+    await screen.findByRole('heading', { name: /4 · Human action/ })
+
+    expect(recheckFn).not.toHaveBeenCalled()
+  })
+
+  it('replays the persisted recheck key across a refresh', async () => {
+    const first = renderDetail()
+    await waitFor(() => expect(first.recheckFn).toHaveBeenCalledTimes(1))
+    const firstKey = first.recheckFn.mock.calls[0][1]
+    first.unmount()
+
+    const second = renderDetail()
+    await waitFor(() => expect(second.recheckFn).toHaveBeenCalledTimes(1))
+
+    expect(second.recheckFn.mock.calls[0][1]).toBe(firstKey)
+  })
+
+  it('offers an explicit recheck action that uses a fresh key', async () => {
+    const { recheckFn } = renderDetail()
+    await waitFor(() => expect(recheckFn).toHaveBeenCalledTimes(1))
+    const autoKey = recheckFn.mock.calls[0][1]
+
+    fireEvent.click(await screen.findByRole('button', { name: /重新复核/ }))
+
+    await waitFor(() => expect(recheckFn).toHaveBeenCalledTimes(2))
+    expect(recheckFn.mock.calls[1][1]).not.toBe(autoKey)
+  })
+
+  it('uses the server-returned status after accepting instead of fabricating one', async () => {
+    const acceptFn = vi.fn(async (): Promise<TriggerAcceptEnvelope> => ({
+      ok: true,
+      data: {
+        status: 'ACCEPTED_BY_SERVER',
+        decision_id: 'DEC-1',
+        risk_verdict: riskVerdict(),
+        order: { order_id: 'PO-1' },
+        fill: { fill_id: 'PF-1' },
+        position: { position_id: 'POS-1' },
+        account: null,
+      },
+      error: null,
+      meta,
+    }))
+    renderDetail({ accept: acceptFn })
+    await screen.findByRole('heading', { name: /4 · Human action/ })
+    fireEvent.click(screen.getByRole('button', { name: /接受（Paper）/ }))
+    fireEvent.click(screen.getByRole('button', { name: /确认接受（Paper）/ }))
+    await waitFor(() => expect(acceptFn).toHaveBeenCalledTimes(1))
+
+    expect(screen.getAllByText('ACCEPTED_BY_SERVER').length).toBeGreaterThan(0)
+    expect(screen.getByTestId('action-live')).toHaveTextContent(/已接受（Paper）/)
+  })
+
+  it('aborts an in-flight accept when the dialog is closed', async () => {
+    let receivedSignal: AbortSignal | undefined
+    const acceptFn = vi.fn(
+      (_id: string, _key: string, signal?: AbortSignal): Promise<TriggerAcceptEnvelope> => {
+        receivedSignal = signal
+        return new Promise<TriggerAcceptEnvelope>(() => undefined)
+      },
+    )
+    renderDetail({ accept: acceptFn })
+    await screen.findByRole('heading', { name: /4 · Human action/ })
+    fireEvent.click(screen.getByRole('button', { name: /接受（Paper）/ }))
+    fireEvent.click(screen.getByRole('button', { name: /确认接受（Paper）/ }))
+    expect(receivedSignal?.aborted).toBe(false)
+
+    fireEvent.click(screen.getByRole('button', { name: /取消/ }))
+
+    expect(receivedSignal?.aborted).toBe(true)
+    expect(screen.queryByRole('dialog')).not.toBeInTheDocument()
+  })
+
+  it('surfaces an action error outside the dialog after it closes', async () => {
+    const acceptFn = vi.fn(async (): Promise<TriggerAcceptEnvelope> => {
+      throw new Error('paper engine unavailable')
+    })
+    renderDetail({ accept: acceptFn })
+    await screen.findByRole('heading', { name: /4 · Human action/ })
+    fireEvent.click(screen.getByRole('button', { name: /接受（Paper）/ }))
+    const dialog = screen.getByRole('dialog', { name: /接受（Paper）确认/ })
+    fireEvent.click(within(dialog).getByRole('button', { name: /确认接受（Paper）/ }))
+    expect(await within(dialog).findByRole('alert')).toHaveTextContent(/paper engine unavailable/)
+
+    fireEvent.click(within(dialog).getByRole('button', { name: /取消/ }))
+
+    expect(await screen.findByText(/操作失败/)).toBeInTheDocument()
+    expect(screen.getAllByText(/paper engine unavailable/).length).toBeGreaterThan(0)
+  })
+
+  it('traps focus, describes the consequences, and restores focus on Escape', async () => {
+    renderDetail()
+    const invoke = await screen.findByRole('button', { name: /接受（Paper）/ })
+    invoke.focus()
+    fireEvent.click(invoke)
+
+    const dialog = screen.getByRole('dialog', { name: /接受（Paper）确认/ })
+    expect(dialog).toHaveAttribute('aria-describedby', 'accept-consequences')
+    const cancel = within(dialog).getByRole('button', { name: /取消/ })
+    const confirm = within(dialog).getByRole('button', { name: /确认接受（Paper）/ })
+    expect(cancel).toHaveFocus()
+    expect(document.querySelector('.app-shell')).toHaveAttribute('inert')
+    expect(document.body.style.overflow).toBe('hidden')
+
+    confirm.focus()
+    fireEvent.keyDown(document, { key: 'Tab' })
+    expect(cancel).toHaveFocus()
+    fireEvent.keyDown(document, { key: 'Tab', shiftKey: true })
+    expect(confirm).toHaveFocus()
+
+    fireEvent.keyDown(document, { key: 'Escape' })
+    expect(screen.queryByRole('dialog')).not.toBeInTheDocument()
+    expect(invoke).toHaveFocus()
+    expect(document.body.style.overflow).toBe('')
+  })
+
+  it('submits the reject form with Enter and links the reason error to the input', async () => {
+    const { rejectFn } = renderDetail()
+    await screen.findByRole('heading', { name: /4 · Human action/ })
+    fireEvent.click(screen.getByRole('button', { name: /^拒绝$/ }))
+
+    const dialog = screen.getByRole('dialog', { name: /拒绝入场复核/ })
+    const form = dialog.querySelector('form')
+    const input = within(dialog).getByLabelText(/拒绝理由（必填）/)
+    expect(form).not.toBeNull()
+
+    fireEvent.submit(form as HTMLFormElement)
+    expect(within(dialog).getByRole('alert')).toHaveTextContent(/请输入拒绝理由/)
+    expect(input).toHaveAttribute('aria-invalid', 'true')
+    expect(input).toHaveAttribute('aria-describedby', 'reject-reason-error')
+
+    fireEvent.change(input, { target: { value: 'structure broken' } })
+    fireEvent.submit(form as HTMLFormElement)
+
+    await waitFor(() => expect(rejectFn).toHaveBeenCalledTimes(1))
+    expect(rejectFn.mock.calls[0][1]).toBe('structure broken')
   })
 })

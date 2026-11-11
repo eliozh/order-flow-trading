@@ -39,7 +39,7 @@ export function PaperPositionsTable({ positions }: { positions: PaperPosition[] 
     <div className="table-wrap" role="region" tabIndex={0} aria-label="未平仓持仓表">
       <table className="data-table">
         <caption className="visually-hidden">未平仓持仓，{positions.length} 个，Paper</caption>
-        <thead>
+        <thead lang="en">
           <tr>
             <th scope="col">Symbol</th>
             <th scope="col">Side</th>
@@ -102,7 +102,7 @@ export function PaperOrdersTable({ orders, total }: { orders: PaperOrder[]; tota
         <caption className="visually-hidden">
           模拟订单{total !== undefined ? `，共 ${total} 条` : ''} · 最近 {orders.length} 条
         </caption>
-        <thead>
+        <thead lang="en">
           <tr>
             <th scope="col">Order ID</th>
             <th scope="col">Time</th>
@@ -161,7 +161,7 @@ export function PaperFillsTable({ fills, total }: { fills: PaperFill[]; total?: 
         <caption className="visually-hidden">
           模拟成交{total !== undefined ? `，共 ${total} 条` : ''} · 最近 {fills.length} 条
         </caption>
-        <thead>
+        <thead lang="en">
           <tr>
             <th scope="col">Fill ID</th>
             <th scope="col">Time</th>

@@ -34,7 +34,11 @@ function setup(active = false) {
     }
     return envelope(false)
   })
-  render(<KillSwitchBar fetchStatusFn={status} activateFn={activate} deactivateFn={deactivate} />)
+  render(
+    <div className="app-shell">
+      <KillSwitchBar fetchStatusFn={status} activateFn={activate} deactivateFn={deactivate} />
+    </div>,
+  )
   return { status, activate, deactivate }
 }
 
@@ -42,27 +46,49 @@ describe('KillSwitchBar', () => {
   it('is available immediately and activates with one press when inactive', async () => {
     const { status, activate } = setup(false)
 
-    const button = await screen.findByRole('button', { name: /Kill switch 关闭，立即停止新订单/ })
+    const button = await screen.findByRole('button', { name: /启用 Kill switch（立即停止新订单）/ })
     fireEvent.click(button)
 
     await waitFor(() => expect(activate).toHaveBeenCalledTimes(1))
     expect(status).toHaveBeenCalledTimes(1)
     expect(await screen.findByText(/KILL SWITCH ON/)).toBeInTheDocument()
     expect(activate.mock.calls.length).toBe(1)
+    expect(screen.getByRole('status')).toHaveTextContent(/已启用/)
   })
 
-  it('remains available when the status probe fails', async () => {
+  it('announces an UNKNOWN state chip while the probe is still in flight', () => {
     render(
-      <KillSwitchBar
-        fetchStatusFn={async () => {
-          throw new Error('status unavailable')
-        }}
-        activateFn={async () => envelope(true)}
-        deactivateFn={async () => envelope(false)}
-      />,
+      <div className="app-shell">
+        <KillSwitchBar
+          fetchStatusFn={() => new Promise<KillSwitchEnvelope>(() => undefined)}
+          activateFn={async () => envelope(true)}
+          deactivateFn={async () => envelope(false)}
+        />
+      </div>,
+    )
+
+    expect(screen.getByText('状态未知')).toBeInTheDocument()
+    // Unknown is never presented as trading-enabled.
+    expect(screen.queryByText(/KILL SWITCH OFF/)).not.toBeInTheDocument()
+    expect(screen.getByRole('button', { name: /启用 Kill switch/ })).toBeEnabled()
+  })
+
+  it('remains available when the status probe fails and never asserts OFF', async () => {
+    render(
+      <div className="app-shell">
+        <KillSwitchBar
+          fetchStatusFn={async () => {
+            throw new Error('status unavailable')
+          }}
+          activateFn={async () => envelope(true)}
+          deactivateFn={async () => envelope(false)}
+        />
+      </div>,
     )
 
     expect(await screen.findByRole('alert')).toHaveTextContent(/status unavailable/)
+    expect(screen.getByText('状态未知')).toBeInTheDocument()
+    expect(screen.queryByText(/KILL SWITCH OFF/)).not.toBeInTheDocument()
     expect(screen.getByRole('button', { name: /启用 Kill switch/ })).toBeEnabled()
   })
 
@@ -86,19 +112,22 @@ describe('KillSwitchBar', () => {
     fireEvent.click(confirm)
 
     await waitFor(() => expect(deactivate).toHaveBeenCalledWith('RESUME'))
-    expect(await screen.findByText(/Kill switch 关闭，立即停止新订单/)).toBeInTheDocument()
+    expect(await screen.findByText(/KILL SWITCH OFF/)).toBeInTheDocument()
+    expect(screen.getByRole('button', { name: /启用 Kill switch/ })).toBeInTheDocument()
   })
 
-  it('surfaces a server token rejection and changes nothing', async () => {
+  it('surfaces a server token rejection inside the dialog and changes nothing', async () => {
     const deactivate = vi.fn(async () => {
       throw new Error('the RESUME token is required')
     })
     render(
-      <KillSwitchBar
-        fetchStatusFn={async () => envelope(true)}
-        activateFn={async () => envelope(true)}
-        deactivateFn={deactivate}
-      />,
+      <div className="app-shell">
+        <KillSwitchBar
+          fetchStatusFn={async () => envelope(true)}
+          activateFn={async () => envelope(true)}
+          deactivateFn={deactivate}
+        />
+      </div>,
     )
     fireEvent.click(await screen.findByRole('button', { name: /Kill switch 开启，可停止新订单/ }))
     const dialog = screen.getByRole('dialog', { name: /关闭 Kill switch/ })
@@ -107,7 +136,66 @@ describe('KillSwitchBar', () => {
     })
     fireEvent.click(within(dialog).getByRole('button', { name: /输入 RESUME 并关闭/ }))
 
-    expect(await screen.findByRole('alert')).toHaveTextContent(/RESUME token is required/)
+    const alert = await within(dialog).findByRole('alert')
+    expect(alert).toHaveTextContent(/RESUME token is required/)
+    expect(screen.getByRole('dialog', { name: /关闭 Kill switch/ })).toBeInTheDocument()
     expect(screen.getByText(/KILL SWITCH ON/)).toBeInTheDocument()
+  })
+
+  it('traps focus, locks scroll, and restores focus on Escape', async () => {
+    setup(true)
+    const invoke = await screen.findByRole('button', {
+      name: /Kill switch 开启，可停止新订单/,
+    })
+    invoke.focus()
+    fireEvent.click(invoke)
+
+    const dialog = screen.getByRole('dialog', { name: /关闭 Kill switch/ })
+    expect(dialog).toHaveAttribute('aria-describedby', 'kill-switch-off-consequences')
+    expect(document.querySelector('.app-shell')).toHaveAttribute('inert')
+    expect(document.body.style.overflow).toBe('hidden')
+
+    const tokenInput = within(dialog).getByLabelText(/输入 RESUME/)
+    expect(tokenInput).toHaveFocus()
+
+    const cancel = within(dialog).getByRole('button', { name: /取消/ })
+    const confirm = within(dialog).getByRole('button', { name: /输入 RESUME 并关闭/ })
+    expect(cancel).toBeInTheDocument()
+    fireEvent.change(tokenInput, { target: { value: 'RESUME' } })
+    confirm.focus()
+    fireEvent.keyDown(document, { key: 'Tab' })
+    expect(tokenInput).toHaveFocus()
+    fireEvent.keyDown(document, { key: 'Tab', shiftKey: true })
+    expect(confirm).toHaveFocus()
+
+    fireEvent.keyDown(document, { key: 'Escape' })
+    expect(screen.queryByRole('dialog')).not.toBeInTheDocument()
+    expect(invoke).toHaveFocus()
+    expect(document.querySelector('.app-shell')).not.toHaveAttribute('inert')
+    expect(document.body.style.overflow).toBe('')
+  })
+
+  it('submits the resume form with Enter', async () => {
+    const { deactivate } = setup(true)
+    fireEvent.click(await screen.findByRole('button', { name: /Kill switch 开启，可停止新订单/ }))
+    const dialog = screen.getByRole('dialog', { name: /关闭 Kill switch/ })
+    const form = dialog.querySelector('form')
+    expect(form).not.toBeNull()
+    fireEvent.change(within(dialog).getByLabelText(/输入 RESUME/), {
+      target: { value: 'RESUME' },
+    })
+    fireEvent.submit(form as HTMLFormElement)
+
+    await waitFor(() => expect(deactivate).toHaveBeenCalledWith('RESUME'))
+  })
+
+  it('revalidates the status when the window regains focus', async () => {
+    const { status } = setup(false)
+    await screen.findByRole('button', { name: /启用 Kill switch/ })
+    expect(status).toHaveBeenCalledTimes(1)
+
+    fireEvent(window, new Event('focus'))
+
+    await waitFor(() => expect(status).toHaveBeenCalledTimes(2))
   })
 })

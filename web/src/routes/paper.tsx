@@ -118,7 +118,9 @@ export function PaperPage({
     <section className="system-page" aria-labelledby="paper-heading" data-readonly={compact}>
       <div className="page-head">
         <div>
-          <p className="kicker">Paper / 账户</p>
+          <p className="kicker">
+            <span lang="en">Paper</span> / 账户
+          </p>
           <h1 id="paper-heading">Paper 交易账户</h1>
           <p className="page-sub">
             模拟余额、订单、成交与持仓。用于至少 4 周的闭环验证；本页只读，不含重置或 Live
@@ -158,22 +160,28 @@ export function PaperPage({
         <>
           <dl className="stat-grid">
             <div className="stat">
-              <dt>Equity</dt>
+              <dt lang="en">Equity</dt>
               <dd className="mono">{load.account.equity}</dd>
-              <dd className="stat-note">cash + Σ(size × last mark)</dd>
+              <dd className="stat-note" lang="en">
+                cash + Σ(size × last mark)
+              </dd>
             </div>
             <div className="stat">
-              <dt>Cash balance</dt>
+              <dt lang="en">Cash balance</dt>
               <dd className="mono">{load.account.cash_balance}</dd>
-              <dd className="stat-note">paper balance</dd>
+              <dd className="stat-note" lang="en">
+                paper balance
+              </dd>
             </div>
             <div className="stat">
-              <dt>Marked value</dt>
+              <dt lang="en">Marked value</dt>
               <dd className="mono">{load.account.unrealized_at_last_mark}</dd>
-              <dd className="stat-note">at last mark · not a PnL number</dd>
+              <dd className="stat-note" lang="en">
+                at last mark · not a PnL number
+              </dd>
             </div>
             <div className="stat">
-              <dt>Open positions</dt>
+              <dt lang="en">Open positions</dt>
               <dd className="mono">{load.account.open_positions} 个未平仓</dd>
               <dd className="stat-note">{load.account.account_id}</dd>
             </div>

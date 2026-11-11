@@ -37,14 +37,6 @@ export function StatusBar({
       <span className="sb-item">
         readiness <b className={readiness === 'READY' ? 'sb-ok' : 'sb-warn'}>{readiness}</b>
       </span>
-      <button
-        type="button"
-        className="kill-btn"
-        title="Kill switch is not wired in the walking skeleton"
-        aria-label="Kill switch (not available in this build)"
-      >
-        Kill switch <span className="dot" aria-hidden="true" />
-      </button>
     </header>
   )
 }

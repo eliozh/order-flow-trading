@@ -279,28 +279,6 @@ code {
   color: var(--oft-status-warn);
 }
 
-.kill-btn {
-  margin-left: auto;
-  height: 28px;
-  padding: 0 10px;
-  border: 1px solid var(--oft-status-danger);
-  border-radius: var(--oft-radius-sm);
-  background: transparent;
-  color: var(--oft-status-danger);
-  font: 700 10px var(--oft-font-mono);
-  letter-spacing: 0.08em;
-  text-transform: uppercase;
-  cursor: not-allowed;
-}
-
-.kill-btn .dot {
-  display: inline-block;
-  width: 6px;
-  height: 6px;
-  margin-left: 6px;
-  background: currentColor;
-}
-
 /* /system shell */
 .system-page {
   display: flex;
@@ -601,11 +579,6 @@ code {
   .statusbar .sb-sep,
   .statusbar .sb-brand {
     display: none;
-  }
-
-  .statusbar .kill-btn {
-    margin-left: auto;
-    min-height: 44px;
   }
 
   .app-main {
@@ -1432,4 +1405,40 @@ code {
   .card-grid {
     grid-template-columns: minmax(0, 1fr);
   }
+}
+
+/* Slice 20 fixer: modal dialogs and safety-control sizing. */
+.dialog-overlay {
+  position: fixed;
+  inset: 0;
+  z-index: 20;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  padding: 16px;
+  background: #07080ab8;
+}
+
+.dialog-panel {
+  width: min(560px, 100%);
+  max-height: calc(100vh - 32px);
+  overflow-y: auto;
+  border: 1px solid var(--oft-border-strong);
+  background: var(--oft-bg-raised);
+  padding: 16px;
+}
+
+.dialog-panel--narrow {
+  width: min(520px, 100%);
+}
+
+/* Primary dialog and kill-switch controls meet the 44px design rule at every
+   width, including <=768px. */
+.dialog-panel .btn,
+.kill-switch-bar .btn {
+  min-height: 44px;
+}
+
+.btn--muted {
+  cursor: not-allowed;
 }

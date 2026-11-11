@@ -1,3 +1,4 @@
+/* eslint-disable jsx-a11y/no-noninteractive-tabindex -- keyboard-scrollable risk table */
 import type { ReactNode } from 'react'
 
 import { riskVerdictChip, type RiskVerdict } from '../api/triggers'
@@ -26,9 +27,9 @@ function staleInputs(verdict: RiskVerdict | null): string[] {
   return Array.isArray(values) ? values.filter((item) => typeof item === 'string') : []
 }
 
-function Row({ cap, children }: { cap: string; children: ReactNode }) {
+function Row({ cap, testId, children }: { cap: string; testId?: string; children: ReactNode }) {
   return (
-    <tr>
+    <tr data-testid={testId}>
       <th scope="row">{cap}</th>
       {children}
     </tr>
@@ -60,6 +61,11 @@ export function RiskPanel({ verdict, symbol }: RiskPanelProps) {
       ? '—'
       : `${allowed.quantity}${symbol ? ` ${symbol}` : ''}`
 
+  const requestedQuantity =
+    requested.quantity === null || requested.quantity === undefined
+      ? '—'
+      : `${requested.quantity}${symbol ? ` ${symbol}` : ''}`
+
   return (
     <div>
       <div className="action-row" style={{ marginBottom: 8 }}>
@@ -67,10 +73,10 @@ export function RiskPanel({ verdict, symbol }: RiskPanelProps) {
         {stale.length > 0 && <span className="chip chip--warn">PARTIAL</span>}
         <span className="mono-muted">requested vs allowed · stricter side wins</span>
       </div>
-      <div className="table-wrap">
+      <div className="table-wrap" role="region" tabIndex={0} aria-label="Risk gate caps table">
         <table className="data-table">
           <caption className="visually-hidden">Risk gate caps, requested versus allowed</caption>
-          <thead>
+          <thead lang="en">
             <tr>
               <th scope="col">Cap</th>
               <th scope="col">Requested</th>
@@ -90,12 +96,16 @@ export function RiskPanel({ verdict, symbol }: RiskPanelProps) {
               <td className="mono">请求 {value(requested.leverage, 'x')}</td>
               <td className="mono">allowed {value(allowed.leverage, 'x')}</td>
             </Row>
-            <Row cap="入场 / 止损">
-              <td className="mono">entry {value(requested.entry_price)}</td>
-              <td className="mono">stop {value(requested.stop_price)}</td>
+            <Row cap="入场价" testId="cap-entry">
+              <td className="mono">请求 {value(requested.entry_price)}</td>
+              <td className="mono">—</td>
             </Row>
-            <Row cap="最终规模">
-              <td className="mono">allowed {value(allowed.quantity)}</td>
+            <Row cap="止损价" testId="cap-stop">
+              <td className="mono">请求 {value(requested.stop_price)}</td>
+              <td className="mono">—</td>
+            </Row>
+            <Row cap="最终规模" testId="cap-final-size">
+              <td className="mono">请求 {requestedQuantity}</td>
               <td className="mono">{finalSize}</td>
             </Row>
             <tr data-testid="binding-cap">
@@ -107,6 +117,10 @@ export function RiskPanel({ verdict, symbol }: RiskPanelProps) {
           </tbody>
         </table>
       </div>
+      <p className="panel-foot">
+        入场价与止损价是请求值（没有 allowed 对应项）；最终规模只取 requested 与 allowed
+        中更严格的一方。列上方标题为 <span lang="en">Requested / Allowed</span>。
+      </p>
       {stale.length > 0 && (
         <p className="panel-foot">
           PARTIAL — 未测量的输入：{stale.join(', ')}。这些输入不会被当作零。

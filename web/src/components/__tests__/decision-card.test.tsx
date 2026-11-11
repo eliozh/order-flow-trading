@@ -91,7 +91,7 @@ describe('DecisionCard', () => {
     render(<DecisionCard card={card()} />)
 
     expect(screen.getAllByText('CALC').length).toBeGreaterThanOrEqual(2)
-    expect(screen.getByText('LLM')).toBeInTheDocument()
+    expect(screen.getAllByText('LLM').length).toBeGreaterThan(0)
     expect(screen.getByText(/Untrusted model text/)).toBeInTheDocument()
     expect(screen.getByText('POC absorption held.')).toBeInTheDocument()
   })
@@ -125,6 +125,47 @@ describe('DecisionCard', () => {
     expect(screen.getByText('REJECT')).toBeInTheDocument()
     expect(screen.getByText('structure broken')).toBeInTheDocument()
     expect(screen.queryByRole('button', { name: /接受（Paper）/ })).not.toBeInTheDocument()
+  })
+
+  it('keeps a blocked accept focusable with a reachable reason and guards clicks', () => {
+    const onAccept = vi.fn()
+    render(
+      <DecisionCard
+        card={card({
+          risk: {
+            verdict: 'BLOCK',
+            binding_cap: 'STALE_MARK',
+            reasons: ['mark is stale'],
+            stale_inputs: ['mark'],
+            requested: { entry_price: '96710.00', stop_price: '95500.00', risk_pct: 0.8 },
+            allowed: { quantity: '0', notional_usd: '0', leverage: null, risk_amount_usd: '0' },
+          },
+        })}
+        onAccept={onAccept}
+      />,
+    )
+
+    const accept = screen.getByRole('button', { name: /接受（Paper）/ })
+    expect(accept).toHaveAttribute('aria-disabled', 'true')
+    expect(accept).not.toHaveAttribute('disabled')
+    expect(accept).toHaveAccessibleDescription(/接受不可用/)
+    expect(accept).toHaveClass('btn--muted')
+
+    fireEvent.click(accept)
+    expect(onAccept).not.toHaveBeenCalled()
+  })
+
+  it('labels analysis provenance as belonging to the linked scan analysis', () => {
+    render(
+      <DecisionCard
+        card={card()}
+        analysis={{ provider: 'anthropic', model: 'claude-sonnet-4-5', prompt_id: 'analysis' }}
+      />,
+    )
+
+    expect(screen.getByText(/关联的扫描分析决策/)).toBeInTheDocument()
+    // The disclosure stays present alongside the explicit label.
+    expect(screen.getByText(/No raw prompt is rendered/)).toBeInTheDocument()
   })
 
   it('is read-only at 375px and explains where to act', () => {

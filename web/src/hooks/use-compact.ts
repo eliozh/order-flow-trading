@@ -1,6 +1,8 @@
 import { useEffect, useState } from 'react'
 
-export const COMPACT_QUERY = '(max-width: 768px)'
+// Phone-width read-only surface. A 768px tablet must keep Accept/Reject, and
+// 200% zoom on a desktop (1440px -> 720px) must not remove the actions.
+export const COMPACT_QUERY = '(max-width: 480px)'
 
 export function detectCompact(): boolean {
   if (typeof window === 'undefined' || typeof window.matchMedia !== 'function') {

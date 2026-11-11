@@ -80,30 +80,52 @@ export function TriggersPage({
 
   useEffect(() => {
     const controller = new AbortController()
-    setQueue((previous) => ({ ...previous, state: 'loading' }))
+    setQueue({ state: 'loading', rows: [] })
     async function load(): Promise<void> {
       const envelope = await fetchTriggersFn({ limit: 50 }, controller.signal)
       const items = envelope.data?.items ?? []
-      const rows = await Promise.all(
-        items.map(async (summary): Promise<QueueRow> => {
+      if (controller.signal.aborted) {
+        return
+      }
+      // Render the summary rows immediately; details hydrate progressively.
+      setQueue({
+        state: 'ready',
+        rows: orderRows(
+          items.map((summary) => ({
+            summary,
+            detail: null,
+            confidence: null,
+          })),
+        ),
+      })
+      // Resolved rows need no detail fan-out; their state is in the summary.
+      const pending = items.filter((summary) => isPendingStatus(summary.status))
+      await Promise.all(
+        pending.map(async (summary) => {
           const [detail, opportunity] = await Promise.allSettled([
             fetchTriggerDetailFn(summary.trigger_id, controller.signal),
             fetchOpportunityFn(summary.opportunity_id, controller.signal),
           ])
-          return {
-            summary,
-            detail: detail.status === 'fulfilled' ? detail.value.data : null,
-            confidence:
-              opportunity.status === 'fulfilled'
-                ? (opportunity.value.data?.confidence ?? null)
-                : null,
+          if (controller.signal.aborted) {
+            return
           }
+          setQueue((previous) => ({
+            ...previous,
+            rows: previous.rows.map((row) =>
+              row.summary.trigger_id === summary.trigger_id
+                ? {
+                    ...row,
+                    detail: detail.status === 'fulfilled' ? detail.value.data : null,
+                    confidence:
+                      opportunity.status === 'fulfilled'
+                        ? (opportunity.value.data?.confidence ?? null)
+                        : null,
+                  }
+                : row,
+            ),
+          }))
         }),
       )
-      if (controller.signal.aborted) {
-        return
-      }
-      setQueue({ state: 'ready', rows: orderRows(rows) })
     }
     load().catch((error: unknown) => {
       if (controller.signal.aborted || isAbortError(error)) {
@@ -198,7 +220,7 @@ export function TriggersPage({
               <caption className="visually-hidden">
                 入场复核队列 · 待处理 {pending} · 已处理 {resolved}
               </caption>
-              <thead>
+              <thead lang="en">
                 <tr>
                   <th scope="col">Decision</th>
                   <th scope="col">Symbol</th>
@@ -216,8 +238,10 @@ export function TriggersPage({
                   const state = stateChip(status)
                   const verdict = row.detail?.risk_verdict ?? null
                   const risk =
-                    isPendingStatus(status) && verdict === null
-                      ? { label: 'PENDING', className: 'chip' }
+                    row.detail === null
+                      ? isPendingStatus(status)
+                        ? { label: 'PENDING', className: 'chip' }
+                        : { label: '—', className: 'chip' }
                       : riskVerdictChip(verdict)
                   const band = row.confidence === null ? null : confidenceBand(row.confidence)
                   return (
@@ -245,7 +269,7 @@ export function TriggersPage({
                         <span className={risk.className}>{risk.label}</span>
                       </td>
                       <td>
-                        <span className="env-chip env-chip--paper">
+                        <span className="env-chip env-chip--paper" lang="en">
                           {row.detail?.environment ?? '—'}
                         </span>
                       </td>
