@@ -1,14 +1,18 @@
+import { KillSwitchBar } from './components/kill-switch'
 import { StatusBar } from './components/status-bar'
 import { useStatusBar } from './hooks/use-status-bar'
 import { resolveRoute } from './routes/route-match'
 import { OpportunityDetailPage } from './routes/opportunity-detail'
 import { OpportunitiesPage } from './routes/opportunities'
+import { PaperPage } from './routes/paper'
 import { ReportDetailPage } from './routes/report-detail'
 import { ReportsPage } from './routes/reports'
 import { ScanDetailPage } from './routes/scan-detail'
 import { ScansPage } from './routes/scans'
 import { SymbolInspectorPage } from './routes/symbol-inspector'
 import { SystemPage } from './routes/system'
+import { TriggerDetailPage } from './routes/trigger-detail'
+import { TriggersPage } from './routes/triggers'
 import { WatchlistPage } from './routes/watchlist'
 import './styles/tokens.css'
 import './styles/app.css'
@@ -27,6 +31,7 @@ export default function App() {
   return (
     <div className="app-shell">
       <StatusBar {...statusBar} />
+      <KillSwitchBar />
       <main className="app-main">
         {route.inspectorSymbol !== null ? (
           <SymbolInspectorPage key={route.inspectorSymbol} symbol={route.inspectorSymbol} />
@@ -36,12 +41,18 @@ export default function App() {
           <ReportDetailPage key={route.reportId} reportId={route.reportId} />
         ) : route.opportunityId !== null ? (
           <OpportunityDetailPage key={route.opportunityId} opportunityId={route.opportunityId} />
+        ) : route.triggerId !== null ? (
+          <TriggerDetailPage key={route.triggerId} triggerId={route.triggerId} />
         ) : route.isScans ? (
           <ScansPage />
         ) : route.isReports ? (
           <ReportsPage />
         ) : route.isOpportunities ? (
           <OpportunitiesPage />
+        ) : route.isTriggers ? (
+          <TriggersPage />
+        ) : route.isPaper ? (
+          <PaperPage />
         ) : route.isWatchlist ? (
           <WatchlistPage />
         ) : route.isSystem ? (
@@ -51,7 +62,8 @@ export default function App() {
             <h1>Not found</h1>
             <p className="status-message">
               Open <code>/watchlist</code>, <code>/scans</code>, <code>/reports</code>,{' '}
-              <code>/opportunities</code>, or <code>/system</code>.
+              <code>/opportunities</code>, <code>/triggers</code>, <code>/paper</code>, or{' '}
+              <code>/system</code>.
             </p>
           </section>
         )}
