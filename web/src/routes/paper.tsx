@@ -14,7 +14,7 @@ import {
   type PaperOrdersEnvelope,
 } from '../api/paper'
 import { PaperFillsTable, PaperOrdersTable, PaperPositionsTable } from '../components/paper-tables'
-import { useCompact } from '../hooks/use-compact'
+import { useNarrowCompact } from '../hooks/use-compact'
 
 interface PaperPageProps {
   fetchAccountFn?: (signal?: AbortSignal) => Promise<PaperAccountEnvelope>
@@ -66,7 +66,7 @@ export function PaperPage({
     fills: [],
     fillsTotal: 0,
   })
-  const compact = useCompact(isCompact)
+  const compact = useNarrowCompact(isCompact)
 
   useEffect(() => {
     const controller = new AbortController()

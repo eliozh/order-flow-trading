@@ -15,7 +15,7 @@ import {
   type TriggerSummary,
   riskVerdictChip,
 } from '../api/triggers'
-import { useCompact } from '../hooks/use-compact'
+import { useNarrowCompact } from '../hooks/use-compact'
 
 interface TriggersPageProps {
   fetchTriggersFn?: (
@@ -76,7 +76,7 @@ export function TriggersPage({
   isCompact,
 }: TriggersPageProps) {
   const [queue, setQueue] = useState<QueueState>({ state: 'loading', rows: [] })
-  const compact = useCompact(isCompact)
+  const compact = useNarrowCompact(isCompact)
 
   useEffect(() => {
     const controller = new AbortController()

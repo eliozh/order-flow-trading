@@ -24,7 +24,7 @@ import {
   type TriggerRejectEnvelope,
 } from '../api/triggers'
 import { DecisionCard, type AnalysisProvenance } from '../components/decision-card'
-import { useCompact } from '../hooks/use-compact'
+import { useNarrowCompact } from '../hooks/use-compact'
 
 interface TriggerDetailPageProps {
   triggerId: string
@@ -265,7 +265,7 @@ export function TriggerDetailPage({
   const [rejected, setRejected] = useState<TriggerRejectData | null>(null)
   const [rechecking, setRechecking] = useState(false)
   const [announcement, setAnnouncement] = useState('')
-  const compact = useCompact(isCompact)
+  const compact = useNarrowCompact(isCompact)
 
   // Keys are lazy-initialised: `idempotencyKey` never runs during render.
   const acceptKeyRef = useRef<string | null>(null)
