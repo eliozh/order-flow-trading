@@ -226,6 +226,33 @@ def test_position_requires_open_state() -> None:
 
 
 def test_position_requires_a_positive_size() -> None:
+    for size in (Decimal("0"), Decimal("-0.01")):
+        with pytest.raises(ValueError):
+            Position(
+                position_id="POS-1",
+                account_id="ACC-PAPER",
+                environment="PAPER",
+                symbol="BTCUSDT",
+                side=PositionSide.LONG,
+                state="OPEN",
+                size=size,
+                entry_price=Decimal("1"),
+                avg_entry_price=Decimal("1"),
+                mark_price=Decimal("1"),
+                notional_usd=Decimal("0.01"),
+                stop_price=None,
+                target_prices=(),
+                leverage=2,
+                margin_usd=Decimal("0.005"),
+                risk_amount_usd=Decimal("0"),
+                risk_pct=0.0,
+                fees_usd=Decimal("0"),
+                opened_at="t",
+                updated_at="t",
+            )
+
+
+def test_position_requires_positive_quantity() -> None:
     with pytest.raises(ValueError):
         Position(
             position_id="POS-1",
@@ -238,14 +265,71 @@ def test_position_requires_a_positive_size() -> None:
             entry_price=Decimal("1"),
             avg_entry_price=Decimal("1"),
             mark_price=Decimal("1"),
-            notional_usd=Decimal("0"),
+            notional_usd=Decimal("0.01"),
             stop_price=None,
             target_prices=(),
             leverage=2,
-            margin_usd=Decimal("0"),
+            margin_usd=Decimal("0.005"),
             risk_amount_usd=Decimal("0"),
             risk_pct=0.0,
             fees_usd=Decimal("0"),
             opened_at="t",
             updated_at="t",
         )
+
+
+@pytest.mark.parametrize(
+    ("start", "target"),
+    [
+        (OrderStatus.CREATED, OrderStatus.PARTIALLY_FILLED),
+        (OrderStatus.CREATED, OrderStatus.FILLED),
+        (OrderStatus.CREATED, OrderStatus.CANCELED),
+        (OrderStatus.CREATED, OrderStatus.EXPIRED),
+        (OrderStatus.CREATED, OrderStatus.UNKNOWN),
+        (OrderStatus.SUBMITTED, OrderStatus.CREATED),
+        (OrderStatus.FILLED, OrderStatus.SUBMITTED),
+        (OrderStatus.CANCELED, OrderStatus.FILLED),
+        (OrderStatus.REJECTED, OrderStatus.SUBMITTED),
+        (OrderStatus.EXPIRED, OrderStatus.FILLED),
+        (OrderStatus.UNKNOWN, OrderStatus.FILLED),
+    ],
+)
+def test_forbidden_transitions(start: OrderStatus, target: OrderStatus) -> None:
+    with pytest.raises(OrderStateError):
+        _order(start).transition(target, at="t")
+
+
+def test_all_transitions_append_to_the_trace() -> None:
+    order = _order(OrderStatus.CREATED)
+    submitted = order.transition(OrderStatus.SUBMITTED, at="2026-11-06T12:00:01.000Z")
+    filled = submitted.transition(OrderStatus.FILLED, at="2026-11-06T12:00:02.000Z")
+
+    assert filled.trace == ("SUBMITTED", "FILLED")
+    assert filled.status == OrderStatus.FILLED
+
+
+def test_only_open_positions_are_created_by_this_slice() -> None:
+    for state in ("CLOSED", "LIQUIDATED", "RECONCILING"):
+        with pytest.raises(ValueError):
+            Position(
+                position_id="POS-1",
+                account_id="ACC-PAPER",
+                environment="PAPER",
+                symbol="BTCUSDT",
+                side=PositionSide.LONG,
+                state=state,
+                size=Decimal("0.01"),
+                entry_price=Decimal("1"),
+                avg_entry_price=Decimal("1"),
+                mark_price=Decimal("1"),
+                notional_usd=Decimal("0.01"),
+                stop_price=None,
+                target_prices=(),
+                leverage=2,
+                margin_usd=Decimal("0.005"),
+                risk_amount_usd=Decimal("0"),
+                risk_pct=0.0,
+                fees_usd=Decimal("0"),
+                opened_at="t",
+                updated_at="t",
+            )

@@ -13,6 +13,9 @@ from dataclasses import dataclass
 from typing import Any
 
 GENESIS_HASH = "0" * 64
+# The ``system_state`` key holding the last (seq, event_hash) written. It lives
+# outside the append-only table so tail truncation is detectable.
+AUDIT_HEAD_KEY = "audit_head"
 
 
 @dataclass(frozen=True)
@@ -60,4 +63,4 @@ def build_audit_entry(
     )
 
 
-__all__ = ["AuditChainEntry", "GENESIS_HASH", "build_audit_entry"]
+__all__ = ["AUDIT_HEAD_KEY", "AuditChainEntry", "GENESIS_HASH", "build_audit_entry"]

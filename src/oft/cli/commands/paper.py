@@ -53,6 +53,11 @@ def _emit(settings: Any, method: str, json_output: bool, *, limit: int | None = 
             typer.echo(
                 f"equity {data.get('equity', '-')} · open positions {data.get('open_positions', 0)}"
             )
+        stale = data.get("stale_inputs") or []
+        if stale:
+            # Equity fell back to cash (for example a missing mark); say so
+            # instead of presenting a degraded number as complete (S7).
+            typer.echo("  stale: " + ", ".join(str(name) for name in stale))
         return
     items = data.get("items") or []
     if not items:

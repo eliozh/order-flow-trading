@@ -11,7 +11,7 @@ from typing import Any, Literal
 from pydantic import BaseModel, ConfigDict
 
 from oft import __version__
-from oft.config import Settings
+from oft.config import SECRET_FIELDS, Settings
 from oft.domain.layout import PARTITION_ROOTS
 from oft.domain.time import utc_timestamp
 from oft.ports.clock import ClockPort
@@ -215,13 +215,31 @@ def _stale_jobs_check(store: StorePort, clock: ClockPort) -> CheckResult:
     return CheckResult("jobs.stale", "ok", "no stale RUNNING job runs")
 
 
-def _audit_chain_check() -> CheckResult:
-    """The append-only hash chain is implemented; the doctor does not verify it."""
+def _audit_chain_check(store: StorePort) -> CheckResult:
+    """Re-derive the append-only hash chain and report the first broken link."""
+    from oft.application.kill_switch import verify_audit_chain
+
+    try:
+        verification = verify_audit_chain(store)
+    except Exception as exc:  # pragma: no cover - defensive boundary
+        return CheckResult("audit.chain", "degraded", f"AUDIT_CHAIN_BROKEN: {exc}")
     return CheckResult(
         "audit.chain",
-        "unknown",
-        "audit_events hash chain is not verified by the doctor",
+        "ok" if verification.ok else "degraded",
+        verification.message,
     )
+
+
+def _secrets_check(settings: Settings) -> CheckResult:
+    """Report how many secrets are configured; never echo a value."""
+    configured = [name for name in SECRET_FIELDS if getattr(settings, name, None) is not None]
+    if configured:
+        return CheckResult(
+            "config.secrets",
+            "ok",
+            f"{len(configured)} secret(s) configured (values not displayed)",
+        )
+    return CheckResult("config.secrets", "ok", "no secrets configured")
 
 
 def build_doctor(
@@ -285,7 +303,8 @@ def build_doctor(
         _disk_check(settings),
         _manifest_orphans_check(settings, store),
         _stale_jobs_check(store, clock),
-        _audit_chain_check(),
+        _audit_chain_check(store),
+        _secrets_check(settings),
         ingest_check,
         ws_check,
         CheckResult(

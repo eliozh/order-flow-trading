@@ -12,16 +12,28 @@ from dataclasses import dataclass
 from decimal import Decimal
 
 from oft.application.kill_switch import KillSwitch
+from oft.application.paper_account import compute_equity
 from oft.application.paper_broker import BrokerResult, OrderIntent, PaperBroker
 from oft.domain.risk import RiskRequest, verdict_inputs_hash
 from oft.domain.time import utc_timestamp
 from oft.ports.clock import ClockPort
-from oft.ports.store import RiskVerdictRecord, StorePort
+from oft.ports.store import OmsConflictError, RiskVerdictRecord, StorePort
 
 
 def _decimal_or_none(value: object) -> Decimal | None:
     """Parse an exact decimal; ``None`` and the contract's "0" mean absent."""
     if value is None or value == "0":
+        return None
+    return Decimal(str(value))
+
+
+def _decimal_or_zero(value: object) -> Decimal | None:
+    """Parse a measured decimal; only ``None`` means "not measured".
+
+    ``daily_loss_usd`` is persisted as SQL ``NULL`` when unmeasured and as the
+    string ``"0"`` for a measured zero, so the digest stays stable (P4).
+    """
+    if value is None:
         return None
     return Decimal(str(value))
 
@@ -65,6 +77,8 @@ class ExecutionGateway:
         mark_as_of: str,
     ) -> BrokerResult:
         self._kill_switch.require_clear()
+        if intent.environment != self._environment or intent.environment != "PAPER":
+            raise GatewayError("ORDER_REJECTED", "only PAPER orders are supported")
         if auth.approval_id is None:
             raise GatewayError("ORDER_REJECTED", "human paper approval is required")
         verdict = self._store.get_risk_verdict(intent.risk_verdict_id)
@@ -79,18 +93,46 @@ class ExecutionGateway:
         existing = self._store.get_order_by_idempotency(intent.idempotency_key)
         if existing is not None:
             payload = json.loads(existing.payload_json)
+            if str(payload.get("intent_hash") or "") != intent.hash():
+                raise GatewayError(
+                    "IDEMPOTENCY_CONFLICT",
+                    f"idempotency key {intent.idempotency_key} was used for a different intent",
+                )
             raise GatewayError("ORDER_DUPLICATE", f"order already exists: {payload['order_id']}")
 
         self._bind_to_verdict(intent, verdict, mark_price=mark_price)
 
-        result = self._broker.submit(
-            intent,
-            mark_price=mark_price,
-            mark_as_of=mark_as_of,
-            now=now,
-            audit_actor={"kind": auth.kind, "id": auth.actor_id},
-        )
+        try:
+            result = self._broker.submit(
+                intent,
+                mark_price=mark_price,
+                mark_as_of=mark_as_of,
+                now=now,
+                audit_actor={"kind": auth.kind, "id": auth.actor_id},
+            )
+        except OmsConflictError as exc:
+            # A concurrent submit can pass the read-only duplicate pre-check
+            # and lose the unique index inside the commit. Never leak a 500:
+            # replay the winner's order or report a typed conflict (DB-2/D6).
+            raise self._conflict_error(intent, exc) from exc
         return result
+
+    def _conflict_error(self, intent: OrderIntent, exc: OmsConflictError) -> GatewayError:
+        if exc.constraint == "idempotency_key":
+            existing = self._store.get_order_by_idempotency(intent.idempotency_key)
+            if existing is not None:
+                payload = json.loads(existing.payload_json)
+                if str(payload.get("intent_hash") or "") == intent.hash():
+                    return GatewayError(
+                        "ORDER_DUPLICATE", f"order already exists: {existing.order_id}"
+                    )
+                return GatewayError(
+                    "IDEMPOTENCY_CONFLICT",
+                    f"idempotency key {intent.idempotency_key} was used for a different intent",
+                )
+        if exc.constraint == "trigger_entry":
+            return GatewayError("ORDER_DUPLICATE", "an entry order already exists for this trigger")
+        return GatewayError("ORDER_DUPLICATE", "a concurrent submit already committed this intent")
 
     def _bind_to_verdict(
         self,
@@ -140,10 +182,18 @@ class ExecutionGateway:
         except (KeyError, TypeError, ValueError, ArithmeticError) as exc:
             raise GatewayError("RISK_BLOCKED", "the risk verdict inputs are incomplete") from exc
         account = self._broker.account()
+        positions = self._store.list_positions(state="OPEN", limit=None)
+        equity, _view = compute_equity(
+            Decimal(account.balance),
+            [json.loads(record.payload_json) for record in positions],
+        )
         digest = verdict_inputs_hash(
             request,
-            equity=Decimal(account.balance),
-            open_positions=len(self._store.list_positions(state="OPEN")),
+            equity=equity,
+            open_positions=len(positions),
+            spread_bps=record.spread_bps,
+            expected_slippage_bps=record.expected_slippage_bps,
+            daily_loss_usd=_decimal_or_zero(record.daily_loss_usd),
         )
         if digest != payload.get("inputs_hash"):
             raise GatewayError(

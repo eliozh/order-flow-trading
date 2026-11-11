@@ -10,7 +10,7 @@ from fastapi import APIRouter, Query, Request
 from oft.api.envelope import new_request_id, success_envelope
 from oft.api.errors import ApiError
 from oft.application.kill_switch import InvalidResumeToken, KillSwitch
-from oft.application.paper_broker import PaperBroker
+from oft.application.paper_account import PaperAccountService
 
 router = APIRouter()
 
@@ -20,26 +20,21 @@ def _kill_switch(request: Request) -> KillSwitch:
     return KillSwitch(settings=container.settings, store=container.store, clock=container.clock)
 
 
-def _broker(request: Request) -> PaperBroker:
+def _account_service(request: Request) -> PaperAccountService:
     container = request.app.state.container
-    return PaperBroker(settings=container.settings, store=container.store, clock=container.clock)
+    return PaperAccountService(
+        settings=container.settings, store=container.store, clock=container.clock
+    )
 
 
 @router.get("/api/v1/paper/account")
 def paper_account(request: Request) -> dict[str, Any]:
-    account = _broker(request).account()
+    summary = _account_service(request).summary()
     return success_envelope(
-        {
-            "account_id": account.account_id,
-            "environment": account.environment,
-            "currency": account.currency,
-            "initial_balance": account.initial_balance,
-            "balance": account.balance,
-            "updated_at": account.updated_at,
-        },
+        summary,
         request_id=new_request_id(),
         provenance="CALC",
-        data_quality="COMPLETE",
+        data_quality="PARTIAL" if summary["stale_inputs"] else "COMPLETE",
     )
 
 
@@ -99,19 +94,24 @@ def paper_fills(
 
 @router.get("/api/v1/paper/equity")
 def paper_equity(request: Request) -> dict[str, Any]:
-    account = _broker(request).account()
-    open_positions = request.app.state.container.store.count_positions(state="OPEN")
+    summary = _account_service(request).summary()
     return success_envelope(
         {
-            "account_id": account.account_id,
-            "balance": account.balance,
-            "equity": account.balance,
-            "open_positions": open_positions,
-            "note": "PnL and funding are out of scope in this slice; equity equals balance.",
+            "account_id": summary["account_id"],
+            "currency": summary["currency"],
+            "cash_balance": summary["cash_balance"],
+            "balance": summary["balance"],
+            "unrealized_at_last_mark": summary["unrealized_at_last_mark"],
+            "equity": summary["equity"],
+            "positions": summary["positions"],
+            "open_positions": summary["open_positions"],
+            "stale_inputs": summary["stale_inputs"],
+            "updated_at": summary["updated_at"],
+            "note": "PnL, funding, and paper reset are out of scope in this slice.",
         },
         request_id=new_request_id(),
         provenance="CALC",
-        data_quality="COMPLETE",
+        data_quality="PARTIAL" if summary["stale_inputs"] else "COMPLETE",
     )
 
 

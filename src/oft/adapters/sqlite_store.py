@@ -21,7 +21,7 @@ from pathlib import Path
 from typing import Any, Literal
 
 from oft.config import Settings
-from oft.domain.audit import build_audit_entry
+from oft.domain.audit import AUDIT_HEAD_KEY, build_audit_entry
 from oft.domain.budget_periods import budget_record_id, period_parts
 from oft.domain.conditions import ConditionParamsError, normalize_timestamp
 from oft.domain.data_quality import DataGap, GapSeverity
@@ -56,6 +56,7 @@ from oft.ports.store import (
     LLMCallRecord,
     ManifestEntry,
     OmsCommit,
+    OmsConflictError,
     OpportunityEventRecord,
     OpportunityRecord,
     OrderRecord,
@@ -84,7 +85,7 @@ def _zero_budget_totals() -> dict[str, dict[str, Any]]:
     }
 
 
-_SCHEMA_VERSION = 19
+_SCHEMA_VERSION = 20
 _BUSY_TIMEOUT_MS = 5000
 # ``PRAGMA journal_mode=WAL`` needs an exclusive lock and does not reliably
 # consult the busy handler, so a concurrent initializer can still see
@@ -528,8 +529,12 @@ _SCHEMA_SQL = f"""
         binding_cap TEXT NOT NULL,
         computed_at TEXT NOT NULL,
         expires_at TEXT NOT NULL,
-        payload_json TEXT NOT NULL
+        payload_json TEXT NOT NULL,
+        spread_bps REAL,
+        expected_slippage_bps REAL,
+        daily_loss_usd TEXT
     );
+    CREATE INDEX IF NOT EXISTS risk_verdicts_trigger_id ON risk_verdicts(trigger_id);
     CREATE TABLE IF NOT EXISTS orders (
         order_id TEXT PRIMARY KEY,
         client_order_id TEXT NOT NULL UNIQUE,
@@ -540,8 +545,16 @@ _SCHEMA_SQL = f"""
         idempotency_key TEXT NOT NULL UNIQUE,
         created_at TEXT NOT NULL,
         updated_at TEXT NOT NULL,
-        payload_json TEXT NOT NULL
+        payload_json TEXT NOT NULL,
+        trigger_id TEXT,
+        decision_id TEXT,
+        purpose TEXT NOT NULL DEFAULT 'ENTRY'
     );
+    -- D6: at most one ENTRY order per trigger, enforced by the database, not a
+    -- read-then-act guard. A retry that races a committed order fails here.
+    CREATE UNIQUE INDEX IF NOT EXISTS orders_one_entry_per_trigger
+        ON orders(trigger_id, environment, purpose)
+        WHERE trigger_id IS NOT NULL AND purpose = 'ENTRY';
     CREATE TABLE IF NOT EXISTS fills (
         fill_id TEXT PRIMARY KEY,
         order_id TEXT NOT NULL REFERENCES orders(order_id),
@@ -560,6 +573,7 @@ _SCHEMA_SQL = f"""
         payload_json TEXT NOT NULL
     );
     CREATE INDEX IF NOT EXISTS positions_state ON positions(state);
+    CREATE INDEX IF NOT EXISTS positions_account_id ON positions(account_id);
     -- Slice 11 replay/pagination indexes. ``fills(order_id)`` is mandatory:
     -- it is an FK and the accept replay looks the fill up by order. The
     -- trigger indexes below are current as of schema v19 (trigger provenance).
@@ -593,6 +607,20 @@ _SCHEMA_SQL = f"""
         event_hash TEXT NOT NULL,
         payload_json TEXT NOT NULL
     );
+    -- D7 hardening: the chain is append-only in the database itself; an
+    -- application bug (or a casual writer) cannot rewrite or remove a row.
+    DROP TRIGGER IF EXISTS audit_events_no_update;
+    CREATE TRIGGER audit_events_no_update
+        BEFORE UPDATE ON audit_events
+    BEGIN
+        SELECT RAISE(ABORT, 'audit_events is append-only');
+    END;
+    DROP TRIGGER IF EXISTS audit_events_no_delete;
+    CREATE TRIGGER audit_events_no_delete
+        BEFORE DELETE ON audit_events
+    BEGIN
+        SELECT RAISE(ABORT, 'audit_events is append-only');
+    END;
     CREATE TABLE IF NOT EXISTS prompt_templates (
         prompt_id TEXT PRIMARY KEY,
         role TEXT NOT NULL,
@@ -1137,6 +1165,16 @@ _TRIGGER_EVENT_ADDITIONS = (
     ("data_quality", "TEXT NOT NULL DEFAULT ''"),
     ("condition_count", "INTEGER NOT NULL DEFAULT 0"),
 )
+_ORDER_ADDITIONS = (
+    ("trigger_id", "TEXT"),
+    ("decision_id", "TEXT"),
+    ("purpose", "TEXT NOT NULL DEFAULT 'ENTRY'"),
+)
+_RISK_VERDICT_ADDITIONS = (
+    ("spread_bps", "REAL"),
+    ("expected_slippage_bps", "REAL"),
+    ("daily_loss_usd", "TEXT"),
+)
 
 
 def _period_parts(occurred_at: str) -> tuple[str, str, str]:
@@ -1492,6 +1530,42 @@ def _migrate_v19(connection: sqlite3.Connection) -> None:
         raise
 
 
+def _migrate_v20(connection: sqlite3.Connection) -> None:
+    """Add the paper-OMS trigger binding and measured verdict inputs (v20).
+
+    ``orders`` gains ``trigger_id``/``decision_id``/``purpose`` plus the partial
+    UNIQUE index that makes "at most one ENTRY order per trigger" a database
+    invariant; ``risk_verdicts`` gains the measured inputs the gateway needs to
+    re-derive ``inputs_hash`` without re-measuring.
+    """
+    if not _table_exists(connection, "orders") and not _table_exists(connection, "risk_verdicts"):
+        return
+    if connection.in_transaction:
+        connection.commit()
+    connection.execute("BEGIN IMMEDIATE")
+    try:
+        _add_missing_columns(connection, "orders", _ORDER_ADDITIONS)
+        _add_missing_columns(connection, "risk_verdicts", _RISK_VERDICT_ADDITIONS)
+        if _table_exists(connection, "orders"):
+            connection.execute(
+                "CREATE UNIQUE INDEX IF NOT EXISTS orders_one_entry_per_trigger "
+                "ON orders(trigger_id, environment, purpose) "
+                "WHERE trigger_id IS NOT NULL AND purpose = 'ENTRY'"
+            )
+        if _table_exists(connection, "risk_verdicts"):
+            connection.execute(
+                "CREATE INDEX IF NOT EXISTS risk_verdicts_trigger_id ON risk_verdicts(trigger_id)"
+            )
+        if _table_exists(connection, "positions"):
+            connection.execute(
+                "CREATE INDEX IF NOT EXISTS positions_account_id ON positions(account_id)"
+            )
+        connection.execute("COMMIT")
+    except Exception:
+        connection.execute("ROLLBACK")
+        raise
+
+
 def _opportunity_conditions_pk(
     connection: sqlite3.Connection,
 ) -> tuple[str, ...]:
@@ -1661,11 +1735,12 @@ def _enable_wal(connection: sqlite3.Connection) -> None:
 
 
 def initialize_database(settings: Settings) -> None:
-    """Create the data directory and the schema, currently v19.
+    """Create the data directory and the schema, currently v20.
 
     v19 adds the trigger snapshot provenance columns (``snapshot_hash``,
     ``as_of``, ``data_quality``, ``condition_count``) and backfills them from
-    recorded payloads.
+    recorded payloads. v20 binds paper orders to their trigger (with a partial
+    UNIQUE index) and stores the measured risk inputs on each verdict.
     """
     settings.data_dir.mkdir(parents=True, exist_ok=True)
     settings.data_dir.chmod(0o700)
@@ -1722,6 +1797,8 @@ def initialize_database(settings: Settings) -> None:
             _migrate_v18(connection)
         if _schema_version(connection) < 19 or not _migration_recorded(connection, 19):
             _migrate_v19(connection)
+        if _schema_version(connection) < 20 or not _migration_recorded(connection, 20):
+            _migrate_v20(connection)
         _ensure_opportunity_conditions_shape(connection)
         with connection:
             # ``_SCHEMA_SQL`` drops and recreates the immutability trigger, a
@@ -1805,7 +1882,11 @@ def initialize_database(settings: Settings) -> None:
             )
             connection.execute(
                 "INSERT OR IGNORE INTO schema_migrations (version, applied_at) VALUES (?, ?)",
-                (_SCHEMA_VERSION, "2026-11-09T12:00:00.000Z"),
+                (19, "2026-11-09T12:00:00.000Z"),
+            )
+            connection.execute(
+                "INSERT OR IGNORE INTO schema_migrations (version, applied_at) VALUES (?, ?)",
+                (_SCHEMA_VERSION, "2026-11-10T00:00:00.000Z"),
             )
             _seed_prompt_defaults(connection)
     finally:
@@ -2055,6 +2136,17 @@ def _row_to_scan_symbol(row: sqlite3.Row) -> ScanSymbolRecord:
         cost_usd=row["cost_usd"] if "cost_usd" in keys else "0",
         cost_unpriced=bool(row["cost_unpriced"]) if "cost_unpriced" in keys else True,
     )
+
+
+def _oms_conflict_kind(message: str) -> str:
+    """Classify an ``orders`` unique violation for the gateway's reconciliation."""
+    if "orders.trigger_id" in message or "orders.environment" in message:
+        return "trigger_entry"
+    if "orders.idempotency_key" in message:
+        return "idempotency_key"
+    if "orders.client_order_id" in message:
+        return "client_order_id"
+    return "unknown"
 
 
 class SqliteStore:
@@ -4732,14 +4824,37 @@ class SqliteStore:
         finally:
             connection.close()
 
-    def update_trigger_event(self, record: TriggerEventRecord) -> bool:
+    def update_trigger_event(
+        self,
+        record: TriggerEventRecord,
+        *,
+        expected_status: str | None = None,
+        require_no_order: bool = False,
+        require_no_entry_order: bool = False,
+    ) -> bool:
+        clauses = ["trigger_id = ?"]
+        params: list[object] = [record.status, record.payload_json, record.trigger_id]
+        if expected_status is not None:
+            clauses.append("status = ?")
+            params.append(expected_status)
+        if require_no_order:
+            # ``created_order_id`` is a payload field (the frozen trigger
+            # contract), not a column; the compare-and-set reads it from JSON.
+            clauses.append("json_extract(payload_json, '$.created_order_id') IS NULL")
+        if require_no_entry_order:
+            # Atomic with the update: a concurrent accept that committed its
+            # order before this statement makes the write lose.
+            clauses.append(
+                "NOT EXISTS (SELECT 1 FROM orders o WHERE o.trigger_id = trigger_events.trigger_id "
+                "AND o.purpose = 'ENTRY' AND o.environment = 'PAPER')"
+            )
         with closing(self._connect()) as connection, connection:
             cursor = connection.execute(
-                """
+                f"""
                 UPDATE trigger_events SET status = ?, payload_json = ?
-                WHERE trigger_id = ?
+                WHERE {" AND ".join(clauses)}
                 """,
-                (record.status, record.payload_json, record.trigger_id),
+                tuple(params),
             )
         return cursor.rowcount == 1
 
@@ -4827,9 +4942,20 @@ class SqliteStore:
                 """
                 INSERT INTO risk_verdicts (
                     risk_verdict_id, trigger_id, decision_id, verdict, binding_cap,
-                    computed_at, expires_at, payload_json
-                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?)
-                ON CONFLICT(risk_verdict_id) DO NOTHING
+                    computed_at, expires_at, payload_json, spread_bps,
+                    expected_slippage_bps, daily_loss_usd
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                ON CONFLICT(risk_verdict_id) DO UPDATE SET
+                    trigger_id = excluded.trigger_id,
+                    decision_id = excluded.decision_id,
+                    verdict = excluded.verdict,
+                    binding_cap = excluded.binding_cap,
+                    computed_at = excluded.computed_at,
+                    expires_at = excluded.expires_at,
+                    payload_json = excluded.payload_json,
+                    spread_bps = excluded.spread_bps,
+                    expected_slippage_bps = excluded.expected_slippage_bps,
+                    daily_loss_usd = excluded.daily_loss_usd
                 """,
                 (
                     record.risk_verdict_id,
@@ -4840,6 +4966,9 @@ class SqliteStore:
                     record.computed_at,
                     record.expires_at,
                     record.payload_json,
+                    record.spread_bps,
+                    record.expected_slippage_bps,
+                    record.daily_loss_usd,
                 ),
             )
 
@@ -4897,8 +5026,8 @@ class SqliteStore:
                 INSERT INTO orders (
                     order_id, client_order_id, environment, symbol, status,
                     risk_verdict_id, idempotency_key, created_at, updated_at,
-                    payload_json
-                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    payload_json, trigger_id, decision_id, purpose
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 """,
                 (
                     order.order_id,
@@ -4911,6 +5040,9 @@ class SqliteStore:
                     order.created_at,
                     order.updated_at,
                     order.payload_json,
+                    order.trigger_id,
+                    order.decision_id,
+                    order.purpose,
                 ),
             )
             connection.execute(
@@ -4973,6 +5105,9 @@ class SqliteStore:
                 updated_at=account.updated_at,
             )
             return OmsCommit(account=committed_account, audit=audit_record)
+        except sqlite3.IntegrityError as exc:
+            connection.rollback()
+            raise OmsConflictError(_oms_conflict_kind(str(exc))) from exc
         except BaseException:
             connection.rollback()
             raise
@@ -5010,6 +5145,21 @@ class SqliteStore:
         try:
             row = connection.execute(
                 "SELECT * FROM orders WHERE client_order_id = ?", (client_order_id,)
+            ).fetchone()
+        finally:
+            connection.close()
+        return _row_to_order(row) if row is not None else None
+
+    def get_entry_order_for_trigger(self, trigger_id: str) -> OrderRecord | None:
+        connection = self._connect_read_only()
+        if connection is None:
+            return None
+        try:
+            row = connection.execute(
+                "SELECT * FROM orders WHERE trigger_id = ? AND purpose = 'ENTRY' "
+                "AND environment = 'PAPER' "
+                "ORDER BY created_at ASC, order_id ASC LIMIT 1",
+                (trigger_id,),
             ).fetchone()
         finally:
             connection.close()
@@ -5072,21 +5222,25 @@ class SqliteStore:
         return _row_to_fill(row) if row is not None else None
 
     def list_positions(
-        self, *, state: str | None = None, limit: int = 100, offset: int = 0
+        self, *, state: str | None = None, limit: int | None = 100, offset: int = 0
     ) -> tuple[PositionRecord, ...]:
         connection = self._connect_read_only()
         if connection is None:
             return ()
-        if state is None:
-            query = "SELECT * FROM positions ORDER BY opened_at DESC LIMIT ? OFFSET ?"
-            params: tuple[object, ...] = (limit, offset)
-        else:
-            query = (
-                "SELECT * FROM positions WHERE state = ? ORDER BY opened_at DESC LIMIT ? OFFSET ?"
-            )
-            params = (state, limit, offset)
+        clauses: list[str] = []
+        params: list[object] = []
+        if state is not None:
+            clauses.append("state = ?")
+            params.append(state)
+        where = f" WHERE {' AND '.join(clauses)}" if clauses else ""
+        query = f"SELECT * FROM positions{where} ORDER BY opened_at DESC"
+        # An equity total must be exact: ``limit=None`` reads every open row
+        # instead of silently truncating at the default page size (DB-5).
+        if limit is not None:
+            query += " LIMIT ? OFFSET ?"
+            params.extend((limit, offset))
         try:
-            rows = connection.execute(query, params).fetchall()
+            rows = connection.execute(query, tuple(params)).fetchall()
         finally:
             connection.close()
         return tuple(_row_to_position(row) for row in rows)
@@ -5151,27 +5305,29 @@ class SqliteStore:
                 ),
             )
 
-    # -- Audit and system state ------------------------------------------
-
-    def save_audit_event(self, record: AuditEventRecord) -> None:
+    def seed_paper_account(self, record: PaperAccountRecord) -> PaperAccountRecord:
+        """Insert the seed account once and return the row actually stored."""
         with closing(self._connect()) as connection, connection:
             connection.execute(
                 """
-                INSERT INTO audit_events (
-                    event_id, seq, event_type, created_at, previous_hash,
-                    event_hash, payload_json
-                ) VALUES (?, ?, ?, ?, ?, ?, ?)
+                INSERT INTO paper_accounts (
+                    account_id, environment, currency, initial_balance, balance, updated_at
+                ) VALUES (?, ?, ?, ?, ?, ?)
+                ON CONFLICT(account_id) DO NOTHING
                 """,
                 (
-                    record.event_id,
-                    record.seq,
-                    record.event_type,
-                    record.created_at,
-                    record.previous_hash,
-                    record.event_hash,
-                    record.payload_json,
+                    record.account_id,
+                    record.environment,
+                    record.currency,
+                    record.initial_balance,
+                    record.balance,
+                    record.updated_at,
                 ),
             )
+        stored = self.get_paper_account(record.account_id)
+        return stored if stored is not None else record
+
+    # -- Audit and system state ------------------------------------------
 
     def append_audit_event(self, draft: AuditEventDraft) -> AuditEventRecord:
         connection = self._connect()
@@ -5227,6 +5383,22 @@ class SqliteStore:
                 record.payload_json,
             ),
         )
+        # D7: a high-water mark outside the append-only table, written in the
+        # same transaction. Deleting the newest rows leaves a gap the chain
+        # scan alone cannot see; the head can.
+        connection.execute(
+            """
+            INSERT INTO system_state (key, value, updated_at) VALUES (?, ?, ?)
+            ON CONFLICT(key) DO UPDATE SET
+                value = excluded.value,
+                updated_at = excluded.updated_at
+            """,
+            (
+                AUDIT_HEAD_KEY,
+                json.dumps({"seq": record.seq, "event_hash": record.event_hash}, sort_keys=True),
+                record.created_at,
+            ),
+        )
         return record
 
     def list_audit_events(self, *, limit: int = 100) -> tuple[AuditEventRecord, ...]:
@@ -5237,6 +5409,23 @@ class SqliteStore:
             rows = connection.execute(
                 "SELECT * FROM audit_events ORDER BY seq DESC LIMIT ?", (limit,)
             ).fetchall()
+        finally:
+            connection.close()
+        return tuple(_row_to_audit(row) for row in rows)
+
+    def list_audit_events_ascending(
+        self, *, limit: int | None = None
+    ) -> tuple[AuditEventRecord, ...]:
+        connection = self._connect_read_only()
+        if connection is None:
+            return ()
+        try:
+            if limit is None:
+                rows = connection.execute("SELECT * FROM audit_events ORDER BY seq ASC").fetchall()
+            else:
+                rows = connection.execute(
+                    "SELECT * FROM audit_events ORDER BY seq ASC LIMIT ?", (limit,)
+                ).fetchall()
         finally:
             connection.close()
         return tuple(_row_to_audit(row) for row in rows)
@@ -5252,6 +5441,19 @@ class SqliteStore:
         finally:
             connection.close()
         return _row_to_audit(row) if row is not None else None
+
+    def audit_store_initialized(self) -> bool:
+        """Whether the DB exists and carries the append-only audit table (D7)."""
+        connection = self._connect_read_only()
+        if connection is None:
+            return False
+        try:
+            row = connection.execute(
+                "SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'audit_events'"
+            ).fetchone()
+        finally:
+            connection.close()
+        return row is not None
 
     def get_system_state(self, key: str) -> str | None:
         connection = self._connect_read_only()
@@ -5276,6 +5478,31 @@ class SqliteStore:
                 """,
                 (key, value, updated_at),
             )
+
+    def save_risk_caps(
+        self, *, value: str, updated_at: str, audit: AuditEventDraft
+    ) -> AuditEventRecord:
+        """Write the caps and their audit event in one unit of work (D4)."""
+        connection = self._connect()
+        try:
+            connection.execute("BEGIN IMMEDIATE")
+            connection.execute(
+                """
+                INSERT INTO system_state (key, value, updated_at) VALUES (?, ?, ?)
+                ON CONFLICT(key) DO UPDATE SET
+                    value = excluded.value,
+                    updated_at = excluded.updated_at
+                """,
+                ("risk_caps", value, updated_at),
+            )
+            record = self._insert_audit_event(connection, audit)
+            connection.commit()
+            return record
+        except BaseException:
+            connection.rollback()
+            raise
+        finally:
+            connection.close()
 
 
 def _row_to_llm_call(row: sqlite3.Row) -> LLMCallRecord:
@@ -5451,6 +5678,7 @@ def _row_to_trigger_event(row: sqlite3.Row) -> TriggerEventRecord:
 
 
 def _row_to_risk_verdict(row: sqlite3.Row) -> RiskVerdictRecord:
+    keys = row.keys()
     return RiskVerdictRecord(
         risk_verdict_id=row["risk_verdict_id"],
         trigger_id=row["trigger_id"],
@@ -5460,10 +5688,16 @@ def _row_to_risk_verdict(row: sqlite3.Row) -> RiskVerdictRecord:
         computed_at=row["computed_at"],
         expires_at=row["expires_at"],
         payload_json=row["payload_json"],
+        spread_bps=row["spread_bps"] if "spread_bps" in keys else None,
+        expected_slippage_bps=(
+            row["expected_slippage_bps"] if "expected_slippage_bps" in keys else None
+        ),
+        daily_loss_usd=row["daily_loss_usd"] if "daily_loss_usd" in keys else None,
     )
 
 
 def _row_to_order(row: sqlite3.Row) -> OrderRecord:
+    keys = row.keys()
     return OrderRecord(
         order_id=row["order_id"],
         client_order_id=row["client_order_id"],
@@ -5475,6 +5709,9 @@ def _row_to_order(row: sqlite3.Row) -> OrderRecord:
         created_at=row["created_at"],
         updated_at=row["updated_at"],
         payload_json=row["payload_json"],
+        trigger_id=row["trigger_id"] if "trigger_id" in keys else None,
+        decision_id=row["decision_id"] if "decision_id" in keys else None,
+        purpose=row["purpose"] if "purpose" in keys else "ENTRY",
     )
 
 
