@@ -37,6 +37,10 @@ The PRD's hard rule is enforced by four contracts plus the architecture:
 
 `GET /api/v1/reports/{id}` is a composition, not a fifth contract: `snapshot` is `market-snapshot.schema.json`, `metrics` is `orderflow-metrics.schema.json`, and `llm` reuses the persisted decision/provenance fields from `llm-decision.schema.json` behind a `configured` flag. A metrics-only report returns `llm = {configured: false, reason}` while the CALC report stays valid. The web report renders the LLM narrative as untrusted text and never renders raw prompts, provider keys, or HTML.
 
+### Opportunity list read model
+
+`GET /api/v1/opportunities?state=…` returns a read-only projection, not the full contract: each item carries `opportunity_id`, `symbol`, `side`, `state`, `confidence`, `zone {low, high}`, `entry_preference`, `trigger_conditions`, `expires_at`, `created_at`, `updated_at`, and `source`, plus the filtered `total`. A `counts` object gives the server-side COUNT per state (`OPEN`, `TRIGGERED`, `EXPIRED`, `INVALIDATED`) so the ledger's tab counts never depend on the fetched page. Rows render from this projection; they never fetch one full contract per row. The opportunity detail still reuses `opportunity.schema.json`; the ledger's stored provenance has no validation verdict, so the UI labels it "from ledger · not re-validated" rather than inventing one.
+
 ## Validation pipeline
 
 ```

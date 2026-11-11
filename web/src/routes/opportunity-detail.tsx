@@ -8,15 +8,16 @@ import {
   type OpportunityData,
   type OpportunityEnvelope,
 } from '../api/opportunities'
-import { confidenceBand, utcLabel, type LlmState } from '../api/reports'
+import { isAbortError } from '../api/abort'
+import { confidenceBand, utcLabel } from '../api/reports'
 import { DataQualityBadge } from '../components/data-quality'
-import { LlmBand } from '../components/llm-band'
+import { LlmBand, type LedgerLlmState } from '../components/llm-band'
 import { ProvenanceStamp } from '../components/provenance'
 import { useCompact } from '../hooks/use-compact'
 
 interface OpportunityDetailPageProps {
   opportunityId: string
-  fetchOpportunityFn?: (opportunityId: string) => Promise<OpportunityEnvelope>
+  fetchOpportunityFn?: (opportunityId: string, signal?: AbortSignal) => Promise<OpportunityEnvelope>
   isCompact?: boolean
 }
 
@@ -48,7 +49,7 @@ function ConditionTable({
 }) {
   return (
     // eslint-disable-next-line jsx-a11y/no-noninteractive-tabindex -- scrollable table
-    <div className="table-wrap" role="region" aria-label={`${tableLabel} table`} tabIndex={0}>
+    <div className="table-wrap" role="region" tabIndex={0}>
       <table className="data-table condition-table">
         <caption className="visually-hidden">{tableLabel}</caption>
         <thead>
@@ -108,19 +109,19 @@ function sourceReport(reportId: string) {
   )
 }
 
-function llmStateFromProvenance(opportunity: OpportunityData): LlmState {
+/**
+ * The ledger persists the LLM draft provenance, not a validation verdict.
+ * Build the ledger band from those stored fields only; never synthesize a
+ * `configured` flag, a `validation_status`, or a knowledge status.
+ */
+function ledgerLlmState(opportunity: OpportunityData): LedgerLlmState {
   const llm = opportunity.provenance.llm
   return {
-    configured: true,
     provider: llm.provider,
     model: llm.model,
     prompt_id: llm.prompt_id,
     prompt_version: llm.prompt_version,
-    knowledge: {
-      status: llm.knowledge_artifact_hash ? 'AVAILABLE' : 'ABSENT',
-      artifact_id: llm.knowledge_artifact_hash ?? null,
-    },
-    validation_status: 'VALID',
+    knowledge_hash: llm.knowledge_artifact_hash ?? null,
     confidence: opportunity.confidence,
     narrative: opportunity.thesis,
     cost: llm.cost,
@@ -137,11 +138,11 @@ export function OpportunityDetailPage({
   const compact = useCompact(isCompact)
 
   useEffect(() => {
-    let active = true
+    const controller = new AbortController()
     setLoad({ state: 'loading' })
-    fetchOpportunityFn(opportunityId)
+    fetchOpportunityFn(opportunityId, controller.signal)
       .then((envelope) => {
-        if (!active) {
+        if (controller.signal.aborted) {
           return
         }
         if (!envelope.data) {
@@ -151,15 +152,16 @@ export function OpportunityDetailPage({
         setLoad({ state: 'ready', opportunity: envelope.data })
       })
       .catch((error: unknown) => {
-        if (active) {
-          setLoad({
-            state: 'error',
-            message: error instanceof Error ? error.message : 'Unknown error',
-          })
+        if (controller.signal.aborted || isAbortError(error)) {
+          return
         }
+        setLoad({
+          state: 'error',
+          message: error instanceof Error ? error.message : 'Unknown error',
+        })
       })
     return () => {
-      active = false
+      controller.abort()
     }
   }, [opportunityId, fetchOpportunityFn])
 
@@ -190,7 +192,7 @@ export function OpportunityDetailPage({
   const directionClass = opportunity.side === 'SHORT' ? 'value-down' : 'value-up'
   const directionLabel =
     opportunity.side === 'SHORT' ? `▼ ${opportunity.side}` : `▲ ${opportunity.side}`
-  const llm = llmStateFromProvenance(opportunity)
+  const llm = ledgerLlmState(opportunity)
 
   return (
     <section className="system-page" aria-labelledby="opportunity-heading" data-readonly={compact}>
@@ -212,7 +214,10 @@ export function OpportunityDetailPage({
         <div className="report-stamps">
           <ProvenanceStamp kind="LLM" />
           <ProvenanceStamp kind="CALC" />
-          <DataQualityBadge status={opportunity.data_quality.status} />
+          <DataQualityBadge
+            status={opportunity.data_quality.status}
+            reasons={opportunity.data_quality.reasons}
+          />
         </div>
       </div>
 
@@ -305,15 +310,21 @@ export function OpportunityDetailPage({
         </div>
 
         <div className="stack-sm">
-          <LlmBand llm={llm} narrative={opportunity.thesis} title="LLM rationale (untrusted)" />
+          <LlmBand
+            mode="ledger"
+            ledger={llm}
+            narrative={opportunity.thesis}
+            title="LLM rationale (untrusted)"
+          />
 
           <section className="panel" aria-labelledby="timeline-heading">
             <div className="panel-head">
               <h2 id="timeline-heading">State timeline</h2>
             </div>
-            <ol className="timeline" aria-label="State timeline">
-              {opportunity.state_history.map((entry, index) => (
-                <li key={`${entry.at}-${entry.to_state}-${index}`}>
+            {/* eslint-disable-next-line jsx-a11y/no-redundant-roles -- styled list-style:none drops list semantics in Safari/VoiceOver */}
+            <ol className="timeline" role="list" aria-label="State timeline">
+              {opportunity.state_history.map((entry) => (
+                <li key={`${entry.at}-${entry.to_state}`}>
                   <span className="tl-time mono">{utcLabel(entry.at)} UTC</span>
                   <span className="tl-title">
                     {entry.from_state === null

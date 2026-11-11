@@ -56,7 +56,16 @@ logger = structlog.get_logger(__name__)
 _MUTATING_METHODS = frozenset({"POST", "PUT", "PATCH", "DELETE"})
 _COOKIE_PATHS = frozenset({"/health", "/ready", "/api/v1/status"})
 _SPA_ENTRY_PATHS = frozenset(
-    {"/", "/system", "/system/", "/watchlist", "/watchlist/search", "/scans", "/reports"}
+    {
+        "/",
+        "/system",
+        "/system/",
+        "/watchlist",
+        "/watchlist/search",
+        "/scans",
+        "/reports",
+        "/opportunities",
+    }
 )
 _LOOPBACK_HOSTS = frozenset({"127.0.0.1", "localhost", "::1"})
 _TEST_CLIENT_HOST = "testserver"
@@ -127,6 +136,7 @@ def _is_spa_entry(path: str) -> bool:
         or path.startswith("/watchlist/")
         or path.startswith("/scans/")
         or path.startswith("/reports/")
+        or path.startswith("/opportunities/")
     )
 
 

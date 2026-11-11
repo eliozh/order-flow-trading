@@ -18,6 +18,8 @@ from oft.application.opportunity_service import (
 
 router = APIRouter()
 
+_OPPORTUNITY_STATES = ("OPEN", "TRIGGERED", "EXPIRED", "INVALIDATED")
+
 
 @router.get("/api/v1/opportunities")
 def list_opportunities(
@@ -34,12 +36,15 @@ def list_opportunities(
     try:
         items = service.list(state=state, limit=limit, offset=offset)
         total = service.count(state=state)
+        # Per-state counts come from SQL, so tab counts never depend on the
+        # fetched page and cannot under-report above the page size.
+        counts = {name: service.count(state=name) for name in _OPPORTUNITY_STATES}
     except OpportunityContractError as exc:
         raise ApiError("DATA_UNAVAILABLE", str(exc)) from exc
     payloads = [opportunity_summary(item) for item in items]
     has_next = offset + len(payloads) < total
     return success_envelope(
-        {"items": payloads, "total": total},
+        {"items": payloads, "total": total, "counts": counts},
         request_id=new_request_id(),
         provenance="MIXED",
         data_quality="COMPLETE" if payloads else "MISSING",

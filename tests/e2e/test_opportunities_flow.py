@@ -92,8 +92,21 @@ def test_ledger_lists_filters_and_total_distinction(tmp_path: Path) -> None:
     assert summary["side"] in {"LONG", "SHORT"}
     assert summary["state"] == "OPEN"
     assert summary["source"]["report_id"] == report_id
+    # The list row is self-sufficient: no per-row detail GET is needed.
+    assert summary["zone"]["low"] and summary["zone"]["high"]
+    assert summary["entry_preference"] in {"LIMIT", "MARKET", "STOP"}
+    assert summary["trigger_conditions"]
+    assert summary["trigger_conditions"][0]["condition_id"]
+    # Counts are computed server-side per state, independent of the page/filter.
+    assert payload["counts"] == {
+        "OPEN": 1,
+        "TRIGGERED": 0,
+        "EXPIRED": 0,
+        "INVALIDATED": 0,
+    }
 
     assert opened.status_code == 200
+    assert opened.json()["data"]["counts"] == payload["counts"]
     assert [item["opportunity_id"] for item in opened.json()["data"]["items"]] == [opportunity_id]
 
     # The overall total stays 1 while the filter is empty, so the UI can tell
@@ -116,6 +129,24 @@ def test_empty_ledger_reports_zero_total_not_a_filter_miss(tmp_path: Path) -> No
     assert data["items"] == []
     # total == 0 is the "no scan has run yet" state, distinct from an empty filter.
     assert data["total"] == 0
+    assert data["counts"] == {"OPEN": 0, "TRIGGERED": 0, "EXPIRED": 0, "INVALIDATED": 0}
+
+
+def test_ledger_spa_entry_requires_a_session(tmp_path: Path) -> None:
+    """Direct navigation to /opportunities must prompt for `oft open`."""
+    harness = _harness(tmp_path)
+    try:
+        client = harness.client
+        client.cookies.clear()
+        prompt = client.get("/opportunities")
+        detail_prompt = client.get("/opportunities/OPP-1")
+    finally:
+        harness.client.close()
+
+    for response in (prompt, detail_prompt):
+        assert response.status_code == 401
+        assert "oft open" in response.text
+        assert harness.app.state.api_token not in response.text
 
 
 def test_opportunity_detail_carries_the_full_read_only_contract(tmp_path: Path) -> None:
@@ -189,14 +220,20 @@ def test_web_ledger_sources_are_read_only_and_label_unevaluable_conditions() -> 
 
     detail = (WEB_SRC / "routes" / "opportunity-detail.tsx").read_text(encoding="utf-8")
     ledger = (WEB_SRC / "routes" / "opportunities.tsx").read_text(encoding="utf-8")
+    llm_band = (WEB_SRC / "components" / "llm-band.tsx").read_text(encoding="utf-8")
     # Unevaluable conditions are labelled and never rendered as met.
     assert "UNAVAILABLE" in detail
     assert "evaluable" in detail
     assert "MISSING INPUT" in detail
     assert "never treated as met" in detail
-    # The state timeline is rendered from the stored history.
+    # The ledger band never fabricates a validation verdict from a hash.
+    assert "from ledger · not re-validated" in llm_band
+    assert "Knowledge hash" in llm_band
+    assert "validation_status: 'VALID'" not in detail
+    # The state timeline is rendered from the stored history with real list semantics.
     assert "state_history.map" in detail
     assert "State timeline" in detail
+    assert 'role="list"' in detail
     # A missing source report falls back to N/A with a reports link.
     assert "sourceReport" in detail
     assert 'href="/reports"' in detail
@@ -210,7 +247,9 @@ def test_web_ledger_sources_are_read_only_and_label_unevaluable_conditions() -> 
     assert "count--accent" in ledger
     assert "count--muted" in ledger
     assert "count--danger" in ledger
+    # Rows render from the list read model; the ledger never fetches details per row.
     assert "fetchOpportunity" in detail
+    assert "fetchOpportunity" not in ledger
     # 375px stays read-only on both ledger surfaces.
     assert "data-readonly={compact}" in detail
     assert "data-readonly={compact}" in ledger

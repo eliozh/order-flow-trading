@@ -46,7 +46,9 @@ export function resolveRoute(pathname: string): RouteMatch {
     scanId: scanMatch !== null ? decodeSegment(scanMatch[1]) : null,
     isReports: path === '/reports' || path.startsWith('/reports/'),
     reportId: reportMatch !== null ? decodeSegment(reportMatch[1]) : null,
-    isOpportunities: path === '/opportunities' || path.startsWith('/opportunities/'),
+    // The list or exactly one detail segment; a deeper path is not an
+    // opportunity route and must fall through to the not-found panel.
+    isOpportunities: path === '/opportunities' || opportunityMatch !== null,
     opportunityId: opportunityMatch !== null ? decodeSegment(opportunityMatch[1]) : null,
   }
 }

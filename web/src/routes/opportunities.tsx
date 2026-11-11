@@ -1,22 +1,22 @@
 import { useEffect, useState, type KeyboardEvent } from 'react'
 
+import { isAbortError } from '../api/abort'
 import {
   describeCondition,
   fetchOpportunities,
-  fetchOpportunity,
-  type OpportunityData,
   type OpportunityListEnvelope,
   type OpportunityState,
   type OpportunitySummary,
-  type OpportunityEnvelope,
 } from '../api/opportunities'
 import { confidenceBand, utcLabel } from '../api/reports'
 import { ProvenanceStamp } from '../components/provenance'
 import { useCompact } from '../hooks/use-compact'
 
 interface OpportunitiesPageProps {
-  fetchOpportunitiesFn?: () => Promise<OpportunityListEnvelope>
-  fetchOpportunityFn?: (opportunityId: string) => Promise<OpportunityEnvelope>
+  fetchOpportunitiesFn?: (
+    options: { state: OpportunityState; limit: number },
+    signal?: AbortSignal,
+  ) => Promise<OpportunityListEnvelope>
   isCompact?: boolean
 }
 
@@ -24,10 +24,14 @@ interface LedgerState {
   state: 'loading' | 'ready' | 'error'
   items: OpportunitySummary[]
   total: number
+  counts: Record<OpportunityState, number>
   message?: string
 }
 
 const STATE_ORDER: OpportunityState[] = ['OPEN', 'TRIGGERED', 'EXPIRED', 'INVALIDATED']
+
+/** One page of rows; the server reports `total` and per-state counts. */
+const PAGE_SIZE = 50
 
 const STATE_LABEL: Record<OpportunityState, string> = {
   OPEN: 'Open',
@@ -51,90 +55,74 @@ const COUNT_CLASS: Record<OpportunityState, string> = {
   INVALIDATED: 'count count--danger',
 }
 
-function sideLabel(side: string): string {
-  return side === 'SHORT' ? `▼ ${side}` : `▲ ${side}`
-}
-
-function sideClass(side: string): string {
-  return side === 'SHORT' ? 'value-down' : 'value-up'
-}
-
 function emptyCounts(): Record<OpportunityState, number> {
   return { OPEN: 0, TRIGGERED: 0, EXPIRED: 0, INVALIDATED: 0 }
 }
 
+function overallCount(counts: Record<OpportunityState, number>): number {
+  return STATE_ORDER.reduce((sum, state) => sum + counts[state], 0)
+}
+
 export function OpportunitiesPage({
   fetchOpportunitiesFn = fetchOpportunities,
-  fetchOpportunityFn = fetchOpportunity,
   isCompact,
 }: OpportunitiesPageProps) {
-  const [load, setLoad] = useState<LedgerState>({ state: 'loading', items: [], total: 0 })
-  const [details, setDetails] = useState<Record<string, OpportunityData>>({})
+  const [load, setLoad] = useState<LedgerState>({
+    state: 'loading',
+    items: [],
+    total: 0,
+    counts: emptyCounts(),
+  })
   const [filter, setFilter] = useState<OpportunityState>('OPEN')
   const compact = useCompact(isCompact)
 
   useEffect(() => {
-    let active = true
-    setLoad({ state: 'loading', items: [], total: 0 })
-    setDetails({})
-    fetchOpportunitiesFn()
+    const controller = new AbortController()
+    // Keep the previous counts while the next filter loads so the tabs stay
+    // mounted and focused.
+    setLoad((previous) => ({ ...previous, state: 'loading' }))
+    fetchOpportunitiesFn({ state: filter, limit: PAGE_SIZE }, controller.signal)
       .then((envelope) => {
-        if (!active) {
+        if (controller.signal.aborted) {
           return
         }
         const data = envelope.data
         if (!data) {
-          setLoad({
+          setLoad((previous) => ({
+            ...previous,
             state: 'error',
             items: [],
             total: 0,
             message: 'Opportunity response was empty.',
-          })
+          }))
           return
         }
-        setLoad({ state: 'ready', items: data.items, total: data.total })
-        void Promise.all(
-          data.items.map(async (item) => {
-            try {
-              const detail = await fetchOpportunityFn(item.opportunity_id)
-              return detail.data ? ([item.opportunity_id, detail.data] as const) : null
-            } catch {
-              return null
-            }
-          }),
-        ).then((rows) => {
-          if (!active) {
-            return
-          }
-          const next: Record<string, OpportunityData> = {}
-          for (const row of rows) {
-            if (row !== null) {
-              next[row[0]] = row[1]
-            }
-          }
-          setDetails(next)
+        setLoad({
+          state: 'ready',
+          items: data.items,
+          total: data.total,
+          counts: data.counts ?? emptyCounts(),
         })
       })
       .catch((error: unknown) => {
-        if (active) {
-          setLoad({
-            state: 'error',
-            items: [],
-            total: 0,
-            message: error instanceof Error ? error.message : 'Unknown error',
-          })
+        if (controller.signal.aborted || isAbortError(error)) {
+          return
         }
+        setLoad((previous) => ({
+          ...previous,
+          state: 'error',
+          items: [],
+          total: 0,
+          message: error instanceof Error ? error.message : 'Unknown error',
+        }))
       })
     return () => {
-      active = false
+      controller.abort()
     }
-  }, [fetchOpportunitiesFn, fetchOpportunityFn])
+  }, [fetchOpportunitiesFn, filter])
 
-  const counts = emptyCounts()
-  for (const item of load.items) {
-    counts[item.state] += 1
-  }
-  const filtered = load.items.filter((item) => item.state === filter)
+  const overall = overallCount(load.counts)
+  const filtered = load.items
   const filterLabel = STATE_LABEL[filter].toLowerCase()
 
   function selectState(state: OpportunityState): void {
@@ -161,6 +149,11 @@ export function OpportunitiesPage({
     setFilter(next)
     document.getElementById(`opp-tab-${next}`)?.focus()
   }
+
+  const loadingAnnouncement =
+    load.state === 'ready'
+      ? `${STATE_LABEL[filter]} filter: showing ${filtered.length} of ${load.total} opportunities.`
+      : ''
 
   return (
     <section
@@ -189,7 +182,7 @@ export function OpportunitiesPage({
         </p>
       )}
 
-      {load.state === 'loading' && (
+      {load.state === 'loading' && overall === 0 && (
         <p className="status-message" role="status">
           Loading opportunities…
         </p>
@@ -201,7 +194,7 @@ export function OpportunitiesPage({
         </p>
       )}
 
-      {load.state === 'ready' && load.total === 0 && (
+      {load.state === 'ready' && overall === 0 && (
         <section className="panel" role="status">
           <h2>No opportunities yet</h2>
           <p>
@@ -214,8 +207,12 @@ export function OpportunitiesPage({
         </section>
       )}
 
-      {load.state === 'ready' && load.total > 0 && (
+      {load.state !== 'error' && overall > 0 && (
         <>
+          <p className="visually-hidden" role="status" aria-live="polite">
+            {loadingAnnouncement}
+          </p>
+
           <div className="tabs" role="tablist" aria-label="Opportunity state">
             {STATE_ORDER.map((state, index) => (
               <button
@@ -224,13 +221,16 @@ export function OpportunitiesPage({
                 role="tab"
                 className="tab"
                 id={`opp-tab-${state}`}
-                aria-controls={`opp-panel-${state}`}
+                // Only the selected tab owns an existing panel; a reference from
+                // any other tab would dangle.
+                aria-controls={filter === state ? `opp-panel-${state}` : undefined}
                 aria-selected={filter === state}
                 tabIndex={filter === state ? 0 : -1}
                 onClick={() => selectState(state)}
                 onKeyDown={(event) => handleTabKey(event, index)}
               >
-                {STATE_LABEL[state]} <span className={COUNT_CLASS[state]}>{counts[state]}</span>
+                {STATE_LABEL[state]}{' '}
+                <span className={COUNT_CLASS[state]}>{load.counts[state]}</span>
               </button>
             ))}
           </div>
@@ -242,11 +242,15 @@ export function OpportunitiesPage({
             className="tabpanel"
             tabIndex={0}
           >
-            {filtered.length === 0 ? (
+            {load.state === 'loading' ? (
+              <p className="status-message" role="status">
+                Loading {filterLabel} opportunities…
+              </p>
+            ) : filtered.length === 0 ? (
               <section className="panel empty-panel" role="status">
                 <h2>No {filterLabel} opportunities</h2>
                 <p>
-                  There are {load.total} opportunities in other states; none in this filter. Switch
+                  There are {overall} opportunities in other states; none in this filter. Switch
                   states above to review them. {filterLabel} is empty, not missing.
                 </p>
               </section>
@@ -254,14 +258,13 @@ export function OpportunitiesPage({
               <section className="panel" aria-labelledby="ledger-table-heading">
                 <div className="panel-head">
                   <h2 id="ledger-table-heading">
-                    {STATE_LABEL[filter]} opportunities ({filtered.length})
+                    {STATE_LABEL[filter]} opportunities ({load.total})
                   </h2>
                   <span className="mono-muted">expiry in UTC</span>
                 </div>
                 <div
                   className="table-wrap"
                   role="region"
-                  aria-label="Opportunity ledger table"
                   // eslint-disable-next-line jsx-a11y/no-noninteractive-tabindex -- scrollable table
                   tabIndex={0}
                 >
@@ -283,8 +286,7 @@ export function OpportunitiesPage({
                     </thead>
                     <tbody>
                       {filtered.map((item) => {
-                        const detail = details[item.opportunity_id]
-                        const trigger = detail?.trigger_conditions[0]
+                        const trigger = item.trigger_conditions[0]
                         const band = confidenceBand(item.confidence)
                         return (
                           <tr key={item.opportunity_id}>
@@ -297,9 +299,12 @@ export function OpportunitiesPage({
                               </a>
                             </td>
                             <td className="mono">{item.symbol}</td>
-                            <td className={sideClass(item.side)}>{sideLabel(item.side)}</td>
+                            <td className={item.side === 'SHORT' ? 'value-down' : 'value-up'}>
+                              {item.side === 'SHORT' ? `▼ ${item.side}` : `▲ ${item.side}`}
+                            </td>
                             <td className="mono">
-                              {detail ? `${detail.zone.low} – ${detail.zone.high}` : '—'}
+                              {item.zone.low} – {item.zone.high}{' '}
+                              <span className="mono-muted">{item.entry_preference}</span>
                             </td>
                             <td className="calc-note">
                               {trigger ? describeCondition(trigger) : '—'}
@@ -322,6 +327,11 @@ export function OpportunitiesPage({
                   Triggered states are decided by code. A condition marked UNAVAILABLE is never
                   treated as met. No accept/reject action exists here.
                 </p>
+                {load.total > filtered.length && (
+                  <p className="panel-foot">
+                    Showing {filtered.length} of {load.total} {filterLabel} opportunities.
+                  </p>
+                )}
               </section>
             )}
           </div>

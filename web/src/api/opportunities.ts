@@ -4,6 +4,9 @@ export type { ApiError, ApiMeta }
 
 export type OpportunityState = 'OPEN' | 'TRIGGERED' | 'EXPIRED' | 'INVALIDATED'
 
+/** Position direction, constrained to the two values the ledger can hold. */
+export type Side = 'LONG' | 'SHORT'
+
 export interface OpportunityCondition {
   condition_id: string
   type: string
@@ -75,7 +78,7 @@ export interface OpportunityData {
   schema_version: string
   opportunity_id: string
   symbol: string
-  side: string
+  side: Side
   state: OpportunityState
   created_at: string
   updated_at: string
@@ -96,9 +99,12 @@ export interface OpportunityData {
 export interface OpportunitySummary {
   opportunity_id: string
   symbol: string
-  side: string
+  side: Side
   state: OpportunityState
   confidence: number
+  zone: { low: string; high: string }
+  entry_preference: string
+  trigger_conditions: OpportunityCondition[]
   expires_at: string
   created_at: string
   updated_at: string
@@ -107,7 +113,10 @@ export interface OpportunitySummary {
 
 export interface OpportunityListData {
   items: OpportunitySummary[]
+  /** The unfiltered total for the requested ``state`` filter. */
   total: number
+  /** Server-side COUNT per state; tab counts never come from the page. */
+  counts: Record<OpportunityState, number>
 }
 
 export interface OpportunityTimelineData {
@@ -148,10 +157,12 @@ export class OpportunityApiError extends Error {
 
 async function getEnvelope<T>(
   path: string,
+  signal?: AbortSignal,
 ): Promise<{ ok: boolean; data: T | null; error: ApiError | null; meta: ApiMeta }> {
   const response = await fetch(path, {
     headers: { Accept: 'application/json' },
     credentials: 'same-origin',
+    signal,
   })
   let envelope: { ok: boolean; data: T | null; error: ApiError | null; meta: ApiMeta } | null = null
   try {
@@ -175,27 +186,36 @@ async function getEnvelope<T>(
 
 export async function fetchOpportunities(
   options: { state?: OpportunityState; limit?: number; offset?: number } = {},
+  signal?: AbortSignal,
 ): Promise<OpportunityListEnvelope> {
   const params = new URLSearchParams()
-  params.set('limit', String(options.limit ?? 200))
+  params.set('limit', String(options.limit ?? 50))
   if (options.offset !== undefined) {
     params.set('offset', String(options.offset))
   }
   if (options.state) {
     params.set('state', options.state)
   }
-  return getEnvelope<OpportunityListData>(`/api/v1/opportunities?${params.toString()}`)
+  return getEnvelope<OpportunityListData>(`/api/v1/opportunities?${params.toString()}`, signal)
 }
 
-export async function fetchOpportunity(opportunityId: string): Promise<OpportunityEnvelope> {
-  return getEnvelope<OpportunityData>(`/api/v1/opportunities/${encodeURIComponent(opportunityId)}`)
+export async function fetchOpportunity(
+  opportunityId: string,
+  signal?: AbortSignal,
+): Promise<OpportunityEnvelope> {
+  return getEnvelope<OpportunityData>(
+    `/api/v1/opportunities/${encodeURIComponent(opportunityId)}`,
+    signal,
+  )
 }
 
 export async function fetchOpportunityTimeline(
   opportunityId: string,
+  signal?: AbortSignal,
 ): Promise<OpportunityTimelineEnvelope> {
   return getEnvelope<OpportunityTimelineData>(
     `/api/v1/opportunities/${encodeURIComponent(opportunityId)}/timeline`,
+    signal,
   )
 }
 

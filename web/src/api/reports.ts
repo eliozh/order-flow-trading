@@ -355,7 +355,10 @@ export class ReportApiError extends Error {
   }
 }
 
-async function getEnvelope<T>(path: string): Promise<{
+async function getEnvelope<T>(
+  path: string,
+  signal?: AbortSignal,
+): Promise<{
   ok: boolean
   data: T | null
   error: ApiError | null
@@ -364,6 +367,7 @@ async function getEnvelope<T>(path: string): Promise<{
   const response = await fetch(path, {
     headers: { Accept: 'application/json' },
     credentials: 'same-origin',
+    signal,
   })
   let envelope: { ok: boolean; data: T | null; error: ApiError | null; meta: ApiMeta } | null = null
   try {
@@ -385,8 +389,8 @@ async function getEnvelope<T>(path: string): Promise<{
   return envelope
 }
 
-export async function fetchReport(reportId: string): Promise<ReportEnvelope> {
-  return getEnvelope<ReportData>(`/api/v1/reports/${encodeURIComponent(reportId)}`)
+export async function fetchReport(reportId: string, signal?: AbortSignal): Promise<ReportEnvelope> {
+  return getEnvelope<ReportData>(`/api/v1/reports/${encodeURIComponent(reportId)}`, signal)
 }
 
 export async function fetchReports(options: { limit?: number; scanId?: string } = {}) {

@@ -12,6 +12,7 @@ import {
   type OpportunityData,
   type OpportunityEnvelope,
 } from '../api/opportunities'
+import { isAbortError } from '../api/abort'
 import { addDecimals } from '../api/decimal'
 import { Chart } from '../components/chart'
 import { DataQualityBadge } from '../components/data-quality'
@@ -22,8 +23,8 @@ import { useCompact } from '../hooks/use-compact'
 
 interface ReportDetailPageProps {
   reportId: string
-  fetchReportFn?: (reportId: string) => Promise<ReportEnvelope>
-  fetchOpportunityFn?: (opportunityId: string) => Promise<OpportunityEnvelope>
+  fetchReportFn?: (reportId: string, signal?: AbortSignal) => Promise<ReportEnvelope>
+  fetchOpportunityFn?: (opportunityId: string, signal?: AbortSignal) => Promise<OpportunityEnvelope>
   isCompact?: boolean
 }
 
@@ -59,12 +60,12 @@ export function ReportDetailPage({
   const compact = useCompact(isCompact)
 
   useEffect(() => {
-    let active = true
+    const controller = new AbortController()
     setLoad({ state: 'loading' })
     setCards([])
-    fetchReportFn(reportId)
+    fetchReportFn(reportId, controller.signal)
       .then((envelope) => {
-        if (!active) {
+        if (controller.signal.aborted) {
           return
         }
         if (!envelope.data) {
@@ -72,12 +73,13 @@ export function ReportDetailPage({
           return
         }
         setLoad({ state: 'ready', report: envelope.data })
-        const ids = envelope.data.llm.opportunity_ids ?? []
+        // Duplicate ids would render duplicate cards; keep the first.
+        const ids = Array.from(new Set(envelope.data.llm.opportunity_ids ?? []))
         setCards(ids.map((opportunityId) => ({ opportunity_id: opportunityId })))
         void Promise.all(
           ids.map(async (opportunityId): Promise<OpportunityCardState> => {
             try {
-              const detail = await fetchOpportunityFn(opportunityId)
+              const detail = await fetchOpportunityFn(opportunityId, controller.signal)
               return detail.data
                 ? { opportunity_id: opportunityId, opportunity: detail.data }
                 : { opportunity_id: opportunityId, error: 'Details unavailable.' }
@@ -86,21 +88,22 @@ export function ReportDetailPage({
             }
           }),
         ).then((loaded) => {
-          if (active) {
+          if (!controller.signal.aborted) {
             setCards(loaded)
           }
         })
       })
       .catch((error: unknown) => {
-        if (active) {
-          setLoad({
-            state: 'error',
-            message: error instanceof Error ? error.message : 'Unknown error',
-          })
+        if (controller.signal.aborted || isAbortError(error)) {
+          return
         }
+        setLoad({
+          state: 'error',
+          message: error instanceof Error ? error.message : 'Unknown error',
+        })
       })
     return () => {
-      active = false
+      controller.abort()
     }
   }, [reportId, fetchReportFn, fetchOpportunityFn])
 

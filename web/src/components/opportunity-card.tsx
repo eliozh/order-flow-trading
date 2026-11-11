@@ -1,4 +1,6 @@
-import type { OpportunityData, OpportunityState } from '../api/opportunities'
+import { useId } from 'react'
+
+import type { OpportunityData, OpportunityState, Side } from '../api/opportunities'
 import { confidenceBand } from '../api/reports'
 import { utcLabel } from '../api/reports'
 
@@ -14,17 +16,19 @@ const STATE_CHIP: Record<OpportunityState, string> = {
   INVALIDATED: 'chip chip--danger',
 }
 
-function sideClass(side: string): string {
+function sideClass(side: Side): string {
   return side === 'SHORT' ? 'value-down' : 'value-up'
 }
 
-function sideLabel(side: string): string {
+function sideLabel(side: Side): string {
   return side === 'SHORT' ? `▼ ${side}` : `▲ ${side}`
 }
 
 /** A read-only report card: it links to the ledger and offers no action. */
 export function OpportunityCard({ opportunityId, opportunity }: OpportunityCardProps) {
-  const headingId = `opp-card-${opportunityId}`
+  // A per-instance id keeps `aria-labelledby` valid even if the same
+  // opportunity id appears twice in the report's proposal list.
+  const headingId = useId()
   const band = opportunity ? confidenceBand(opportunity.confidence) : null
 
   return (
@@ -38,12 +42,21 @@ export function OpportunityCard({ opportunityId, opportunity }: OpportunityCardP
         <span className="oc-id mono">{opportunityId}</span>
       </div>
 
-      {opportunity ? (
-        <>
-          <h3 id={headingId}>
+      {/* The heading always exists, so `aria-labelledby` never dangles before
+          (or without) the detail fetch. */}
+      <h3 id={headingId}>
+        {opportunity ? (
+          <>
             {opportunity.symbol}{' '}
             <span className={sideClass(opportunity.side)}>{sideLabel(opportunity.side)}</span>
-          </h3>
+          </>
+        ) : (
+          <span className="mono">{opportunityId}</span>
+        )}
+      </h3>
+
+      {opportunity ? (
+        <>
           <div className={`zone-band zone-band--${opportunity.state.toLowerCase()} mono`}>
             {opportunity.zone.low} – {opportunity.zone.high}
           </div>

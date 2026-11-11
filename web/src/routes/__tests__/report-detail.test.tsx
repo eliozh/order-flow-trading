@@ -386,6 +386,16 @@ describe('ReportDetail CALC and LLM band order', () => {
     expect(screen.queryByText(/narrative measurement/i)).not.toBeInTheDocument()
     expect(screen.getAllByText(/not a measurement/i).length).toBeGreaterThan(0)
   })
+
+  it('keeps the unpriced marker when the cost amount is absent', async () => {
+    const unpriced: LlmState = {
+      ...VALID_LLM,
+      cost: { amount_usd: null, unpriced: true },
+    }
+    await renderReport(report(unpriced))
+
+    expect(screen.getByText('unpriced · N/A')).toBeInTheDocument()
+  })
 })
 
 describe('ReportDetail narrative failure states', () => {
@@ -449,11 +459,24 @@ describe('ReportDetail opportunity cards', () => {
       throw new Error('ledger unavailable')
     })
 
-    expect(await screen.findByRole('link', { name: /View OPP-9/i })).toHaveAttribute(
-      'href',
-      '/opportunities/OPP-9',
-    )
+    const link = await screen.findByRole('link', { name: /View OPP-9/i })
+    expect(link).toHaveAttribute('href', '/opportunities/OPP-9')
     expect(screen.getByText(/details unavailable/i)).toBeInTheDocument()
+    // The heading always exists, so `aria-labelledby` never points at nothing.
+    const card = link.closest('article')
+    if (!card) {
+      throw new Error('missing opportunity card')
+    }
+    expect(within(card).getByRole('heading', { name: 'OPP-9' })).toBeInTheDocument()
+  })
+
+  it('deduplicates a repeated opportunity id into one card', async () => {
+    const data = report(VALID_LLM)
+    data.llm.opportunity_ids = ['OPP-1', 'OPP-1']
+    await renderReport(data)
+
+    expect(await screen.findByRole('link', { name: /View OPP-1/i })).toBeInTheDocument()
+    expect(screen.getAllByRole('link', { name: /View OPP-1/i })).toHaveLength(1)
   })
 })
 

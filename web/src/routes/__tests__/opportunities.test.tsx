@@ -7,6 +7,7 @@ import type {
   OpportunityData,
   OpportunityEnvelope,
   OpportunityListEnvelope,
+  OpportunityState,
   OpportunitySummary,
 } from '../../api/opportunities'
 import { OpportunityDetailPage } from '../opportunity-detail'
@@ -109,6 +110,9 @@ function summary(item: OpportunityData): OpportunitySummary {
     side: item.side,
     state: item.state,
     confidence: item.confidence,
+    zone: item.zone,
+    entry_preference: item.entry_preference,
+    trigger_conditions: item.trigger_conditions,
     expires_at: item.expires_at,
     created_at: item.created_at,
     updated_at: item.updated_at,
@@ -116,8 +120,30 @@ function summary(item: OpportunityData): OpportunitySummary {
   }
 }
 
-function listEnvelope(items: OpportunityData[]): OpportunityListEnvelope {
-  return { ok: true, data: { items: items.map(summary), total: items.length }, error: null, meta }
+type Counts = Record<OpportunityState, number>
+
+function countsFor(items: OpportunityData[]): Counts {
+  const counts: Counts = { OPEN: 0, TRIGGERED: 0, EXPIRED: 0, INVALIDATED: 0 }
+  for (const item of items) {
+    counts[item.state] += 1
+  }
+  return counts
+}
+
+function listEnvelope(
+  items: OpportunityData[],
+  options: { total?: number; counts?: Counts } = {},
+): OpportunityListEnvelope {
+  return {
+    ok: true,
+    data: {
+      items: items.map(summary),
+      total: options.total ?? items.length,
+      counts: options.counts ?? countsFor(items),
+    },
+    error: null,
+    meta,
+  }
 }
 
 function detailEnvelope(item: OpportunityData): OpportunityEnvelope {
@@ -142,14 +168,27 @@ function detailById(items: OpportunityData[]) {
   }
 }
 
-async function renderLedger(items: OpportunityData[] = LEDGER) {
-  render(
-    <OpportunitiesPage
-      fetchOpportunitiesFn={async () => listEnvelope(items)}
-      fetchOpportunityFn={detailById(items)}
-    />,
-  )
+/** Emulate the server: the list filters by state and reports all-state counts. */
+function ledgerFetcher(all: OpportunityData[]) {
+  return async (options: {
+    state: OpportunityState
+    limit: number
+  }): Promise<OpportunityListEnvelope> => {
+    const filtered = all.filter((item) => item.state === options.state)
+    return listEnvelope(filtered.slice(0, options.limit), {
+      total: filtered.length,
+      counts: countsFor(all),
+    })
+  }
+}
+
+async function renderLedger(
+  all: OpportunityData[] = LEDGER,
+  fetchOpportunitiesFn = ledgerFetcher(all),
+) {
+  const view = render(<OpportunitiesPage fetchOpportunitiesFn={fetchOpportunitiesFn} />)
   await screen.findByRole('tab', { name: /Open/ })
+  return { ...view, fetchOpportunitiesFn }
 }
 
 describe('OpportunitiesPage filters and counts', () => {
@@ -173,7 +212,40 @@ describe('OpportunitiesPage filters and counts', () => {
     expect(await screen.findByRole('alert')).toHaveTextContent(/ledger down/)
   })
 
-  it('renders state counts with neutral, accent, muted, and danger classes', async () => {
+  it('does not surface an aborted request as an error', async () => {
+    render(
+      <OpportunitiesPage
+        fetchOpportunitiesFn={async () => {
+          const aborted = new Error('aborted')
+          aborted.name = 'AbortError'
+          throw aborted
+        }}
+      />,
+    )
+
+    expect(screen.queryByRole('alert')).not.toBeInTheDocument()
+    expect(screen.getByRole('status')).toHaveTextContent(/Loading opportunities/)
+  })
+
+  it('asks the server for the selected state with a 50-row page', async () => {
+    const fetchOpportunitiesFn = vi.fn(ledgerFetcher(LEDGER))
+    await renderLedger(LEDGER, fetchOpportunitiesFn)
+
+    expect(fetchOpportunitiesFn).toHaveBeenCalledWith(
+      { state: 'OPEN', limit: 50 },
+      expect.any(AbortSignal),
+    )
+
+    fireEvent.click(screen.getByRole('tab', { name: /Triggered/i }))
+
+    expect(await screen.findByRole('link', { name: 'OPP-TRIGGERED' })).toBeInTheDocument()
+    expect(fetchOpportunitiesFn).toHaveBeenLastCalledWith(
+      { state: 'TRIGGERED', limit: 50 },
+      expect.any(AbortSignal),
+    )
+  })
+
+  it('renders server counts with neutral, accent, muted, and danger classes', async () => {
     await renderLedger()
 
     const expected: Record<(typeof STATES)[number], string> = {
@@ -201,10 +273,11 @@ describe('OpportunitiesPage filters and counts', () => {
     expect(screen.queryByRole('link', { name: 'OPP-OPEN' })).not.toBeInTheDocument()
   })
 
-  it('shows enriched zone and trigger detail for each row', async () => {
+  it('renders zone, entry preference, and trigger from the list row alone', async () => {
     await renderLedger([LEDGER[0]])
 
     expect(await screen.findByText(/69000\.00 – 71000\.00/)).toBeInTheDocument()
+    expect(screen.getByText('MARKET')).toBeInTheDocument()
     expect(screen.getByText(/price touch zone/i)).toBeInTheDocument()
     expect(screen.getByRole('link', { name: 'OPP-OPEN' })).toHaveAttribute(
       'href',
@@ -212,12 +285,50 @@ describe('OpportunitiesPage filters and counts', () => {
     )
   })
 
+  it('announces the active filter and result count in a polite live region', async () => {
+    await renderLedger()
+
+    const live = screen.getByText(/Open filter: showing 1 of 1 opportunities/)
+    expect(live).toHaveAttribute('aria-live', 'polite')
+    expect(live).toHaveAttribute('role', 'status')
+
+    fireEvent.click(screen.getByRole('tab', { name: /Expired/i }))
+
+    expect(
+      await screen.findByText(/Expired filter: showing 1 of 1 opportunities/),
+    ).toBeInTheDocument()
+  })
+
+  it('points aria-controls at the panel only from the selected tab', async () => {
+    await renderLedger()
+
+    expect(screen.getByRole('tab', { name: /Open/i })).toHaveAttribute(
+      'aria-controls',
+      'opp-panel-OPEN',
+    )
+    for (const name of [/Triggered/i, /Expired/i, /Invalidated/i]) {
+      expect(screen.getByRole('tab', { name })).not.toHaveAttribute('aria-controls')
+    }
+  })
+
+  it('shows "showing N of M" when the page is truncated by the total', async () => {
+    const rows = [
+      opportunity({ opportunity_id: 'OPP-A' }),
+      opportunity({ opportunity_id: 'OPP-B', symbol: 'ETHUSDT' }),
+    ]
+    const fetchOpportunitiesFn = async (): Promise<OpportunityListEnvelope> =>
+      listEnvelope(rows, {
+        total: 7,
+        counts: { OPEN: 7, TRIGGERED: 0, EXPIRED: 0, INVALIDATED: 0 },
+      })
+    render(<OpportunitiesPage fetchOpportunitiesFn={fetchOpportunitiesFn} />)
+
+    expect(await screen.findByText(/Showing 2 of 7 open opportunities/)).toBeInTheDocument()
+  })
+
   it('distinguishes no-scan from an empty filter', async () => {
     const { unmount } = render(
-      <OpportunitiesPage
-        fetchOpportunitiesFn={async () => listEnvelope([])}
-        fetchOpportunityFn={detailById([])}
-      />,
+      <OpportunitiesPage fetchOpportunitiesFn={async () => listEnvelope([])} />,
     )
     expect(
       await screen.findByRole('heading', { name: /No opportunities yet/i }),
@@ -255,6 +366,32 @@ describe('OpportunityDetailPage', () => {
     const timeline = screen.getByRole('list', { name: /state timeline/i })
     expect(within(timeline).getByText(/CREATED/)).toBeInTheDocument()
     expect(within(timeline).getByText(/created from a validated LLM draft/)).toBeInTheDocument()
+  })
+
+  it('labels ledger provenance as not re-validated and never fabricates a VALID verdict', async () => {
+    const item = opportunity()
+    render(<OpportunityDetailPage opportunityId="OPP-1" fetchOpportunityFn={detailById([item])} />)
+    await screen.findByRole('heading', { name: 'OPP-1' })
+
+    const band = screen.getByRole('region', { name: /LLM rationale/i })
+    expect(within(band).getByText('from ledger · not re-validated')).toHaveClass('chip')
+    expect(within(band).getByText('Knowledge hash')).toBeInTheDocument()
+    expect(within(band).getByText('KNW-HASH-1')).toBeInTheDocument()
+    expect(within(band).queryByText('VALID')).not.toBeInTheDocument()
+    expect(within(band).queryByText('REPAIRED')).not.toBeInTheDocument()
+    expect(within(band).queryByText(/not a measurement/i)).toBeInTheDocument()
+  })
+
+  it('shows the data-quality reasons recorded on the opportunity', async () => {
+    render(
+      <OpportunityDetailPage
+        opportunityId="OPP-1"
+        fetchOpportunityFn={detailById([opportunity()])}
+      />,
+    )
+    await screen.findByRole('heading', { name: 'OPP-1' })
+
+    expect(screen.getByText(/1 quality reason recorded/i)).toBeInTheDocument()
   })
 
   it('labels an unevaluable condition UNAVAILABLE and never renders it as met', async () => {
@@ -364,12 +501,34 @@ describe('OpportunityDetailPage', () => {
     expect(container.querySelector('img')).toBeNull()
   })
 
-  it('does not fetch when unmounted before the request resolves', async () => {
-    const never = vi.fn(() => new Promise<OpportunityEnvelope>(() => undefined))
+  it('passes an abort signal and aborts it on unmount', async () => {
+    let captured: AbortSignal | undefined
+    const never = vi.fn((_id: string, signal?: AbortSignal) => {
+      captured = signal
+      return new Promise<OpportunityEnvelope>(() => undefined)
+    })
     const { unmount } = render(
       <OpportunityDetailPage opportunityId="OPP-1" fetchOpportunityFn={never} />,
     )
+    expect(never.mock.calls[0][0]).toBe('OPP-1')
+    expect(captured).toBeInstanceOf(AbortSignal)
     unmount()
-    expect(never).toHaveBeenCalledWith('OPP-1')
+    expect(captured?.aborted).toBe(true)
+  })
+
+  it('does not surface an aborted detail request as an error', async () => {
+    render(
+      <OpportunityDetailPage
+        opportunityId="OPP-1"
+        fetchOpportunityFn={async () => {
+          const aborted = new Error('aborted')
+          aborted.name = 'AbortError'
+          throw aborted
+        }}
+      />,
+    )
+
+    expect(screen.queryByRole('alert')).not.toBeInTheDocument()
+    expect(screen.getByRole('status')).toHaveTextContent(/Loading opportunity OPP-1/)
   })
 })

@@ -22,7 +22,11 @@ const meta = {
 
 const emptyEnvelope: OpportunityListEnvelope = {
   ok: true,
-  data: { items: [], total: 0 },
+  data: {
+    items: [],
+    total: 0,
+    counts: { OPEN: 0, TRIGGERED: 0, EXPIRED: 0, INVALIDATED: 0 },
+  },
   error: null,
   meta,
 }
@@ -44,15 +48,24 @@ describe('fetchOpportunities', () => {
     vi.unstubAllGlobals()
   })
 
-  it('lists the ledger with an explicit limit and no state filter by default', async () => {
+  it('lists the ledger with a bounded default page and no state filter', async () => {
     const fetchMock = stubFetch(emptyEnvelope)
 
     await fetchOpportunities()
 
     const url = String(fetchMock.mock.calls[0][0])
     expect(url).toContain('/api/v1/opportunities?')
-    expect(url).toContain('limit=200')
+    expect(url).toContain('limit=50')
     expect(url).not.toContain('state=')
+  })
+
+  it('threads the abort signal into fetch', async () => {
+    const fetchMock = stubFetch(emptyEnvelope)
+    const controller = new AbortController()
+
+    await fetchOpportunities({ state: 'OPEN', limit: 50 }, controller.signal)
+
+    expect(fetchMock.mock.calls[0][1]).toMatchObject({ signal: controller.signal })
   })
 
   it('encodes the state filter and offset', async () => {

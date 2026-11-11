@@ -51,4 +51,13 @@ describe('resolveRoute', () => {
     expect(route.isScans).toBe(false)
     expect(route.scanId).toBeNull()
   })
+
+  it('treats only the exact list path as the ledger list', () => {
+    expect(resolveRoute('/opportunities').isOpportunities).toBe(true)
+    // A stale or fabricated deeper path must render the not-found panel, not
+    // silently fall back to the list.
+    const deep = resolveRoute('/opportunities/OPP-1/extra')
+    expect(deep.isOpportunities).toBe(false)
+    expect(deep.opportunityId).toBeNull()
+  })
 })
