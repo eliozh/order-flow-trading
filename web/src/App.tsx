@@ -1,6 +1,8 @@
 import { StatusBar } from './components/status-bar'
 import { useStatusBar } from './hooks/use-status-bar'
 import { resolveRoute } from './routes/route-match'
+import { OpportunityDetailPage } from './routes/opportunity-detail'
+import { OpportunitiesPage } from './routes/opportunities'
 import { ReportDetailPage } from './routes/report-detail'
 import { ReportsPage } from './routes/reports'
 import { ScanDetailPage } from './routes/scan-detail'
@@ -32,10 +34,14 @@ export default function App() {
           <ScanDetailPage key={route.scanId} scanId={route.scanId} />
         ) : route.reportId !== null ? (
           <ReportDetailPage key={route.reportId} reportId={route.reportId} />
+        ) : route.opportunityId !== null ? (
+          <OpportunityDetailPage key={route.opportunityId} opportunityId={route.opportunityId} />
         ) : route.isScans ? (
           <ScansPage />
         ) : route.isReports ? (
           <ReportsPage />
+        ) : route.isOpportunities ? (
+          <OpportunitiesPage />
         ) : route.isWatchlist ? (
           <WatchlistPage />
         ) : route.isSystem ? (
@@ -44,8 +50,8 @@ export default function App() {
           <section className="system-page">
             <h1>Not found</h1>
             <p className="status-message">
-              Open <code>/watchlist</code>, <code>/scans</code>, <code>/reports</code>, or{' '}
-              <code>/system</code>.
+              Open <code>/watchlist</code>, <code>/scans</code>, <code>/reports</code>,{' '}
+              <code>/opportunities</code>, or <code>/system</code>.
             </p>
           </section>
         )}

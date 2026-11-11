@@ -627,12 +627,25 @@ def opportunity_payload(opportunity: Opportunity) -> dict[str, Any]:
 
 
 def opportunity_summary(opportunity: Opportunity) -> dict[str, Any]:
+    """List-row read model; carries the fields the ledger renders per row.
+
+    The list surface never fetches a full contract per row: zone, entry
+    preference, and trigger conditions are projected here instead.
+    """
     return {
         "opportunity_id": opportunity.opportunity_id,
         "symbol": opportunity.symbol,
         "side": opportunity.side,
         "state": opportunity.state.value,
         "confidence": opportunity.confidence,
+        "zone": {
+            "low": str(opportunity.zone_low),
+            "high": str(opportunity.zone_high),
+        },
+        "entry_preference": opportunity.entry_preference,
+        "trigger_conditions": [
+            condition.to_contract() for condition in opportunity.trigger_conditions
+        ],
         "expires_at": opportunity.expires_at,
         "created_at": opportunity.created_at,
         "updated_at": opportunity.updated_at,

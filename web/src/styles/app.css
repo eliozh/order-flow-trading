@@ -1107,3 +1107,329 @@ code {
 .panel-head {
   flex-wrap: wrap;
 }
+
+/* Slice 19: the LLM band and the read-only opportunity ledger. */
+.band--llm {
+  border-left: 2px solid var(--oft-accent);
+}
+
+.band-meta {
+  display: flex;
+  flex-wrap: wrap;
+  gap: var(--oft-space-2) var(--oft-space-6);
+  margin: 0 0 var(--oft-space-3);
+  padding: var(--oft-space-2) 0;
+  border-top: 1px solid var(--oft-border-subtle);
+  border-bottom: 1px solid var(--oft-border-subtle);
+}
+
+.band-meta > div {
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+  min-width: 96px;
+}
+
+.band-meta dt {
+  color: var(--oft-text-muted);
+  font-family: var(--oft-font-mono);
+  font-size: 9px;
+  letter-spacing: 0.12em;
+  text-transform: uppercase;
+}
+
+.band-meta dd {
+  margin: 0;
+  color: var(--oft-text-primary);
+  font-family: var(--oft-font-mono);
+  font-size: 11px;
+  overflow-wrap: anywhere;
+}
+
+.prose {
+  max-width: 78ch;
+  margin: 0 0 var(--oft-space-2);
+  color: var(--oft-text-primary);
+  font-size: 13px;
+  line-height: 1.6;
+  overflow-wrap: anywhere;
+}
+
+.band-note,
+.llm-empty {
+  margin: 0;
+  color: var(--oft-text-muted);
+  font-size: 11px;
+}
+
+.llm-reason {
+  margin: 0 0 var(--oft-space-2);
+  color: var(--oft-text-secondary);
+  font-size: 12px;
+  overflow-wrap: anywhere;
+}
+
+.llm-reason code {
+  color: var(--oft-status-danger);
+  overflow-wrap: anywhere;
+}
+
+.card-grid {
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(260px, 1fr));
+  gap: 1px;
+  padding: 1px;
+  background: var(--oft-border-subtle);
+}
+
+.opp-card {
+  display: flex;
+  flex-direction: column;
+  gap: var(--oft-space-2);
+  min-width: 0;
+  padding: var(--oft-space-4);
+  background: var(--oft-bg-panel);
+}
+
+.opp-card h3 {
+  margin: 0;
+  font-family: var(--oft-font-mono);
+  font-size: 14px;
+  letter-spacing: 0.06em;
+}
+
+.oc-top {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: var(--oft-space-2);
+}
+
+.oc-id {
+  color: var(--oft-text-muted);
+  font-size: 11px;
+  overflow-wrap: anywhere;
+}
+
+.zone-band {
+  padding: 6px 8px;
+  border: 1px solid var(--oft-border-default);
+  background: var(--oft-bg-raised);
+  color: var(--oft-text-primary);
+  font-size: 12px;
+}
+
+.zone-band--triggered {
+  border-color: var(--oft-accent);
+  background: var(--oft-accent-muted-surface);
+  color: var(--oft-accent);
+}
+
+.oc-meta {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: baseline;
+  gap: var(--oft-space-2);
+  color: var(--oft-text-muted);
+  font-family: var(--oft-font-mono);
+  font-size: 11px;
+}
+
+.oc-foot {
+  margin-top: auto;
+}
+
+.tabs {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 2px;
+  border-bottom: 1px solid var(--oft-border-subtle);
+}
+
+.tab {
+  display: inline-flex;
+  align-items: center;
+  gap: var(--oft-space-2);
+  padding: var(--oft-space-2) var(--oft-space-3);
+  border: 1px solid transparent;
+  border-bottom-color: transparent;
+  background: transparent;
+  color: var(--oft-text-secondary);
+  font: 12px var(--oft-font-mono);
+  letter-spacing: 0.04em;
+  cursor: pointer;
+}
+
+.tab:hover {
+  background: var(--oft-bg-hover);
+}
+
+.tab[aria-selected='true'] {
+  border-bottom-color: var(--oft-accent);
+  color: var(--oft-text-primary);
+  background: var(--oft-bg-raised);
+}
+
+.tab:focus-visible,
+.tabpanel:focus-visible {
+  outline: 2px solid var(--oft-accent);
+  outline-offset: 2px;
+}
+
+.count {
+  font-size: 11px;
+}
+
+.count--neutral {
+  color: var(--oft-text-secondary);
+}
+
+.count--accent {
+  color: var(--oft-accent);
+}
+
+.count--muted {
+  color: var(--oft-text-muted);
+}
+
+.count--danger {
+  color: var(--oft-status-danger);
+}
+
+.tabpanel {
+  display: flex;
+  flex-direction: column;
+  gap: var(--oft-space-4);
+  min-width: 0;
+}
+
+.detail-cols {
+  display: grid;
+  grid-template-columns: minmax(0, 1.6fr) minmax(0, 1fr);
+  align-items: start;
+  gap: var(--oft-space-4);
+}
+
+.stack-sm {
+  display: flex;
+  flex-direction: column;
+  gap: var(--oft-space-4);
+  min-width: 0;
+}
+
+.kv {
+  display: grid;
+  grid-template-columns: max-content minmax(0, 1fr);
+  gap: var(--oft-space-2) var(--oft-space-4);
+  margin: 0;
+  padding: var(--oft-space-4);
+}
+
+.kv dt {
+  color: var(--oft-text-muted);
+  font-family: var(--oft-font-mono);
+  font-size: 10px;
+  letter-spacing: 0.1em;
+  text-transform: uppercase;
+}
+
+.kv dd {
+  margin: 0;
+  font-size: 13px;
+  overflow-wrap: anywhere;
+}
+
+.timeline {
+  display: flex;
+  flex-direction: column;
+  gap: var(--oft-space-3);
+  margin: 0;
+  padding: var(--oft-space-4);
+  list-style: none;
+}
+
+.timeline li {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr);
+  gap: 2px;
+  padding-left: var(--oft-space-3);
+  border-left: 2px solid var(--oft-border-default);
+}
+
+.tl-time {
+  color: var(--oft-text-muted);
+  font-size: 11px;
+}
+
+.tl-title {
+  font-family: var(--oft-font-mono);
+  font-size: 12px;
+  letter-spacing: 0.08em;
+  text-transform: uppercase;
+}
+
+.tl-reason {
+  color: var(--oft-accent);
+  font-size: 10px;
+  letter-spacing: 0.08em;
+}
+
+.tl-desc {
+  color: var(--oft-text-secondary);
+  font-size: 12px;
+}
+
+.condition-table th[scope='row'] {
+  min-width: 180px;
+  text-align: left;
+  font-weight: 500;
+}
+
+.condition-note {
+  margin: 4px 0 0;
+  color: var(--oft-text-muted);
+  font-size: 11px;
+}
+
+.empty-panel {
+  padding: var(--oft-space-6);
+}
+
+.ledger-banner {
+  margin: 0;
+  padding: var(--oft-space-3) var(--oft-space-4);
+  border: 1px solid var(--oft-border-default);
+  border-left: 2px solid var(--oft-accent);
+  background: var(--oft-bg-panel);
+  color: var(--oft-text-secondary);
+  font-size: 12px;
+}
+
+@media (max-width: 768px) {
+  .detail-cols {
+    grid-template-columns: minmax(0, 1fr);
+  }
+
+  .kv {
+    grid-template-columns: minmax(0, 1fr);
+    gap: var(--oft-space-1);
+  }
+
+  .kv dd {
+    margin-bottom: var(--oft-space-2);
+  }
+
+  .tab {
+    min-height: 44px;
+  }
+}
+
+@media (max-width: 480px) {
+  .band-meta {
+    gap: var(--oft-space-2);
+  }
+
+  .card-grid {
+    grid-template-columns: minmax(0, 1fr);
+  }
+}

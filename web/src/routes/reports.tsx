@@ -17,6 +17,20 @@ interface ReportsState {
   message?: string
 }
 
+/** The report's narrative stage, kept visually separate from the CALC report. */
+function NarrativeChip({ report }: { report: ReportSummary }) {
+  if (!report.llm.configured) {
+    return <span className="chip chip--warn">CALC only</span>
+  }
+  if (report.llm.validation_status === 'REJECTED' || report.llm_stage === 'FAILED') {
+    return <span className="chip chip--danger">REJECTED</span>
+  }
+  if (report.llm_stage === 'DONE') {
+    return <span className="chip chip--calc">LLM</span>
+  }
+  return <span className="chip">unvalidated</span>
+}
+
 export function ReportsPage({ fetchReportsFn = fetchReports, isCompact }: ReportsPageProps) {
   const [load, setLoad] = useState<ReportsState>({
     state: 'loading',
@@ -112,6 +126,7 @@ export function ReportsPage({ fetchReportsFn = fetchReports, isCompact }: Report
                   <th scope="col">Period</th>
                   <th scope="col">Generated</th>
                   <th scope="col">Quality</th>
+                  <th scope="col">Narrative</th>
                 </tr>
               </thead>
               <tbody>
@@ -130,6 +145,9 @@ export function ReportsPage({ fetchReportsFn = fetchReports, isCompact }: Report
                     <td className="mono">{report.generated_at}</td>
                     <td>
                       <DataQualityBadge status={report.data_quality} />
+                    </td>
+                    <td>
+                      <NarrativeChip report={report} />
                     </td>
                   </tr>
                 ))}
