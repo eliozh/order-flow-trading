@@ -3,12 +3,20 @@
 from __future__ import annotations
 
 import json
+import shutil
 from pathlib import Path
+from typing import Any
 
 import pytest
 from typer.testing import CliRunner
 
-from oft.replay.paper_loop import PaperLoopResult
+from oft.api.errors import ERROR_CATALOG
+from oft.replay.paper_loop import (
+    PaperFillSummary,
+    PaperLoopResult,
+    PaperOrderSummary,
+    PaperPositionSummary,
+)
 
 pytestmark = pytest.mark.replay
 
@@ -42,10 +50,15 @@ def test_the_cli_replays_recorded_output_as_json(
     data = envelope["data"]
     assert data["deterministic"] is True
     assert data["decision_id"]
-    assert data["order_id"]
-    assert data["fill_id"]
-    assert data["entry_price"]
+    assert data["order"]["order_id"]
+    assert data["fill"]["fill_id"]
+    assert data["fill"]["price"]
+    assert data["position"]["position_id"]
     assert Path(data["summary_path"]).is_file()
+    # The envelope meta mirrors the trigger snapshot's quality, not an empty
+    # top-level trigger field.
+    assert data["data_quality"] == "PARTIAL"
+    assert envelope["meta"]["data_quality"] == "PARTIAL"
 
 
 def test_the_cli_renders_a_human_summary() -> None:
@@ -57,18 +70,18 @@ def test_the_cli_renders_a_human_summary() -> None:
             trigger_id="TRG-1",
             decision_id="DEC-1",
             decision_validation="VALID",
-            order_id="ORD-1",
-            fill_id="FIL-1",
-            position_id="POS-1",
-            entry_price="70000.00",
-            fee="1.00",
-            position_size="0.01",
-            position_value="700.00",
+            data_quality="PARTIAL",
+            order=PaperOrderSummary(
+                order_id="ORD-1", status="FILLED", client_order_id="oft-paper-BTCUSDT-entry-1"
+            ),
+            fill=PaperFillSummary(fill_id="FIL-1", price="70000.00", fee="1.00", source="PAPER"),
+            position=PaperPositionSummary(position_id="POS-1", size="0.01", notional_usd="700.00"),
             summary_path="/tmp/summary.json",
         )
     )
 
     assert "deterministic=true" in rendered
+    assert "data_quality=PARTIAL" in rendered
     assert "DEC-1" in rendered
     assert "70000.00" in rendered
     assert "/tmp/summary.json" in rendered
@@ -97,9 +110,7 @@ def test_the_cli_fails_clearly_when_a_recording_is_missing(
     assert "recorded LLM output" in result.output
 
 
-def _invoke(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, extra: list[str] | None = None
-) -> object:
+def _invoke(tmp_path: Path, monkeypatch: pytest.MonkeyPatch, extra: list[str] | None = None) -> Any:
     from oft.cli.main import app as cli_app
 
     monkeypatch.setenv("OFT_ENV", "test")
@@ -115,6 +126,51 @@ def _invoke(
     return CliRunner().invoke(cli_app, [*args, *(extra or [])])
 
 
+def _error_envelope(result: Any) -> dict[str, Any]:
+    output = result.output
+    return json.loads(output[output.index("{") :])
+
+
+def test_the_cli_emits_a_catalog_code_when_live_is_refused(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    result = _invoke(tmp_path, monkeypatch, ["--environment", "live", "--json"])
+
+    envelope = _error_envelope(result)
+    assert result.exit_code == 2
+    assert envelope["error"]["code"] == "LIVE_DISABLED"
+    assert envelope["error"]["code"] in ERROR_CATALOG
+
+
+def test_the_cli_emits_a_catalog_code_for_a_missing_recording(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    result = _invoke(tmp_path, monkeypatch, ["--json"])
+
+    envelope = _error_envelope(result)
+    assert envelope["error"]["code"] == "DATA_UNAVAILABLE"
+    assert "recorded LLM output" in str(envelope["error"]["message"])
+
+
+def test_the_cli_reports_a_tampered_recording_as_invalid_not_missing(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, replay_recordings: Path
+) -> None:
+    recordings = tmp_path / "recordings"
+    shutil.copytree(replay_recordings, recordings)
+    analysis = sorted((recordings / "ANALYSIS").glob("*.json"))[0]
+    payload = json.loads(analysis.read_text(encoding="utf-8"))
+    payload["raw_text"] = payload["raw_text"] + "tampered"
+    analysis.write_text(json.dumps(payload), encoding="utf-8")
+
+    result = _invoke(tmp_path, monkeypatch, ["--json"])
+
+    envelope = _error_envelope(result)
+    message = str(envelope["error"]["message"])
+    assert envelope["error"]["code"] == "VALIDATION_FAILED"
+    assert "tampered" in message.lower()
+    assert "record one" not in message.lower()
+
+
 def _fake_result(tmp_path: Path) -> PaperLoopResult:
     summary = tmp_path / "summary.json"
     summary.write_text("{}", encoding="utf-8")
@@ -123,13 +179,12 @@ def _fake_result(tmp_path: Path) -> PaperLoopResult:
         trigger_id="TRG-1",
         decision_id="DEC-1",
         decision_validation="VALID",
-        order_id="ORD-1",
-        fill_id="FIL-1",
-        position_id="POS-1",
-        entry_price="70000.00",
-        fee="1.00",
-        position_size="0.01",
-        position_value="700.00",
+        data_quality="PARTIAL",
+        order=PaperOrderSummary(
+            order_id="ORD-1", status="FILLED", client_order_id="oft-paper-BTCUSDT-entry-1"
+        ),
+        fill=PaperFillSummary(fill_id="FIL-1", price="70000.00", fee="1.00", source="PAPER"),
+        position=PaperPositionSummary(position_id="POS-1", size="0.01", notional_usd="700.00"),
         summary_path=str(summary),
     )
 
@@ -186,6 +241,18 @@ def test_the_cli_rejects_a_bad_or_naive_now(
     assert "ISO-8601" in bad.output
     assert naive.exit_code != 0
     assert "timezone-aware" in naive.output
+
+
+def test_an_unmapped_replay_error_code_fails_loudly() -> None:
+    from oft.cli.commands.replay import _catalog_code
+    from oft.replay.harness import ReplayError
+
+    assert _catalog_code("LLM_RECORDING_MISSING") == "DATA_UNAVAILABLE"
+    assert _catalog_code("LLM_RECORDING_INVALID") == "VALIDATION_FAILED"
+    assert _catalog_code("ORDER_REJECTED") == "ORDER_REJECTED"
+
+    with pytest.raises(ReplayError, match="no ERROR_CATALOG mapping"):
+        _catalog_code("A_FUTURE_CODE_WITH_NO_ENTRY")
 
 
 def test_the_cli_requires_an_archive_fixture_directory(

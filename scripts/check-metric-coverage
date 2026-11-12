@@ -34,9 +34,8 @@ TARGETS = (
 DEFAULT_DATA_FILE = ".coverage"
 
 
-def _matches(path: str, target_parts: tuple[str, ...]) -> bool:
-    path_parts = Path(path).parts
-    return path_parts[-len(target_parts) :] == target_parts
+def _matches(path: Path, target_parts: tuple[str, ...]) -> bool:
+    return path.parts[-len(target_parts) :] == target_parts
 
 
 def main(argv: list[str]) -> int:

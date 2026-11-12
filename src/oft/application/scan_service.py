@@ -821,6 +821,9 @@ class ScanService:
                     "provider": provider_name,
                     "validation_status": "REJECTED",
                     "reason": f"{prefix}: {exc}",
+                    # Additive: replay branches on the typed code instead of
+                    # sniffing the English reason string.
+                    "error_code": error_code,
                     "opportunity_ids": [],
                 },
                 None,

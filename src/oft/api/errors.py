@@ -134,6 +134,7 @@ ERROR_CATALOG: dict[str, ErrorSpec] = {
         422, "LLM", False, "The model output was truncated (incomplete status)."
     ),
     "LLM_REFUSED": ErrorSpec(422, "LLM", False, "The model refused the request."),
+    "LIVE_DISABLED": ErrorSpec(403, "RISK", False, "Live trading is not armed."),
     "PROMPT_VALIDATION_FAILED": ErrorSpec(
         422,
         "LLM",

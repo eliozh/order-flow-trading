@@ -144,6 +144,93 @@ def test_a_path_like_input_hash_is_rejected(tmp_path: Path) -> None:
         RecordedLLMSource(recordings_dir=tmp_path).complete(_request(input_hash="../escape"))
 
 
+def _write_recording(root: Path, payload: object) -> Path:
+    directory = root / "ENTRY_RECHECK"
+    directory.mkdir(parents=True, exist_ok=True)
+    path = directory / f"{INPUT_HASH}.json"
+    path.write_text(json.dumps(payload), encoding="utf-8")
+    return path
+
+
+@pytest.mark.parametrize(
+    "payload",
+    [
+        [],  # not a JSON object
+        {  # recorded for a different role
+            "role": "ANALYSIS",
+            "input_hash": INPUT_HASH,
+            "raw_text": "x",
+            "content_hash": hashlib.sha256(b"x").hexdigest(),
+        },
+        {  # recorded for a different input hash
+            "role": "ENTRY_RECHECK",
+            "input_hash": "b" * 64,
+            "raw_text": "x",
+            "content_hash": hashlib.sha256(b"x").hexdigest(),
+        },
+        {"role": "ENTRY_RECHECK", "input_hash": INPUT_HASH},  # no raw_text
+    ],
+)
+def test_a_malformed_recording_fails_closed(tmp_path: Path, payload: object) -> None:
+    _write_recording(tmp_path, payload)
+
+    with pytest.raises(LLMRecordingInvalid):
+        RecordedLLMSource(recordings_dir=tmp_path).complete(_request())
+
+
+def test_an_unreadable_recording_fails_closed(tmp_path: Path) -> None:
+    directory = tmp_path / "ENTRY_RECHECK"
+    directory.mkdir(parents=True)
+    (directory / f"{INPUT_HASH}.json").write_text("{not json", encoding="utf-8")
+
+    with pytest.raises(LLMRecordingInvalid, match="unreadable"):
+        RecordedLLMSource(recordings_dir=tmp_path).complete(_request())
+
+
+def test_a_symlinked_recording_file_outside_the_root_is_rejected(tmp_path: Path) -> None:
+    outside = tmp_path / "outside.json"
+    outside.write_text(
+        json.dumps(
+            {
+                "role": "ENTRY_RECHECK",
+                "input_hash": INPUT_HASH,
+                "raw_text": "x",
+                "content_hash": hashlib.sha256(b"x").hexdigest(),
+            }
+        ),
+        encoding="utf-8",
+    )
+    root = tmp_path / "root"
+    directory = root / "ENTRY_RECHECK"
+    directory.mkdir(parents=True)
+    (directory / f"{INPUT_HASH}.json").symlink_to(outside)
+
+    with pytest.raises(LLMRecordingInvalid, match="escaped"):
+        RecordedLLMSource(recordings_dir=root).complete(_request())
+
+
+def test_a_symlinked_role_directory_outside_the_root_is_rejected(tmp_path: Path) -> None:
+    outside_role = tmp_path / "outside-role"
+    outside_role.mkdir()
+    (outside_role / f"{INPUT_HASH}.json").write_text(
+        json.dumps(
+            {
+                "role": "ENTRY_RECHECK",
+                "input_hash": INPUT_HASH,
+                "raw_text": "x",
+                "content_hash": hashlib.sha256(b"x").hexdigest(),
+            }
+        ),
+        encoding="utf-8",
+    )
+    root = tmp_path / "root"
+    root.mkdir()
+    (root / "ENTRY_RECHECK").symlink_to(outside_role, target_is_directory=True)
+
+    with pytest.raises(LLMRecordingInvalid, match="escaped"):
+        RecordedLLMSource(recordings_dir=root).complete(_request())
+
+
 def test_the_recorded_source_is_explicitly_unpriced(tmp_path: Path) -> None:
     source = RecordedLLMSource(recordings_dir=tmp_path)
 

@@ -549,6 +549,34 @@ def test_stale_trigger_check_flags_old_pending_triggers() -> None:
     assert "1 waiting" in healthy.detail
 
 
+def test_stale_trigger_check_ignores_rechecked_triggers() -> None:
+    from types import SimpleNamespace
+
+    from oft.application.health import _stale_triggers_check
+
+    queried: list[str] = []
+
+    class FakeStore:
+        def list_trigger_events(
+            self, *, status: str, limit: int, offset: int
+        ) -> tuple[SimpleNamespace, ...]:
+            queried.append(status)
+            if status == "RECHECKED" and not offset:
+                # A finished re-check awaiting human action is not stale.
+                return (
+                    SimpleNamespace(
+                        trigger_id="TRG-OLD",
+                        triggered_at=utc_timestamp(NOW - timedelta(hours=1)),
+                    ),
+                )
+            return ()
+
+    check = _stale_triggers_check(FakeStore(), FixedClock(NOW), 60)  # type: ignore[arg-type]
+
+    assert check.status == "ok"
+    assert "RECHECKED" not in queried
+
+
 def test_doctor_flags_an_active_kill_switch(tmp_path: Path) -> None:
     from oft.application.kill_switch import KillSwitch
 

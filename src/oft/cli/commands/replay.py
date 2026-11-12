@@ -10,6 +10,7 @@ refused with a non-zero exit; a missing recording is a clear error unless
 from __future__ import annotations
 
 import json
+from dataclasses import asdict
 from datetime import UTC, date, datetime
 from pathlib import Path
 from typing import Annotated, Any, NoReturn
@@ -17,6 +18,7 @@ from typing import Annotated, Any, NoReturn
 import typer
 
 from oft.api.envelope import new_request_id, success_envelope
+from oft.api.errors import ERROR_CATALOG
 from oft.application.entry_service import EntryRejected
 from oft.cli.commands.doctor import emit_error
 from oft.config import ConfigError, load_settings
@@ -26,12 +28,13 @@ from oft.replay.harness import (
     ReplayLivePathError,
     ReplayNonDeterministicError,
 )
-from oft.replay.llm_source import LLMRecordingError
+from oft.replay.llm_source import LLMRecordingError, LLMRecordingInvalid
 from oft.replay.paper_loop import (
     DEFAULT_REPLAY_NOW,
     PaperLoopConfig,
     PaperLoopReplay,
     PaperLoopResult,
+    ReplayRecordingError,
     validate_run_id,
 )
 
@@ -41,6 +44,31 @@ replay_app = typer.Typer(
 )
 
 _EXIT_FAILED = 2
+
+# Recording failures have no dedicated catalog code yet. Map them to the
+# closest existing code so JSON consumers never see a misleading 500
+# ``INTERNAL_ERROR``; every code is asserted against the catalog before emit.
+_RECORDING_ERROR_CODES: dict[str, str] = {
+    "LLM_RECORDING_MISSING": "DATA_UNAVAILABLE",
+    "LLM_RECORDING_INVALID": "VALIDATION_FAILED",
+}
+
+
+def _catalog_code(code: str) -> str:
+    """Map the two recording codes; refuse to relabel anything else.
+
+    Only the recording failures have an explicit mapping. A non-recording code
+    must already be a real ``ERROR_CATALOG`` entry; silently rewriting an
+    unknown code to ``VALIDATION_FAILED`` would hide a programming error (and
+    make the membership assert in ``_fail`` meaningless for that path).
+    """
+    resolved = _RECORDING_ERROR_CODES.get(code, code)
+    if resolved not in ERROR_CATALOG:
+        raise ReplayError(
+            f"replay error code {code!r} has no ERROR_CATALOG mapping; "
+            "add one instead of relabeling it"
+        )
+    return resolved
 
 
 def _parse_date(value: str) -> date:
@@ -61,6 +89,7 @@ def _parse_datetime(value: str) -> datetime:
 
 
 def _fail(message: str, *, json_output: bool, code: str = "VALIDATION_FAILED") -> NoReturn:
+    assert code in ERROR_CATALOG, f"unknown error code for replay: {code}"
     if json_output:
         emit_error(code, message, json_output=True)
     else:
@@ -69,33 +98,20 @@ def _fail(message: str, *, json_output: bool, code: str = "VALIDATION_FAILED") -
 
 
 def _result_payload(result: PaperLoopResult) -> dict[str, Any]:
-    return {
-        "run_id": result.run_id,
-        "trigger_id": result.trigger_id,
-        "decision_id": result.decision_id,
-        "decision_validation": result.decision_validation,
-        "order_id": result.order_id,
-        "fill_id": result.fill_id,
-        "position_id": result.position_id,
-        "entry_price": result.entry_price,
-        "fee": result.fee,
-        "position_size": result.position_size,
-        "position_value": result.position_value,
-        "summary_path": result.summary_path,
-        "deterministic": result.deterministic,
-    }
+    return asdict(result)
 
 
 def _render(result: PaperLoopResult) -> str:
     return "\n".join(
         (
-            f"replay {result.run_id} · deterministic={str(result.deterministic).lower()}",
+            f"replay {result.run_id} · deterministic={str(result.deterministic).lower()} "
+            f"· data_quality={result.data_quality}",
             f"decision  {result.decision_id} ({result.decision_validation})",
             f"trigger   {result.trigger_id}",
-            f"order     {result.order_id}",
-            f"fill      {result.fill_id} @ {result.entry_price} fee {result.fee}",
-            f"position  {result.position_id} size {result.position_size} "
-            f"notional {result.position_value}",
+            f"order     {result.order.order_id} ({result.order.status})",
+            f"fill      {result.fill.fill_id} @ {result.fill.price} fee {result.fill.fee}",
+            f"position  {result.position.position_id} size {result.position.size} "
+            f"notional {result.position.notional_usd}",
             f"summary   {result.summary_path}",
         )
     )
@@ -188,10 +204,14 @@ def replay_run(
         result = PaperLoopReplay(data_dir=settings.data_dir, config=config).run()
     except ReplayLivePathError as exc:
         _fail(str(exc), json_output=json_output, code="LIVE_DISABLED")
+    except ReplayRecordingError as exc:
+        _fail(str(exc), json_output=json_output, code=_catalog_code(exc.code))
     except LLMRecordingError as exc:
-        _fail(exc.message, json_output=json_output, code="LLM_PROVIDER_NOT_CONFIGURED")
+        _fail(exc.message, json_output=json_output, code=_catalog_code(exc.code))
+    except LLMRecordingInvalid as exc:
+        _fail(exc.message, json_output=json_output, code=_catalog_code(exc.code))
     except EntryRejected as exc:
-        _fail(exc.message, json_output=json_output, code=exc.code)
+        _fail(exc.message, json_output=json_output, code=_catalog_code(exc.code))
     except ReplayNonDeterministicError as exc:
         _fail(str(exc), json_output=json_output, code="VALIDATION_FAILED")
     except ReplayError as exc:
@@ -209,7 +229,7 @@ def replay_run(
                     request_id=new_request_id(),
                     generated_at=utc_timestamp(resolved_now),
                     provenance="CALC",
-                    data_quality="COMPLETE",
+                    data_quality=result.data_quality,
                 ),
                 indent=2,
             )

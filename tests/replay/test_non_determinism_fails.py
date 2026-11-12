@@ -2,12 +2,14 @@
 
 from __future__ import annotations
 
+import shutil
 from dataclasses import replace
 from datetime import date
 from pathlib import Path
 
 import pytest
 
+from oft.application.entry_service import EntryRejected
 from oft.replay.harness import (
     ReplayError,
     ReplayNonDeterministicError,
@@ -36,8 +38,15 @@ def _config(recordings: Path, *, run_id: str = "paper-loop") -> PaperLoopConfig:
     )
 
 
+@pytest.mark.parametrize(
+    "field",
+    ["fill", "trigger", "order", "position", "account", "risk_verdict"],
+)
 def test_a_non_deterministic_paper_loop_fails_loudly(
-    tmp_path: Path, replay_recordings: Path, monkeypatch: pytest.MonkeyPatch
+    tmp_path: Path,
+    replay_recordings: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    field: str,
 ) -> None:
     calls = {"count": 0}
     original = PaperLoopReplay._run_once
@@ -46,8 +55,9 @@ def test_a_non_deterministic_paper_loop_fails_loudly(
         outcome = original(self, attempt)
         calls["count"] += 1
         if calls["count"] == 2:
-            assert outcome.fill is not None
-            return replace(outcome, fill={**outcome.fill, "price": "1.00"})
+            value = getattr(outcome, field)
+            assert isinstance(value, dict)
+            return replace(outcome, **{field: {**value, "mutated": True}})
         return outcome
 
     monkeypatch.setattr(PaperLoopReplay, "_run_once", flaky)
@@ -61,12 +71,32 @@ def test_a_non_deterministic_paper_loop_fails_loudly(
     assert not summary.exists()
 
 
-def test_no_recorded_output_fails_the_loop(tmp_path: Path) -> None:
+def test_no_recorded_analysis_output_fails_the_loop(tmp_path: Path) -> None:
     with pytest.raises(ReplayError, match="no recorded LLM output"):
         PaperLoopReplay(
             data_dir=tmp_path / "data",
             config=_config(tmp_path / "empty-recordings"),
         ).run()
+
+
+def test_a_missing_entry_recheck_recording_fails_loudly(
+    tmp_path: Path, replay_recordings: Path
+) -> None:
+    recordings = tmp_path / "recordings"
+    shutil.copytree(replay_recordings, recordings)
+    role_dir = recordings / "ENTRY_RECHECK"
+    assert role_dir.is_dir()
+    for path in role_dir.glob("*.json"):
+        path.unlink()
+
+    with pytest.raises(EntryRejected) as raised:
+        PaperLoopReplay(
+            data_dir=tmp_path / "data",
+            config=_config(recordings, run_id="missing-entry"),
+        ).run()
+
+    assert raised.value.code == "LLM_RECORDING_MISSING"
+    assert "recorded LLM output" in raised.value.message
 
 
 @pytest.mark.parametrize("run_id", [".", "..", "---", "a/b", "../escape"])

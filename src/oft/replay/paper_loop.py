@@ -19,14 +19,17 @@ Safety rules:
 
 from __future__ import annotations
 
+import hashlib
 import json
 import re
-from dataclasses import dataclass
+from collections.abc import Mapping
+from dataclasses import asdict, dataclass
 from dataclasses import replace as replace_dataclass
 from datetime import UTC, date, datetime
 from pathlib import Path
-from typing import TYPE_CHECKING, Any, NoReturn
+from typing import TYPE_CHECKING, Any, Literal, NoReturn
 
+from oft.domain.trigger import CONTRACT_DATA_QUALITIES
 from oft.replay.harness import (
     REPLAY_NAMESPACE,
     ReplayError,
@@ -40,6 +43,7 @@ if TYPE_CHECKING:
     from oft.bootstrap import AppContainer
     from oft.config import Settings
     from oft.ports.llm import LLMPort
+    from oft.ports.store import DecisionRecord
 
 PAPER_LOOP_NAMESPACE = "paper-loop"
 DEFAULT_REPLAY_ENVIRONMENT = "PAPER"
@@ -53,6 +57,89 @@ _RUN_ID_RULE = (
 )
 _ATTEMPT_1 = "attempt-1"
 _ATTEMPT_2 = "attempt-2"
+
+# Every setting that can change a fill, fee, account balance, or risk verdict is
+# pinned here. ``Settings`` is a ``BaseSettings`` model, so an ambient
+# ``OFT_PAPER_*``/``OFT_RISK_*`` value would otherwise leak into a replay on a
+# different machine and surface only as a generic non-determinism error.
+_PINNED_OUTCOME_SETTINGS: dict[str, Any] = {
+    "paper_initial_balance": "10000.00",
+    "paper_slippage_bps": "2",
+    "paper_taker_fee_bps": "5",
+    "risk_per_trade_pct": 0.8,
+    "risk_max_concurrent_positions": 3,
+    "risk_daily_loss_pct": 3.0,
+    "risk_max_leverage": 5.0,
+    "risk_max_notional_pct": 20.0,
+    "risk_max_slippage_bps": 25.0,
+    "risk_max_spread_bps": 15.0,
+    "risk_stale_mark_seconds": 60,
+}
+
+
+def _pinned_fixture_paths() -> dict[str, Path]:
+    """The committed fixtures that seed sizing/risk and data-quality outcomes.
+
+    The exchange-info fixture seeds the symbol registry (tick/step/min-notional
+    drive entry sizing and the risk gate); the klines fixture changes the
+    cross-check ``quality_reasons`` and therefore ``data_quality``. Pinning them
+    explicitly keeps an ambient ``OFT_*_FIXTURE`` value from changing a replay.
+    """
+    from oft.config import (
+        DEFAULT_EXCHANGE_INFO_FIXTURE,
+        DEFAULT_FIXTURES_DIR,
+        DEFAULT_KLINES_FIXTURE,
+    )
+
+    return {
+        "fixtures_dir": DEFAULT_FIXTURES_DIR,
+        "klines_fixture": DEFAULT_KLINES_FIXTURE,
+        "exchange_info_fixture": DEFAULT_EXCHANGE_INFO_FIXTURE,
+    }
+
+
+def _fixture_content_digest(path: Path) -> str:
+    """Hash fixture *contents*, so identical fixtures share a digest across checkouts.
+
+    Absolute resolved paths differ between two clones even when every fixture
+    byte is identical; hashing the file names (relative to the fixture root) and
+    their bytes keeps ``settings_digest`` checkout-independent. A missing path
+    hashes the stable ``missing`` marker instead of raising while writing a
+    summary (the missing fixture would already have failed the replay earlier).
+    """
+    resolved = Path(path).expanduser()
+    try:
+        if resolved.is_dir():
+            digest = hashlib.sha256()
+            for file_path in sorted(item for item in resolved.rglob("*") if item.is_file()):
+                relative = file_path.relative_to(resolved).as_posix()
+                digest.update(relative.encode("utf-8") + b"\0")
+                digest.update(file_path.read_bytes())
+                digest.update(b"\0")
+            return digest.hexdigest()
+        if resolved.is_file():
+            return hashlib.sha256(resolved.read_bytes()).hexdigest()
+    except OSError as exc:
+        raise ReplayError(f"cannot read replay fixture {resolved}: {exc}") from exc
+    return "missing"
+
+
+class ReplayRecordingError(ReplayError):
+    """A recorded LLM output is missing or unusable; replay fails closed."""
+
+    code = "VALIDATION_FAILED"
+
+
+class ReplayRecordingMissingError(ReplayRecordingError):
+    """No recording exists for a request; replay never invents one."""
+
+    code = "DATA_UNAVAILABLE"
+
+
+class ReplayRecordingInvalidError(ReplayRecordingError):
+    """A recording exists but is unreadable, tampered, or for another request."""
+
+    code = "VALIDATION_FAILED"
 
 
 def validate_run_id(run_id: str) -> str:
@@ -104,8 +191,8 @@ class PaperLoopConfig:
         validate_run_id(self.run_id)
         if self.recordings_dir is None:
             raise ReplayError(
-                "recordings_dir is required; a replay never invents an LLM output. "
-                "Capture one with --capture or --live-llm first."
+                "recordings_dir is required; pass --recordings-dir first, then populate it "
+                "with --capture (offline stub) or --live-llm (explicit provider)."
             )
 
 
@@ -131,22 +218,65 @@ class PaperLoopOutcome:
 
 
 @dataclass(frozen=True)
+class PaperOrderSummary:
+    """A paper order the replay produced; the id is required and non-empty."""
+
+    order_id: str
+    status: str
+    client_order_id: str
+
+    def __post_init__(self) -> None:
+        if not self.order_id.strip():
+            raise ReplayError("paper order is missing a non-empty order_id")
+
+
+@dataclass(frozen=True)
+class PaperFillSummary:
+    """A paper fill the replay produced; the id is required and non-empty."""
+
+    fill_id: str
+    price: str
+    fee: str
+    source: str
+
+    def __post_init__(self) -> None:
+        if not self.fill_id.strip():
+            raise ReplayError("paper fill is missing a non-empty fill_id")
+
+
+@dataclass(frozen=True)
+class PaperPositionSummary:
+    """A paper position the replay produced; the id is required and non-empty."""
+
+    position_id: str
+    size: str
+    notional_usd: str
+
+    def __post_init__(self) -> None:
+        if not self.position_id.strip():
+            raise ReplayError("paper position is missing a non-empty position_id")
+
+
+@dataclass(frozen=True)
 class PaperLoopResult:
-    """The identity of one verified deterministic paper-loop replay."""
+    """The identity of one verified deterministic paper-loop replay.
+
+    The order, fill, and position are value objects with required ids, so an
+    impossible "order without an order id" state cannot be represented, and
+    ``deterministic`` can only be ``True`` because the result is built only
+    after both attempts compared equal.
+    """
 
     run_id: str
     trigger_id: str
     decision_id: str
     decision_validation: str
-    order_id: str | None
-    fill_id: str | None
-    position_id: str | None
-    entry_price: str | None
-    fee: str | None
-    position_size: str | None
-    position_value: str | None
+    data_quality: str
+    order: PaperOrderSummary
+    fill: PaperFillSummary
+    position: PaperPositionSummary
     summary_path: str
-    deterministic: bool = True
+    deterministic: Literal[True] = True
 
 
 def _stable_opportunity(payload: dict[str, Any]) -> dict[str, Any]:
@@ -161,29 +291,51 @@ def _stable_opportunity(payload: dict[str, Any]) -> dict[str, Any]:
 
 
 def _stable_outcome(outcome: PaperLoopOutcome) -> dict[str, Any]:
-    """The projection two replay attempts must agree on exactly."""
-    return {
-        "decision_id": outcome.decision_id,
-        "decision_validation": outcome.decision_validation,
-        "metric_version": outcome.metric_version,
-        "prompt_version": outcome.prompt_version,
-        "knowledge_artifact_hash": outcome.knowledge_artifact_hash,
-        "llm_provider": outcome.llm_provider,
-        "llm_model": outcome.llm_model,
-        "data_quality": outcome.data_quality,
-        "opportunity": _stable_opportunity(outcome.opportunity),
-        "trigger": outcome.trigger,
-        "order": outcome.order,
-        "fill": outcome.fill,
-        "position": outcome.position,
-        "account": outcome.account,
-        "risk_verdict": outcome.risk_verdict,
-    }
+    """The projection two replay attempts must agree on exactly.
+
+    Built from ``asdict`` so a new field is compared automatically; only the
+    opportunity needs a stable projection because a scan generates two random
+    ids.
+    """
+    stable = asdict(outcome)
+    stable["opportunity"] = _stable_opportunity(outcome.opportunity)
+    return stable
 
 
 def _canonical_json(payload: Any) -> str:
     """Deterministic comparison text; the paper loop carries floats, unlike metrics."""
     return json.dumps(payload, sort_keys=True, separators=(",", ":"), ensure_ascii=False)
+
+
+def _decision_payload(decision: DecisionRecord | None) -> dict[str, Any]:
+    """Read the accepted decision; a missing or unvalidated decision is fatal."""
+    if decision is None:
+        raise ReplayError("replay decision disappeared after accept")
+    payload = json.loads(decision.payload_json)
+    if not isinstance(payload, dict):
+        raise ReplayError("replay decision payload is not a JSON object")
+    if not str(payload.get("validation_status") or "").strip():
+        raise ReplayError("replay decision has an empty validation_status")
+    return payload
+
+
+def _trigger_data_quality(trigger_payload: Mapping[str, Any]) -> str:
+    """Read the frozen snapshot's ``data_quality``; absent/invalid is fatal.
+
+    The value lives at ``trigger_payload["snapshot"]["data_quality"]`` (the
+    trigger event contract), not at the payload top level. Replay must never
+    pass an empty or non-contract label through to the response envelope.
+    """
+    snapshot = trigger_payload.get("snapshot")
+    if not isinstance(snapshot, Mapping):
+        raise ReplayError("replay trigger payload has no snapshot object")
+    value = snapshot.get("data_quality")
+    if not isinstance(value, str) or value not in CONTRACT_DATA_QUALITIES:
+        raise ReplayError(
+            "replay trigger snapshot data_quality is missing or invalid: "
+            f"{value!r}; expected one of {sorted(CONTRACT_DATA_QUALITIES)}"
+        )
+    return value
 
 
 class PaperLoopReplay:
@@ -220,6 +372,13 @@ class PaperLoopReplay:
             "llm_model": "fixture",
             "llm_fixtures_dir": self._config.llm_fixtures_dir or DEFAULT_LLM_FIXTURES_DIR,
         }
+        # Pin the fixtures that feed sizing, risk, and data quality explicitly:
+        # an ambient OFT_FIXTURES_DIR/OFT_KLINES_FIXTURE/OFT_EXCHANGE_INFO_FIXTURE
+        # would otherwise change the outcome on another machine.
+        values.update(_pinned_fixture_paths())
+        # Explicit values win over ambient environment variables, so a replay on
+        # another machine cannot silently change fills, fees, balance, or caps.
+        values.update(_PINNED_OUTCOME_SETTINGS)
         if self._config.live_llm:
             # Honour the configured provider (explicit --provider wins), never
             # default to a live provider when none is named.
@@ -228,6 +387,32 @@ class PaperLoopReplay:
         else:
             values["llm_provider"] = "stub"
         return Settings(**values)
+
+    def _settings_digest(self) -> str:
+        """A stable, checkout-independent digest of the inputs behind a replay.
+
+        Fixtures are hashed by content, not by absolute path: two checkouts with
+        byte-identical fixtures produce the same digest.
+        """
+        from oft.config import DEFAULT_LLM_FIXTURES_DIR
+
+        payload = {
+            "symbol": self._config.symbol,
+            "period": self._config.period,
+            "environment": self._config.environment.upper(),
+            "archive_fixture_digest": _fixture_content_digest(self._config.archive_fixture_dir),
+            "llm_fixtures_digest": _fixture_content_digest(
+                self._config.llm_fixtures_dir or DEFAULT_LLM_FIXTURES_DIR
+            ),
+            "pinned_fixtures": {
+                name: _fixture_content_digest(path)
+                for name, path in _pinned_fixture_paths().items()
+            },
+            "llm_model": "fixture",
+            "provider": self._config.provider if self._config.live_llm else "stub",
+            "pinned": _PINNED_OUTCOME_SETTINGS,
+        }
+        return hashlib.sha256(_canonical_json(payload).encode("utf-8")).hexdigest()
 
     def _recordings_dir(self) -> Path:
         assert self._config.recordings_dir is not None
@@ -243,11 +428,9 @@ class PaperLoopReplay:
         from oft.application.prompt_service import secret_values_from_settings
         from oft.replay.llm_source import RecordedLLMSource, RecordingLLMSource
 
-        if not (self._config.live_llm or self._config.capture_recordings):
-            return RecordedLLMSource(recordings_dir=self._recordings_dir())
-        if attempt != _ATTEMPT_1:
-            # Attempt-2 reads exactly what attempt-1 recorded; the provider is
-            # never called twice and cannot simply agree with itself.
+        if attempt != _ATTEMPT_1 or not (self._config.live_llm or self._config.capture_recordings):
+            # Read-only replay, or attempt-2 of a capture: both consume exactly
+            # what attempt-1 recorded. The provider is never called twice.
             return RecordedLLMSource(recordings_dir=self._recordings_dir())
         if self._config.live_llm:
             inner = container.llm_provider
@@ -345,20 +528,19 @@ class PaperLoopReplay:
         if stored_trigger is None:  # pragma: no cover - accept writes it atomically
             raise ReplayError("replay trigger disappeared after accept")
         trigger_payload = json.loads(stored_trigger.payload_json)
-        decision = container.store.get_decision(result.decision_id)
-        decision_payload = {} if decision is None else json.loads(decision.payload_json)
+        decision_payload = _decision_payload(container.store.get_decision(result.decision_id))
         provenance = decision_payload.get("provenance") or {}
         metrics_payload = json.loads(scan.report.metrics_json)
 
         return PaperLoopOutcome(
             decision_id=result.decision_id,
-            decision_validation=str(decision_payload.get("validation_status") or ""),
+            decision_validation=str(decision_payload["validation_status"]),
             metric_version=metrics_payload.get("metric_version"),
             prompt_version=provenance.get("prompt_version"),
             knowledge_artifact_hash=provenance.get("knowledge_artifact_hash"),
             llm_provider=provenance.get("provider"),
             llm_model=provenance.get("model"),
-            data_quality=str(trigger_payload.get("data_quality") or ""),
+            data_quality=_trigger_data_quality(trigger_payload),
             opportunity=json.loads(opportunity.payload_json),
             trigger=trigger_payload,
             order=result.order,
@@ -372,9 +554,21 @@ class PaperLoopReplay:
     def _raise_no_opportunity(scan: ScanRun) -> NoReturn:
         llm_state = scan.llm_state or {}
         reason = str(llm_state.get("reason") or "")
-        if "recorded LLM output" in reason or "LLM_RECORDING_MISSING" in reason:
-            raise ReplayError(
-                "no recorded LLM output for role=ANALYSIS; record one or pass --live-llm: " + reason
+        code = str(llm_state.get("error_code") or "")
+        if code == "LLM_RECORDING_INVALID":
+            raise ReplayRecordingInvalidError(
+                "recorded LLM output is invalid or tampered; refusing to replay it. "
+                "Inspect and re-capture deliberately (never overwrite a published "
+                "recording blindly): " + (reason or "unknown reason")
+            )
+        if (
+            code == "LLM_RECORDING_MISSING"
+            or "LLM_RECORDING_MISSING" in reason
+            or "no recorded LLM output" in reason
+        ):
+            raise ReplayRecordingMissingError(
+                "no recorded LLM output for role=ANALYSIS; record one with --capture "
+                "(offline stub) or --live-llm (explicit provider): " + (reason or "unknown reason")
             )
         raise ReplayError("replay produced no OPEN opportunity; " + (reason or "unknown reason"))
 
@@ -404,6 +598,45 @@ class PaperLoopReplay:
         summary_path = (self.run_root / "summary.json").resolve()
         if not summary_path.is_relative_to(self._replay_root.resolve()):
             raise ReplayError("replay summary escaped the replay namespace")
+
+        # Validate the artifacts and build the value object before writing the
+        # summary: a run that cannot produce an order, fill, or position (or a
+        # value object with an empty id) must not leave a success-looking
+        # ``"deterministic": true`` artifact behind.
+        order = first.order
+        fill = first.fill
+        position = first.position
+        if order is None:
+            raise ReplayError("replay produced no paper order")
+        if fill is None:
+            raise ReplayError("replay produced no paper fill")
+        if position is None:
+            raise ReplayError("replay produced no paper position")
+        result = PaperLoopResult(
+            run_id=self._config.run_id,
+            trigger_id=str(first.trigger.get("trigger_id") or ""),
+            decision_id=first.decision_id,
+            decision_validation=first.decision_validation,
+            data_quality=first.data_quality,
+            order=PaperOrderSummary(
+                order_id=str(order.get("order_id") or ""),
+                status=str(order.get("status") or ""),
+                client_order_id=str(order.get("client_order_id") or ""),
+            ),
+            fill=PaperFillSummary(
+                fill_id=str(fill.get("fill_id") or ""),
+                price=str(fill.get("price") or ""),
+                fee=str(fill.get("fee") or ""),
+                source=str(fill.get("source") or ""),
+            ),
+            position=PaperPositionSummary(
+                position_id=str(position.get("position_id") or ""),
+                size=str(position.get("size") or ""),
+                notional_usd=str(position.get("notional_usd") or ""),
+            ),
+            summary_path=str(summary_path),
+        )
+
         summary = {
             "run_id": self._config.run_id,
             "environment": self._config.environment.upper(),
@@ -411,38 +644,26 @@ class PaperLoopReplay:
             "period": self._config.period,
             "attempts": 2,
             "deterministic": True,
+            "settings_digest": self._settings_digest(),
             "outcome": left,
         }
         write_atomic(summary_path, _canonical_json(summary))
-
-        order = first.order or {}
-        fill = first.fill or {}
-        position = first.position or {}
-        return PaperLoopResult(
-            run_id=self._config.run_id,
-            trigger_id=str(first.trigger.get("trigger_id") or ""),
-            decision_id=first.decision_id,
-            decision_validation=first.decision_validation,
-            order_id=None if first.order is None else str(order.get("order_id") or ""),
-            fill_id=None if first.fill is None else str(fill.get("fill_id") or ""),
-            position_id=None if first.position is None else str(position.get("position_id") or ""),
-            entry_price=None if first.fill is None else str(fill.get("price") or ""),
-            fee=None if first.fill is None else str(fill.get("fee") or ""),
-            position_size=(None if first.position is None else str(position.get("size") or "")),
-            position_value=(
-                None if first.position is None else str(position.get("notional_usd") or "")
-            ),
-            summary_path=str(summary_path),
-        )
+        return result
 
 
 __all__ = [
     "DEFAULT_REPLAY_ENVIRONMENT",
     "DEFAULT_REPLAY_NOW",
     "PAPER_LOOP_NAMESPACE",
+    "PaperFillSummary",
     "PaperLoopConfig",
     "PaperLoopOutcome",
     "PaperLoopReplay",
     "PaperLoopResult",
+    "PaperOrderSummary",
+    "PaperPositionSummary",
+    "ReplayRecordingError",
+    "ReplayRecordingInvalidError",
+    "ReplayRecordingMissingError",
     "validate_run_id",
 ]

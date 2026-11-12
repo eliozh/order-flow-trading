@@ -101,13 +101,15 @@ uv run oft replay run \
 Expected `data` fields (ids are deterministic for this fixture):
 
 ```text
-deterministic: true
-decision_id:   DEC-ENTRY-<16-hex>
-order_id:      ORD-<16-hex>
-fill_id:       FIL-<16-hex>
-position_id:   POS-<16-hex>
-entry_price:   <paper fill price>
-summary_path:  /tmp/<data-dir>/replay/paper-loop/capture/summary.json
+deterministic:        true
+data_quality:         PARTIAL
+decision_id:          DEC-ENTRY-<16-hex>
+order.order_id:       ORD-<16-hex>
+order.status:         FILLED
+fill.fill_id:         FIL-<16-hex>
+fill.price:           <paper fill price>
+position.position_id: POS-<16-hex>
+summary_path:         /tmp/<data-dir>/replay/paper-loop/capture/summary.json
 ```
 
 Each recording contains `role`, `input_hash`, `provider`, `model`, `raw_text`,
@@ -139,6 +141,21 @@ blocks. The run id stays fixed because it is part of the deterministic identity:
 it seeds the paper order's idempotency key and approval id. A different run id
 is a different replay namespace by design, so its ids differ.
 
+Every setting that can change a fill, fee, balance, or risk verdict is pinned by
+replay (`paper_initial_balance`, `paper_slippage_bps`, `paper_taker_fee_bps`,
+and every `risk_*` cap). The committed fixtures that feed sizing, risk, and data
+quality are pinned too: the exchange-info fixture seeds the symbol registry
+(tick/step/min-notional), and the klines fixture supplies the independent
+cross-check. Ambient `OFT_PAPER_*`/`OFT_RISK_*`/`OFT_FIXTURES_DIR`/
+`OFT_KLINES_FIXTURE`/`OFT_EXCHANGE_INFO_FIXTURE` values are ignored, so two
+machines cannot diverge on them. `summary.json` also records a
+`settings_digest`, which hashes fixture **contents** (relative names plus bytes)
+rather than absolute checkout paths: two checkouts with byte-identical fixtures
+produce the same digest. The cross-machine check below compares both the
+`outcome` blocks and that digest. If the digest differs, the two runs used
+different pinned inputs or different fixture contents and the determinism
+comparison would be meaningless.
+
 A run id is used at most once per data directory. Replay never deletes,
 resets, or overwrites an existing run: a second invocation with the same
 `--run-id` fails before writing with `run '<id>' already exists ... pass a new
@@ -165,11 +182,12 @@ OFT_DATA_DIR="$OFT_DATA_DIR_2" uv run oft replay run \
 uv run python - <<'PY'
 import json, os
 a = json.load(open(os.path.join(
-    os.environ["OFT_DATA_DIR"], "replay", "paper-loop", "demo-a", "summary.json")))["outcome"]
+    os.environ["OFT_DATA_DIR"], "replay", "paper-loop", "demo-a", "summary.json")))
 b = json.load(open(os.path.join(
-    os.environ["OFT_DATA_DIR_2"], "replay", "paper-loop", "demo-a", "summary.json")))["outcome"]
-assert a == b, "replay is not deterministic"
-print("identical outcome:", a["decision_id"], a["order"]["order_id"])
+    os.environ["OFT_DATA_DIR_2"], "replay", "paper-loop", "demo-a", "summary.json")))
+assert a["settings_digest"] == b["settings_digest"], "pinned settings differ"
+assert a["outcome"] == b["outcome"], "replay is not deterministic"
+print("identical outcome:", a["outcome"]["decision_id"], a["outcome"]["order"]["order_id"])
 PY
 ```
 
@@ -198,10 +216,12 @@ uv run oft replay run \
 echo "exit=$?"
 ```
 
-Expected: `no recorded LLM output ... record one under ... or pass --live-llm`
-and a non-zero exit. Replay never synthesises an LLM output. `--live-llm`
-explicitly calls the configured provider (the stub above) and records the result
-before use.
+Expected: `no recorded LLM output ... record one with --capture (offline stub)
+or --live-llm (explicit provider)` and a non-zero exit. Replay never synthesises
+an LLM output. `--live-llm` explicitly calls the configured provider (the stub
+above) and records the result before use. A recording that exists but is
+tampered or malformed fails with a distinct `invalid or tampered` error and is
+never reported as missing.
 
 ## 7. Confirm replay left live state untouched
 
@@ -258,6 +278,7 @@ coverage`.
 - **`ReplayNonDeterministicError`**: two identical attempts differed. A new
   provider, prompt, knowledge artifact, or metric version entered the loop
   without being pinned; investigate rather than editing a published replay.
+  Check that both summaries carry the same `settings_digest`.
 - **`no recorded LLM output`**: the prompt input hash changed (for example a
   knowledge artifact or prompt version changed). Re-capture with `--capture`
   (offline stub) or `--live-llm` (explicit provider), review the redacted diff,

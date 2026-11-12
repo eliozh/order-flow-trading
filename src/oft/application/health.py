@@ -244,7 +244,7 @@ def _secrets_check(settings: Settings) -> CheckResult:
 
 
 def _provider_check(settings: Settings) -> CheckResult:
-    """Report the configured LLM provider without ever reading a key value."""
+    """Report the configured LLM provider without ever printing or logging a key value."""
     from oft.application.llm_orchestrator import provider_configured
 
     name = (settings.llm_provider or "").strip().lower()
@@ -304,7 +304,9 @@ def _budget_ledger_check(store: StorePort) -> CheckResult:
     )
 
 
-_STALE_TRIGGER_STATUSES = ("PENDING_RECHECK", "RECHECKED")
+# RECHECKED means the re-check finished and the trigger awaits a human
+# decision, so it is not stale; only PENDING_RECHECK is waiting on a re-check.
+_STALE_TRIGGER_STATUSES = ("PENDING_RECHECK",)
 _TRIGGER_PAGE_SIZE = 200
 
 
