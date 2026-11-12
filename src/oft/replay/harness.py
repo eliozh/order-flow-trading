@@ -62,6 +62,39 @@ class ReplayNonDeterministicError(ReplayError):
     """Two identical computations disagreed; replay must fail loudly."""
 
 
+class ReplayLivePathError(ReplayError):
+    """Replay refuses any configuration that could reach a live order path."""
+
+
+def write_atomic(path: Path, text: str) -> None:
+    """Write ``text`` so a reader sees the old file or the whole new one.
+
+    Used by every replay writer (metric documents, paper-loop summaries, LLM
+    recordings) so they share one durable pattern: ``mkstemp`` in the target
+    directory, flush and fsync the file, ``os.replace``, then fsync the
+    directory to persist the rename.
+    """
+    path.parent.mkdir(parents=True, exist_ok=True)
+    descriptor, temporary_name = tempfile.mkstemp(
+        dir=path.parent,
+        prefix=f".{path.name}.",
+        suffix=".tmp",
+    )
+    try:
+        with os.fdopen(descriptor, "w", encoding="utf-8") as handle:
+            handle.write(text)
+            handle.flush()
+            os.fsync(handle.fileno())
+        os.replace(temporary_name, path)
+        directory_fd = os.open(path.parent, os.O_RDONLY)
+        try:
+            os.fsync(directory_fd)
+        finally:
+            os.close(directory_fd)
+    finally:
+        Path(temporary_name).unlink(missing_ok=True)
+
+
 @dataclass(frozen=True)
 class ReplayConfig:
     """Inputs that fully determine one replay document."""
@@ -446,24 +479,7 @@ class ReplayHarness:
             )
 
         output_path.parent.mkdir(parents=True, exist_ok=True)
-        descriptor, temporary_name = tempfile.mkstemp(
-            dir=output_path.parent,
-            prefix=f".{output_path.name}.",
-            suffix=".tmp",
-        )
-        try:
-            with os.fdopen(descriptor, "w", encoding="utf-8") as handle:
-                handle.write(self._record(first))
-                handle.flush()
-                os.fsync(handle.fileno())
-            os.replace(temporary_name, output_path)
-            directory_fd = os.open(output_path.parent, os.O_RDONLY)
-            try:
-                os.fsync(directory_fd)
-            finally:
-                os.close(directory_fd)
-        finally:
-            Path(temporary_name).unlink(missing_ok=True)
+        write_atomic(output_path, self._record(first))
         return ReplayResult(
             metric_version=first.metric_version,
             input_manifest_hash=first.input_manifest_hash,

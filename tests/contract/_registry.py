@@ -14,6 +14,17 @@ from referencing.jsonschema import DRAFT202012
 ROOT = Path(__file__).resolve().parents[2]
 CONTRACTS = ROOT / "docs" / "contracts"
 
+# Every record family the deterministic paper loop persists, mapped to its
+# contract. Kept here so a new family cannot be added without registering it.
+PAPER_LOOP_CONTRACTS: dict[str, str] = {
+    "budget": "budget-record.schema.json",
+    "decision": "llm-decision.schema.json",
+    "fill": "fill.schema.json",
+    "order": "order.schema.json",
+    "position": "position.schema.json",
+    "trigger": "trigger-event.schema.json",
+}
+
 
 def load(name: str) -> dict[str, Any]:
     return json.loads((CONTRACTS / name).read_text(encoding="utf-8"))

@@ -1,10 +1,13 @@
 #!/usr/bin/env python3
-"""Fail when a pure metric primitive is below 100% branch coverage.
+"""Fail when a deterministic primitive is below 100% branch coverage.
 
 Run after ``pytest --cov=oft --cov-branch``. The gate covers the deterministic
 metric core (CVD, delta, footprint, volume profile, funding, OI,
-liquidations, versioning, and the exact-decimal renderer). These modules have no I/O and are fully unit-testable, so partial
-branches are regressions rather than acceptable gaps.
+liquidations, versioning, and the exact-decimal renderer) plus the risk gate,
+the trigger state machine, and the OMS state machine. These modules have no
+I/O and are fully unit-testable, so partial branches are regressions rather
+than acceptable gaps. Targets are package-relative paths because names such as
+``risk.py`` and ``trigger.py`` also exist in other packages.
 """
 
 from __future__ import annotations
@@ -15,17 +18,24 @@ from pathlib import Path
 import coverage
 
 TARGETS = (
-    "cvd.py",
-    "delta.py",
-    "footprint.py",
-    "types.py",
-    "volume_profile.py",
-    "funding.py",
-    "open_interest.py",
-    "liquidations.py",
-    "version.py",
+    "domain/metrics/cvd.py",
+    "domain/metrics/delta.py",
+    "domain/metrics/footprint.py",
+    "domain/metrics/types.py",
+    "domain/metrics/volume_profile.py",
+    "domain/metrics/funding.py",
+    "domain/metrics/open_interest.py",
+    "domain/metrics/liquidations.py",
+    "domain/metrics/version.py",
+    "domain/risk.py",
+    "domain/trigger.py",
+    "domain/oms.py",
 )
 DEFAULT_DATA_FILE = ".coverage"
+
+
+def _matches(path: Path, target_parts: tuple[str, ...]) -> bool:
+    return path.parts[-len(target_parts) :] == target_parts
 
 
 def main(argv: list[str]) -> int:
@@ -39,7 +49,8 @@ def main(argv: list[str]) -> int:
     measured_paths = tuple(Path(path) for path in cov.get_data().measured_files())
     failures: list[str] = []
     for target in TARGETS:
-        matches = [path for path in measured_paths if path.name == target]
+        target_parts = tuple(Path(target).parts)
+        matches = [path for path in measured_paths if _matches(path, target_parts)]
         if len(matches) != 1:
             failures.append(f"{target}: expected exactly one measured path, found {len(matches)}")
             continue

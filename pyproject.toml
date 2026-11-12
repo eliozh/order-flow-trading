@@ -178,6 +178,33 @@ forbidden_modules = [
   "binance_connector",
 ]
 
+# Slice 21: the LLM adapter family is the untrusted provider boundary. It must
+# never reach the execution/broker path or a Binance client, even indirectly
+# through a shared helper. This is narrower and explicit alongside the broader
+# adapter contract above; neither is weakened.
+[[tool.importlinter.contracts]]
+name = "LLM adapters never import execution, broker, or Binance modules"
+type = "forbidden"
+source_modules = [
+  "oft.adapters.llm_common",
+  "oft.adapters.llm_stub",
+  "oft.adapters.llm_openai",
+  "oft.adapters.llm_anthropic",
+  "oft.adapters.llm_deepseek",
+]
+forbidden_modules = [
+  "oft.application.entry_service",
+  "oft.application.execution_gateway",
+  "oft.application.paper_broker",
+  "oft.application.paper_account",
+  "oft.application.kill_switch",
+  "oft.adapters.binance_rest",
+  "oft.adapters.binance_ws",
+  "binance",
+  "binance_connector",
+  "ccxt",
+]
+
 # The provider boundary is a denylist of every LLM SDK the project may add; the
 # list is intentionally broad so a new adapter import fails closed.
 [[tool.importlinter.contracts]]

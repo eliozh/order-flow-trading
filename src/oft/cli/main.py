@@ -18,6 +18,7 @@ from oft.cli.commands.open import open_command
 from oft.cli.commands.opp import opp_app
 from oft.cli.commands.paper import paper_app
 from oft.cli.commands.prompt import prompt_app
+from oft.cli.commands.replay import replay_app
 from oft.cli.commands.report import report_app
 from oft.cli.commands.risk import risk_app
 from oft.cli.commands.scan import scan_app
@@ -55,6 +56,7 @@ app.add_typer(kill_app, name="kill")
 app.add_typer(llm_app, name="llm")
 app.add_typer(budget_app, name="budget")
 app.add_typer(risk_app, name="risk")
+app.add_typer(replay_app, name="replay")
 
 _LOOPBACK_HOSTS = frozenset({"127.0.0.1", "localhost", "::1"})
 

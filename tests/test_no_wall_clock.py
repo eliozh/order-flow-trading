@@ -29,6 +29,20 @@ from oft.ports.store import JobRunRecord, ManifestEntry
 ROOT = Path(__file__).resolve().parents[1]
 SRC = ROOT / "src" / "oft"
 DETERMINISTIC_PACKAGES = ("domain", "application", "replay")
+
+# Slice 21: the deterministic core is listed explicitly so a module cannot drop
+# out of the scan by moving packages. Silence is never an allow-list entry.
+REQUIRED_DETERMINISTIC_MODULES = (
+    "domain/risk.py",
+    "domain/trigger.py",
+    "domain/oms.py",
+    "application/entry_service.py",
+    "application/execution_gateway.py",
+    "application/paper_broker.py",
+    "application/budget_ledger.py",
+    "replay/harness.py",
+    "replay/llm_source.py",
+)
 NOW = datetime(2026, 11, 6, 12, 0, 0, tzinfo=UTC)
 
 _WALL_CLOCK_MODULES = {"datetime", "date", "time"}
@@ -206,6 +220,19 @@ def test_domain_and_application_never_call_the_wall_clock() -> None:
     assert not violations, "wall-clock calls must move behind ClockPort:\n" + "\n".join(violations)
 
 
+def test_every_required_deterministic_module_is_scanned() -> None:
+    """Risk, trigger, OMS, and the execution/LLM application services stay pure."""
+    violations: list[str] = []
+    for relative in REQUIRED_DETERMINISTIC_MODULES:
+        path = SRC / relative
+        assert path.is_file(), f"deterministic module is missing: {relative}"
+        tree = ast.parse(path.read_text(encoding="utf-8"), filename=str(path))
+        for line, expression in _wall_clock_calls(tree):
+            violations.append(f"{path.relative_to(ROOT)}:{line}: {expression}")
+
+    assert not violations, "wall-clock calls must move behind ClockPort:\n" + "\n".join(violations)
+
+
 def _settings(tmp_path: Path) -> Settings:
     return Settings(env="test", port=8765, data_dir=tmp_path / "data")
 
@@ -236,6 +263,10 @@ def test_doctor_reports_every_required_section(tmp_path: Path) -> None:
         "manifest.orphans",
         "jobs.stale",
         "audit.chain",
+        "config.provider",
+        "budget.ledger",
+        "triggers.stale",
+        "kill_switch",
     ):
         assert name in checks, name
     assert checks["storage.sqlite"].status == "ok"
@@ -244,6 +275,10 @@ def test_doctor_reports_every_required_section(tmp_path: Path) -> None:
     assert checks["jobs.stale"].status == "ok"
     assert checks["audit.chain"].status == "ok"
     assert "AUDIT_CHAIN_OK" in checks["audit.chain"].detail
+    assert checks["config.provider"].status == "ok"
+    assert checks["budget.ledger"].status == "ok"
+    assert checks["triggers.stale"].status == "ok"
+    assert checks["kill_switch"].status == "ok"
     assert report.status == "READY"
 
 
@@ -418,3 +453,154 @@ def test_wall_clock_detector_tracks_rebinding_and_getattr() -> None:
 
     found = {expression for _, expression in _wall_clock_calls(tree)}
     assert {"now()", "utcnow()", "time()", "getattr(now)", "getattr(today)"} <= found
+
+
+# -- slice 21 doctor extensions --------------------------------------------
+
+
+@pytest.mark.parametrize(
+    ("provider", "api_key", "expected"),
+    [
+        (None, None, "ok"),
+        ("stub", None, "ok"),
+        ("openai", "sk-test", "ok"),
+        ("openai", None, "degraded"),
+    ],
+)
+def test_provider_check_never_echoes_a_key_and_fails_closed(
+    tmp_path: Path, provider: str | None, api_key: str | None, expected: str
+) -> None:
+    from oft.application.health import _provider_check
+
+    settings = Settings(
+        env="test",
+        port=8765,
+        data_dir=tmp_path / "data",
+        llm_provider=provider,
+        openai_api_key=api_key,
+    )
+
+    check = _provider_check(settings)
+
+    assert check.status == expected
+    if api_key is not None:
+        assert api_key not in check.detail
+    if provider is not None:
+        assert provider in check.detail
+
+
+def test_budget_ledger_check_flags_an_invalid_cost() -> None:
+    from types import SimpleNamespace
+
+    from oft.application.health import _budget_ledger_check
+
+    class FakeStore:
+        def __init__(self, records: tuple[Any, ...]) -> None:
+            self._records = records
+
+        def list_budget_records(self) -> tuple[Any, ...]:
+            return self._records
+
+    assert _budget_ledger_check(FakeStore(())).status == "ok"
+    assert (
+        _budget_ledger_check(FakeStore((SimpleNamespace(cost_usd="0.10", unpriced=True),))).status
+        == "ok"
+    )
+    assert (
+        _budget_ledger_check(
+            FakeStore((SimpleNamespace(cost_usd="not-a-number", unpriced=False),))
+        ).status
+        == "degraded"
+    )
+    assert (
+        _budget_ledger_check(FakeStore((SimpleNamespace(cost_usd="-1", unpriced=False),))).status
+        == "degraded"
+    )
+
+
+def test_stale_trigger_check_flags_old_pending_triggers() -> None:
+    from types import SimpleNamespace
+
+    from oft.application.health import _stale_triggers_check
+
+    def record(trigger_id: str, triggered_at: str) -> SimpleNamespace:
+        return SimpleNamespace(trigger_id=trigger_id, triggered_at=triggered_at)
+
+    class FakeStore:
+        def __init__(self, records: tuple[SimpleNamespace, ...]) -> None:
+            self._records = records
+
+        def list_trigger_events(
+            self, *, status: str, limit: int, offset: int
+        ) -> tuple[SimpleNamespace, ...]:
+            if status != "PENDING_RECHECK" or offset:
+                return ()
+            return self._records[:limit]
+
+    old = record("TRG-OLD", utc_timestamp(NOW - timedelta(hours=1)))
+    fresh = record("TRG-NEW", utc_timestamp(NOW))
+
+    stale = _stale_triggers_check(FakeStore((old,)), FixedClock(NOW), 60)  # type: ignore[arg-type]
+    healthy = _stale_triggers_check(FakeStore((fresh,)), FixedClock(NOW), 60)  # type: ignore[arg-type]
+
+    assert stale.status == "degraded"
+    assert "1" in stale.detail
+    assert healthy.status == "ok"
+    assert "1 waiting" in healthy.detail
+
+
+def test_stale_trigger_check_ignores_rechecked_triggers() -> None:
+    from types import SimpleNamespace
+
+    from oft.application.health import _stale_triggers_check
+
+    queried: list[str] = []
+
+    class FakeStore:
+        def list_trigger_events(
+            self, *, status: str, limit: int, offset: int
+        ) -> tuple[SimpleNamespace, ...]:
+            queried.append(status)
+            if status == "RECHECKED" and not offset:
+                # A finished re-check awaiting human action is not stale.
+                return (
+                    SimpleNamespace(
+                        trigger_id="TRG-OLD",
+                        triggered_at=utc_timestamp(NOW - timedelta(hours=1)),
+                    ),
+                )
+            return ()
+
+    check = _stale_triggers_check(FakeStore(), FixedClock(NOW), 60)  # type: ignore[arg-type]
+
+    assert check.status == "ok"
+    assert "RECHECKED" not in queried
+
+
+def test_doctor_flags_an_active_kill_switch(tmp_path: Path) -> None:
+    from oft.application.kill_switch import KillSwitch
+
+    settings = _settings(tmp_path)
+    store = SqliteStore(settings)
+    store.initialize()
+    KillSwitch(settings=settings, store=store, clock=FixedClock(NOW)).activate(actor_id="test")
+
+    report = _doctor(settings, store)
+    checks = {check.name: check for check in report.checks}
+
+    assert checks["kill_switch"].status == "degraded"
+    assert "ACTIVE" in checks["kill_switch"].detail
+    assert report.status == "DEGRADED"
+
+
+def test_doctor_reports_an_unreadable_budget_ledger(tmp_path: Path) -> None:
+    from oft.application.health import _budget_ledger_check
+
+    class BrokenStore:
+        def list_budget_records(self) -> tuple[Any, ...]:
+            raise RuntimeError("ledger is corrupt")
+
+    check = _budget_ledger_check(BrokenStore())  # type: ignore[arg-type]
+
+    assert check.status == "degraded"
+    assert "unreadable" in check.detail
