@@ -13,7 +13,14 @@ describe('StatusBar', () => {
     expect(screen.getByText('UP')).toBeInTheDocument()
     expect(screen.getByText('0.1.0')).toBeInTheDocument()
     expect(screen.getByText('READY')).toBeInTheDocument()
-    expect(screen.getByRole('button', { name: /Kill switch/i })).toBeInTheDocument()
+  })
+
+  it('does not render a dead kill-switch placeholder button', () => {
+    render(<StatusBar env="PAPER" daemon="UP" version="0.1.0" readiness="READY" />)
+
+    // The only kill-switch affordance is the live KillSwitchBar above the shell.
+    expect(screen.queryByRole('button')).not.toBeInTheDocument()
+    expect(screen.queryByText(/not available in this build/i)).not.toBeInTheDocument()
   })
 
   it('shows OFFLINE when the daemon probe fails', () => {

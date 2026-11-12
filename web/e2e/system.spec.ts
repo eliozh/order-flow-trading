@@ -222,10 +222,13 @@ test('at 375px the shell is read-only and has no page-level horizontal scroll', 
   }
   await expect(page.locator('[contenteditable="true"]')).toHaveCount(0)
 
-  // The kill switch is rendered but is explicitly non-functional.
+  // The global kill switch is a real control and stays available in every
+  // state, including the 375px read-only shell outside <main>.
   const killSwitch = page.getByRole('button', { name: /Kill switch/ })
   await expect(killSwitch).toBeVisible()
-  await expect(killSwitch).toHaveAttribute('title', /not wired|not available/i)
+  await expect(killSwitch).toBeEnabled()
+  await expect(killSwitch).toHaveAttribute('aria-label', /Kill switch/)
+  await expect(page.locator('section.kill-switch-bar[aria-label="Kill switch"]')).toBeVisible()
 
   const widths = await page.evaluate(() => {
     const viewport = window.innerWidth

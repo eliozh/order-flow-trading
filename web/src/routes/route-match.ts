@@ -10,6 +10,9 @@ export interface RouteMatch {
   reportId: string | null
   isOpportunities: boolean
   opportunityId: string | null
+  isTriggers: boolean
+  triggerId: string | null
+  isPaper: boolean
 }
 
 function decodeSegment(segment: string): string {
@@ -36,6 +39,7 @@ export function resolveRoute(pathname: string): RouteMatch {
   const scanMatch = /^\/scans\/([^/]+)$/.exec(path)
   const reportMatch = /^\/reports\/([^/]+)$/.exec(path)
   const opportunityMatch = /^\/opportunities\/([^/]+)$/.exec(path)
+  const triggerMatch = /^\/triggers\/([^/]+)$/.exec(path)
   return {
     path,
     inspectorSymbol,
@@ -50,5 +54,8 @@ export function resolveRoute(pathname: string): RouteMatch {
     // opportunity route and must fall through to the not-found panel.
     isOpportunities: path === '/opportunities' || opportunityMatch !== null,
     opportunityId: opportunityMatch !== null ? decodeSegment(opportunityMatch[1]) : null,
+    isTriggers: path === '/triggers',
+    triggerId: triggerMatch !== null ? decodeSegment(triggerMatch[1]) : null,
+    isPaper: path === '/paper',
   }
 }
