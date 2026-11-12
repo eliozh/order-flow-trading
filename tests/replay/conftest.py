@@ -8,7 +8,7 @@ from pathlib import Path
 
 import pytest
 
-from oft.replay.harness import PaperLoopConfig, PaperLoopReplay
+from oft.replay.paper_loop import PaperLoopConfig, PaperLoopReplay
 
 ROOT = Path(__file__).resolve().parents[2]
 ARCHIVE = ROOT / "tests" / "fixtures" / "archive"

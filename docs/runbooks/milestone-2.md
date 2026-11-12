@@ -139,6 +139,15 @@ blocks. The run id stays fixed because it is part of the deterministic identity:
 it seeds the paper order's idempotency key and approval id. A different run id
 is a different replay namespace by design, so its ids differ.
 
+A run id is used at most once per data directory. Replay never deletes,
+resets, or overwrites an existing run: a second invocation with the same
+`--run-id` fails before writing with `run '<id>' already exists ... pass a new
+--run-id`. Pass `--run-id demo-b` (or delete the whole data directory yourself)
+to run again. Run ids must contain at least one letter or digit and match
+`^[A-Za-z0-9._-]{1,64}$`; `.` and `..` are refused, and the resolved run root
+must stay under `$OFT_DATA_DIR/replay/paper-loop/` (symlinked components are
+rejected).
+
 ```bash
 export OFT_DATA_DIR_2="$(mktemp -d)"
 mkdir -p "$OFT_DATA_DIR_2/replay"
@@ -236,11 +245,16 @@ Runs, with no network or daemon: `ruff` check/format, `mypy`, `import-linter`
 (including the LLM-adapter ⇸ execution/Binance contract), fixture checksums,
 `pytest` unit/integration/contract/replay with the 80% overall coverage floor
 and the 100% metric branch gate, then web lint, typecheck, test, and production
-build. Risk, trigger, and OMS are additionally verified at 100% branch coverage
-in the slice-21 replay suite.
+build. The 100% branch gate is enforced by `scripts/check-metric-coverage` for
+the metric core **and** `domain/risk.py`, `domain/trigger.py`, and
+`domain/oms.py`, so a partial branch in those state machines fails `make
+coverage`.
 
 ## Troubleshooting
 
+- **`run '<id>' already exists`**: replay never deletes or resets a run
+  directory. Re-run with a new `--run-id`, or remove the whole data directory
+  yourself if you intend a clean start.
 - **`ReplayNonDeterministicError`**: two identical attempts differed. A new
   provider, prompt, knowledge artifact, or metric version entered the loop
   without being pinned; investigate rather than editing a published replay.

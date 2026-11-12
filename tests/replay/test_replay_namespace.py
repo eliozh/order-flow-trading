@@ -14,10 +14,12 @@ from oft.clock import FixedClock
 from oft.config import Settings
 from oft.replay.harness import (
     REPLAY_NAMESPACE,
-    PaperLoopConfig,
-    PaperLoopReplay,
+    ReplayError,
     ReplayLivePathError,
 )
+from oft.replay.paper_loop import PaperLoopConfig, PaperLoopReplay
+
+pytestmark = pytest.mark.replay
 
 ROOT = Path(__file__).resolve().parents[2]
 ARCHIVE = ROOT / "tests" / "fixtures" / "archive"
@@ -105,3 +107,27 @@ def test_the_cli_exits_non_zero_on_an_attempted_live_path(
 
     assert result.exit_code != 0
     assert "live" in result.output.lower()
+
+
+def test_a_symlinked_run_root_is_rejected_before_any_write(
+    tmp_path: Path, replay_recordings: Path
+) -> None:
+    data_dir = tmp_path / "data"
+    outside = tmp_path / "outside"
+    outside.mkdir()
+    run_root = data_dir / REPLAY_NAMESPACE / "paper-loop" / "symlinked"
+    run_root.parent.mkdir(parents=True)
+    run_root.symlink_to(outside, target_is_directory=True)
+    config = PaperLoopConfig(
+        symbol="BTCUSDT",
+        archive_fixture_dir=ARCHIVE,
+        backfill_start=START,
+        backfill_end=END,
+        recordings_dir=replay_recordings,
+        run_id="symlinked",
+    )
+
+    with pytest.raises(ReplayError, match="symlink"):
+        PaperLoopReplay(data_dir=data_dir, config=config).run()
+
+    assert list(outside.rglob("*")) == []

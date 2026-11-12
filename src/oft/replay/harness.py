@@ -20,10 +20,9 @@ from __future__ import annotations
 import hashlib
 import json
 import os
-import re
 import tempfile
 from dataclasses import dataclass
-from datetime import UTC, date, datetime
+from datetime import datetime
 from decimal import Decimal
 from pathlib import Path
 from typing import Any
@@ -53,10 +52,6 @@ from oft.replay.clock import ReplayClock
 from oft.replay.event_source import ReplayEventSource, ReplayWindow
 
 REPLAY_NAMESPACE = "replay"
-PAPER_LOOP_NAMESPACE = "paper-loop"
-DEFAULT_REPLAY_ENVIRONMENT = "PAPER"
-DEFAULT_REPLAY_NOW = datetime(2026, 11, 6, 12, 0, 0, tzinfo=UTC)
-_READ_ONLY_ENVIRONMENTS = frozenset({"PAPER", "TEST"})
 
 
 class ReplayError(ValueError):
@@ -69,6 +64,35 @@ class ReplayNonDeterministicError(ReplayError):
 
 class ReplayLivePathError(ReplayError):
     """Replay refuses any configuration that could reach a live order path."""
+
+
+def write_atomic(path: Path, text: str) -> None:
+    """Write ``text`` so a reader sees the old file or the whole new one.
+
+    Used by every replay writer (metric documents, paper-loop summaries, LLM
+    recordings) so they share one durable pattern: ``mkstemp`` in the target
+    directory, flush and fsync the file, ``os.replace``, then fsync the
+    directory to persist the rename.
+    """
+    path.parent.mkdir(parents=True, exist_ok=True)
+    descriptor, temporary_name = tempfile.mkstemp(
+        dir=path.parent,
+        prefix=f".{path.name}.",
+        suffix=".tmp",
+    )
+    try:
+        with os.fdopen(descriptor, "w", encoding="utf-8") as handle:
+            handle.write(text)
+            handle.flush()
+            os.fsync(handle.fileno())
+        os.replace(temporary_name, path)
+        directory_fd = os.open(path.parent, os.O_RDONLY)
+        try:
+            os.fsync(directory_fd)
+        finally:
+            os.close(directory_fd)
+    finally:
+        Path(temporary_name).unlink(missing_ok=True)
 
 
 @dataclass(frozen=True)
@@ -455,24 +479,7 @@ class ReplayHarness:
             )
 
         output_path.parent.mkdir(parents=True, exist_ok=True)
-        descriptor, temporary_name = tempfile.mkstemp(
-            dir=output_path.parent,
-            prefix=f".{output_path.name}.",
-            suffix=".tmp",
-        )
-        try:
-            with os.fdopen(descriptor, "w", encoding="utf-8") as handle:
-                handle.write(self._record(first))
-                handle.flush()
-                os.fsync(handle.fileno())
-            os.replace(temporary_name, output_path)
-            directory_fd = os.open(output_path.parent, os.O_RDONLY)
-            try:
-                os.fsync(directory_fd)
-            finally:
-                os.close(directory_fd)
-        finally:
-            Path(temporary_name).unlink(missing_ok=True)
+        write_atomic(output_path, self._record(first))
         return ReplayResult(
             metric_version=first.metric_version,
             input_manifest_hash=first.input_manifest_hash,
@@ -481,365 +488,4 @@ class ReplayHarness:
             event_count=first.event_count,
             data_quality=first.payload["data_quality"],
             output_path=str(output_path),
-        )
-
-
-# -- paper-loop replay -------------------------------------------------------
-#
-# The metric harness above replays one metrics window. The paper-loop replay
-# below runs the *full* deterministic path (backfill -> scan -> trigger ->
-# entry re-check -> risk -> paper fill) twice in two fresh stores that both
-# live under ``$OFT_DATA/replay/paper-loop/<run_id>/``. The live database,
-# paper account, OMS ledger, and budget ledger are never opened or written.
-
-
-_RUN_ID_PATTERN = re.compile(r"^[A-Za-z0-9._-]{1,64}$")
-
-
-@dataclass(frozen=True)
-class PaperLoopConfig:
-    """Inputs that fully determine one paper-loop replay."""
-
-    symbol: str
-    archive_fixture_dir: Path
-    backfill_start: date
-    backfill_end: date
-    period: str = "4h"
-    recordings_dir: Path | None = None
-    live_llm: bool = False
-    capture_recordings: bool = False
-    provider: str | None = None
-    environment: str = DEFAULT_REPLAY_ENVIRONMENT
-    now: datetime = DEFAULT_REPLAY_NOW
-    run_id: str = "paper-loop"
-    llm_fixtures_dir: Path | None = None
-
-    def __post_init__(self) -> None:
-        if self.environment.strip().upper() not in _READ_ONLY_ENVIRONMENTS:
-            raise ReplayLivePathError(
-                f"replay refuses environment {self.environment!r}; "
-                "only PAPER/TEST replay is supported and a live order path is never opened"
-            )
-        if self.now.tzinfo is None:
-            raise ReplayError("paper-loop replay requires a timezone-aware fixed clock")
-        if self.backfill_end < self.backfill_start:
-            raise ReplayError("backfill_end must be on or after backfill_start")
-        if _RUN_ID_PATTERN.fullmatch(self.run_id) is None:
-            raise ReplayError("run_id must match ^[A-Za-z0-9._-]{1,64}$")
-        if self.recordings_dir is None:
-            raise ReplayError(
-                "recordings_dir is required; a replay never invents an LLM output. "
-                "Capture one with --capture or --live-llm first."
-            )
-
-
-@dataclass(frozen=True)
-class PaperLoopOutcome:
-    """The stable values one attempt produced (never a path or random id)."""
-
-    decision_id: str
-    decision_validation: str
-    metric_version: str | None
-    prompt_version: int | None
-    knowledge_artifact_hash: str | None
-    llm_provider: str | None
-    llm_model: str | None
-    data_quality: str
-    opportunity: dict[str, Any]
-    trigger: dict[str, Any]
-    order: dict[str, Any] | None
-    fill: dict[str, Any] | None
-    position: dict[str, Any] | None
-    account: dict[str, Any] | None
-    risk_verdict: dict[str, Any]
-
-
-@dataclass(frozen=True)
-class PaperLoopResult:
-    """The identity of one verified deterministic paper-loop replay."""
-
-    run_id: str
-    trigger_id: str
-    decision_id: str
-    decision_validation: str
-    order_id: str | None
-    fill_id: str | None
-    position_id: str | None
-    entry_price: str | None
-    fee: str | None
-    position_size: str | None
-    position_value: str | None
-    summary_path: str
-    deterministic: bool = True
-
-
-def _stable_opportunity(payload: dict[str, Any]) -> dict[str, Any]:
-    """Drop the two ids a scan generates randomly; everything else is pinned."""
-    copy: dict[str, Any] = json.loads(json.dumps(payload))
-    source = copy.get("source")
-    if isinstance(source, dict):
-        copy["source"] = {
-            key: value for key, value in source.items() if key not in {"scan_id", "report_id"}
-        }
-    return copy
-
-
-def _stable_outcome(outcome: PaperLoopOutcome) -> dict[str, Any]:
-    """The projection two replay attempts must agree on exactly."""
-    return {
-        "decision_id": outcome.decision_id,
-        "decision_validation": outcome.decision_validation,
-        "metric_version": outcome.metric_version,
-        "prompt_version": outcome.prompt_version,
-        "knowledge_artifact_hash": outcome.knowledge_artifact_hash,
-        "llm_provider": outcome.llm_provider,
-        "llm_model": outcome.llm_model,
-        "data_quality": outcome.data_quality,
-        "opportunity": _stable_opportunity(outcome.opportunity),
-        "trigger": outcome.trigger,
-        "order": outcome.order,
-        "fill": outcome.fill,
-        "position": outcome.position,
-        "account": outcome.account,
-        "risk_verdict": outcome.risk_verdict,
-    }
-
-
-def _canonical_json(payload: Any) -> str:
-    """Deterministic comparison text; the paper loop carries floats, unlike metrics."""
-    return json.dumps(payload, sort_keys=True, separators=(",", ":"), ensure_ascii=False)
-
-
-def _write_atomic(path: Path, text: str) -> None:
-    path.parent.mkdir(parents=True, exist_ok=True)
-    descriptor, temporary_name = tempfile.mkstemp(
-        dir=path.parent,
-        prefix=f".{path.name}.",
-        suffix=".tmp",
-    )
-    try:
-        with os.fdopen(descriptor, "w", encoding="utf-8") as handle:
-            handle.write(text)
-            handle.flush()
-            os.fsync(handle.fileno())
-        os.replace(temporary_name, path)
-        directory_fd = os.open(path.parent, os.O_RDONLY)
-        try:
-            os.fsync(directory_fd)
-        finally:
-            os.close(directory_fd)
-    finally:
-        Path(temporary_name).unlink(missing_ok=True)
-
-
-class PaperLoopReplay:
-    """Run the paper loop twice under replay and prove it is deterministic."""
-
-    def __init__(self, *, data_dir: Path, config: PaperLoopConfig) -> None:
-        self._data_dir = Path(data_dir).expanduser().resolve()
-        self._config = config
-        self._replay_root = self._data_dir / REPLAY_NAMESPACE
-
-    @property
-    def replay_root(self) -> Path:
-        return self._replay_root
-
-    @property
-    def run_root(self) -> Path:
-        return self._replay_root / PAPER_LOOP_NAMESPACE / self._config.run_id
-
-    def _settings(self, attempt_dir: Path) -> Any:
-        from oft.config import DEFAULT_LLM_FIXTURES_DIR, Settings
-
-        values: dict[str, Any] = {
-            "env": "test",
-            "port": 8765,
-            "data_dir": attempt_dir,
-            "archive_fixture_dir": self._config.archive_fixture_dir,
-            "llm_model": "fixture",
-            "llm_fixtures_dir": self._config.llm_fixtures_dir or DEFAULT_LLM_FIXTURES_DIR,
-        }
-        if self._config.live_llm:
-            # Honour the configured provider (explicit --provider wins), never
-            # default to a live provider when none is named.
-            if self._config.provider is not None:
-                values["llm_provider"] = self._config.provider
-        else:
-            values["llm_provider"] = "stub"
-        return Settings(**values)
-
-    def _recordings_dir(self) -> Path:
-        assert self._config.recordings_dir is not None
-        return Path(self._config.recordings_dir).expanduser().resolve()
-
-    def _source(self, container: Any, settings: Any) -> Any:
-        from oft.adapters.llm_stub import LLMStub
-        from oft.application.prompt_service import secret_values_from_settings
-        from oft.replay.llm_source import RecordedLLMSource, RecordingLLMSource
-
-        if not (self._config.live_llm or self._config.capture_recordings):
-            return RecordedLLMSource(recordings_dir=self._recordings_dir())
-        if self._config.live_llm:
-            inner = container.llm_provider
-            if inner is None:
-                raise ReplayError(
-                    "no live LLM provider is configured; set OFT_LLM_PROVIDER or omit --live-llm"
-                )
-        else:
-            inner = LLMStub(fixtures_dir=settings.llm_fixtures_dir)
-        return RecordingLLMSource(
-            inner=inner,
-            recordings_dir=self._recordings_dir(),
-            clock=container.clock,
-            secrets=secret_values_from_settings(settings),
-        )
-
-    @staticmethod
-    def _provider_name(source: Any) -> str:
-        return str(getattr(source, "provider", "") or "stub")
-
-    def _run_once(self, attempt: str) -> PaperLoopOutcome:
-        from dataclasses import replace as replace_dataclass
-
-        from oft.application.entry_service import EntryService
-        from oft.application.kill_switch import KillSwitch
-        from oft.application.scan_service import ScanRequest, ScanService
-        from oft.application.trigger_service import TriggerService
-        from oft.bootstrap import build_container
-        from oft.clock import FixedClock
-
-        attempt_dir = self.run_root / attempt
-        settings = self._settings(attempt_dir)
-        clock = FixedClock(self._config.now)
-        container = build_container(settings, initialize=True, clock=clock)
-        source = self._source(container, settings)
-        container = replace_dataclass(container, llm_provider=source)
-        provider_name = self._provider_name(source)
-
-        backfill = container.backfill.run(
-            symbol=self._config.symbol,
-            data_type="aggTrades",
-            start=self._config.backfill_start,
-            end=self._config.backfill_end,
-        )
-        if backfill.run.status != "COMPLETE":
-            raise ReplayError(f"replay backfill did not complete: {backfill.run.status}")
-
-        scan = ScanService(container=container, lock=container.scan_lock).run(
-            ScanRequest(
-                symbol=self._config.symbol,
-                period=self._config.period,
-                metrics_only=False,
-                provider=provider_name,
-            )
-        )
-        opportunities = container.store.list_opportunities(state="OPEN")
-        if not opportunities:
-            self._raise_no_opportunity(scan)
-        opportunity = opportunities[0]
-
-        trigger_run = TriggerService(store=container.store, clock=container.clock).evaluate(
-            opportunity.opportunity_id
-        )
-        if trigger_run.trigger is None:
-            raise ReplayError(
-                "replay trigger did not fire; the fixture window is not replayable: "
-                + "; ".join(trigger_run.evaluation.reasons)
-            )
-        trigger_id = trigger_run.trigger.trigger_id
-        kill = KillSwitch(
-            settings=container.settings,
-            store=container.store,
-            clock=container.clock,
-        )
-        entry = EntryService(
-            store=container.store,
-            clock=container.clock,
-            provider=source,
-            settings=container.settings,
-            kill_switch=kill,
-        )
-        result = entry.accept(trigger_id, idempotency_key=f"replay-{self._config.run_id}")
-
-        stored_trigger = container.store.get_trigger_event(trigger_id)
-        if stored_trigger is None:  # pragma: no cover - accept writes it atomically
-            raise ReplayError("replay trigger disappeared after accept")
-        trigger_payload = json.loads(stored_trigger.payload_json)
-        decision = container.store.get_decision(result.decision_id)
-        decision_payload = {} if decision is None else json.loads(decision.payload_json)
-        provenance = decision_payload.get("provenance") or {}
-        metrics_payload = json.loads(scan.report.metrics_json)
-
-        return PaperLoopOutcome(
-            decision_id=result.decision_id,
-            decision_validation=str(decision_payload.get("validation_status") or ""),
-            metric_version=metrics_payload.get("metric_version"),
-            prompt_version=provenance.get("prompt_version"),
-            knowledge_artifact_hash=provenance.get("knowledge_artifact_hash"),
-            llm_provider=provenance.get("provider"),
-            llm_model=provenance.get("model"),
-            data_quality=str(trigger_payload.get("data_quality") or ""),
-            opportunity=json.loads(opportunity.payload_json),
-            trigger=trigger_payload,
-            order=result.order,
-            fill=result.fill,
-            position=result.position,
-            account=result.account,
-            risk_verdict=result.risk_verdict,
-        )
-
-    @staticmethod
-    def _raise_no_opportunity(scan: Any) -> None:
-        llm_state = getattr(scan, "llm_state", {}) or {}
-        reason = str(llm_state.get("reason") or "")
-        if "recorded LLM output" in reason or "LLM_RECORDING_MISSING" in reason:
-            raise ReplayError(
-                "no recorded LLM output for role=ANALYSIS; record one or pass --live-llm: " + reason
-            )
-        raise ReplayError("replay produced no OPEN opportunity; " + (reason or "unknown reason"))
-
-    def run(self) -> PaperLoopResult:
-        """Run the loop twice, compare every stable value, and write a summary."""
-        first = self._run_once("attempt-1")
-        second = self._run_once("attempt-2")
-        left = _stable_outcome(first)
-        right = _stable_outcome(second)
-        if _canonical_json(left) != _canonical_json(right):
-            raise ReplayNonDeterministicError(
-                "paper-loop replay is non-deterministic: attempt-1 and attempt-2 produced "
-                "different decisions, triggers, orders, fills, positions, or account values"
-            )
-
-        summary_path = (self.run_root / "summary.json").resolve()
-        if not summary_path.is_relative_to(self._replay_root.resolve()):
-            raise ReplayError("replay summary escaped the replay namespace")
-        summary = {
-            "run_id": self._config.run_id,
-            "environment": self._config.environment.upper(),
-            "symbol": self._config.symbol,
-            "period": self._config.period,
-            "attempts": 2,
-            "deterministic": True,
-            "outcome": left,
-        }
-        _write_atomic(summary_path, _canonical_json(summary))
-
-        order = first.order or {}
-        fill = first.fill or {}
-        position = first.position or {}
-        return PaperLoopResult(
-            run_id=self._config.run_id,
-            trigger_id=str(first.trigger.get("trigger_id") or ""),
-            decision_id=first.decision_id,
-            decision_validation=first.decision_validation,
-            order_id=None if first.order is None else str(order.get("order_id") or ""),
-            fill_id=None if first.fill is None else str(fill.get("fill_id") or ""),
-            position_id=None if first.position is None else str(position.get("position_id") or ""),
-            entry_price=None if first.fill is None else str(fill.get("price") or ""),
-            fee=None if first.fill is None else str(fill.get("fee") or ""),
-            position_size=(None if first.position is None else str(position.get("size") or "")),
-            position_value=(
-                None if first.position is None else str(position.get("notional_usd") or "")
-            ),
-            summary_path=str(summary_path),
         )

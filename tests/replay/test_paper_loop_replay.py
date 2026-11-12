@@ -8,6 +8,9 @@ from datetime import UTC, date, datetime
 from pathlib import Path
 from typing import Any
 
+import pytest
+
+from oft.adapters.llm_stub import LLMStub
 from oft.application.entry_service import EntryService
 from oft.application.kill_switch import KillSwitch
 from oft.application.scan_service import ScanRequest, ScanService
@@ -15,6 +18,14 @@ from oft.application.trigger_service import TriggerService
 from oft.bootstrap import build_container
 from oft.clock import FixedClock
 from oft.config import Settings
+from oft.ports.llm import LLMRequest, LLMResult
+from oft.replay.paper_loop import (
+    PaperLoopConfig,
+    PaperLoopReplay,
+    ReplayError,
+)
+
+pytestmark = pytest.mark.replay
 
 ROOT = Path(__file__).resolve().parents[2]
 ARCHIVE = ROOT / "tests" / "fixtures" / "archive"
@@ -121,8 +132,6 @@ def test_replay_does_not_invent_a_provider_or_credential(tmp_path: Path) -> None
 
 
 def _paper_loop(tmp_path: Path, recordings: Path) -> Any:
-    from oft.replay.harness import PaperLoopConfig, PaperLoopReplay
-
     config = PaperLoopConfig(
         symbol="BTCUSDT",
         archive_fixture_dir=ARCHIVE,
@@ -192,3 +201,49 @@ def test_replaying_the_same_scenario_twice_is_identical(
     assert first.entry_price == second.entry_price
     assert first.fee == second.fee
     assert first.position_value == second.position_value
+
+
+def test_rerunning_an_existing_run_fails_before_writing(
+    tmp_path: Path, replay_recordings: Path
+) -> None:
+    first = _paper_loop(tmp_path, replay_recordings)
+    summary = Path(first.summary_path)
+    before = summary.read_bytes()
+
+    with pytest.raises(ReplayError, match="already exists.*--run-id"):
+        _paper_loop(tmp_path, replay_recordings)
+
+    assert summary.read_bytes() == before
+
+
+def test_live_llm_calls_the_provider_once_per_recorded_request(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    calls = {"count": 0}
+    original = LLMStub.complete
+
+    def counting(self: LLMStub, request: LLMRequest) -> LLMResult:
+        calls["count"] += 1
+        return original(self, request)
+
+    monkeypatch.setattr(LLMStub, "complete", counting)
+    recordings = tmp_path / "recordings"
+    config = PaperLoopConfig(
+        symbol="BTCUSDT",
+        archive_fixture_dir=ARCHIVE,
+        backfill_start=START,
+        backfill_end=END,
+        recordings_dir=recordings,
+        live_llm=True,
+        provider="stub",
+        run_id="live",
+    )
+
+    result = PaperLoopReplay(data_dir=tmp_path / "data", config=config).run()
+
+    recorded = sorted(recordings.rglob("*.json"))
+    assert result.deterministic is True
+    assert recorded
+    # One provider call per request; attempt-2 read the recordings instead of
+    # calling the provider again (which would double the count).
+    assert calls["count"] == len(recorded)

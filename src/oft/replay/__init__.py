@@ -12,11 +12,7 @@ from oft.replay.event_source import (
     load_agg_trade_csv,
 )
 from oft.replay.harness import (
-    PAPER_LOOP_NAMESPACE,
     REPLAY_NAMESPACE,
-    PaperLoopConfig,
-    PaperLoopReplay,
-    PaperLoopResult,
     ReplayConfig,
     ReplayError,
     ReplayHarness,
@@ -30,6 +26,14 @@ from oft.replay.llm_source import (
     RecordedLLMSource,
     RecordingLLMSource,
 )
+from oft.replay.paper_loop import (
+    PAPER_LOOP_NAMESPACE,
+    PaperLoopConfig,
+    PaperLoopOutcome,
+    PaperLoopReplay,
+    PaperLoopResult,
+    validate_run_id,
+)
 
 __all__ = [
     "PAPER_LOOP_NAMESPACE",
@@ -40,6 +44,7 @@ __all__ = [
     "LLMRecordingInvalid",
     "MemoryEventSource",
     "PaperLoopConfig",
+    "PaperLoopOutcome",
     "PaperLoopReplay",
     "PaperLoopResult",
     "RecordedLLMSource",
@@ -54,4 +59,5 @@ __all__ = [
     "ReplayResult",
     "ReplayWindow",
     "load_agg_trade_csv",
+    "validate_run_id",
 ]

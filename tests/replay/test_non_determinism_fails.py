@@ -9,11 +9,15 @@ from pathlib import Path
 import pytest
 
 from oft.replay.harness import (
-    PaperLoopConfig,
-    PaperLoopReplay,
     ReplayError,
     ReplayNonDeterministicError,
 )
+from oft.replay.paper_loop import (
+    PaperLoopConfig,
+    PaperLoopReplay,
+)
+
+pytestmark = pytest.mark.replay
 
 ROOT = Path(__file__).resolve().parents[2]
 ARCHIVE = ROOT / "tests" / "fixtures" / "archive"
@@ -63,3 +67,9 @@ def test_no_recorded_output_fails_the_loop(tmp_path: Path) -> None:
             data_dir=tmp_path / "data",
             config=_config(tmp_path / "empty-recordings"),
         ).run()
+
+
+@pytest.mark.parametrize("run_id", [".", "..", "---", "a/b", "../escape"])
+def test_dot_and_path_like_run_ids_are_rejected(tmp_path: Path, run_id: str) -> None:
+    with pytest.raises(ReplayError, match="run_id"):
+        _config(tmp_path, run_id=run_id)

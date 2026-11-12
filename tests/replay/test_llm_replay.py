@@ -25,6 +25,8 @@ from oft.replay.llm_source import (
     RecordingLLMSource,
 )
 
+pytestmark = pytest.mark.replay
+
 ROOT = Path(__file__).resolve().parents[2]
 LLM_FIXTURES = ROOT / "tests" / "fixtures" / "llm"
 NOW = datetime(2026, 11, 6, 12, 0, tzinfo=UTC)

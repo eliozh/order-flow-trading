@@ -22,15 +22,18 @@ from oft.cli.commands.doctor import emit_error
 from oft.config import ConfigError, load_settings
 from oft.domain.time import utc_timestamp
 from oft.replay.harness import (
-    DEFAULT_REPLAY_NOW,
-    PaperLoopConfig,
-    PaperLoopReplay,
-    PaperLoopResult,
     ReplayError,
     ReplayLivePathError,
     ReplayNonDeterministicError,
 )
 from oft.replay.llm_source import LLMRecordingError
+from oft.replay.paper_loop import (
+    DEFAULT_REPLAY_NOW,
+    PaperLoopConfig,
+    PaperLoopReplay,
+    PaperLoopResult,
+    validate_run_id,
+)
 
 replay_app = typer.Typer(
     help="Deterministic paper-loop replay (offline; replay namespace only).",
@@ -161,6 +164,7 @@ def replay_run(
     try:
         settings = load_settings()
         resolved_now = _parse_datetime(now)
+        validate_run_id(run_id)
         resolved_archive = archive_fixture_dir or settings.archive_fixture_dir
         if resolved_archive is None:
             _fail(

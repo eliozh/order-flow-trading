@@ -8,7 +8,9 @@ from pathlib import Path
 import pytest
 from typer.testing import CliRunner
 
-from oft.replay.harness import PaperLoopResult
+from oft.replay.paper_loop import PaperLoopResult
+
+pytestmark = pytest.mark.replay
 
 ROOT = Path(__file__).resolve().parents[2]
 ARCHIVE = ROOT / "tests" / "fixtures" / "archive"
@@ -135,7 +137,7 @@ def _fake_result(tmp_path: Path) -> PaperLoopResult:
 def test_the_cli_renders_the_default_success_output(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    from oft.replay.harness import PaperLoopReplay
+    from oft.replay.paper_loop import PaperLoopReplay
 
     monkeypatch.setattr(PaperLoopReplay, "run", lambda self: _fake_result(tmp_path))
 
@@ -149,7 +151,8 @@ def test_the_cli_renders_the_default_success_output(
 def test_the_cli_reports_a_replay_error_as_a_json_envelope(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    from oft.replay.harness import PaperLoopReplay, ReplayError
+    from oft.replay.harness import ReplayError
+    from oft.replay.paper_loop import PaperLoopReplay
 
     def fail(self: PaperLoopReplay) -> PaperLoopResult:
         raise ReplayError("the fixture window is unusable")
@@ -201,6 +204,22 @@ def test_the_cli_requires_an_archive_fixture_directory(
     assert "--archive-fixture-dir" in result.output
 
 
+def test_the_cli_rejects_a_dot_or_path_like_run_id(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from oft.replay.paper_loop import PaperLoopReplay
+
+    def unexpected(self: PaperLoopReplay) -> PaperLoopResult:  # pragma: no cover - must not run
+        raise AssertionError("the replay must not start for an unsafe run id")
+
+    monkeypatch.setattr(PaperLoopReplay, "run", unexpected)
+
+    for run_id in (".", "..", "a/b"):
+        result = _invoke(tmp_path, monkeypatch, ["--run-id", run_id])
+        assert result.exit_code == 2, result.output
+        assert "run_id" in result.output
+
+
 def _raise(error: Exception) -> object:
     def fail(self: object) -> PaperLoopResult:
         raise error
@@ -225,8 +244,9 @@ def test_the_cli_maps_every_replay_failure_to_a_non_zero_exit(
 
     from oft.application.entry_service import EntryRejected
     from oft.config import ConfigError
-    from oft.replay.harness import PaperLoopReplay, ReplayNonDeterministicError
+    from oft.replay.harness import ReplayNonDeterministicError
     from oft.replay.llm_source import LLMRecordingError
+    from oft.replay.paper_loop import PaperLoopReplay
 
     instances: dict[str, Exception] = {
         "LLMRecordingError": LLMRecordingError("ENTRY_RECHECK", "a" * 64, _Path("/tmp")),

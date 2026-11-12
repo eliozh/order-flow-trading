@@ -22,9 +22,7 @@ from __future__ import annotations
 
 import hashlib
 import json
-import os
 import re
-import tempfile
 from collections.abc import Iterable
 from pathlib import Path
 
@@ -39,6 +37,7 @@ from oft.ports.llm import (
     ProviderCapabilities,
     redact,
 )
+from oft.replay.harness import write_atomic
 
 RECORDING_FORMAT_VERSION = "1.0.0"
 RECORDED_PRICE_VERSION = "recorded/v1"
@@ -87,23 +86,6 @@ def _recording_path(root: Path, role: str, input_hash: str) -> Path:
 
 def _content_hash(raw_text: str) -> str:
     return hashlib.sha256(raw_text.encode("utf-8")).hexdigest()
-
-
-def _write_atomic(path: Path, text: str) -> None:
-    path.parent.mkdir(parents=True, exist_ok=True)
-    descriptor, temporary_name = tempfile.mkstemp(
-        dir=path.parent,
-        prefix=f".{path.name}.",
-        suffix=".tmp",
-    )
-    try:
-        with os.fdopen(descriptor, "w", encoding="utf-8") as handle:
-            handle.write(text)
-            handle.flush()
-            os.fsync(handle.fileno())
-        os.replace(temporary_name, path)
-    finally:
-        Path(temporary_name).unlink(missing_ok=True)
 
 
 class RecordedLLMSource:
@@ -219,7 +201,7 @@ class RecordingLLMSource:
             "truncated": result.truncated,
             "recorded_at": utc_timestamp(self._clock.now()),
         }
-        _write_atomic(path, json.dumps(payload, indent=2, sort_keys=True) + "\n")
+        write_atomic(path, json.dumps(payload, indent=2, sort_keys=True) + "\n")
         return path
 
 
