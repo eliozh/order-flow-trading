@@ -2,7 +2,7 @@
 
 Covers the ``opportunities``, ``opportunity_events``, ``opportunity_conditions``,
 ``trigger_events``, ``risk_verdicts``, ``orders``, ``fills``, ``positions``, and
-``paper_accounts`` tables, the audit-chain insert helper, and their row mappers.
+``paper_accounts`` tables and their row mappers.
 """
 
 from __future__ import annotations
@@ -15,12 +15,11 @@ from contextlib import closing
 from decimal import ROUND_DOWN, Decimal
 from typing import TYPE_CHECKING, Literal
 
-from oft.domain.audit import AUDIT_HEAD_KEY, build_audit_entry
+from oft.adapters.sqlite_audit import SqliteAuditMixin
 from oft.domain.conditions import normalize_timestamp
 from oft.domain.opportunities import _ALLOWED_TRANSITIONS, OpportunityState
 from oft.ports.store import (
     AuditEventDraft,
-    AuditEventRecord,
     ConditionRecord,
     FillRecord,
     OmsCommit,
@@ -48,7 +47,7 @@ def _oms_conflict_kind(message: str) -> str:
     return "unknown"
 
 
-class TradingStoreMixin:
+class TradingStoreMixin(SqliteAuditMixin):
     """Read and write trading-ledger state and the paper OMS rows."""
 
     if TYPE_CHECKING:
@@ -1001,65 +1000,6 @@ class TradingStoreMixin:
             )
         stored = self.get_paper_account(record.account_id)
         return stored if stored is not None else record
-
-    def _insert_audit_event(
-        self, connection: sqlite3.Connection, draft: AuditEventDraft
-    ) -> AuditEventRecord:
-        previous = connection.execute(
-            "SELECT seq, event_hash FROM audit_events ORDER BY seq DESC LIMIT 1"
-        ).fetchone()
-        entry = build_audit_entry(
-            previous_seq=None if previous is None else int(previous["seq"]),
-            previous_hash=None if previous is None else str(previous["event_hash"]),
-            event_type=draft.event_type,
-            actor=draft.actor,
-            subject=draft.subject,
-            payload=draft.payload,
-            created_at=draft.created_at,
-        )
-        record = AuditEventRecord(
-            event_id=entry.event_id,
-            seq=entry.seq,
-            event_type=draft.event_type,
-            created_at=draft.created_at,
-            previous_hash=entry.previous_hash,
-            event_hash=entry.event_hash,
-            payload_json=entry.payload_json,
-        )
-        connection.execute(
-            """
-            INSERT INTO audit_events (
-                event_id, seq, event_type, created_at, previous_hash,
-                event_hash, payload_json
-            ) VALUES (?, ?, ?, ?, ?, ?, ?)
-            """,
-            (
-                record.event_id,
-                record.seq,
-                record.event_type,
-                record.created_at,
-                record.previous_hash,
-                record.event_hash,
-                record.payload_json,
-            ),
-        )
-        # D7: a high-water mark outside the append-only table, written in the
-        # same transaction. Deleting the newest rows leaves a gap the chain
-        # scan alone cannot see; the head can.
-        connection.execute(
-            """
-            INSERT INTO system_state (key, value, updated_at) VALUES (?, ?, ?)
-            ON CONFLICT(key) DO UPDATE SET
-                value = excluded.value,
-                updated_at = excluded.updated_at
-            """,
-            (
-                AUDIT_HEAD_KEY,
-                json.dumps({"seq": record.seq, "event_hash": record.event_hash}, sort_keys=True),
-                record.created_at,
-            ),
-        )
-        return record
 
 
 def _row_to_opportunity(row: sqlite3.Row) -> OpportunityRecord:
