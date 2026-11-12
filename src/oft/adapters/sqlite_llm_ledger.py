@@ -13,9 +13,10 @@ from collections.abc import Callable
 from contextlib import closing
 from dataclasses import replace
 from decimal import ROUND_HALF_UP, Decimal, InvalidOperation
-from typing import TYPE_CHECKING, Any
+from typing import Any
 
 from oft.adapters.sqlite_audit import SqliteAuditMixin
+from oft.adapters.sqlite_connections import SqliteConnectionMixin
 from oft.domain.budget_periods import budget_record_id
 from oft.ports.store import (
     AuditEventDraft,
@@ -35,13 +36,8 @@ def _zero_budget_totals() -> dict[str, dict[str, Any]]:
     }
 
 
-class LLMStoreMixin(SqliteAuditMixin):
+class LLMStoreMixin(SqliteConnectionMixin, SqliteAuditMixin):
     """Read and write LLM calls, decisions, and budget rows."""
-
-    if TYPE_CHECKING:
-
-        def _connect(self) -> sqlite3.Connection: ...
-        def _connect_read_only(self) -> sqlite3.Connection | None: ...
 
     # -- LLM decision ledger ---------------------------------------------
 

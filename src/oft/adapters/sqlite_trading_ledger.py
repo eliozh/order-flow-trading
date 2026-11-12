@@ -13,9 +13,10 @@ import sqlite3
 from collections.abc import Sequence
 from contextlib import closing
 from decimal import ROUND_DOWN, Decimal
-from typing import TYPE_CHECKING, Literal
+from typing import Literal
 
 from oft.adapters.sqlite_audit import SqliteAuditMixin
+from oft.adapters.sqlite_connections import SqliteConnectionMixin
 from oft.domain.conditions import normalize_timestamp
 from oft.domain.opportunities import _ALLOWED_TRANSITIONS, OpportunityState
 from oft.ports.store import (
@@ -47,13 +48,8 @@ def _oms_conflict_kind(message: str) -> str:
     return "unknown"
 
 
-class TradingStoreMixin(SqliteAuditMixin):
+class TradingStoreMixin(SqliteConnectionMixin, SqliteAuditMixin):
     """Read and write trading-ledger state and the paper OMS rows."""
-
-    if TYPE_CHECKING:
-
-        def _connect(self) -> sqlite3.Connection: ...
-        def _connect_read_only(self) -> sqlite3.Connection | None: ...
 
     # -- Opportunity ledger ----------------------------------------------
 

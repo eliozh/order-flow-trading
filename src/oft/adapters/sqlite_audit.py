@@ -1,8 +1,10 @@
-"""Audit-chain mixin: the append-only ``audit_events`` table and its head.
+"""Audit-chain mixin: the append-only ``audit_events`` chain insert and head.
 
 Owns the ``audit_events`` chain insert and the ``system_state`` entry named by
 ``AUDIT_HEAD_KEY`` (``audit_head``), which records the last (seq, event_hash)
-written so tail truncation stays detectable (ADR-0006, D7).
+written so tail truncation stays detectable (ADR-0006, D7). The
+``audit_events`` table DDL and its append-only triggers live in
+``sqlite_store.py``.
 """
 
 from __future__ import annotations

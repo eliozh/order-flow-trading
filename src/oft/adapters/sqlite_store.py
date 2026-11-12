@@ -1,7 +1,9 @@
 """SQLite transactional store (WAL) for scans and the Parquet manifest.
 
-The daemon is the only writer. Diagnostic commands open the database with
-``mode=ro`` so ``oft status`` / ``oft doctor`` never block or create files.
+Composes the connection, LLM-ledger, trading-ledger, and audit mixins, and owns
+the schema DDL and migrations. The daemon is the only writer. Diagnostic
+commands open the database with ``mode=ro`` so ``oft status`` / ``oft doctor``
+never block or create files.
 """
 
 from __future__ import annotations
@@ -17,7 +19,7 @@ from decimal import Decimal
 from pathlib import Path
 from typing import Any
 
-from oft.adapters.sqlite_connections import _BUSY_TIMEOUT_MS, SqliteConnectionMixin
+from oft.adapters.sqlite_connections import configure_connection
 from oft.adapters.sqlite_llm_ledger import LLMStoreMixin
 from oft.adapters.sqlite_trading_ledger import TradingStoreMixin
 from oft.config import Settings
@@ -1725,8 +1727,7 @@ def initialize_database(settings: Settings) -> None:
         # concurrent initializer fail with SQLITE_BUSY before the handler
         # existed. ``_enable_wal`` additionally retries the switch, because
         # that pragma does not always consult the handler.
-        connection.execute(f"PRAGMA busy_timeout={_BUSY_TIMEOUT_MS}")
-        connection.execute("PRAGMA foreign_keys=ON")
+        configure_connection(connection)
         connection.execute("PRAGMA synchronous=NORMAL")
         _enable_wal(connection)
         _ensure_opportunities_expires_at(connection)
@@ -2111,7 +2112,7 @@ def _row_to_scan_symbol(row: sqlite3.Row) -> ScanSymbolRecord:
     )
 
 
-class SqliteStore(SqliteConnectionMixin, LLMStoreMixin, TradingStoreMixin):
+class SqliteStore(LLMStoreMixin, TradingStoreMixin):
     """Concrete :class:`oft.ports.store.StorePort` implementation."""
 
     def __init__(self, settings: Settings) -> None:
