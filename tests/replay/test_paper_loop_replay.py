@@ -115,3 +115,80 @@ def test_replay_does_not_invent_a_provider_or_credential(tmp_path: Path) -> None
     assert payload["decision"]["provenance"]["provider"] == "stub"
     assert payload["decision"]["provenance"]["model"] == "fixture"
     assert payload["decision"]["provenance"]["cost"]["unpriced"] is True
+
+
+# -- full paper-loop replay (slice 21) --------------------------------------
+
+
+def _paper_loop(tmp_path: Path, recordings: Path) -> Any:
+    from oft.replay.harness import PaperLoopConfig, PaperLoopReplay
+
+    config = PaperLoopConfig(
+        symbol="BTCUSDT",
+        archive_fixture_dir=ARCHIVE,
+        backfill_start=START,
+        backfill_end=END,
+        recordings_dir=recordings,
+        run_id="paper-loop",
+    )
+    return PaperLoopReplay(data_dir=tmp_path / "replay-data", config=config).run()
+
+
+def _outcome(result: Any) -> dict[str, Any]:
+    return json.loads(Path(result.summary_path).read_text(encoding="utf-8"))["outcome"]
+
+
+def test_the_full_loop_replays_decisions_triggers_orders_fills_and_positions(
+    tmp_path: Path, replay_recordings: Path
+) -> None:
+    result = _paper_loop(tmp_path, replay_recordings)
+    outcome = _outcome(result)
+
+    assert result.deterministic is True
+    assert outcome["decision_id"] == result.decision_id
+    assert outcome["decision_validation"] == "VALID"
+    assert outcome["metric_version"].startswith("orderflow_metrics.v1.")
+    assert outcome["prompt_version"] == 1
+    # The recorded source preserves the original provenance; replay invents none.
+    assert (outcome["llm_provider"], outcome["llm_model"]) == ("stub", "fixture")
+
+    trigger = outcome["trigger"]
+    assert trigger["trigger_id"] == result.trigger_id
+    assert trigger["snapshot"]["snapshot_hash"]
+
+    order = outcome["order"]
+    assert order["order_id"] == result.order_id
+    assert order["status"] == "FILLED"
+    assert order["client_order_id"].startswith("oft-paper-BTCUSDT-entry-")
+
+    fill = outcome["fill"]
+    assert fill["fill_id"] == result.fill_id
+    assert fill["source"] == "PAPER"
+    assert fill["price"] == result.entry_price
+    assert fill["fee"] == result.fee
+
+    position = outcome["position"]
+    assert position["position_id"] == result.position_id
+    assert position["entry_price"] == fill["price"]
+    assert position["avg_entry_price"] == fill["price"]
+    assert position["size"] == result.position_size
+    assert position["notional_usd"] == result.position_value
+    assert position["fees_usd"] == fill["fee"]
+    # This milestone records no PnL; a replay must not fabricate one.
+    assert position["unrealized_pnl_usd"] is None
+    assert outcome["account"]["balance"] != "10000.00"
+
+
+def test_replaying_the_same_scenario_twice_is_identical(
+    tmp_path: Path, replay_recordings: Path
+) -> None:
+    first = _paper_loop(tmp_path / "first", replay_recordings)
+    second = _paper_loop(tmp_path / "second", replay_recordings)
+
+    assert _outcome(first) == _outcome(second)
+    assert first.order_id == second.order_id
+    assert first.fill_id == second.fill_id
+    assert first.position_id == second.position_id
+    assert first.entry_price == second.entry_price
+    assert first.fee == second.fee
+    assert first.position_value == second.position_value

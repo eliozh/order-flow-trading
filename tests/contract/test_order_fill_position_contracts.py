@@ -111,3 +111,41 @@ def _assert_risk_verdict_contract(verdict: dict) -> None:
     errors = list(Draft202012Validator(schema).iter_errors(verdict))
 
     assert not errors, "\n".join(error.message for error in errors)
+
+
+def test_duplicate_equity_stale_inputs_are_never_duplicated() -> None:
+    """The stale-input list names each unmeasured input exactly once (D1)."""
+    from decimal import Decimal
+
+    from oft.domain.risk import DEFAULT_CAPS, RiskRequest, evaluate_risk
+
+    verdict = evaluate_risk(
+        request=RiskRequest(
+            symbol="BTCUSDT",
+            side="LONG",
+            entry_price=Decimal("70000.00"),
+            stop_price=Decimal("69000.00"),
+            quantity=Decimal("0.01"),
+            risk_pct=0.8,
+            leverage=2.0,
+            notional_usd=None,
+        ),
+        caps=DEFAULT_CAPS,
+        equity=Decimal("10000.00"),
+        open_positions=0,
+        daily_loss_usd=None,
+        mark_price=Decimal("70000.00"),
+        mark_as_of="2026-11-06T11:59:30.000Z",
+        now="2026-11-06T12:00:00.000Z",
+        tick_size=Decimal("0.10"),
+        step_size=Decimal("0.001"),
+        min_notional=Decimal("5.00"),
+        equity_stale_inputs=("daily_loss_usd", "mark"),
+    )
+
+    assert verdict.stale_inputs == (
+        "daily_loss_usd",
+        "spread_bps",
+        "expected_slippage_bps",
+        "mark",
+    )

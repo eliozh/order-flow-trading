@@ -5,6 +5,7 @@ from __future__ import annotations
 import shutil
 import socket
 from dataclasses import asdict, dataclass
+from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any, Literal
 
@@ -242,6 +243,130 @@ def _secrets_check(settings: Settings) -> CheckResult:
     return CheckResult("config.secrets", "ok", "no secrets configured")
 
 
+def _provider_check(settings: Settings) -> CheckResult:
+    """Report the configured LLM provider without ever reading a key value."""
+    from oft.application.llm_orchestrator import provider_configured
+
+    name = (settings.llm_provider or "").strip().lower()
+    if not name:
+        return CheckResult(
+            "config.provider",
+            "ok",
+            "no LLM provider configured (CALC-only)",
+        )
+    if name == "stub":
+        return CheckResult(
+            "config.provider",
+            "ok",
+            "provider=stub (deterministic fixture provider)",
+        )
+    if provider_configured(settings, name):
+        return CheckResult(
+            "config.provider",
+            "ok",
+            f"provider={name} configured (key present, value not displayed)",
+        )
+    return CheckResult(
+        "config.provider",
+        "degraded",
+        f"provider={name} is not configured (missing API key)",
+    )
+
+
+def _budget_ledger_check(store: StorePort) -> CheckResult:
+    """Verify the budget ledger is readable and every row carries a valid cost."""
+    from decimal import Decimal, InvalidOperation
+
+    try:
+        records = store.list_budget_records()
+    except Exception as exc:  # pragma: no cover - defensive boundary
+        return CheckResult("budget.ledger", "degraded", f"budget ledger unreadable ({exc})")
+    invalid = 0
+    for record in records:
+        try:
+            cost = Decimal(str(record.cost_usd))
+        except (InvalidOperation, TypeError, ValueError):
+            invalid += 1
+            continue
+        if not cost.is_finite() or cost < 0:
+            invalid += 1
+    unpriced = sum(1 for record in records if record.unpriced)
+    if invalid:
+        return CheckResult(
+            "budget.ledger",
+            "degraded",
+            f"{invalid} budget record(s) have an invalid cost",
+        )
+    return CheckResult(
+        "budget.ledger",
+        "ok",
+        f"{len(records)} budget record(s), {unpriced} unpriced",
+    )
+
+
+_STALE_TRIGGER_STATUSES = ("PENDING_RECHECK", "RECHECKED")
+_TRIGGER_PAGE_SIZE = 200
+
+
+def _stale_triggers_check(
+    store: StorePort, clock: ClockPort, stale_after_seconds: int
+) -> CheckResult:
+    """Count triggers waiting for a re-check longer than the freshness budget."""
+    now = clock.now().astimezone(UTC)
+    stale = 0
+    total = 0
+    try:
+        for status in _STALE_TRIGGER_STATUSES:
+            offset = 0
+            while True:
+                page = store.list_trigger_events(
+                    status=status, limit=_TRIGGER_PAGE_SIZE, offset=offset
+                )
+                if not page:
+                    break
+                for record in page:
+                    total += 1
+                    try:
+                        triggered_at = datetime.fromisoformat(
+                            record.triggered_at.replace("Z", "+00:00")
+                        )
+                    except (TypeError, ValueError):
+                        stale += 1
+                        continue
+                    if (now - triggered_at.astimezone(UTC)).total_seconds() > stale_after_seconds:
+                        stale += 1
+                offset += len(page)
+    except Exception as exc:  # pragma: no cover - defensive boundary
+        return CheckResult("triggers.stale", "degraded", f"trigger ledger unreadable ({exc})")
+    if stale:
+        return CheckResult(
+            "triggers.stale",
+            "degraded",
+            f"{stale} trigger(s) awaiting a re-check beyond {stale_after_seconds}s; "
+            "re-check or reject them",
+        )
+    return CheckResult(
+        "triggers.stale",
+        "ok",
+        f"no stale pending triggers ({total} waiting)",
+    )
+
+
+def _kill_switch_check(settings: Settings, store: StorePort, clock: ClockPort) -> CheckResult:
+    """Report the kill-switch state; an active switch blocks new paper orders."""
+    from oft.application.kill_switch import KillSwitch
+
+    try:
+        active = KillSwitch(settings=settings, store=store, clock=clock).is_active()
+    except Exception as exc:  # pragma: no cover - defensive boundary
+        return CheckResult("kill_switch", "degraded", f"kill switch state unreadable ({exc})")
+    if active:
+        return CheckResult(
+            "kill_switch", "degraded", "kill switch is ACTIVE; new orders are blocked"
+        )
+    return CheckResult("kill_switch", "ok", "kill switch clear")
+
+
 def build_doctor(
     settings: Settings,
     store: StorePort,
@@ -304,6 +429,10 @@ def build_doctor(
         _manifest_orphans_check(settings, store),
         _stale_jobs_check(store, clock),
         _audit_chain_check(store),
+        _provider_check(settings),
+        _budget_ledger_check(store),
+        _stale_triggers_check(store, clock, settings.trigger_stale_after_seconds),
+        _kill_switch_check(settings, store, clock),
         _secrets_check(settings),
         ingest_check,
         ws_check,

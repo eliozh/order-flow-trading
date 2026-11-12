@@ -15,7 +15,9 @@ from decimal import Decimal
 from pathlib import Path
 from typing import Any
 
+import _helpers
 import pytest
+from _registry import PAPER_LOOP_CONTRACTS, validate
 from jsonschema import Draft202012Validator
 from referencing import Registry, Resource
 from referencing.jsonschema import DRAFT202012
@@ -301,3 +303,24 @@ def test_every_json_fixture_has_a_known_schema_mapping() -> None:
         unmapped.append(str(path.relative_to(ROOT)))
 
     assert not unmapped, "add a schema mapping for new JSON fixtures:\n" + "\n".join(unmapped)
+
+
+def test_the_paper_loop_persists_only_registered_contract_families(tmp_path: Path) -> None:
+    """Every paper-loop record family validates, including the budget ledger."""
+    loop = _helpers.build_loop(tmp_path)
+
+    assert loop["budget_records"], "the loop must persist at least one budget record"
+    for record in loop["budget_records"]:
+        validate(PAPER_LOOP_CONTRACTS["budget"], record)
+
+    validate(PAPER_LOOP_CONTRACTS["trigger"], loop["trigger"])
+    assert loop["decision"] is not None
+    validate(PAPER_LOOP_CONTRACTS["decision"], loop["decision"])
+
+    result = loop["result"]
+    assert result.order is not None
+    assert result.fill is not None
+    assert result.position is not None
+    validate(PAPER_LOOP_CONTRACTS["order"], result.order)
+    validate(PAPER_LOOP_CONTRACTS["fill"], result.fill)
+    validate(PAPER_LOOP_CONTRACTS["position"], result.position)
