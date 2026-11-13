@@ -207,6 +207,29 @@ class ApiClient:
         query = f"?token={quote(token, safe='')}" if token is not None else ""
         return self._request("DELETE", f"/api/v1/kill-switch{query}")
 
+    # -- Positions and the trade journal ---------------------------------
+
+    def list_positions(self, *, state: str | None = None, limit: int = 100) -> dict[str, Any]:
+        query = f"?limit={limit}"
+        if state:
+            query += f"&state={quote(state, safe='')}"
+        return self._request("GET", f"/api/v1/positions{query}")
+
+    def get_position(self, position_id: str) -> dict[str, Any]:
+        return self._request("GET", f"/api/v1/positions/{quote(position_id, safe='')}")
+
+    def monitor_position(self, position_id: str) -> dict[str, Any]:
+        return self._request("POST", f"/api/v1/positions/{quote(position_id, safe='')}/monitor", {})
+
+    def list_trade_logs(self, *, symbol: str | None = None, limit: int = 100) -> dict[str, Any]:
+        query = f"?limit={limit}"
+        if symbol:
+            query += f"&symbol={quote(symbol, safe='')}"
+        return self._request("GET", f"/api/v1/journal{query}")
+
+    def get_trade_log(self, trade_id: str) -> dict[str, Any]:
+        return self._request("GET", f"/api/v1/journal/{quote(trade_id, safe='')}")
+
     # -- Prompts ---------------------------------------------------------
 
     def list_prompts(self) -> dict[str, Any]:

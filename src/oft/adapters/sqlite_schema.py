@@ -33,7 +33,7 @@ from oft.domain.prompts import (
 _LOGGER = logging.getLogger(__name__)
 
 
-_SCHEMA_VERSION = 21
+_SCHEMA_VERSION = 22
 # ``PRAGMA journal_mode=WAL`` needs an exclusive lock and does not reliably
 # consult the busy handler, so a concurrent initializer can still see
 # SQLITE_BUSY with the timeout installed. Retry the switch briefly.
@@ -274,6 +274,70 @@ _POSITIONS_DEFINITION = f"""
     opened_at TEXT NOT NULL,
     payload_json TEXT NOT NULL
 """
+
+# v22: the closed-trade journal and the append-only management timeline.
+_TRADE_LOGS_DEFINITION = """
+    trade_id TEXT PRIMARY KEY,
+    position_id TEXT NOT NULL UNIQUE REFERENCES positions(position_id),
+    account_id TEXT NOT NULL REFERENCES paper_accounts(account_id),
+    environment TEXT NOT NULL,
+    symbol TEXT NOT NULL,
+    side TEXT NOT NULL CHECK (side IN ('LONG','SHORT')),
+    opened_at TEXT NOT NULL,
+    closed_at TEXT NOT NULL,
+    net_pnl_usd TEXT NOT NULL,
+    idempotency_key TEXT NOT NULL,
+    payload_json TEXT NOT NULL,
+    order_id TEXT NOT NULL REFERENCES orders(order_id),
+    fill_id TEXT NOT NULL REFERENCES fills(fill_id),
+    risk_verdict_id TEXT NOT NULL REFERENCES risk_verdicts(risk_verdict_id),
+    decision_id TEXT NOT NULL REFERENCES decisions(decision_id)
+"""
+# Exactly the actions the application writes to the management timeline.
+_POSITION_EVENT_ACTIONS = ("FULL_CLOSE",)
+_POSITION_EVENTS_DEFINITION = f"""
+    position_id TEXT NOT NULL REFERENCES positions(position_id),
+    seq INTEGER NOT NULL CHECK (seq > 0),
+    at TEXT NOT NULL,
+    action TEXT NOT NULL CHECK (
+        action IN ({_enum_check(_POSITION_EVENT_ACTIONS)})
+    ),
+    order_id TEXT,
+    note TEXT NOT NULL,
+    PRIMARY KEY (position_id, seq)
+"""
+_TRADE_LOGS_TABLE = f"CREATE TABLE IF NOT EXISTS trade_logs ({_TRADE_LOGS_DEFINITION});"
+# The journal reads with ``ORDER BY closed_at DESC, trade_id ASC``; the
+# composite indexes match that exact order, and the account index covers the
+# foreign-key child column so a parent delete/update is not a full scan.
+_TRADE_LOGS_INDEX_NAMES = (
+    "trade_logs_closed",
+    "trade_logs_symbol_closed",
+    "trade_logs_account_id",
+)
+_TRADE_LOGS_INDEXES = (
+    "DROP INDEX IF EXISTS trade_logs_closed_at;",
+    "DROP INDEX IF EXISTS trade_logs_symbol;",
+    "CREATE INDEX IF NOT EXISTS trade_logs_closed ON trade_logs(closed_at DESC, trade_id ASC);",
+    "CREATE INDEX IF NOT EXISTS trade_logs_symbol_closed "
+    "ON trade_logs(symbol, closed_at DESC, trade_id ASC);",
+    "CREATE INDEX IF NOT EXISTS trade_logs_account_id ON trade_logs(account_id);",
+)
+_POSITION_EVENTS_TABLE = (
+    f"CREATE TABLE IF NOT EXISTS position_events ({_POSITION_EVENTS_DEFINITION});"
+)
+_POSITION_EVENTS_TRIGGER_NAMES = ("position_events_no_update", "position_events_no_delete")
+_POSITION_EVENTS_TRIGGERS = (
+    "DROP TRIGGER IF EXISTS position_events_no_update;",
+    "CREATE TRIGGER position_events_no_update BEFORE UPDATE ON position_events "
+    "BEGIN SELECT RAISE(ABORT, 'position_events is append-only'); END;",
+    "DROP TRIGGER IF EXISTS position_events_no_delete;",
+    "CREATE TRIGGER position_events_no_delete BEFORE DELETE ON position_events "
+    "BEGIN SELECT RAISE(ABORT, 'position_events is append-only'); END;",
+)
+_V22_DDL = "\n".join(
+    (_TRADE_LOGS_TABLE, *_TRADE_LOGS_INDEXES, _POSITION_EVENTS_TABLE, *_POSITION_EVENTS_TRIGGERS)
+)
 
 # Every column copied by the v21 rebuild, in table order.
 _V21_REBUILDS: tuple[tuple[str, str, tuple[str, ...]], ...] = (
@@ -772,6 +836,7 @@ _SCHEMA_SQL = f"""
         updated_at TEXT NOT NULL
     );
 {_OPPORTUNITY_CONDITIONS_DDL}
+{_V22_DDL}
 """
 
 
@@ -1816,6 +1881,125 @@ def _migrate_v21(connection: sqlite3.Connection) -> None:
         connection.execute("PRAGMA foreign_keys=ON")
 
 
+def _v22_objects_present(connection: sqlite3.Connection) -> bool:
+    """Whether every v22 table, index, and trigger already exists.
+
+    The migration is one transaction, so testing the full set tells a
+    concurrent initializer that the other writer already applied it.
+    """
+    if not (
+        _table_exists(connection, "trade_logs") and _table_exists(connection, "position_events")
+    ):
+        return False
+    indexes = {row[1] for row in connection.execute("PRAGMA index_list(trade_logs)")}
+    if not set(_TRADE_LOGS_INDEX_NAMES) <= indexes:
+        return False
+    triggers = {
+        row[0]
+        for row in connection.execute("SELECT name FROM sqlite_master WHERE type = 'trigger'")
+    }
+    return set(_POSITION_EVENTS_TRIGGER_NAMES) <= triggers
+
+
+def _backfill_position_source_trigger_ids(connection: sqlite3.Connection) -> None:
+    """Copy ``source_trigger_id`` from each position's ENTRY order into its payload.
+
+    Before this slice a position payload did not carry ``source_trigger_id``,
+    so the exit verdict had no real parent trigger and close failed as
+    ``DATA_UNAVAILABLE``. The order row already knows the trigger; the backfill
+    matches an ENTRY order by the ``position_id`` recorded in its payload and
+    writes the trigger id into the OPEN position's payload. No column is added;
+    a malformed row is skipped with a warning rather than aborting the upgrade.
+    """
+    if not (_table_exists(connection, "positions") and _table_exists(connection, "orders")):
+        return
+    position_columns = {row[1] for row in connection.execute("PRAGMA table_info(positions)")}
+    order_columns = {row[1] for row in connection.execute("PRAGMA table_info(orders)")}
+    if not {"position_id", "state", "payload_json"} <= position_columns:
+        return
+    if not {"trigger_id", "purpose", "payload_json"} <= order_columns:
+        return
+    triggers_by_position: dict[str, str] = {}
+    for row in connection.execute(
+        "SELECT trigger_id, payload_json FROM orders "
+        "WHERE purpose = 'ENTRY' AND trigger_id IS NOT NULL"
+    ):
+        try:
+            order_payload = json.loads(row[1])
+        except (json.JSONDecodeError, TypeError, ValueError):
+            _LOGGER.warning("skipping unreadable ENTRY order payload during v22 backfill")
+            continue
+        if not isinstance(order_payload, dict):
+            continue
+        position_id = order_payload.get("position_id")
+        if position_id is not None:
+            triggers_by_position.setdefault(str(position_id), str(row[0]))
+    if not triggers_by_position:
+        return
+    for row in connection.execute(
+        "SELECT position_id, payload_json FROM positions WHERE state = 'OPEN'"
+    ).fetchall():
+        try:
+            payload = json.loads(row[1])
+        except (json.JSONDecodeError, TypeError, ValueError):
+            _LOGGER.warning(
+                "skipping unreadable position payload during v22 backfill: %s",
+                row[0],
+            )
+            continue
+        if not isinstance(payload, dict) or payload.get("source_trigger_id"):
+            continue
+        position_id = str(payload.get("position_id") or row[0])
+        trigger_id = triggers_by_position.get(position_id)
+        if trigger_id is None:
+            _LOGGER.warning(
+                "no ENTRY order to backfill source_trigger_id for position %s", position_id
+            )
+            continue
+        payload["source_trigger_id"] = trigger_id
+        connection.execute(
+            "UPDATE positions SET payload_json = ? WHERE position_id = ?",
+            (json.dumps(payload, sort_keys=True), row[0]),
+        )
+
+
+def _migrate_v22(connection: sqlite3.Connection) -> None:
+    """Add ``trade_logs`` and the append-only ``position_events`` timeline (v22).
+
+    Both tables are new; the only data change is the ``source_trigger_id``
+    backfill for pre-v22 OPEN positions, which copies the trigger id already
+    recorded on the matching ENTRY order. ``IF NOT EXISTS`` plus the trigger
+    drop/create makes the migration idempotent; ``BEGIN IMMEDIATE`` serializes
+    two concurrent initializers and keeps the backfill in the same transaction.
+    A fresh database has no ``positions`` table yet, so the migration is a
+    no-op and ``_SCHEMA_SQL`` creates the full schema afterwards.
+    """
+    if not (_table_exists(connection, "positions") and _table_exists(connection, "paper_accounts")):
+        return
+    if connection.in_transaction:
+        connection.commit()
+    connection.execute("BEGIN IMMEDIATE")
+    try:
+        # Re-check under the write lock: a concurrent initializer may have
+        # already applied the migration after the unlocked version check that
+        # led here, in which case dropping/recreating is wasted work.
+        if _v22_objects_present(connection):
+            connection.execute("COMMIT")
+            return
+        connection.execute(_TRADE_LOGS_TABLE)
+        for statement in _TRADE_LOGS_INDEXES:
+            connection.execute(statement)
+        connection.execute(_POSITION_EVENTS_TABLE)
+        for statement in _POSITION_EVENTS_TRIGGERS:
+            connection.execute(statement)
+        _backfill_position_source_trigger_ids(connection)
+        connection.execute("COMMIT")
+    except Exception:
+        if connection.in_transaction:
+            connection.execute("ROLLBACK")
+        raise
+
+
 def _opportunity_conditions_pk(
     connection: sqlite3.Connection,
 ) -> tuple[str, ...]:
@@ -1985,14 +2169,15 @@ def _enable_wal(connection: sqlite3.Connection) -> None:
 
 
 def initialize_database(settings: Settings) -> None:
-    """Create the data directory and the schema, currently v21.
+    """Create the data directory and the schema, currently v22.
 
     v19 adds the trigger snapshot provenance columns (``snapshot_hash``,
     ``as_of``, ``data_quality``, ``condition_count``) and backfills them from
     recorded payloads. v20 binds paper orders to their trigger (with a partial
     UNIQUE index) and stores the measured risk inputs on each verdict. v21 adds
     the residual foreign keys and the enum CHECK constraints, rebuilding the six
-    affected tables.
+    affected tables. v22 adds ``trade_logs`` (unique ``position_id``) and the
+    append-only ``position_events`` timeline.
     """
     settings.data_dir.mkdir(parents=True, exist_ok=True)
     settings.data_dir.chmod(0o700)
@@ -2052,6 +2237,8 @@ def initialize_database(settings: Settings) -> None:
             _migrate_v20(connection)
         if _schema_version(connection) < 21 or not _migration_recorded(connection, 21):
             _migrate_v21(connection)
+        if _schema_version(connection) < 22 or not _migration_recorded(connection, 22):
+            _migrate_v22(connection)
         _ensure_opportunity_conditions_shape(connection)
         with connection:
             # ``_SCHEMA_SQL`` drops and recreates the immutability trigger, a
@@ -2143,7 +2330,11 @@ def initialize_database(settings: Settings) -> None:
             )
             connection.execute(
                 "INSERT OR IGNORE INTO schema_migrations (version, applied_at) VALUES (?, ?)",
-                (_SCHEMA_VERSION, "2026-11-11T00:00:00.000Z"),
+                (21, "2026-11-11T00:00:00.000Z"),
+            )
+            connection.execute(
+                "INSERT OR IGNORE INTO schema_migrations (version, applied_at) VALUES (?, ?)",
+                (_SCHEMA_VERSION, "2026-11-14T00:00:00.000Z"),
             )
             _seed_prompt_defaults(connection)
     finally:

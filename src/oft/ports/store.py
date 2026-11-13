@@ -534,6 +534,67 @@ class OmsCommit:
     audit: AuditEventRecord | None
 
 
+@dataclass(frozen=True)
+class PositionEventRecord:
+    """One append-only entry in a position's management timeline.
+
+    ``seq`` is ``None`` for a draft: the store assigns the next contiguous
+    sequence inside the close transaction. An explicit positive value is kept
+    as-is for tests and replay fixtures.
+    """
+
+    position_id: str
+    at: str
+    action: str
+    order_id: str | None
+    note: str
+    seq: int | None = None
+
+
+@dataclass(frozen=True)
+class TradeLogRecord:
+    """The one closed-trade record for a position, plus its query keys."""
+
+    trade_id: str
+    position_id: str
+    account_id: str
+    environment: str
+    symbol: str
+    side: str
+    opened_at: str
+    closed_at: str
+    net_pnl_usd: str
+    idempotency_key: str
+    payload_json: str
+    order_id: str = ""
+    fill_id: str = ""
+    risk_verdict_id: str = ""
+    decision_id: str = ""
+
+
+@dataclass(frozen=True)
+class ClosedPositionRecord:
+    """Everything one full close commits in a single transaction."""
+
+    order: OrderRecord
+    fill: FillRecord
+    position: PositionRecord
+    account: PaperAccountRecord
+    balance_delta: str
+    event: PositionEventRecord
+    trade_log: TradeLogRecord
+    audits: tuple[AuditEventDraft, ...] = ()
+
+
+@dataclass(frozen=True)
+class CloseCommitResult:
+    """The committed account row and audit records from one close."""
+
+    account: PaperAccountRecord
+    trade_log: TradeLogRecord
+    audits: tuple[AuditEventRecord, ...] = ()
+
+
 class StorePort(Protocol):
     """Persistence contract shared by the API and CLI diagnostics."""
 
@@ -987,6 +1048,37 @@ class StorePort(Protocol):
     def count_positions(self, *, state: str | None = None) -> int: ...
 
     def get_position(self, position_id: str) -> PositionRecord | None: ...
+
+    def update_open_position_payload(self, position_id: str, *, payload_json: str) -> bool:
+        """Replace an OPEN position's payload; ``False`` when it is not OPEN.
+
+        The caller owns the payload (including its version/``updated_at`` bump).
+        Only ``state = 'OPEN'`` rows change, so a concurrent close can never be
+        overwritten and no order is created for a stale tick.
+        """
+        ...
+
+    def save_close(self, record: ClosedPositionRecord) -> CloseCommitResult:
+        """Atomically commit a full close.
+
+        Writes the account balance delta, order, fill, the in-place position
+        update, the position event, the trade log, and every audit draft in one
+        ``BEGIN IMMEDIATE`` transaction. Any error rolls the whole unit back;
+        the position update must match exactly one OPEN row.
+        """
+        ...
+
+    def get_trade_log(self, trade_id: str) -> TradeLogRecord | None: ...
+
+    def get_trade_log_for_position(self, position_id: str) -> TradeLogRecord | None: ...
+
+    def list_trade_logs(
+        self, *, symbol: str | None = None, limit: int | None = 100, offset: int = 0
+    ) -> tuple[TradeLogRecord, ...]: ...
+
+    def count_trade_logs(self, *, symbol: str | None = None) -> int: ...
+
+    def list_position_events(self, position_id: str) -> tuple[PositionEventRecord, ...]: ...
 
     def get_paper_account(self, account_id: str) -> PaperAccountRecord | None: ...
 

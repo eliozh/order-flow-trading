@@ -6,7 +6,7 @@ from typing import Any
 
 from pydantic import BaseModel, ConfigDict, Field, field_validator
 
-from oft.api.schemas.trigger import Envelope
+from oft.api.schemas.envelope import Envelope
 from oft.domain.prompts import PromptKind, PromptRole, PromptStatus
 
 MAX_PROMPT_BODY_BYTES = 64 * 1024

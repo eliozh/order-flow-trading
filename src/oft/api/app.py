@@ -33,9 +33,11 @@ from oft.api.envelope import new_request_id
 from oft.api.errors import ApiError, error_response
 from oft.api.routes.budget import router as budget_router
 from oft.api.routes.data import router as data_router
+from oft.api.routes.journal import router as journal_router
 from oft.api.routes.llm import router as llm_router
 from oft.api.routes.opportunities import router as opportunities_router
 from oft.api.routes.paper import router as paper_router
+from oft.api.routes.positions import router as positions_router
 from oft.api.routes.prompts import router as prompts_router
 from oft.api.routes.reports import router as reports_router
 from oft.api.routes.scans import router as scans_router
@@ -246,6 +248,8 @@ def create_app(settings: Settings | None = None, *, clock: ClockPort | None = No
     app.include_router(opportunities_router)
     app.include_router(triggers_router)
     app.include_router(paper_router)
+    app.include_router(positions_router)
+    app.include_router(journal_router)
     app.include_router(prompts_router)
     app.include_router(data_router)
     app.include_router(llm_router)

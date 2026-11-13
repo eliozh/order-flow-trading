@@ -11,6 +11,7 @@ from pathlib import Path
 
 import pytest
 
+from oft.adapters.sqlite_connections import configure_connection
 from oft.adapters.sqlite_schema import _TRIGGER_STATUSES
 from oft.adapters.sqlite_store import SqliteStore, database_path
 from oft.config import Settings
@@ -87,7 +88,7 @@ def test_v1_database_upgrades_to_v2_with_effective_checks(tmp_path: Path) -> Non
     finally:
         connection.close()
 
-    assert versions == {1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21}
+    assert versions == set(range(1, 23))
 
 
 _V2_BACKFILL = """
@@ -145,7 +146,7 @@ def test_v2_database_gains_the_backfill_heartbeat_column(tmp_path: Path) -> None
 
     assert "updated_at" in columns
     assert updated_at == "2026-11-06T00:00:00.000Z"
-    assert versions == {1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21}
+    assert versions == set(range(1, 23))
 
 
 def test_v5_checks_indexes_and_foreign_keys(tmp_path: Path) -> None:
@@ -242,7 +243,7 @@ def test_v5_database_migrates_manifest_metrics_columns(tmp_path: Path) -> None:
 
     assert {"metric_version", "input_manifest_hash", "window_start", "window_end"} <= columns
     assert legacy == ("/tmp/legacy.parquet", None, None)
-    assert versions == {1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21}
+    assert versions == set(range(1, 23))
 
 
 def test_v6_database_migrates_starred_columns(tmp_path: Path) -> None:
@@ -301,7 +302,7 @@ def test_v6_database_migrates_starred_columns(tmp_path: Path) -> None:
 
     assert {"starred", "starred_at"} <= columns
     assert row == ("BTCUSDT", 0, None)
-    assert versions == {1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21}
+    assert versions == set(range(1, 23))
 
 
 def test_manifest_run_metadata_columns_are_added_idempotently(tmp_path: Path) -> None:
@@ -318,7 +319,7 @@ def test_manifest_run_metadata_columns_are_added_idempotently(tmp_path: Path) ->
         connection.close()
 
     assert {"run_id", "last_n", "recomputed_from", "parent_run_id"} <= columns
-    assert versions == {1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21}
+    assert versions == set(range(1, 23))
 
 
 _V12_JOB_RUNS = """
@@ -384,7 +385,7 @@ def test_v12_database_gains_the_job_run_scope_symbol_column(tmp_path: Path) -> N
 
     assert "symbol" in columns
     assert symbol is None  # pre-v13 batch rows keep a null (batch) scope
-    assert versions == {1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21}
+    assert versions == set(range(1, 23))
 
 
 _V13_JOB_RUNS = """
@@ -635,7 +636,7 @@ def test_v9_database_upgrades_to_v10_with_ledgers_and_indexes(tmp_path: Path) ->
     finally:
         connection.close()
 
-    assert versions == {1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21}
+    assert versions == set(range(1, 23))
     assert "llm_json" in report_columns
     assert {
         "llm_calls",
@@ -787,7 +788,7 @@ def test_v15_prompt_and_llm_rows_upgrade_to_v16_and_seed_only_missing_families(
         "entry_recheck:system",
     }
     assert tuple(llm_defaults) == ("", 1, "")
-    assert versions == {1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21}
+    assert versions == set(range(1, 23))
 
 
 def test_prompt_versions_are_immutable_and_have_one_active_row_per_prompt(
@@ -949,7 +950,7 @@ def test_v16_database_gains_budget_periods_settings_and_provider_capabilities(
     assert {"budget_ledger_week", "budget_ledger_month"} <= indexes
     # 2026-11-04 is ISO week 2026-W45.
     assert tuple(backfilled) == ("2026-11-04", "2026-W45", "2026-11", "")
-    assert versions == {1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21}
+    assert versions == set(range(1, 23))
 
 
 def _v16_budget_connection(settings: Settings) -> sqlite3.Connection:
@@ -1132,7 +1133,7 @@ def test_v18_trigger_events_gain_snapshot_provenance_and_backfill(
     assert tuple(good) == ("HASH-V18", "2026-11-09T10:00:00.000Z", "PARTIAL", 2)
     # A malformed legacy payload is skipped with its defaults, never aborting boot.
     assert tuple(bad) == ("", "", "", 0)
-    assert versions == {1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21}
+    assert versions == set(range(1, 23))
     skipped = [
         record
         for record in caplog.records
@@ -1200,7 +1201,7 @@ def test_concurrent_initializes_upgrade_v19_idempotently(tmp_path: Path) -> None
     assert tuple(good) == ("HASH-V18", "2026-11-09T10:00:00.000Z", "PARTIAL", 2)
     # Exactly one recorded v19 upgrade; v20 and v21 are recorded on the same boot.
     assert versions == {19}
-    assert highest_version == 21
+    assert highest_version == 22
     assert immutable_triggers == 1
     assert journal_mode.lower() == "wal"
 
@@ -1677,7 +1678,7 @@ def test_populated_v20_database_upgrades_to_v21_preserving_every_row(
     finally:
         connection.close()
 
-    assert to_version == 21
+    assert to_version == 22
     assert {20, 21} <= versions
     # Every populated row survives the rebuild: one row in every table.
     assert counts == {
@@ -2087,3 +2088,183 @@ def test_sqlite_store_module_stays_under_the_soft_ceiling() -> None:
 
     source_path = Path(store_module.__file__)
     assert len(source_path.read_text(encoding="utf-8").splitlines()) < 800
+
+
+# -- v22: trade_logs / position_events ------------------------------------
+
+
+def _v21_settings(tmp_path: Path) -> Settings:
+    """A populated database downgraded to exactly schema v21.
+
+    The v22 migration is the only remaining step, so this exercises
+    ``_migrate_v22`` itself rather than the ``_SCHEMA_SQL`` catch-all.
+    """
+    settings = _v20_settings(tmp_path)
+    SqliteStore(settings).initialize()
+    connection = sqlite3.connect(database_path(settings))
+    try:
+        connection.execute("DROP TRIGGER IF EXISTS position_events_no_update")
+        connection.execute("DROP TRIGGER IF EXISTS position_events_no_delete")
+        connection.execute("DROP TABLE IF EXISTS position_events")
+        connection.execute("DROP TABLE IF EXISTS trade_logs")
+        connection.execute("DELETE FROM schema_migrations WHERE version >= 22")
+        connection.commit()
+        version = connection.execute("SELECT MAX(version) FROM schema_migrations").fetchone()[0]
+    finally:
+        connection.close()
+    assert version == 21
+    return settings
+
+
+def test_v21_database_migrates_to_v22_with_the_journal_tables(tmp_path: Path) -> None:
+    settings = _v21_settings(tmp_path)
+    store = SqliteStore(settings)
+
+    store.initialize()
+    store.initialize()  # idempotent
+
+    connection = sqlite3.connect(database_path(settings))
+    try:
+        version = connection.execute("SELECT MAX(version) FROM schema_migrations").fetchone()[0]
+        tables = {
+            row[0]
+            for row in connection.execute("SELECT name FROM sqlite_master WHERE type='table'")
+        }
+        indexes = _index_names(connection, "trade_logs")
+        triggers = {
+            row[0]
+            for row in connection.execute("SELECT name FROM sqlite_master WHERE type='trigger'")
+        }
+        trade_log_fks = _foreign_key_targets(connection, "trade_logs")
+    finally:
+        connection.close()
+
+    assert version == 22
+    assert {"trade_logs", "position_events"} <= tables
+    assert {
+        "trade_logs_closed",
+        "trade_logs_symbol_closed",
+        "trade_logs_account_id",
+    } <= indexes
+    # The pre-v22 single-column indexes are gone on the migrated path.
+    assert "trade_logs_symbol" not in indexes
+    assert "trade_logs_closed_at" not in indexes
+    assert {"position_events_no_update", "position_events_no_delete"} <= triggers
+    assert {
+        ("order_id", "orders"),
+        ("fill_id", "fills"),
+        ("risk_verdict_id", "risk_verdicts"),
+        ("decision_id", "decisions"),
+    } <= trade_log_fks
+
+
+def test_v22_backfills_source_trigger_id_from_the_entry_order(tmp_path: Path) -> None:
+    settings = _v21_settings(tmp_path)
+    connection = sqlite3.connect(database_path(settings))
+    try:
+        connection.execute(
+            "UPDATE orders SET payload_json = ? WHERE order_id = 'ORD-1'",
+            (json.dumps({"position_id": "POS-1", "status": "FILLED"}),),
+        )
+        connection.execute(
+            "UPDATE positions SET payload_json = ? WHERE position_id = 'POS-1'",
+            (json.dumps({"position_id": "POS-1", "state": "OPEN"}),),
+        )
+        connection.commit()
+    finally:
+        connection.close()
+
+    SqliteStore(settings).initialize()
+    SqliteStore(settings).initialize()  # idempotent, keeps the backfill
+
+    connection = sqlite3.connect(database_path(settings))
+    try:
+        raw = connection.execute(
+            "SELECT payload_json FROM positions WHERE position_id = 'POS-1'"
+        ).fetchone()[0]
+    finally:
+        connection.close()
+    payload = json.loads(raw)
+    assert payload["source_trigger_id"] == "TRG-1"
+
+
+def test_v22_tables_match_between_a_fresh_and_a_migrated_database(tmp_path: Path) -> None:
+    migrated_settings = _v21_settings(tmp_path / "migrated")
+    SqliteStore(migrated_settings).initialize()
+    fresh_settings = Settings(env="test", port=8765, data_dir=tmp_path / "fresh" / "data")
+    SqliteStore(fresh_settings).initialize()
+
+    migrated = sqlite3.connect(database_path(migrated_settings))
+    fresh = sqlite3.connect(database_path(fresh_settings))
+    try:
+        for table in ("trade_logs", "position_events"):
+            assert _normalized_ddl(migrated, table) == _normalized_ddl(fresh, table), table
+            assert _index_names(migrated, table) == _index_names(fresh, table), table
+            assert _foreign_key_targets(migrated, table) == _foreign_key_targets(fresh, table), (
+                table
+            )
+        for trigger in ("position_events_no_update", "position_events_no_delete"):
+            migrated_sql = migrated.execute(
+                "SELECT sql FROM sqlite_master WHERE type='trigger' AND name=?", (trigger,)
+            ).fetchone()[0]
+            fresh_sql = fresh.execute(
+                "SELECT sql FROM sqlite_master WHERE type='trigger' AND name=?", (trigger,)
+            ).fetchone()[0]
+            assert " ".join(migrated_sql.split()) == " ".join(fresh_sql.split()), trigger
+    finally:
+        migrated.close()
+        fresh.close()
+
+
+def test_position_events_and_audit_events_reject_every_mutation(tmp_path: Path) -> None:
+    settings = Settings(env="test", port=8765, data_dir=tmp_path / "data")
+    SqliteStore(settings).initialize()
+    connection = sqlite3.connect(database_path(settings))
+    configure_connection(connection)
+    try:
+        _seed_oms_parents(connection)
+        connection.execute(
+            "INSERT INTO positions "
+            "(position_id, account_id, environment, symbol, state, opened_at, payload_json) "
+            "VALUES ('POS-1', 'ACC-1', 'PAPER', 'BTCUSDT', 'OPEN', 't', '{}')"
+        )
+        connection.execute(
+            "INSERT INTO position_events (position_id, seq, at, action, order_id, note) "
+            "VALUES ('POS-1', 1, 't', 'FULL_CLOSE', NULL, 'stop')"
+        )
+        connection.execute(
+            "INSERT INTO audit_events "
+            "(event_id, seq, event_type, created_at, previous_hash, event_hash, payload_json) "
+            "VALUES ('EV-1', 1, 'TEST', 't', 'p', 'h', '{}')"
+        )
+        connection.commit()
+
+        mutations = (
+            "UPDATE position_events SET note = 'rewritten' WHERE position_id = 'POS-1'",
+            "DELETE FROM position_events WHERE position_id = 'POS-1'",
+            "INSERT OR REPLACE INTO position_events "
+            "(position_id, seq, at, action, order_id, note) "
+            "VALUES ('POS-1', 1, 't2', 'FULL_CLOSE', NULL, 'replaced')",
+            "UPDATE audit_events SET event_type = 'REWRITTEN' WHERE event_id = 'EV-1'",
+            "DELETE FROM audit_events WHERE event_id = 'EV-1'",
+            "INSERT OR REPLACE INTO audit_events "
+            "(event_id, seq, event_type, created_at, previous_hash, event_hash, payload_json) "
+            "VALUES ('EV-1', 1, 'TEST', 't', 'p', 'h2', '{}')",
+        )
+        for statement in mutations:
+            with pytest.raises(sqlite3.IntegrityError):
+                connection.execute(statement)
+
+        # The DDL itself rejects an unknown action and a non-positive seq.
+        with pytest.raises(sqlite3.IntegrityError):
+            connection.execute(
+                "INSERT INTO position_events (position_id, seq, at, action, order_id, note) "
+                "VALUES ('POS-1', 2, 't', 'NOT_A_REAL_ACTION', NULL, 'bad')"
+            )
+        with pytest.raises(sqlite3.IntegrityError):
+            connection.execute(
+                "INSERT INTO position_events (position_id, seq, at, action, order_id, note) "
+                "VALUES ('POS-1', 0, 't', 'FULL_CLOSE', NULL, 'bad')"
+            )
+    finally:
+        connection.close()

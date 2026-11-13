@@ -61,23 +61,3 @@ class TriggerAcceptData(BaseModel):
     fill: dict[str, Any] | None
     position: dict[str, Any] | None
     account: dict[str, Any] | None
-
-
-class EnvelopeMeta(BaseModel):
-    request_id: str
-    generated_at: str
-    duration_ms: int
-    provenance: str
-    data_quality: str | None
-    warnings: list[str]
-    pagination: dict[str, Any] | None
-    idempotent_replay: bool
-
-
-class Envelope[T](BaseModel):
-    """The documented success envelope with a typed ``data`` payload."""
-
-    ok: bool
-    data: T
-    error: Any = None
-    meta: EnvelopeMeta

@@ -14,12 +14,16 @@ from oft.adapters.sqlite_audit import SqliteAuditMixin
 from oft.adapters.sqlite_connections import SqliteConnectionMixin
 from oft.ports.store import (
     AuditEventDraft,
+    CloseCommitResult,
+    ClosedPositionRecord,
     FillRecord,
     OmsCommit,
     OmsConflictError,
     OrderRecord,
     PaperAccountRecord,
+    PositionEventRecord,
     PositionRecord,
+    TradeLogRecord,
 )
 
 
@@ -32,6 +36,180 @@ def _oms_conflict_kind(message: str) -> str:
     if "orders.client_order_id" in message:
         return "client_order_id"
     return "unknown"
+
+
+def _close_conflict_kind(message: str) -> str:
+    """Classify a constraint failure inside a close commit."""
+    kind = _oms_conflict_kind(message)
+    if kind != "unknown":
+        return kind
+    if "trade_logs.position_id" in message:
+        return "trade_log"
+    return "close"
+
+
+def _account_base(
+    connection: sqlite3.Connection, record: ClosedPositionRecord
+) -> tuple[Decimal, str, str, str]:
+    """Read the live account inside the transaction, or use the seed defaults."""
+    existing = connection.execute(
+        "SELECT * FROM paper_accounts WHERE account_id = ?",
+        (record.account.account_id,),
+    ).fetchone()
+    if existing is not None:
+        return (
+            Decimal(str(existing["balance"])),
+            str(existing["initial_balance"]),
+            str(existing["environment"]),
+            str(existing["currency"]),
+        )
+    return (
+        Decimal(record.account.initial_balance),
+        record.account.initial_balance,
+        record.account.environment,
+        record.account.currency,
+    )
+
+
+def _insert_close_order(connection: sqlite3.Connection, order: OrderRecord) -> None:
+    connection.execute(
+        """
+        INSERT INTO orders (
+            order_id, client_order_id, environment, symbol, status,
+            risk_verdict_id, idempotency_key, created_at, updated_at,
+            payload_json, trigger_id, decision_id, purpose
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        """,
+        (
+            order.order_id,
+            order.client_order_id,
+            order.environment,
+            order.symbol,
+            order.status,
+            order.risk_verdict_id,
+            order.idempotency_key,
+            order.created_at,
+            order.updated_at,
+            order.payload_json,
+            order.trigger_id,
+            order.decision_id,
+            order.purpose,
+        ),
+    )
+
+
+def _insert_close_fill(connection: sqlite3.Connection, fill: FillRecord) -> None:
+    connection.execute(
+        """
+        INSERT INTO fills (
+            fill_id, order_id, environment, symbol, filled_at, payload_json
+        ) VALUES (?, ?, ?, ?, ?, ?)
+        """,
+        (
+            fill.fill_id,
+            fill.order_id,
+            fill.environment,
+            fill.symbol,
+            fill.filled_at,
+            fill.payload_json,
+        ),
+    )
+
+
+def _upsert_close_account(
+    connection: sqlite3.Connection,
+    record: ClosedPositionRecord,
+    *,
+    balance: Decimal,
+    initial_balance: str,
+    environment: str,
+    currency: str,
+) -> None:
+    connection.execute(
+        """
+        INSERT INTO paper_accounts (
+            account_id, environment, currency, initial_balance, balance, updated_at
+        ) VALUES (?, ?, ?, ?, ?, ?)
+        ON CONFLICT(account_id) DO UPDATE SET
+            balance = excluded.balance,
+            updated_at = excluded.updated_at
+        """,
+        (
+            record.account.account_id,
+            environment,
+            currency,
+            initial_balance,
+            str(balance),
+            record.account.updated_at,
+        ),
+    )
+
+
+def _mark_position_closed(connection: sqlite3.Connection, record: ClosedPositionRecord) -> None:
+    """Flip the one OPEN row to CLOSED; a zero-row update aborts the unit."""
+    updated = connection.execute(
+        "UPDATE positions SET state = 'CLOSED', payload_json = ? "
+        "WHERE position_id = ? AND state = 'OPEN'",
+        (record.position.payload_json, record.position.position_id),
+    )
+    if updated.rowcount != 1:
+        raise OmsConflictError("position_state")
+
+
+def _insert_position_event(connection: sqlite3.Connection, event: PositionEventRecord) -> None:
+    """Append the event at the next contiguous sequence for the position."""
+    if event.seq is None:
+        sequence = connection.execute(
+            "SELECT COALESCE(MAX(seq), 0) + 1 AS next FROM position_events WHERE position_id = ?",
+            (event.position_id,),
+        ).fetchone()
+        seq = int(sequence["next"]) if sequence is not None else 1
+    else:
+        seq = event.seq
+    connection.execute(
+        """
+        INSERT INTO position_events (
+            position_id, seq, at, action, order_id, note
+        ) VALUES (?, ?, ?, ?, ?, ?)
+        """,
+        (
+            event.position_id,
+            seq,
+            event.at,
+            event.action,
+            event.order_id,
+            event.note,
+        ),
+    )
+
+
+def _insert_trade_log(connection: sqlite3.Connection, trade_log: TradeLogRecord) -> None:
+    connection.execute(
+        """
+        INSERT INTO trade_logs (
+            trade_id, position_id, account_id, environment, symbol, side,
+            opened_at, closed_at, net_pnl_usd, idempotency_key,
+            payload_json, order_id, fill_id, risk_verdict_id, decision_id
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        """,
+        (
+            trade_log.trade_id,
+            trade_log.position_id,
+            trade_log.account_id,
+            trade_log.environment,
+            trade_log.symbol,
+            trade_log.side,
+            trade_log.opened_at,
+            trade_log.closed_at,
+            trade_log.net_pnl_usd,
+            trade_log.idempotency_key,
+            trade_log.payload_json,
+            trade_log.order_id,
+            trade_log.fill_id,
+            trade_log.risk_verdict_id,
+            trade_log.decision_id,
+        ),
+    )
 
 
 class PaperOmsStoreMixin(SqliteConnectionMixin, SqliteAuditMixin):
@@ -163,6 +341,58 @@ class PaperOmsStoreMixin(SqliteConnectionMixin, SqliteAuditMixin):
         except sqlite3.IntegrityError as exc:
             connection.rollback()
             raise OmsConflictError(_oms_conflict_kind(str(exc))) from exc
+        except BaseException:
+            connection.rollback()
+            raise
+        finally:
+            connection.close()
+
+    def save_close(self, record: ClosedPositionRecord) -> CloseCommitResult:
+        """Commit a full close as one unit of work (no partial transaction).
+
+        The existing position row is updated in place; a zero-row update means
+        the position is no longer OPEN and aborts the whole commit. The account
+        balance is read and written inside the same transaction so concurrent
+        fills cannot overwrite each other's delta.
+        """
+        connection = self._connect()
+        try:
+            connection.execute("BEGIN IMMEDIATE")
+            audits = tuple(self._insert_audit_event(connection, draft) for draft in record.audits)
+            base, initial_balance, environment, currency = _account_base(connection, record)
+            balance = (base + Decimal(record.balance_delta)).quantize(
+                Decimal("0.00000001"), rounding=ROUND_DOWN
+            )
+            _insert_close_order(connection, record.order)
+            _insert_close_fill(connection, record.fill)
+            _upsert_close_account(
+                connection,
+                record,
+                balance=balance,
+                initial_balance=initial_balance,
+                environment=environment,
+                currency=currency,
+            )
+            _mark_position_closed(connection, record)
+            _insert_position_event(connection, record.event)
+            _insert_trade_log(connection, record.trade_log)
+            connection.commit()
+            committed = PaperAccountRecord(
+                account_id=record.account.account_id,
+                environment=environment,
+                currency=currency,
+                initial_balance=initial_balance,
+                balance=str(balance),
+                updated_at=record.account.updated_at,
+            )
+            return CloseCommitResult(
+                account=committed,
+                trade_log=record.trade_log,
+                audits=audits,
+            )
+        except sqlite3.IntegrityError as exc:
+            connection.rollback()
+            raise OmsConflictError(_close_conflict_kind(str(exc))) from exc
         except BaseException:
             connection.rollback()
             raise
@@ -327,6 +557,88 @@ class PaperOmsStoreMixin(SqliteConnectionMixin, SqliteAuditMixin):
             connection.close()
         return _row_to_position(row) if row is not None else None
 
+    def update_open_position_payload(self, position_id: str, *, payload_json: str) -> bool:
+        """Update only an OPEN position row; a CLOSED row is left untouched."""
+        with closing(self._connect()) as connection, connection:
+            updated = connection.execute(
+                "UPDATE positions SET payload_json = ? WHERE position_id = ? AND state = 'OPEN'",
+                (payload_json, position_id),
+            )
+            return updated.rowcount == 1
+
+    def get_trade_log(self, trade_id: str) -> TradeLogRecord | None:
+        connection = self._connect_read_only()
+        if connection is None:
+            return None
+        try:
+            row = connection.execute(
+                "SELECT * FROM trade_logs WHERE trade_id = ?", (trade_id,)
+            ).fetchone()
+        finally:
+            connection.close()
+        return _row_to_trade_log(row) if row is not None else None
+
+    def get_trade_log_for_position(self, position_id: str) -> TradeLogRecord | None:
+        connection = self._connect_read_only()
+        if connection is None:
+            return None
+        try:
+            row = connection.execute(
+                "SELECT * FROM trade_logs WHERE position_id = ?", (position_id,)
+            ).fetchone()
+        finally:
+            connection.close()
+        return _row_to_trade_log(row) if row is not None else None
+
+    def list_trade_logs(
+        self, *, symbol: str | None = None, limit: int | None = 100, offset: int = 0
+    ) -> tuple[TradeLogRecord, ...]:
+        connection = self._connect_read_only()
+        if connection is None:
+            return ()
+        params: list[object] = []
+        where = ""
+        if symbol is not None:
+            where = " WHERE symbol = ?"
+            params.append(symbol)
+        query = f"SELECT * FROM trade_logs{where} ORDER BY closed_at DESC, trade_id ASC"
+        if limit is not None:
+            query += " LIMIT ? OFFSET ?"
+            params.extend((limit, offset))
+        try:
+            rows = connection.execute(query, tuple(params)).fetchall()
+        finally:
+            connection.close()
+        return tuple(_row_to_trade_log(row) for row in rows)
+
+    def count_trade_logs(self, *, symbol: str | None = None) -> int:
+        connection = self._connect_read_only()
+        if connection is None:
+            return 0
+        try:
+            if symbol is None:
+                row = connection.execute("SELECT COUNT(*) AS total FROM trade_logs").fetchone()
+            else:
+                row = connection.execute(
+                    "SELECT COUNT(*) AS total FROM trade_logs WHERE symbol = ?", (symbol,)
+                ).fetchone()
+        finally:
+            connection.close()
+        return int(row["total"]) if row is not None else 0
+
+    def list_position_events(self, position_id: str) -> tuple[PositionEventRecord, ...]:
+        connection = self._connect_read_only()
+        if connection is None:
+            return ()
+        try:
+            rows = connection.execute(
+                "SELECT * FROM position_events WHERE position_id = ? ORDER BY seq ASC",
+                (position_id,),
+            ).fetchall()
+        finally:
+            connection.close()
+        return tuple(_row_to_position_event(row) for row in rows)
+
     def get_paper_account(self, account_id: str) -> PaperAccountRecord | None:
         connection = self._connect_read_only()
         if connection is None:
@@ -433,4 +745,35 @@ def _row_to_paper_account(row: sqlite3.Row) -> PaperAccountRecord:
         initial_balance=row["initial_balance"],
         balance=row["balance"],
         updated_at=row["updated_at"],
+    )
+
+
+def _row_to_trade_log(row: sqlite3.Row) -> TradeLogRecord:
+    return TradeLogRecord(
+        trade_id=row["trade_id"],
+        position_id=row["position_id"],
+        account_id=row["account_id"],
+        environment=row["environment"],
+        symbol=row["symbol"],
+        side=row["side"],
+        opened_at=row["opened_at"],
+        closed_at=row["closed_at"],
+        net_pnl_usd=row["net_pnl_usd"],
+        idempotency_key=row["idempotency_key"],
+        payload_json=row["payload_json"],
+        order_id=row["order_id"],
+        fill_id=row["fill_id"],
+        risk_verdict_id=row["risk_verdict_id"],
+        decision_id=row["decision_id"],
+    )
+
+
+def _row_to_position_event(row: sqlite3.Row) -> PositionEventRecord:
+    return PositionEventRecord(
+        position_id=row["position_id"],
+        seq=row["seq"],
+        at=row["at"],
+        action=row["action"],
+        order_id=row["order_id"],
+        note=row["note"],
     )
