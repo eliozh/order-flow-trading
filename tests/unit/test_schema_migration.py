@@ -11,6 +11,7 @@ from pathlib import Path
 
 import pytest
 
+from oft.adapters.sqlite_schema import _TRIGGER_STATUSES
 from oft.adapters.sqlite_store import SqliteStore, database_path
 from oft.config import Settings
 from oft.domain.oms import OrderStatus, PositionState
@@ -1790,6 +1791,92 @@ def test_v21_aborts_and_leaves_v20_untouched_on_an_invalid_legacy_row(
     ]
 
 
+def _v20_settings_with_orphan_foreign_key(tmp_path: Path) -> Settings:
+    """A v20 database whose ``orders`` row points at a missing risk verdict."""
+    settings = _v20_settings(tmp_path)
+    connection = sqlite3.connect(database_path(settings))
+    try:
+        connection.execute(
+            "INSERT INTO orders (order_id, client_order_id, environment, symbol, status, "
+            "risk_verdict_id, idempotency_key, created_at, updated_at, payload_json, "
+            "trigger_id, decision_id, purpose) VALUES "
+            "('ORD-ORPHAN', 'client-orphan', 'PAPER', 'BTCUSDT', 'FILLED', 'MISSING', "
+            "'idem-orphan', 't', 't', '{}', NULL, NULL, 'ENTRY')"
+        )
+        connection.commit()
+    finally:
+        connection.close()
+    return settings
+
+
+def test_v21_aborts_and_leaves_v20_untouched_on_an_orphan_foreign_key(
+    tmp_path: Path,
+) -> None:
+    settings = _v20_settings_with_orphan_foreign_key(tmp_path)
+
+    with pytest.raises(sqlite3.IntegrityError) as caught:
+        SqliteStore(settings).initialize()
+
+    message = str(caught.value)
+    # The abort names the child table and the missing parent, not just "error".
+    assert "orders" in message
+    assert "risk_verdicts" in message
+    assert "v20" in message
+
+    connection = sqlite3.connect(database_path(settings))
+    try:
+        version = connection.execute("SELECT MAX(version) FROM schema_migrations").fetchone()[0]
+        tables = {
+            row[0]
+            for row in connection.execute("SELECT name FROM sqlite_master WHERE type = 'table'")
+        }
+        counts = {
+            table: connection.execute(f"SELECT COUNT(*) FROM {table}").fetchone()[0]
+            for table in (
+                "llm_calls",
+                "decisions",
+                "trigger_events",
+                "risk_verdicts",
+                "orders",
+                "fills",
+                "positions",
+                "paper_accounts",
+                "opportunities",
+                "opportunity_conditions",
+                "opportunity_events",
+                "budget_ledger",
+            )
+        }
+        orders = connection.execute(
+            "SELECT order_id, risk_verdict_id FROM orders ORDER BY order_id"
+        ).fetchall()
+    finally:
+        connection.close()
+
+    assert version == 20
+    # The whole rebuild rolled back: no ``*_v20`` scratch table survives and
+    # every row is preserved verbatim, orphan included.
+    assert not {name for name in tables if name.endswith("_v20")}
+    assert counts == {
+        "llm_calls": 1,
+        "decisions": 1,
+        "trigger_events": 1,
+        "risk_verdicts": 1,
+        "orders": 2,
+        "fills": 1,
+        "positions": 1,
+        "paper_accounts": 1,
+        "opportunities": 1,
+        "opportunity_conditions": 1,
+        "opportunity_events": 1,
+        "budget_ledger": 1,
+    }
+    assert [tuple(row) for row in orders] == [
+        ("ORD-1", "RISK-1"),
+        ("ORD-ORPHAN", "MISSING"),
+    ]
+
+
 def _seed_oms_parents(connection: sqlite3.Connection) -> None:
     with connection:
         connection.execute(
@@ -1940,10 +2027,7 @@ def test_v21_accepts_every_decision_validation_status(tmp_path: Path, status: st
         connection.close()
 
 
-@pytest.mark.parametrize(
-    "status",
-    ["PENDING_RECHECK", "RECHECKED", "REJECTED", "BLOCKED", "ACCEPTED", "EXPIRED"],
-)
+@pytest.mark.parametrize("status", _TRIGGER_STATUSES)
 def test_v21_accepts_every_trigger_status(tmp_path: Path, status: str) -> None:
     settings = Settings(env="test", port=8765, data_dir=tmp_path / "data")
     SqliteStore(settings).initialize()

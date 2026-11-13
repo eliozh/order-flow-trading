@@ -1672,17 +1672,23 @@ def _migrate_v20(connection: sqlite3.Connection) -> None:
         raise
 
 
+# The foreign keys v21 introduces, as ``(child table, child column, parent)``.
+# Only these are *new* constraints: a legacy orphan on an older foreign key
+# violates nothing v21 added, so it is carried rather than aborting boot.
+_V21_NEW_FOREIGN_KEYS: tuple[tuple[str, str, str], ...] = (
+    ("risk_verdicts", "decision_id", "decisions"),
+    ("orders", "risk_verdict_id", "risk_verdicts"),
+    ("positions", "account_id", "paper_accounts"),
+)
+
+
 def _v21_foreign_keys_present(connection: sqlite3.Connection) -> bool:
     """Whether every existing rebuilt table already carries its v21 foreign keys.
 
     The rebuild is one transaction, so testing the new child foreign keys is
     enough to tell whether a concurrent initializer has already applied it.
     """
-    expected = {
-        "risk_verdicts": ("decision_id", "decisions"),
-        "orders": ("risk_verdict_id", "risk_verdicts"),
-        "positions": ("account_id", "paper_accounts"),
-    }
+    expected = {child: (column, parent) for child, column, parent in _V21_NEW_FOREIGN_KEYS}
     seen = False
     for table, (column, parent) in expected.items():
         if not _table_exists(connection, table):
@@ -1696,6 +1702,32 @@ def _v21_foreign_keys_present(connection: sqlite3.Connection) -> bool:
     return seen
 
 
+class _V21MigrationAbort(sqlite3.IntegrityError):
+    """A v21 abort whose message is already complete and must not be re-wrapped."""
+
+
+def _v21_orphan_foreign_key(
+    connection: sqlite3.Connection,
+) -> tuple[str, str] | None:
+    """The first orphaned child row on a foreign key v21 introduced.
+
+    ``PRAGMA foreign_key_check`` reports one row per child row whose parent is
+    missing. ``PRAGMA foreign_keys=OFF`` disables *enforcement* for the copy,
+    not this scan. Only the ``(child, parent)`` pairs in
+    ``_V21_NEW_FOREIGN_KEYS`` are new constraints; sorting keeps the reported
+    violation deterministic across SQLite versions.
+    """
+    new_pairs = {(child, parent) for child, _column, parent in _V21_NEW_FOREIGN_KEYS}
+    violations = sorted(
+        {
+            (str(row[0]), str(row[2]))
+            for row in connection.execute("PRAGMA foreign_key_check")
+            if (str(row[0]), str(row[2])) in new_pairs
+        }
+    )
+    return violations[0] if violations else None
+
+
 def _migrate_v21(connection: sqlite3.Connection) -> None:
     """Add the residual foreign keys and the enum CHECKs (v21).
 
@@ -1705,16 +1737,19 @@ def _migrate_v21(connection: sqlite3.Connection) -> None:
     with the old table and recreated by ``_SCHEMA_SQL`` afterwards.
 
     ``PRAGMA foreign_keys=OFF`` defers *foreign-key* enforcement for the copy
-    only; it does not disable CHECK constraints. A legacy row that cannot
-    satisfy a new constraint aborts the migration: the transaction is rolled
-    back, the database stays at v20, no data is changed, and the raised
-    ``sqlite3.IntegrityError`` names the table and the violated constraint so
-    the operator can repair the row. Rows are never defaulted, rewritten, or
-    dropped. ``legacy_alter_table`` is enabled so the rename does not rewrite
-    the REFERENCES clauses of the *other* tables (``fills`` references
-    ``orders``, ``budget_ledger`` references ``llm_calls``, ``risk_verdicts``
-    references ``trigger_events``); without it those clauses would follow the
-    renamed table and dangle once it is dropped.
+    only; it does not disable CHECK constraints. After the copy, still inside
+    the transaction, ``PRAGMA foreign_key_check`` looks for child rows whose
+    parent is missing. A legacy row that violates a *new* constraint -- a CHECK
+    or one of the foreign keys v21 introduces -- aborts the migration: the
+    transaction is rolled back, the database stays at v20, no data is changed,
+    and the raised ``sqlite3.IntegrityError`` names the offending table (and,
+    for a foreign key, the missing parent) so the operator can repair the row.
+    Rows are never defaulted, rewritten, or dropped. ``legacy_alter_table`` is
+    enabled so the rename does not rewrite the REFERENCES clauses of the
+    *other* tables (``fills`` references ``orders``, ``budget_ledger``
+    references ``llm_calls``, ``risk_verdicts`` references ``trigger_events``);
+    without it those clauses would follow the renamed table and dangle once it
+    is dropped.
     """
     if not any(_table_exists(connection, table) for table, _definition, _columns in _V21_REBUILDS):
         return
@@ -1747,7 +1782,23 @@ def _migrate_v21(connection: sqlite3.Connection) -> None:
                 f"INSERT INTO {table} ({column_list}) SELECT {column_list} FROM {old_table}"
             )
             connection.execute(f"DROP TABLE {old_table}")
+        # The copy declares the v21 foreign keys while enforcement is off, so
+        # check them explicitly before the schema is stamped v21. A v20 row
+        # whose parent is missing must abort exactly like a CHECK violation.
+        orphan = _v21_orphan_foreign_key(connection)
+        if orphan is not None:
+            child, parent = orphan
+            raise _V21MigrationAbort(
+                f"v21 migration aborted: a legacy row in table {child!r} references a "
+                f"missing row in table {parent!r} (PRAGMA foreign_key_check). The database "
+                "was left at schema v20 with no data changed. Repair or remove the offending "
+                "row, then restart."
+            )
         connection.execute("COMMIT")
+    except _V21MigrationAbort:
+        if connection.in_transaction:
+            connection.execute("ROLLBACK")
+        raise
     except sqlite3.IntegrityError as exc:
         if connection.in_transaction:
             connection.execute("ROLLBACK")
