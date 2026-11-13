@@ -15,6 +15,8 @@ from decimal import Decimal
 from enum import StrEnum
 from typing import Any
 
+from oft.domain.pnl import plain_money_str
+
 _SCHEMA_VERSION = "1.0.0"
 
 
@@ -183,12 +185,30 @@ class Position:
     updated_at: str
     source_trigger_id: str | None = None
     source_decision_id: str | None = None
+    closed_at: str | None = None
+    exit_price: Decimal | None = None
+    realized_pnl_usd: Decimal | None = None
+    funding_usd: Decimal = Decimal("0")
+    management_history: tuple[dict[str, Any], ...] = ()
+    version: int = 1
 
     def __post_init__(self) -> None:
-        if self.state != PositionState.OPEN:
-            raise ValueError("this slice only creates OPEN positions")
+        if self.state not in {PositionState.OPEN, PositionState.CLOSED}:
+            raise ValueError("this slice only creates OPEN or CLOSED positions")
         if self.size <= 0:
             raise ValueError("position size must be positive")
+        if self.state == PositionState.OPEN:
+            if (
+                self.closed_at is not None
+                or self.exit_price is not None
+                or self.realized_pnl_usd is not None
+            ):
+                raise ValueError("an OPEN position must not carry close fields")
+        else:
+            if self.closed_at is None or self.exit_price is None:
+                raise ValueError("a CLOSED position requires closed_at and exit_price")
+            if self.realized_pnl_usd is None:
+                raise ValueError("a CLOSED position requires realized_pnl_usd")
 
     def to_contract(self) -> dict[str, Any]:
         return {
@@ -213,16 +233,18 @@ class Position:
             "margin_usd": str(self.margin_usd),
             "risk_amount_usd": str(self.risk_amount_usd),
             "risk_pct": self.risk_pct,
-            "fees_usd": str(self.fees_usd),
-            "funding_usd": "0",
-            "realized_pnl_usd": None,
+            "fees_usd": plain_money_str(self.fees_usd),
+            "funding_usd": plain_money_str(self.funding_usd),
+            "realized_pnl_usd": (
+                None if self.realized_pnl_usd is None else plain_money_str(self.realized_pnl_usd)
+            ),
             "opened_at": self.opened_at,
             "updated_at": self.updated_at,
-            "closed_at": None,
-            "exit_price": None,
+            "closed_at": self.closed_at,
+            "exit_price": None if self.exit_price is None else str(self.exit_price),
             "source_trigger_id": self.source_trigger_id,
             "source_decision_id": self.source_decision_id,
-            "management_history": [],
+            "management_history": [dict(entry) for entry in self.management_history],
             "data_quality": {
                 "status": "COMPLETE",
                 "reasons": [],
@@ -230,7 +252,7 @@ class Position:
                 "last_event_at": self.updated_at,
                 "coverage_start": None,
             },
-            "version": 1,
+            "version": self.version,
         }
 
 
@@ -340,6 +362,7 @@ def order_from_intent(
     created_at: str,
     status: OrderStatus = OrderStatus.CREATED,
     position_id: str | None = None,
+    reduce_only: bool = False,
 ) -> Order:
     return Order(
         order_id=order_id,
@@ -354,7 +377,7 @@ def order_from_intent(
         quantity=quantity,
         price=price,
         stop_price=stop_price,
-        reduce_only=False,
+        reduce_only=reduce_only,
         status=status,
         risk_verdict_id=risk_verdict_id,
         approval_id=approval_id,

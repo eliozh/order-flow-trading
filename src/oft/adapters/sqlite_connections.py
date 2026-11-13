@@ -20,9 +20,12 @@ def configure_connection(connection: sqlite3.Connection, *, foreign_keys: bool =
 
     Foreign keys are enabled by default because every read-write handle uses
     them; read-only handles pass ``foreign_keys=False`` so their pragma
-    sequence stays exactly the busy timeout alone.
+    sequence keeps ``PRAGMA foreign_keys`` untouched. Recursive triggers are
+    always enabled so ``INSERT OR REPLACE`` fires the append-only delete
+    triggers instead of silently rewriting an immutable row (D7).
     """
     connection.execute(f"PRAGMA busy_timeout={_BUSY_TIMEOUT_MS}")
+    connection.execute("PRAGMA recursive_triggers=ON")
     if foreign_keys:
         connection.execute("PRAGMA foreign_keys=ON")
 

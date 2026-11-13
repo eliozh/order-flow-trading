@@ -53,6 +53,11 @@ def _emit(settings: Any, method: str, json_output: bool, *, limit: int | None = 
             typer.echo(
                 f"equity {data.get('equity', '-')} · open positions {data.get('open_positions', 0)}"
             )
+            typer.echo(
+                f"realized {data.get('realized_pnl_usd', '-')}"
+                f" · fees {data.get('fees_usd', '-')}"
+                f" · closed trades {data.get('closed_trades', 0)}"
+            )
         stale = data.get("stale_inputs") or []
         if stale:
             # Equity fell back to cash (for example a missing mark); say so

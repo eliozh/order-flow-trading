@@ -11,13 +11,15 @@ import json
 from dataclasses import dataclass
 from decimal import Decimal
 
-from oft.application.kill_switch import KillSwitch
+from oft.application.kill_switch import KillSwitch, record_audit
 from oft.application.paper_account import compute_equity
 from oft.application.paper_broker import BrokerResult, OrderIntent, PaperBroker
 from oft.domain.risk import RiskRequest, verdict_inputs_hash
 from oft.domain.time import utc_timestamp
 from oft.ports.clock import ClockPort
 from oft.ports.store import OmsConflictError, RiskVerdictRecord, StorePort
+
+_RISK_REDUCING_PURPOSES = frozenset({"EXIT"})
 
 
 def _decimal_or_none(value: object) -> Decimal | None:
@@ -52,6 +54,21 @@ class AuthContext:
     approval_id: str | None = None
 
 
+@dataclass(frozen=True)
+class IntentClassification:
+    """Whether an intent increases or reduces risk (ADR-0006 kill-switch policy)."""
+
+    risk_reducing: bool
+    reason: str
+
+
+def classify_intent(intent: OrderIntent) -> IntentClassification:
+    """A reduce-only EXIT reduces risk; everything else increases it."""
+    if intent.reduce_only and intent.purpose.upper() in _RISK_REDUCING_PURPOSES:
+        return IntentClassification(True, "reduce-only exit")
+    return IntentClassification(False, "risk-increasing intent")
+
+
 class ExecutionGateway:
     def __init__(
         self,
@@ -76,7 +93,28 @@ class ExecutionGateway:
         mark_price: Decimal,
         mark_as_of: str,
     ) -> BrokerResult:
-        self._kill_switch.require_clear()
+        now = utc_timestamp(self._clock.now())
+        classification = classify_intent(intent)
+        # Audit the classification before the kill-switch decision so a blocked
+        # risk-increasing intent is still on the record (ADR-0006).
+        record_audit(
+            self._store,
+            event_type="INTENT_CLASSIFIED",
+            actor={"kind": "SYSTEM", "id": "execution_gateway"},
+            subject={"kind": "ORDER_INTENT", "id": intent.idempotency_key},
+            payload={
+                "risk_reducing": classification.risk_reducing,
+                "reason": classification.reason,
+                "purpose": intent.purpose,
+                "reduce_only": intent.reduce_only,
+                "position_id": intent.position_id,
+            },
+            at=now,
+        )
+        # The kill switch blocks risk-increasing intents but must permit the
+        # reduce-only protective close while active.
+        if not classification.risk_reducing:
+            self._kill_switch.require_clear()
         if intent.environment != self._environment or intent.environment != "PAPER":
             raise GatewayError("ORDER_REJECTED", "only PAPER orders are supported")
         if auth.approval_id is None:
@@ -86,7 +124,6 @@ class ExecutionGateway:
             raise GatewayError("RISK_BLOCKED", "a persisted risk verdict is required")
         if verdict.verdict == "BLOCK":
             raise GatewayError("RISK_BLOCKED", "the risk verdict blocks this intent")
-        now = utc_timestamp(self._clock.now())
         if verdict.expires_at <= now:
             raise GatewayError("RISK_BLOCKED", "the risk verdict has expired")
 
@@ -100,7 +137,10 @@ class ExecutionGateway:
                 )
             raise GatewayError("ORDER_DUPLICATE", f"order already exists: {payload['order_id']}")
 
-        self._bind_to_verdict(intent, verdict, mark_price=mark_price)
+        if classification.risk_reducing:
+            self._bind_exit_to_verdict(intent, verdict)
+        else:
+            self._bind_to_verdict(intent, verdict, mark_price=mark_price)
 
         try:
             result = self._broker.submit(
@@ -133,6 +173,50 @@ class ExecutionGateway:
         if exc.constraint == "trigger_entry":
             return GatewayError("ORDER_DUPLICATE", "an entry order already exists for this trigger")
         return GatewayError("ORDER_DUPLICATE", "a concurrent submit already committed this intent")
+
+    def _bind_exit_to_verdict(
+        self,
+        intent: OrderIntent,
+        record: RiskVerdictRecord,
+    ) -> None:
+        """Bind a reduce-only exit to its persisted verdict and target position.
+
+        An exit does not need the entry trigger/stop/equity-digest binding: the
+        verdict only has to belong to the same decision, cover the exit
+        quantity, name the same symbol/side as the position, and the intent must
+        be reduce-only against an OPEN position that carries a source trigger.
+        """
+        if not intent.reduce_only:
+            raise GatewayError("RISK_BLOCKED", "an exit intent must be reduce-only")
+        payload = json.loads(record.payload_json)
+        if record.decision_id != intent.decision_id:
+            raise GatewayError("RISK_BLOCKED", "the risk verdict belongs to a different decision")
+        allowed = payload.get("allowed") or {}
+        allowed_quantity = _decimal_or_none(allowed.get("quantity"))
+        if allowed_quantity is None or intent.quantity > allowed_quantity:
+            raise GatewayError("RISK_BLOCKED", "the intent exceeds the verdict's allowed quantity")
+        if intent.position_id is None:
+            raise GatewayError("RISK_BLOCKED", "an exit intent requires a position id")
+        position = self._store.get_position(intent.position_id)
+        if position is None:
+            raise GatewayError("RISK_BLOCKED", "the position to close does not exist")
+        position_payload = json.loads(position.payload_json)
+        if position.state != "OPEN":
+            raise GatewayError("RISK_BLOCKED", "the position is not OPEN")
+        if position.symbol != intent.symbol:
+            raise GatewayError("RISK_BLOCKED", "the intent symbol does not match the position")
+        if position_payload.get("side") != intent.position_side.value:
+            raise GatewayError("RISK_BLOCKED", "the intent side does not match the position")
+        source_trigger = position_payload.get("source_trigger_id")
+        if not source_trigger:
+            raise GatewayError(
+                "DATA_UNAVAILABLE",
+                "the position has no source trigger; refusing to fabricate one",
+            )
+        if str(source_trigger) != record.trigger_id:
+            raise GatewayError(
+                "RISK_BLOCKED", "the risk verdict does not belong to the position's trigger"
+            )
 
     def _bind_to_verdict(
         self,
