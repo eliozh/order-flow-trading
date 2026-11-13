@@ -16,7 +16,7 @@ from oft.application.entry_service import EntryService
 from oft.application.kill_switch import KillSwitch
 from oft.application.paper_account import PaperAccountService
 from oft.application.paper_broker import BrokerError, OrderIntent, PaperBroker
-from oft.application.position_service import PositionService
+from oft.application.position_service import PositionCloseError, PositionService
 from oft.application.scan_service import ScanRequest, ScanService
 from oft.application.trigger_service import TriggerService
 from oft.bootstrap import build_container
@@ -27,7 +27,7 @@ from oft.domain.pnl import quantize_money, return_percent
 from oft.domain.positions import TradeLogContext
 from oft.domain.resampling import Bar
 from oft.domain.time import utc_timestamp
-from oft.ports.store import DecisionRecord, RiskVerdictRecord
+from oft.ports.store import DecisionRecord, OmsConflictError, RiskVerdictRecord
 from position_support import set_position_mark
 
 ROOT = Path(__file__).resolve().parents[2]
@@ -132,12 +132,15 @@ def _persist_verdict(
     verdict: str = "ALLOW",
     allowed_quantity: str | None = None,
     allowed_leverage: float | None = None,
+    allowed_risk_usd: str = "1000000",
+    requested_stop: str | None = None,
     expires_at: str | None = None,
 ) -> None:
     """Persist a verdict bound to the position's trigger and add decision.
 
-    The default is a usable ``ALLOW`` that covers the original position size
-    and leverage; the negative tests override one dimension at a time.
+    The default is a usable ``ALLOW`` that covers the original position size,
+    leverage, requested stop, and stop-based risk; the negative tests override
+    one dimension at a time.
     """
     container.store.save_decision(
         DecisionRecord(
@@ -152,14 +155,22 @@ def _persist_verdict(
     )
     allowed = None if verdict == "BLOCK" else (allowed_quantity or str(Decimal(position["size"])))
     leverage = float(position["leverage"]) if allowed_leverage is None else allowed_leverage
+    stop = requested_stop or str(Decimal(str(position["stop_price"])))
     expiry = expires_at or utc_timestamp(NOW + timedelta(hours=8))
     payload = {
         "verdict": verdict,
+        "requested": {
+            "entry_price": str(Decimal(str(position["avg_entry_price"]))),
+            "stop_price": stop,
+            "quantity": str(Decimal(position["size"])),
+            "leverage": float(position["leverage"]),
+            "risk_pct": float(position["risk_pct"]),
+        },
         "allowed": {
             "quantity": allowed,
             "notional_usd": None,
             "leverage": leverage,
-            "risk_amount_usd": "0",
+            "risk_amount_usd": allowed_risk_usd,
         },
         "expires_at": expiry,
     }
@@ -930,4 +941,424 @@ def test_mae_uses_the_size_in_force_before_a_partial_close(tmp_path: Path) -> No
     # The excursion before the partial close is measured on the full size.
     assert Decimal(closed.trade_log["mae_usd"]) == quantize_money(
         (entry - Decimal("5000") - entry) * size
+    )
+
+
+def test_a_reduce_verdict_cannot_authorize_an_add(tmp_path: Path) -> None:
+    loop = _build_loop(tmp_path)
+    container = loop["container"]
+    position = loop["position"]
+    assert position is not None
+    size = Decimal(position["size"])
+    _persist_verdict(
+        container,
+        position,
+        decision_id="DEC-add-reduce",
+        risk_verdict_id="RISK-add-reduce",
+        verdict="REDUCE",
+    )
+
+    with pytest.raises(BrokerError) as exc:
+        _broker(container).submit(
+            _intent(
+                position,
+                purpose="ADD",
+                quantity=str(size),
+                idempotency_key="add-reduce",
+                risk_verdict_id="RISK-add-reduce",
+                decision_id="DEC-add-reduce",
+            ),
+            mark_price=_mark(position),
+            mark_as_of=position["updated_at"],
+            now=position["updated_at"],
+        )
+    assert exc.value.code == "RISK_VERDICT_INVALID"
+
+
+def test_an_add_stop_that_contradicts_the_verdict_is_rejected(tmp_path: Path) -> None:
+    loop = _build_loop(tmp_path)
+    container = loop["container"]
+    position = loop["position"]
+    assert position is not None
+    size = Decimal(position["size"])
+    _persist_verdict(
+        container,
+        position,
+        decision_id="DEC-add-stop",
+        risk_verdict_id="RISK-add-stop",
+        requested_stop=str(Decimal(str(position["stop_price"])) + Decimal("1")),
+    )
+
+    with pytest.raises(BrokerError) as exc:
+        _broker(container).submit(
+            _intent(
+                position,
+                purpose="ADD",
+                quantity=str(size),
+                idempotency_key="add-stop-mismatch",
+                risk_verdict_id="RISK-add-stop",
+                decision_id="DEC-add-stop",
+            ),
+            mark_price=_mark(position),
+            mark_as_of=position["updated_at"],
+            now=position["updated_at"],
+        )
+    assert exc.value.code == "RISK_VERDICT_INVALID"
+
+
+def test_an_add_whose_stop_risk_at_the_mark_exceeds_the_cap_is_rejected(
+    tmp_path: Path,
+) -> None:
+    loop = _build_loop(tmp_path)
+    container = loop["container"]
+    position = loop["position"]
+    assert position is not None
+    size = Decimal(position["size"])
+    _persist_verdict(
+        container,
+        position,
+        decision_id="DEC-add-risk",
+        risk_verdict_id="RISK-add-risk",
+        allowed_risk_usd="1",
+    )
+
+    with pytest.raises(BrokerError) as exc:
+        _broker(container).submit(
+            _intent(
+                position,
+                purpose="ADD",
+                quantity=str(size),
+                idempotency_key="add-risk-over-cap",
+                risk_verdict_id="RISK-add-risk",
+                decision_id="DEC-add-risk",
+            ),
+            mark_price=_mark(position) + Decimal("500"),
+            mark_as_of=position["updated_at"],
+            now=position["updated_at"],
+        )
+    assert exc.value.code == "RISK_VERDICT_INVALID"
+
+
+def test_add_verdict_expiry_uses_the_broker_clock_not_the_caller(tmp_path: Path) -> None:
+    loop = _build_loop(tmp_path)
+    container = loop["container"]
+    position = loop["position"]
+    assert position is not None
+    size = Decimal(position["size"])
+    _persist_verdict(
+        container,
+        position,
+        decision_id="DEC-add-late",
+        risk_verdict_id="RISK-add-late",
+        expires_at=utc_timestamp(NOW + timedelta(hours=1)),
+    )
+    # The caller claims it is an hour earlier than the broker's clock; the
+    # verdict is already expired by the server clock and must be rejected.
+    later_broker = PaperBroker(
+        settings=container.settings,
+        store=container.store,
+        clock=FixedClock(NOW + timedelta(hours=2)),
+    )
+
+    with pytest.raises(BrokerError) as exc:
+        later_broker.submit(
+            _intent(
+                position,
+                purpose="ADD",
+                quantity=str(size),
+                idempotency_key="add-server-clock",
+                risk_verdict_id="RISK-add-late",
+                decision_id="DEC-add-late",
+            ),
+            mark_price=_mark(position),
+            mark_as_of=position["updated_at"],
+            now=position["updated_at"],
+        )
+    assert exc.value.code == "RISK_BLOCKED"
+
+
+class _ConflictOnceAdjustmentStore:
+    """Delegate to a real store but fail the first adjustment commit."""
+
+    def __init__(self, store: Any) -> None:
+        self._store = store
+        self._raised = False
+
+    def __getattr__(self, name: str) -> Any:
+        return getattr(self._store, name)
+
+    def save_position_adjustment(self, record: Any) -> Any:
+        if not self._raised:
+            self._raised = True
+            raise OmsConflictError("position_version")
+        return self._store.save_position_adjustment(record)
+
+
+def test_a_concurrent_partial_close_maps_to_a_typed_conflict(tmp_path: Path) -> None:
+    loop = _build_loop(tmp_path)
+    container = loop["container"]
+    position = loop["position"]
+    assert position is not None
+    store = _ConflictOnceAdjustmentStore(container.store)
+    broker = PaperBroker(settings=container.settings, store=store, clock=container.clock)
+
+    with pytest.raises(BrokerError) as exc:
+        broker.submit(
+            _intent(
+                position,
+                purpose="EXIT",
+                quantity=str(Decimal(position["size"]) / Decimal("2")),
+                idempotency_key="partial-conflict",
+                risk_verdict_id=loop["order"]["risk_verdict_id"],
+            ),
+            mark_price=_mark(position),
+            mark_as_of=position["updated_at"],
+            now=position["updated_at"],
+        )
+
+    assert exc.value.code == "CONFLICT"
+    assert container.store.list_trade_logs(limit=None) == ()
+
+
+def _rewrite_stored_payload(container: Any, position_id: str, **changes: Any) -> None:
+    database = container.settings.data_dir / "oft.db"
+    with sqlite3.connect(database) as connection:
+        row = connection.execute(
+            "SELECT payload_json FROM positions WHERE position_id = ?", (position_id,)
+        ).fetchone()
+        payload = json.loads(row[0])
+        payload.update(changes)
+        connection.execute(
+            "UPDATE positions SET payload_json = ? WHERE position_id = ?",
+            (json.dumps(payload, sort_keys=True), position_id),
+        )
+        connection.commit()
+
+
+def _full_close_context(position: dict[str, Any]) -> TradeLogContext:
+    return TradeLogContext(
+        signal={},
+        provenance={},
+        decision_quality={},
+        mae_usd=Decimal("-1"),
+        mfe_usd=Decimal("1"),
+        risk_amount_usd=Decimal(str(position["risk_amount_usd"])),
+        entry_notional_usd=Decimal(str(position["notional_usd"])),
+        data_quality_status="COMPLETE",
+        data_quality_reasons=(),
+        stopped=True,
+    )
+
+
+def test_a_corrupt_accumulated_gross_fails_a_partial_close_closed(tmp_path: Path) -> None:
+    loop = _build_loop(tmp_path)
+    container = loop["container"]
+    position = loop["position"]
+    assert position is not None
+    _rewrite_stored_payload(container, position["position_id"], realized_pnl_usd="not-a-decimal")
+
+    with pytest.raises(BrokerError) as exc:
+        _broker(container).submit(
+            _intent(
+                position,
+                purpose="EXIT",
+                quantity=str(Decimal(position["size"]) / Decimal("2")),
+                idempotency_key="corrupt-partial",
+                risk_verdict_id=loop["order"]["risk_verdict_id"],
+            ),
+            mark_price=_mark(position),
+            mark_as_of=position["updated_at"],
+            now=position["updated_at"],
+        )
+    assert exc.value.code == "DATA_UNAVAILABLE"
+    assert container.store.list_position_events(position["position_id"]) == ()
+    assert _payload(container, position["position_id"])["realized_pnl_usd"] == "not-a-decimal"
+
+
+def test_a_non_finite_accumulated_gross_fails_an_add_closed(tmp_path: Path) -> None:
+    loop = _build_loop(tmp_path)
+    container = loop["container"]
+    position = loop["position"]
+    assert position is not None
+    _rewrite_stored_payload(container, position["position_id"], realized_pnl_usd="NaN")
+    _persist_verdict(
+        container,
+        position,
+        decision_id="DEC-add-corrupt",
+        risk_verdict_id="RISK-add-corrupt",
+    )
+
+    with pytest.raises(BrokerError) as exc:
+        _broker(container).submit(
+            _intent(
+                position,
+                purpose="ADD",
+                quantity=str(position["size"]),
+                idempotency_key="corrupt-add",
+                risk_verdict_id="RISK-add-corrupt",
+                decision_id="DEC-add-corrupt",
+            ),
+            mark_price=_mark(position),
+            mark_as_of=position["updated_at"],
+            now=position["updated_at"],
+        )
+    assert exc.value.code == "DATA_UNAVAILABLE"
+    assert container.store.list_position_events(position["position_id"]) == ()
+
+
+def test_an_out_of_range_accumulated_gross_fails_a_full_close_closed(tmp_path: Path) -> None:
+    loop = _build_loop(tmp_path)
+    container = loop["container"]
+    position = loop["position"]
+    assert position is not None
+    _rewrite_stored_payload(container, position["position_id"], realized_pnl_usd="1e100")
+
+    with pytest.raises(BrokerError) as exc:
+        _broker(container).submit(
+            _intent(
+                position,
+                purpose="EXIT",
+                quantity=str(position["size"]),
+                idempotency_key="corrupt-close",
+                risk_verdict_id=loop["order"]["risk_verdict_id"],
+                trade_log=_full_close_context(position),
+            ),
+            mark_price=_mark(position),
+            mark_as_of=position["updated_at"],
+            now=position["updated_at"],
+        )
+    assert exc.value.code == "DATA_UNAVAILABLE"
+    assert container.store.list_trade_logs(limit=None) == ()
+
+
+def test_a_full_close_without_a_trade_log_context_is_rejected(tmp_path: Path) -> None:
+    loop = _build_loop(tmp_path)
+    container = loop["container"]
+    position = loop["position"]
+    assert position is not None
+
+    with pytest.raises(BrokerError) as exc:
+        _broker(container).submit(
+            _intent(
+                position,
+                purpose="EXIT",
+                quantity=str(position["size"]),
+                idempotency_key="no-journal-context",
+                risk_verdict_id=loop["order"]["risk_verdict_id"],
+            ),
+            mark_price=_mark(position),
+            mark_as_of=position["updated_at"],
+            now=position["updated_at"],
+        )
+
+    assert exc.value.code == "TRADE_LOG_INVALID"
+    assert container.store.list_trade_logs(limit=None) == ()
+
+
+def test_a_corrupt_persisted_history_fails_typed_not_attribute_error(
+    tmp_path: Path,
+) -> None:
+    loop = _build_loop(tmp_path)
+    container = loop["container"]
+    position = loop["position"]
+    assert position is not None
+    position_id = position["position_id"]
+    _rewrite_stored_payload(container, position_id, management_history=["not-an-object"])
+    set_position_mark(
+        container,
+        position_id,
+        position["stop_price"],
+        as_of=utc_timestamp(NOW),
+    )
+    service = PositionService(
+        store=container.store, clock=container.clock, settings=container.settings
+    )
+
+    with pytest.raises(PositionCloseError) as exc:
+        service.monitor(position_id)
+
+    assert exc.value.code == "DATA_UNAVAILABLE"
+
+
+def test_a_missing_accumulator_with_recorded_partials_fails_closed(
+    tmp_path: Path,
+) -> None:
+    loop = _build_loop(tmp_path)
+    container = loop["container"]
+    position = loop["position"]
+    assert position is not None
+    position_id = position["position_id"]
+    broker = _broker(container)
+    broker.submit(
+        _intent(
+            position,
+            purpose="EXIT",
+            quantity=str(Decimal(position["size"]) / Decimal("2")),
+            idempotency_key="f2-partial",
+            risk_verdict_id=loop["order"]["risk_verdict_id"],
+        ),
+        mark_price=_mark(position),
+        mark_as_of=position["updated_at"],
+        now=position["updated_at"],
+    )
+    residual = Decimal(_payload(container, position_id)["size"])
+    _rewrite_stored_payload(container, position_id, realized_pnl_usd=None)
+
+    with pytest.raises(BrokerError) as partial_error:
+        broker.submit(
+            _intent(
+                position,
+                purpose="EXIT",
+                quantity="0.001",
+                idempotency_key="f2-partial-again",
+                risk_verdict_id=loop["order"]["risk_verdict_id"],
+            ),
+            mark_price=_mark(position),
+            mark_as_of=position["updated_at"],
+            now=position["updated_at"],
+        )
+    assert partial_error.value.code == "DATA_UNAVAILABLE"
+
+    _persist_verdict(container, position, decision_id="DEC-f2-add", risk_verdict_id="RISK-f2-add")
+    with pytest.raises(BrokerError) as add_error:
+        broker.submit(
+            _intent(
+                position,
+                purpose="ADD",
+                quantity=str(residual),
+                idempotency_key="f2-add",
+                risk_verdict_id="RISK-f2-add",
+                decision_id="DEC-f2-add",
+            ),
+            mark_price=_mark(position),
+            mark_as_of=position["updated_at"],
+            now=position["updated_at"],
+        )
+    assert add_error.value.code == "DATA_UNAVAILABLE"
+
+    with pytest.raises(BrokerError) as close_error:
+        broker.submit(
+            _intent(
+                position,
+                purpose="EXIT",
+                quantity=str(residual),
+                idempotency_key="f2-close",
+                risk_verdict_id=loop["order"]["risk_verdict_id"],
+                trade_log=_full_close_context(position),
+            ),
+            mark_price=_mark(position),
+            mark_as_of=position["updated_at"],
+            now=position["updated_at"],
+        )
+    assert close_error.value.code == "DATA_UNAVAILABLE"
+
+    service = PositionService(
+        store=container.store, clock=container.clock, settings=container.settings
+    )
+    history = service.history(position_id)
+    assert history["pnl"]["basis"] == "ACCUMULATED_GROSS"
+    assert history["pnl"]["gross_pnl_usd"] is None
+    assert history["pnl"]["data_quality"]["status"] == "PARTIAL"
+    assert any(
+        "recorded partial closes" in reason for reason in history["pnl"]["data_quality"]["reasons"]
     )

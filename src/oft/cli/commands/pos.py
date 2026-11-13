@@ -1,4 +1,4 @@
-"""``oft pos list|show|monitor``: the position ledger and the manual tick."""
+"""``oft pos list|show|history|monitor``: the position ledger and management tick."""
 
 from __future__ import annotations
 
@@ -13,8 +13,8 @@ from oft.config import ConfigError, load_settings
 
 pos_app = typer.Typer(
     help=(
-        "Position ledger and the deterministic protective-exit tick "
-        "(no target, partial, add, or live path)."
+        "Position ledger, accounting history, and the deterministic protective-exit tick "
+        "(no target, live, or exchange path)."
     ),
     no_args_is_help=True,
     add_completion=False,
@@ -121,6 +121,7 @@ def _render_history(data: dict[str, Any]) -> str:
         f"size {data.get('size', '-')} · entry {data.get('avg_entry_price', '-')}",
     ]
     pnl = data.get("pnl") or {}
+    lines.append(f"pnl basis {pnl.get('basis', '-')}")
     lines.append(
         f"gross {pnl.get('gross_pnl_usd', '-')} · fees {pnl.get('fees_usd', '-')}"
         f" · funding {pnl.get('funding_usd', '-')} · net {pnl.get('net_pnl_usd', '-')}"
@@ -137,10 +138,21 @@ def _render_history(data: dict[str, Any]) -> str:
     if not funding:
         lines.append("  (no recorded settlement in the holding window)")
     for item in funding:
+        status = (
+            "accrued"
+            if item.get("accrued")
+            else f"not accrued: {item.get('reason') or 'reason unavailable'}"
+        )
         lines.append(
             f"  {item.get('settlement_time', '-')} · rate {item.get('rate', '-')}"
             f" · mark {item.get('mark_price', '-')} · amount {item.get('amount_usd', '-')}"
+            f" · {status}"
         )
+    funding_reasons = data.get("funding_reasons") or []
+    if funding_reasons:
+        lines.append("FUNDING QUALITY")
+        for reason in funding_reasons:
+            lines.append(f"  {reason}")
     events = data.get("events") or []
     lines.append("TIMELINE")
     if not events:
@@ -161,9 +173,7 @@ def pos_history(
     """Show the accounting timeline: events, funding accruals, and PnL terms."""
     settings = _settings_or_exit(json_output)
     try:
-        envelope = ApiClient.from_settings(settings)._request(
-            "GET", f"/api/v1/positions/{position_id}/history"
-        )
+        envelope = ApiClient.from_settings(settings).position_history(position_id)
     except ApiClientError as exc:
         emit_error(exc.code, exc.message, json_output=json_output)
         raise typer.Exit(code=exit_code_for(exc.code)) from exc
@@ -179,7 +189,7 @@ def pos_monitor(
     position_id: str,
     json_output: Annotated[bool, typer.Option("--json", help="Emit JSON.")] = False,
 ) -> None:
-    """Run one stop-touch tick against the daemon (idempotent)."""
+    """Accrue recorded funding, then run one stop-touch tick against the daemon."""
     settings = _settings_or_exit(json_output)
     try:
         envelope = ApiClient.from_settings(settings).monitor_position(position_id)

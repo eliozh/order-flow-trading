@@ -556,7 +556,11 @@ class PositionEventRecord:
 
 @dataclass(frozen=True)
 class TradeLogRecord:
-    """The one closed-trade record for a position, plus its query keys."""
+    """The one closed-trade record for a position, plus its query keys.
+
+    The scalar columns duplicate fields of ``payload_json``; the broker builds
+    them from the rendered payload so the two can never disagree.
+    """
 
     trade_id: str
     position_id: str
@@ -611,8 +615,10 @@ class FundingAccrualRecord:
     """One recorded funding settlement applied to a position.
 
     ``amount_usd`` is the signed cash flow (a LONG paying a positive rate is
-    negative). The ``(position_id, settlement_time)`` unique constraint makes a
-    replay or restart a no-op.
+    negative). ``side`` and ``size`` are the position state the amount was
+    priced on, so the accrual can be re-derived without replaying the timeline.
+    The ``(position_id, settlement_time)`` unique constraint makes a replay or
+    restart a no-op.
     """
 
     accrual_id: str
@@ -622,16 +628,22 @@ class FundingAccrualRecord:
     mark_price: str
     amount_usd: str
     created_at: str
+    side: str
+    size: str
 
 
 @dataclass(frozen=True)
 class FundingAccrualCommit:
-    """Everything one funding accrual commits in a single transaction."""
+    """Everything one funding accrual commits in a single transaction.
+
+    The balance delta is not carried separately: the store derives it from
+    ``accrual.amount_usd`` and verifies the position's funding total advanced by
+    exactly that amount before committing.
+    """
 
     accrual: FundingAccrualRecord
     position: PositionRecord
     account: PaperAccountRecord
-    balance_delta: str
     event: PositionEventRecord
     audits: tuple[AuditEventDraft, ...] = ()
 

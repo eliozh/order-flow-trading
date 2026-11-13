@@ -1,5 +1,8 @@
-"""Deterministic money and PnL arithmetic for a full position close.
+"""Deterministic money and PnL arithmetic for position accounting.
 
+Covers the exact terms a full close journals (gross, fees, funding, net), the
+gross PnL of a partial-close slice, an add's weighted average entry and frozen
+risk, signed funding at a settlement, and the recorded-bar excursion measure.
 Pure standard-library functions only: no I/O, clock, or provider type enters
 here. Every value is an exact ``Decimal`` quantized to 8 decimal places with
 ``ROUND_DOWN`` so it matches the paper broker's money quantization. Strings that
@@ -192,6 +195,27 @@ def _bar_range(bar: Mapping[str, Any]) -> tuple[Decimal, Decimal] | None:
     return low, high
 
 
+@dataclass(frozen=True)
+class SizedExcursion:
+    """A recorded-bar excursion plus how much of the window it actually measured.
+
+    ``measured_bars`` counts the bars with a usable ``(low, high)`` pair;
+    ``skipped_bars`` counts the unusable ones. A window with no usable bar is
+    reported as unmeasured (``measured_bars == 0``) so a caller can name the
+    data-quality gap instead of claiming a measured zero. ``complete`` is true
+    only when the whole window was measurable.
+    """
+
+    mae_usd: Decimal
+    mfe_usd: Decimal
+    measured_bars: int
+    skipped_bars: int
+
+    @property
+    def complete(self) -> bool:
+        return self.measured_bars > 0 and self.skipped_bars == 0
+
+
 def mae_mfe_from_bars(
     side: str,
     entry_price: Decimal,
@@ -208,20 +232,23 @@ def mae_mfe_from_bars(
     _validate_side(side)
     if size < 0:
         raise ValueError("size must be non-negative")
-    return mae_mfe_from_sized_bars(side, bars, ((entry_price, size) for _ in bars))
+    excursion = mae_mfe_from_sized_bars(side, bars, ((entry_price, size) for _ in bars))
+    return excursion.mae_usd, excursion.mfe_usd
 
 
 def mae_mfe_from_sized_bars(
     side: str,
     bars: Sequence[Mapping[str, Any]],
     states: Iterable[tuple[Decimal, Decimal]],
-) -> tuple[Decimal, Decimal]:
+) -> SizedExcursion:
     """MAE/MFE using the entry price and size in force at each bar.
 
     ``states`` is aligned with ``bars``: ``states[i]`` is the
     ``(average entry price, open size)`` in force for ``bars[i]``. This keeps a
     pre-partial-close excursion measured on the pre-close quantity instead of
-    silently rescaling the whole window to the final residual size.
+    silently rescaling the whole window to the final residual size. The typed
+    result reports how many bars were measured and skipped, so an all-unusable
+    window is never silently reported as a measured ``(0, 0)``.
     """
     _validate_side(side)
     states = tuple(states)
@@ -229,12 +256,16 @@ def mae_mfe_from_sized_bars(
         raise ValueError("each bar needs exactly one size/entry state")
     adverse = ZERO
     favorable = ZERO
+    measured = 0
+    skipped = 0
     for bar, (entry_price, size) in zip(bars, states, strict=True):
         if size < 0:
             raise ValueError("size must be non-negative")
         prices = _bar_range(bar)
         if prices is None:
+            skipped += 1
             continue
+        measured += 1
         low, high = prices
         if side == "LONG":
             adverse = min(adverse, (low - entry_price) * size)
@@ -242,7 +273,12 @@ def mae_mfe_from_sized_bars(
         else:
             adverse = min(adverse, (entry_price - high) * size)
             favorable = max(favorable, (entry_price - low) * size)
-    return quantize_money(min(adverse, ZERO)), quantize_money(max(favorable, ZERO))
+    return SizedExcursion(
+        mae_usd=quantize_money(min(adverse, ZERO)),
+        mfe_usd=quantize_money(max(favorable, ZERO)),
+        measured_bars=measured,
+        skipped_bars=skipped,
+    )
 
 
 @dataclass(frozen=True)
@@ -293,17 +329,33 @@ def first_touch(
 
 
 def r_multiple(net_pnl: Decimal, initial_risk: Decimal | None) -> float | None:
-    """``R = net / frozen initial risk``; a zero or missing risk yields ``null``."""
+    """``R = net / frozen initial risk``; a zero, missing, or implausible risk is ``None``.
+
+    A ratio outside the persisted money range is treated as unmeasured rather
+    than allowed to escape ``quantize_money`` as an untyped ``ValueError`` after
+    a partial commit.
+    """
     if initial_risk is None or initial_risk <= 0:
         return None
-    return float(quantize_money(Decimal(net_pnl) / Decimal(initial_risk)))
+    try:
+        return float(quantize_money(Decimal(net_pnl) / Decimal(initial_risk)))
+    except (ArithmeticError, ValueError):
+        return None
 
 
 def return_percent(net_pnl: Decimal, entry_notional: Decimal | None) -> float:
-    """``return_pct = net / entry notional x 100``; zero notional yields ``0.0``."""
+    """``return_pct = net / entry notional x 100``; an unmeasured or implausible basis is ``0.0``.
+
+    The trade-log contract requires ``return_pct`` to be a number, so an
+    implausible ratio degrades to a contract-valid ``0.0`` instead of raising an
+    untyped error. Callers that can name the gap do so in ``data_quality``.
+    """
     if entry_notional is None or entry_notional <= 0:
         return 0.0
-    return float(quantize_money(Decimal(net_pnl) / Decimal(entry_notional) * HUNDRED))
+    try:
+        return float(quantize_money(Decimal(net_pnl) / Decimal(entry_notional) * HUNDRED))
+    except (ArithmeticError, ValueError):
+        return 0.0
 
 
 def outcome_tags(
@@ -351,6 +403,7 @@ __all__ = [
     "STOP_FIRST",
     "TARGET_FIRST",
     "FirstTouch",
+    "SizedExcursion",
     "add_stop_risk",
     "decimal_str",
     "fees_total",

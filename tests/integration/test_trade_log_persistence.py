@@ -80,8 +80,32 @@ def test_full_close_trade_log_carries_every_contract_field(tmp_path: Path) -> No
     assert Decimal(trade["mfe_usd"]) >= 0
     assert isinstance(trade["r_multiple"], float)
     assert isinstance(trade["return_pct"], float)
+    # A bar-covered close is fully measured: no quality gap and no reason.
+    assert trade["data_quality"]["status"] == "COMPLETE"
+    assert trade["data_quality"]["reasons"] == []
+    # Provenance is copied from the recorded entry decision and report, not
+    # left at the renderer's defaults.
+    trigger = container.store.get_trigger_event(position["source_trigger_id"])
+    assert trigger is not None
+    trigger_payload = json.loads(trigger.payload_json)
+    decision_record = container.store.get_decision(str(trigger_payload["entry_decision_id"]))
+    assert decision_record is not None
+    recorded_provenance = json.loads(decision_record.payload_json)["provenance"]
+    assert trade["provenance"]["llm_model"] == "fixture"
+    assert trade["provenance"]["llm_model"] == recorded_provenance["model"]
+    assert trade["provenance"]["prompt_version"] == recorded_provenance["prompt_version"]
+    opportunity = container.store.get_opportunity(trigger.opportunity_id)
+    assert opportunity is not None
+    source = json.loads(opportunity.payload_json)["source"]
+    report = container.store.get_report(str(source["report_id"]))
+    assert report is not None
+    recorded_metric_version = next(
+        entry["metric_version"]
+        for entry in json.loads(report.metrics_manifest_json)
+        if isinstance(entry, dict) and entry.get("metric_version")
+    )
+    assert trade["provenance"]["calc_metric_version"] == recorded_metric_version
     assert trade["provenance"]["llm_provider"] == "stub"
-    assert trade["provenance"]["calc_metric_version"] != ""
     assert trade["signal"]["trigger_id"] == position["source_trigger_id"]
     assert trade["signal"]["opportunity_id"] is not None
     assert trade["signal"]["decision_id"] is not None
@@ -281,3 +305,141 @@ def test_a_bar_containing_both_stop_and_target_is_an_ambiguous_bar(
     trade = result.trade_log
     assert trade["data_quality"]["status"] == "PARTIAL"
     assert any("AMBIGUOUS_BAR" in reason for reason in trade["data_quality"]["reasons"])
+
+
+def test_an_unknown_recorded_provider_is_named_and_marks_partial(tmp_path: Path) -> None:
+    loop = _build_loop(tmp_path)
+    container = loop["container"]
+    position = loop["position"]
+    trigger = container.store.get_trigger_event(position["source_trigger_id"])
+    assert trigger is not None
+    trigger_payload = json.loads(trigger.payload_json)
+    decision_id = str(trigger_payload["entry_decision_id"])
+    decision = container.store.get_decision(decision_id)
+    assert decision is not None
+    payload = json.loads(decision.payload_json)
+    payload["provenance"]["provider"] = "rogue-provider"
+    database = container.settings.data_dir / "oft.db"
+    with sqlite3.connect(database) as connection:
+        connection.execute(
+            "UPDATE decisions SET payload_json = ? WHERE decision_id = ?",
+            (json.dumps(payload, sort_keys=True), decision_id),
+        )
+        connection.commit()
+    service = PositionService(
+        store=container.store, clock=container.clock, settings=container.settings
+    )
+
+    result = _close_with_bars(container, position, service)
+
+    assert result.status == "CLOSED" and result.trade_log is not None
+    trade = result.trade_log
+    assert trade["provenance"]["llm_provider"] == "stub"
+    assert trade["data_quality"]["status"] == "PARTIAL"
+    assert any("not recognized" in reason for reason in trade["data_quality"]["reasons"])
+
+
+def test_a_missing_entry_fill_does_not_substitute_residual_notional(tmp_path: Path) -> None:
+    loop = _build_loop(tmp_path)
+    container = loop["container"]
+    position = loop["position"]
+    entry_order_id = loop["order"]["order_id"]
+    database = container.settings.data_dir / "oft.db"
+    with sqlite3.connect(database) as connection:
+        connection.execute(
+            "UPDATE fills SET payload_json = '{}' WHERE order_id = ?", (entry_order_id,)
+        )
+        connection.commit()
+    service = PositionService(
+        store=container.store, clock=container.clock, settings=container.settings
+    )
+
+    result = _close_with_bars(container, position, service)
+
+    assert result.status == "CLOSED" and result.trade_log is not None
+    trade = result.trade_log
+    assert trade["return_pct"] == 0.0
+    assert trade["data_quality"]["status"] == "PARTIAL"
+    assert any("entry notional" in reason for reason in trade["data_quality"]["reasons"])
+
+
+def test_a_window_with_no_usable_bars_is_named_partial(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    loop = _build_loop(tmp_path)
+    container = loop["container"]
+    position = loop["position"]
+    position_id = position["position_id"]
+    service = PositionService(
+        store=container.store, clock=container.clock, settings=container.settings
+    )
+    monkeypatch.setattr(
+        service,
+        "_window_bars",
+        lambda *args, **kwargs: ({"bar_end": utc_timestamp(NOW), "low": None, "high": "1"},),
+    )
+    set_position_mark(container, position_id, position["stop_price"], as_of=utc_timestamp(NOW))
+
+    result = service.monitor(position_id)
+
+    assert result.status == "CLOSED" and result.trade_log is not None
+    assert result.trade_log["data_quality"]["status"] == "PARTIAL"
+    assert any(
+        "no usable recorded bar" in reason for reason in result.trade_log["data_quality"]["reasons"]
+    )
+
+
+def test_a_partially_usable_bar_window_is_named_partial(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    loop = _build_loop(tmp_path)
+    container = loop["container"]
+    position = loop["position"]
+    position_id = position["position_id"]
+    service = PositionService(
+        store=container.store, clock=container.clock, settings=container.settings
+    )
+    monkeypatch.setattr(
+        service,
+        "_window_bars",
+        lambda *args, **kwargs: (
+            {"bar_end": utc_timestamp(NOW), "low": "69000", "high": "71000"},
+            {"bar_end": utc_timestamp(NOW), "low": None, "high": "1"},
+        ),
+    )
+    set_position_mark(container, position_id, position["stop_price"], as_of=utc_timestamp(NOW))
+
+    result = service.monitor(position_id)
+
+    assert result.status == "CLOSED" and result.trade_log is not None
+    assert any("were unusable" in reason for reason in result.trade_log["data_quality"]["reasons"])
+
+
+def test_history_marks_a_corrupt_trade_projection_partial(tmp_path: Path) -> None:
+    loop = _build_loop(tmp_path)
+    container = loop["container"]
+    position = loop["position"]
+    position_id = position["position_id"]
+    service = PositionService(
+        store=container.store, clock=container.clock, settings=container.settings
+    )
+    result = _close_with_bars(container, position, service)
+    assert result.status == "CLOSED"
+    trade = container.store.get_trade_log_for_position(position_id)
+    assert trade is not None
+    payload = json.loads(trade.payload_json)
+    payload["gross_pnl_usd"] = "bogus"
+    database = container.settings.data_dir / "oft.db"
+    with sqlite3.connect(database) as connection:
+        connection.execute(
+            "UPDATE trade_logs SET payload_json = ? WHERE trade_id = ?",
+            (json.dumps(payload, sort_keys=True), trade.trade_id),
+        )
+        connection.commit()
+
+    history = service.history(position_id)
+
+    pnl = history["pnl"]
+    assert pnl["gross_pnl_usd"] is None
+    assert pnl["data_quality"]["status"] == "PARTIAL"
+    assert any("gross_pnl_usd is unreadable" in reason for reason in pnl["data_quality"]["reasons"])

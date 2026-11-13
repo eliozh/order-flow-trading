@@ -14,7 +14,7 @@ from referencing import Registry, Resource
 from referencing.jsonschema import DRAFT202012
 
 from oft.domain.oms import Fill, OrderSide, Position, PositionSide
-from oft.domain.pnl import net_pnl_usd
+from oft.domain.pnl import ZERO, net_pnl_usd
 from oft.domain.positions import (
     FULL_CLOSE,
     FUNDING_REASON,
@@ -146,7 +146,9 @@ def test_management_decision_id_is_deterministic_and_input_bound() -> None:
 
 
 def test_close_full_writes_the_caller_decision_id_once() -> None:
-    close = close_full(_position(), _fill(), at=NOW, decision_id=DECISION_ID)
+    close = close_full(
+        _position(), _fill(), at=NOW, decision_id=DECISION_ID, accumulated_gross=ZERO
+    )
 
     assert close.event.decision_id == DECISION_ID
     history = close.to_contract()["management_history"]
@@ -156,7 +158,9 @@ def test_close_full_writes_the_caller_decision_id_once() -> None:
 
 
 def test_close_result_rejects_a_net_that_contradicts_its_terms() -> None:
-    close = close_full(_position(), _fill(), at=NOW, decision_id=DECISION_ID)
+    close = close_full(
+        _position(), _fill(), at=NOW, decision_id=DECISION_ID, accumulated_gross=ZERO
+    )
 
     with pytest.raises(ValueError):
         replace(close, net_pnl_usd=close.net_pnl_usd + Decimal("1"))
@@ -183,7 +187,9 @@ def test_a_non_finite_recorded_value_is_unavailable_not_a_crash() -> None:
 
 
 def test_close_full_produces_a_valid_closed_position_payload() -> None:
-    close = close_full(_position(), _fill(), at=NOW, decision_id=DECISION_ID)
+    close = close_full(
+        _position(), _fill(), at=NOW, decision_id=DECISION_ID, accumulated_gross=ZERO
+    )
     payload = close.to_contract()
 
     _validate("position.schema.json", payload)
@@ -207,7 +213,9 @@ def test_close_full_round_trips_through_the_contract_payload() -> None:
     open_position = _position()
     assert position_from_contract(open_position.to_contract()) == open_position
 
-    close = close_full(open_position, _fill(), at=NOW, decision_id=DECISION_ID)
+    close = close_full(
+        open_position, _fill(), at=NOW, decision_id=DECISION_ID, accumulated_gross=ZERO
+    )
     rebuilt = position_from_contract(close.to_contract())
     assert rebuilt.state == "CLOSED"
     assert rebuilt.realized_pnl_usd == close.net_pnl_usd
@@ -233,13 +241,27 @@ def test_close_full_rejects_a_wrong_side_or_partial_fill() -> None:
         )
 
     with pytest.raises(PositionError):
-        close_full(_position(), _sided(OrderSide.BUY, "0.01"), at=NOW, decision_id=DECISION_ID)
+        close_full(
+            _position(),
+            _sided(OrderSide.BUY, "0.01"),
+            at=NOW,
+            decision_id=DECISION_ID,
+            accumulated_gross=ZERO,
+        )
     with pytest.raises(PositionError):
-        close_full(_position(), _sided(OrderSide.SELL, "0.005"), at=NOW, decision_id=DECISION_ID)
+        close_full(
+            _position(),
+            _sided(OrderSide.SELL, "0.005"),
+            at=NOW,
+            decision_id=DECISION_ID,
+            accumulated_gross=ZERO,
+        )
 
 
 def test_trade_log_from_close_validates_and_holds_the_pnl_formula() -> None:
-    close = close_full(_position(), _fill(), at=NOW, decision_id=DECISION_ID)
+    close = close_full(
+        _position(), _fill(), at=NOW, decision_id=DECISION_ID, accumulated_gross=ZERO
+    )
     trade = trade_log_from_close(close, trade_id=trade_id_for("POS-TEST"))
 
     _validate("trade-log.schema.json", trade)
@@ -321,7 +343,9 @@ def test_a_position_requires_finite_target_prices() -> None:
 
 def test_trade_log_emits_the_actual_funding_term() -> None:
     """Funding is serialized from the close, not hardcoded to "0"."""
-    close = close_full(_position(), _fill(), at=NOW, decision_id=DECISION_ID)
+    close = close_full(
+        _position(), _fill(), at=NOW, decision_id=DECISION_ID, accumulated_gross=ZERO
+    )
     funding = Decimal("-0.05")
     funded = replace(
         close,

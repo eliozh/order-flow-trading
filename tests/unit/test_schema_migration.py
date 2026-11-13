@@ -2374,16 +2374,16 @@ def test_v22_database_migrates_to_v23_preserving_events_and_funding_uniqueness(
         )
         connection.execute(
             "INSERT INTO funding_accruals (accrual_id, position_id, settlement_time, rate, "
-            "mark_price, amount_usd, created_at) "
+            "mark_price, amount_usd, created_at, side, size) "
             "VALUES ('FND-1', 'POS-1', '2026-11-14T00:00:00.000Z', '0.0001', '70000', "
-            "'-0.07', 't')"
+            "'-0.07', 't', 'LONG', '1')"
         )
         with pytest.raises(sqlite3.IntegrityError):
             connection.execute(
                 "INSERT INTO funding_accruals (accrual_id, position_id, settlement_time, rate, "
-                "mark_price, amount_usd, created_at) "
+                "mark_price, amount_usd, created_at, side, size) "
                 "VALUES ('FND-2', 'POS-1', '2026-11-14T00:00:00.000Z', '0.0001', '70000', "
-                "'-0.07', 't')"
+                "'-0.07', 't', 'LONG', '1')"
             )
         with pytest.raises(sqlite3.IntegrityError):
             connection.execute("UPDATE position_events SET note = 'rewritten'")
@@ -2420,3 +2420,78 @@ def test_v23_tables_match_between_a_fresh_and_a_migrated_database(tmp_path: Path
     finally:
         migrated.close()
         fresh.close()
+
+
+def test_a_stamped_v23_funding_table_without_side_size_is_repaired(tmp_path: Path) -> None:
+    settings = Settings(env="test", port=8765, data_dir=tmp_path / "data")
+    SqliteStore(settings).initialize()
+    database = database_path(settings)
+    with sqlite3.connect(database) as connection:
+        connection.execute("DROP TABLE funding_accruals")
+        connection.execute(
+            "CREATE TABLE funding_accruals ("
+            "accrual_id TEXT PRIMARY KEY,"
+            "position_id TEXT NOT NULL REFERENCES positions(position_id),"
+            "settlement_time TEXT NOT NULL,"
+            "rate TEXT NOT NULL,"
+            "mark_price TEXT NOT NULL,"
+            "amount_usd TEXT NOT NULL,"
+            "created_at TEXT NOT NULL,"
+            "UNIQUE (position_id, settlement_time))"
+        )
+        connection.commit()
+
+    from oft.adapters import sqlite_schema
+
+    inspection = sqlite3.connect(database)
+    try:
+        assert sqlite_schema._v23_objects_present(inspection) is False
+    finally:
+        inspection.close()
+
+    SqliteStore(settings).initialize()
+    SqliteStore(settings).initialize()  # idempotent
+
+    with sqlite3.connect(database) as connection:
+        columns = {str(row[1]) for row in connection.execute("PRAGMA table_info(funding_accruals)")}
+        version = connection.execute("SELECT MAX(version) FROM schema_migrations").fetchone()[0]
+    assert {"side", "size"} <= columns
+    assert version == 23
+
+
+def test_ensure_funding_accruals_shape_rolls_back_a_failed_repair(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from oft.adapters import sqlite_schema
+
+    settings = Settings(env="test", port=8765, data_dir=tmp_path / "data")
+    SqliteStore(settings).initialize()
+    database = database_path(settings)
+    with sqlite3.connect(database) as connection:
+        connection.execute("DROP TABLE funding_accruals")
+        connection.execute(
+            "CREATE TABLE funding_accruals ("
+            "accrual_id TEXT PRIMARY KEY,"
+            "position_id TEXT NOT NULL REFERENCES positions(position_id),"
+            "settlement_time TEXT NOT NULL,"
+            "rate TEXT NOT NULL,"
+            "mark_price TEXT NOT NULL,"
+            "amount_usd TEXT NOT NULL,"
+            "created_at TEXT NOT NULL,"
+            "UNIQUE (position_id, settlement_time))"
+        )
+        connection.commit()
+
+    def boom(connection: sqlite3.Connection) -> None:
+        raise RuntimeError("rebuild failed")
+
+    monkeypatch.setattr(sqlite_schema, "_rebuild_funding_accruals_for_v23", boom)
+    connection = sqlite3.connect(database)
+    try:
+        with pytest.raises(RuntimeError):
+            sqlite_schema._ensure_funding_accruals_shape(connection)
+        assert not connection.in_transaction
+        columns = {str(row[1]) for row in connection.execute("PRAGMA table_info(funding_accruals)")}
+        assert "side" not in columns
+    finally:
+        connection.close()

@@ -9,7 +9,7 @@ from typing import Any
 import pytest
 
 from oft.domain.oms import Fill, OrderSide, Position, PositionSide
-from oft.domain.pnl import return_percent
+from oft.domain.pnl import ZERO, return_percent
 from oft.domain.positions import (
     ADD,
     PARTIAL_CLOSE,
@@ -93,6 +93,7 @@ def test_partial_close_halves_size_and_keeps_the_position_open() -> None:
         _fill(),
         at=NOW,
         decision_id="MGD-1",
+        accumulated_gross=ZERO,
     )
 
     payload = result.payload
@@ -100,7 +101,8 @@ def test_partial_close_halves_size_and_keeps_the_position_open() -> None:
     assert payload["size"] == "0.5"
     assert payload["closed_at"] is None
     assert payload["exit_price"] is None
-    assert result.gross_pnl_usd == Decimal("250.00000000")
+    assert result.slice_gross_pnl_usd == Decimal("250.00000000")
+    assert result.accumulated_fees_usd == Decimal("27.62500000")
     assert result.accumulated_gross_pnl_usd == Decimal("250.00000000")
     assert Decimal(payload["realized_pnl_usd"]) == Decimal("250.00000000")
     assert Decimal(payload["fees_usd"]) == Decimal("27.62500000")
@@ -110,7 +112,9 @@ def test_partial_close_halves_size_and_keeps_the_position_open() -> None:
 
 
 def test_a_second_partial_close_accumulates_the_gross_total() -> None:
-    first = partial_close(_position(size="1"), _fill(quantity="0.4"), at=NOW, decision_id="M1")
+    first = partial_close(
+        _position(size="1"), _fill(quantity="0.4"), at=NOW, decision_id="M1", accumulated_gross=ZERO
+    )
     position = Position(
         position_id="POS-1",
         account_id="ACC-PAPER",
@@ -146,7 +150,7 @@ def test_a_second_partial_close_accumulates_the_gross_total() -> None:
 
 
 def test_a_full_close_after_partials_totals_every_slice() -> None:
-    first = partial_close(_position(), _fill(), at=NOW, decision_id="M1")
+    first = partial_close(_position(), _fill(), at=NOW, decision_id="M1", accumulated_gross=ZERO)
     position = Position(
         position_id="POS-1",
         account_id="ACC-PAPER",
@@ -186,21 +190,28 @@ def test_a_full_close_after_partials_totals_every_slice() -> None:
 
 def test_a_partial_close_that_empties_the_position_is_rejected() -> None:
     with pytest.raises(PositionError):
-        partial_close(_position(), _fill(quantity="1"), at=NOW, decision_id="M1")
+        partial_close(
+            _position(), _fill(quantity="1"), at=NOW, decision_id="M1", accumulated_gross=ZERO
+        )
     # A non-positive fill is rejected by the fill itself.
     with pytest.raises(ValueError):
-        partial_close(_position(), _fill(quantity="0"), at=NOW, decision_id="M1")
+        partial_close(
+            _position(), _fill(quantity="0"), at=NOW, decision_id="M1", accumulated_gross=ZERO
+        )
 
 
 def test_partial_close_side_and_symbol_must_match() -> None:
     with pytest.raises(PositionError):
-        partial_close(_position(), _fill(side=OrderSide.BUY), at=NOW, decision_id="M1")
+        partial_close(
+            _position(), _fill(side=OrderSide.BUY), at=NOW, decision_id="M1", accumulated_gross=ZERO
+        )
     with pytest.raises(PositionError):
         partial_close(
             _position(side=PositionSide.SHORT, stop="71000"),
             _fill(side=OrderSide.SELL),
             at=NOW,
             decision_id="M1",
+            accumulated_gross=ZERO,
         )
 
 
@@ -210,6 +221,7 @@ def test_apply_add_moves_size_and_weighted_average_entry() -> None:
         _fill(side=OrderSide.BUY, price="71000", quantity="1", fee="35.50"),
         at=NOW,
         decision_id="M-ADD",
+        accumulated_gross=ZERO,
     )
 
     position = result.position
@@ -231,6 +243,7 @@ def test_apply_add_requires_a_stop_and_the_increasing_side() -> None:
             _fill(side=OrderSide.BUY, price="71000", quantity="1"),
             at=NOW,
             decision_id="M-ADD",
+            accumulated_gross=ZERO,
         )
     with pytest.raises(PositionError):
         apply_add(
@@ -238,6 +251,7 @@ def test_apply_add_requires_a_stop_and_the_increasing_side() -> None:
             _fill(side=OrderSide.SELL, price="71000", quantity="1"),
             at=NOW,
             decision_id="M-ADD",
+            accumulated_gross=ZERO,
         )
 
 
@@ -248,6 +262,7 @@ def test_apply_add_rejects_a_stop_on_the_wrong_side_of_the_add_price() -> None:
             _fill(side=OrderSide.BUY, price="68000", quantity="1"),
             at=NOW,
             decision_id="M-ADD",
+            accumulated_gross=ZERO,
         )
 
 
@@ -265,11 +280,12 @@ def test_apply_add_rejects_a_closed_position() -> None:
             _fill(side=OrderSide.BUY, price="71000", quantity="1"),
             at=NOW,
             decision_id="M-ADD",
+            accumulated_gross=ZERO,
         )
 
 
 def test_partial_close_reduces_notional_and_margin_proportionally() -> None:
-    result = partial_close(_position(), _fill(), at=NOW, decision_id="M1")
+    result = partial_close(_position(), _fill(), at=NOW, decision_id="M1", accumulated_gross=ZERO)
 
     payload = result.payload
     assert Decimal(payload["size"]) == Decimal("0.5")
@@ -300,7 +316,7 @@ def test_apply_add_persists_the_fill_mark_and_accumulated_gross() -> None:
 
 
 def test_the_trade_log_size_is_the_total_closed_quantity_and_tags_partial() -> None:
-    first = partial_close(_position(), _fill(), at=NOW, decision_id="M1")
+    first = partial_close(_position(), _fill(), at=NOW, decision_id="M1", accumulated_gross=ZERO)
     remaining = position_from_contract(first.payload)
     close = close_full(
         remaining,
@@ -337,7 +353,7 @@ def test_the_trade_log_size_is_the_total_closed_quantity_and_tags_partial() -> N
 
 
 def test_a_journal_context_that_contradicts_the_position_is_rejected() -> None:
-    first = partial_close(_position(), _fill(), at=NOW, decision_id="M1")
+    first = partial_close(_position(), _fill(), at=NOW, decision_id="M1", accumulated_gross=ZERO)
     remaining = position_from_contract(first.payload)
     close = close_full(
         remaining,
@@ -389,6 +405,7 @@ def _closed_position() -> Any:
         _fill(side=OrderSide.SELL, price="69900", quantity="1", fee="17.475"),
         at=NOW,
         decision_id="M2",
+        accumulated_gross=ZERO,
     )
 
 
@@ -425,3 +442,110 @@ def test_the_journal_context_rejects_mutually_exclusive_outcomes() -> None:
         _render(close, _valid_context(close, stopped=False, manual=True))
     with pytest.raises(PositionError):
         _render(close, _valid_context(close, stopped=False, target=True))
+
+
+def test_a_corrupt_management_history_fails_closed_typed() -> None:
+    from oft.domain.positions import recorded_partial_close
+
+    corrupt = replace(_position(), management_history=("not-an-object",))
+    with pytest.raises(PositionError):
+        recorded_partial_close(corrupt)
+    payload = _position().to_contract()
+    payload["management_history"] = ["nope"]
+    with pytest.raises(PositionError):
+        position_from_contract(payload)
+
+
+def test_an_unknown_close_reason_is_rejected() -> None:
+    from oft.domain.positions import CloseOutcome
+
+    with pytest.raises(PositionError):
+        CloseOutcome.from_reason("NOT_A_REASON")
+    with pytest.raises(PositionError):
+        close_full(
+            _position(),
+            _fill(side=OrderSide.SELL, price="69900", quantity="1", fee="17.475"),
+            at=NOW,
+            decision_id="M2",
+            accumulated_gross=ZERO,
+            close_reason="NOT_A_REASON",
+        )
+
+
+def test_the_journal_context_cannot_claim_a_different_outcome_than_the_close() -> None:
+    close = _closed_position()  # the applied outcome is STOP_TOUCH
+    context = _valid_context(
+        close,
+        close_reason="TARGET_TOUCH",
+        stopped=False,
+        target=True,
+    )
+    with pytest.raises(PositionError):
+        _render(close, context)
+
+
+def test_the_traded_quantity_is_required_and_reconciled() -> None:
+    close = _closed_position()
+    with pytest.raises(PositionError):
+        _render(close, _valid_context(close, traded_quantity=None))
+    with pytest.raises(PositionError):
+        _render(close, _valid_context(close, traded_quantity=Decimal("2")))
+    with pytest.raises(PositionError):
+        trade_log_from_close(
+            close,
+            trade_id=trade_id_for(close.position.position_id),
+            context=_valid_context(close, traded_quantity=Decimal("2")),
+            expected_traded_quantity=Decimal("1"),
+        )
+
+
+def test_a_tiny_measured_return_stays_complete_without_a_return_reason() -> None:
+    close = _closed_position()
+    context = _valid_context(close, entry_notional_usd=Decimal("1000000000000000"))
+    trade = _render(close, context)
+    assert trade["return_pct"] == 0.0
+    assert trade["data_quality"]["status"] == "COMPLETE"
+    assert not any("return_pct" in reason for reason in trade["data_quality"]["reasons"])
+
+
+def test_an_unmeasured_entry_notional_renders_a_zero_return_with_a_reason() -> None:
+    close = _closed_position()
+    context = _valid_context(
+        close,
+        entry_notional_usd=None,
+        data_quality_status="PARTIAL",
+        data_quality_reasons=("entry notional is unavailable",),
+    )
+    trade = _render(close, context)
+    assert trade["return_pct"] == 0.0
+    assert trade["data_quality"]["status"] == "PARTIAL"
+    assert any("entry notional" in reason for reason in trade["data_quality"]["reasons"])
+
+
+def test_the_partial_close_flag_is_reconciled_with_the_recorded_timeline() -> None:
+    first = partial_close(_position(), _fill(), at=NOW, decision_id="M1", accumulated_gross=ZERO)
+    remaining = position_from_contract(first.payload)
+    close = close_full(
+        remaining,
+        _fill(quantity="0.5", price="69900", fee="17.475"),
+        at="2026-11-14T13:00:00.000Z",
+        decision_id="M2",
+        accumulated_gross=first.accumulated_gross_pnl_usd,
+    )
+    # The timeline records a partial close, so a False flag is a contradiction.
+    with pytest.raises(PositionError):
+        _render(close, _valid_context(close, had_partial_close=False))
+    # A partial close means the traded size must exceed the residual open size.
+    with pytest.raises(PositionError):
+        _render(
+            close,
+            _valid_context(
+                close,
+                had_partial_close=True,
+                traded_quantity=close.position.size,
+            ),
+        )
+    # A trade with no recorded partial cannot claim one.
+    plain = _closed_position()
+    with pytest.raises(PositionError):
+        _render(plain, _valid_context(plain, had_partial_close=True, traded_quantity=Decimal("2")))

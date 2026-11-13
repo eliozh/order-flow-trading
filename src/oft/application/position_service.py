@@ -1,12 +1,13 @@
-"""Position management: read models, mark lookup, stop touch, and full close.
+"""Position management: read models, mark lookup, stop touch, and the journal.
 
-The service owns the one deterministic management path in this slice: it
-resolves the position's latest recorded mark from published bars (falling back
-to the mark persisted on the position), refuses to act on a missing or stale
-mark, applies the code-owned stop-touch rule, persists a management decision and
-an exit risk verdict, submits one reduce-only ``FULL_CLOSE`` through the
-execution gateway, and surfaces the single trade-log row the broker committed.
-No route or CLI calls the broker directly.
+The service owns the deterministic management paths: it resolves the position's
+latest recorded mark from published bars (falling back to the mark persisted on
+the position), refuses to act on a missing or stale mark, applies the
+code-owned stop-touch rule, accrues recorded funding settlements, and computes
+the complete trade-log facts. Partial closes and adds are submitted through the
+same execution gateway; the full close persists a management decision, an exit
+risk verdict, one reduce-only ``FULL_CLOSE``, and the single trade-log row the
+broker committed. No route or CLI calls the broker directly.
 
 Mark lookup prefers the latest recorded bar close for the position's symbol and
 uses the bar's ``bar_end`` as the mark's as-of. When no bar series or usable row
@@ -15,15 +16,21 @@ fallback. The newest recorded observation wins; the stale rule is applied
 unchanged to the chosen as-of, and a bar whose ``bar_end`` is in the future is
 never selected. A bar-derived mark is written to the position row immediately
 before a close so the gateway's independent re-read sees the same recorded mark.
+
+The read model keeps the PnL bases explicit. An OPEN position's
+``realized_pnl_usd`` is ACCUMULATED GROSS; a CLOSED position's is NET. The
+history payload names the basis and never substitutes the residual position
+notional for a missing entry notional.
 """
 
 from __future__ import annotations
 
+import builtins
 import hashlib
 import json
 import logging
 import re
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from datetime import UTC, datetime, timedelta
 from decimal import Decimal
 from typing import Any
@@ -41,12 +48,14 @@ from oft.application.paper_broker import (
 )
 from oft.application.payloads import decode_payload_json
 from oft.config import Settings
-from oft.domain.oms import OrderSide, OrderType, Position, PositionSide, deterministic_id
+from oft.domain.oms import OrderType, Position, deterministic_id
 from oft.domain.pnl import (
     MAX_ABS_FUNDING_RATE,
+    MAX_ABS_MONEY,
     MAX_ABS_PRICE,
     MAX_ABS_QUANTITY,
     ZERO,
+    decimal_str,
     first_touch,
     funding_amount_usd,
     mae_mfe_from_sized_bars,
@@ -62,7 +71,10 @@ from oft.domain.positions import (
     TradeLogContext,
     evaluate_protective_exit,
     management_decision_id,
+    payload_has_partial_close,
     position_from_contract,
+    recorded_partial_close,
+    reducing_side,
 )
 from oft.domain.risk import (
     RISK_VERDICT_TTL_SECONDS,
@@ -143,6 +155,9 @@ def _apply_decision_provenance(
         reasons.append("entry provenance is partial: the decision has no provider")
         provider = "stub"
     elif provider not in _PROVIDER_VALUES:
+        reasons.append(
+            f"entry provenance is partial: the decision provider {provider!r} is not recognized"
+        )
         provider = "stub"
     if not isinstance(model, str) or not model:
         reasons.append("entry provenance is partial: the decision has no model")
@@ -192,6 +207,7 @@ class PositionMonitorResult:
     trade_log: dict[str, Any] | None = None
     account: dict[str, Any] | None = None
     idempotent_replay: bool = False
+    funding: dict[str, Any] | None = None
 
     def __post_init__(self) -> None:
         if self.status not in {NO_ACTION, CLOSED}:
@@ -215,6 +231,7 @@ class PositionMonitorResult:
             "trade_log": self.trade_log,
             "account": self.account,
             "idempotent_replay": self.idempotent_replay,
+            "funding": self.funding,
         }
 
 
@@ -296,6 +313,214 @@ class _SourceFacts:
 
 
 @dataclass(frozen=True)
+class _HistoryPnl:
+    """A typed history PnL read model with an explicit basis.
+
+    The same persisted field means different things by state: an OPEN position's
+    ``realized_pnl_usd`` is ACCUMULATED GROSS, a CLOSED one's is NET. This model
+    names the basis and exposes an explicit gross term so a reader never has to
+    infer it. The two concrete subclasses are the OPEN and CLOSED projections.
+    """
+
+    basis: str
+    gross_pnl_usd: str | None
+    realized_gross_pnl_usd: str | None
+    fees_usd: str | None
+    funding_usd: str | None
+    net_pnl_usd: str | None
+    r_multiple: float | None
+    return_pct: float | None
+    mae_usd: str | None
+    mfe_usd: str | None
+    outcome_tags: tuple[str, ...]
+    data_quality: dict[str, Any]
+
+    def to_contract(self) -> dict[str, Any]:
+        return {
+            "basis": self.basis,
+            "gross_pnl_usd": self.gross_pnl_usd,
+            "realized_gross_pnl_usd": self.realized_gross_pnl_usd,
+            "fees_usd": self.fees_usd,
+            "funding_usd": self.funding_usd,
+            "net_pnl_usd": self.net_pnl_usd,
+            "r_multiple": self.r_multiple,
+            "return_pct": self.return_pct,
+            "mae_usd": self.mae_usd,
+            "mfe_usd": self.mfe_usd,
+            "outcome_tags": list(self.outcome_tags),
+            "data_quality": self.data_quality,
+        }
+
+
+def _money_text(value: object) -> str | None:
+    """Render a persisted money value, or ``None`` when it is unreadable.
+
+    An already-rendered contract string is preserved verbatim so the history
+    projection cannot disagree with the trade-log document it mirrors.
+    """
+    parsed = _decimal_or_none(value)
+    if parsed is None or abs(parsed) > MAX_ABS_MONEY:
+        return None
+    if isinstance(value, str):
+        return value
+    return plain_money_str(parsed)
+
+
+def _number_or_none(value: object) -> float | None:
+    if isinstance(value, bool) or not isinstance(value, (int, float)):
+        return None
+    number = float(value)
+    return number if number == number and number not in (float("inf"), float("-inf")) else None
+
+
+def _degraded_quality(quality: dict[str, Any], reasons: list[str]) -> dict[str, Any]:
+    """Force a stored data-quality summary to PARTIAL and merge named reasons."""
+    merged = dict(quality)
+    existing = [str(reason) for reason in merged.get("reasons") or []]
+    for reason in reasons:
+        if reason not in existing:
+            existing.append(reason)
+    merged["status"] = "PARTIAL"
+    merged["reasons"] = existing
+    return merged
+
+
+class _OpenPnl(_HistoryPnl):
+    """The OPEN projection: the persisted value is ACCUMULATED GROSS."""
+
+    @classmethod
+    def from_payload(cls, payload: dict[str, Any]) -> _OpenPnl:
+        reasons: list[str] = []
+        raw = payload.get("realized_pnl_usd")
+        if raw is None:
+            if payload_has_partial_close(payload):
+                # The stored total was lost; the recorded partial closes make it
+                # unmeasured rather than a measured zero.
+                gross = None
+                reasons.append(
+                    "accumulated gross is unmeasured: the recorded partial closes "
+                    "have no stored total"
+                )
+            else:
+                gross = plain_money_str(ZERO)
+        else:
+            parsed = _decimal_or_none(raw)
+            if parsed is None or abs(parsed) > MAX_ABS_MONEY:
+                gross = None
+                reasons.append("realized PnL is unreadable; the accumulated gross is not measured")
+            else:
+                gross = plain_money_str(parsed)
+        fees = _money_text(payload.get("fees_usd"))
+        if payload.get("fees_usd") is not None and fees is None:
+            reasons.append("fees_usd is unreadable; the accumulated fees are not measured")
+        funding = _money_text(payload.get("funding_usd"))
+        if payload.get("funding_usd") is not None and funding is None:
+            reasons.append("funding_usd is unreadable; accrued funding is not measured")
+        return cls(
+            basis="ACCUMULATED_GROSS",
+            gross_pnl_usd=gross,
+            realized_gross_pnl_usd=gross,
+            fees_usd=fees,
+            funding_usd=funding,
+            net_pnl_usd=None,
+            r_multiple=None,
+            return_pct=None,
+            mae_usd=None,
+            mfe_usd=None,
+            outcome_tags=(),
+            data_quality={"status": "PARTIAL" if reasons else "COMPLETE", "reasons": reasons},
+        )
+
+
+class _ClosedPnl(_HistoryPnl):
+    """The CLOSED projection: the persisted value is NET."""
+
+    @classmethod
+    def from_trade(cls, payload: dict[str, Any]) -> _ClosedPnl:
+        reasons: list[str] = []
+
+        def money(key: str) -> str | None:
+            value = _money_text(payload.get(key))
+            if value is None:
+                reasons.append(f"trade-log {key} is unreadable")
+            return value
+
+        gross = money("gross_pnl_usd")
+        fees = money("fees_usd")
+        funding = money("funding_usd")
+        net = money("net_pnl_usd")
+        mae = money("mae_usd")
+        mfe = money("mfe_usd")
+        r_raw = payload.get("r_multiple")
+        computed_r = _number_or_none(r_raw)
+        if r_raw is not None and computed_r is None:
+            reasons.append("trade-log r_multiple is unreadable")
+        return_raw = payload.get("return_pct")
+        computed_return = _number_or_none(return_raw)
+        if computed_return is None:
+            reasons.append("trade-log return_pct is unreadable")
+        data_quality = payload.get("data_quality")
+        if isinstance(data_quality, dict):
+            quality = dict(data_quality)
+            stored_status = quality.get("status")
+            stored_reasons = quality.get("reasons")
+            if stored_status not in {"COMPLETE", "PARTIAL"} or not isinstance(stored_reasons, list):
+                reasons.append("stored trade-log data quality is invalid")
+        else:
+            quality = {"status": "PARTIAL", "reasons": []}
+            reasons.append("stored trade-log data quality is invalid")
+        if reasons:
+            existing = [str(reason) for reason in quality.get("reasons") or []]
+            for reason in reasons:
+                if reason not in existing:
+                    existing.append(reason)
+            quality["status"] = "PARTIAL"
+            quality["reasons"] = existing
+        tags = payload.get("outcome_tags")
+        return cls(
+            basis="NET",
+            gross_pnl_usd=gross,
+            realized_gross_pnl_usd=gross,
+            fees_usd=fees,
+            funding_usd=funding,
+            net_pnl_usd=net,
+            r_multiple=computed_r,
+            return_pct=computed_return,
+            mae_usd=mae,
+            mfe_usd=mfe,
+            outcome_tags=tuple(str(tag) for tag in tags) if isinstance(tags, list) else (),
+            data_quality=quality,
+        )
+
+    @classmethod
+    def from_position_payload(cls, payload: dict[str, Any]) -> _ClosedPnl:
+        reasons = ["the trade log is missing; the net PnL is not measured"]
+        net = _money_text(payload.get("realized_pnl_usd"))
+        if net is None:
+            reasons.append("realized PnL is unreadable")
+        fees = _money_text(payload.get("fees_usd"))
+        if payload.get("fees_usd") is not None and fees is None:
+            reasons.append("fees_usd is unreadable")
+        funding = _money_text(payload.get("funding_usd"))
+        if payload.get("funding_usd") is not None and funding is None:
+            reasons.append("funding_usd is unreadable")
+        return cls(
+            basis="NET",
+            gross_pnl_usd=None,
+            realized_gross_pnl_usd=None,
+            fees_usd=fees,
+            funding_usd=funding,
+            net_pnl_usd=net,
+            r_multiple=None,
+            return_pct=None,
+            mae_usd=None,
+            mfe_usd=None,
+            outcome_tags=(),
+            data_quality={"status": "PARTIAL", "reasons": reasons},
+        )
+
+
+@dataclass(frozen=True)
 class _CloseIds:
     """The deterministic identifiers for one close attempt."""
 
@@ -325,11 +550,6 @@ def _parse_timestamp(value: object) -> datetime | None:
     return parsed.astimezone(UTC)
 
 
-def _decimal_or_zero(value: object) -> Decimal:
-    parsed = _decimal_or_none(value)
-    return parsed if parsed is not None else Decimal("0")
-
-
 def _decimal_or_none(value: object) -> Decimal | None:
     if value is None:
         return None
@@ -338,6 +558,12 @@ def _decimal_or_none(value: object) -> Decimal | None:
     except ArithmeticError:
         return None
     return parsed if parsed.is_finite() else None
+
+
+def _decimal_text(value: object) -> str | None:
+    """Render a persisted price/quantity/rate, or ``None`` when unreadable."""
+    parsed = _decimal_or_none(value)
+    return None if parsed is None else decimal_str(parsed)
 
 
 def _inside_window(ts: str, opened_at: str, now: str) -> bool:
@@ -434,7 +660,13 @@ class PositionService:
         return self._decode(record.payload_json, subject=f"position {position_id}")
 
     def history(self, position_id: str) -> dict[str, Any]:
-        """The position's accounting timeline: events, funding, and PnL terms."""
+        """The position's accounting timeline: events, funding, and PnL terms.
+
+        The PnL basis is explicit: an OPEN position reports ACCUMULATED GROSS in
+        ``gross_pnl_usd``/``realized_gross_pnl_usd``; a CLOSED one reports NET.
+        Recorded funding settlements that were not accrued are listed with the
+        reason, so "none recorded" and "recorded but rejected" are distinct.
+        """
         record = self._store.get_position(position_id)
         if record is None:
             raise PositionNotFound(position_id)
@@ -442,36 +674,24 @@ class PositionService:
         events = self._store.list_position_events(position_id)
         accruals = self._store.list_funding_accruals(position_id)
         trade = self._store.get_trade_log_for_position(position_id)
-        pnl: dict[str, Any]
         trade_payload: dict[str, Any] | None = None
         if trade is not None:
             trade_payload = self._decode(trade.payload_json, subject=f"trade log {trade.trade_id}")
+        pnl: _HistoryPnl
         if trade_payload is not None:
-            pnl = {
-                "gross_pnl_usd": trade_payload.get("gross_pnl_usd"),
-                "fees_usd": trade_payload.get("fees_usd"),
-                "funding_usd": trade_payload.get("funding_usd"),
-                "net_pnl_usd": trade_payload.get("net_pnl_usd"),
-                "r_multiple": trade_payload.get("r_multiple"),
-                "return_pct": trade_payload.get("return_pct"),
-                "mae_usd": trade_payload.get("mae_usd"),
-                "mfe_usd": trade_payload.get("mfe_usd"),
-                "outcome_tags": trade_payload.get("outcome_tags"),
-                "data_quality": trade_payload.get("data_quality"),
-            }
+            pnl = _ClosedPnl.from_trade(trade_payload)
+        elif payload.get("state") == "OPEN":
+            try:
+                pnl = _OpenPnl.from_payload(payload)
+            except PositionError as exc:
+                raise PositionCloseError(exc.code, exc.message) from exc
         else:
-            pnl = {
-                "gross_pnl_usd": plain_money_str(_decimal_or_zero(payload.get("realized_pnl_usd"))),
-                "fees_usd": payload.get("fees_usd"),
-                "funding_usd": payload.get("funding_usd"),
-                "net_pnl_usd": None,
-                "r_multiple": None,
-                "return_pct": None,
-                "mae_usd": None,
-                "mfe_usd": None,
-                "outcome_tags": [],
-                "data_quality": payload.get("data_quality"),
-            }
+            pnl = _ClosedPnl.from_position_payload(payload)
+        funding_items, funding_reasons, funding_degraded = self._funding_history_items(
+            position_id, payload, accruals
+        )
+        if funding_degraded:
+            pnl = replace(pnl, data_quality=_degraded_quality(pnl.data_quality, funding_reasons))
         return {
             "position_id": position_id,
             "symbol": payload.get("symbol"),
@@ -490,19 +710,114 @@ class PositionService:
                 }
                 for event in events
             ],
-            "funding": [
+            "funding": funding_items,
+            "funding_reasons": funding_reasons,
+            "pnl": pnl.to_contract(),
+        }
+
+    def _funding_history_items(
+        self,
+        position_id: str,
+        payload: dict[str, Any],
+        accruals: tuple[FundingAccrualRecord, ...],
+    ) -> tuple[builtins.list[dict[str, Any]], builtins.list[str], bool]:
+        """Every in-window recorded settlement with its accrual status.
+
+        Accrued settlements carry the persisted amount; a recorded settlement
+        that was not accrued carries a named reason. A stored accrual whose
+        fields cannot be parsed is named and marks the history degraded (so the
+        envelope cannot stay COMPLETE while a value is missing). A window with
+        no recorded settlement yields an empty list and no reasons, distinguishing
+        it from a settlement that exists but was rejected.
+        """
+        try:
+            position = position_from_contract(payload)
+        except PositionError as exc:
+            return [], [f"position accounting is unavailable: {exc.message}"], True
+        now = str(payload.get("closed_at") or self._now())
+        history = self._funding_history(position)
+        bars = self._window_bars(position, position.opened_at, now)
+        timeline = self._management_timeline(position)
+        accrued = {accrual.settlement_time for accrual in accruals}
+        reasons: list[str] = list(history.reasons)
+        degraded = False
+        items: list[dict[str, Any]] = []
+        for accrual in accruals:
+            rate_text = _decimal_text(accrual.rate)
+            mark_text = _decimal_text(accrual.mark_price)
+            amount_text = _money_text(accrual.amount_usd)
+            size_text = _decimal_text(accrual.size)
+            unreadable = [
+                name
+                for name, value in (
+                    ("rate", rate_text),
+                    ("mark_price", mark_text),
+                    ("amount_usd", amount_text),
+                    ("size", size_text),
+                )
+                if value is None
+            ]
+            item_reason: str | None = None
+            if unreadable:
+                degraded = True
+                item_reason = (
+                    f"funding accrual {accrual.accrual_id} has unreadable stored "
+                    f"field(s): {', '.join(unreadable)}"
+                )
+                reasons.append(item_reason)
+            items.append(
                 {
                     "accrual_id": accrual.accrual_id,
                     "settlement_time": accrual.settlement_time,
-                    "rate": accrual.rate,
-                    "mark_price": accrual.mark_price,
-                    "amount_usd": accrual.amount_usd,
+                    "rate": rate_text,
+                    "mark_price": mark_text,
+                    "amount_usd": amount_text,
+                    "side": accrual.side,
+                    "size": size_text,
                     "created_at": accrual.created_at,
+                    "accrued": True,
+                    "reason": item_reason,
                 }
-                for accrual in accruals
-            ],
-            "pnl": pnl,
-        }
+            )
+        recorded: set[str] = set()
+        for point in history.points:
+            if not _inside_window(point.ts, position.opened_at, now):
+                continue
+            recorded.add(point.ts)
+            if point.ts in accrued:
+                continue
+            mark = _mark_at(bars, point.ts)
+            if point.rate is None or mark is None:
+                reason = (
+                    f"funding settlement {point.ts} is missing a recorded rate or mark; not accrued"
+                )
+            else:
+                state = timeline.state_at(point.ts)
+                if state is None or not timeline.complete or state[1] <= 0:
+                    reason = (
+                        f"funding settlement {point.ts} has no recorded size in force; not accrued"
+                    )
+                else:
+                    reason = f"funding settlement {point.ts} was recorded but not accrued"
+            reasons.append(reason)
+            items.append(
+                {
+                    "accrual_id": None,
+                    "settlement_time": point.ts,
+                    "rate": None if point.rate is None else decimal_str(point.rate),
+                    "mark_price": None if mark is None else decimal_str(mark),
+                    "amount_usd": None,
+                    "side": position.side.value,
+                    "size": None,
+                    "created_at": None,
+                    "accrued": False,
+                    "reason": reason,
+                }
+            )
+        reasons.extend(
+            self._expected_funding_reasons(history, position.opened_at, now, recorded, accrued)
+        )
+        return items, reasons, degraded
 
     def _now(self) -> str:
         now_dt = self._clock.now()
@@ -630,15 +945,22 @@ class PositionService:
             updated["funding_usd"] = plain_money_str(new_total)
             updated["version"] = int(updated.get("version", 1)) + 1
             updated_json = json.dumps(updated, sort_keys=True)
+            accrual_id = deterministic_id("FND", f"{position_id}:{point.ts}")
+            amount_text = plain_money_str(amount)
+            # The FUNDING event is derived from the accrual it records: the same
+            # accrual id and amount appear in the note, at the same settlement
+            # timestamp, so the two rows are traceable to each other.
             commit = FundingAccrualCommit(
                 accrual=FundingAccrualRecord(
-                    accrual_id=deterministic_id("FND", f"{position_id}:{point.ts}"),
+                    accrual_id=accrual_id,
                     position_id=position_id,
                     settlement_time=point.ts,
-                    rate=str(point.rate),
-                    mark_price=str(mark),
-                    amount_usd=str(amount),
+                    rate=decimal_str(point.rate),
+                    mark_price=decimal_str(mark),
+                    amount_usd=amount_text,
                     created_at=now_value,
+                    side=position.side.value,
+                    size=decimal_str(size),
                 ),
                 position=PositionRecord(
                     position_id=position_id,
@@ -651,14 +973,16 @@ class PositionService:
                     expected_payload_json=current_payload_json,
                 ),
                 account=self._paper.ensure(),
-                balance_delta=str(amount),
                 event=PositionEventRecord(
                     position_id=position_id,
                     seq=None,
                     at=point.ts,
                     action="FUNDING",
                     order_id=None,
-                    note=f"funding {point.rate}",
+                    note=(
+                        f"funding accrual {accrual_id} amount {amount_text} "
+                        f"rate {decimal_str(point.rate)}"
+                    ),
                 ),
             )
             if self._store.save_funding_accrual(commit):
@@ -967,6 +1291,13 @@ class PositionService:
     # -- management tick -------------------------------------------------
 
     def monitor(self, position_id: str) -> PositionMonitorResult:
+        """Accrue recorded funding, then run the stop-touch rule for one tick.
+
+        Funding settles independently of the stop rule and is applied first, so
+        any close in the same tick carries the recorded funding term. The result
+        always reports the accrual outcome (``accrued`` and ``reasons``) alongside
+        the stop-touch status.
+        """
         record = self._store.get_position(position_id)
         if record is None:
             raise PositionNotFound(position_id)
@@ -1024,6 +1355,7 @@ class PositionService:
                 status=NO_ACTION,
                 reason_code=DATA_STALE,
                 reason="the position has no recorded mark price",
+                funding=funding,
             )
         if self._is_stale(now, observation.as_of):
             return PositionMonitorResult(
@@ -1033,6 +1365,7 @@ class PositionService:
                 reason=(
                     f"the recorded mark is older than {self._stale_seconds}s; no order was created"
                 ),
+                funding=funding,
             )
         try:
             decision = evaluate_protective_exit(position, observation.mark, at=now)
@@ -1044,6 +1377,7 @@ class PositionService:
                 status=NO_ACTION,
                 reason_code=STOP_NOT_TOUCHED,
                 reason="the mark did not touch the protective stop",
+                funding=funding,
             )
         return self._close(
             position,
@@ -1056,6 +1390,7 @@ class PositionService:
             history=history,
             series=series,
             cache=cache,
+            funding=funding,
         )
 
     def _resolve_mark(
@@ -1163,12 +1498,24 @@ class PositionService:
         if bars:
             states = self._bar_states(position, bars, timeline)
             try:
-                mae, mfe = mae_mfe_from_sized_bars(position.side.value, bars, states)
+                excursion = mae_mfe_from_sized_bars(position.side.value, bars, states)
             except (ArithmeticError, ValueError):
-                mae = mfe = Decimal("0")
+                mae = mfe = ZERO
                 reasons.append("MAE/MFE not measured: the recorded bars or size are implausible")
+            else:
+                mae, mfe = excursion.mae_usd, excursion.mfe_usd
+                if excursion.measured_bars == 0:
+                    reasons.append(
+                        "MAE/MFE not measured: no usable recorded bar covers the holding window"
+                    )
+                elif excursion.skipped_bars:
+                    reasons.append(
+                        "MAE/MFE are partial: "
+                        f"{excursion.skipped_bars} recorded bar(s) in the holding window "
+                        "were unusable"
+                    )
         else:
-            mae = mfe = Decimal("0")
+            mae = mfe = ZERO
             reasons.append("MAE/MFE not measured: no recorded bars cover the holding window")
         target = position.target_prices[0] if position.target_prices else None
         touch = first_touch(
@@ -1192,12 +1539,17 @@ class PositionService:
             timeline.partial_quantity + position.size if timeline.complete else position.size
         )
         # ``return_pct`` is measured against the immutable entry notional, not
-        # the residual exposure a partial close leaves behind.
+        # the residual exposure a partial close leaves behind. When that fill
+        # cannot be resolved the residual notional is NOT substituted: the
+        # journal names the gap and renders a contract-valid ``return_pct``.
         entry_notional = recorded_entry_notional_usd(self._store, position.source_trigger_id)
         if entry_notional is None:
             reasons.append("entry notional is unavailable: the recorded entry fill was not found")
-            entry_notional = position.notional_usd
-            status = "PARTIAL"
+        status = "PARTIAL" if reasons else "COMPLETE"
+        try:
+            had_partial_close = recorded_partial_close(position)
+        except PositionError as exc:
+            raise PositionCloseError(exc.code, exc.message) from exc
         return TradeLogContext(
             signal=source.signal,
             provenance=source.provenance,
@@ -1214,7 +1566,7 @@ class PositionService:
             data_quality_reasons=tuple(reasons),
             close_reason=STOP_TOUCH_RULE,
             stopped=True,
-            had_partial_close=timeline.partial_quantity > 0,
+            had_partial_close=had_partial_close,
             traded_quantity=traded_quantity,
         )
 
@@ -1393,6 +1745,7 @@ class PositionService:
         history: _FundingHistory | None = None,
         series: set[tuple[str, str]] | None = None,
         cache: dict[tuple[str, str], tuple[dict[str, object], ...]] | None = None,
+        funding: dict[str, Any] | None = None,
     ) -> PositionMonitorResult:
         seed = f"{position.position_id}:{mark}:{mark_as_of}"
         ids = _CloseIds(
@@ -1433,7 +1786,7 @@ class PositionService:
             now=now,
         )
         result = self._submit_close(intent, ids, mark, mark_as_of)
-        return self._closed_result(position, result)
+        return self._closed_result(position, result, funding=funding)
 
     def _persist_mark(
         self,
@@ -1481,7 +1834,7 @@ class PositionService:
         ids: _CloseIds,
         context: TradeLogContext | None,
     ) -> OrderIntent:
-        side = OrderSide.SELL if position.side is PositionSide.LONG else OrderSide.BUY
+        side = reducing_side(position.side)
         return OrderIntent(
             symbol=position.symbol,
             side=side,
@@ -1552,7 +1905,13 @@ class PositionService:
         except (GatewayError, BrokerError) as exc:
             raise PositionCloseError(exc.code, exc.message) from exc
 
-    def _closed_result(self, position: Position, result: BrokerResult) -> PositionMonitorResult:
+    def _closed_result(
+        self,
+        position: Position,
+        result: BrokerResult,
+        *,
+        funding: dict[str, Any] | None = None,
+    ) -> PositionMonitorResult:
         trade = self._store.get_trade_log_for_position(position.position_id)
         if trade is None:
             raise PositionCloseError("CONFLICT", "the close committed but no trade log was written")
@@ -1575,6 +1934,7 @@ class PositionService:
             trade_log=trade_payload,
             account=self._paper.summary(),
             idempotent_replay=False,
+            funding=funding,
         )
 
     def _persist_decision(

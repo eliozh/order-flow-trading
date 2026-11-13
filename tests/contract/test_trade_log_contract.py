@@ -236,6 +236,7 @@ def test_an_enriched_trade_log_validates_with_bar_backed_excursions() -> None:
         fill,
         at="2026-11-14T12:00:00.000Z",
         decision_id="MGD-ENRICHED",
+        accumulated_gross=Decimal("0"),
     )
     context = TradeLogContext(
         signal={
@@ -260,6 +261,7 @@ def test_an_enriched_trade_log_validates_with_bar_backed_excursions() -> None:
         data_quality_reasons=(),
         close_reason="STOP_TOUCH",
         stopped=True,
+        traded_quantity=Decimal("0.01"),
     )
 
     trade = trade_log_from_close(
@@ -276,3 +278,38 @@ def test_an_enriched_trade_log_validates_with_bar_backed_excursions() -> None:
     assert trade["signal"]["trigger_id"] == "TRG-TEST"
     assert trade["provenance"]["calc_metric_version"] == "ofi.v1.deadbeef"
     assert trade["data_quality"]["status"] == "COMPLETE"
+
+
+def test_trade_log_provenance_matches_the_recorded_decision_and_report(
+    tmp_path: Path,
+) -> None:
+    loop = _helpers.build_loop(tmp_path)
+    container = loop["container"]
+    position = loop["result"].position
+    assert position is not None
+    set_position_mark(
+        container,
+        position["position_id"],
+        position["stop_price"],
+        position["updated_at"],
+    )
+    service = PositionService(
+        store=container.store, clock=container.clock, settings=container.settings
+    )
+    result = service.monitor(position["position_id"])
+    assert result.trade_log is not None
+    trade = result.trade_log
+
+    provenance = loop["decision"]["provenance"]
+    assert trade["provenance"]["llm_model"] == "fixture"
+    assert trade["provenance"]["llm_model"] == provenance["model"]
+    assert trade["provenance"]["llm_provider"] == provenance["provider"]
+    assert trade["provenance"]["prompt_version"] == provenance["prompt_version"]
+    report = container.store.get_report(str(loop["opportunity"]["source"]["report_id"]))
+    assert report is not None
+    recorded_metric_version = next(
+        entry["metric_version"]
+        for entry in json.loads(report.metrics_manifest_json)
+        if isinstance(entry, dict) and entry.get("metric_version")
+    )
+    assert trade["provenance"]["calc_metric_version"] == recorded_metric_version

@@ -240,6 +240,9 @@ def test_an_unrecorded_rate_marks_the_trade_partial_and_accrues_nothing(
     )
     assert closed.trade_log["funding_usd"] == "0"
     assert "DATA_PARTIAL" in closed.trade_log["outcome_tags"]
+    # The monitor surfaces the accrual reasons it discarded before the fix.
+    assert closed.funding is not None
+    assert any("missing a recorded rate or mark" in reason for reason in closed.funding["reasons"])
 
 
 def test_funding_is_read_from_a_report_recorded_after_entry(tmp_path: Path) -> None:
@@ -532,6 +535,8 @@ def test_a_funding_update_built_from_a_stale_payload_is_rejected(tmp_path: Path)
                     mark_price="71000",
                     amount_usd="0",
                     created_at=utc_timestamp(NOW),
+                    side=position["side"],
+                    size=str(position["size"]),
                 ),
                 position=PositionRecord(
                     position_id=position_id,
@@ -544,7 +549,6 @@ def test_a_funding_update_built_from_a_stale_payload_is_rejected(tmp_path: Path)
                     expected_payload_json=stale.payload_json,
                 ),
                 account=account,
-                balance_delta="0",
                 event=PositionEventRecord(
                     position_id=position_id,
                     seq=None,
@@ -779,3 +783,484 @@ def test_a_corrupt_funding_source_marks_the_trade_partial(tmp_path: Path) -> Non
     assert trade["data_quality"]["status"] == "PARTIAL"
     assert any("funding source is corrupt" in reason for reason in trade["data_quality"]["reasons"])
     assert "DATA_PARTIAL" in trade["outcome_tags"]
+
+
+def _save_funding_report(
+    container: Any,
+    *,
+    settlement: str,
+    rate: str | None,
+    report_id: str,
+    generated_at: str,
+) -> None:
+    database = container.settings.data_dir / "oft.db"
+    with sqlite3.connect(database) as connection:
+        connection.execute(
+            "INSERT OR IGNORE INTO scans ("
+            "scan_id, symbol, period, status, trigger_source, metrics_only, fixture_path, "
+            "started_at, finished_at, window_start, window_end, trade_count, buy_volume, "
+            "sell_volume, delta, cvd, data_quality, manifest_path, parquet_rows, created_at"
+            ") VALUES ('SCAN-FUNDING', 'BTCUSDT', '4h', 'COMPLETE', 'FIXTURE', 0, '', "
+            "'t', 't', 't', 't', 0, '0', '0', '0', '0', 'COMPLETE', '', 0, 't')"
+        )
+        connection.commit()
+    snapshot = {
+        "orderflow": {
+            "funding": {
+                "interval_hours": 8,
+                "history": [{"ts": settlement, "rate": rate}],
+            }
+        }
+    }
+    container.store.save_report(
+        ReportRecord(
+            report_id=report_id,
+            scan_id="SCAN-FUNDING",
+            symbol="BTCUSDT",
+            timeframe="4h",
+            generated_at=generated_at,
+            metrics_manifest_json="[]",
+            llm_decision_id=None,
+            narrative_ref=None,
+            data_quality="COMPLETE",
+            snapshot_json=json.dumps(snapshot, sort_keys=True),
+            metrics_json="{}",
+        )
+    )
+
+
+def test_a_short_position_receives_positive_funding_cash(tmp_path: Path) -> None:
+    from test_position_close_flow import NOW as SHORT_NOW
+    from test_position_close_flow import _short_setup
+
+    setup = _short_setup(tmp_path)
+    container = setup["container"]
+    position = setup["position"]
+    position_id = position["position_id"]
+    settlement = SHORT_NOW + timedelta(hours=1)
+    entry = Decimal(position["avg_entry_price"])
+    size = Decimal(position["size"])
+    _seed_bar(
+        container,
+        close=entry,
+        bar_end=settlement,
+        period="4h",
+        metric_version="fundingshort.v1.0000000000000000",
+        run_id="short-funding-bar",
+    )
+    _save_funding_report(
+        container,
+        settlement=utc_timestamp(settlement),
+        rate="0.0001",
+        report_id="RPT-FUNDING-SHORT",
+        generated_at=utc_timestamp(settlement),
+    )
+    service = PositionService(
+        store=container.store,
+        clock=FixedClock(SHORT_NOW + timedelta(hours=2)),
+        settings=container.settings,
+    )
+    cash_before = _cash(container)
+    expected = (Decimal("0.0001") * entry * size).quantize(Decimal("0.00000001"))
+
+    result = service.accrue_funding(position_id)
+
+    assert result["accrued"] == 1
+    accruals = container.store.list_funding_accruals(position_id)
+    assert len(accruals) == 1
+    assert Decimal(accruals[0].amount_usd) == expected > 0
+    assert accruals[0].side == "SHORT"
+    assert Decimal(accruals[0].size) == size
+    # A SHORT receives a positive rate, so cash is credited.
+    assert _cash(container) - cash_before == expected
+    payload = _position_payload(container, position_id)
+    assert Decimal(payload["funding_usd"]) == expected
+
+
+def test_settlements_outside_the_holding_window_are_never_accrued(tmp_path: Path) -> None:
+    loop = _build_loop(tmp_path)
+    container = loop["container"]
+    position = loop["position"]
+    position_id = position["position_id"]
+    opened_at = position["opened_at"]
+    now_value = NOW + timedelta(hours=2)
+    # A usable mark exists for both out-of-window settlements, so removing the
+    # window check would wrongly accrue them (missing-mark cannot mask the bug).
+    period, version = _bars_series(container)
+    for bar_end, run_id in (
+        (NOW, "outside-window-open-bar"),
+        (now_value + timedelta(hours=1), "outside-window-future-bar"),
+    ):
+        _seed_bar(
+            container,
+            close=Decimal(position["avg_entry_price"]),
+            bar_end=bar_end,
+            period=period,
+            metric_version=version,
+            run_id=run_id,
+        )
+    _inject_funding_history(
+        container,
+        position,
+        [
+            {"ts": opened_at, "rate": "0.0001", "interval_hours": 8},
+            {"ts": utc_timestamp(now_value + timedelta(hours=1)), "rate": "0.0001"},
+        ],
+    )
+    service = PositionService(
+        store=container.store,
+        clock=FixedClock(now_value),
+        settings=container.settings,
+    )
+    cash_before = _cash(container)
+
+    result = service.accrue_funding(position_id)
+
+    assert result["accrued"] == 0
+    assert container.store.list_funding_accruals(position_id) == ()
+    assert _cash(container) == cash_before
+
+
+def test_a_recorded_rate_without_a_mark_is_named_and_not_accrued(tmp_path: Path) -> None:
+    loop = _build_loop(tmp_path)
+    container = loop["container"]
+    position = loop["position"]
+    position_id = position["position_id"]
+    settlement = NOW + timedelta(hours=1)
+    _inject_funding_history(
+        container,
+        position,
+        [{"ts": utc_timestamp(settlement), "rate": "0.0001", "interval_hours": 8}],
+    )
+    service = PositionService(
+        store=container.store,
+        clock=FixedClock(NOW + timedelta(hours=2)),
+        settings=container.settings,
+    )
+    cash_before = _cash(container)
+
+    result = service.accrue_funding(position_id)
+
+    assert result["accrued"] == 0
+    assert any("missing a recorded rate or mark" in reason for reason in result["reasons"])
+    assert container.store.list_funding_accruals(position_id) == ()
+    assert _cash(container) == cash_before
+
+
+def test_a_missing_expected_settlement_is_named_in_the_trade_log(tmp_path: Path) -> None:
+    loop = _build_loop(tmp_path)
+    container = loop["container"]
+    position = loop["position"]
+    position_id = position["position_id"]
+    settlement = NOW + timedelta(hours=1)
+    period, version = _bars_series(container)
+    _seed_bar(
+        container,
+        close=Decimal(position["avg_entry_price"]),
+        bar_end=settlement,
+        period=period,
+        metric_version=version,
+        run_id="expected-funding-bar",
+    )
+    _inject_funding_history(
+        container,
+        position,
+        [{"ts": utc_timestamp(settlement), "rate": "0.0001", "interval_hours": 8}],
+    )
+    later = NOW + timedelta(hours=10)
+    set_position_mark(
+        container,
+        position_id,
+        position["stop_price"],
+        as_of=utc_timestamp(later),
+    )
+    service = PositionService(
+        store=container.store,
+        clock=FixedClock(later),
+        settings=container.settings,
+    )
+
+    closed = service.monitor(position_id)
+
+    assert closed.status == "CLOSED" and closed.trade_log is not None
+    reasons = closed.trade_log["data_quality"]["reasons"]
+    assert any("expected every 8 hours" in reason for reason in reasons)
+    assert closed.trade_log["data_quality"]["status"] == "PARTIAL"
+
+
+def test_a_duplicate_store_level_funding_accrual_is_a_noop(tmp_path: Path) -> None:
+    loop = _build_loop(tmp_path)
+    container = loop["container"]
+    position = loop["position"]
+    position_id = position["position_id"]
+    settlement = NOW + timedelta(hours=1)
+    period, version = _bars_series(container)
+    _seed_bar(
+        container,
+        close=Decimal("71000"),
+        bar_end=settlement,
+        period=period,
+        metric_version=version,
+        run_id="duplicate-funding-bar",
+    )
+    _inject_funding_history(
+        container,
+        position,
+        [{"ts": utc_timestamp(settlement), "rate": "0.0001", "interval_hours": 8}],
+    )
+    service = PositionService(
+        store=container.store,
+        clock=FixedClock(NOW + timedelta(hours=2)),
+        settings=container.settings,
+    )
+    assert service.accrue_funding(position_id)["accrued"] == 1
+    accruals = container.store.list_funding_accruals(position_id)
+    assert len(accruals) == 1
+    record = container.store.get_position(position_id)
+    assert record is not None
+    account = container.store.get_paper_account("ACC-PAPER")
+    assert account is not None
+    cash_before = _cash(container)
+
+    duplicate = FundingAccrualCommit(
+        accrual=accruals[0],
+        position=PositionRecord(
+            position_id=position_id,
+            account_id=position["account_id"],
+            environment=position["environment"],
+            symbol=position["symbol"],
+            state="OPEN",
+            opened_at=position["opened_at"],
+            payload_json=record.payload_json,
+            expected_payload_json=record.payload_json,
+        ),
+        account=account,
+        event=PositionEventRecord(
+            position_id=position_id,
+            seq=None,
+            at=accruals[0].settlement_time,
+            action="FUNDING",
+            order_id=None,
+            note="duplicate",
+        ),
+    )
+
+    assert container.store.save_funding_accrual(duplicate) is False
+    assert len(container.store.list_funding_accruals(position_id)) == 1
+    assert _cash(container) == cash_before
+
+
+def _rewrite_position_payload(container: Any, position_id: str, **changes: Any) -> None:
+    database = container.settings.data_dir / "oft.db"
+    with sqlite3.connect(database) as connection:
+        row = connection.execute(
+            "SELECT payload_json FROM positions WHERE position_id = ?", (position_id,)
+        ).fetchone()
+        payload = json.loads(row[0])
+        payload.update(changes)
+        connection.execute(
+            "UPDATE positions SET payload_json = ? WHERE position_id = ?",
+            (json.dumps(payload, sort_keys=True), position_id),
+        )
+        connection.commit()
+
+
+def test_history_names_a_recorded_settlement_that_was_not_accrued(tmp_path: Path) -> None:
+    loop = _build_loop(tmp_path)
+    container = loop["container"]
+    position = loop["position"]
+    position_id = position["position_id"]
+    settlement = NOW + timedelta(hours=1)
+    _inject_funding_history(
+        container,
+        position,
+        [{"ts": utc_timestamp(settlement), "rate": "0.0001", "interval_hours": 8}],
+    )
+    service = PositionService(
+        store=container.store,
+        clock=FixedClock(NOW + timedelta(hours=2)),
+        settings=container.settings,
+    )
+
+    history = service.history(position_id)
+
+    assert history["funding"], "a recorded but unaccrued settlement must be listed"
+    item = history["funding"][0]
+    assert item["accrued"] is False
+    assert item["reason"] is not None and "not accrued" in item["reason"]
+    assert any("not accrued" in reason for reason in history["funding_reasons"])
+
+
+def test_history_does_not_coerce_a_corrupt_open_realized_pnl(tmp_path: Path) -> None:
+    loop = _build_loop(tmp_path)
+    container = loop["container"]
+    position = loop["position"]
+    position_id = position["position_id"]
+    _rewrite_position_payload(container, position_id, realized_pnl_usd="not-a-decimal")
+    service = PositionService(
+        store=container.store, clock=container.clock, settings=container.settings
+    )
+
+    history = service.history(position_id)
+
+    pnl = history["pnl"]
+    assert pnl["basis"] == "ACCUMULATED_GROSS"
+    assert pnl["gross_pnl_usd"] is None
+    assert pnl["realized_gross_pnl_usd"] is None
+    assert pnl["data_quality"]["status"] == "PARTIAL"
+    assert any("realized PnL" in reason for reason in pnl["data_quality"]["reasons"])
+
+
+def test_history_labels_the_open_basis_and_the_closed_basis(tmp_path: Path) -> None:
+    loop = _build_loop(tmp_path)
+    container = loop["container"]
+    position = loop["position"]
+    position_id = position["position_id"]
+    service = PositionService(
+        store=container.store, clock=container.clock, settings=container.settings
+    )
+    open_history = service.history(position_id)
+    assert open_history["pnl"]["basis"] == "ACCUMULATED_GROSS"
+    assert open_history["pnl"]["net_pnl_usd"] is None
+
+    set_position_mark(
+        container,
+        position_id,
+        position["stop_price"],
+        as_of=utc_timestamp(NOW),
+    )
+    closed = service.monitor(position_id)
+    assert closed.status == "CLOSED"
+    closed_history = service.history(position_id)
+    assert closed_history["pnl"]["basis"] == "NET"
+    assert closed_history["pnl"]["net_pnl_usd"] is not None
+    assert closed_history["pnl"]["realized_gross_pnl_usd"] == closed_history["pnl"]["gross_pnl_usd"]
+
+
+def test_a_no_action_monitor_still_reports_funding_reasons(tmp_path: Path) -> None:
+    loop = _build_loop(tmp_path)
+    container = loop["container"]
+    position = loop["position"]
+    position_id = position["position_id"]
+    settlement = NOW + timedelta(hours=1)
+    now_value = NOW + timedelta(hours=2)
+    _inject_funding_history(
+        container,
+        position,
+        [{"ts": utc_timestamp(settlement), "rate": "0.0001", "interval_hours": 8}],
+    )
+    set_position_mark(
+        container,
+        position_id,
+        position["avg_entry_price"],
+        as_of=utc_timestamp(now_value),
+    )
+    service = PositionService(
+        store=container.store,
+        clock=FixedClock(now_value),
+        settings=container.settings,
+    )
+
+    result = service.monitor(position_id)
+
+    assert result.status == "NO_ACTION"
+    assert result.reason_code == "STOP_NOT_TOUCHED"
+    assert result.funding is not None
+    assert result.funding["accrued"] == 0
+    assert any("missing a recorded rate or mark" in reason for reason in result.funding["reasons"])
+
+
+def test_a_funding_total_mismatch_fails_closed_and_rolls_back(tmp_path: Path) -> None:
+    loop = _build_loop(tmp_path)
+    container = loop["container"]
+    position = loop["position"]
+    position_id = position["position_id"]
+    record = container.store.get_position(position_id)
+    assert record is not None
+    account = container.store.get_paper_account("ACC-PAPER")
+    assert account is not None
+    cash_before = _cash(container)
+    commit = FundingAccrualCommit(
+        accrual=FundingAccrualRecord(
+            accrual_id="FND-MISMATCH",
+            position_id=position_id,
+            settlement_time="2030-01-01T00:00:00.000Z",
+            rate="0.0001",
+            mark_price="70000",
+            amount_usd="-1",
+            created_at=utc_timestamp(NOW),
+            side=position["side"],
+            size=str(position["size"]),
+        ),
+        position=PositionRecord(
+            position_id=position_id,
+            account_id=position["account_id"],
+            environment=position["environment"],
+            symbol=position["symbol"],
+            state="OPEN",
+            opened_at=position["opened_at"],
+            # The funding total did not advance by the accrual amount.
+            payload_json=record.payload_json,
+            expected_payload_json=record.payload_json,
+        ),
+        account=account,
+        event=PositionEventRecord(
+            position_id=position_id,
+            seq=None,
+            at="2030-01-01T00:00:00.000Z",
+            action="FUNDING",
+            order_id=None,
+            note="mismatch",
+        ),
+    )
+
+    with pytest.raises(OmsConflictError) as exc:
+        container.store.save_funding_accrual(commit)
+
+    assert exc.value.constraint == "funding_total"
+    assert container.store.list_funding_accruals(position_id) == ()
+    assert _cash(container) == cash_before
+
+
+def test_history_marks_a_corrupt_accrual_partial(tmp_path: Path) -> None:
+    loop = _build_loop(tmp_path)
+    container = loop["container"]
+    position = loop["position"]
+    position_id = position["position_id"]
+    settlement = NOW + timedelta(hours=1)
+    period, version = _bars_series(container)
+    _seed_bar(
+        container,
+        close=Decimal("71000"),
+        bar_end=settlement,
+        period=period,
+        metric_version=version,
+        run_id="corrupt-accrual-bar",
+    )
+    _inject_funding_history(
+        container,
+        position,
+        [{"ts": utc_timestamp(settlement), "rate": "0.0001", "interval_hours": 8}],
+    )
+    service = PositionService(
+        store=container.store,
+        clock=FixedClock(NOW + timedelta(hours=2)),
+        settings=container.settings,
+    )
+    assert service.accrue_funding(position_id)["accrued"] == 1
+    database = container.settings.data_dir / "oft.db"
+    with sqlite3.connect(database) as connection:
+        connection.execute(
+            "UPDATE funding_accruals SET amount_usd = 'bogus' WHERE position_id = ?",
+            (position_id,),
+        )
+        connection.commit()
+
+    history = service.history(position_id)
+
+    item = history["funding"][0]
+    assert item["accrued"] is True
+    assert item["amount_usd"] is None
+    assert item["reason"] is not None and "unreadable" in item["reason"]
+    assert history["pnl"]["data_quality"]["status"] == "PARTIAL"
+    assert any("unreadable" in reason for reason in history["pnl"]["data_quality"]["reasons"])

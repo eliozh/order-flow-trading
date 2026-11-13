@@ -349,6 +349,8 @@ _FUNDING_ACCRUALS_DEFINITION = """
     mark_price TEXT NOT NULL,
     amount_usd TEXT NOT NULL,
     created_at TEXT NOT NULL,
+    side TEXT NOT NULL,
+    size TEXT NOT NULL,
     UNIQUE (position_id, settlement_time)
 """
 _FUNDING_ACCRUALS_TABLE = (
@@ -2037,6 +2039,62 @@ def _funding_unique_constraint_present(connection: sqlite3.Connection) -> bool:
     return False
 
 
+def _funding_has_side_size(connection: sqlite3.Connection) -> bool:
+    """Whether ``funding_accruals`` records the side and size the amount was priced on.
+
+    Callers only invoke this after confirming the table exists; ``PRAGMA
+    table_info`` on a missing table simply yields no columns.
+    """
+    columns = {str(row[1]) for row in connection.execute("PRAGMA table_info(funding_accruals)")}
+    return {"side", "size"} <= columns
+
+
+def _rebuild_funding_accruals_for_v23(connection: sqlite3.Connection) -> None:
+    """Rebuild a pre-release v23 funding table to add ``side``/``size``.
+
+    v23 was never released, so a table without these columns can only come from
+    an intermediate build. Existing rows (if any) are preserved verbatim; the
+    two new columns are empty strings because their values cannot be
+    reconstructed from the old row.
+    """
+    connection.execute("ALTER TABLE funding_accruals RENAME TO funding_accruals_v23_old")
+    connection.execute(_FUNDING_ACCRUALS_TABLE)
+    connection.execute(
+        """
+        INSERT INTO funding_accruals (
+            accrual_id, position_id, settlement_time, rate, mark_price,
+            amount_usd, created_at, side, size
+        )
+        SELECT accrual_id, position_id, settlement_time, rate, mark_price,
+               amount_usd, created_at, '', ''
+        FROM funding_accruals_v23_old
+        """
+    )
+    connection.execute("DROP TABLE funding_accruals_v23_old")
+
+
+def _ensure_funding_accruals_shape(connection: sqlite3.Connection) -> None:
+    """Repair a v23 funding table recorded before ``side``/``size`` landed.
+
+    The migration is unmerged, so a database stamped v23 may predate the
+    columns. Re-running initialization repairs it idempotently.
+    """
+    if not _table_exists(connection, "funding_accruals"):
+        return
+    if _funding_has_side_size(connection):
+        return
+    # ``commit()`` is a no-op without an open transaction, so the repair never
+    # tries to start ``BEGIN IMMEDIATE`` inside one.
+    connection.commit()
+    connection.execute("BEGIN IMMEDIATE")
+    try:
+        _rebuild_funding_accruals_for_v23(connection)
+        connection.execute("COMMIT")
+    except Exception:
+        connection.rollback()
+        raise
+
+
 def _reports_has_symbol_column(connection: sqlite3.Connection) -> bool:
     if not _table_exists(connection, "reports"):
         return False
@@ -2057,6 +2115,8 @@ def _ensure_reports_symbol_index(connection: sqlite3.Connection) -> None:
 def _v23_objects_present(connection: sqlite3.Connection) -> bool:
     """Whether the v23 funding table, report index, and event actions exist."""
     if not _table_exists(connection, "funding_accruals"):
+        return False
+    if not _funding_has_side_size(connection):
         return False
     if not _funding_unique_constraint_present(connection):
         return False
@@ -2120,6 +2180,8 @@ def _migrate_v23(connection: sqlite3.Connection) -> None:
             connection.execute("COMMIT")
             return
         connection.execute(_FUNDING_ACCRUALS_TABLE)
+        if not _funding_has_side_size(connection):
+            _rebuild_funding_accruals_for_v23(connection)
         _ensure_reports_symbol_index(connection)
         if _table_exists(connection, "position_events"):
             row = connection.execute(
@@ -2315,8 +2377,9 @@ def initialize_database(settings: Settings) -> None:
     the residual foreign keys and the enum CHECK constraints, rebuilding the six
     affected tables. v22 adds ``trade_logs`` (unique ``position_id``) and the
     append-only ``position_events`` timeline. v23 adds ``funding_accruals``
-    (unique ``position_id + settlement_time``) and widens the event action CHECK
-    to ``PARTIAL_CLOSE``/``ADD``/``FUNDING``.
+    (unique ``position_id + settlement_time``, recording the side and size the
+    amount was priced on) and widens the event action CHECK to
+    ``PARTIAL_CLOSE``/``ADD``/``FUNDING``.
     """
     settings.data_dir.mkdir(parents=True, exist_ok=True)
     settings.data_dir.chmod(0o700)
@@ -2381,6 +2444,7 @@ def initialize_database(settings: Settings) -> None:
         if _schema_version(connection) < 23 or not _migration_recorded(connection, 23):
             _migrate_v23(connection)
         _ensure_opportunity_conditions_shape(connection)
+        _ensure_funding_accruals_shape(connection)
         with connection:
             # ``_SCHEMA_SQL`` drops and recreates the immutability trigger, a
             # check-then-DDL pair. Run the whole batch inside one write

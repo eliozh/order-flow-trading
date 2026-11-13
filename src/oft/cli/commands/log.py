@@ -102,7 +102,7 @@ def log_show(
     trade_id: str,
     json_output: Annotated[bool, typer.Option("--json", help="Emit JSON.")] = False,
 ) -> None:
-    """Show one closed trade and its data-quality reasons."""
+    """Show one closed trade: PnL terms, outcome tags, and data-quality reasons."""
     settings = _settings_or_exit(json_output)
     try:
         envelope = ApiClient.from_settings(settings).get_trade_log(trade_id)

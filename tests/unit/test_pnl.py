@@ -145,14 +145,13 @@ def test_mae_mfe_use_recorded_highs_and_lows_with_the_documented_signs() -> None
     assert mfe == Decimal("1500.00000000")
 
 
-def test_mae_mfe_are_symmetric_for_a_short() -> None:
-    bars = (
-        {"low": "69000", "high": "71200"},
-        {"low": "68500", "high": "71500"},
-    )
+def test_mae_mfe_are_asymmetric_for_a_short() -> None:
+    # A SHORT's adverse extreme is the bar HIGH and its favorable extreme the
+    # low, so a side-blind implementation cannot pass this shape.
+    bars = ({"low": "69000", "high": "72000"},)
     mae, mfe = mae_mfe_from_bars("SHORT", Decimal("70000"), Decimal("1"), bars)
-    assert mae == Decimal("-1500.00000000")
-    assert mfe == Decimal("1500.00000000")
+    assert mae == Decimal("-2000.00000000")
+    assert mfe == Decimal("1000.00000000")
 
 
 def test_mae_mfe_never_cross_zero() -> None:
@@ -211,15 +210,40 @@ def test_mae_mfe_use_the_size_in_force_at_each_bar() -> None:
     )
     # Before a 50% partial the excursion is measured on the full size; after it
     # the same price move counts half.
-    mae, mfe = mae_mfe_from_sized_bars(
+    excursion = mae_mfe_from_sized_bars(
         "LONG",
         bars,
         ((Decimal("70000"), Decimal("1")), (Decimal("70000"), Decimal("0.5"))),
     )
-    assert mae == Decimal("-1000.00000000")
-    assert mfe == Decimal("200.00000000")
+    assert excursion.mae_usd == Decimal("-1000.00000000")
+    assert excursion.mfe_usd == Decimal("200.00000000")
+    assert excursion.measured_bars == 2
+    assert excursion.skipped_bars == 0
+    assert excursion.complete is True
     with pytest.raises(ValueError):
         mae_mfe_from_sized_bars("LONG", bars, ((Decimal("70000"), Decimal("1")),))
+
+
+def test_mae_mfe_are_asymmetric_for_a_short_with_sized_bars() -> None:
+    bars = ({"low": "69000", "high": "72000"},)
+    excursion = mae_mfe_from_sized_bars("SHORT", bars, ((Decimal("70000"), Decimal("2")),))
+    assert excursion.mae_usd == Decimal("-4000.00000000")
+    assert excursion.mfe_usd == Decimal("2000.00000000")
+    assert excursion.measured_bars == 1
+
+
+def test_mae_mfe_report_an_all_unusable_window_as_unmeasured() -> None:
+    bars = ({"low": None, "high": "1"}, {"low": "71000", "high": "69000"})
+    excursion = mae_mfe_from_sized_bars(
+        "LONG",
+        bars,
+        ((Decimal("70000"), Decimal("1")), (Decimal("70000"), Decimal("1"))),
+    )
+    assert excursion.measured_bars == 0
+    assert excursion.skipped_bars == 2
+    assert excursion.complete is False
+    assert excursion.mae_usd == Decimal("0.00000000")
+    assert excursion.mfe_usd == Decimal("0.00000000")
 
 
 def test_mae_mfe_skip_an_inconsistent_bar() -> None:

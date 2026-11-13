@@ -1,12 +1,16 @@
-"""Paper OMS mixin: orders, fills, positions, and paper accounts.
+"""Paper OMS mixin: orders, fills, positions, trade logs, and funding accruals.
 
-Covers the ``orders``, ``fills``, ``positions``, and ``paper_accounts`` tables
-plus their row mappers.
+Covers the ``orders``, ``fills``, ``positions``, ``trade_logs``,
+``position_events``, ``funding_accruals``, and ``paper_accounts`` tables plus
+their row mappers and the atomic open-position update used by adjustments and
+funding.
 """
 
 from __future__ import annotations
 
+import json
 import sqlite3
+from collections.abc import Callable
 from contextlib import closing
 from decimal import ROUND_DOWN, Decimal
 
@@ -214,8 +218,8 @@ def _insert_funding_accrual(connection: sqlite3.Connection, accrual: FundingAccr
         """
         INSERT INTO funding_accruals (
             accrual_id, position_id, settlement_time, rate, mark_price,
-            amount_usd, created_at
-        ) VALUES (?, ?, ?, ?, ?, ?, ?)
+            amount_usd, created_at, side, size
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
         ON CONFLICT(position_id, settlement_time) DO NOTHING
         """,
         (
@@ -226,9 +230,34 @@ def _insert_funding_accrual(connection: sqlite3.Connection, accrual: FundingAccr
             accrual.mark_price,
             accrual.amount_usd,
             accrual.created_at,
+            accrual.side,
+            accrual.size,
         ),
     )
     return cursor.rowcount == 1
+
+
+def _funding_total_advanced(record: FundingAccrualCommit) -> None:
+    """Fail closed unless the position's funding advanced by the accrual amount.
+
+    The amount is the only cash movement for a funding settlement, so the
+    updated payload's ``funding_usd`` must equal the prior payload's value plus
+    ``accrual.amount_usd``. A mismatch means the caller built the commit from
+    the wrong payload; committing it would desynchronise cash and the position.
+    """
+    expected = record.position.expected_payload_json
+    if expected is None:
+        return
+    try:
+        prior = json.loads(expected)
+        updated = json.loads(record.position.payload_json)
+        prior_funding = Decimal(str(prior.get("funding_usd") or "0"))
+        new_funding = Decimal(str(updated.get("funding_usd") or "0"))
+        amount = Decimal(record.accrual.amount_usd)
+    except (json.JSONDecodeError, TypeError, ValueError, ArithmeticError) as exc:
+        raise OmsConflictError("funding_total") from exc
+    if new_funding != prior_funding + amount:
+        raise OmsConflictError("funding_total")
 
 
 def _insert_position_event(connection: sqlite3.Connection, event: PositionEventRecord) -> None:
@@ -288,7 +317,7 @@ def _insert_trade_log(connection: sqlite3.Connection, trade_log: TradeLogRecord)
 
 
 class PaperOmsStoreMixin(SqliteConnectionMixin, SqliteAuditMixin):
-    """Read and write paper-OMS rows: orders, fills, positions, and accounts."""
+    """Read and write paper-OMS rows: orders, fills, positions, events, and funding."""
 
     # -- Paper OMS -------------------------------------------------------
 
@@ -474,18 +503,33 @@ class PaperOmsStoreMixin(SqliteConnectionMixin, SqliteAuditMixin):
         finally:
             connection.close()
 
-    def save_position_adjustment(self, record: PositionAdjustmentRecord) -> OmsCommit:
-        """Commit a partial close or add as one unit; no trade log is written."""
+    def _commit_open_update(
+        self,
+        record: PositionAdjustmentRecord | FundingAccrualCommit,
+        *,
+        balance_delta: Decimal,
+        precheck: Callable[[sqlite3.Connection], bool] | None = None,
+    ) -> OmsCommit | None:
+        """Commit one update to the one OPEN position as an atomic unit.
+
+        Shared by a partial close/add and a funding accrual: both may insert an
+        order/fill (adjustments), move the account balance by a derived delta,
+        replace the OPEN payload optimistically, and append one event. Funding
+        passes a precheck that inserts its unique accrual row first, so a replay
+        returns ``None`` without touching the account or position.
+        """
         connection = self._connect()
         try:
             connection.execute("BEGIN IMMEDIATE")
+            if precheck is not None and not precheck(connection):
+                connection.rollback()
+                return None
             audits = tuple(self._insert_audit_event(connection, draft) for draft in record.audits)
             base, initial_balance, environment, currency = _account_base(connection, record)
-            balance = (base + Decimal(record.balance_delta)).quantize(
-                Decimal("0.00000001"), rounding=ROUND_DOWN
-            )
-            _insert_close_order(connection, record.order)
-            _insert_close_fill(connection, record.fill)
+            balance = (base + balance_delta).quantize(Decimal("0.00000001"), rounding=ROUND_DOWN)
+            if isinstance(record, PositionAdjustmentRecord):
+                _insert_close_order(connection, record.order)
+                _insert_close_fill(connection, record.fill)
             _upsert_close_account(
                 connection,
                 record,
@@ -515,40 +559,35 @@ class PaperOmsStoreMixin(SqliteConnectionMixin, SqliteAuditMixin):
         finally:
             connection.close()
 
+    def save_position_adjustment(self, record: PositionAdjustmentRecord) -> OmsCommit:
+        """Commit a partial close or add as one unit; no trade log is written."""
+        result = self._commit_open_update(record, balance_delta=Decimal(record.balance_delta))
+        # An adjustment passes no precheck, so the shared commit never returns
+        # the "duplicate/no-op" None that a funding accrual can.
+        assert result is not None, "an adjustment commit must write the position"
+        return result
+
     def save_funding_accrual(self, record: FundingAccrualCommit) -> bool:
-        """Commit one funding settlement once; a replay applies nothing."""
-        connection = self._connect()
-        try:
-            connection.execute("BEGIN IMMEDIATE")
+        """Commit one funding settlement once; a replay applies nothing.
+
+        The cash delta and the position's funding total are both derived from
+        ``record.accrual.amount_usd``; the total is verified before commit. A
+        duplicate ``(position, settlement)`` returns ``False`` before any
+        account or position write.
+        """
+
+        def precheck(connection: sqlite3.Connection) -> bool:
             if not _insert_funding_accrual(connection, record.accrual):
-                connection.rollback()
                 return False
-            for draft in record.audits:
-                self._insert_audit_event(connection, draft)
-            base, initial_balance, environment, currency = _account_base(connection, record)
-            balance = (base + Decimal(record.balance_delta)).quantize(
-                Decimal("0.00000001"), rounding=ROUND_DOWN
-            )
-            _upsert_close_account(
-                connection,
-                record,
-                balance=balance,
-                initial_balance=initial_balance,
-                environment=environment,
-                currency=currency,
-            )
-            _update_open_position(connection, record.position)
-            _insert_position_event(connection, record.event)
-            connection.commit()
+            _funding_total_advanced(record)
             return True
-        except sqlite3.IntegrityError as exc:
-            connection.rollback()
-            raise OmsConflictError(_close_conflict_kind(str(exc))) from exc
-        except BaseException:
-            connection.rollback()
-            raise
-        finally:
-            connection.close()
+
+        result = self._commit_open_update(
+            record,
+            balance_delta=Decimal(record.accrual.amount_usd),
+            precheck=precheck,
+        )
+        return result is not None
 
     def list_funding_accruals(self, position_id: str) -> tuple[FundingAccrualRecord, ...]:
         connection = self._connect_read_only()
@@ -557,7 +596,7 @@ class PaperOmsStoreMixin(SqliteConnectionMixin, SqliteAuditMixin):
         try:
             rows = connection.execute(
                 "SELECT accrual_id, position_id, settlement_time, rate, mark_price, "
-                "amount_usd, created_at FROM funding_accruals WHERE position_id = ? "
+                "amount_usd, created_at, side, size FROM funding_accruals WHERE position_id = ? "
                 "ORDER BY settlement_time ASC, accrual_id ASC",
                 (position_id,),
             ).fetchall()
@@ -1033,4 +1072,6 @@ def _row_to_funding_accrual(row: sqlite3.Row) -> FundingAccrualRecord:
         mark_price=row["mark_price"],
         amount_usd=row["amount_usd"],
         created_at=row["created_at"],
+        side=row["side"],
+        size=row["size"],
     )

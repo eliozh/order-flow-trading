@@ -1,4 +1,4 @@
-"""Read the position ledger and run one manual protective-exit tick."""
+"""Read the position ledger, its accounting history, and run one management tick."""
 
 from __future__ import annotations
 
@@ -126,7 +126,7 @@ def monitor_position(
     request: Request,
     position_id: str = Path(min_length=1, max_length=64, pattern=r"^[A-Za-z0-9._:-]+$"),
 ) -> dict[str, Any]:
-    """Run one deterministic stop-touch tick; the result is idempotent."""
+    """Accrue recorded funding and run one deterministic stop-touch tick (idempotent)."""
     try:
         result = _service(request).monitor(position_id)
     except PositionNotFound as exc:
