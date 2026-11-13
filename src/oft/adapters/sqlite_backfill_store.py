@@ -1,7 +1,8 @@
 """Backfill run, manifest, and data-gap mixin.
 
 Covers the ``backfill_runs``, ``backfill_manifest``, ``manifest`` (part rows), and
-``data_gaps`` tables plus their row mappers.
+``data_gaps`` tables plus their row mappers. Owns the backfill part-manifest rows
+(``_insert_part_manifest``); the scan mixin owns the scan manifest rows.
 """
 
 from __future__ import annotations

@@ -1431,6 +1431,23 @@ CREATE TABLE llm_calls (
     system_prompt_version INTEGER NOT NULL DEFAULT 1,
     system_prompt_hash TEXT NOT NULL DEFAULT ''
 );
+CREATE TABLE budget_ledger (
+    record_id TEXT PRIMARY KEY,
+    call_id TEXT NOT NULL UNIQUE REFERENCES llm_calls(call_id),
+    decision_id TEXT,
+    occurred_at TEXT NOT NULL,
+    provider TEXT NOT NULL,
+    model TEXT NOT NULL,
+    cost_usd TEXT NOT NULL,
+    price_version TEXT NOT NULL,
+    unpriced INTEGER NOT NULL CHECK (unpriced IN (0, 1)),
+    budget_state TEXT NOT NULL,
+    period_day TEXT NOT NULL,
+    period_week TEXT NOT NULL DEFAULT '',
+    period_month TEXT NOT NULL DEFAULT '',
+    role TEXT NOT NULL DEFAULT '',
+    payload_json TEXT NOT NULL
+);
 CREATE TABLE risk_verdicts (
     risk_verdict_id TEXT PRIMARY KEY,
     trigger_id TEXT NOT NULL REFERENCES trigger_events(trigger_id),
@@ -1537,6 +1554,11 @@ INSERT INTO positions VALUES (
     'POS-1', 'ACC-1', 'PAPER', 'BTCUSDT', 'OPEN',
     '2026-11-10T00:00:00.000Z', '{}'
 );
+INSERT INTO budget_ledger VALUES (
+    'BUD-1', 'CALL-1', 'DEC-1', '2026-11-10T00:00:00.000Z', 'stub', 'fixture',
+    '0.0015', 'stub/v1', 1, 'OK', '2026-11-10', '2026-W45', '2026-11', 'ANALYSIS',
+    '{}'
+);
 """
 
 _V21_REBUILT_TABLES = (
@@ -1567,6 +1589,15 @@ def _normalized_ddl(connection: sqlite3.Connection, table: str) -> str:
     ).fetchone()
     assert row is not None and row[0] is not None
     return " ".join(str(row[0]).split())
+
+
+def _index_names(connection: sqlite3.Connection, table: str) -> set[str]:
+    return {row[1] for row in connection.execute(f"PRAGMA index_list({table})")}
+
+
+def _foreign_key_targets(connection: sqlite3.Connection, table: str) -> set[tuple[str, str]]:
+    """The ``(child column, parent table)`` pairs of a table's foreign keys."""
+    return {(row[3], row[2]) for row in connection.execute(f"PRAGMA foreign_key_list({table})")}
 
 
 def test_populated_v20_database_upgrades_to_v21_preserving_every_row(
@@ -1602,6 +1633,7 @@ def test_populated_v20_database_upgrades_to_v21_preserving_every_row(
                 "opportunities",
                 "opportunity_conditions",
                 "opportunity_events",
+                "budget_ledger",
             )
         }
         preserved = {
@@ -1636,6 +1668,9 @@ def test_populated_v20_database_upgrades_to_v21_preserving_every_row(
             "event": connection.execute(
                 "SELECT opportunity_id, seq, to_state FROM opportunity_events"
             ).fetchone(),
+            "budget": connection.execute(
+                "SELECT record_id, call_id, decision_id FROM budget_ledger"
+            ).fetchone(),
         }
         foreign_key_errors = connection.execute("PRAGMA foreign_key_check").fetchall()
     finally:
@@ -1656,6 +1691,7 @@ def test_populated_v20_database_upgrades_to_v21_preserving_every_row(
         "opportunities": 1,
         "opportunity_conditions": 1,
         "opportunity_events": 1,
+        "budget_ledger": 1,
     }
     # Columns (and their values) are preserved across the table rebuilds.
     assert tuple(preserved["llm_call"]) == ("CALL-1", "DEC-1", "OK")
@@ -1669,6 +1705,7 @@ def test_populated_v20_database_upgrades_to_v21_preserving_every_row(
     assert tuple(preserved["opportunity"]) == ("OPP-1", "TRIGGERED")
     assert tuple(preserved["condition"]) == ("C-1", "OPP-1", 1)
     assert tuple(preserved["event"]) == ("OPP-1", 1, "TRIGGERED")
+    assert tuple(preserved["budget"]) == ("BUD-1", "CALL-1", "DEC-1")
     assert foreign_key_errors == []
 
 
@@ -1686,12 +1723,71 @@ def test_upgraded_tables_match_a_fresh_database(tmp_path: Path) -> None:
             upgraded_fks = upgraded.execute(f"PRAGMA foreign_key_list({table})").fetchall()
             fresh_fks = fresh.execute(f"PRAGMA foreign_key_list({table})").fetchall()
             assert [tuple(row) for row in upgraded_fks] == [tuple(row) for row in fresh_fks], table
-            upgraded_indexes = {row[1] for row in upgraded.execute(f"PRAGMA index_list({table})")}
-            fresh_indexes = {row[1] for row in fresh.execute(f"PRAGMA index_list({table})")}
+            upgraded_indexes = _index_names(upgraded, table)
+            fresh_indexes = _index_names(fresh, table)
             assert upgraded_indexes == fresh_indexes, table
+        # The two FK child columns added in v21 must be indexed on both paths.
+        for connection in (upgraded, fresh):
+            assert "risk_verdicts_decision_id" in _index_names(connection, "risk_verdicts")
+            assert "orders_risk_verdict_id" in _index_names(connection, "orders")
+            # ``legacy_alter_table`` must keep these non-rebuilt children
+            # pointing at the live tables rather than the dropped ``*_v20`` one.
+            assert ("order_id", "orders") in _foreign_key_targets(connection, "fills")
+            assert ("call_id", "llm_calls") in _foreign_key_targets(connection, "budget_ledger")
     finally:
         upgraded.close()
         fresh.close()
+
+
+def _v20_settings_with_invalid_trigger_status(tmp_path: Path) -> Settings:
+    settings = _v20_settings(tmp_path)
+    connection = sqlite3.connect(database_path(settings))
+    try:
+        connection.execute(
+            "INSERT INTO trigger_events "
+            "(trigger_id, opportunity_id, symbol, status, idempotency_key, triggered_at, "
+            "payload_json) VALUES "
+            "('TRG-BAD', 'OPP-1', 'BTCUSDT', 'LEGACY_VALUE', 'TRG-KEY-BAD', 't', '{}')"
+        )
+        connection.commit()
+    finally:
+        connection.close()
+    return settings
+
+
+def test_v21_aborts_and_leaves_v20_untouched_on_an_invalid_legacy_row(
+    tmp_path: Path,
+) -> None:
+    settings = _v20_settings_with_invalid_trigger_status(tmp_path)
+
+    with pytest.raises(sqlite3.IntegrityError) as caught:
+        SqliteStore(settings).initialize()
+
+    message = str(caught.value)
+    assert "trigger_events" in message
+    assert "v20" in message
+
+    connection = sqlite3.connect(database_path(settings))
+    try:
+        version = connection.execute("SELECT MAX(version) FROM schema_migrations").fetchone()[0]
+        tables = {
+            row[0]
+            for row in connection.execute("SELECT name FROM sqlite_master WHERE type = 'table'")
+        }
+        rows = connection.execute(
+            "SELECT trigger_id, status FROM trigger_events ORDER BY trigger_id"
+        ).fetchall()
+    finally:
+        connection.close()
+
+    assert version == 20
+    # The whole rebuild rolled back: no ``*_v20`` scratch table survives and the
+    # offending row is preserved verbatim (never defaulted, rewritten, dropped).
+    assert not {name for name in tables if name.endswith("_v20")}
+    assert [tuple(row) for row in rows] == [
+        ("TRG-1", "PENDING_RECHECK"),
+        ("TRG-BAD", "LEGACY_VALUE"),
+    ]
 
 
 def _seed_oms_parents(connection: sqlite3.Connection) -> None:
@@ -1845,7 +1941,8 @@ def test_v21_accepts_every_decision_validation_status(tmp_path: Path, status: st
 
 
 @pytest.mark.parametrize(
-    "status", ["PENDING_RECHECK", "RECHECKED", "REJECTED", "BLOCKED", "ACCEPTED"]
+    "status",
+    ["PENDING_RECHECK", "RECHECKED", "REJECTED", "BLOCKED", "ACCEPTED", "EXPIRED"],
 )
 def test_v21_accepts_every_trigger_status(tmp_path: Path, status: str) -> None:
     settings = Settings(env="test", port=8765, data_dir=tmp_path / "data")

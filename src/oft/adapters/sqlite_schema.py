@@ -149,13 +149,28 @@ _SCAN_SYMBOLS_DEFINITION = """
 """
 
 
+def _enum_check(values: tuple[str, ...]) -> str:
+    """Render the ``IN`` list of an enum CHECK from its vocabulary tuple."""
+    return ",".join(f"'{value}'" for value in values)
+
+
 # v21 enum domains. Each tuple is exactly what the application writes: the
 # ``status``/``state`` values come from the writer sites and the domain
-# ``StrEnum`` values in ``oft.domain.oms``. The CHECKs are attached to both a
-# fresh database and the v20 -> v21 rebuild so the two schemas stay identical.
+# ``StrEnum`` values in ``oft.domain.oms``, plus the contract enums in
+# ``docs/contracts/common.schema.json``. The CHECK text is generated from these
+# tuples so the DDL cannot drift from the documented vocabulary, and the same
+# definitions are attached to both a fresh database and the v20 -> v21 rebuild
+# so the two schemas stay identical.
 _LLM_CALL_STATUSES = ("OK", "ERROR")
 _DECISION_VALIDATION_STATUSES = ("VALID", "REPAIRED", "REJECTED")
-_TRIGGER_STATUSES = ("PENDING_RECHECK", "RECHECKED", "REJECTED", "BLOCKED", "ACCEPTED")
+_TRIGGER_STATUSES = (
+    "PENDING_RECHECK",
+    "RECHECKED",
+    "REJECTED",
+    "BLOCKED",
+    "ACCEPTED",
+    "EXPIRED",
+)
 _ORDER_STATUSES = (
     "CREATED",
     "SUBMITTED",
@@ -168,7 +183,7 @@ _ORDER_STATUSES = (
 )
 _POSITION_STATES = ("OPEN", "CLOSED", "LIQUIDATED", "RECONCILING")
 
-_LLM_CALLS_DEFINITION = """
+_LLM_CALLS_DEFINITION = f"""
     call_id TEXT PRIMARY KEY,
     decision_id TEXT,
     role TEXT NOT NULL,
@@ -180,7 +195,7 @@ _LLM_CALLS_DEFINITION = """
     input_hash TEXT NOT NULL,
     attempt INTEGER NOT NULL CHECK (attempt IN (1, 2)),
     request_id TEXT NOT NULL,
-    status TEXT NOT NULL CHECK (status IN ('OK','ERROR')),
+    status TEXT NOT NULL CHECK (status IN ({_enum_check(_LLM_CALL_STATUSES)})),
     raw_output_hash TEXT NOT NULL,
     usage_json TEXT NOT NULL,
     latency_ms INTEGER NOT NULL,
@@ -190,23 +205,23 @@ _LLM_CALLS_DEFINITION = """
     system_prompt_version INTEGER NOT NULL DEFAULT 1,
     system_prompt_hash TEXT NOT NULL DEFAULT ''
 """
-_DECISIONS_DEFINITION = """
+_DECISIONS_DEFINITION = f"""
     decision_id TEXT PRIMARY KEY,
     role TEXT NOT NULL,
     decision_type TEXT NOT NULL,
     validation_status TEXT NOT NULL CHECK (
-        validation_status IN ('VALID','REPAIRED','REJECTED')
+        validation_status IN ({_enum_check(_DECISION_VALIDATION_STATUSES)})
     ),
     raw_output_hash TEXT NOT NULL,
     persisted_at TEXT NOT NULL,
     payload_json TEXT NOT NULL
 """
-_TRIGGER_EVENTS_DEFINITION = """
+_TRIGGER_EVENTS_DEFINITION = f"""
     trigger_id TEXT PRIMARY KEY,
     opportunity_id TEXT NOT NULL REFERENCES opportunities(opportunity_id),
     symbol TEXT NOT NULL,
     status TEXT NOT NULL CHECK (
-        status IN ('PENDING_RECHECK','RECHECKED','REJECTED','BLOCKED','ACCEPTED')
+        status IN ({_enum_check(_TRIGGER_STATUSES)})
     ),
     idempotency_key TEXT NOT NULL UNIQUE,
     triggered_at TEXT NOT NULL,
@@ -229,15 +244,14 @@ _RISK_VERDICTS_DEFINITION = """
     expected_slippage_bps REAL,
     daily_loss_usd TEXT
 """
-_ORDERS_DEFINITION = """
+_ORDERS_DEFINITION = f"""
     order_id TEXT PRIMARY KEY,
     client_order_id TEXT NOT NULL UNIQUE,
     environment TEXT NOT NULL,
     symbol TEXT NOT NULL,
     status TEXT NOT NULL CHECK (
         status IN (
-            'CREATED','SUBMITTED','PARTIALLY_FILLED','FILLED',
-            'CANCELED','REJECTED','EXPIRED','UNKNOWN'
+            {_enum_check(_ORDER_STATUSES)}
         )
     ),
     risk_verdict_id TEXT NOT NULL REFERENCES risk_verdicts(risk_verdict_id),
@@ -249,13 +263,13 @@ _ORDERS_DEFINITION = """
     decision_id TEXT,
     purpose TEXT NOT NULL DEFAULT 'ENTRY'
 """
-_POSITIONS_DEFINITION = """
+_POSITIONS_DEFINITION = f"""
     position_id TEXT PRIMARY KEY,
     account_id TEXT NOT NULL REFERENCES paper_accounts(account_id),
     environment TEXT NOT NULL,
     symbol TEXT NOT NULL,
     state TEXT NOT NULL CHECK (
-        state IN ('OPEN','CLOSED','LIQUIDATED','RECONCILING')
+        state IN ({_enum_check(_POSITION_STATES)})
     ),
     opened_at TEXT NOT NULL,
     payload_json TEXT NOT NULL
@@ -645,7 +659,11 @@ _SCHEMA_SQL = f"""
         ON trigger_events(opportunity_id, triggered_at);
     CREATE TABLE IF NOT EXISTS risk_verdicts ({_RISK_VERDICTS_DEFINITION});
     CREATE INDEX IF NOT EXISTS risk_verdicts_trigger_id ON risk_verdicts(trigger_id);
+    -- ``decision_id`` is a foreign-key child column added in v21; index it so
+    -- ``foreign_key_check`` and parent updates do not scan the table.
+    CREATE INDEX IF NOT EXISTS risk_verdicts_decision_id ON risk_verdicts(decision_id);
     CREATE TABLE IF NOT EXISTS orders ({_ORDERS_DEFINITION});
+    CREATE INDEX IF NOT EXISTS orders_risk_verdict_id ON orders(risk_verdict_id);
     -- D6: at most one ENTRY order per trigger, enforced by the database, not a
     -- read-then-act guard. A retry that races a committed order fails here.
     CREATE UNIQUE INDEX IF NOT EXISTS orders_one_entry_per_trigger
@@ -1654,6 +1672,30 @@ def _migrate_v20(connection: sqlite3.Connection) -> None:
         raise
 
 
+def _v21_foreign_keys_present(connection: sqlite3.Connection) -> bool:
+    """Whether every existing rebuilt table already carries its v21 foreign keys.
+
+    The rebuild is one transaction, so testing the new child foreign keys is
+    enough to tell whether a concurrent initializer has already applied it.
+    """
+    expected = {
+        "risk_verdicts": ("decision_id", "decisions"),
+        "orders": ("risk_verdict_id", "risk_verdicts"),
+        "positions": ("account_id", "paper_accounts"),
+    }
+    seen = False
+    for table, (column, parent) in expected.items():
+        if not _table_exists(connection, table):
+            continue
+        seen = True
+        targets = {
+            (row[3], row[2]) for row in connection.execute(f"PRAGMA foreign_key_list({table})")
+        }
+        if (column, parent) not in targets:
+            return False
+    return seen
+
+
 def _migrate_v21(connection: sqlite3.Connection) -> None:
     """Add the residual foreign keys and the enum CHECKs (v21).
 
@@ -1662,13 +1704,17 @@ def _migrate_v21(connection: sqlite3.Connection) -> None:
     copy every existing column, drop the renamed table. Every index is dropped
     with the old table and recreated by ``_SCHEMA_SQL`` afterwards.
 
-    Foreign keys are disabled for the copy so a legacy row that cannot satisfy a
-    new constraint does not abort the boot; ``PRAGMA foreign_key_check`` reports
-    any such row afterwards. ``legacy_alter_table`` is enabled so the rename
-    does not rewrite the REFERENCES clauses of the *other* tables (``fills``
-    references ``orders``, ``budget_ledger`` references ``llm_calls``,
-    ``risk_verdicts`` references ``trigger_events``); without it those clauses
-    would follow the renamed table and dangle once it is dropped.
+    ``PRAGMA foreign_keys=OFF`` defers *foreign-key* enforcement for the copy
+    only; it does not disable CHECK constraints. A legacy row that cannot
+    satisfy a new constraint aborts the migration: the transaction is rolled
+    back, the database stays at v20, no data is changed, and the raised
+    ``sqlite3.IntegrityError`` names the table and the violated constraint so
+    the operator can repair the row. Rows are never defaulted, rewritten, or
+    dropped. ``legacy_alter_table`` is enabled so the rename does not rewrite
+    the REFERENCES clauses of the *other* tables (``fills`` references
+    ``orders``, ``budget_ledger`` references ``llm_calls``, ``risk_verdicts``
+    references ``trigger_events``); without it those clauses would follow the
+    renamed table and dangle once it is dropped.
     """
     if not any(_table_exists(connection, table) for table, _definition, _columns in _V21_REBUILDS):
         return
@@ -1676,8 +1722,15 @@ def _migrate_v21(connection: sqlite3.Connection) -> None:
         connection.commit()
     connection.execute("PRAGMA foreign_keys=OFF")
     connection.execute("PRAGMA legacy_alter_table=ON")
-    connection.execute("BEGIN IMMEDIATE")
+    table = ""
     try:
+        connection.execute("BEGIN IMMEDIATE")
+        # Re-check under the write lock: a concurrent initializer may have
+        # already performed this rebuild after the unlocked version check that
+        # led here, in which case rebuilding again would be wasted work.
+        if _v21_foreign_keys_present(connection):
+            connection.execute("COMMIT")
+            return
         for table, definition, columns in _V21_REBUILDS:
             if not _table_exists(connection, table):
                 continue
@@ -1695,8 +1748,17 @@ def _migrate_v21(connection: sqlite3.Connection) -> None:
             )
             connection.execute(f"DROP TABLE {old_table}")
         connection.execute("COMMIT")
+    except sqlite3.IntegrityError as exc:
+        if connection.in_transaction:
+            connection.execute("ROLLBACK")
+        raise sqlite3.IntegrityError(
+            f"v21 migration aborted: a legacy row in table {table!r} violates a new "
+            f"constraint ({exc}). The database was left at schema v20 with no data "
+            "changed. Repair or remove the offending row, then restart."
+        ) from exc
     except Exception:
-        connection.execute("ROLLBACK")
+        if connection.in_transaction:
+            connection.execute("ROLLBACK")
         raise
     finally:
         connection.execute("PRAGMA legacy_alter_table=OFF")

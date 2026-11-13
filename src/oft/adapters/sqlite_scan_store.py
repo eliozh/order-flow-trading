@@ -1,7 +1,8 @@
 """Scan, report, idempotency, and manifest mixin.
 
 Covers the ``scans``, ``reports``, ``idempotency_keys``, ``manifest``, and
-``scan_symbols`` tables plus their row mappers.
+``scan_symbols`` tables plus their row mappers. Owns the scan manifest rows
+(``_insert_manifest``); the backfill mixin owns the backfill part-manifest rows.
 """
 
 from __future__ import annotations
