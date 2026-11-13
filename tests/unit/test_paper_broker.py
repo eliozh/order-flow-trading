@@ -46,6 +46,34 @@ def _intent(*, quantity: str = "0.01", idempotency_key: str = "idem-1") -> Order
     )
 
 
+def _seed_verdict_parents(store: SqliteStore) -> None:
+    """Seed the v21 parents for the synthetic ``RISK-1`` verdict."""
+    with sqlite3.connect(store.path) as connection:
+        connection.execute(
+            "INSERT INTO opportunities "
+            "(opportunity_id, symbol, state, created_at, updated_at, payload_json, expires_at) "
+            "VALUES ('OPP-1', 'BTCUSDT', 'TRIGGERED', 't', 't', '{}', NULL)"
+        )
+        connection.execute(
+            "INSERT INTO trigger_events "
+            "(trigger_id, opportunity_id, symbol, status, idempotency_key, triggered_at, "
+            "payload_json) VALUES ('TRG-1', 'OPP-1', 'BTCUSDT', 'PENDING_RECHECK', "
+            "'TRG-KEY-1', 't', '{}')"
+        )
+        connection.execute(
+            "INSERT INTO decisions "
+            "(decision_id, role, decision_type, validation_status, raw_output_hash, "
+            "persisted_at, payload_json) VALUES "
+            "('DEC-1', 'ENTRY_RECHECK', 'ENTRY_RECHECK', 'VALID', 'H', 't', '{}')"
+        )
+        connection.execute(
+            "INSERT INTO risk_verdicts "
+            "(risk_verdict_id, trigger_id, decision_id, verdict, binding_cap, computed_at, "
+            "expires_at, payload_json) VALUES "
+            "('RISK-1', 'TRG-1', 'DEC-1', 'ALLOW', 'NONE', 't', 't', '{}')"
+        )
+
+
 def test_the_broker_rejects_any_non_paper_environment(tmp_path: Path) -> None:
     settings = _settings(tmp_path)
     store = SqliteStore(settings)
@@ -108,6 +136,7 @@ def test_market_fill_applies_two_bps_slippage_and_five_bps_fee(tmp_path: Path) -
     settings = _settings(tmp_path)
     store = SqliteStore(settings)
     store.initialize()
+    _seed_verdict_parents(store)
     broker = PaperBroker(settings=settings, store=store, clock=FixedClock(NOW))
 
     result = broker.submit(
@@ -133,6 +162,7 @@ def test_short_fill_applies_slippage_downward(tmp_path: Path) -> None:
     settings = _settings(tmp_path)
     store = SqliteStore(settings)
     store.initialize()
+    _seed_verdict_parents(store)
     broker = PaperBroker(settings=settings, store=store, clock=FixedClock(NOW))
     intent = OrderIntent(
         symbol="BTCUSDT",
@@ -170,6 +200,8 @@ def test_same_inputs_and_clock_produce_identical_ids_and_values(tmp_path: Path) 
     second_store = SqliteStore(second_settings)
     first_store.initialize()
     second_store.initialize()
+    _seed_verdict_parents(first_store)
+    _seed_verdict_parents(second_store)
     first = PaperBroker(settings=first_settings, store=first_store, clock=FixedClock(NOW))
     second = PaperBroker(settings=second_settings, store=second_store, clock=FixedClock(NOW))
 
@@ -198,6 +230,7 @@ def test_records_are_visible_through_the_store(tmp_path: Path) -> None:
     settings = _settings(tmp_path)
     store = SqliteStore(settings)
     store.initialize()
+    _seed_verdict_parents(store)
     broker = PaperBroker(settings=settings, store=store, clock=FixedClock(NOW))
 
     result = broker.submit(
@@ -226,6 +259,7 @@ def test_account_seeds_ten_thousand_once_and_never_overwrites(tmp_path: Path) ->
 
     first = service.ensure()
     second = service.ensure()
+    _seed_verdict_parents(store)
     broker = PaperBroker(settings=settings, store=store, clock=FixedClock(NOW))
     broker.submit(
         _intent(),
@@ -245,6 +279,7 @@ def test_summary_equity_adds_the_position_value_at_the_recorded_mark(tmp_path: P
     settings = _settings(tmp_path)
     store = SqliteStore(settings)
     store.initialize()
+    _seed_verdict_parents(store)
     broker = PaperBroker(settings=settings, store=store, clock=FixedClock(NOW))
     broker.submit(
         _intent(),
@@ -377,6 +412,7 @@ def test_market_fill_is_whole_not_partial(tmp_path: Path) -> None:
     settings = _settings(tmp_path)
     store = SqliteStore(settings)
     store.initialize()
+    _seed_verdict_parents(store)
     broker = PaperBroker(settings=settings, store=store, clock=FixedClock(NOW))
 
     result = broker.submit(

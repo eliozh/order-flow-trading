@@ -1754,6 +1754,19 @@ def _persist_verdict(
         "stale_inputs": [],
     }
     verdict_id = "RISK-TEST"
+    # ``risk_verdicts.decision_id`` is a foreign key from schema v21; the
+    # synthetic verdicts in these gateway tests need their parent decision.
+    container.store.save_decision(
+        DecisionRecord(
+            decision_id=decision_id,
+            role=LLMRole.ENTRY_RECHECK.value,
+            decision_type="ENTRY_RECHECK",
+            validation_status="VALID",
+            raw_output_hash="TEST-HASH",
+            persisted_at=now,
+            payload_json="{}",
+        )
+    )
     container.store.save_risk_verdict(
         RiskVerdictRecord(
             risk_verdict_id=verdict_id,

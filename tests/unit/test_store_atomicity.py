@@ -119,6 +119,34 @@ def _oms(suffix: str) -> tuple[OrderRecord, FillRecord, PositionRecord, PaperAcc
     return order, fill, position, account
 
 
+def _seed_oms_parents(store: SqliteStore) -> None:
+    """Seed the v21 parents that ``orders.risk_verdict_id`` now references."""
+    with sqlite3.connect(store.path) as connection:
+        connection.execute(
+            "INSERT INTO opportunities "
+            "(opportunity_id, symbol, state, created_at, updated_at, payload_json, expires_at) "
+            "VALUES ('OPP-1', 'BTCUSDT', 'TRIGGERED', 't', 't', '{}', NULL)"
+        )
+        connection.execute(
+            "INSERT INTO trigger_events "
+            "(trigger_id, opportunity_id, symbol, status, idempotency_key, triggered_at, "
+            "payload_json) VALUES ('TRG-1', 'OPP-1', 'BTCUSDT', 'PENDING_RECHECK', "
+            "'TRG-KEY-1', 't', '{}')"
+        )
+        connection.execute(
+            "INSERT INTO decisions "
+            "(decision_id, role, decision_type, validation_status, raw_output_hash, "
+            "persisted_at, payload_json) VALUES "
+            "('DEC-1', 'ENTRY_RECHECK', 'ENTRY_RECHECK', 'VALID', 'H', 't', '{}')"
+        )
+        connection.execute(
+            "INSERT INTO risk_verdicts "
+            "(risk_verdict_id, trigger_id, decision_id, verdict, binding_cap, computed_at, "
+            "expires_at, payload_json) VALUES "
+            "('RISK-1', 'TRG-1', 'DEC-1', 'ALLOW', 'NONE', 't', 't', '{}')"
+        )
+
+
 def _audit(suffix: str) -> AuditEventDraft:
     return AuditEventDraft(
         event_type="ORDER_FILLED",
@@ -133,6 +161,7 @@ def test_order_fill_position_and_audit_commit_together(tmp_path: Path) -> None:
     settings = Settings(env="test", port=8765, data_dir=tmp_path / "data")
     store = SqliteStore(settings)
     store.initialize()
+    _seed_oms_parents(store)
     order, fill, position, account = _oms("1")
 
     commit = store.save_order_fill_position(
@@ -174,6 +203,7 @@ def test_balance_delta_is_applied_inside_the_write_transaction(tmp_path: Path) -
     settings = Settings(env="test", port=8765, data_dir=tmp_path / "data")
     store = SqliteStore(settings)
     store.initialize()
+    _seed_oms_parents(store)
 
     # Both calls carry the same stale absolute balance; only the in-transaction
     # delta application can keep both debits.
