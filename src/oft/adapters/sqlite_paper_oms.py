@@ -112,23 +112,9 @@ class PaperOmsStoreMixin(SqliteConnectionMixin, SqliteAuditMixin):
                     fill.payload_json,
                 ),
             )
-            connection.execute(
-                """
-                INSERT INTO positions (
-                    position_id, account_id, environment, symbol, state,
-                    opened_at, payload_json
-                ) VALUES (?, ?, ?, ?, ?, ?, ?)
-                """,
-                (
-                    position.position_id,
-                    position.account_id,
-                    position.environment,
-                    position.symbol,
-                    position.state,
-                    position.opened_at,
-                    position.payload_json,
-                ),
-            )
+            # The account row is written before the position in the same
+            # transaction: ``positions.account_id`` is a foreign key to
+            # ``paper_accounts`` (schema v21), so the parent must exist first.
             connection.execute(
                 """
                 INSERT INTO paper_accounts (
@@ -145,6 +131,23 @@ class PaperOmsStoreMixin(SqliteConnectionMixin, SqliteAuditMixin):
                     initial_balance,
                     str(balance),
                     account.updated_at,
+                ),
+            )
+            connection.execute(
+                """
+                INSERT INTO positions (
+                    position_id, account_id, environment, symbol, state,
+                    opened_at, payload_json
+                ) VALUES (?, ?, ?, ?, ?, ?, ?)
+                """,
+                (
+                    position.position_id,
+                    position.account_id,
+                    position.environment,
+                    position.symbol,
+                    position.state,
+                    position.opened_at,
+                    position.payload_json,
                 ),
             )
             connection.commit()

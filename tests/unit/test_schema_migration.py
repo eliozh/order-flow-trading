@@ -13,6 +13,7 @@ import pytest
 
 from oft.adapters.sqlite_store import SqliteStore, database_path
 from oft.config import Settings
+from oft.domain.oms import OrderStatus, PositionState
 from oft.ports.store import ScanSymbolRecord
 
 _V1_SCHEMA = """
@@ -85,7 +86,7 @@ def test_v1_database_upgrades_to_v2_with_effective_checks(tmp_path: Path) -> Non
     finally:
         connection.close()
 
-    assert versions == {1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20}
+    assert versions == {1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21}
 
 
 _V2_BACKFILL = """
@@ -143,7 +144,7 @@ def test_v2_database_gains_the_backfill_heartbeat_column(tmp_path: Path) -> None
 
     assert "updated_at" in columns
     assert updated_at == "2026-11-06T00:00:00.000Z"
-    assert versions == {1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20}
+    assert versions == {1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21}
 
 
 def test_v5_checks_indexes_and_foreign_keys(tmp_path: Path) -> None:
@@ -240,7 +241,7 @@ def test_v5_database_migrates_manifest_metrics_columns(tmp_path: Path) -> None:
 
     assert {"metric_version", "input_manifest_hash", "window_start", "window_end"} <= columns
     assert legacy == ("/tmp/legacy.parquet", None, None)
-    assert versions == {1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20}
+    assert versions == {1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21}
 
 
 def test_v6_database_migrates_starred_columns(tmp_path: Path) -> None:
@@ -299,7 +300,7 @@ def test_v6_database_migrates_starred_columns(tmp_path: Path) -> None:
 
     assert {"starred", "starred_at"} <= columns
     assert row == ("BTCUSDT", 0, None)
-    assert versions == {1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20}
+    assert versions == {1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21}
 
 
 def test_manifest_run_metadata_columns_are_added_idempotently(tmp_path: Path) -> None:
@@ -316,7 +317,7 @@ def test_manifest_run_metadata_columns_are_added_idempotently(tmp_path: Path) ->
         connection.close()
 
     assert {"run_id", "last_n", "recomputed_from", "parent_run_id"} <= columns
-    assert versions == {1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20}
+    assert versions == {1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21}
 
 
 _V12_JOB_RUNS = """
@@ -382,7 +383,7 @@ def test_v12_database_gains_the_job_run_scope_symbol_column(tmp_path: Path) -> N
 
     assert "symbol" in columns
     assert symbol is None  # pre-v13 batch rows keep a null (batch) scope
-    assert versions == {1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20}
+    assert versions == {1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21}
 
 
 _V13_JOB_RUNS = """
@@ -633,7 +634,7 @@ def test_v9_database_upgrades_to_v10_with_ledgers_and_indexes(tmp_path: Path) ->
     finally:
         connection.close()
 
-    assert versions == {1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20}
+    assert versions == {1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21}
     assert "llm_json" in report_columns
     assert {
         "llm_calls",
@@ -785,7 +786,7 @@ def test_v15_prompt_and_llm_rows_upgrade_to_v16_and_seed_only_missing_families(
         "entry_recheck:system",
     }
     assert tuple(llm_defaults) == ("", 1, "")
-    assert versions == {1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20}
+    assert versions == {1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21}
 
 
 def test_prompt_versions_are_immutable_and_have_one_active_row_per_prompt(
@@ -947,7 +948,7 @@ def test_v16_database_gains_budget_periods_settings_and_provider_capabilities(
     assert {"budget_ledger_week", "budget_ledger_month"} <= indexes
     # 2026-11-04 is ISO week 2026-W45.
     assert tuple(backfilled) == ("2026-11-04", "2026-W45", "2026-11", "")
-    assert versions == {1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20}
+    assert versions == {1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21}
 
 
 def _v16_budget_connection(settings: Settings) -> sqlite3.Connection:
@@ -1130,7 +1131,7 @@ def test_v18_trigger_events_gain_snapshot_provenance_and_backfill(
     assert tuple(good) == ("HASH-V18", "2026-11-09T10:00:00.000Z", "PARTIAL", 2)
     # A malformed legacy payload is skipped with its defaults, never aborting boot.
     assert tuple(bad) == ("", "", "", 0)
-    assert versions == {1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20}
+    assert versions == {1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21}
     skipped = [
         record
         for record in caplog.records
@@ -1196,9 +1197,9 @@ def test_concurrent_initializes_upgrade_v19_idempotently(tmp_path: Path) -> None
         connection.close()
     assert {"snapshot_hash", "as_of", "data_quality", "condition_count"} <= columns
     assert tuple(good) == ("HASH-V18", "2026-11-09T10:00:00.000Z", "PARTIAL", 2)
-    # Exactly one recorded v19 upgrade; v20 is recorded on the same boot.
+    # Exactly one recorded v19 upgrade; v20 and v21 are recorded on the same boot.
     assert versions == {19}
-    assert highest_version == 20
+    assert highest_version == 21
     assert immutable_triggers == 1
     assert journal_mode.lower() == "wal"
 
@@ -1319,7 +1320,7 @@ def test_v19_orders_survive_the_v20_upgrade_with_a_null_trigger_id(tmp_path: Pat
         connection.execute("ALTER TABLE risk_verdicts DROP COLUMN spread_bps")
         connection.execute("ALTER TABLE risk_verdicts DROP COLUMN expected_slippage_bps")
         connection.execute("ALTER TABLE risk_verdicts DROP COLUMN daily_loss_usd")
-        connection.execute("DELETE FROM schema_migrations WHERE version = 20")
+        connection.execute("DELETE FROM schema_migrations WHERE version IN (20, 21)")
         connection.commit()
     finally:
         connection.close()
@@ -1336,3 +1337,572 @@ def test_v19_orders_survive_the_v20_upgrade_with_a_null_trigger_id(tmp_path: Pat
         connection.close()
     assert tuple(row) == ("ORD-LEGACY", None, "ENTRY")
     assert "orders_one_entry_per_trigger" in indexes
+
+
+# -- v20 -> v21: residual foreign keys, enum CHECKs, and a populated upgrade --
+
+_V20_POPULATED = """
+CREATE TABLE schema_migrations (
+    version INTEGER PRIMARY KEY,
+    applied_at TEXT NOT NULL
+);
+INSERT INTO schema_migrations (version, applied_at) VALUES
+    (1,'t'),(2,'t'),(3,'t'),(4,'t'),(5,'t'),(6,'t'),(7,'t'),(8,'t'),(9,'t'),(10,'t'),
+    (11,'t'),(12,'t'),(13,'t'),(14,'t'),(15,'t'),(16,'t'),(17,'t'),(18,'t'),(19,'t'),(20,'t');
+CREATE TABLE opportunities (
+    opportunity_id TEXT PRIMARY KEY,
+    symbol TEXT NOT NULL,
+    state TEXT NOT NULL CHECK (
+        state IN ('OPEN','TRIGGERED','EXPIRED','INVALIDATED')
+    ),
+    created_at TEXT NOT NULL,
+    updated_at TEXT NOT NULL,
+    payload_json TEXT NOT NULL,
+    expires_at TEXT
+);
+CREATE TABLE opportunity_events (
+    opportunity_id TEXT NOT NULL REFERENCES opportunities(opportunity_id),
+    seq INTEGER NOT NULL,
+    at TEXT NOT NULL,
+    from_state TEXT,
+    to_state TEXT NOT NULL,
+    reason_code TEXT NOT NULL,
+    note TEXT NOT NULL,
+    PRIMARY KEY (opportunity_id, seq)
+);
+CREATE TABLE opportunity_conditions (
+    condition_id TEXT NOT NULL,
+    opportunity_id TEXT NOT NULL REFERENCES opportunities(opportunity_id),
+    kind TEXT NOT NULL CHECK (kind IN ('TRIGGER','INVALIDATION')),
+    seq INTEGER NOT NULL,
+    type TEXT NOT NULL,
+    params_json TEXT NOT NULL,
+    window_start TEXT NOT NULL,
+    window_end TEXT NOT NULL,
+    required_data_json TEXT NOT NULL,
+    evaluable INTEGER NOT NULL CHECK (evaluable IN (0, 1)),
+    unavailable_reason TEXT,
+    last_value TEXT,
+    last_evaluated_at TEXT,
+    last_result INTEGER CHECK (last_result IN (0, 1) OR last_result IS NULL),
+    PRIMARY KEY (opportunity_id, condition_id)
+);
+CREATE TABLE trigger_events (
+    trigger_id TEXT PRIMARY KEY,
+    opportunity_id TEXT NOT NULL REFERENCES opportunities(opportunity_id),
+    symbol TEXT NOT NULL,
+    status TEXT NOT NULL,
+    idempotency_key TEXT NOT NULL UNIQUE,
+    triggered_at TEXT NOT NULL,
+    payload_json TEXT NOT NULL,
+    snapshot_hash TEXT NOT NULL DEFAULT '',
+    as_of TEXT NOT NULL DEFAULT '',
+    data_quality TEXT NOT NULL DEFAULT '',
+    condition_count INTEGER NOT NULL DEFAULT 0
+);
+CREATE TABLE decisions (
+    decision_id TEXT PRIMARY KEY,
+    role TEXT NOT NULL,
+    decision_type TEXT NOT NULL,
+    validation_status TEXT NOT NULL,
+    raw_output_hash TEXT NOT NULL,
+    persisted_at TEXT NOT NULL,
+    payload_json TEXT NOT NULL
+);
+CREATE TABLE llm_calls (
+    call_id TEXT PRIMARY KEY,
+    decision_id TEXT,
+    role TEXT NOT NULL,
+    provider TEXT NOT NULL,
+    model TEXT NOT NULL,
+    prompt_id TEXT NOT NULL,
+    prompt_version INTEGER NOT NULL,
+    prompt_hash TEXT NOT NULL,
+    input_hash TEXT NOT NULL,
+    attempt INTEGER NOT NULL CHECK (attempt IN (1, 2)),
+    request_id TEXT NOT NULL,
+    status TEXT NOT NULL,
+    raw_output_hash TEXT NOT NULL,
+    usage_json TEXT NOT NULL,
+    latency_ms INTEGER NOT NULL,
+    error_code TEXT,
+    created_at TEXT NOT NULL,
+    system_prompt_id TEXT NOT NULL DEFAULT '',
+    system_prompt_version INTEGER NOT NULL DEFAULT 1,
+    system_prompt_hash TEXT NOT NULL DEFAULT ''
+);
+CREATE TABLE risk_verdicts (
+    risk_verdict_id TEXT PRIMARY KEY,
+    trigger_id TEXT NOT NULL REFERENCES trigger_events(trigger_id),
+    decision_id TEXT NOT NULL,
+    verdict TEXT NOT NULL CHECK (verdict IN ('ALLOW','REDUCE','BLOCK')),
+    binding_cap TEXT NOT NULL,
+    computed_at TEXT NOT NULL,
+    expires_at TEXT NOT NULL,
+    payload_json TEXT NOT NULL,
+    spread_bps REAL,
+    expected_slippage_bps REAL,
+    daily_loss_usd TEXT
+);
+CREATE TABLE orders (
+    order_id TEXT PRIMARY KEY,
+    client_order_id TEXT NOT NULL UNIQUE,
+    environment TEXT NOT NULL,
+    symbol TEXT NOT NULL,
+    status TEXT NOT NULL,
+    risk_verdict_id TEXT NOT NULL,
+    idempotency_key TEXT NOT NULL UNIQUE,
+    created_at TEXT NOT NULL,
+    updated_at TEXT NOT NULL,
+    payload_json TEXT NOT NULL,
+    trigger_id TEXT,
+    decision_id TEXT,
+    purpose TEXT NOT NULL DEFAULT 'ENTRY'
+);
+CREATE UNIQUE INDEX orders_one_entry_per_trigger
+    ON orders(trigger_id, environment, purpose)
+    WHERE trigger_id IS NOT NULL AND purpose = 'ENTRY';
+CREATE TABLE fills (
+    fill_id TEXT PRIMARY KEY,
+    order_id TEXT NOT NULL REFERENCES orders(order_id),
+    environment TEXT NOT NULL,
+    symbol TEXT NOT NULL,
+    filled_at TEXT NOT NULL,
+    payload_json TEXT NOT NULL
+);
+CREATE INDEX fills_order_id ON fills(order_id);
+CREATE TABLE positions (
+    position_id TEXT PRIMARY KEY,
+    account_id TEXT NOT NULL,
+    environment TEXT NOT NULL,
+    symbol TEXT NOT NULL,
+    state TEXT NOT NULL,
+    opened_at TEXT NOT NULL,
+    payload_json TEXT NOT NULL
+);
+CREATE INDEX positions_state ON positions(state);
+CREATE INDEX positions_account_id ON positions(account_id);
+CREATE TABLE paper_accounts (
+    account_id TEXT PRIMARY KEY,
+    environment TEXT NOT NULL,
+    currency TEXT NOT NULL,
+    initial_balance TEXT NOT NULL,
+    balance TEXT NOT NULL,
+    updated_at TEXT NOT NULL
+);
+INSERT INTO opportunities VALUES (
+    'OPP-1', 'BTCUSDT', 'TRIGGERED', '2026-11-10T00:00:00.000Z',
+    '2026-11-10T00:00:00.000Z',
+    '{"opportunity_id": "OPP-1", "trigger_conditions": [], "invalidation_conditions": []}',
+    '2026-12-10T00:00:00.000Z'
+);
+INSERT INTO opportunity_events VALUES (
+    'OPP-1', 1, '2026-11-10T00:00:00.000Z', 'OPEN', 'TRIGGERED',
+    'TRIGGERED', 'trigger fired'
+);
+INSERT INTO opportunity_conditions VALUES (
+    'C-1', 'OPP-1', 'TRIGGER', 1, 'PRICE_TOUCH_ZONE', '{}',
+    '2026-11-01T00:00:00.000Z', '2026-12-01T00:00:00.000Z', '[]', 1, NULL,
+    '70000.00', '2026-11-10T00:00:00.000Z', 1
+);
+INSERT INTO trigger_events VALUES (
+    'TRG-1', 'OPP-1', 'BTCUSDT', 'PENDING_RECHECK', 'TRG-KEY-1',
+    '2026-11-10T00:00:00.000Z', '{"status": "PENDING_RECHECK"}',
+    'SNAP-HASH', '2026-11-10T00:00:00.000Z', 'COMPLETE', 1
+);
+INSERT INTO decisions VALUES (
+    'DEC-1', 'ANALYSIS', 'MARKET_ANALYSIS', 'VALID', 'RAW-HASH',
+    '2026-11-10T00:00:00.000Z', '{}'
+);
+INSERT INTO llm_calls VALUES (
+    'CALL-1', 'DEC-1', 'ANALYSIS', 'stub', 'fixture', 'analysis', 1, 'PH', 'IH',
+    1, 'REQ-1', 'OK', 'RH', '{}', 0, NULL, '2026-11-10T00:00:00.000Z', '', 1, ''
+);
+INSERT INTO risk_verdicts VALUES (
+    'RISK-1', 'TRG-1', 'DEC-1', 'ALLOW', 'NONE',
+    '2026-11-10T00:00:00.000Z', '2026-11-10T00:01:00.000Z', '{}', NULL, NULL, NULL
+);
+INSERT INTO orders VALUES (
+    'ORD-1', 'client-1', 'PAPER', 'BTCUSDT', 'FILLED', 'RISK-1', 'idem-1',
+    '2026-11-10T00:00:00.000Z', '2026-11-10T00:00:00.000Z', '{}',
+    'TRG-1', 'DEC-1', 'ENTRY'
+);
+INSERT INTO fills VALUES (
+    'FIL-1', 'ORD-1', 'PAPER', 'BTCUSDT', '2026-11-10T00:00:00.000Z', '{}'
+);
+INSERT INTO paper_accounts VALUES (
+    'ACC-1', 'PAPER', 'USDT', '10000.00', '9990.00', '2026-11-10T00:00:00.000Z'
+);
+INSERT INTO positions VALUES (
+    'POS-1', 'ACC-1', 'PAPER', 'BTCUSDT', 'OPEN',
+    '2026-11-10T00:00:00.000Z', '{}'
+);
+"""
+
+_V21_REBUILT_TABLES = (
+    "llm_calls",
+    "decisions",
+    "trigger_events",
+    "risk_verdicts",
+    "orders",
+    "positions",
+)
+
+
+def _v20_settings(tmp_path: Path) -> Settings:
+    settings = Settings(env="test", port=8765, data_dir=tmp_path / "data")
+    settings.data_dir.mkdir(parents=True)
+    connection = sqlite3.connect(database_path(settings))
+    try:
+        connection.executescript(_V20_POPULATED)
+        connection.commit()
+    finally:
+        connection.close()
+    return settings
+
+
+def _normalized_ddl(connection: sqlite3.Connection, table: str) -> str:
+    row = connection.execute(
+        "SELECT sql FROM sqlite_master WHERE type = 'table' AND name = ?", (table,)
+    ).fetchone()
+    assert row is not None and row[0] is not None
+    return " ".join(str(row[0]).split())
+
+
+def test_populated_v20_database_upgrades_to_v21_preserving_every_row(
+    tmp_path: Path,
+) -> None:
+    settings = _v20_settings(tmp_path)
+    before = sqlite3.connect(database_path(settings))
+    try:
+        from_version = before.execute("SELECT MAX(version) FROM schema_migrations").fetchone()[0]
+    finally:
+        before.close()
+    assert from_version == 20
+
+    store = SqliteStore(settings)
+    store.initialize()
+    store.initialize()  # idempotent rebuild
+
+    connection = sqlite3.connect(database_path(settings))
+    try:
+        to_version = connection.execute("SELECT MAX(version) FROM schema_migrations").fetchone()[0]
+        versions = {row[0] for row in connection.execute("SELECT version FROM schema_migrations")}
+        counts = {
+            table: connection.execute(f"SELECT COUNT(*) FROM {table}").fetchone()[0]
+            for table in (
+                "llm_calls",
+                "decisions",
+                "trigger_events",
+                "risk_verdicts",
+                "orders",
+                "fills",
+                "positions",
+                "paper_accounts",
+                "opportunities",
+                "opportunity_conditions",
+                "opportunity_events",
+            )
+        }
+        preserved = {
+            "llm_call": connection.execute(
+                "SELECT call_id, decision_id, status FROM llm_calls"
+            ).fetchone(),
+            "decision": connection.execute(
+                "SELECT decision_id, validation_status FROM decisions"
+            ).fetchone(),
+            "trigger": connection.execute(
+                "SELECT trigger_id, opportunity_id, status FROM trigger_events"
+            ).fetchone(),
+            "verdict": connection.execute(
+                "SELECT risk_verdict_id, trigger_id, decision_id FROM risk_verdicts"
+            ).fetchone(),
+            "order": connection.execute(
+                "SELECT order_id, risk_verdict_id, trigger_id, decision_id, purpose FROM orders"
+            ).fetchone(),
+            "fill": connection.execute("SELECT fill_id, order_id FROM fills").fetchone(),
+            "position": connection.execute(
+                "SELECT position_id, account_id, state FROM positions"
+            ).fetchone(),
+            "account": connection.execute(
+                "SELECT account_id, balance FROM paper_accounts"
+            ).fetchone(),
+            "opportunity": connection.execute(
+                "SELECT opportunity_id, state FROM opportunities"
+            ).fetchone(),
+            "condition": connection.execute(
+                "SELECT condition_id, opportunity_id, last_result FROM opportunity_conditions"
+            ).fetchone(),
+            "event": connection.execute(
+                "SELECT opportunity_id, seq, to_state FROM opportunity_events"
+            ).fetchone(),
+        }
+        foreign_key_errors = connection.execute("PRAGMA foreign_key_check").fetchall()
+    finally:
+        connection.close()
+
+    assert to_version == 21
+    assert {20, 21} <= versions
+    # Every populated row survives the rebuild: one row in every table.
+    assert counts == {
+        "llm_calls": 1,
+        "decisions": 1,
+        "trigger_events": 1,
+        "risk_verdicts": 1,
+        "orders": 1,
+        "fills": 1,
+        "positions": 1,
+        "paper_accounts": 1,
+        "opportunities": 1,
+        "opportunity_conditions": 1,
+        "opportunity_events": 1,
+    }
+    # Columns (and their values) are preserved across the table rebuilds.
+    assert tuple(preserved["llm_call"]) == ("CALL-1", "DEC-1", "OK")
+    assert tuple(preserved["decision"]) == ("DEC-1", "VALID")
+    assert tuple(preserved["trigger"]) == ("TRG-1", "OPP-1", "PENDING_RECHECK")
+    assert tuple(preserved["verdict"]) == ("RISK-1", "TRG-1", "DEC-1")
+    assert tuple(preserved["order"]) == ("ORD-1", "RISK-1", "TRG-1", "DEC-1", "ENTRY")
+    assert tuple(preserved["fill"]) == ("FIL-1", "ORD-1")
+    assert tuple(preserved["position"]) == ("POS-1", "ACC-1", "OPEN")
+    assert tuple(preserved["account"]) == ("ACC-1", "9990.00")
+    assert tuple(preserved["opportunity"]) == ("OPP-1", "TRIGGERED")
+    assert tuple(preserved["condition"]) == ("C-1", "OPP-1", 1)
+    assert tuple(preserved["event"]) == ("OPP-1", 1, "TRIGGERED")
+    assert foreign_key_errors == []
+
+
+def test_upgraded_tables_match_a_fresh_database(tmp_path: Path) -> None:
+    upgraded_settings = _v20_settings(tmp_path / "upgraded")
+    SqliteStore(upgraded_settings).initialize()
+    fresh_settings = Settings(env="test", port=8765, data_dir=tmp_path / "fresh" / "data")
+    SqliteStore(fresh_settings).initialize()
+
+    upgraded = sqlite3.connect(database_path(upgraded_settings))
+    fresh = sqlite3.connect(database_path(fresh_settings))
+    try:
+        for table in _V21_REBUILT_TABLES:
+            assert _normalized_ddl(upgraded, table) == _normalized_ddl(fresh, table), table
+            upgraded_fks = upgraded.execute(f"PRAGMA foreign_key_list({table})").fetchall()
+            fresh_fks = fresh.execute(f"PRAGMA foreign_key_list({table})").fetchall()
+            assert [tuple(row) for row in upgraded_fks] == [tuple(row) for row in fresh_fks], table
+            upgraded_indexes = {row[1] for row in upgraded.execute(f"PRAGMA index_list({table})")}
+            fresh_indexes = {row[1] for row in fresh.execute(f"PRAGMA index_list({table})")}
+            assert upgraded_indexes == fresh_indexes, table
+    finally:
+        upgraded.close()
+        fresh.close()
+
+
+def _seed_oms_parents(connection: sqlite3.Connection) -> None:
+    with connection:
+        connection.execute(
+            "INSERT OR IGNORE INTO opportunities "
+            "(opportunity_id, symbol, state, created_at, updated_at, payload_json, expires_at) "
+            "VALUES ('OPP-1', 'BTCUSDT', 'TRIGGERED', 't', 't', '{}', NULL)"
+        )
+        connection.execute(
+            "INSERT OR IGNORE INTO trigger_events "
+            "(trigger_id, opportunity_id, symbol, status, idempotency_key, triggered_at, "
+            "payload_json) VALUES ('TRG-1', 'OPP-1', 'BTCUSDT', 'PENDING_RECHECK', "
+            "'TRG-KEY-1', 't', '{}')"
+        )
+        connection.execute(
+            "INSERT OR IGNORE INTO decisions "
+            "(decision_id, role, decision_type, validation_status, raw_output_hash, "
+            "persisted_at, payload_json) VALUES "
+            "('DEC-1', 'ANALYSIS', 'MARKET_ANALYSIS', 'VALID', 'H', 't', '{}')"
+        )
+        connection.execute(
+            "INSERT OR IGNORE INTO risk_verdicts "
+            "(risk_verdict_id, trigger_id, decision_id, verdict, binding_cap, computed_at, "
+            "expires_at, payload_json) VALUES "
+            "('RISK-1', 'TRG-1', 'DEC-1', 'ALLOW', 'NONE', 't', 't', '{}')"
+        )
+        connection.execute(
+            "INSERT OR IGNORE INTO paper_accounts "
+            "(account_id, environment, currency, initial_balance, balance, updated_at) "
+            "VALUES ('ACC-1', 'PAPER', 'USDT', '10000.00', '10000.00', 't')"
+        )
+
+
+def _fk_connection(settings: Settings) -> sqlite3.Connection:
+    connection = sqlite3.connect(database_path(settings))
+    connection.execute("PRAGMA foreign_keys=ON")
+    return connection
+
+
+def test_v21_rejects_orphan_foreign_keys(tmp_path: Path) -> None:
+    settings = Settings(env="test", port=8765, data_dir=tmp_path / "data")
+    SqliteStore(settings).initialize()
+    connection = _fk_connection(settings)
+    try:
+        _seed_oms_parents(connection)
+        with pytest.raises(sqlite3.IntegrityError):
+            connection.execute(
+                "INSERT INTO orders (order_id, client_order_id, environment, symbol, status, "
+                "risk_verdict_id, idempotency_key, created_at, updated_at, payload_json, "
+                "trigger_id, decision_id, purpose) VALUES "
+                "('ORD-ORPHAN', 'client-orphan', 'PAPER', 'BTCUSDT', 'FILLED', 'MISSING', "
+                "'idem-orphan', 't', 't', '{}', NULL, NULL, 'ENTRY')"
+            )
+        with pytest.raises(sqlite3.IntegrityError):
+            connection.execute(
+                "INSERT INTO risk_verdicts "
+                "(risk_verdict_id, trigger_id, decision_id, verdict, binding_cap, computed_at, "
+                "expires_at, payload_json) VALUES "
+                "('RISK-ORPHAN', 'TRG-1', 'MISSING', 'ALLOW', 'NONE', 't', 't', '{}')"
+            )
+        with pytest.raises(sqlite3.IntegrityError):
+            connection.execute(
+                "INSERT INTO positions "
+                "(position_id, account_id, environment, symbol, state, opened_at, payload_json) "
+                "VALUES ('POS-ORPHAN', 'MISSING', 'PAPER', 'BTCUSDT', 'OPEN', 't', '{}')"
+            )
+    finally:
+        connection.close()
+
+
+def _insert_llm_call(connection: sqlite3.Connection, status: str) -> None:
+    connection.execute(
+        "INSERT INTO llm_calls (call_id, decision_id, role, provider, model, prompt_id, "
+        "prompt_version, prompt_hash, input_hash, attempt, request_id, status, "
+        "raw_output_hash, usage_json, latency_ms, error_code, created_at) VALUES "
+        "(?, NULL, 'ANALYSIS', 'stub', 'fixture', 'analysis', 1, 'PH', 'IH', 1, 'REQ', ?, "
+        "'RH', '{}', 0, NULL, 't')",
+        (f"CALL-{status}", status),
+    )
+
+
+def test_v21_rejects_an_invalid_value_in_each_enum_column(tmp_path: Path) -> None:
+    settings = Settings(env="test", port=8765, data_dir=tmp_path / "data")
+    SqliteStore(settings).initialize()
+    connection = _fk_connection(settings)
+    try:
+        _seed_oms_parents(connection)
+        with pytest.raises(sqlite3.IntegrityError):
+            _insert_llm_call(connection, "BOGUS")
+        with pytest.raises(sqlite3.IntegrityError):
+            connection.execute(
+                "INSERT INTO decisions "
+                "(decision_id, role, decision_type, validation_status, raw_output_hash, "
+                "persisted_at, payload_json) VALUES "
+                "('DEC-BOGUS', 'ANALYSIS', 'MARKET_ANALYSIS', 'BOGUS', 'H', 't', '{}')"
+            )
+        with pytest.raises(sqlite3.IntegrityError):
+            connection.execute(
+                "INSERT INTO trigger_events "
+                "(trigger_id, opportunity_id, symbol, status, idempotency_key, triggered_at, "
+                "payload_json) VALUES "
+                "('TRG-BOGUS', 'OPP-1', 'BTCUSDT', 'BOGUS', 'TRG-KEY-BOGUS', 't', '{}')"
+            )
+        with pytest.raises(sqlite3.IntegrityError):
+            connection.execute(
+                "INSERT INTO orders (order_id, client_order_id, environment, symbol, status, "
+                "risk_verdict_id, idempotency_key, created_at, updated_at, payload_json, "
+                "trigger_id, decision_id, purpose) VALUES "
+                "('ORD-BOGUS', 'client-bogus', 'PAPER', 'BTCUSDT', 'BOGUS', 'RISK-1', "
+                "'idem-bogus', 't', 't', '{}', NULL, NULL, 'ENTRY')"
+            )
+        with pytest.raises(sqlite3.IntegrityError):
+            connection.execute(
+                "INSERT INTO positions "
+                "(position_id, account_id, environment, symbol, state, opened_at, payload_json) "
+                "VALUES ('POS-BOGUS', 'ACC-1', 'PAPER', 'BTCUSDT', 'BOGUS', 't', '{}')"
+            )
+    finally:
+        connection.close()
+
+
+@pytest.mark.parametrize("status", ["OK", "ERROR"])
+def test_v21_accepts_every_llm_call_status(tmp_path: Path, status: str) -> None:
+    settings = Settings(env="test", port=8765, data_dir=tmp_path / "data")
+    SqliteStore(settings).initialize()
+    connection = _fk_connection(settings)
+    try:
+        _insert_llm_call(connection, status)
+        connection.commit()
+    finally:
+        connection.close()
+
+
+@pytest.mark.parametrize("status", ["VALID", "REPAIRED", "REJECTED"])
+def test_v21_accepts_every_decision_validation_status(tmp_path: Path, status: str) -> None:
+    settings = Settings(env="test", port=8765, data_dir=tmp_path / "data")
+    SqliteStore(settings).initialize()
+    connection = _fk_connection(settings)
+    try:
+        connection.execute(
+            "INSERT INTO decisions "
+            "(decision_id, role, decision_type, validation_status, raw_output_hash, "
+            "persisted_at, payload_json) VALUES "
+            "(?, 'ANALYSIS', 'MARKET_ANALYSIS', ?, 'H', 't', '{}')",
+            (f"DEC-{status}", status),
+        )
+        connection.commit()
+    finally:
+        connection.close()
+
+
+@pytest.mark.parametrize(
+    "status", ["PENDING_RECHECK", "RECHECKED", "REJECTED", "BLOCKED", "ACCEPTED"]
+)
+def test_v21_accepts_every_trigger_status(tmp_path: Path, status: str) -> None:
+    settings = Settings(env="test", port=8765, data_dir=tmp_path / "data")
+    SqliteStore(settings).initialize()
+    connection = _fk_connection(settings)
+    try:
+        _seed_oms_parents(connection)
+        connection.execute(
+            "INSERT INTO trigger_events "
+            "(trigger_id, opportunity_id, symbol, status, idempotency_key, triggered_at, "
+            "payload_json) VALUES (?, 'OPP-1', 'BTCUSDT', ?, ?, 't', '{}')",
+            (f"TRG-{status}", status, f"TRG-KEY-{status}"),
+        )
+        connection.commit()
+    finally:
+        connection.close()
+
+
+@pytest.mark.parametrize("status", [member.value for member in OrderStatus])
+def test_v21_accepts_every_order_status(tmp_path: Path, status: str) -> None:
+    settings = Settings(env="test", port=8765, data_dir=tmp_path / "data")
+    SqliteStore(settings).initialize()
+    connection = _fk_connection(settings)
+    try:
+        _seed_oms_parents(connection)
+        connection.execute(
+            "INSERT INTO orders (order_id, client_order_id, environment, symbol, status, "
+            "risk_verdict_id, idempotency_key, created_at, updated_at, payload_json, "
+            "trigger_id, decision_id, purpose) VALUES "
+            "(?, ?, 'PAPER', 'BTCUSDT', ?, 'RISK-1', ?, 't', 't', '{}', NULL, NULL, 'ENTRY')",
+            (f"ORD-{status}", f"client-{status}", status, f"idem-{status}"),
+        )
+        connection.commit()
+    finally:
+        connection.close()
+
+
+@pytest.mark.parametrize("state", [member.value for member in PositionState])
+def test_v21_accepts_every_position_state(tmp_path: Path, state: str) -> None:
+    settings = Settings(env="test", port=8765, data_dir=tmp_path / "data")
+    SqliteStore(settings).initialize()
+    connection = _fk_connection(settings)
+    try:
+        _seed_oms_parents(connection)
+        connection.execute(
+            "INSERT INTO positions "
+            "(position_id, account_id, environment, symbol, state, opened_at, payload_json) "
+            "VALUES (?, 'ACC-1', 'PAPER', 'BTCUSDT', ?, 't', '{}')",
+            (f"POS-{state}", state),
+        )
+        connection.commit()
+    finally:
+        connection.close()
+
+
+def test_sqlite_store_module_stays_under_the_soft_ceiling() -> None:
+    import oft.adapters.sqlite_store as store_module
+
+    source_path = Path(store_module.__file__)
+    assert len(source_path.read_text(encoding="utf-8").splitlines()) < 800
