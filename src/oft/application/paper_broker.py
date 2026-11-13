@@ -17,6 +17,7 @@ from oft.domain.oms import (
     Fill,
     Order,
     OrderSide,
+    OrderStatus,
     OrderType,
     Position,
     PositionSide,
@@ -26,11 +27,24 @@ from oft.domain.oms import (
     order_from_intent,
     position_from_fill,
 )
-from oft.domain.pnl import money_str
+from oft.domain.pnl import (
+    MAX_ABS_MONEY,
+    MAX_ABS_PRICE,
+    MAX_ABS_QUANTITY,
+    money_str,
+    quantize_money,
+)
 from oft.domain.positions import (
+    STOP_TOUCH_RULE,
+    AddResult,
     CloseResult,
     ManagementEvent,
+    PositionError,
+    TradeLogContext,
+    accumulated_realized_gross,
+    apply_add,
     close_full,
+    partial_close,
     position_from_contract,
     trade_id_for,
     trade_log_from_close,
@@ -40,8 +54,10 @@ from oft.ports.store import (
     AuditEventDraft,
     ClosedPositionRecord,
     FillRecord,
+    OmsConflictError,
     OrderRecord,
     PaperAccountRecord,
+    PositionAdjustmentRecord,
     PositionEventRecord,
     PositionRecord,
     StorePort,
@@ -85,6 +101,10 @@ class OrderIntent:
     trigger_id: str | None = None
     position_id: str | None = None
     reduce_only: bool = False
+    # Service-owned journal facts rendered atomically with a full close. It is
+    # deliberately excluded from ``hash()``: it is derived from the position, not
+    # part of the order intent.
+    trade_log: TradeLogContext | None = None
 
     def __post_init__(self) -> None:
         # One closed representation: ``purpose`` is the authority and
@@ -126,6 +146,16 @@ class BrokerResult:
 
 def _quantize(value: Decimal) -> Decimal:
     return value.quantize(_EIGHT_DP, rounding=ROUND_DOWN)
+
+
+def _decimal_or_none(value: object) -> Decimal | None:
+    if value is None:
+        return None
+    try:
+        parsed = Decimal(str(value))
+    except (ArithmeticError, TypeError, ValueError):
+        return None
+    return parsed if parsed.is_finite() else None
 
 
 def _fill_amounts(
@@ -174,6 +204,59 @@ def _cash_flow(side: OrderSide, quote_quantity: Decimal, fee: Decimal) -> Decima
     return -(quote_quantity + fee)
 
 
+def recorded_entry_notional_usd(store: StorePort, trigger_id: str | None) -> Decimal | None:
+    """The immutable entry notional: the recorded entry fill's quote quantity.
+
+    A partial close scales the mutable read-model ``notional_usd`` down to the
+    remaining exposure, so the journal's ``return_pct`` and entry-notional
+    context cannot use it. This resolves the entry basis from the same recorded
+    entry order/fill the position was opened from. Missing or implausible
+    recorded data yields ``None`` and the caller falls back to a named gap.
+    """
+    if trigger_id is None:
+        return None
+    order = store.get_entry_order_for_trigger(trigger_id)
+    if order is None:
+        return None
+    fill = store.get_fill_by_order_id(order.order_id)
+    if fill is None:
+        return None
+    try:
+        payload = json.loads(fill.payload_json)
+    except (json.JSONDecodeError, TypeError, ValueError):
+        return None
+    if not isinstance(payload, dict):
+        return None
+    quote = payload.get("quote_quantity")
+    if quote is not None:
+        try:
+            value = Decimal(str(quote))
+        except ArithmeticError:
+            value = None
+        if value is not None and value.is_finite() and 0 < value <= MAX_ABS_MONEY:
+            return quantize_money(value)
+    price = payload.get("price")
+    quantity = payload.get("quantity")
+    try:
+        price_value = Decimal(str(price))
+        quantity_value = Decimal(str(quantity))
+    except (ArithmeticError, TypeError, ValueError):
+        return None
+    if (
+        not price_value.is_finite()
+        or not quantity_value.is_finite()
+        or price_value <= 0
+        or quantity_value <= 0
+        or price_value > MAX_ABS_PRICE
+        or quantity_value > MAX_ABS_QUANTITY
+    ):
+        return None
+    try:
+        return quantize_money(price_value * quantity_value)
+    except ValueError:
+        return None
+
+
 class PaperBroker:
     def __init__(self, *, settings: Settings, store: StorePort, clock: ClockPort) -> None:
         self._settings = settings
@@ -207,6 +290,13 @@ class PaperBroker:
             raise BrokerError("quantity must be positive")
         if mark_price <= 0:
             raise BrokerError("mark price must be positive")
+        if intent.purpose == "ADD":
+            return self._submit_add(
+                intent,
+                mark_price=mark_price,
+                now=now,
+                audit_actor=audit_actor,
+            )
         if intent.reduce_only:
             return self._submit_exit(
                 intent,
@@ -327,42 +417,233 @@ class PaperBroker:
         now: str,
         audit_actor: dict[str, Any] | None,
     ) -> BrokerResult:
-        """Apply a reduce-only full close to the one existing position row.
+        """Apply a reduce-only fill to the one existing position row.
 
-        The position is updated in place by ``save_close``; no second position
-        is ever created. Cash changes by the sale proceeds minus the fee for a
-        LONG close, or by minus (buy-back + fee) for a SHORT close.
+        A quantity equal to the position's size is a full close: the row flips
+        to CLOSED and exactly one trade log is written atomically. A smaller
+        quantity is a partial close: the row stays OPEN, accumulates realized
+        PnL/fees, and no trade log is written. No second position is ever
+        created.
         """
         if not intent.reduce_only:
             raise BrokerError("an exit intent must be reduce-only")
-        position = self._exit_position(intent)
+        position, raw_payload, raw_json = self._load_position(intent)
+        if intent.side is not _reducing_side(position.side):
+            raise BrokerError("the exit side is wrong for the position")
+        # A replay is recognized before the size checks: after a committed
+        # partial close the residual size no longer matches the intent's slice.
+        existing = self._store.get_order_by_idempotency(intent.idempotency_key)
+        if existing is not None:
+            return self._replay_adjustment(intent, existing, position)
+        if intent.quantity > position.size:
+            raise BrokerError("the exit quantity exceeds the position size")
+        if intent.quantity < position.size:
+            _validate_step_multiple(self._store, position.symbol, intent.quantity)
+            return self._submit_partial_close(
+                intent,
+                position,
+                raw_payload,
+                raw_json,
+                mark_price=mark_price,
+                now=now,
+                audit_actor=audit_actor,
+            )
         fill, order, close, fill_price, cash_delta = self._build_exit(
-            intent, position, mark_price=mark_price, now=now
+            intent,
+            position,
+            prior_gross=accumulated_realized_gross(raw_payload),
+            mark_price=mark_price,
+            now=now,
         )
         trade_id = trade_id_for(position.position_id)
-        trade_payload = trade_log_from_close(close, trade_id=trade_id)
-        commit = self._store.save_close(
-            _close_record(
+        expected_entry_notional = (
+            recorded_entry_notional_usd(self._store, position.source_trigger_id)
+            if intent.trade_log is not None
+            else None
+        )
+        try:
+            trade_payload = trade_log_from_close(
+                close,
+                trade_id=trade_id,
+                context=intent.trade_log,
+                expected_entry_notional_usd=expected_entry_notional,
+            )
+        except PositionError as exc:
+            raise BrokerError(exc.message, code=exc.code) from exc
+        try:
+            commit = self._store.save_close(
+                _close_record(
+                    intent=intent,
+                    order=order,
+                    fill=fill,
+                    position=position,
+                    close=close,
+                    account=self.account(),
+                    cash_delta=cash_delta,
+                    trade_id=trade_id,
+                    trade_payload=trade_payload,
+                    order_id=order.order_id,
+                    fill_id=fill.fill_id,
+                    fill_price=fill_price,
+                    now=now,
+                    audit_actor=audit_actor,
+                    expected_position_json=raw_json,
+                )
+            )
+        except OmsConflictError as exc:
+            if exc.constraint == "position_version":
+                raise BrokerError(
+                    "the position changed concurrently; retry the close", code="CONFLICT"
+                ) from exc
+            raise
+        return BrokerResult(
+            order=order,
+            fill=fill,
+            position=close.position,
+            account=commit.account,
+        )
+
+    def _submit_partial_close(
+        self,
+        intent: OrderIntent,
+        position: Position,
+        raw_payload: dict[str, Any],
+        raw_json: str,
+        *,
+        mark_price: Decimal,
+        now: str,
+        audit_actor: dict[str, Any] | None,
+    ) -> BrokerResult:
+        """Apply a reduce-only slice; the position stays OPEN, no trade log."""
+        fill_price, quote_quantity, fee, cash_delta = self._exit_amounts(intent, mark_price)
+        digest, client_id, order_id, fill_id = _intent_ids(intent)
+        fill = _fill_for(
+            intent,
+            fill_id=fill_id,
+            order_id=order_id,
+            price=fill_price,
+            quote_quantity=quote_quantity,
+            fee=fee,
+            now=now,
+        )
+        order = _adjustment_order(
+            intent,
+            client_id=client_id,
+            order_id=order_id,
+            digest=digest,
+            fill=fill,
+            position_id=position.position_id,
+            reduce_only=True,
+            now=now,
+        )
+        try:
+            result = partial_close(
+                position,
+                fill,
+                at=now,
+                decision_id=intent.decision_id,
+                accumulated_gross=accumulated_realized_gross(raw_payload),
+            )
+        except PositionError as exc:
+            raise BrokerError(exc.message, code=exc.code) from exc
+        commit = self._store.save_position_adjustment(
+            _adjustment_record(
                 intent=intent,
                 order=order,
                 fill=fill,
-                position=position,
-                close=close,
+                position_payload=result.payload,
+                event=result.event,
+                position_id=position.position_id,
                 account=self.account(),
                 cash_delta=cash_delta,
-                trade_id=trade_id,
-                trade_payload=trade_payload,
-                order_id=order.order_id,
-                fill_id=fill.fill_id,
-                fill_price=fill_price,
+                symbol=position.symbol,
                 now=now,
                 audit_actor=audit_actor,
+                audit_event_type="POSITION_PARTIAL_CLOSE",
+                note="partial close",
+                expected_payload_json=raw_json,
+            )
+        )
+        updated = position_from_contract(result.payload)
+        return BrokerResult(order=order, fill=fill, position=updated, account=commit.account)
+
+    def _submit_add(
+        self,
+        intent: OrderIntent,
+        *,
+        mark_price: Decimal,
+        now: str,
+        audit_actor: dict[str, Any] | None,
+    ) -> BrokerResult:
+        """Apply a position-increasing fill in place; no duplicate position."""
+        position, raw_payload, raw_json = self._load_position(intent)
+        existing = self._store.get_order_by_idempotency(intent.idempotency_key)
+        if existing is not None:
+            return self._replay_adjustment(intent, existing, position)
+        _validate_step_multiple(self._store, position.symbol, intent.quantity)
+        _require_add_verdict(self._store, position, intent, now=now)
+        if intent.side is not _increasing_side(position.side):
+            raise BrokerError("the add side is wrong for the position")
+        fill_price, quote_quantity, fee = _fill_amounts(
+            intent.side,
+            mark_price,
+            intent.quantity,
+            slippage=self._slippage,
+            taker_fee=self._taker_fee,
+        )
+        cash_delta = _cash_flow(intent.side, quote_quantity, fee)
+        digest, client_id, order_id, fill_id = _intent_ids(intent)
+        fill = _fill_for(
+            intent,
+            fill_id=fill_id,
+            order_id=order_id,
+            price=fill_price,
+            quote_quantity=quote_quantity,
+            fee=fee,
+            now=now,
+        )
+        order = _adjustment_order(
+            intent,
+            client_id=client_id,
+            order_id=order_id,
+            digest=digest,
+            fill=fill,
+            position_id=position.position_id,
+            reduce_only=False,
+            now=now,
+        )
+        try:
+            result: AddResult = apply_add(
+                position,
+                fill,
+                at=now,
+                decision_id=intent.decision_id,
+                accumulated_gross=accumulated_realized_gross(raw_payload),
+            )
+        except PositionError as exc:
+            raise BrokerError(exc.message, code=exc.code) from exc
+        commit = self._store.save_position_adjustment(
+            _adjustment_record(
+                intent=intent,
+                order=order,
+                fill=fill,
+                position_payload=result.payload,
+                event=result.event,
+                position_id=position.position_id,
+                account=self.account(),
+                cash_delta=cash_delta,
+                symbol=position.symbol,
+                now=now,
+                audit_actor=audit_actor,
+                audit_event_type="POSITION_ADDED",
+                note="add to position",
+                expected_payload_json=raw_json,
             )
         )
         return BrokerResult(
             order=order,
             fill=fill,
-            position=close.position,
+            position=result.position,
             account=commit.account,
         )
 
@@ -371,10 +652,11 @@ class PaperBroker:
         intent: OrderIntent,
         position: Position,
         *,
+        prior_gross: Decimal,
         mark_price: Decimal,
         now: str,
     ) -> tuple[Fill, Order, CloseResult, Decimal, Decimal]:
-        """Fill, order, close, and cash delta for one validated exit intent."""
+        """Fill, order, close, and cash delta for one validated full exit."""
         fill_price, quote_quantity, fee, cash_delta = self._exit_amounts(intent, mark_price)
         digest, client_id, order_id, fill_id = _intent_ids(intent)
         fill = _fill_for(
@@ -395,32 +677,83 @@ class PaperBroker:
             fill=fill,
             now=now,
         )
-        close = close_full(position, fill, at=now, decision_id=intent.decision_id)
+        close_reason = STOP_TOUCH_RULE
+        try:
+            close = close_full(
+                position,
+                fill,
+                at=now,
+                decision_id=intent.decision_id,
+                accumulated_gross=prior_gross,
+                close_reason=close_reason,
+            )
+        except PositionError as exc:
+            raise BrokerError(exc.message, code=exc.code) from exc
         return fill, order, close, fill_price, cash_delta
 
-    def _exit_position(self, intent: OrderIntent) -> Position:
-        """Load and validate the one OPEN position an exit intent targets."""
+    def _load_position(self, intent: OrderIntent) -> tuple[Position, dict[str, Any], str]:
+        """Load and validate the one OPEN position an exit/add intent targets."""
         if intent.position_id is None:
-            raise BrokerError("an exit intent requires a position id")
+            raise BrokerError("a management intent requires a position id")
         record = self._store.get_position(intent.position_id)
         if record is None:
-            raise BrokerError("the position to close does not exist", code="POSITION_NOT_FOUND")
-        position = position_from_contract(json.loads(record.payload_json))
+            raise BrokerError("the position does not exist", code="POSITION_NOT_FOUND")
+        raw_json = record.payload_json
+        raw_payload = json.loads(raw_json)
+        position = position_from_contract(raw_payload)
         if position.state != "OPEN":
             raise BrokerError("the position is not OPEN", code="POSITION_STATE_INVALID")
         if position.symbol != intent.symbol or position.side is not intent.position_side:
-            raise BrokerError("the exit intent does not match the position")
-        if intent.quantity != position.size:
-            raise BrokerError("only a full close is supported")
+            raise BrokerError("the management intent does not match the position")
         if position.source_trigger_id is None:
             raise BrokerError(
                 "the position has no source trigger; refusing to fabricate one",
                 code="DATA_UNAVAILABLE",
             )
-        expected_side = OrderSide.SELL if position.side is PositionSide.LONG else OrderSide.BUY
-        if intent.side is not expected_side:
-            raise BrokerError("the exit side is wrong for the position")
-        return position
+        return position, raw_payload, raw_json
+
+    def _replay_adjustment(
+        self,
+        intent: OrderIntent,
+        existing: OrderRecord,
+        position: Position,
+    ) -> BrokerResult:
+        """Return the committed adjustment for a replayed idempotency key."""
+        try:
+            order_payload = json.loads(existing.payload_json)
+        except (json.JSONDecodeError, TypeError, ValueError) as exc:
+            raise BrokerError(
+                "the existing adjustment order payload is unreadable",
+                code="DATA_UNAVAILABLE",
+            ) from exc
+        if (
+            not isinstance(order_payload, dict)
+            or str(order_payload.get("intent_hash") or "") != intent.hash()
+        ):
+            raise BrokerError(
+                f"idempotency key {intent.idempotency_key} was used for a different adjustment",
+                code="IDEMPOTENCY_CONFLICT",
+            )
+        fill_record = self._store.get_fill_by_order_id(existing.order_id)
+        if fill_record is None:
+            raise BrokerError(
+                f"the existing adjustment fill for {existing.order_id} is missing",
+                code="DATA_UNAVAILABLE",
+            )
+        try:
+            order = _order_from_payload(order_payload)
+            fill = _fill_from_payload(json.loads(fill_record.payload_json))
+        except (KeyError, TypeError, ValueError) as exc:
+            raise BrokerError(
+                "the existing adjustment payload is corrupt",
+                code="DATA_UNAVAILABLE",
+            ) from exc
+        return BrokerResult(
+            order=order,
+            fill=fill,
+            position=position,
+            account=self.account(),
+        )
 
     def _exit_amounts(
         self, intent: OrderIntent, mark_price: Decimal
@@ -452,12 +785,13 @@ def _close_record(
     fill_price: Decimal,
     now: str,
     audit_actor: dict[str, Any] | None,
+    expected_position_json: str | None = None,
 ) -> ClosedPositionRecord:
     """Assemble every row one close commits in a single transaction."""
     return ClosedPositionRecord(
         order=_order_record(order, intent),
         fill=_fill_record(fill),
-        position=_closed_position_record(position, close),
+        position=_closed_position_record(position, close, expected_position_json),
         account=_account_shell(account, now),
         balance_delta=str(cash_delta),
         event=_exit_event(position.position_id, close.event),
@@ -547,7 +881,9 @@ def _exit_order(
     return _complete_fill(order, fill, at=now)
 
 
-def _closed_position_record(position: Position, close: CloseResult) -> PositionRecord:
+def _closed_position_record(
+    position: Position, close: CloseResult, expected_payload_json: str | None = None
+) -> PositionRecord:
     return PositionRecord(
         position_id=position.position_id,
         account_id=position.account_id,
@@ -556,6 +892,7 @@ def _closed_position_record(position: Position, close: CloseResult) -> PositionR
         state=close.position.state,
         opened_at=position.opened_at,
         payload_json=json.dumps(close.position.to_contract(), sort_keys=True),
+        expected_payload_json=expected_payload_json,
     )
 
 
@@ -652,6 +989,227 @@ def _exit_audits(
             },
             created_at=now,
         ),
+    )
+
+
+def _reducing_side(side: PositionSide) -> OrderSide:
+    return OrderSide.SELL if side is PositionSide.LONG else OrderSide.BUY
+
+
+def _increasing_side(side: PositionSide) -> OrderSide:
+    return OrderSide.BUY if side is PositionSide.LONG else OrderSide.SELL
+
+
+def _validate_step_multiple(store: StorePort, symbol: str, quantity: Decimal) -> None:
+    """Reject an adjustment size that is not a multiple of the recorded step."""
+    contract = store.get_symbol(symbol)
+    if contract is None or contract.step_size <= 0:
+        # No recorded contract basis: there is nothing to normalize against.
+        return
+    if quantity % contract.step_size != 0:
+        raise BrokerError(
+            f"quantity {quantity} is not a multiple of the recorded step size {contract.step_size}",
+            code="ORDER_REJECTED",
+        )
+
+
+def _require_add_verdict(
+    store: StorePort, position: Position, intent: OrderIntent, *, now: str
+) -> None:
+    """An ADD must carry a usable, persisted verdict bound to this position.
+
+    The public ADD route is slice 25, so this is the broker-level gate: the
+    verdict must exist, be bound to the source trigger and the add decision, be
+    an ``ALLOW`` that has not expired, and cover the add's quantity/leverage.
+    Kill-switch and gateway routing of ADD remain slice 25.
+    """
+    verdict = store.get_risk_verdict(intent.risk_verdict_id)
+    if verdict is None:
+        raise BrokerError("an add requires a persisted risk verdict", code="RISK_VERDICT_MISSING")
+    if verdict.trigger_id != position.source_trigger_id:
+        raise BrokerError(
+            "the add risk verdict is not bound to the position's source trigger",
+            code="RISK_VERDICT_INVALID",
+        )
+    if verdict.decision_id != intent.decision_id:
+        raise BrokerError(
+            "the add risk verdict is not bound to the add decision",
+            code="RISK_VERDICT_INVALID",
+        )
+    if verdict.verdict == "BLOCK":
+        raise BrokerError("the risk verdict blocks this add", code="RISK_BLOCKED")
+    if verdict.expires_at <= now:
+        raise BrokerError("the add risk verdict has expired", code="RISK_BLOCKED")
+    try:
+        payload = json.loads(verdict.payload_json)
+    except (json.JSONDecodeError, TypeError, ValueError) as exc:
+        raise BrokerError(
+            "the add risk verdict payload is unreadable", code="RISK_VERDICT_INVALID"
+        ) from exc
+    allowed = payload.get("allowed") if isinstance(payload, dict) else None
+    if not isinstance(allowed, dict):
+        raise BrokerError(
+            "the add risk verdict records no allowed cap", code="RISK_VERDICT_INVALID"
+        )
+    allowed_quantity = _decimal_or_none(allowed.get("quantity"))
+    if allowed_quantity is None or allowed_quantity <= 0 or intent.quantity > allowed_quantity:
+        raise BrokerError(
+            "the add quantity exceeds the risk verdict's allowed quantity",
+            code="RISK_VERDICT_INVALID",
+        )
+    allowed_leverage = _decimal_or_none(allowed.get("leverage"))
+    if allowed_leverage is None or Decimal(str(intent.leverage)) > allowed_leverage:
+        raise BrokerError(
+            "the add leverage exceeds the risk verdict's allowed leverage",
+            code="RISK_VERDICT_INVALID",
+        )
+
+
+def _order_from_payload(payload: dict[str, Any]) -> Order:
+    """Rebuild a domain ``Order`` from its persisted contract payload."""
+    return Order(
+        order_id=str(payload["order_id"]),
+        client_order_id=str(payload["client_order_id"]),
+        environment=str(payload["environment"]),
+        account_id=str(payload["account_id"]),
+        position_id=payload.get("position_id"),
+        symbol=str(payload["symbol"]),
+        side=OrderSide(str(payload["side"])),
+        type=OrderType(str(payload["type"])),
+        time_in_force=str(payload.get("time_in_force") or "GTC"),
+        quantity=Decimal(str(payload["quantity"])),
+        price=None if payload.get("price") is None else Decimal(str(payload["price"])),
+        stop_price=(
+            None if payload.get("stop_price") is None else Decimal(str(payload["stop_price"]))
+        ),
+        reduce_only=bool(payload.get("reduce_only", False)),
+        status=OrderStatus(str(payload["status"])),
+        risk_verdict_id=str(payload.get("risk_verdict_id") or ""),
+        approval_id=payload.get("approval_id"),
+        intent_hash=str(payload.get("intent_hash") or ""),
+        idempotency_key=str(payload.get("idempotency_key") or ""),
+        created_at=str(payload["created_at"]),
+        submitted_at=payload.get("submitted_at"),
+        updated_at=str(payload["updated_at"]),
+        filled_at=payload.get("filled_at"),
+        avg_fill_price=(
+            None
+            if payload.get("avg_fill_price") is None
+            else Decimal(str(payload["avg_fill_price"]))
+        ),
+        filled_quantity=Decimal(str(payload.get("filled_quantity") or "0")),
+    )
+
+
+def _fill_from_payload(payload: dict[str, Any]) -> Fill:
+    """Rebuild a domain ``Fill`` from its persisted contract payload."""
+    return Fill(
+        fill_id=str(payload["fill_id"]),
+        order_id=str(payload["order_id"]),
+        environment=str(payload["environment"]),
+        account_id=str(payload["account_id"]),
+        symbol=str(payload["symbol"]),
+        side=OrderSide(str(payload["side"])),
+        price=Decimal(str(payload["price"])),
+        quantity=Decimal(str(payload["quantity"])),
+        quote_quantity=Decimal(str(payload["quote_quantity"])),
+        fee=Decimal(str(payload["fee"])),
+        fee_asset=str(payload.get("fee_asset") or "USDT"),
+        maker=bool(payload.get("maker", False)),
+        filled_at=str(payload["filled_at"]),
+        received_at=str(payload["received_at"]),
+        source=str(payload.get("source") or "PAPER"),
+        exchange_trade_id=payload.get("exchange_trade_id"),
+    )
+
+
+def _adjustment_order(
+    intent: OrderIntent,
+    *,
+    client_id: str,
+    order_id: str,
+    digest: str,
+    fill: Fill,
+    position_id: str,
+    reduce_only: bool,
+    now: str,
+) -> Order:
+    order = order_from_intent(
+        order_id=order_id,
+        client_order_id_value=client_id,
+        environment=intent.environment,
+        account_id=intent.account_id,
+        symbol=intent.symbol,
+        side=intent.side,
+        order_type=intent.order_type,
+        quantity=intent.quantity,
+        price=intent.price,
+        stop_price=intent.stop_price,
+        risk_verdict_id=intent.risk_verdict_id,
+        approval_id=intent.approval_id,
+        intent_hash_value=digest,
+        idempotency_key=intent.idempotency_key,
+        created_at=now,
+        status=_filled_status(),
+        position_id=position_id,
+        reduce_only=reduce_only,
+    )
+    return _complete_fill(order, fill, at=now)
+
+
+def _adjustment_record(
+    *,
+    intent: OrderIntent,
+    order: Order,
+    fill: Fill,
+    position_payload: dict[str, Any],
+    event: ManagementEvent,
+    position_id: str,
+    account: PaperAccountRecord,
+    cash_delta: Decimal,
+    symbol: str,
+    now: str,
+    audit_actor: dict[str, Any] | None,
+    audit_event_type: str,
+    note: str,
+    expected_payload_json: str | None = None,
+) -> PositionAdjustmentRecord:
+    audits: tuple[AuditEventDraft, ...] = ()
+    if audit_actor is not None:
+        audits = (
+            AuditEventDraft(
+                event_type=audit_event_type,
+                actor=audit_actor,
+                subject={"kind": "POSITION", "id": position_id},
+                payload={
+                    "order_id": order.order_id,
+                    "fill_id": fill.fill_id,
+                    "price": str(fill.price),
+                    "quantity": str(fill.quantity),
+                    "action": event.action,
+                    "note": note,
+                    "environment": intent.environment,
+                },
+                created_at=now,
+            ),
+        )
+    return PositionAdjustmentRecord(
+        order=_order_record(order, intent),
+        fill=_fill_record(fill),
+        position=PositionRecord(
+            position_id=position_id,
+            account_id=account.account_id,
+            environment=account.environment,
+            symbol=symbol,
+            state="OPEN",
+            opened_at=str(position_payload.get("opened_at") or now),
+            payload_json=json.dumps(position_payload, sort_keys=True),
+            expected_payload_json=expected_payload_json,
+        ),
+        account=account,
+        balance_delta=str(cash_delta),
+        event=_exit_event(position_id, event),
+        audits=audits,
     )
 
 

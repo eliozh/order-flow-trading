@@ -93,6 +93,31 @@ def read_position(
     )
 
 
+@router.get(
+    "/api/v1/positions/{position_id}/history",
+    response_model=Envelope[dict[str, Any]],
+)
+def read_position_history(
+    request: Request,
+    position_id: str = Path(min_length=1, max_length=64, pattern=r"^[A-Za-z0-9._:-]+$"),
+) -> dict[str, Any]:
+    """The position's management timeline, funding accruals, and PnL terms."""
+    try:
+        payload = _service(request).history(position_id)
+    except PositionNotFound as exc:
+        raise ApiError("NOT_FOUND", exc.message) from exc
+    except PositionCloseError as exc:
+        raise _api_error(exc) from exc
+    return success_envelope(
+        payload,
+        request_id=new_request_id(),
+        provenance="CALC",
+        data_quality=str(
+            ((payload.get("pnl") or {}).get("data_quality") or {}).get("status", "COMPLETE")
+        ),
+    )
+
+
 @router.post(
     "/api/v1/positions/{position_id}/monitor",
     response_model=Envelope[PositionMonitorData],

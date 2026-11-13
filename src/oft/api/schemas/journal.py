@@ -1,6 +1,8 @@
-"""Trade-log journal response schemas (envelope-typed, minimal projection)."""
+"""Trade-log journal response schemas (envelope-typed, PnL/funding breakdown)."""
 
 from __future__ import annotations
+
+from typing import Any
 
 from pydantic import BaseModel, ConfigDict
 
@@ -21,6 +23,11 @@ class TradeLogSummary(BaseModel):
     funding_usd: str
     net_pnl_usd: str
     return_pct: float
+    r_multiple: float | None = None
+    mae_usd: str = "0"
+    mfe_usd: str = "0"
+    outcome_tags: list[str] = []
+    data_quality: dict[str, Any] | None = None
 
 
 class TradeLogListData(BaseModel):

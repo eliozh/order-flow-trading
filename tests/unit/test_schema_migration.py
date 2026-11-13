@@ -88,7 +88,7 @@ def test_v1_database_upgrades_to_v2_with_effective_checks(tmp_path: Path) -> Non
     finally:
         connection.close()
 
-    assert versions == set(range(1, 23))
+    assert versions == set(range(1, 24))
 
 
 _V2_BACKFILL = """
@@ -146,7 +146,7 @@ def test_v2_database_gains_the_backfill_heartbeat_column(tmp_path: Path) -> None
 
     assert "updated_at" in columns
     assert updated_at == "2026-11-06T00:00:00.000Z"
-    assert versions == set(range(1, 23))
+    assert versions == set(range(1, 24))
 
 
 def test_v5_checks_indexes_and_foreign_keys(tmp_path: Path) -> None:
@@ -243,7 +243,7 @@ def test_v5_database_migrates_manifest_metrics_columns(tmp_path: Path) -> None:
 
     assert {"metric_version", "input_manifest_hash", "window_start", "window_end"} <= columns
     assert legacy == ("/tmp/legacy.parquet", None, None)
-    assert versions == set(range(1, 23))
+    assert versions == set(range(1, 24))
 
 
 def test_v6_database_migrates_starred_columns(tmp_path: Path) -> None:
@@ -302,7 +302,7 @@ def test_v6_database_migrates_starred_columns(tmp_path: Path) -> None:
 
     assert {"starred", "starred_at"} <= columns
     assert row == ("BTCUSDT", 0, None)
-    assert versions == set(range(1, 23))
+    assert versions == set(range(1, 24))
 
 
 def test_manifest_run_metadata_columns_are_added_idempotently(tmp_path: Path) -> None:
@@ -319,7 +319,7 @@ def test_manifest_run_metadata_columns_are_added_idempotently(tmp_path: Path) ->
         connection.close()
 
     assert {"run_id", "last_n", "recomputed_from", "parent_run_id"} <= columns
-    assert versions == set(range(1, 23))
+    assert versions == set(range(1, 24))
 
 
 _V12_JOB_RUNS = """
@@ -385,7 +385,7 @@ def test_v12_database_gains_the_job_run_scope_symbol_column(tmp_path: Path) -> N
 
     assert "symbol" in columns
     assert symbol is None  # pre-v13 batch rows keep a null (batch) scope
-    assert versions == set(range(1, 23))
+    assert versions == set(range(1, 24))
 
 
 _V13_JOB_RUNS = """
@@ -636,7 +636,7 @@ def test_v9_database_upgrades_to_v10_with_ledgers_and_indexes(tmp_path: Path) ->
     finally:
         connection.close()
 
-    assert versions == set(range(1, 23))
+    assert versions == set(range(1, 24))
     assert "llm_json" in report_columns
     assert {
         "llm_calls",
@@ -788,7 +788,7 @@ def test_v15_prompt_and_llm_rows_upgrade_to_v16_and_seed_only_missing_families(
         "entry_recheck:system",
     }
     assert tuple(llm_defaults) == ("", 1, "")
-    assert versions == set(range(1, 23))
+    assert versions == set(range(1, 24))
 
 
 def test_prompt_versions_are_immutable_and_have_one_active_row_per_prompt(
@@ -950,7 +950,7 @@ def test_v16_database_gains_budget_periods_settings_and_provider_capabilities(
     assert {"budget_ledger_week", "budget_ledger_month"} <= indexes
     # 2026-11-04 is ISO week 2026-W45.
     assert tuple(backfilled) == ("2026-11-04", "2026-W45", "2026-11", "")
-    assert versions == set(range(1, 23))
+    assert versions == set(range(1, 24))
 
 
 def _v16_budget_connection(settings: Settings) -> sqlite3.Connection:
@@ -1133,7 +1133,7 @@ def test_v18_trigger_events_gain_snapshot_provenance_and_backfill(
     assert tuple(good) == ("HASH-V18", "2026-11-09T10:00:00.000Z", "PARTIAL", 2)
     # A malformed legacy payload is skipped with its defaults, never aborting boot.
     assert tuple(bad) == ("", "", "", 0)
-    assert versions == set(range(1, 23))
+    assert versions == set(range(1, 24))
     skipped = [
         record
         for record in caplog.records
@@ -1201,7 +1201,7 @@ def test_concurrent_initializes_upgrade_v19_idempotently(tmp_path: Path) -> None
     assert tuple(good) == ("HASH-V18", "2026-11-09T10:00:00.000Z", "PARTIAL", 2)
     # Exactly one recorded v19 upgrade; v20 and v21 are recorded on the same boot.
     assert versions == {19}
-    assert highest_version == 22
+    assert highest_version == 23
     assert immutable_triggers == 1
     assert journal_mode.lower() == "wal"
 
@@ -1597,6 +1597,17 @@ def _index_names(connection: sqlite3.Connection, table: str) -> set[str]:
     return {row[1] for row in connection.execute(f"PRAGMA index_list({table})")}
 
 
+def _has_unique_index(connection: sqlite3.Connection, table: str, columns: list[str]) -> bool:
+    """Whether ``table`` carries a unique index over exactly ``columns``."""
+    for row in connection.execute(f"PRAGMA index_list({table})"):
+        if int(row[2]) != 1:
+            continue
+        indexed = [str(info[2]) for info in connection.execute(f"PRAGMA index_info('{row[1]}')")]
+        if indexed == columns:
+            return True
+    return False
+
+
 def _foreign_key_targets(connection: sqlite3.Connection, table: str) -> set[tuple[str, str]]:
     """The ``(child column, parent table)`` pairs of a table's foreign keys."""
     return {(row[3], row[2]) for row in connection.execute(f"PRAGMA foreign_key_list({table})")}
@@ -1678,7 +1689,7 @@ def test_populated_v20_database_upgrades_to_v21_preserving_every_row(
     finally:
         connection.close()
 
-    assert to_version == 22
+    assert to_version == 23
     assert {20, 21} <= versions
     # Every populated row survives the rebuild: one row in every table.
     assert counts == {
@@ -2139,7 +2150,7 @@ def test_v21_database_migrates_to_v22_with_the_journal_tables(tmp_path: Path) ->
     finally:
         connection.close()
 
-    assert version == 22
+    assert version == 23
     assert {"trade_logs", "position_events"} <= tables
     assert {
         "trade_logs_closed",
@@ -2268,3 +2279,144 @@ def test_position_events_and_audit_events_reject_every_mutation(tmp_path: Path) 
             )
     finally:
         connection.close()
+
+
+# -- v22 -> v23: funding accruals and widened event actions ----------------
+
+
+def _v22_settings(tmp_path: Path) -> Settings:
+    """A populated database rolled back to exactly schema v22.
+
+    ``position_events`` is rebuilt with the v22 single-action CHECK and the
+    funding table is dropped, so ``_migrate_v23`` itself is exercised.
+    """
+    settings = _v21_settings(tmp_path)
+    SqliteStore(settings).initialize()
+    database = database_path(settings)
+    with sqlite3.connect(database) as connection:
+        connection.execute(
+            "INSERT INTO position_events (position_id, seq, at, action, order_id, note) "
+            "VALUES ('POS-1', 1, 't', 'FULL_CLOSE', NULL, 'legacy close')"
+        )
+        connection.execute("DROP TABLE funding_accruals")
+        connection.execute("DROP INDEX IF EXISTS reports_symbol_generated")
+        connection.execute("DROP TRIGGER IF EXISTS position_events_no_update")
+        connection.execute("DROP TRIGGER IF EXISTS position_events_no_delete")
+        connection.execute("ALTER TABLE position_events RENAME TO position_events_v22")
+        connection.execute(
+            "CREATE TABLE position_events ("
+            "position_id TEXT NOT NULL REFERENCES positions(position_id),"
+            "seq INTEGER NOT NULL CHECK (seq > 0),"
+            "at TEXT NOT NULL,"
+            "action TEXT NOT NULL CHECK (action IN ('FULL_CLOSE')),"
+            "order_id TEXT,"
+            "note TEXT NOT NULL,"
+            "PRIMARY KEY (position_id, seq))"
+        )
+        connection.execute(
+            "INSERT INTO position_events (position_id, seq, at, action, order_id, note) "
+            "SELECT position_id, seq, at, action, order_id, note FROM position_events_v22"
+        )
+        connection.execute("DROP TABLE position_events_v22")
+        connection.execute(
+            "CREATE TRIGGER position_events_no_update BEFORE UPDATE ON position_events "
+            "BEGIN SELECT RAISE(ABORT, 'position_events is append-only'); END"
+        )
+        connection.execute(
+            "CREATE TRIGGER position_events_no_delete BEFORE DELETE ON position_events "
+            "BEGIN SELECT RAISE(ABORT, 'position_events is append-only'); END"
+        )
+        connection.execute("DELETE FROM schema_migrations WHERE version >= 23")
+        connection.commit()
+        version = connection.execute("SELECT MAX(version) FROM schema_migrations").fetchone()[0]
+    assert version == 22
+    return settings
+
+
+def test_v22_database_migrates_to_v23_preserving_events_and_funding_uniqueness(
+    tmp_path: Path,
+) -> None:
+    settings = _v22_settings(tmp_path)
+    store = SqliteStore(settings)
+
+    store.initialize()
+    store.initialize()  # idempotent
+
+    connection = sqlite3.connect(database_path(settings))
+    try:
+        version = connection.execute("SELECT MAX(version) FROM schema_migrations").fetchone()[0]
+        tables = {
+            row[0]
+            for row in connection.execute("SELECT name FROM sqlite_master WHERE type = 'table'")
+        }
+        definition = connection.execute(
+            "SELECT sql FROM sqlite_master WHERE type = 'table' AND name = 'position_events'"
+        ).fetchone()[0]
+        preserved = connection.execute(
+            "SELECT action, note FROM position_events WHERE position_id = 'POS-1'"
+        ).fetchone()
+        unique_present = _has_unique_index(
+            connection, "funding_accruals", ["position_id", "settlement_time"]
+        )
+        event_indexes = _index_names(connection, "position_events")
+        report_indexes = _index_names(connection, "reports")
+        connection.execute(
+            "INSERT INTO position_events (position_id, seq, at, action, order_id, note) "
+            "VALUES ('POS-1', 2, 't2', 'PARTIAL_CLOSE', NULL, 'partial')"
+        )
+        connection.execute(
+            "INSERT INTO position_events (position_id, seq, at, action, order_id, note) "
+            "VALUES ('POS-1', 3, 't3', 'ADD', NULL, 'add')"
+        )
+        connection.execute(
+            "INSERT INTO position_events (position_id, seq, at, action, order_id, note) "
+            "VALUES ('POS-1', 4, 't4', 'FUNDING', NULL, 'funding')"
+        )
+        connection.execute(
+            "INSERT INTO funding_accruals (accrual_id, position_id, settlement_time, rate, "
+            "mark_price, amount_usd, created_at) "
+            "VALUES ('FND-1', 'POS-1', '2026-11-14T00:00:00.000Z', '0.0001', '70000', "
+            "'-0.07', 't')"
+        )
+        with pytest.raises(sqlite3.IntegrityError):
+            connection.execute(
+                "INSERT INTO funding_accruals (accrual_id, position_id, settlement_time, rate, "
+                "mark_price, amount_usd, created_at) "
+                "VALUES ('FND-2', 'POS-1', '2026-11-14T00:00:00.000Z', '0.0001', '70000', "
+                "'-0.07', 't')"
+            )
+        with pytest.raises(sqlite3.IntegrityError):
+            connection.execute("UPDATE position_events SET note = 'rewritten'")
+        connection.commit()
+    finally:
+        connection.close()
+
+    assert version == 23
+    assert "funding_accruals" in tables
+    assert "reports_symbol_generated" in report_indexes
+    assert "position_events_position_at" not in event_indexes
+    assert all(f"'{action}'" in definition for action in ("PARTIAL_CLOSE", "ADD", "FUNDING"))
+    assert tuple(preserved) == ("FULL_CLOSE", "legacy close")
+    assert unique_present
+
+
+def test_v23_tables_match_between_a_fresh_and_a_migrated_database(tmp_path: Path) -> None:
+    migrated_settings = _v22_settings(tmp_path / "migrated")
+    SqliteStore(migrated_settings).initialize()
+    fresh_settings = Settings(env="test", port=8765, data_dir=tmp_path / "fresh" / "data")
+    SqliteStore(fresh_settings).initialize()
+
+    migrated = sqlite3.connect(database_path(migrated_settings))
+    fresh = sqlite3.connect(database_path(fresh_settings))
+    try:
+        for table in ("funding_accruals", "position_events"):
+            assert _normalized_ddl(migrated, table) == _normalized_ddl(fresh, table), table
+            assert _index_names(migrated, table) == _index_names(fresh, table), table
+            assert _foreign_key_targets(migrated, table) == _foreign_key_targets(fresh, table), (
+                table
+            )
+        assert _index_names(migrated, "reports") == _index_names(fresh, "reports")
+        assert "reports_symbol_generated" in _index_names(fresh, "reports")
+    finally:
+        migrated.close()
+        fresh.close()

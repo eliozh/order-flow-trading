@@ -12,17 +12,22 @@ from decimal import ROUND_DOWN, Decimal
 
 from oft.adapters.sqlite_audit import SqliteAuditMixin
 from oft.adapters.sqlite_connections import SqliteConnectionMixin
+from oft.adapters.sqlite_scan_store import _row_to_report
 from oft.ports.store import (
     AuditEventDraft,
     CloseCommitResult,
     ClosedPositionRecord,
     FillRecord,
+    FundingAccrualCommit,
+    FundingAccrualRecord,
     OmsCommit,
     OmsConflictError,
     OrderRecord,
     PaperAccountRecord,
+    PositionAdjustmentRecord,
     PositionEventRecord,
     PositionRecord,
+    ReportRecord,
     TradeLogRecord,
 )
 
@@ -49,7 +54,8 @@ def _close_conflict_kind(message: str) -> str:
 
 
 def _account_base(
-    connection: sqlite3.Connection, record: ClosedPositionRecord
+    connection: sqlite3.Connection,
+    record: ClosedPositionRecord | PositionAdjustmentRecord | FundingAccrualCommit,
 ) -> tuple[Decimal, str, str, str]:
     """Read the live account inside the transaction, or use the seed defaults."""
     existing = connection.execute(
@@ -118,7 +124,7 @@ def _insert_close_fill(connection: sqlite3.Connection, fill: FillRecord) -> None
 
 def _upsert_close_account(
     connection: sqlite3.Connection,
-    record: ClosedPositionRecord,
+    record: ClosedPositionRecord | PositionAdjustmentRecord | FundingAccrualCommit,
     *,
     balance: Decimal,
     initial_balance: str,
@@ -146,14 +152,83 @@ def _upsert_close_account(
 
 
 def _mark_position_closed(connection: sqlite3.Connection, record: ClosedPositionRecord) -> None:
-    """Flip the one OPEN row to CLOSED; a zero-row update aborts the unit."""
+    """Flip the one OPEN row to CLOSED; a zero-row update aborts the unit.
+
+    When the record carries ``expected_payload_json`` the update is optimistic:
+    it only matches the exact payload the caller read. A concurrent funding
+    accrual, partial close, or add that already replaced the row makes this a
+    zero-row update, so the whole close rolls back instead of silently erasing
+    the other write from the surviving payload.
+    """
+    if record.position.expected_payload_json is None:
+        updated = connection.execute(
+            "UPDATE positions SET state = 'CLOSED', payload_json = ? "
+            "WHERE position_id = ? AND state = 'OPEN'",
+            (record.position.payload_json, record.position.position_id),
+        )
+        if updated.rowcount != 1:
+            raise OmsConflictError("position_state")
+        return
     updated = connection.execute(
         "UPDATE positions SET state = 'CLOSED', payload_json = ? "
-        "WHERE position_id = ? AND state = 'OPEN'",
-        (record.position.payload_json, record.position.position_id),
+        "WHERE position_id = ? AND state = 'OPEN' AND payload_json = ?",
+        (
+            record.position.payload_json,
+            record.position.position_id,
+            record.position.expected_payload_json,
+        ),
     )
     if updated.rowcount != 1:
-        raise OmsConflictError("position_state")
+        raise OmsConflictError("position_version")
+
+
+def _update_open_position(connection: sqlite3.Connection, position: PositionRecord) -> None:
+    """Replace the one OPEN row's payload; a zero-row update aborts the unit.
+
+    When the record carries ``expected_payload_json`` the update is
+    optimistic: it only matches the payload the caller read. A concurrent
+    adjustment or funding accrual that already replaced the row makes this a
+    zero-row update, so the caller can re-read and retry instead of silently
+    losing the other write.
+    """
+    if position.expected_payload_json is None:
+        updated = connection.execute(
+            "UPDATE positions SET payload_json = ? WHERE position_id = ? AND state = 'OPEN'",
+            (position.payload_json, position.position_id),
+        )
+    else:
+        updated = connection.execute(
+            "UPDATE positions SET payload_json = ? "
+            "WHERE position_id = ? AND state = 'OPEN' AND payload_json = ?",
+            (position.payload_json, position.position_id, position.expected_payload_json),
+        )
+    if updated.rowcount != 1:
+        raise OmsConflictError(
+            "position_state" if position.expected_payload_json is None else "position_version"
+        )
+
+
+def _insert_funding_accrual(connection: sqlite3.Connection, accrual: FundingAccrualRecord) -> bool:
+    """Insert the accrual once; ``False`` when ``(position, settlement)`` exists."""
+    cursor = connection.execute(
+        """
+        INSERT INTO funding_accruals (
+            accrual_id, position_id, settlement_time, rate, mark_price,
+            amount_usd, created_at
+        ) VALUES (?, ?, ?, ?, ?, ?, ?)
+        ON CONFLICT(position_id, settlement_time) DO NOTHING
+        """,
+        (
+            accrual.accrual_id,
+            accrual.position_id,
+            accrual.settlement_time,
+            accrual.rate,
+            accrual.mark_price,
+            accrual.amount_usd,
+            accrual.created_at,
+        ),
+    )
+    return cursor.rowcount == 1
 
 
 def _insert_position_event(connection: sqlite3.Connection, event: PositionEventRecord) -> None:
@@ -399,6 +474,156 @@ class PaperOmsStoreMixin(SqliteConnectionMixin, SqliteAuditMixin):
         finally:
             connection.close()
 
+    def save_position_adjustment(self, record: PositionAdjustmentRecord) -> OmsCommit:
+        """Commit a partial close or add as one unit; no trade log is written."""
+        connection = self._connect()
+        try:
+            connection.execute("BEGIN IMMEDIATE")
+            audits = tuple(self._insert_audit_event(connection, draft) for draft in record.audits)
+            base, initial_balance, environment, currency = _account_base(connection, record)
+            balance = (base + Decimal(record.balance_delta)).quantize(
+                Decimal("0.00000001"), rounding=ROUND_DOWN
+            )
+            _insert_close_order(connection, record.order)
+            _insert_close_fill(connection, record.fill)
+            _upsert_close_account(
+                connection,
+                record,
+                balance=balance,
+                initial_balance=initial_balance,
+                environment=environment,
+                currency=currency,
+            )
+            _update_open_position(connection, record.position)
+            _insert_position_event(connection, record.event)
+            connection.commit()
+            committed = PaperAccountRecord(
+                account_id=record.account.account_id,
+                environment=environment,
+                currency=currency,
+                initial_balance=initial_balance,
+                balance=str(balance),
+                updated_at=record.account.updated_at,
+            )
+            return OmsCommit(account=committed, audit=audits[-1] if audits else None)
+        except sqlite3.IntegrityError as exc:
+            connection.rollback()
+            raise OmsConflictError(_close_conflict_kind(str(exc))) from exc
+        except BaseException:
+            connection.rollback()
+            raise
+        finally:
+            connection.close()
+
+    def save_funding_accrual(self, record: FundingAccrualCommit) -> bool:
+        """Commit one funding settlement once; a replay applies nothing."""
+        connection = self._connect()
+        try:
+            connection.execute("BEGIN IMMEDIATE")
+            if not _insert_funding_accrual(connection, record.accrual):
+                connection.rollback()
+                return False
+            for draft in record.audits:
+                self._insert_audit_event(connection, draft)
+            base, initial_balance, environment, currency = _account_base(connection, record)
+            balance = (base + Decimal(record.balance_delta)).quantize(
+                Decimal("0.00000001"), rounding=ROUND_DOWN
+            )
+            _upsert_close_account(
+                connection,
+                record,
+                balance=balance,
+                initial_balance=initial_balance,
+                environment=environment,
+                currency=currency,
+            )
+            _update_open_position(connection, record.position)
+            _insert_position_event(connection, record.event)
+            connection.commit()
+            return True
+        except sqlite3.IntegrityError as exc:
+            connection.rollback()
+            raise OmsConflictError(_close_conflict_kind(str(exc))) from exc
+        except BaseException:
+            connection.rollback()
+            raise
+        finally:
+            connection.close()
+
+    def list_funding_accruals(self, position_id: str) -> tuple[FundingAccrualRecord, ...]:
+        connection = self._connect_read_only()
+        if connection is None:
+            return ()
+        try:
+            rows = connection.execute(
+                "SELECT accrual_id, position_id, settlement_time, rate, mark_price, "
+                "amount_usd, created_at FROM funding_accruals WHERE position_id = ? "
+                "ORDER BY settlement_time ASC, accrual_id ASC",
+                (position_id,),
+            ).fetchall()
+        finally:
+            connection.close()
+        return tuple(_row_to_funding_accrual(row) for row in rows)
+
+    _REPORT_COLUMNS = (
+        "report_id, scan_id, symbol, timeframe, generated_at, metrics_manifest_json, "
+        "llm_decision_id, narrative_ref, data_quality, snapshot_json, metrics_json, "
+        "llm_json, window_policy_json"
+    )
+
+    def list_reports_for_symbol(
+        self, symbol: str, *, since: str | None = None, limit: int | None = None
+    ) -> tuple[ReportRecord, ...]:
+        """Recorded reports for one symbol, oldest generated first.
+
+        ``since`` bounds the read to the newest reports generated at/after a
+        position's opening plus the single newest report generated before it.
+        The pre-entry report is retained because it is the frozen source the
+        position was opened from, while a settlement inside the holding window
+        can only appear in a report generated after the position opened.
+        ``limit`` caps the post-entry rows, so a long history cannot turn one
+        monitor tick into an unbounded snapshot scan. The
+        ``reports_symbol_generated`` index backs both queries.
+        """
+        connection = self._connect_read_only()
+        if connection is None:
+            return ()
+        try:
+            if since is None:
+                query = (
+                    f"SELECT {self._REPORT_COLUMNS} FROM reports WHERE symbol = ? "
+                    "ORDER BY generated_at DESC, report_id DESC"
+                )
+                params: list[object] = [symbol]
+                if limit is not None:
+                    query += " LIMIT ?"
+                    params.append(int(limit))
+                rows = list(connection.execute(query, tuple(params)).fetchall())
+            else:
+                query = (
+                    f"SELECT {self._REPORT_COLUMNS} FROM reports "
+                    "WHERE symbol = ? AND generated_at >= ? "
+                    "ORDER BY generated_at DESC, report_id DESC"
+                )
+                params = [symbol, since]
+                if limit is not None:
+                    query += " LIMIT ?"
+                    params.append(int(limit))
+                rows = list(connection.execute(query, tuple(params)).fetchall())
+                pre_entry = connection.execute(
+                    f"SELECT {self._REPORT_COLUMNS} FROM reports "
+                    "WHERE symbol = ? AND generated_at < ? "
+                    "ORDER BY generated_at DESC, report_id DESC LIMIT 1",
+                    (symbol, since),
+                ).fetchone()
+                if pre_entry is not None:
+                    rows.append(pre_entry)
+        finally:
+            connection.close()
+        records = [_row_to_report(row) for row in rows]
+        records.sort(key=lambda record: (record.generated_at, record.report_id))
+        return tuple(records)
+
     def get_order(self, order_id: str) -> OrderRecord | None:
         connection = self._connect_read_only()
         if connection is None:
@@ -557,13 +782,33 @@ class PaperOmsStoreMixin(SqliteConnectionMixin, SqliteAuditMixin):
             connection.close()
         return _row_to_position(row) if row is not None else None
 
-    def update_open_position_payload(self, position_id: str, *, payload_json: str) -> bool:
-        """Update only an OPEN position row; a CLOSED row is left untouched."""
+    def update_open_position_payload(
+        self,
+        position_id: str,
+        *,
+        payload_json: str,
+        expected_payload_json: str | None = None,
+    ) -> bool:
+        """Update only an OPEN position row; a CLOSED row is left untouched.
+
+        With ``expected_payload_json`` the update is optimistic: it only wins
+        when the row still carries the payload the caller read. A concurrent
+        funding accrual or adjustment that replaced the row makes it a
+        zero-row update, so the caller can re-read instead of losing it.
+        """
         with closing(self._connect()) as connection, connection:
-            updated = connection.execute(
-                "UPDATE positions SET payload_json = ? WHERE position_id = ? AND state = 'OPEN'",
-                (payload_json, position_id),
-            )
+            if expected_payload_json is None:
+                updated = connection.execute(
+                    "UPDATE positions SET payload_json = ? "
+                    "WHERE position_id = ? AND state = 'OPEN'",
+                    (payload_json, position_id),
+                )
+            else:
+                updated = connection.execute(
+                    "UPDATE positions SET payload_json = ? "
+                    "WHERE position_id = ? AND state = 'OPEN' AND payload_json = ?",
+                    (payload_json, position_id, expected_payload_json),
+                )
             return updated.rowcount == 1
 
     def get_trade_log(self, trade_id: str) -> TradeLogRecord | None:
@@ -776,4 +1021,16 @@ def _row_to_position_event(row: sqlite3.Row) -> PositionEventRecord:
         action=row["action"],
         order_id=row["order_id"],
         note=row["note"],
+    )
+
+
+def _row_to_funding_accrual(row: sqlite3.Row) -> FundingAccrualRecord:
+    return FundingAccrualRecord(
+        accrual_id=row["accrual_id"],
+        position_id=row["position_id"],
+        settlement_time=row["settlement_time"],
+        rate=row["rate"],
+        mark_price=row["mark_price"],
+        amount_usd=row["amount_usd"],
+        created_at=row["created_at"],
     )

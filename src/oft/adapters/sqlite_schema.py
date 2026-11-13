@@ -33,7 +33,7 @@ from oft.domain.prompts import (
 _LOGGER = logging.getLogger(__name__)
 
 
-_SCHEMA_VERSION = 22
+_SCHEMA_VERSION = 23
 # ``PRAGMA journal_mode=WAL`` needs an exclusive lock and does not reliably
 # consult the busy handler, so a concurrent initializer can still see
 # SQLITE_BUSY with the timeout installed. Retry the switch briefly.
@@ -294,7 +294,7 @@ _TRADE_LOGS_DEFINITION = """
     decision_id TEXT NOT NULL REFERENCES decisions(decision_id)
 """
 # Exactly the actions the application writes to the management timeline.
-_POSITION_EVENT_ACTIONS = ("FULL_CLOSE",)
+_POSITION_EVENT_ACTIONS = ("FULL_CLOSE", "PARTIAL_CLOSE", "ADD", "FUNDING")
 _POSITION_EVENTS_DEFINITION = f"""
     position_id TEXT NOT NULL REFERENCES positions(position_id),
     seq INTEGER NOT NULL CHECK (seq > 0),
@@ -338,6 +338,31 @@ _POSITION_EVENTS_TRIGGERS = (
 _V22_DDL = "\n".join(
     (_TRADE_LOGS_TABLE, *_TRADE_LOGS_INDEXES, _POSITION_EVENTS_TABLE, *_POSITION_EVENTS_TRIGGERS)
 )
+
+# v23: recorded funding settlements. The unique ``(position_id, settlement_time)``
+# pair is the idempotency key: a replay or restart cannot accrue twice.
+_FUNDING_ACCRUALS_DEFINITION = """
+    accrual_id TEXT PRIMARY KEY,
+    position_id TEXT NOT NULL REFERENCES positions(position_id),
+    settlement_time TEXT NOT NULL,
+    rate TEXT NOT NULL,
+    mark_price TEXT NOT NULL,
+    amount_usd TEXT NOT NULL,
+    created_at TEXT NOT NULL,
+    UNIQUE (position_id, settlement_time)
+"""
+_FUNDING_ACCRUALS_TABLE = (
+    f"CREATE TABLE IF NOT EXISTS funding_accruals ({_FUNDING_ACCRUALS_DEFINITION});"
+)
+# No separate index: ``UNIQUE (position_id, settlement_time)`` already creates
+# the covering autoindex, so a named duplicate would only add write amplification.
+# The funding-history read filters reports by symbol and orders by
+# ``(generated_at, report_id)``; this index is the exact covering shape.
+_REPORTS_SYMBOL_GENERATED_INDEX = (
+    "CREATE INDEX IF NOT EXISTS reports_symbol_generated "
+    "ON reports(symbol, generated_at DESC, report_id);"
+)
+_V23_DDL = _FUNDING_ACCRUALS_TABLE
 
 # Every column copied by the v21 rebuild, in table order.
 _V21_REBUILDS: tuple[tuple[str, str, tuple[str, ...]], ...] = (
@@ -837,6 +862,7 @@ _SCHEMA_SQL = f"""
     );
 {_OPPORTUNITY_CONDITIONS_DDL}
 {_V22_DDL}
+{_V23_DDL}
 """
 
 
@@ -2000,6 +2026,117 @@ def _migrate_v22(connection: sqlite3.Connection) -> None:
         raise
 
 
+def _funding_unique_constraint_present(connection: sqlite3.Connection) -> bool:
+    """Whether ``funding_accruals`` carries the ``(position_id, settlement_time)`` key."""
+    for row in connection.execute("PRAGMA index_list(funding_accruals)"):
+        if int(row[2]) != 1:
+            continue
+        columns = [str(info[2]) for info in connection.execute(f"PRAGMA index_info('{row[1]}')")]
+        if columns == ["position_id", "settlement_time"]:
+            return True
+    return False
+
+
+def _reports_has_symbol_column(connection: sqlite3.Connection) -> bool:
+    if not _table_exists(connection, "reports"):
+        return False
+    return any(str(row[1]) == "symbol" for row in connection.execute("PRAGMA table_info(reports)"))
+
+
+def _ensure_reports_symbol_index(connection: sqlite3.Connection) -> None:
+    """Create the funding-history covering index when the table can carry it.
+
+    Very old synthetic schemas have a minimal ``reports`` table without the
+    ``symbol`` column; the index is skipped there and the normal upgraded
+    schema (v9+ migrations add the column) receives it.
+    """
+    if _reports_has_symbol_column(connection):
+        connection.execute(_REPORTS_SYMBOL_GENERATED_INDEX)
+
+
+def _v23_objects_present(connection: sqlite3.Connection) -> bool:
+    """Whether the v23 funding table, report index, and event actions exist."""
+    if not _table_exists(connection, "funding_accruals"):
+        return False
+    if not _funding_unique_constraint_present(connection):
+        return False
+    if _reports_has_symbol_column(connection):
+        index_row = connection.execute(
+            "SELECT 1 FROM sqlite_master WHERE type = 'index' AND name = 'reports_symbol_generated'"
+        ).fetchone()
+        if index_row is None:
+            return False
+    if not _table_exists(connection, "position_events"):
+        return True
+    row = connection.execute(
+        "SELECT sql FROM sqlite_master WHERE type = 'table' AND name = 'position_events'"
+    ).fetchone()
+    if row is None or row[0] is None:
+        return True
+    definition = str(row[0])
+    return all(f"'{action}'" in definition for action in ("PARTIAL_CLOSE", "ADD", "FUNDING"))
+
+
+def _rebuild_position_events_for_v23(connection: sqlite3.Connection) -> None:
+    """Widen the append-only event action CHECK, preserving every row.
+
+    SQLite cannot widen a CHECK with ``ALTER TABLE``. The append-only triggers
+    are dropped first, the table is rebuilt with the new definition, its rows
+    are copied verbatim, and the triggers are recreated.
+    """
+    for statement in _POSITION_EVENTS_TRIGGERS[:1] + _POSITION_EVENTS_TRIGGERS[2:3]:
+        connection.execute(statement)
+    connection.execute("DROP TABLE IF EXISTS position_events_v22")
+    connection.execute("ALTER TABLE position_events RENAME TO position_events_v22")
+    connection.execute(_POSITION_EVENTS_TABLE)
+    connection.execute(
+        """
+        INSERT INTO position_events (position_id, seq, at, action, order_id, note)
+        SELECT position_id, seq, at, action, order_id, note FROM position_events_v22
+        """
+    )
+    connection.execute("DROP TABLE position_events_v22")
+    for statement in _POSITION_EVENTS_TRIGGERS[1::2]:
+        connection.execute(statement)
+
+
+def _migrate_v23(connection: sqlite3.Connection) -> None:
+    """Add ``funding_accruals`` and widen the position-event actions (v23).
+
+    The funding table carries the ``(position_id, settlement_time)`` idempotency
+    constraint. ``position_events`` is rebuilt because SQLite cannot widen its
+    CHECK with ``ALTER TABLE``; the append-only triggers are dropped, the rows
+    copied verbatim, and the triggers recreated. ``BEGIN IMMEDIATE`` plus the
+    in-lock re-check matches the v22 pattern, so two concurrent initializers
+    cannot both rebuild.
+    """
+    if not _table_exists(connection, "positions"):
+        return
+    if connection.in_transaction:
+        connection.commit()
+    connection.execute("BEGIN IMMEDIATE")
+    try:
+        if _v23_objects_present(connection):
+            connection.execute("COMMIT")
+            return
+        connection.execute(_FUNDING_ACCRUALS_TABLE)
+        _ensure_reports_symbol_index(connection)
+        if _table_exists(connection, "position_events"):
+            row = connection.execute(
+                "SELECT sql FROM sqlite_master WHERE type = 'table' AND name = 'position_events'"
+            ).fetchone()
+            definition = "" if row is None or row[0] is None else str(row[0])
+            if not all(
+                f"'{action}'" in definition for action in ("PARTIAL_CLOSE", "ADD", "FUNDING")
+            ):
+                _rebuild_position_events_for_v23(connection)
+        connection.execute("COMMIT")
+    except Exception:
+        if connection.in_transaction:
+            connection.execute("ROLLBACK")
+        raise
+
+
 def _opportunity_conditions_pk(
     connection: sqlite3.Connection,
 ) -> tuple[str, ...]:
@@ -2169,7 +2306,7 @@ def _enable_wal(connection: sqlite3.Connection) -> None:
 
 
 def initialize_database(settings: Settings) -> None:
-    """Create the data directory and the schema, currently v22.
+    """Create the data directory and the schema, currently v23.
 
     v19 adds the trigger snapshot provenance columns (``snapshot_hash``,
     ``as_of``, ``data_quality``, ``condition_count``) and backfills them from
@@ -2177,7 +2314,9 @@ def initialize_database(settings: Settings) -> None:
     UNIQUE index) and stores the measured risk inputs on each verdict. v21 adds
     the residual foreign keys and the enum CHECK constraints, rebuilding the six
     affected tables. v22 adds ``trade_logs`` (unique ``position_id``) and the
-    append-only ``position_events`` timeline.
+    append-only ``position_events`` timeline. v23 adds ``funding_accruals``
+    (unique ``position_id + settlement_time``) and widens the event action CHECK
+    to ``PARTIAL_CLOSE``/``ADD``/``FUNDING``.
     """
     settings.data_dir.mkdir(parents=True, exist_ok=True)
     settings.data_dir.chmod(0o700)
@@ -2239,6 +2378,8 @@ def initialize_database(settings: Settings) -> None:
             _migrate_v21(connection)
         if _schema_version(connection) < 22 or not _migration_recorded(connection, 22):
             _migrate_v22(connection)
+        if _schema_version(connection) < 23 or not _migration_recorded(connection, 23):
+            _migrate_v23(connection)
         _ensure_opportunity_conditions_shape(connection)
         with connection:
             # ``_SCHEMA_SQL`` drops and recreates the immutability trigger, a
@@ -2334,9 +2475,14 @@ def initialize_database(settings: Settings) -> None:
             )
             connection.execute(
                 "INSERT OR IGNORE INTO schema_migrations (version, applied_at) VALUES (?, ?)",
+                (22, "2026-11-13T00:00:00.000Z"),
+            )
+            connection.execute(
+                "INSERT OR IGNORE INTO schema_migrations (version, applied_at) VALUES (?, ?)",
                 (_SCHEMA_VERSION, "2026-11-14T00:00:00.000Z"),
             )
             _seed_prompt_defaults(connection)
+            _ensure_reports_symbol_index(connection)
     finally:
         connection.close()
         # The DB may hold a trading journal; never leave it group/world readable.

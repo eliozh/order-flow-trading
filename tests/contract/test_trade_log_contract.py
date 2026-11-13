@@ -12,7 +12,13 @@ import _helpers
 from _registry import validate
 
 from oft.application.position_service import PositionService
-from oft.domain.oms import Position, PositionSide
+from oft.domain.oms import Fill, OrderSide, Position, PositionSide
+from oft.domain.positions import (
+    TradeLogContext,
+    close_full,
+    trade_id_for,
+    trade_log_from_close,
+)
 from position_support import set_position_mark
 
 
@@ -48,8 +54,11 @@ def test_trade_log_formula_holds_to_eight_decimal_places(tmp_path: Path) -> None
     funding = Decimal(trade["funding_usd"])
     net = Decimal(trade["net_pnl_usd"])
     assert net == (gross - fees + funding).quantize(Decimal("0.00000001"))
+    # No recorded funding settlement falls inside this short holding window, so
+    # funding is a measured zero, never an unmeasured placeholder.
     assert trade["funding_usd"] == "0"
-    assert "funding accrual not in this slice" in trade["data_quality"]["reasons"]
+    assert trade["data_quality"]["status"] == "PARTIAL"
+    assert any("MAE/MFE" in reason for reason in trade["data_quality"]["reasons"])
 
 
 def test_trade_log_names_every_unmeasured_field(tmp_path: Path) -> None:
@@ -58,23 +67,23 @@ def test_trade_log_names_every_unmeasured_field(tmp_path: Path) -> None:
     reasons = trade["data_quality"]["reasons"]
     assert any("MAE" in reason for reason in reasons)
     assert any("MFE" in reason for reason in reasons)
-    assert any("R multiple" in reason for reason in reasons)
-    assert trade["r_multiple"] is None
-    assert trade["mae_usd"] == "0"
-    assert trade["mfe_usd"] == "0"
-    assert trade["signal"] == {
-        "scan_id": None,
-        "report_id": None,
-        "opportunity_id": None,
-        "trigger_id": None,
-        "decision_id": None,
-    }
-    assert trade["outcome_tags"] == []
+    # The frozen initial risk is recorded, so R is measured rather than null.
+    assert isinstance(trade["r_multiple"], float)
+    assert trade["mae_usd"] == "0.00000000"
+    assert trade["mfe_usd"] == "0.00000000"
+    signal = trade["signal"]
+    assert signal["trigger_id"] is not None
+    assert signal["opportunity_id"] is not None
+    assert signal["decision_id"] is not None
+    assert "LOSS" in trade["outcome_tags"]
+    assert "STOPPED" in trade["outcome_tags"]
+    assert "DATA_PARTIAL" in trade["outcome_tags"]
     assert trade["review_decision_id"] is None
     assert trade["decision_quality"]["matched_rules"] is None
     assert trade["decision_quality"]["confidence"] is None
     assert trade["provenance"]["llm_provider"] == "stub"
     assert trade["provenance"]["prompt_version"] >= 1
+    assert trade["provenance"]["calc_metric_version"] != ""
 
 
 def test_closed_position_validates_the_position_contract(tmp_path: Path) -> None:
@@ -136,3 +145,134 @@ def test_zero_fee_zero_net_close_serializes_money_as_plain_decimals() -> None:
     assert "E" not in payload["fees_usd"]
     assert "E" not in payload["funding_usd"]
     assert "E" not in payload["realized_pnl_usd"]
+
+
+def test_a_funded_open_position_validates_the_position_contract() -> None:
+    position = Position(
+        position_id="POS-FUNDED",
+        account_id="ACC-PAPER",
+        environment="PAPER",
+        symbol="BTCUSDT",
+        side=PositionSide.LONG,
+        state="OPEN",
+        size=Decimal("0.005"),
+        entry_price=Decimal("70000"),
+        avg_entry_price=Decimal("70000"),
+        mark_price=Decimal("70500"),
+        notional_usd=Decimal("350"),
+        stop_price=Decimal("69000"),
+        target_prices=(),
+        leverage=2.0,
+        margin_usd=Decimal("175"),
+        risk_amount_usd=Decimal("10"),
+        risk_pct=0.8,
+        fees_usd=Decimal("0.35"),
+        funding_usd=Decimal("-0.07"),
+        opened_at="2026-11-14T11:00:00.000Z",
+        updated_at="2026-11-14T12:00:00.000Z",
+        source_trigger_id="TRG-TEST",
+        management_history=(
+            {
+                "decision_id": "MGD-PARTIAL",
+                "action": "PARTIAL_CLOSE",
+                "at": "2026-11-14T12:00:00.000Z",
+                "executed_order_id": "ORD-PARTIAL",
+                "note": "partial close",
+            },
+        ),
+        version=2,
+    )
+
+    payload = position.to_contract()
+
+    validate("position.schema.json", payload)
+    assert payload["funding_usd"] == "-0.07"
+    assert all(entry["action"] != "FUNDING" for entry in payload["management_history"])
+
+
+def test_an_enriched_trade_log_validates_with_bar_backed_excursions() -> None:
+    position = Position(
+        position_id="POS-ENRICHED",
+        account_id="ACC-PAPER",
+        environment="PAPER",
+        symbol="BTCUSDT",
+        side=PositionSide.LONG,
+        state="OPEN",
+        size=Decimal("0.01"),
+        entry_price=Decimal("70000"),
+        avg_entry_price=Decimal("70000"),
+        mark_price=Decimal("70000"),
+        notional_usd=Decimal("700"),
+        stop_price=Decimal("69000"),
+        target_prices=(Decimal("72000"),),
+        leverage=2.0,
+        margin_usd=Decimal("350"),
+        risk_amount_usd=Decimal("10"),
+        risk_pct=0.8,
+        fees_usd=Decimal("0.35"),
+        funding_usd=Decimal("-0.07"),
+        opened_at="2026-11-14T11:00:00.000Z",
+        updated_at="2026-11-14T12:00:00.000Z",
+        source_trigger_id="TRG-TEST",
+    )
+    fill = Fill(
+        fill_id="FIL-EXIT",
+        order_id="ORD-EXIT",
+        environment="PAPER",
+        account_id="ACC-PAPER",
+        symbol="BTCUSDT",
+        side=OrderSide.SELL,
+        price=Decimal("68980"),
+        quantity=Decimal("0.01"),
+        quote_quantity=Decimal("689.80"),
+        fee=Decimal("0.345"),
+        fee_asset="USDT",
+        maker=False,
+        filled_at="2026-11-14T12:00:00.000Z",
+        received_at="2026-11-14T12:00:00.000Z",
+    )
+    close = close_full(
+        position,
+        fill,
+        at="2026-11-14T12:00:00.000Z",
+        decision_id="MGD-ENRICHED",
+    )
+    context = TradeLogContext(
+        signal={
+            "scan_id": "SCAN-1",
+            "report_id": "RPT-1",
+            "opportunity_id": "OPP-1",
+            "trigger_id": "TRG-TEST",
+            "decision_id": "DEC-ENTRY",
+        },
+        provenance={
+            "calc_metric_version": "ofi.v1.deadbeef",
+            "prompt_version": 2,
+            "llm_provider": "stub",
+            "llm_model": "fixture",
+        },
+        decision_quality={"matched_rules": None, "confidence": None, "notes": "not reviewed"},
+        mae_usd=Decimal("-12.50"),
+        mfe_usd=Decimal("4.25"),
+        risk_amount_usd=Decimal("10"),
+        entry_notional_usd=Decimal("700"),
+        data_quality_status="COMPLETE",
+        data_quality_reasons=(),
+        close_reason="STOP_TOUCH",
+        stopped=True,
+    )
+
+    trade = trade_log_from_close(
+        close,
+        trade_id=trade_id_for("POS-ENRICHED"),
+        context=context,
+    )
+
+    validate("trade-log.schema.json", trade)
+    assert trade["r_multiple"] == -1.0965
+    assert trade["mae_usd"] == "-12.50000000"
+    assert trade["mfe_usd"] == "4.25000000"
+    assert trade["outcome_tags"] == ["LOSS", "STOPPED"]
+    assert trade["signal"]["trigger_id"] == "TRG-TEST"
+    assert trade["provenance"]["calc_metric_version"] == "ofi.v1.deadbeef"
+    assert trade["data_quality"]["status"] == "COMPLETE"
