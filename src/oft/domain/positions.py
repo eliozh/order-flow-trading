@@ -50,7 +50,12 @@ class PositionError(Exception):
 
 @dataclass(frozen=True)
 class ProtectiveExit:
-    """One deterministic stop-touch decision for an open position."""
+    """One deterministic stop-touch decision for an open position.
+
+    The decision id is not derived here: the caller owns the recorded mark and
+    its as-of, so it derives the id once with
+    :func:`management_decision_id` and passes it through the close path.
+    """
 
     position_id: str
     symbol: str
@@ -61,24 +66,57 @@ class ProtectiveExit:
     at: str
     rule: str = STOP_TOUCH_RULE
 
-    @property
-    def decision_id(self) -> str:
-        return deterministic_id("MGD", f"{self.position_id}:{self.at}")
 
-    @property
-    def event_id(self) -> str:
-        return deterministic_id("PEV", f"{self.position_id}:CLOSED:{self.at}")
+def management_decision_id(position_id: str, mark: Decimal, mark_as_of: str) -> str:
+    """The one ``MGD`` id for a management decision on a recorded mark.
+
+    Single source of truth: the persisted ``decisions`` row, the position's
+    ``management_history`` entry, and the trade-log ``decision_id`` all use the
+    value returned here.
+    """
+    return deterministic_id("MGD", f"{position_id}:{mark}:{mark_as_of}")
+
+
+@dataclass(frozen=True)
+class ManagementEvent:
+    """One management timeline entry, the single source for every projection.
+
+    The position payload's ``management_history`` and the append-only
+    ``position_events`` audit row are both rendered from this value, so they
+    cannot diverge.
+    """
+
+    decision_id: str
+    action: str
+    at: str
+    order_id: str | None
+    note: str
+
+    def to_history_entry(self) -> dict[str, Any]:
+        return {
+            "decision_id": self.decision_id,
+            "action": self.action,
+            "at": self.at,
+            "executed_order_id": self.order_id,
+            "note": self.note,
+        }
 
 
 @dataclass(frozen=True)
 class CloseResult:
-    """The closed position and its exact PnL terms."""
+    """The closed position, its exact PnL terms, and the management event."""
 
     position: Position
     gross_pnl_usd: Decimal
     fees_usd: Decimal
     funding_usd: Decimal
     net_pnl_usd: Decimal
+    event: ManagementEvent
+
+    def __post_init__(self) -> None:
+        expected = quantize_money(self.gross_pnl_usd - self.fees_usd + self.funding_usd)
+        if self.net_pnl_usd != expected:
+            raise ValueError("close net PnL must equal gross - fees + funding")
 
     def to_contract(self) -> dict[str, Any]:
         return self.position.to_contract()
@@ -173,12 +211,20 @@ def evaluate_protective_exit(
     )
 
 
-def close_full(position: Position, exit_fill: Fill, *, at: str) -> CloseResult:
+def close_full(
+    position: Position,
+    exit_fill: Fill,
+    *,
+    at: str,
+    decision_id: str,
+) -> CloseResult:
     """Apply a full-close fill to an OPEN position and return the closed result.
 
     The existing row is updated in place by the caller; this function never
     creates a second position. The exit fee is added to the entry fee already
-    carried by the position.
+    carried by the position. ``decision_id`` is the caller-owned, single-sourced
+    management id: it is written into the payload history and returned on the
+    event so the broker's audit row cannot diverge.
     """
     if position.state != PositionState.OPEN:
         raise PositionError("POSITION_STATE_INVALID", "only an OPEN position can be closed")
@@ -199,17 +245,14 @@ def close_full(position: Position, exit_fill: Fill, *, at: str) -> CloseResult:
     fees = fees_total(position.fees_usd, exit_fill.fee)
     funding = Decimal("0")
     net = net_pnl_usd(gross, fees, funding)
-    decision_id = deterministic_id("MGD", f"{position.position_id}:{at}")
-    history = (
-        *position.management_history,
-        {
-            "decision_id": decision_id,
-            "action": FULL_CLOSE,
-            "at": at,
-            "executed_order_id": exit_fill.order_id,
-            "note": "protective stop touched",
-        },
+    event = ManagementEvent(
+        decision_id=decision_id,
+        action=FULL_CLOSE,
+        at=at,
+        order_id=exit_fill.order_id,
+        note="protective stop touched",
     )
+    history = (*position.management_history, event.to_history_entry())
     closed = replace(
         position,
         state=PositionState.CLOSED.value,
@@ -229,6 +272,7 @@ def close_full(position: Position, exit_fill: Fill, *, at: str) -> CloseResult:
         fees_usd=fees,
         funding_usd=funding,
         net_pnl_usd=net,
+        event=event,
     )
 
 
@@ -319,10 +363,12 @@ __all__ = [
     "FUNDING_REASON",
     "STOP_TOUCH_RULE",
     "CloseResult",
+    "ManagementEvent",
     "PositionError",
     "ProtectiveExit",
     "close_full",
     "evaluate_protective_exit",
+    "management_decision_id",
     "position_from_contract",
     "trade_id_for",
     "trade_log_from_close",

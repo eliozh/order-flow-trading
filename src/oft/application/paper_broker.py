@@ -26,9 +26,10 @@ from oft.domain.oms import (
     order_from_intent,
     position_from_fill,
 )
-from oft.domain.pnl import plain_money_str
+from oft.domain.pnl import money_str
 from oft.domain.positions import (
     CloseResult,
+    ManagementEvent,
     close_full,
     position_from_contract,
     trade_id_for,
@@ -85,6 +86,15 @@ class OrderIntent:
     position_id: str | None = None
     reduce_only: bool = False
 
+    def __post_init__(self) -> None:
+        # One closed representation: ``purpose`` is the authority and
+        # ``reduce_only`` is derived from it, so the gateway (AND) and the
+        # broker (OR) can never disagree. The intent hash now includes the
+        # normalized purpose and the derived flag.
+        purpose = self.purpose.upper()
+        object.__setattr__(self, "purpose", purpose)
+        object.__setattr__(self, "reduce_only", purpose == "EXIT")
+
     def hash(self) -> str:
         return intent_hash(
             {
@@ -116,6 +126,40 @@ class BrokerResult:
 
 def _quantize(value: Decimal) -> Decimal:
     return value.quantize(_EIGHT_DP, rounding=ROUND_DOWN)
+
+
+def _fill_amounts(
+    side: OrderSide,
+    mark_price: Decimal,
+    quantity: Decimal,
+    *,
+    slippage: Decimal,
+    taker_fee: Decimal,
+) -> tuple[Decimal, Decimal, Decimal]:
+    """Return ``(fill price, quote quantity, fee)`` for a filled market order.
+
+    A BUY fills above the mark and a SELL below it; both entry and exit use
+    this one expression so the money math cannot drift.
+    """
+    direction = Decimal("1") if side is OrderSide.BUY else Decimal("-1")
+    fill_price = _quantize(mark_price * (Decimal("1") + direction * slippage))
+    quote_quantity = _quantize(fill_price * quantity)
+    fee = _quantize(quote_quantity * taker_fee)
+    return fill_price, quote_quantity, fee
+
+
+def _intent_ids(intent: OrderIntent) -> tuple[str, str, str, str]:
+    """The deterministic ``(digest, client id, order id, fill id)`` of an intent."""
+    digest = intent.hash()
+    client_id = client_order_id(
+        intent.environment,
+        intent.symbol,
+        intent.purpose,
+        f"{intent.decision_id}|{digest}",
+    )
+    order_id = deterministic_id("ORD", f"{client_id}:order")
+    fill_id = deterministic_id("FIL", f"{client_id}:fill")
+    return digest, client_id, order_id, fill_id
 
 
 def _cash_flow(side: OrderSide, quote_quantity: Decimal, fee: Decimal) -> Decimal:
@@ -163,7 +207,7 @@ class PaperBroker:
             raise BrokerError("quantity must be positive")
         if mark_price <= 0:
             raise BrokerError("mark price must be positive")
-        if intent.reduce_only or intent.purpose.upper() == "EXIT":
+        if intent.reduce_only:
             return self._submit_exit(
                 intent,
                 mark_price=mark_price,
@@ -171,26 +215,20 @@ class PaperBroker:
                 now=now,
                 audit_actor=audit_actor,
             )
-        direction = Decimal("1") if intent.side is OrderSide.BUY else Decimal("-1")
-        fill_price = _quantize(mark_price * (Decimal("1") + direction * self._slippage))
-        quote_quantity = _quantize(fill_price * intent.quantity)
-        fee = _quantize(quote_quantity * self._taker_fee)
+        fill_price, quote_quantity, fee = _fill_amounts(
+            intent.side,
+            mark_price,
+            intent.quantity,
+            slippage=self._slippage,
+            taker_fee=self._taker_fee,
+        )
         account = self.account()
         # The store applies this delta to the balance it reads inside the write
         # transaction, so concurrent fills cannot overwrite each other. A SELL
         # (SHORT entry) credits proceeds; a BUY (LONG entry) debits the cost.
         balance_delta = str(_cash_flow(intent.side, quote_quantity, fee))
 
-        digest = intent.hash()
-        # D6: the deterministic client id binds the decision and the intent.
-        client_id = client_order_id(
-            intent.environment,
-            intent.symbol,
-            intent.purpose,
-            f"{intent.decision_id}|{digest}",
-        )
-        order_id = deterministic_id("ORD", f"{client_id}:order")
-        fill_id = deterministic_id("FIL", f"{client_id}:fill")
+        digest, client_id, order_id, fill_id = _intent_ids(intent)
         position_id = deterministic_id("POS", f"{client_id}:position")
 
         fill = Fill(
@@ -338,7 +376,7 @@ class PaperBroker:
     ) -> tuple[Fill, Order, CloseResult, Decimal, Decimal]:
         """Fill, order, close, and cash delta for one validated exit intent."""
         fill_price, quote_quantity, fee, cash_delta = self._exit_amounts(intent, mark_price)
-        digest, client_id, order_id, fill_id = _exit_ids(intent)
+        digest, client_id, order_id, fill_id = _intent_ids(intent)
         fill = _fill_for(
             intent,
             fill_id=fill_id,
@@ -357,7 +395,8 @@ class PaperBroker:
             fill=fill,
             now=now,
         )
-        return fill, order, close_full(position, fill, at=now), fill_price, cash_delta
+        close = close_full(position, fill, at=now, decision_id=intent.decision_id)
+        return fill, order, close, fill_price, cash_delta
 
     def _exit_position(self, intent: OrderIntent) -> Position:
         """Load and validate the one OPEN position an exit intent targets."""
@@ -387,25 +426,14 @@ class PaperBroker:
         self, intent: OrderIntent, mark_price: Decimal
     ) -> tuple[Decimal, Decimal, Decimal, Decimal]:
         """Return the exit ``(fill price, quote, fee, cash delta)``."""
-        direction = Decimal("-1") if intent.side is OrderSide.SELL else Decimal("1")
-        fill_price = _quantize(mark_price * (Decimal("1") + direction * self._slippage))
-        quote_quantity = _quantize(fill_price * intent.quantity)
-        fee = _quantize(quote_quantity * self._taker_fee)
+        fill_price, quote_quantity, fee = _fill_amounts(
+            intent.side,
+            mark_price,
+            intent.quantity,
+            slippage=self._slippage,
+            taker_fee=self._taker_fee,
+        )
         return fill_price, quote_quantity, fee, _cash_flow(intent.side, quote_quantity, fee)
-
-
-def _exit_ids(intent: OrderIntent) -> tuple[str, str, str, str]:
-    """The deterministic ``(digest, client id, order id, fill id)`` of an exit."""
-    digest = intent.hash()
-    client_id = client_order_id(
-        intent.environment,
-        intent.symbol,
-        intent.purpose,
-        f"{intent.decision_id}|{digest}",
-    )
-    order_id = deterministic_id("ORD", f"{client_id}:order")
-    fill_id = deterministic_id("FIL", f"{client_id}:fill")
-    return digest, client_id, order_id, fill_id
 
 
 def _close_record(
@@ -432,7 +460,7 @@ def _close_record(
         position=_closed_position_record(position, close),
         account=_account_shell(account, now),
         balance_delta=str(cash_delta),
-        event=_exit_event(position.position_id, at=now, order_id=order_id),
+        event=_exit_event(position.position_id, close.event),
         trade_log=_trade_log_record(
             intent=intent,
             position=position,
@@ -542,14 +570,15 @@ def _account_shell(account: PaperAccountRecord, now: str) -> PaperAccountRecord:
     )
 
 
-def _exit_event(position_id: str, *, at: str, order_id: str) -> PositionEventRecord:
+def _exit_event(position_id: str, event: ManagementEvent) -> PositionEventRecord:
+    """The append-only audit projection of the close's single management event."""
     return PositionEventRecord(
         position_id=position_id,
-        seq=0,
-        at=at,
-        action="FULL_CLOSE",
-        order_id=order_id,
-        note="protective stop touched",
+        seq=None,
+        at=event.at,
+        action=event.action,
+        order_id=event.order_id,
+        note=event.note,
     )
 
 
@@ -573,7 +602,7 @@ def _trade_log_record(
         side=position.side.value,
         opened_at=position.opened_at,
         closed_at=now,
-        net_pnl_usd=plain_money_str(close.net_pnl_usd),
+        net_pnl_usd=money_str(close.net_pnl_usd),
         idempotency_key=intent.idempotency_key,
         payload_json=json.dumps(trade_payload, sort_keys=True),
         order_id=order_id,

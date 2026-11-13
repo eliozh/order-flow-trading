@@ -100,7 +100,7 @@ def pos_show(
     position_id: str,
     json_output: Annotated[bool, typer.Option("--json", help="Emit JSON.")] = False,
 ) -> None:
-    """Show one position, its fills, and its management history."""
+    """Show one position and its management history."""
     settings = _settings_or_exit(json_output)
     try:
         envelope = ApiClient.from_settings(settings).get_position(position_id)

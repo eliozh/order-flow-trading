@@ -1,5 +1,6 @@
-"""The simulated paper account: a 10,000 USDT seed plus read models (D3).
+"""The simulated paper account: a 10,000 USDT seed plus read models.
 
+The seed is inserted exactly once and is never overwritten by a live balance.
 Equity is only ever ``cash + marked_value``, where a LONG open position
 contributes ``+size × recorded mark`` and a SHORT contributes ``−size ×
 recorded mark`` (the liability to buy it back). When any open position has no
@@ -92,8 +93,10 @@ def compute_equity(
 
 
 def _money_term(payload: Mapping[str, Any], key: str) -> Decimal:
-    """Parse one finite decimal money term from a trade-log payload."""
-    value = Decimal(str(payload.get(key, "0")))
+    """Parse one required, finite decimal money term from a trade-log payload."""
+    if key not in payload:
+        raise KeyError(f"trade-log payload is missing {key}")
+    value = Decimal(str(payload[key]))
     if not value.is_finite():
         raise ValueError(f"trade-log {key} must be finite")
     return value
@@ -138,11 +141,12 @@ class PaperAccountService:
         explicit read model so the journal and CLI can show them without
         re-deriving them from fills.
 
-        Corruption policy (P4): a trade log whose payload is not valid JSON, is
-        valid JSON that is not an object (``[]``, ``null``, ``"x"``), or does
-        not carry finite decimal money terms is skipped deterministically,
-        named in a warning, and left out of the totals. The read model keeps
-        serving instead of raising on one bad row, and the skip is never silent.
+        Corruption policy: a trade log whose payload is not valid JSON, is
+        valid JSON that is not an object (``[]``, ``null``, ``"x"``), omits
+        either required money term (``net_pnl_usd``/``fees_usd``), or does not
+        carry finite decimal money terms is skipped deterministically, named in
+        a warning, and left out of the totals. The read model keeps serving
+        instead of raising on one bad row, and the skip is never silent.
         """
         realized = Decimal("0")
         fees = Decimal("0")
@@ -154,9 +158,13 @@ class PaperAccountService:
                 payload = json.loads(record.payload_json)
                 if not isinstance(payload, Mapping):
                     raise ValueError("trade-log payload must be a JSON object")
-                realized += _money_term(payload, "net_pnl_usd")
-                fees += _money_term(payload, "fees_usd")
-            except (json.JSONDecodeError, TypeError, ValueError, ArithmeticError):
+                # Parse both terms before accumulating so a row missing one is
+                # skipped whole, never counted as a partial zero-or-value.
+                net_term = _money_term(payload, "net_pnl_usd")
+                fee_term = _money_term(payload, "fees_usd")
+                realized += net_term
+                fees += fee_term
+            except (json.JSONDecodeError, KeyError, TypeError, ValueError, ArithmeticError):
                 _LOGGER.warning(
                     "skipping corrupt trade log %s; totals exclude this row",
                     record.trade_id,

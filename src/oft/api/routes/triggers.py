@@ -23,8 +23,8 @@ from oft.api.idempotency import (
 from oft.api.idempotency import (
     request_hash as compute_request_hash,
 )
+from oft.api.schemas.envelope import Envelope
 from oft.api.schemas.trigger import (
-    Envelope,
     TriggerAcceptData,
     TriggerEvaluateData,
     TriggerEvaluateRequest,

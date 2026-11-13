@@ -110,7 +110,7 @@ def paper_equity(request: Request) -> dict[str, Any]:
             "closed_trades": summary["closed_trades"],
             "stale_inputs": summary["stale_inputs"],
             "updated_at": summary["updated_at"],
-            "note": "PnL, funding, and paper reset are out of scope in this slice.",
+            "note": "Funding accrual and paper reset are out of scope in this slice.",
         },
         request_id=new_request_id(),
         provenance="CALC",

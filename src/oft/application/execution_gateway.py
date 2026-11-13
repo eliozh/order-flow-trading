@@ -33,7 +33,7 @@ def _decimal_or_zero(value: object) -> Decimal | None:
     """Parse a measured decimal; only ``None`` means "not measured".
 
     ``daily_loss_usd`` is persisted as SQL ``NULL`` when unmeasured and as the
-    string ``"0"`` for a measured zero, so the digest stays stable (P4).
+    string ``"0"`` for a measured zero, so the digest stays stable.
     """
     if value is None:
         return None
@@ -138,7 +138,7 @@ class ExecutionGateway:
             raise GatewayError("ORDER_DUPLICATE", f"order already exists: {payload['order_id']}")
 
         if classification.risk_reducing:
-            self._bind_exit_to_verdict(intent, verdict)
+            self._bind_exit_to_verdict(intent, verdict, mark_price=mark_price)
         else:
             self._bind_to_verdict(intent, verdict, mark_price=mark_price)
 
@@ -178,6 +178,8 @@ class ExecutionGateway:
         self,
         intent: OrderIntent,
         record: RiskVerdictRecord,
+        *,
+        mark_price: Decimal,
     ) -> None:
         """Bind a reduce-only exit to its persisted verdict and target position.
 
@@ -185,6 +187,9 @@ class ExecutionGateway:
         verdict only has to belong to the same decision, cover the exit
         quantity, name the same symbol/side as the position, and the intent must
         be reduce-only against an OPEN position that carries a source trigger.
+        ADR-0006 also forbids trusting the caller: the submitted close mark must
+        equal the position's recorded mark, so an exit cannot be priced from an
+        invented or stale price that the position row does not carry.
         """
         if not intent.reduce_only:
             raise GatewayError("RISK_BLOCKED", "an exit intent must be reduce-only")
@@ -216,6 +221,23 @@ class ExecutionGateway:
         if str(source_trigger) != record.trigger_id:
             raise GatewayError(
                 "RISK_BLOCKED", "the risk verdict does not belong to the position's trigger"
+            )
+        self._require_recorded_mark(position_payload, mark_price)
+
+    @staticmethod
+    def _require_recorded_mark(position_payload: dict[str, object], mark_price: Decimal) -> None:
+        """Refuse a close whose mark is not exactly the position's recorded mark."""
+        raw_mark = position_payload.get("mark_price")
+        if raw_mark is None:
+            raise GatewayError("RISK_BLOCKED", "the position has no recorded mark")
+        try:
+            recorded = Decimal(str(raw_mark))
+        except ArithmeticError as exc:
+            raise GatewayError("RISK_BLOCKED", "the position mark is unreadable") from exc
+        if not recorded.is_finite() or recorded != mark_price:
+            raise GatewayError(
+                "RISK_BLOCKED",
+                "the submitted mark does not match the position's recorded mark",
             )
 
     def _bind_to_verdict(

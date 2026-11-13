@@ -6,6 +6,8 @@ from typing import Any
 
 from pydantic import BaseModel, ConfigDict
 
+from oft.api.schemas.envelope import Envelope, EnvelopeMeta
+
 
 class PositionListData(BaseModel):
     model_config = ConfigDict(extra="forbid")
@@ -29,26 +31,6 @@ class PositionMonitorData(BaseModel):
     trade_log: dict[str, Any] | None = None
     account: dict[str, Any] | None = None
     idempotent_replay: bool = False
-
-
-class EnvelopeMeta(BaseModel):
-    request_id: str
-    generated_at: str
-    duration_ms: int
-    provenance: str
-    data_quality: str | None
-    warnings: list[Any]
-    pagination: dict[str, Any] | None
-    idempotent_replay: bool
-
-
-class Envelope[T](BaseModel):
-    """The documented success envelope with a typed ``data`` payload."""
-
-    ok: bool
-    data: T
-    error: Any = None
-    meta: EnvelopeMeta
 
 
 __all__ = ["Envelope", "EnvelopeMeta", "PositionListData", "PositionMonitorData"]

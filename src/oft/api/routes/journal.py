@@ -2,7 +2,6 @@
 
 from __future__ import annotations
 
-import json
 from typing import Any
 
 from fastapi import APIRouter, Path, Query, Request
@@ -10,6 +9,7 @@ from fastapi import APIRouter, Path, Query, Request
 from oft.api.envelope import new_request_id, success_envelope
 from oft.api.errors import ApiError
 from oft.api.schemas.journal import Envelope, TradeLogListData
+from oft.application.payloads import decode_payload_json
 
 router = APIRouter()
 
@@ -36,12 +36,16 @@ def list_journal(
     request: Request,
     symbol: str | None = Query(default=None, max_length=24),
     limit: int = Query(default=100, ge=1, le=500),
-    offset: int = Query(default=0, ge=0),
+    offset: int = Query(default=0, ge=0, le=1_000_000),
 ) -> dict[str, Any]:
     store = request.app.state.container.store
     resolved_symbol = symbol.upper() if symbol else None
     records = store.list_trade_logs(symbol=resolved_symbol, limit=limit, offset=offset)
-    items = [trade_log_summary(json.loads(record.payload_json)) for record in records]
+    items: list[dict[str, Any]] = []
+    for record in records:
+        payload = decode_payload_json(record.payload_json, subject=f"trade log {record.trade_id}")
+        if payload is not None:
+            items.append(trade_log_summary(payload))
     total = store.count_trade_logs(symbol=resolved_symbol)
     has_next = offset + len(items) < total
     return success_envelope(
@@ -68,7 +72,9 @@ def read_journal_trade(
     record = store.get_trade_log(trade_id)
     if record is None:
         raise ApiError("NOT_FOUND", f"Trade {trade_id} does not exist.")
-    payload = json.loads(record.payload_json)
+    payload = decode_payload_json(record.payload_json, subject=f"trade log {trade_id}")
+    if payload is None:
+        raise ApiError("DATA_UNAVAILABLE", f"Trade {trade_id} payload is unreadable.")
     return success_envelope(
         payload,
         request_id=new_request_id(),

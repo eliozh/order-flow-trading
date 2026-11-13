@@ -113,5 +113,5 @@ def paper_fills(
 def paper_equity(
     json_output: Annotated[bool, typer.Option("--json", help="Emit JSON.")] = False,
 ) -> None:
-    """Show paper equity (balance; PnL/funding are out of scope)."""
+    """Show paper equity (balance, realized PnL, fees; funding accrual out of scope)."""
     _emit(_settings_or_exit(json_output), "equity", json_output)

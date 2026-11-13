@@ -2,8 +2,6 @@
 
 from __future__ import annotations
 
-import json
-import sqlite3
 from datetime import UTC, date, datetime
 from decimal import ROUND_DOWN, Decimal
 from pathlib import Path
@@ -18,6 +16,7 @@ from oft.bootstrap import build_container
 from oft.clock import FixedClock
 from oft.config import Settings
 from oft.domain.time import utc_timestamp
+from position_support import set_position_mark
 
 ROOT = Path(__file__).resolve().parents[2]
 ARCHIVE = ROOT / "tests" / "fixtures" / "archive"
@@ -25,22 +24,6 @@ FIXTURES = ROOT / "tests" / "fixtures" / "llm"
 START = date(2026, 10, 1)
 END = date(2026, 10, 7)
 NOW = datetime(2026, 11, 14, 12, 0, 0, tzinfo=UTC)
-
-
-def _set_mark(container: Any, position_id: str, mark: str, as_of: str) -> None:
-    database = container.settings.data_dir / "oft.db"
-    with sqlite3.connect(database) as connection:
-        row = connection.execute(
-            "SELECT payload_json FROM positions WHERE position_id = ?", (position_id,)
-        ).fetchone()
-        payload = json.loads(row[0])
-        payload["mark_price"] = mark
-        payload["updated_at"] = as_of
-        connection.execute(
-            "UPDATE positions SET payload_json = ? WHERE position_id = ?",
-            (json.dumps(payload, sort_keys=True), position_id),
-        )
-        connection.commit()
 
 
 def _run(tmp_path: Path) -> dict[str, Any]:
@@ -73,7 +56,12 @@ def _run(tmp_path: Path) -> dict[str, Any]:
     accepted = entry.accept(run.trigger.trigger_id, idempotency_key="replay-entry")
     assert accepted.position is not None
     position = accepted.position
-    _set_mark(container, position["position_id"], position["stop_price"], utc_timestamp(NOW))
+    set_position_mark(
+        container,
+        position["position_id"],
+        position["stop_price"],
+        utc_timestamp(NOW),
+    )
     service = PositionService(
         store=container.store, clock=container.clock, settings=container.settings
     )

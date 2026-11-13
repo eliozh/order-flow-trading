@@ -2,9 +2,9 @@
 
 from __future__ import annotations
 
-from typing import Any
-
 from pydantic import BaseModel, ConfigDict
+
+from oft.api.schemas.envelope import Envelope, EnvelopeMeta
 
 
 class TradeLogSummary(BaseModel):
@@ -28,24 +28,6 @@ class TradeLogListData(BaseModel):
 
     items: list[TradeLogSummary]
     total: int
-
-
-class EnvelopeMeta(BaseModel):
-    request_id: str
-    generated_at: str
-    duration_ms: int
-    provenance: str
-    data_quality: str | None
-    warnings: list[Any]
-    pagination: dict[str, Any] | None
-    idempotent_replay: bool
-
-
-class Envelope[T](BaseModel):
-    ok: bool
-    data: T
-    error: Any = None
-    meta: EnvelopeMeta
 
 
 __all__ = ["Envelope", "EnvelopeMeta", "TradeLogListData", "TradeLogSummary"]

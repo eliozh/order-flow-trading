@@ -2158,6 +2158,36 @@ def test_v21_database_migrates_to_v22_with_the_journal_tables(tmp_path: Path) ->
     } <= trade_log_fks
 
 
+def test_v22_backfills_source_trigger_id_from_the_entry_order(tmp_path: Path) -> None:
+    settings = _v21_settings(tmp_path)
+    connection = sqlite3.connect(database_path(settings))
+    try:
+        connection.execute(
+            "UPDATE orders SET payload_json = ? WHERE order_id = 'ORD-1'",
+            (json.dumps({"position_id": "POS-1", "status": "FILLED"}),),
+        )
+        connection.execute(
+            "UPDATE positions SET payload_json = ? WHERE position_id = 'POS-1'",
+            (json.dumps({"position_id": "POS-1", "state": "OPEN"}),),
+        )
+        connection.commit()
+    finally:
+        connection.close()
+
+    SqliteStore(settings).initialize()
+    SqliteStore(settings).initialize()  # idempotent, keeps the backfill
+
+    connection = sqlite3.connect(database_path(settings))
+    try:
+        raw = connection.execute(
+            "SELECT payload_json FROM positions WHERE position_id = 'POS-1'"
+        ).fetchone()[0]
+    finally:
+        connection.close()
+    payload = json.loads(raw)
+    assert payload["source_trigger_id"] == "TRG-1"
+
+
 def test_v22_tables_match_between_a_fresh_and_a_migrated_database(tmp_path: Path) -> None:
     migrated_settings = _v21_settings(tmp_path / "migrated")
     SqliteStore(migrated_settings).initialize()

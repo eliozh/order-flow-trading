@@ -308,7 +308,8 @@ _POSITION_EVENTS_DEFINITION = f"""
 """
 _TRADE_LOGS_TABLE = f"CREATE TABLE IF NOT EXISTS trade_logs ({_TRADE_LOGS_DEFINITION});"
 # The journal reads with ``ORDER BY closed_at DESC, trade_id ASC``; the
-# composite indexes match that order (D1) and index the FK child column (D4).
+# composite indexes match that exact order, and the account index covers the
+# foreign-key child column so a parent delete/update is not a full scan.
 _TRADE_LOGS_INDEX_NAMES = (
     "trade_logs_closed",
     "trade_logs_symbol_closed",
@@ -1900,12 +1901,76 @@ def _v22_objects_present(connection: sqlite3.Connection) -> bool:
     return set(_POSITION_EVENTS_TRIGGER_NAMES) <= triggers
 
 
+def _backfill_position_source_trigger_ids(connection: sqlite3.Connection) -> None:
+    """Copy ``source_trigger_id`` from each position's ENTRY order into its payload.
+
+    Before this slice a position payload did not carry ``source_trigger_id``,
+    so the exit verdict had no real parent trigger and close failed as
+    ``DATA_UNAVAILABLE``. The order row already knows the trigger; the backfill
+    matches an ENTRY order by the ``position_id`` recorded in its payload and
+    writes the trigger id into the OPEN position's payload. No column is added;
+    a malformed row is skipped with a warning rather than aborting the upgrade.
+    """
+    if not (_table_exists(connection, "positions") and _table_exists(connection, "orders")):
+        return
+    position_columns = {row[1] for row in connection.execute("PRAGMA table_info(positions)")}
+    order_columns = {row[1] for row in connection.execute("PRAGMA table_info(orders)")}
+    if not {"position_id", "state", "payload_json"} <= position_columns:
+        return
+    if not {"trigger_id", "purpose", "payload_json"} <= order_columns:
+        return
+    triggers_by_position: dict[str, str] = {}
+    for row in connection.execute(
+        "SELECT trigger_id, payload_json FROM orders "
+        "WHERE purpose = 'ENTRY' AND trigger_id IS NOT NULL"
+    ):
+        try:
+            order_payload = json.loads(row[1])
+        except (json.JSONDecodeError, TypeError, ValueError):
+            _LOGGER.warning("skipping unreadable ENTRY order payload during v22 backfill")
+            continue
+        if not isinstance(order_payload, dict):
+            continue
+        position_id = order_payload.get("position_id")
+        if position_id is not None:
+            triggers_by_position.setdefault(str(position_id), str(row[0]))
+    if not triggers_by_position:
+        return
+    for row in connection.execute(
+        "SELECT position_id, payload_json FROM positions WHERE state = 'OPEN'"
+    ).fetchall():
+        try:
+            payload = json.loads(row[1])
+        except (json.JSONDecodeError, TypeError, ValueError):
+            _LOGGER.warning(
+                "skipping unreadable position payload during v22 backfill: %s",
+                row[0],
+            )
+            continue
+        if not isinstance(payload, dict) or payload.get("source_trigger_id"):
+            continue
+        position_id = str(payload.get("position_id") or row[0])
+        trigger_id = triggers_by_position.get(position_id)
+        if trigger_id is None:
+            _LOGGER.warning(
+                "no ENTRY order to backfill source_trigger_id for position %s", position_id
+            )
+            continue
+        payload["source_trigger_id"] = trigger_id
+        connection.execute(
+            "UPDATE positions SET payload_json = ? WHERE position_id = ?",
+            (json.dumps(payload, sort_keys=True), row[0]),
+        )
+
+
 def _migrate_v22(connection: sqlite3.Connection) -> None:
     """Add ``trade_logs`` and the append-only ``position_events`` timeline (v22).
 
-    Both tables are new, so no existing row is rewritten and no backfill runs.
-    ``IF NOT EXISTS`` plus the trigger drop/create makes the migration
-    idempotent; ``BEGIN IMMEDIATE`` serializes two concurrent initializers.
+    Both tables are new; the only data change is the ``source_trigger_id``
+    backfill for pre-v22 OPEN positions, which copies the trigger id already
+    recorded on the matching ENTRY order. ``IF NOT EXISTS`` plus the trigger
+    drop/create makes the migration idempotent; ``BEGIN IMMEDIATE`` serializes
+    two concurrent initializers and keeps the backfill in the same transaction.
     A fresh database has no ``positions`` table yet, so the migration is a
     no-op and ``_SCHEMA_SQL`` creates the full schema afterwards.
     """
@@ -1927,6 +1992,7 @@ def _migrate_v22(connection: sqlite3.Connection) -> None:
         connection.execute(_POSITION_EVENTS_TABLE)
         for statement in _POSITION_EVENTS_TRIGGERS:
             connection.execute(statement)
+        _backfill_position_source_trigger_ids(connection)
         connection.execute("COMMIT")
     except Exception:
         if connection.in_transaction:

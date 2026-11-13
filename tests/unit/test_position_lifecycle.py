@@ -16,10 +16,12 @@ from referencing.jsonschema import DRAFT202012
 from oft.domain.oms import Fill, OrderSide, Position, PositionSide
 from oft.domain.pnl import net_pnl_usd
 from oft.domain.positions import (
+    FULL_CLOSE,
     FUNDING_REASON,
     PositionError,
     close_full,
     evaluate_protective_exit,
+    management_decision_id,
     position_from_contract,
     trade_id_for,
     trade_log_from_close,
@@ -28,6 +30,7 @@ from oft.domain.positions import (
 ROOT = Path(__file__).resolve().parents[2]
 CONTRACTS = ROOT / "docs" / "contracts"
 NOW = "2026-11-14T12:00:00.000Z"
+DECISION_ID = management_decision_id("POS-TEST", Decimal("68980"), NOW)
 
 
 def _position(
@@ -108,8 +111,7 @@ def test_long_stop_is_touched_at_or_below_the_stop() -> None:
     assert exit_ is not None
     assert exit_.position_id == "POS-TEST"
     assert exit_.mark_price == Decimal("69000")
-    assert exit_.decision_id
-    assert exit_.event_id
+    assert exit_.rule == "STOP_TOUCH"
 
 
 def test_long_stop_above_the_stop_produces_no_decision() -> None:
@@ -133,16 +135,55 @@ def test_stop_on_the_wrong_side_fails_closed() -> None:
     assert excinfo.value.code == "POSITION_STATE_INVALID"
 
 
-def test_decision_and_event_ids_are_deterministic() -> None:
-    first = evaluate_protective_exit(_position(), Decimal("69000"), at=NOW)
-    second = evaluate_protective_exit(_position(), Decimal("69000"), at=NOW)
-    assert first is not None and second is not None
-    assert first.decision_id == second.decision_id
-    assert first.event_id == second.event_id
+def test_management_decision_id_is_deterministic_and_input_bound() -> None:
+    first = management_decision_id("POS-TEST", Decimal("68980"), NOW)
+    second = management_decision_id("POS-TEST", Decimal("68980"), NOW)
+    other_mark = management_decision_id("POS-TEST", Decimal("68981"), NOW)
+    other_time = management_decision_id("POS-TEST", Decimal("68980"), "2026-11-14T12:00:01.000Z")
+    assert first == second
+    assert other_mark != first
+    assert other_time != first
+
+
+def test_close_full_writes_the_caller_decision_id_once() -> None:
+    close = close_full(_position(), _fill(), at=NOW, decision_id=DECISION_ID)
+
+    assert close.event.decision_id == DECISION_ID
+    history = close.to_contract()["management_history"]
+    assert history[-1]["decision_id"] == DECISION_ID
+    assert history[-1]["action"] == FULL_CLOSE
+    assert history[-1]["executed_order_id"] == "ORD-EXIT"
+
+
+def test_close_result_rejects_a_net_that_contradicts_its_terms() -> None:
+    close = close_full(_position(), _fill(), at=NOW, decision_id=DECISION_ID)
+
+    with pytest.raises(ValueError):
+        replace(close, net_pnl_usd=close.net_pnl_usd + Decimal("1"))
+
+
+def test_a_non_finite_recorded_value_is_unavailable_not_a_crash() -> None:
+    payload = _position().to_contract()
+    payload["mark_price"] = "NaN"
+    with pytest.raises(PositionError) as excinfo:
+        position_from_contract(payload)
+    assert excinfo.value.code == "DATA_UNAVAILABLE"
+
+    payload = _position().to_contract()
+    payload["size"] = "Infinity"
+    with pytest.raises(PositionError) as excinfo:
+        position_from_contract(payload)
+    assert excinfo.value.code == "DATA_UNAVAILABLE"
+
+    payload = _position().to_contract()
+    payload["stop_price"] = "NaN"
+    with pytest.raises(PositionError) as excinfo:
+        position_from_contract(payload)
+    assert excinfo.value.code == "DATA_UNAVAILABLE"
 
 
 def test_close_full_produces_a_valid_closed_position_payload() -> None:
-    close = close_full(_position(), _fill(), at=NOW)
+    close = close_full(_position(), _fill(), at=NOW, decision_id=DECISION_ID)
     payload = close.to_contract()
 
     _validate("position.schema.json", payload)
@@ -166,7 +207,7 @@ def test_close_full_round_trips_through_the_contract_payload() -> None:
     open_position = _position()
     assert position_from_contract(open_position.to_contract()) == open_position
 
-    close = close_full(open_position, _fill(), at=NOW)
+    close = close_full(open_position, _fill(), at=NOW, decision_id=DECISION_ID)
     rebuilt = position_from_contract(close.to_contract())
     assert rebuilt.state == "CLOSED"
     assert rebuilt.realized_pnl_usd == close.net_pnl_usd
@@ -192,13 +233,13 @@ def test_close_full_rejects_a_wrong_side_or_partial_fill() -> None:
         )
 
     with pytest.raises(PositionError):
-        close_full(_position(), _sided(OrderSide.BUY, "0.01"), at=NOW)
+        close_full(_position(), _sided(OrderSide.BUY, "0.01"), at=NOW, decision_id=DECISION_ID)
     with pytest.raises(PositionError):
-        close_full(_position(), _sided(OrderSide.SELL, "0.005"), at=NOW)
+        close_full(_position(), _sided(OrderSide.SELL, "0.005"), at=NOW, decision_id=DECISION_ID)
 
 
 def test_trade_log_from_close_validates_and_holds_the_pnl_formula() -> None:
-    close = close_full(_position(), _fill(), at=NOW)
+    close = close_full(_position(), _fill(), at=NOW, decision_id=DECISION_ID)
     trade = trade_log_from_close(close, trade_id=trade_id_for("POS-TEST"))
 
     _validate("trade-log.schema.json", trade)
@@ -222,8 +263,8 @@ def test_trade_log_from_close_validates_and_holds_the_pnl_formula() -> None:
 
 
 def test_trade_log_emits_the_actual_funding_term() -> None:
-    """Funding is serialized from the close, not hardcoded to "0" (P1)."""
-    close = close_full(_position(), _fill(), at=NOW)
+    """Funding is serialized from the close, not hardcoded to "0"."""
+    close = close_full(_position(), _fill(), at=NOW, decision_id=DECISION_ID)
     funding = Decimal("-0.05")
     funded = replace(
         close,

@@ -47,7 +47,7 @@ def list_positions(
     request: Request,
     state: str | None = Query(default=None, pattern=_STATE_PATTERN),
     limit: int = Query(default=100, ge=1, le=500),
-    offset: int = Query(default=0, ge=0),
+    offset: int = Query(default=0, ge=0, le=1_000_000),
 ) -> dict[str, Any]:
     service = _service(request)
     resolved_state = state.upper() if state else None
@@ -82,6 +82,8 @@ def read_position(
         payload = _service(request).show(position_id)
     except PositionNotFound as exc:
         raise ApiError("NOT_FOUND", exc.message) from exc
+    except PositionCloseError as exc:
+        raise _api_error(exc) from exc
     return success_envelope(
         payload,
         request_id=new_request_id(),

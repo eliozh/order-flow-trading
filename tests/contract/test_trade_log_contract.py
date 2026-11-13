@@ -13,22 +13,7 @@ from _registry import validate
 
 from oft.application.position_service import PositionService
 from oft.domain.oms import Position, PositionSide
-
-
-def _set_mark(container: Any, position_id: str, mark: str, as_of: str) -> None:
-    database = container.settings.data_dir / "oft.db"
-    with sqlite3.connect(database) as connection:
-        row = connection.execute(
-            "SELECT payload_json FROM positions WHERE position_id = ?", (position_id,)
-        ).fetchone()
-        payload = json.loads(row[0])
-        payload["mark_price"] = mark
-        payload["updated_at"] = as_of
-        connection.execute(
-            "UPDATE positions SET payload_json = ? WHERE position_id = ?",
-            (json.dumps(payload, sort_keys=True), position_id),
-        )
-        connection.commit()
+from position_support import set_position_mark
 
 
 def _close(tmp_path: Path) -> tuple[dict[str, Any], dict[str, Any]]:
@@ -36,7 +21,7 @@ def _close(tmp_path: Path) -> tuple[dict[str, Any], dict[str, Any]]:
     container = loop["container"]
     position = loop["result"].position
     assert position is not None
-    _set_mark(
+    set_position_mark(
         container,
         position["position_id"],
         position["stop_price"],
@@ -114,7 +99,7 @@ def test_closed_position_validates_the_position_contract(tmp_path: Path) -> None
 
 
 def test_zero_fee_zero_net_close_serializes_money_as_plain_decimals() -> None:
-    """An exact zero must be "0", never the exponent form that fails `money` (P3)."""
+    """An exact zero must be "0", never the exponent form that fails `money`."""
     position = Position(
         position_id="POS-ZERO",
         account_id="ACC-PAPER",

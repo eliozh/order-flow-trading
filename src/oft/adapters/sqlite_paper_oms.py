@@ -158,11 +158,14 @@ def _mark_position_closed(connection: sqlite3.Connection, record: ClosedPosition
 
 def _insert_position_event(connection: sqlite3.Connection, event: PositionEventRecord) -> None:
     """Append the event at the next contiguous sequence for the position."""
-    sequence = connection.execute(
-        "SELECT COALESCE(MAX(seq), 0) + 1 AS next FROM position_events WHERE position_id = ?",
-        (event.position_id,),
-    ).fetchone()
-    seq = int(sequence["next"]) if sequence is not None else 1
+    if event.seq is None:
+        sequence = connection.execute(
+            "SELECT COALESCE(MAX(seq), 0) + 1 AS next FROM position_events WHERE position_id = ?",
+            (event.position_id,),
+        ).fetchone()
+        seq = int(sequence["next"]) if sequence is not None else 1
+    else:
+        seq = event.seq
     connection.execute(
         """
         INSERT INTO position_events (
@@ -553,6 +556,15 @@ class PaperOmsStoreMixin(SqliteConnectionMixin, SqliteAuditMixin):
         finally:
             connection.close()
         return _row_to_position(row) if row is not None else None
+
+    def update_open_position_payload(self, position_id: str, *, payload_json: str) -> bool:
+        """Update only an OPEN position row; a CLOSED row is left untouched."""
+        with closing(self._connect()) as connection, connection:
+            updated = connection.execute(
+                "UPDATE positions SET payload_json = ? WHERE position_id = ? AND state = 'OPEN'",
+                (payload_json, position_id),
+            )
+            return updated.rowcount == 1
 
     def get_trade_log(self, trade_id: str) -> TradeLogRecord | None:
         connection = self._connect_read_only()

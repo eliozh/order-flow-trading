@@ -104,9 +104,13 @@ def intent_hash(payload: Mapping[str, Any]) -> str:
 
 
 def client_order_id(environment: str, symbol: str, purpose: str, intent_hash_value: str) -> str:
-    """``oft-{env}-{symbol}-{purpose}-{hash[:16]}`` (ADR-0006)."""
+    """``oft-{env}-{symbol}-{purpose}-{hash[:16]}`` (ADR-0006).
+
+    ``purpose`` is normalized to upper case on the intent; the id component
+    stays lower case so an entry id does not change shape between callers.
+    """
     digest = hashlib.sha256(intent_hash_value.encode("utf-8")).hexdigest()[:16]
-    return f"oft-{environment.lower()}-{symbol}-{purpose}-{digest}"[:64]
+    return f"oft-{environment.lower()}-{symbol}-{purpose.lower()}-{digest}"[:64]
 
 
 def deterministic_id(prefix: str, seed: str) -> str:
@@ -195,6 +199,27 @@ class Position:
     def __post_init__(self) -> None:
         if self.state not in {PositionState.OPEN, PositionState.CLOSED}:
             raise ValueError("this slice only creates OPEN or CLOSED positions")
+        # A corrupt persisted row ("NaN"/"Infinity") must fail as unavailable
+        # data instead of raising ``InvalidOperation`` during a comparison.
+        for name in (
+            "size",
+            "entry_price",
+            "avg_entry_price",
+            "notional_usd",
+            "margin_usd",
+            "risk_amount_usd",
+            "fees_usd",
+            "funding_usd",
+        ):
+            if not getattr(self, name).is_finite():
+                raise ValueError(f"position {name} must be finite")
+        for name in ("mark_price", "stop_price", "exit_price", "realized_pnl_usd"):
+            value = getattr(self, name)
+            if value is not None and not value.is_finite():
+                raise ValueError(f"position {name} must be finite")
+        for price in self.target_prices:
+            if not price.is_finite():
+                raise ValueError("position target prices must be finite")
         if self.size <= 0:
             raise ValueError("position size must be positive")
         if self.state == PositionState.OPEN:

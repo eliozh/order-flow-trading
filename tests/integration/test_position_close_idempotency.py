@@ -16,6 +16,7 @@ from oft.application.execution_gateway import (
     AuthContext,
     ExecutionGateway,
     GatewayError,
+    classify_intent,
 )
 from oft.application.kill_switch import KillSwitch, KillSwitchActive
 from oft.application.paper_broker import OrderIntent, PaperBroker
@@ -38,6 +39,7 @@ from oft.ports.store import (
     RiskVerdictRecord,
     TradeLogRecord,
 )
+from position_support import set_position_mark
 
 ROOT = Path(__file__).resolve().parents[2]
 ARCHIVE = ROOT / "tests" / "fixtures" / "archive"
@@ -93,25 +95,9 @@ def _setup(tmp_path: Path) -> dict[str, Any]:
     }
 
 
-def _set_mark(container: Any, position_id: str, mark: str, *, as_of: str) -> None:
-    database = container.settings.data_dir / "oft.db"
-    with sqlite3.connect(database) as connection:
-        row = connection.execute(
-            "SELECT payload_json FROM positions WHERE position_id = ?", (position_id,)
-        ).fetchone()
-        payload = json.loads(row[0])
-        payload["mark_price"] = mark
-        payload["updated_at"] = as_of
-        connection.execute(
-            "UPDATE positions SET payload_json = ? WHERE position_id = ?",
-            (json.dumps(payload, sort_keys=True), position_id),
-        )
-        connection.commit()
-
-
 def _touch_stop(setup: dict[str, Any]) -> None:
     position = setup["position"]
-    _set_mark(
+    set_position_mark(
         setup["container"],
         position["position_id"],
         position["stop_price"],
@@ -140,10 +126,13 @@ def _exit_intent(
     risk_verdict_id: str,
     decision_id: str,
     quantity: str | None = None,
+    symbol: str | None = None,
+    position_id: str | None = None,
+    position_side: PositionSide | None = None,
 ) -> OrderIntent:
-    side = PositionSide(str(position["side"]))
+    side = position_side or PositionSide(str(position["side"]))
     return OrderIntent(
-        symbol=position["symbol"],
+        symbol=symbol or position["symbol"],
         side=OrderSide.SELL if side is PositionSide.LONG else OrderSide.BUY,
         order_type=OrderType.MARKET,
         quantity=Decimal(quantity or position["size"]),
@@ -159,7 +148,7 @@ def _exit_intent(
         risk_amount_usd=Decimal("0"),
         risk_pct=0.0,
         purpose="exit",
-        position_id=position["position_id"],
+        position_id=position["position_id"] if position_id is None else position_id,
         reduce_only=True,
         trigger_id=position.get("source_trigger_id"),
     )
@@ -185,6 +174,44 @@ def test_replaying_the_same_inputs_returns_the_original_and_creates_nothing(
     assert len(container.store.list_fills()) == 2
     assert len(container.store.list_trade_logs(limit=None)) == 1
     assert container.store.count_positions() == 1
+
+
+@pytest.mark.parametrize("component", ["order", "fill"])
+def test_a_corrupt_replayed_exit_payload_is_data_unavailable(
+    tmp_path: Path, component: str
+) -> None:
+    setup = _setup(tmp_path)
+    container = setup["container"]
+    position_id = setup["position"]["position_id"]
+    first = _close(setup)
+    assert first.idempotent_replay is False
+    orders_before = container.store.count_orders()
+    fills_before = container.store.count_fills()
+    trades_before = container.store.count_trade_logs()
+    database = container.settings.data_dir / "oft.db"
+    with sqlite3.connect(database) as connection:
+        if component == "order":
+            connection.execute(
+                "UPDATE orders SET payload_json = ? WHERE purpose = 'EXIT'",
+                ("not json",),
+            )
+        else:
+            connection.execute(
+                "UPDATE fills SET payload_json = ? WHERE order_id IN "
+                "(SELECT order_id FROM orders WHERE purpose = 'EXIT')",
+                ("not json",),
+            )
+        connection.commit()
+
+    with pytest.raises(PositionCloseError) as excinfo:
+        setup["service"].monitor(position_id)
+
+    assert excinfo.value.code == "DATA_UNAVAILABLE"
+    assert component in excinfo.value.message
+    # The replay degraded loudly; it created nothing.
+    assert container.store.count_orders() == orders_before
+    assert container.store.count_fills() == fills_before
+    assert container.store.count_trade_logs() == trades_before
 
 
 def test_a_different_payload_under_the_same_key_is_an_idempotency_conflict(
@@ -303,6 +330,21 @@ def test_kill_switch_still_blocks_a_risk_increasing_intent(tmp_path: Path) -> No
         )
 
     assert len(container.store.list_orders()) == 1
+    # The blocked intent's own classification is audited before the switch
+    # decision, so a killed risk-increasing intent is never invisible.
+    classified = [
+        json.loads(event.payload_json)
+        for event in container.store.list_audit_events(limit=100)
+        if event.event_type == "INTENT_CLASSIFIED"
+    ]
+    blocked = [
+        entry
+        for entry in classified
+        if (entry.get("subject") or {}).get("id") == "risk-increasing-blocked"
+    ]
+    assert blocked
+    assert blocked[0]["payload"]["risk_reducing"] is False
+    assert blocked[0]["payload"]["purpose"] == "ENTRY"
 
 
 def test_a_missing_exit_verdict_is_rejected_before_the_broker(tmp_path: Path) -> None:
@@ -428,19 +470,46 @@ def test_a_position_without_a_source_trigger_fails_closed(tmp_path: Path) -> Non
     assert container.store.list_trade_logs(limit=None) == ()
 
 
-def test_save_close_is_atomic_when_the_position_is_no_longer_open(tmp_path: Path) -> None:
+def test_save_close_rolls_back_a_successful_flip_when_the_trade_log_conflicts(
+    tmp_path: Path,
+) -> None:
     setup = _setup(tmp_path)
     container = setup["container"]
     position = setup["position"]
     position_id = position["position_id"]
-    _close(setup)
-    closed_record = container.store.get_position(position_id)
-    trade = container.store.get_trade_log_for_position(position_id)
     account = container.store.get_paper_account("ACC-PAPER")
-    exit_order = container.store.get_order(trade.order_id)
-    assert closed_record is not None and trade is not None
-    assert account is not None and exit_order is not None
+    entry_order = next(order for order in container.store.list_orders() if order.purpose == "ENTRY")
+    entry_fill = container.store.get_fill_by_order_id(entry_order.order_id)
+    assert account is not None and entry_fill is not None
+    assert entry_order.decision_id is not None
     now = utc_timestamp(NOW)
+    # Seed an OPEN position with a conflicting trade-log row for the same
+    # position. The close flips the position successfully, then the unique
+    # trade-log insert must roll the whole unit back.
+    database = container.settings.data_dir / "oft.db"
+    with sqlite3.connect(database) as connection:
+        connection.execute(
+            "INSERT INTO trade_logs (trade_id, position_id, account_id, environment, symbol, "
+            "side, opened_at, closed_at, net_pnl_usd, idempotency_key, payload_json, order_id, "
+            "fill_id, risk_verdict_id, decision_id) "
+            "VALUES ('TRD-CONFLICT', ?, ?, 'PAPER', ?, ?, ?, ?, '0', 'idem-conflict', '{}', ?, "
+            "?, ?, ?)",
+            (
+                position_id,
+                account.account_id,
+                position["symbol"],
+                position["side"],
+                position["opened_at"],
+                now,
+                entry_order.order_id,
+                entry_fill.fill_id,
+                entry_order.risk_verdict_id,
+                entry_order.decision_id,
+            ),
+        )
+        connection.commit()
+    open_record = container.store.get_position(position_id)
+    assert open_record is not None and open_record.state == "OPEN"
     rollback = ClosedPositionRecord(
         order=OrderRecord(
             order_id="ORD-ROLLBACK",
@@ -448,13 +517,13 @@ def test_save_close_is_atomic_when_the_position_is_no_longer_open(tmp_path: Path
             environment="PAPER",
             symbol=position["symbol"],
             status="FILLED",
-            risk_verdict_id=exit_order.risk_verdict_id,
+            risk_verdict_id=entry_order.risk_verdict_id,
             idempotency_key="idem-rollback",
             created_at=now,
             updated_at=now,
             payload_json="{}",
             trigger_id=position["source_trigger_id"],
-            decision_id=trade.decision_id,
+            decision_id=entry_order.decision_id,
             purpose="EXIT",
         ),
         fill=FillRecord(
@@ -465,7 +534,7 @@ def test_save_close_is_atomic_when_the_position_is_no_longer_open(tmp_path: Path
             filled_at=now,
             payload_json="{}",
         ),
-        position=closed_record,
+        position=open_record,
         account=PaperAccountRecord(
             account_id=account.account_id,
             environment=account.environment,
@@ -477,7 +546,7 @@ def test_save_close_is_atomic_when_the_position_is_no_longer_open(tmp_path: Path
         balance_delta="1.00",
         event=PositionEventRecord(
             position_id=position_id,
-            seq=0,
+            seq=None,
             at=now,
             action="FULL_CLOSE",
             order_id="ORD-ROLLBACK",
@@ -492,26 +561,29 @@ def test_save_close_is_atomic_when_the_position_is_no_longer_open(tmp_path: Path
             side=position["side"],
             opened_at=position["opened_at"],
             closed_at=now,
-            net_pnl_usd="0",
+            net_pnl_usd="0.00000000",
             idempotency_key="idem-rollback",
             payload_json="{}",
             order_id="ORD-ROLLBACK",
             fill_id="FIL-ROLLBACK",
-            risk_verdict_id=exit_order.risk_verdict_id,
-            decision_id=trade.decision_id,
+            risk_verdict_id=entry_order.risk_verdict_id,
+            decision_id=entry_order.decision_id,
         ),
     )
 
     with pytest.raises(OmsConflictError):
         container.store.save_close(rollback)
 
-    # Nothing from the failed unit of work was committed.
+    # The position flip that happened earlier in the transaction was rolled
+    # back: the row is still OPEN and nothing from the unit of work survives.
+    after_position = container.store.get_position(position_id)
+    assert after_position is not None and after_position.state == "OPEN"
     assert container.store.get_order("ORD-ROLLBACK") is None
     assert container.store.get_fill_by_order_id("ORD-ROLLBACK") is None
     assert container.store.get_trade_log("TRD-ROLLBACK") is None
-    assert container.store.get_trade_log_for_position(position_id) == trade
-    after = container.store.get_paper_account("ACC-PAPER")
-    assert after is not None and after.balance == account.balance
+    assert container.store.list_position_events(position_id) == ()
+    after_account = container.store.get_paper_account("ACC-PAPER")
+    assert after_account is not None and after_account.balance == account.balance
 
 
 def test_trade_log_read_models_filter_and_handle_missing_rows(tmp_path: Path) -> None:
@@ -529,3 +601,227 @@ def test_trade_log_read_models_filter_and_handle_missing_rows(tmp_path: Path) ->
     events = container.store.list_position_events(position["position_id"])
     assert len(events) == 1
     assert container.store.list_position_events("POS-MISSING") == ()
+
+
+def _seed_exit_verdict(
+    container: Any,
+    position: dict[str, Any],
+    *,
+    decision_id: str,
+    risk_verdict_id: str = "RISK-EXIT",
+    trigger_id: str | None = None,
+    allowed_quantity: str | None = None,
+) -> None:
+    container.store.save_decision(
+        DecisionRecord(
+            decision_id=decision_id,
+            role="POSITION_MANAGEMENT",
+            decision_type="POSITION_MANAGEMENT",
+            validation_status="VALID",
+            raw_output_hash="test",
+            persisted_at=utc_timestamp(NOW),
+            payload_json="{}",
+        )
+    )
+    expires_at = utc_timestamp(NOW + timedelta(seconds=30))
+    payload = {
+        "verdict": "ALLOW",
+        "requested": {
+            "entry_price": str(position["mark_price"]),
+            "stop_price": str(position["stop_price"]),
+            "quantity": str(position["size"]),
+            "risk_pct": 0.0,
+            "leverage": float(position["leverage"]),
+            "notional_usd": "1.00",
+        },
+        "allowed": {
+            "quantity": allowed_quantity or str(position["size"]),
+            "notional_usd": "1.00",
+            "leverage": float(position["leverage"]),
+            "risk_amount_usd": "0",
+        },
+        "binding_cap": "NONE",
+        "reasons": [],
+        "computed_at": utc_timestamp(NOW),
+        "expires_at": expires_at,
+        "inputs_hash": "test",
+        "stale_inputs": [],
+    }
+    container.store.save_risk_verdict(
+        RiskVerdictRecord(
+            risk_verdict_id=risk_verdict_id,
+            trigger_id=trigger_id or position["source_trigger_id"],
+            decision_id=decision_id,
+            verdict="ALLOW",
+            binding_cap="NONE",
+            computed_at=utc_timestamp(NOW),
+            expires_at=expires_at,
+            payload_json=json.dumps(payload),
+        )
+    )
+
+
+def _seed_other_trigger(container: Any) -> str:
+    database = container.settings.data_dir / "oft.db"
+    with sqlite3.connect(database) as connection:
+        connection.execute(
+            "INSERT INTO opportunities "
+            "(opportunity_id, symbol, state, created_at, updated_at, payload_json, expires_at) "
+            "VALUES ('OPP-OTHER', 'BTCUSDT', 'TRIGGERED', 't', 't', '{}', NULL)"
+        )
+        connection.execute(
+            "INSERT INTO trigger_events "
+            "(trigger_id, opportunity_id, symbol, status, idempotency_key, triggered_at, "
+            "payload_json) VALUES ('TRG-OTHER', 'OPP-OTHER', 'BTCUSDT', 'PENDING_RECHECK', "
+            "'TRG-OTHER-KEY', 't', '{}')"
+        )
+        connection.commit()
+    return "TRG-OTHER"
+
+
+@pytest.mark.parametrize(
+    "case",
+    [
+        "decision_mismatch",
+        "quantity_cap",
+        "position_missing",
+        "position_not_open",
+        "symbol_mismatch",
+        "side_mismatch",
+        "trigger_mismatch",
+        "mark_mismatch",
+        "missing_mark",
+    ],
+)
+def test_each_exit_binding_guard_is_typed_and_creates_no_order(tmp_path: Path, case: str) -> None:
+    setup = _setup(tmp_path)
+    container = setup["container"]
+    position = setup["position"]
+    position_id = position["position_id"]
+    set_position_mark(container, position_id, position["stop_price"], as_of=utc_timestamp(NOW))
+    verdict_decision = "DEC-EXIT-OK"
+    intent_decision = "DEC-EXIT-OK"
+    verdict_trigger = position["source_trigger_id"]
+    allowed_quantity: str | None = None
+    intent_overrides: dict[str, Any] = {}
+    mark = Decimal(str(position["stop_price"]))
+
+    if case == "decision_mismatch":
+        verdict_decision = "DEC-VERDICT-OTHER"
+    elif case == "quantity_cap":
+        allowed_quantity = str(Decimal(position["size"]) / Decimal("2"))
+    elif case == "position_missing":
+        intent_overrides["position_id"] = "POS-MISSING"
+    elif case == "position_not_open":
+        _close(setup)
+    elif case == "symbol_mismatch":
+        intent_overrides["symbol"] = "ETHUSDT"
+    elif case == "side_mismatch":
+        intent_overrides["position_side"] = (
+            PositionSide.SHORT if position["side"] == "LONG" else PositionSide.LONG
+        )
+    elif case == "trigger_mismatch":
+        verdict_trigger = _seed_other_trigger(container)
+    elif case == "mark_mismatch":
+        mark = mark + Decimal("1")
+    elif case == "missing_mark":
+        set_position_mark(container, position_id, None, as_of=utc_timestamp(NOW))
+
+    _seed_exit_verdict(
+        container,
+        position,
+        decision_id=verdict_decision,
+        trigger_id=verdict_trigger,
+        allowed_quantity=allowed_quantity,
+    )
+    before = container.store.count_orders()
+    gateway, _kill = _gateway(container)
+    intent = _exit_intent(
+        position,
+        idempotency_key=f"guard-{case}",
+        risk_verdict_id="RISK-EXIT",
+        decision_id=intent_decision,
+        **intent_overrides,
+    )
+
+    with pytest.raises(GatewayError) as excinfo:
+        gateway.submit(
+            intent,
+            AuthContext(actor_id="cli", approval_id=intent.approval_id),
+            mark_price=mark,
+            mark_as_of=utc_timestamp(NOW),
+        )
+
+    assert excinfo.value.code == "RISK_BLOCKED"
+    assert container.store.count_orders() == before
+
+
+def _bare_intent(**overrides: Any) -> OrderIntent:
+    values: dict[str, Any] = {
+        "symbol": "BTCUSDT",
+        "side": OrderSide.BUY,
+        "order_type": OrderType.MARKET,
+        "quantity": Decimal("0.01"),
+        "price": None,
+        "stop_price": Decimal("1.00"),
+        "take_profits": (),
+        "leverage": 1.0,
+        "decision_id": "DEC-BARE",
+        "risk_verdict_id": "RISK-BARE",
+        "approval_id": "APR-BARE",
+        "idempotency_key": "bare-intent",
+        "position_side": PositionSide.LONG,
+        "risk_amount_usd": Decimal("1.00"),
+        "risk_pct": 0.1,
+    }
+    values.update(overrides)
+    return OrderIntent(**values)
+
+
+def test_purpose_normalization_derives_reduce_only_from_the_one_representation() -> None:
+    entry_with_reduce_only = _bare_intent(purpose="entry", reduce_only=True)
+    assert entry_with_reduce_only.purpose == "ENTRY"
+    assert entry_with_reduce_only.reduce_only is False
+    assert classify_intent(entry_with_reduce_only).risk_reducing is False
+
+    exit_without_reduce_only = _bare_intent(purpose="exit", reduce_only=False)
+    assert exit_without_reduce_only.purpose == "EXIT"
+    assert exit_without_reduce_only.reduce_only is True
+    assert classify_intent(exit_without_reduce_only).risk_reducing is True
+
+    uppercase_exit = _bare_intent(purpose="EXIT", reduce_only=True)
+    assert uppercase_exit.purpose == "EXIT"
+    assert uppercase_exit.reduce_only is True
+    assert classify_intent(uppercase_exit).risk_reducing is True
+
+
+def test_a_non_exit_intent_is_never_treated_as_a_protective_exit(tmp_path: Path) -> None:
+    setup = _setup(tmp_path)
+    container = setup["container"]
+    position = setup["position"]
+    _seed_exit_verdict(
+        container,
+        position,
+        decision_id="DEC-NON-EXIT",
+        trigger_id=position["source_trigger_id"],
+    )
+    before = container.store.count_orders()
+    gateway, _kill = _gateway(container)
+    intent = _bare_intent(
+        decision_id="DEC-NON-EXIT",
+        risk_verdict_id="RISK-EXIT",
+        idempotency_key="non-exit-intent",
+        purpose="entry",
+        reduce_only=True,
+    )
+
+    with pytest.raises(GatewayError) as excinfo:
+        gateway.submit(
+            intent,
+            AuthContext(actor_id="cli", approval_id=intent.approval_id),
+            mark_price=Decimal("70000"),
+            mark_as_of=utc_timestamp(NOW),
+        )
+
+    assert excinfo.value.code == "RISK_BLOCKED"
+    assert container.store.count_orders() == before

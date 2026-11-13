@@ -12,18 +12,21 @@ from typing import Any
 
 import pytest
 
+from oft.adapters.parquet_store import ParquetStore
 from oft.application.entry_service import EntryService
 from oft.application.kill_switch import KillSwitch
 from oft.application.paper_account import PaperAccountService
 from oft.application.paper_broker import OrderIntent, PaperBroker
-from oft.application.position_service import PositionService
+from oft.application.position_service import PositionMonitorResult, PositionService
 from oft.application.scan_service import ScanRequest, ScanService
 from oft.application.trigger_service import TriggerService
 from oft.bootstrap import build_container
 from oft.clock import FixedClock
 from oft.config import Settings
 from oft.domain.oms import OrderSide, OrderType, PositionSide
+from oft.domain.resampling import Bar
 from oft.domain.time import utc_timestamp
+from position_support import set_position_mark
 
 ROOT = Path(__file__).resolve().parents[2]
 ARCHIVE = ROOT / "tests" / "fixtures" / "archive"
@@ -42,6 +45,67 @@ def _settings(tmp_path: Path) -> Settings:
         llm_provider="stub",
         llm_fixtures_dir=FIXTURES,
     )
+
+
+def _bars_series(container: Any) -> tuple[str, str]:
+    """The period and metric version of the series the scan published."""
+    for entry in container.store.list_manifest():
+        if entry.data_type != "bars" or entry.symbol != "BTCUSDT" or not entry.metric_version:
+            continue
+        marker = "/period="
+        if marker in entry.path:
+            return entry.path.split(marker, 1)[1].split("/", 1)[0], entry.metric_version
+    raise AssertionError("the scan did not publish a bars series")
+
+
+def _seed_bar(
+    container: Any,
+    *,
+    close: Decimal,
+    bar_end: datetime,
+    period: str,
+    metric_version: str,
+    computed_at: str | None = None,
+    run_id: str = "test-fresh-bar",
+) -> None:
+    """Publish one recent recorded bar so the mark resolver can use it.
+
+    ``computed_at`` is the manifest ``created_at`` (it defaults to the bar's
+    end), so a test can make a series look newer in the manifest while its
+    newest usable bar is older, and vice versa.
+    """
+    bar_start = bar_end - timedelta(hours=4)
+    bar = Bar(
+        symbol="BTCUSDT",
+        period=period,
+        bar_start=bar_start,
+        bar_end=bar_end,
+        open=close,
+        high=close,
+        low=close,
+        close=close,
+        volume=Decimal("1"),
+        quote_volume=close,
+        trade_count=1,
+        taker_buy_volume=Decimal("0"),
+        source_mode="BACKFILL",
+    )
+    entry = ParquetStore(container.settings).write_bar_part(
+        (bar,),
+        symbol="BTCUSDT",
+        period=period,
+        window_start=bar_start,
+        window_end=bar_end,
+        metric_version=metric_version,
+        input_manifest_hash="test-input",
+        source_mode="BACKFILL",
+        source_digest="test-digest",
+        run_id=run_id,
+        computed_at=computed_at if computed_at is not None else utc_timestamp(bar_end),
+        data_quality="COMPLETE",
+        quality_reasons=(),
+    )
+    container.store.upsert_manifest_entry(entry)
 
 
 def _setup(tmp_path: Path) -> dict[str, Any]:
@@ -82,29 +146,6 @@ def _setup(tmp_path: Path) -> dict[str, Any]:
         "entry_fill": accepted.fill,
         "trigger_id": run.trigger.trigger_id,
     }
-
-
-def _set_mark(
-    container: Any,
-    position_id: str,
-    mark: str | None,
-    *,
-    as_of: str | None = None,
-) -> None:
-    database = container.settings.data_dir / "oft.db"
-    with sqlite3.connect(database) as connection:
-        row = connection.execute(
-            "SELECT payload_json FROM positions WHERE position_id = ?", (position_id,)
-        ).fetchone()
-        payload = json.loads(row[0])
-        payload["mark_price"] = mark
-        if as_of is not None:
-            payload["updated_at"] = as_of
-        connection.execute(
-            "UPDATE positions SET payload_json = ? WHERE position_id = ?",
-            (json.dumps(payload, sort_keys=True), position_id),
-        )
-        connection.commit()
 
 
 def _seed_short_entry_parents(container: Any) -> None:
@@ -191,7 +232,7 @@ def test_stop_touch_creates_one_order_fill_closed_row_and_trade_log(tmp_path: Pa
     position = setup["position"]
     position_id = position["position_id"]
     stop = position["stop_price"]
-    _set_mark(container, position_id, stop, as_of=utc_timestamp(NOW))
+    set_position_mark(container, position_id, stop, as_of=utc_timestamp(NOW))
 
     result = setup["service"].monitor(position_id)
 
@@ -248,7 +289,7 @@ def test_trade_log_accumulates_entry_and_exit_fees(tmp_path: Path) -> None:
     container = setup["container"]
     position = setup["position"]
     position_id = position["position_id"]
-    _set_mark(container, position_id, position["stop_price"], as_of=utc_timestamp(NOW))
+    set_position_mark(container, position_id, position["stop_price"], as_of=utc_timestamp(NOW))
 
     result = setup["service"].monitor(position_id)
     assert result.trade_log is not None
@@ -272,7 +313,7 @@ def test_a_mark_above_the_stop_creates_no_order(tmp_path: Path) -> None:
     position = setup["position"]
     position_id = position["position_id"]
     mark = str(float(position["stop_price"]) + 1)
-    _set_mark(container, position_id, mark, as_of=utc_timestamp(NOW))
+    set_position_mark(container, position_id, mark, as_of=utc_timestamp(NOW))
 
     result = setup["service"].monitor(position_id)
 
@@ -290,7 +331,7 @@ def test_a_stale_mark_creates_no_order_and_reports_data_stale(tmp_path: Path) ->
     position = setup["position"]
     position_id = position["position_id"]
     stale_at = utc_timestamp(NOW - timedelta(seconds=120))
-    _set_mark(container, position_id, position["stop_price"], as_of=stale_at)
+    set_position_mark(container, position_id, position["stop_price"], as_of=stale_at)
 
     result = setup["service"].monitor(position_id)
 
@@ -308,7 +349,7 @@ def test_a_missing_mark_is_reported_as_data_stale(tmp_path: Path) -> None:
     container = setup["container"]
     position = setup["position"]
     position_id = position["position_id"]
-    _set_mark(container, position_id, None, as_of=utc_timestamp(NOW))
+    set_position_mark(container, position_id, None, as_of=utc_timestamp(NOW))
 
     result = setup["service"].monitor(position_id)
 
@@ -324,7 +365,7 @@ def test_the_close_goes_through_the_execution_gateway(
     container = setup["container"]
     position = setup["position"]
     position_id = position["position_id"]
-    _set_mark(container, position_id, position["stop_price"], as_of=utc_timestamp(NOW))
+    set_position_mark(container, position_id, position["stop_price"], as_of=utc_timestamp(NOW))
     service = setup["service"]
     calls: list[dict[str, Any]] = []
     original = service._gateway.submit
@@ -349,7 +390,7 @@ def test_paper_equity_reports_realized_pnl_and_closed_fees(tmp_path: Path) -> No
     container = setup["container"]
     position = setup["position"]
     position_id = position["position_id"]
-    _set_mark(container, position_id, position["stop_price"], as_of=utc_timestamp(NOW))
+    set_position_mark(container, position_id, position["stop_price"], as_of=utc_timestamp(NOW))
 
     result = setup["service"].monitor(position_id)
     assert result.trade_log is not None
@@ -371,7 +412,7 @@ def test_a_long_full_close_changes_cash_by_exactly_its_net_pnl(tmp_path: Path) -
     position = setup["position"]
     position_id = position["position_id"]
     cash_before_entry = _starting_cash(container)
-    _set_mark(container, position_id, position["stop_price"], as_of=utc_timestamp(NOW))
+    set_position_mark(container, position_id, position["stop_price"], as_of=utc_timestamp(NOW))
 
     result = setup["service"].monitor(position_id)
 
@@ -386,7 +427,7 @@ def test_a_short_full_close_changes_cash_by_exactly_its_net_pnl(tmp_path: Path) 
     position = setup["position"]
     position_id = position["position_id"]
     cash_before_entry = _starting_cash(container)
-    _set_mark(container, position_id, position["stop_price"], as_of=utc_timestamp(NOW))
+    set_position_mark(container, position_id, position["stop_price"], as_of=utc_timestamp(NOW))
 
     result = setup["service"].monitor(position_id)
 
@@ -412,7 +453,7 @@ def test_an_open_short_entry_does_not_overstate_equity(tmp_path: Path) -> None:
     liability = Decimal(position["size"]) * Decimal(position["mark_price"])
     marked = Decimal(summary["unrealized_at_last_mark"])
     # An open SHORT is a liability, not an asset: equity is cash minus the
-    # marked buy-back cost, never cash plus the entry notional (H2).
+    # marked buy-back cost, never cash plus the entry notional.
     assert summary["open_positions"] == 1
     assert marked == -liability
     assert Decimal(summary["equity"]) == cash + marked
@@ -443,6 +484,8 @@ def test_a_fresh_account_reports_zero_totals_as_plain_decimals(tmp_path: Path) -
         "[]",
         "null",
         '"x"',
+        "{}",
+        '{"net_pnl_usd": "1.00"}',
     ],
 )
 def test_corrupt_trade_log_payloads_are_skipped_with_a_warning(
@@ -451,7 +494,12 @@ def test_corrupt_trade_log_payloads_are_skipped_with_a_warning(
     setup = _setup(tmp_path)
     container = setup["container"]
     position = setup["position"]
-    _set_mark(container, position["position_id"], position["stop_price"], as_of=utc_timestamp(NOW))
+    set_position_mark(
+        container,
+        position["position_id"],
+        position["stop_price"],
+        as_of=utc_timestamp(NOW),
+    )
     result = setup["service"].monitor(position["position_id"])
     assert result.trade_log is not None
     trade_id = result.trade_log["trade_id"]
@@ -475,3 +523,308 @@ def test_corrupt_trade_log_payloads_are_skipped_with_a_warning(
     assert summary["closed_trades"] == 0
     warnings = [record for record in caplog.records if record.levelno >= logging.WARNING]
     assert any(trade_id in record.getMessage() for record in warnings)
+
+
+# -- recorded-bar mark lookup (public surfaces only) -------------------------
+
+
+def _advance(setup: dict[str, Any], seconds: int) -> PositionService:
+    return PositionService(
+        store=setup["container"].store,
+        clock=FixedClock(NOW + timedelta(seconds=seconds)),
+        settings=setup["container"].settings,
+    )
+
+
+def test_a_fresh_recorded_bar_at_the_stop_closes_through_public_surfaces(
+    tmp_path: Path,
+) -> None:
+    setup = _setup(tmp_path)
+    container = setup["container"]
+    position = setup["position"]
+    position_id = position["position_id"]
+    period, version = _bars_series(container)
+    _seed_bar(
+        container,
+        close=Decimal(position["stop_price"]),
+        bar_end=NOW,
+        period=period,
+        metric_version=version,
+    )
+
+    result = setup["service"].monitor(position_id)
+
+    assert result.status == "CLOSED"
+    assert result.reason_code == "STOP_TOUCH"
+    assert result.trade_log is not None
+    assert len(container.store.list_orders()) == 2  # entry + exactly one exit
+    assert len(container.store.list_fills()) == 2
+    assert len(container.store.list_trade_logs(limit=None)) == 1
+    assert container.store.list_positions(state="OPEN") == ()
+    assert len(container.store.list_positions(state="CLOSED")) == 1
+    assert result.position["state"] == "CLOSED"
+
+
+def test_a_fresh_recorded_bar_above_the_stop_creates_no_order(tmp_path: Path) -> None:
+    setup = _setup(tmp_path)
+    container = setup["container"]
+    position = setup["position"]
+    period, version = _bars_series(container)
+    _seed_bar(
+        container,
+        close=Decimal(position["stop_price"]) + Decimal("1000"),
+        bar_end=NOW,
+        period=period,
+        metric_version=version,
+    )
+
+    result = setup["service"].monitor(position["position_id"])
+
+    assert result.status == "NO_ACTION"
+    assert result.reason_code == "STOP_NOT_TOUCHED"
+    assert len(container.store.list_orders()) == 1
+    assert container.store.list_trade_logs(limit=None) == ()
+
+
+def test_a_stale_recorded_bar_is_data_stale(tmp_path: Path) -> None:
+    setup = _setup(tmp_path)
+    container = setup["container"]
+    position = setup["position"]
+    period, version = _bars_series(container)
+    set_position_mark(
+        container,
+        position["position_id"],
+        str(Decimal(position["stop_price"]) + Decimal("1000")),
+        as_of=utc_timestamp(NOW - timedelta(days=1)),
+    )
+    _seed_bar(
+        container,
+        close=Decimal(position["stop_price"]),
+        bar_end=NOW,
+        period=period,
+        metric_version=version,
+    )
+
+    service = _advance(setup, int(container.settings.risk_stale_mark_seconds) + 1)
+    result = service.monitor(position["position_id"])
+
+    assert result.status == "NO_ACTION"
+    assert result.reason_code == "DATA_STALE"
+    assert len(container.store.list_orders()) == 1
+
+
+def test_the_freshest_series_wins_even_when_another_series_is_newer_in_the_manifest(
+    tmp_path: Path,
+) -> None:
+    setup = _setup(tmp_path)
+    container = setup["container"]
+    position = setup["position"]
+    position_id = position["position_id"]
+    period, version = _bars_series(container)
+    # The stored fallback is stale and away from the stop, so it can never mask
+    # a bar-derived observation.
+    set_position_mark(
+        container,
+        position_id,
+        str(Decimal(position["stop_price"]) + Decimal("1000")),
+        as_of=utc_timestamp(NOW - timedelta(days=1)),
+    )
+    # Manifest-newest series, but its latest usable bar is two hours old.
+    _seed_bar(
+        container,
+        close=Decimal(position["stop_price"]) + Decimal("1000"),
+        bar_end=NOW - timedelta(hours=2),
+        period=period,
+        metric_version=version,
+        computed_at=utc_timestamp(NOW),
+        run_id="test-shadowing-series-bar",
+    )
+    # Fresher series: an older manifest row, but its bar close is at NOW and
+    # sits exactly on the stop.
+    _seed_bar(
+        container,
+        close=Decimal(position["stop_price"]),
+        bar_end=NOW,
+        period=period,
+        metric_version="ofi.v1.0123456789abcdef",
+        computed_at=utc_timestamp(NOW - timedelta(days=2)),
+        run_id="test-fresher-series-bar",
+    )
+
+    result = setup["service"].monitor(position_id)
+
+    assert result.status == "CLOSED"
+    assert result.reason_code == "STOP_TOUCH"
+    assert result.trade_log is not None
+    assert len(container.store.list_orders()) == 2  # entry + exactly one exit
+    assert len(container.store.list_trade_logs(limit=None)) == 1
+
+
+def test_a_bar_as_of_exactly_at_the_ttl_boundary_is_fresh(tmp_path: Path) -> None:
+    setup = _setup(tmp_path)
+    container = setup["container"]
+    position = setup["position"]
+    period, version = _bars_series(container)
+    ttl = int(container.settings.risk_stale_mark_seconds)
+    set_position_mark(
+        container,
+        position["position_id"],
+        str(Decimal(position["stop_price"]) + Decimal("1000")),
+        as_of=utc_timestamp(NOW - timedelta(days=1)),
+    )
+    _seed_bar(
+        container,
+        close=Decimal(position["stop_price"]) + Decimal("1000"),
+        bar_end=NOW,
+        period=period,
+        metric_version=version,
+    )
+
+    result = _advance(setup, ttl).monitor(position["position_id"])
+
+    assert result.reason_code == "STOP_NOT_TOUCHED"
+
+
+def test_a_bar_as_of_one_second_past_the_ttl_is_stale(tmp_path: Path) -> None:
+    setup = _setup(tmp_path)
+    container = setup["container"]
+    position = setup["position"]
+    period, version = _bars_series(container)
+    ttl = int(container.settings.risk_stale_mark_seconds)
+    set_position_mark(
+        container,
+        position["position_id"],
+        str(Decimal(position["stop_price"]) + Decimal("1000")),
+        as_of=utc_timestamp(NOW - timedelta(days=1)),
+    )
+    _seed_bar(
+        container,
+        close=Decimal(position["stop_price"]),
+        bar_end=NOW,
+        period=period,
+        metric_version=version,
+    )
+
+    result = _advance(setup, ttl + 1).monitor(position["position_id"])
+
+    assert result.reason_code == "DATA_STALE"
+    assert len(container.store.list_orders()) == 1
+
+
+def test_a_stored_mark_exactly_at_the_ttl_boundary_is_fresh(tmp_path: Path) -> None:
+    setup = _setup(tmp_path)
+    container = setup["container"]
+    position = setup["position"]
+    ttl = int(container.settings.risk_stale_mark_seconds)
+    set_position_mark(
+        container,
+        position["position_id"],
+        str(Decimal(position["stop_price"]) + Decimal("1000")),
+        as_of=utc_timestamp(NOW - timedelta(seconds=ttl)),
+    )
+
+    result = setup["service"].monitor(position["position_id"])
+
+    assert result.reason_code == "STOP_NOT_TOUCHED"
+
+
+def test_a_stored_mark_one_second_past_the_ttl_is_stale(tmp_path: Path) -> None:
+    setup = _setup(tmp_path)
+    container = setup["container"]
+    position = setup["position"]
+    ttl = int(container.settings.risk_stale_mark_seconds)
+    set_position_mark(
+        container,
+        position["position_id"],
+        position["stop_price"],
+        as_of=utc_timestamp(NOW - timedelta(seconds=ttl + 1)),
+    )
+
+    result = setup["service"].monitor(position["position_id"])
+
+    assert result.reason_code == "DATA_STALE"
+    assert len(container.store.list_orders()) == 1
+
+
+def test_an_unparseable_stored_mark_timestamp_fails_closed(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    setup = _setup(tmp_path)
+    container = setup["container"]
+    position = setup["position"]
+    # No usable bar may win the observation ranking, so the unparseable stored
+    # as-of is the chosen observation and ``_is_stale``'s parse guard decides.
+    monkeypatch.setattr(PositionService, "_latest_bar_mark", lambda self, position, now_dt: None)
+    set_position_mark(
+        container,
+        position["position_id"],
+        position["stop_price"],
+        as_of="not-a-timestamp",
+    )
+
+    result = setup["service"].monitor(position["position_id"])
+
+    assert result.status == "NO_ACTION"
+    assert result.reason_code == "DATA_STALE"
+    assert result.reason is not None and "older than" in result.reason
+    assert result.order is None and result.fill is None
+    assert len(container.store.list_orders()) == 1
+    assert container.store.list_trade_logs(limit=None) == ()
+    assert len(container.store.list_positions(state="OPEN")) == 1
+
+
+def test_one_decision_id_spans_history_decision_and_trade_log(tmp_path: Path) -> None:
+    setup = _setup(tmp_path)
+    container = setup["container"]
+    position = setup["position"]
+    position_id = position["position_id"]
+    set_position_mark(container, position_id, position["stop_price"], as_of=utc_timestamp(NOW))
+
+    result = setup["service"].monitor(position_id)
+
+    assert result.position is not None
+    history_decision_id = result.position["management_history"][-1]["decision_id"]
+    trade = container.store.get_trade_log_for_position(position_id)
+    assert trade is not None
+    assert trade.decision_id == history_decision_id
+    decision = container.store.get_decision(history_decision_id)
+    assert decision is not None
+    assert decision.role == "POSITION_MANAGEMENT"
+
+
+def test_trade_log_column_matches_the_payload_money_string(tmp_path: Path) -> None:
+    setup = _setup(tmp_path)
+    container = setup["container"]
+    position = setup["position"]
+    position_id = position["position_id"]
+    set_position_mark(container, position_id, position["stop_price"], as_of=utc_timestamp(NOW))
+
+    result = setup["service"].monitor(position_id)
+
+    assert result.trade_log is not None
+    trade = container.store.get_trade_log_for_position(position_id)
+    assert trade is not None
+    assert trade.net_pnl_usd == result.trade_log["net_pnl_usd"]
+
+
+def test_monitor_result_rejects_inconsistent_status_shapes() -> None:
+    with pytest.raises(ValueError):
+        PositionMonitorResult(
+            position_id="POS-1",
+            status="CLOSED",
+            reason_code="STOP_TOUCH",
+            action="FULL_CLOSE",
+        )
+    with pytest.raises(ValueError):
+        PositionMonitorResult(
+            position_id="POS-1",
+            status="NO_ACTION",
+            reason_code="DATA_STALE",
+            action="FULL_CLOSE",
+        )
+    with pytest.raises(ValueError):
+        PositionMonitorResult(
+            position_id="POS-1",
+            status="UNKNOWN",
+            reason_code="DATA_STALE",
+        )

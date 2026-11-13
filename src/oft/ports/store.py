@@ -538,16 +538,17 @@ class OmsCommit:
 class PositionEventRecord:
     """One append-only entry in a position's management timeline.
 
-    ``seq`` is assigned by the store inside the close transaction; callers pass
-    ``0`` and the adapter replaces it with the next contiguous sequence.
+    ``seq`` is ``None`` for a draft: the store assigns the next contiguous
+    sequence inside the close transaction. An explicit positive value is kept
+    as-is for tests and replay fixtures.
     """
 
     position_id: str
-    seq: int
     at: str
     action: str
     order_id: str | None
     note: str
+    seq: int | None = None
 
 
 @dataclass(frozen=True)
@@ -1047,6 +1048,15 @@ class StorePort(Protocol):
     def count_positions(self, *, state: str | None = None) -> int: ...
 
     def get_position(self, position_id: str) -> PositionRecord | None: ...
+
+    def update_open_position_payload(self, position_id: str, *, payload_json: str) -> bool:
+        """Replace an OPEN position's payload; ``False`` when it is not OPEN.
+
+        The caller owns the payload (including its version/``updated_at`` bump).
+        Only ``state = 'OPEN'`` rows change, so a concurrent close can never be
+        overwritten and no order is created for a stale tick.
+        """
+        ...
 
     def save_close(self, record: ClosedPositionRecord) -> CloseCommitResult:
         """Atomically commit a full close.

@@ -25,12 +25,14 @@ from referencing import Registry, Resource
 from referencing.jsonschema import DRAFT202012
 from typer.testing import CliRunner
 
+from oft.adapters.sqlite_store import SqliteStore
 from oft.api.app import create_app
 from oft.bootstrap import build_container
 from oft.cli.api_client import ApiClient, ApiClientError
 from oft.cli.main import app as cli_app
 from oft.config import Settings
 from oft.domain.time import utc_timestamp
+from position_support import set_position_mark
 
 ROOT = Path(__file__).resolve().parents[2]
 ARCHIVE = ROOT / "tests" / "fixtures" / "archive"
@@ -193,29 +195,12 @@ def _open_position(settings: Settings) -> dict[str, Any]:
     return accepted["data"]["position"]
 
 
-def _set_mark(settings: Settings, position_id: str, mark: str, *, as_of: str) -> None:
-    database = settings.data_dir / "oft.db"
-    with sqlite3.connect(database) as connection:
-        row = connection.execute(
-            "SELECT payload_json FROM positions WHERE position_id = ?",
-            (position_id,),
-        ).fetchone()
-        payload = json.loads(row[0])
-        payload["mark_price"] = mark
-        payload["updated_at"] = as_of
-        connection.execute(
-            "UPDATE positions SET payload_json = ? WHERE position_id = ?",
-            (json.dumps(payload, sort_keys=True), position_id),
-        )
-        connection.commit()
-
-
 def _now() -> str:
     return utc_timestamp(datetime.now(UTC))
 
 
 def _touch_stop(settings: Settings, position: dict[str, Any]) -> None:
-    _set_mark(settings, position["position_id"], position["stop_price"], as_of=_now())
+    set_position_mark(settings, position["position_id"], position["stop_price"], as_of=_now())
 
 
 def _mark_away_from_stop(position: dict[str, Any]) -> str:
@@ -329,7 +314,7 @@ def test_a_mark_that_does_not_touch_the_stop_creates_no_order(
     runner = CliRunner()
     position = _open_position(live_daemon)
     position_id = position["position_id"]
-    _set_mark(live_daemon, position_id, _mark_away_from_stop(position), as_of=_now())
+    set_position_mark(live_daemon, position_id, _mark_away_from_stop(position), as_of=_now())
 
     result = _json(runner.invoke(cli_app, ["pos", "monitor", position_id, "--json"]))
 
@@ -358,7 +343,7 @@ def test_a_stale_mark_creates_no_order_and_reports_data_stale(
     position_id = position["position_id"]
     stale_seconds = int(live_daemon.risk_stale_mark_seconds) + 60
     stale_at = utc_timestamp(datetime.now(UTC) - timedelta(seconds=stale_seconds))
-    _set_mark(live_daemon, position_id, position["stop_price"], as_of=stale_at)
+    set_position_mark(live_daemon, position_id, position["stop_price"], as_of=stale_at)
 
     result = _json(runner.invoke(cli_app, ["pos", "monitor", position_id, "--json"]))
 
@@ -452,3 +437,121 @@ def test_api_maps_missing_and_unbound_positions_to_catalog_errors(
     with pytest.raises(ApiClientError) as unbound:
         client.monitor_position(position["position_id"])
     assert unbound.value.code == "DATA_UNAVAILABLE"
+
+
+def test_a_mark_inside_the_stale_boundary_is_fresh(live_daemon: Settings) -> None:
+    runner = CliRunner()
+    position = _open_position(live_daemon)
+    ttl = int(live_daemon.risk_stale_mark_seconds)
+    fresh_at = utc_timestamp(datetime.now(UTC) - timedelta(seconds=ttl - 2))
+    set_position_mark(
+        live_daemon,
+        position["position_id"],
+        _mark_away_from_stop(position),
+        as_of=fresh_at,
+    )
+
+    result = _json(runner.invoke(cli_app, ["pos", "monitor", position["position_id"], "--json"]))
+
+    _validate_envelope(result)
+    assert result["data"]["reason_code"] == "STOP_NOT_TOUCHED"
+
+
+def test_a_mark_one_second_past_the_stale_boundary_is_stale(live_daemon: Settings) -> None:
+    runner = CliRunner()
+    position = _open_position(live_daemon)
+    ttl = int(live_daemon.risk_stale_mark_seconds)
+    stale_at = utc_timestamp(datetime.now(UTC) - timedelta(seconds=ttl + 1))
+    set_position_mark(
+        live_daemon,
+        position["position_id"],
+        position["stop_price"],
+        as_of=stale_at,
+    )
+
+    result = _json(runner.invoke(cli_app, ["pos", "monitor", position["position_id"], "--json"]))
+
+    _validate_envelope(result)
+    assert result["data"]["reason_code"] == "DATA_STALE"
+
+
+def test_an_unparseable_mark_timestamp_fails_closed(live_daemon: Settings) -> None:
+    runner = CliRunner()
+    position = _open_position(live_daemon)
+    # Publish no usable bars so the stored mark is the chosen observation and
+    # the unparseable as-of is decided by ``_is_stale``'s parse guard.
+    store = SqliteStore(live_daemon)
+    for entry in store.list_manifest():
+        if entry.data_type == "bars":
+            store.delete_manifest_entry(entry.path)
+    set_position_mark(
+        live_daemon,
+        position["position_id"],
+        position["stop_price"],
+        as_of="not-a-timestamp",
+    )
+
+    result = _json(runner.invoke(cli_app, ["pos", "monitor", position["position_id"], "--json"]))
+
+    _validate_envelope(result)
+    assert result["data"]["status"] == "NO_ACTION"
+    assert result["data"]["reason_code"] == "DATA_STALE"
+    assert "older than" in result["data"]["reason"]
+    assert _row_counts(live_daemon) == {
+        "positions": 1,
+        "orders": 1,
+        "fills": 1,
+        "trade_logs": 0,
+    }
+
+
+def test_list_offsets_are_bounded(live_daemon: Settings) -> None:
+    client = ApiClient.from_settings(live_daemon)
+
+    with pytest.raises(ApiClientError) as positions:
+        client._request("GET", "/api/v1/positions?offset=1000001")
+    assert positions.value.code == "VALIDATION_FAILED"
+    with pytest.raises(ApiClientError) as journal:
+        client._request("GET", "/api/v1/journal?offset=1000001")
+    assert journal.value.code == "VALIDATION_FAILED"
+
+
+def test_a_corrupt_position_row_does_not_break_the_read_routes(live_daemon: Settings) -> None:
+    client = ApiClient.from_settings(live_daemon)
+    position = _open_position(live_daemon)
+    database = live_daemon.data_dir / "oft.db"
+    with sqlite3.connect(database) as connection:
+        connection.execute(
+            "UPDATE positions SET payload_json = ? WHERE position_id = ?",
+            ("not json", position["position_id"]),
+        )
+        connection.commit()
+
+    listed = client._request("GET", "/api/v1/positions")
+    _validate_envelope(listed)
+    assert listed["data"]["items"] == []
+    with pytest.raises(ApiClientError) as excinfo:
+        client.get_position(position["position_id"])
+    assert excinfo.value.code == "DATA_UNAVAILABLE"
+
+
+def test_a_corrupt_trade_log_does_not_break_the_read_routes(live_daemon: Settings) -> None:
+    client = ApiClient.from_settings(live_daemon)
+    position = _open_position(live_daemon)
+    _touch_stop(live_daemon, position)
+    monitored = client.monitor_position(position["position_id"])
+    trade_id = monitored["data"]["trade_log"]["trade_id"]
+    database = live_daemon.data_dir / "oft.db"
+    with sqlite3.connect(database) as connection:
+        connection.execute(
+            "UPDATE trade_logs SET payload_json = ? WHERE trade_id = ?",
+            ("not json", trade_id),
+        )
+        connection.commit()
+
+    listed = client._request("GET", "/api/v1/journal")
+    _validate_envelope(listed)
+    assert listed["data"]["items"] == []
+    with pytest.raises(ApiClientError) as excinfo:
+        client.get_trade_log(trade_id)
+    assert excinfo.value.code == "DATA_UNAVAILABLE"

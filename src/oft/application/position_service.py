@@ -1,30 +1,48 @@
-"""Position management: read models, stop-touch evaluation, and the full close.
+"""Position management: read models, mark lookup, stop touch, and full close.
 
-The service owns the one deterministic management path in this slice: it reads
-the position's recorded mark, refuses to act on a missing or stale mark, applies
-the code-owned stop-touch rule, persists a management decision and an exit risk
-verdict, submits one reduce-only ``FULL_CLOSE`` through the execution gateway,
-and surfaces the single trade-log row the broker committed. No route or CLI
-calls the broker directly.
+The service owns the one deterministic management path in this slice: it
+resolves the position's latest recorded mark from published bars (falling back
+to the mark persisted on the position), refuses to act on a missing or stale
+mark, applies the code-owned stop-touch rule, persists a management decision and
+an exit risk verdict, submits one reduce-only ``FULL_CLOSE`` through the
+execution gateway, and surfaces the single trade-log row the broker committed.
+No route or CLI calls the broker directly.
+
+Mark lookup prefers the latest recorded bar close for the position's symbol and
+uses the bar's ``bar_end`` as the mark's as-of. When no bar series or usable row
+exists, the position payload's recorded ``mark_price``/``updated_at`` is the
+fallback. The newest recorded observation wins; the stale rule is applied
+unchanged to the chosen as-of, and a bar whose ``bar_end`` is in the future is
+never selected. A bar-derived mark is written to the position row immediately
+before a close so the gateway's independent re-read sees the same recorded mark.
 """
 
 from __future__ import annotations
 
 import hashlib
 import json
+import logging
+import re
 from dataclasses import dataclass
-from datetime import datetime, timedelta
+from datetime import UTC, datetime, timedelta
 from decimal import Decimal
-from typing import Any, cast
+from typing import Any
 
+from oft.adapters.parquet_store import read_bars
 from oft.application.execution_gateway import AuthContext, ExecutionGateway, GatewayError
 from oft.application.kill_switch import KillSwitch, record_audit
 from oft.application.paper_account import PaperAccountService
 from oft.application.paper_broker import BrokerError, BrokerResult, OrderIntent, PaperBroker
+from oft.application.payloads import decode_payload_json
 from oft.config import Settings
 from oft.domain.oms import OrderSide, OrderType, Position, PositionSide, deterministic_id
 from oft.domain.pnl import quantize_money
-from oft.domain.positions import PositionError, evaluate_protective_exit, position_from_contract
+from oft.domain.positions import (
+    PositionError,
+    evaluate_protective_exit,
+    management_decision_id,
+    position_from_contract,
+)
 from oft.domain.risk import (
     RISK_VERDICT_TTL_SECONDS,
     BindingCap,
@@ -40,14 +58,22 @@ from oft.ports.store import (
     PositionRecord,
     RiskVerdictRecord,
     StorePort,
+    StoreUnavailableError,
     TradeLogRecord,
 )
+
+_LOGGER = logging.getLogger(__name__)
 
 DATA_STALE = "DATA_STALE"
 STOP_NOT_TOUCHED = "STOP_NOT_TOUCHED"
 STOP_TOUCH = "STOP_TOUCH"
 CLOSED = "CLOSED"
 NO_ACTION = "NO_ACTION"
+
+_MARK_SOURCE_BARS = "BARS"
+_MARK_SOURCE_POSITION = "POSITION"
+_BARS_STATUSES = frozenset({"PUBLISHED", "COMPLETE"})
+_PERIOD_TOKEN = re.compile(r"(?:^|/)period=([^/]+)(?:/|$)")
 
 
 class PositionNotFound(Exception):
@@ -86,6 +112,15 @@ class PositionMonitorResult:
     account: dict[str, Any] | None = None
     idempotent_replay: bool = False
 
+    def __post_init__(self) -> None:
+        if self.status not in {NO_ACTION, CLOSED}:
+            raise ValueError(f"unknown monitor status {self.status!r}")
+        if self.status == NO_ACTION:
+            if self.action is not None or self.trade_log is not None:
+                raise ValueError("a NO_ACTION result carries no action or trade log")
+        elif self.action != "FULL_CLOSE" or self.trade_log is None:
+            raise ValueError("a CLOSED result requires action FULL_CLOSE and a trade log")
+
     def to_contract(self) -> dict[str, Any]:
         return {
             "position_id": self.position_id,
@@ -103,6 +138,15 @@ class PositionMonitorResult:
 
 
 @dataclass(frozen=True)
+class _MarkObservation:
+    """One recorded mark and the timestamp it was observed at."""
+
+    mark: Decimal
+    as_of: str
+    source: str
+
+
+@dataclass(frozen=True)
 class _CloseIds:
     """The deterministic identifiers for one close attempt."""
 
@@ -114,6 +158,37 @@ class _CloseIds:
 
 def _parse(value: str) -> datetime:
     return datetime.fromisoformat(value.replace("Z", "+00:00"))
+
+
+def _parse_timestamp(value: object) -> datetime | None:
+    """Parse a recorded timestamp to an aware UTC datetime, or ``None``."""
+    if isinstance(value, datetime):
+        parsed = value
+    elif value is None:
+        return None
+    else:
+        try:
+            parsed = _parse(str(value))
+        except (TypeError, ValueError, OverflowError):
+            return None
+    if parsed.tzinfo is None:
+        parsed = parsed.replace(tzinfo=UTC)
+    return parsed.astimezone(UTC)
+
+
+def _period_from_path(path: str) -> str | None:
+    match = _PERIOD_TOKEN.search(path)
+    return match.group(1) if match is not None else None
+
+
+def _observation_rank(observation: _MarkObservation) -> tuple[bool, datetime, int]:
+    """Newest first; a parseable as-of beats an unparseable one, bar on a tie."""
+    parsed = _parse_timestamp(observation.as_of)
+    return (
+        parsed is not None,
+        parsed or datetime.min.replace(tzinfo=UTC),
+        1 if observation.source == _MARK_SOURCE_BARS else 0,
+    )
 
 
 class PositionService:
@@ -134,13 +209,23 @@ class PositionService:
 
     # -- read models -----------------------------------------------------
 
+    def _decode(self, payload_json: str, *, subject: str) -> dict[str, Any]:
+        payload = decode_payload_json(payload_json, subject=subject)
+        if payload is None:
+            raise PositionCloseError("DATA_UNAVAILABLE", f"{subject} payload is unreadable")
+        return payload
+
     def list(
         self, *, state: str | None = None, limit: int = 100, offset: int = 0
     ) -> tuple[dict[str, Any], ...]:
-        return tuple(
-            json.loads(record.payload_json)
-            for record in self._store.list_positions(state=state, limit=limit, offset=offset)
-        )
+        items: list[dict[str, Any]] = []
+        for record in self._store.list_positions(state=state, limit=limit, offset=offset):
+            payload = decode_payload_json(
+                record.payload_json, subject=f"position {record.position_id}"
+            )
+            if payload is not None:
+                items.append(payload)
+        return tuple(items)
 
     def count(self, *, state: str | None = None) -> int:
         return self._store.count_positions(state=state)
@@ -149,7 +234,7 @@ class PositionService:
         record = self._store.get_position(position_id)
         if record is None:
             raise PositionNotFound(position_id)
-        return cast(dict[str, Any], json.loads(record.payload_json))
+        return self._decode(record.payload_json, subject=f"position {position_id}")
 
     # -- management tick -------------------------------------------------
 
@@ -157,7 +242,7 @@ class PositionService:
         record = self._store.get_position(position_id)
         if record is None:
             raise PositionNotFound(position_id)
-        payload = json.loads(record.payload_json)
+        payload = self._decode(record.payload_json, subject=f"position {position_id}")
         if payload.get("state") != "OPEN":
             trade = self._store.get_trade_log_for_position(position_id)
             if trade is None:
@@ -170,17 +255,22 @@ class PositionService:
             position = position_from_contract(payload)
         except PositionError as exc:
             raise PositionCloseError(exc.code, exc.message) from exc
-        mark = position.mark_price
-        mark_as_of = str(payload.get("updated_at") or "")
-        now = utc_timestamp(self._clock.now())
-        if mark is None or not mark_as_of:
+
+        now_dt = self._clock.now()
+        if now_dt.tzinfo is None:
+            now_dt = now_dt.replace(tzinfo=UTC)
+        now_dt = now_dt.astimezone(UTC)
+        now = utc_timestamp(now_dt)
+
+        observation = self._resolve_mark(position, payload, now_dt)
+        if observation is None:
             return PositionMonitorResult(
                 position_id=position_id,
                 status=NO_ACTION,
                 reason_code=DATA_STALE,
                 reason="the position has no recorded mark price",
             )
-        if self._is_stale(now, mark_as_of):
+        if self._is_stale(now, observation.as_of):
             return PositionMonitorResult(
                 position_id=position_id,
                 status=NO_ACTION,
@@ -190,7 +280,7 @@ class PositionService:
                 ),
             )
         try:
-            decision = evaluate_protective_exit(position, mark, at=now)
+            decision = evaluate_protective_exit(position, observation.mark, at=now)
         except PositionError as exc:
             raise PositionCloseError(exc.code, exc.message) from exc
         if decision is None:
@@ -200,7 +290,109 @@ class PositionService:
                 reason_code=STOP_NOT_TOUCHED,
                 reason="the mark did not touch the protective stop",
             )
-        return self._close(position, payload, mark, mark_as_of, now)
+        return self._close(position, payload, observation.mark, observation.as_of, now)
+
+    def _resolve_mark(
+        self,
+        position: Position,
+        payload: dict[str, Any],
+        now_dt: datetime,
+    ) -> _MarkObservation | None:
+        """Pick the newest recorded mark: latest bar close first, then the row."""
+        candidates = [
+            observation
+            for observation in (
+                self._latest_bar_mark(position, now_dt),
+                self._stored_mark(position, payload),
+            )
+            if observation is not None
+        ]
+        if not candidates:
+            return None
+        return max(candidates, key=_observation_rank)
+
+    def _latest_bar_mark(self, position: Position, now_dt: datetime) -> _MarkObservation | None:
+        """The newest usable published bar close across every published series."""
+        try:
+            entries = self._store.list_manifest()
+        except StoreUnavailableError as exc:
+            _LOGGER.warning("cannot read the manifest for %s: %s", position.symbol, exc)
+            return None
+        # One read per logical series: manifest parts of the same
+        # (period, metric_version) are merged by ``read_bars`` itself, so
+        # deduping here keeps that merge once per series.
+        series: set[tuple[str, str]] = set()
+        for entry in entries:
+            if (
+                entry.data_type != "bars"
+                or entry.symbol != position.symbol
+                or entry.status not in _BARS_STATUSES
+            ):
+                continue
+            period = _period_from_path(entry.path)
+            metric_version = entry.metric_version
+            if period is None or metric_version is None:
+                _LOGGER.warning(
+                    "skipping bars manifest entry without period/version: %s", entry.path
+                )
+                continue
+            series.add((period, metric_version))
+        observations: list[_MarkObservation] = []
+        for period, metric_version in sorted(series):
+            try:
+                rows = read_bars(
+                    self._settings,
+                    symbol=position.symbol,
+                    period=period,
+                    metric_version=metric_version,
+                    store=self._store,
+                )
+            except (StoreUnavailableError, OSError, ValueError) as exc:
+                _LOGGER.warning("cannot read bars for %s: %s", position.symbol, exc)
+                continue
+            observation = self._latest_valid_bar_row(position.symbol, rows, now_dt)
+            if observation is not None:
+                observations.append(observation)
+        if not observations:
+            return None
+        # The newest recorded observation wins, regardless of which series'
+        # manifest row happened to be newest.
+        return max(observations, key=_observation_rank)
+
+    @staticmethod
+    def _latest_valid_bar_row(
+        symbol: str,
+        rows: tuple[dict[str, object], ...],
+        now_dt: datetime,
+    ) -> _MarkObservation | None:
+        """The newest row with a parseable past ``bar_end`` and a positive close."""
+        for row in reversed(rows):
+            bar_end = _parse_timestamp(row.get("bar_end"))
+            if bar_end is None:
+                _LOGGER.warning("ignoring a bar with an unparseable bar_end for %s", symbol)
+                continue
+            if bar_end > now_dt:
+                # A future-dated bar is not a recorded observation yet.
+                continue
+            try:
+                close = Decimal(str(row.get("close")))
+            except ArithmeticError:
+                _LOGGER.warning("ignoring a bar with an unreadable close for %s", symbol)
+                continue
+            if not close.is_finite() or close <= 0:
+                _LOGGER.warning("ignoring a non-finite/non-positive bar close for %s", symbol)
+                continue
+            return _MarkObservation(close, utc_timestamp(bar_end), _MARK_SOURCE_BARS)
+        return None
+
+    @staticmethod
+    def _stored_mark(position: Position, payload: dict[str, Any]) -> _MarkObservation | None:
+        """The mark already recorded on the position row, with its ``updated_at``."""
+        mark = position.mark_price
+        as_of = str(payload.get("updated_at") or "")
+        if mark is None or not as_of:
+            return None
+        return _MarkObservation(mark, as_of, _MARK_SOURCE_POSITION)
 
     def _is_stale(self, now: str, mark_as_of: str) -> bool:
         try:
@@ -222,7 +414,7 @@ class PositionService:
     ) -> PositionMonitorResult:
         seed = f"{position.position_id}:{mark}:{mark_as_of}"
         ids = _CloseIds(
-            decision_id=deterministic_id("MGD", seed),
+            decision_id=management_decision_id(position.position_id, mark, mark_as_of),
             risk_verdict_id=deterministic_id("RISK-MGD", seed),
             approval_id=deterministic_id("APR", seed),
             idempotency_key=deterministic_id("IDEM-CLOSE", seed),
@@ -236,6 +428,11 @@ class PositionService:
                 "DATA_UNAVAILABLE",
                 "the position has no source trigger; the exit verdict cannot be bound",
             )
+        if not self._persist_mark(position.position_id, payload, mark, mark_as_of):
+            raise PositionCloseError(
+                "POSITION_STATE_INVALID",
+                "the position is no longer OPEN; no order was created",
+            )
 
         self._persist_decision(ids.decision_id, position, mark, mark_as_of, now)
         self._persist_verdict(
@@ -247,6 +444,22 @@ class PositionService:
         )
         result = self._submit_close(intent, ids, mark, mark_as_of)
         return self._closed_result(position, result)
+
+    def _persist_mark(
+        self,
+        position_id: str,
+        payload: dict[str, Any],
+        mark: Decimal,
+        mark_as_of: str,
+    ) -> bool:
+        """Write the chosen recorded mark to the OPEN row before an exit submit."""
+        updated = dict(payload)
+        updated["mark_price"] = str(mark)
+        updated["updated_at"] = mark_as_of
+        updated["version"] = int(updated.get("version", 1)) + 1
+        return self._store.update_open_position_payload(
+            position_id, payload_json=json.dumps(updated, sort_keys=True)
+        )
 
     def _exit_intent(self, position: Position, ids: _CloseIds) -> OrderIntent:
         side = OrderSide.SELL if position.side is PositionSide.LONG else OrderSide.BUY
@@ -266,7 +479,7 @@ class PositionService:
             position_side=position.side,
             risk_amount_usd=Decimal("0"),
             risk_pct=0.0,
-            purpose="exit",
+            purpose="EXIT",
             position_id=position.position_id,
             reduce_only=True,
             trigger_id=position.source_trigger_id,
@@ -279,7 +492,13 @@ class PositionService:
         intent: OrderIntent,
     ) -> PositionMonitorResult:
         """Replay a committed close, or reject a reused key with a new payload."""
-        existing_payload = json.loads(existing.payload_json)
+        existing_payload = decode_payload_json(
+            existing.payload_json, subject=f"order {existing.order_id}"
+        )
+        if existing_payload is None:
+            raise PositionCloseError(
+                "DATA_UNAVAILABLE", "the existing close order payload is unreadable"
+            )
         if str(existing_payload.get("intent_hash") or "") != intent.hash():
             raise PositionCloseError(
                 "IDEMPOTENCY_CONFLICT",
@@ -320,6 +539,10 @@ class PositionService:
         record = self._store.get_position(position.position_id)
         if record is None:  # pragma: no cover - the close updates the row
             raise PositionNotFound(position.position_id)
+        trade_payload = self._decode(trade.payload_json, subject=f"trade log {trade.trade_id}")
+        position_payload = self._decode(
+            record.payload_json, subject=f"position {position.position_id}"
+        )
         return PositionMonitorResult(
             position_id=position.position_id,
             status=CLOSED,
@@ -328,8 +551,8 @@ class PositionService:
             action="FULL_CLOSE",
             order=result.order.to_contract(),
             fill=result.fill.to_contract(),
-            position=json.loads(record.payload_json),
-            trade_log=json.loads(trade.payload_json),
+            position=position_payload,
+            trade_log=trade_payload,
             account=self._paper.summary(),
             idempotent_replay=False,
         )
@@ -444,17 +667,34 @@ class PositionService:
 
     def _replay(self, record: PositionRecord, trade: TradeLogRecord) -> PositionMonitorResult:
         order = self._store.get_order(trade.order_id)
+        if order is None:
+            raise PositionCloseError(
+                "DATA_UNAVAILABLE", f"the replayed exit order {trade.order_id} is missing"
+            )
         fill = self._store.get_fill_by_order_id(trade.order_id)
+        if fill is None:
+            raise PositionCloseError(
+                "DATA_UNAVAILABLE",
+                f"the replayed exit fill for order {trade.order_id} is missing",
+            )
+        # A corrupt stored payload is never reported as a successful replay with
+        # a ``None`` component; it degrades to the typed unavailable error.
+        order_payload = self._decode(order.payload_json, subject=f"order {order.order_id}")
+        fill_payload = self._decode(fill.payload_json, subject=f"fill {fill.fill_id}")
+        trade_payload = self._decode(trade.payload_json, subject=f"trade log {trade.trade_id}")
+        position_payload = self._decode(
+            record.payload_json, subject=f"position {record.position_id}"
+        )
         return PositionMonitorResult(
             position_id=record.position_id,
             status=CLOSED,
             reason_code=STOP_TOUCH,
             reason="the position was already closed; the original result was replayed",
             action="FULL_CLOSE",
-            order=None if order is None else json.loads(order.payload_json),
-            fill=None if fill is None else json.loads(fill.payload_json),
-            position=json.loads(record.payload_json),
-            trade_log=json.loads(trade.payload_json),
+            order=order_payload,
+            fill=fill_payload,
+            position=position_payload,
+            trade_log=trade_payload,
             account=self._paper.summary(),
             idempotent_replay=True,
         )
