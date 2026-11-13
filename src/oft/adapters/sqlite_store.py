@@ -1,7 +1,7 @@
 """SQLite transactional store (WAL) for scans and the Parquet manifest.
 
-Composes the connection, LLM-ledger, trading-ledger, and audit mixins, and owns
-the schema DDL and migrations. The daemon is the only writer. Diagnostic
+Composes the connection, LLM-ledger, opportunity-ledger, paper-OMS, and audit
+mixins, and owns the schema DDL and migrations. The daemon is the only writer. Diagnostic
 commands open the database with ``mode=ro`` so ``oft status`` / ``oft doctor``
 never block or create files.
 """
@@ -21,7 +21,8 @@ from typing import Any
 
 from oft.adapters.sqlite_connections import configure_connection
 from oft.adapters.sqlite_llm_ledger import LLMStoreMixin
-from oft.adapters.sqlite_trading_ledger import TradingStoreMixin
+from oft.adapters.sqlite_opportunity_ledger import OpportunityStoreMixin
+from oft.adapters.sqlite_paper_oms import PaperOmsStoreMixin
 from oft.config import Settings
 from oft.domain.budget_periods import period_parts
 from oft.domain.conditions import ConditionParamsError, normalize_timestamp
@@ -2112,7 +2113,7 @@ def _row_to_scan_symbol(row: sqlite3.Row) -> ScanSymbolRecord:
     )
 
 
-class SqliteStore(LLMStoreMixin, TradingStoreMixin):
+class SqliteStore(LLMStoreMixin, OpportunityStoreMixin, PaperOmsStoreMixin):
     """Concrete :class:`oft.ports.store.StorePort` implementation."""
 
     def __init__(self, settings: Settings) -> None:
