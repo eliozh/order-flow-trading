@@ -262,6 +262,63 @@ def test_trade_log_from_close_validates_and_holds_the_pnl_formula() -> None:
     assert trade["provenance"]["llm_provider"] == "stub"
 
 
+@pytest.fixture
+def closed_position() -> Position:
+    return replace(
+        _position(),
+        state="CLOSED",
+        closed_at=NOW,
+        exit_price=Decimal("68980"),
+        realized_pnl_usd=Decimal("-10.895"),
+    )
+
+
+@pytest.mark.parametrize(
+    "mutate",
+    [
+        pytest.param(lambda position: replace(position, closed_at=NOW), id="closed_at"),
+        pytest.param(
+            lambda position: replace(position, exit_price=Decimal("68980")), id="exit_price"
+        ),
+        pytest.param(
+            lambda position: replace(position, realized_pnl_usd=Decimal("-10.895")),
+            id="realized_pnl_usd",
+        ),
+    ],
+)
+def test_an_open_position_must_not_carry_close_fields(mutate: Any) -> None:
+    with pytest.raises(ValueError) as excinfo:
+        mutate(_position())
+    assert str(excinfo.value) == "an OPEN position must not carry close fields"
+
+
+@pytest.mark.parametrize(
+    "mutate",
+    [
+        pytest.param(lambda position: replace(position, closed_at=None), id="closed_at"),
+        pytest.param(lambda position: replace(position, exit_price=None), id="exit_price"),
+    ],
+)
+def test_a_closed_position_requires_closed_at_and_exit_price(
+    closed_position: Position, mutate: Any
+) -> None:
+    with pytest.raises(ValueError) as excinfo:
+        mutate(closed_position)
+    assert str(excinfo.value) == "a CLOSED position requires closed_at and exit_price"
+
+
+def test_a_closed_position_requires_realized_pnl(closed_position: Position) -> None:
+    with pytest.raises(ValueError) as excinfo:
+        replace(closed_position, realized_pnl_usd=None)
+    assert str(excinfo.value) == "a CLOSED position requires realized_pnl_usd"
+
+
+def test_a_position_requires_finite_target_prices() -> None:
+    with pytest.raises(ValueError) as excinfo:
+        replace(_position(), target_prices=(Decimal("NaN"),))
+    assert str(excinfo.value) == "position target prices must be finite"
+
+
 def test_trade_log_emits_the_actual_funding_term() -> None:
     """Funding is serialized from the close, not hardcoded to "0"."""
     close = close_full(_position(), _fill(), at=NOW, decision_id=DECISION_ID)
