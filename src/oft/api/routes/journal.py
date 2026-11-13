@@ -28,6 +28,11 @@ def trade_log_summary(payload: dict[str, Any]) -> dict[str, Any]:
         "funding_usd": payload.get("funding_usd"),
         "net_pnl_usd": payload.get("net_pnl_usd"),
         "return_pct": payload.get("return_pct"),
+        "r_multiple": payload.get("r_multiple"),
+        "mae_usd": payload.get("mae_usd"),
+        "mfe_usd": payload.get("mfe_usd"),
+        "outcome_tags": payload.get("outcome_tags") or [],
+        "data_quality": payload.get("data_quality"),
     }
 
 

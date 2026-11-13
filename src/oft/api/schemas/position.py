@@ -31,6 +31,7 @@ class PositionMonitorData(BaseModel):
     trade_log: dict[str, Any] | None = None
     account: dict[str, Any] | None = None
     idempotent_replay: bool = False
+    funding: dict[str, Any] | None = None
 
 
 __all__ = ["Envelope", "EnvelopeMeta", "PositionListData", "PositionMonitorData"]

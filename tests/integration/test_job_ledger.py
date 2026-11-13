@@ -40,7 +40,7 @@ def test_job_tables_are_created_idempotently(tmp_path: Path) -> None:
         }
         versions = {row[0] for row in connection.execute("SELECT version FROM schema_migrations")}
     assert {"job_runs", "job_locks", "scan_symbols"} <= tables
-    assert versions == set(range(1, 23))
+    assert versions == set(range(1, 24))
 
 
 def test_duplicate_job_claim_is_skipped(tmp_path: Path) -> None:

@@ -42,6 +42,9 @@ def _render_trade(data: dict[str, Any]) -> str:
         f" · return {data.get('return_pct', '-')}%",
         f"r_multiple {data.get('r_multiple')} · mae {data.get('mae_usd', '-')}"
         f" · mfe {data.get('mfe_usd', '-')}",
+        "outcome " + ", ".join(str(tag) for tag in data.get("outcome_tags") or [])
+        if data.get("outcome_tags")
+        else "outcome -",
         f"signal scan={signal.get('scan_id')} report={signal.get('report_id')}"
         f" opportunity={signal.get('opportunity_id')} trigger={signal.get('trigger_id')}"
         f" decision={signal.get('decision_id')}",
@@ -99,7 +102,7 @@ def log_show(
     trade_id: str,
     json_output: Annotated[bool, typer.Option("--json", help="Emit JSON.")] = False,
 ) -> None:
-    """Show one closed trade and its data-quality reasons."""
+    """Show one closed trade: PnL terms, outcome tags, and data-quality reasons."""
     settings = _settings_or_exit(json_output)
     try:
         envelope = ApiClient.from_settings(settings).get_trade_log(trade_id)

@@ -218,6 +218,9 @@ class ApiClient:
     def get_position(self, position_id: str) -> dict[str, Any]:
         return self._request("GET", f"/api/v1/positions/{quote(position_id, safe='')}")
 
+    def position_history(self, position_id: str) -> dict[str, Any]:
+        return self._request("GET", f"/api/v1/positions/{quote(position_id, safe='')}/history")
+
     def monitor_position(self, position_id: str) -> dict[str, Any]:
         return self._request("POST", f"/api/v1/positions/{quote(position_id, safe='')}/monitor", {})
 

@@ -492,6 +492,9 @@ class PositionRecord:
     state: str
     opened_at: str
     payload_json: str
+    # Optimistic-concurrency guard: when set, the in-place OPEN update must
+    # still match this exact previous payload (a lost-update guard).
+    expected_payload_json: str | None = None
 
 
 @dataclass(frozen=True)
@@ -553,7 +556,11 @@ class PositionEventRecord:
 
 @dataclass(frozen=True)
 class TradeLogRecord:
-    """The one closed-trade record for a position, plus its query keys."""
+    """The one closed-trade record for a position, plus its query keys.
+
+    The scalar columns duplicate fields of ``payload_json``; the broker builds
+    them from the rendered payload so the two can never disagree.
+    """
 
     trade_id: str
     position_id: str
@@ -583,6 +590,61 @@ class ClosedPositionRecord:
     balance_delta: str
     event: PositionEventRecord
     trade_log: TradeLogRecord
+    audits: tuple[AuditEventDraft, ...] = ()
+
+
+@dataclass(frozen=True)
+class PositionAdjustmentRecord:
+    """Everything one partial close or add commits in a single transaction.
+
+    ``position`` carries the already-updated OPEN payload; the store updates the
+    one OPEN row in place. No trade log is written for a partial close or add.
+    """
+
+    order: OrderRecord
+    fill: FillRecord
+    position: PositionRecord
+    account: PaperAccountRecord
+    balance_delta: str
+    event: PositionEventRecord
+    audits: tuple[AuditEventDraft, ...] = ()
+
+
+@dataclass(frozen=True)
+class FundingAccrualRecord:
+    """One recorded funding settlement applied to a position.
+
+    ``amount_usd`` is the signed cash flow (a LONG paying a positive rate is
+    negative). ``side`` and ``size`` are the position state the amount was
+    priced on, so the accrual can be re-derived without replaying the timeline.
+    The ``(position_id, settlement_time)`` unique constraint makes a replay or
+    restart a no-op.
+    """
+
+    accrual_id: str
+    position_id: str
+    settlement_time: str
+    rate: str
+    mark_price: str
+    amount_usd: str
+    created_at: str
+    side: str
+    size: str
+
+
+@dataclass(frozen=True)
+class FundingAccrualCommit:
+    """Everything one funding accrual commits in a single transaction.
+
+    The balance delta is not carried separately: the store derives it from
+    ``accrual.amount_usd`` and verifies the position's funding total advanced by
+    exactly that amount before committing.
+    """
+
+    accrual: FundingAccrualRecord
+    position: PositionRecord
+    account: PaperAccountRecord
+    event: PositionEventRecord
     audits: tuple[AuditEventDraft, ...] = ()
 
 
@@ -629,6 +691,20 @@ class StorePort(Protocol):
     def list_reports(
         self, *, scan_id: str | None = None, limit: int = 20, offset: int = 0
     ) -> tuple[ReportRecord, ...]: ...
+
+    def list_reports_for_symbol(
+        self, symbol: str, *, since: str | None = None, limit: int | None = None
+    ) -> tuple[ReportRecord, ...]:
+        """Recorded reports for one symbol, oldest generated first.
+
+        Used by funding accrual: each recorded report contributes the funding
+        settlements it observed, so a later report can record a settlement that
+        did not exist when the position's entry report was frozen. ``since``
+        bounds the read to the newest reports generated at/after the position's
+        opening plus the single newest report before it; ``limit`` caps the
+        post-entry rows.
+        """
+        ...
 
     def count_reports(self, *, scan_id: str | None = None) -> int: ...
 
@@ -1049,12 +1125,21 @@ class StorePort(Protocol):
 
     def get_position(self, position_id: str) -> PositionRecord | None: ...
 
-    def update_open_position_payload(self, position_id: str, *, payload_json: str) -> bool:
-        """Replace an OPEN position's payload; ``False`` when it is not OPEN.
+    def update_open_position_payload(
+        self,
+        position_id: str,
+        *,
+        payload_json: str,
+        expected_payload_json: str | None = None,
+    ) -> bool:
+        """Replace an OPEN position's payload; ``False`` when the guard misses.
 
         The caller owns the payload (including its version/``updated_at`` bump).
         Only ``state = 'OPEN'`` rows change, so a concurrent close can never be
-        overwritten and no order is created for a stale tick.
+        overwritten and no order is created for a stale tick. When
+        ``expected_payload_json`` is supplied the update is optimistic and also
+        requires the row to still carry that exact payload, so a concurrent
+        funding accrual or adjustment is never silently lost.
         """
         ...
 
@@ -1067,6 +1152,29 @@ class StorePort(Protocol):
         the position update must match exactly one OPEN row.
         """
         ...
+
+    def save_position_adjustment(self, record: PositionAdjustmentRecord) -> OmsCommit:
+        """Atomically commit a partial close or an add.
+
+        Writes the account balance delta, order, fill, the in-place OPEN
+        position update, the position event, and the audits in one
+        ``BEGIN IMMEDIATE`` transaction. A zero-row position update aborts the
+        whole unit; no trade log is written.
+        """
+        ...
+
+    def save_funding_accrual(self, record: FundingAccrualCommit) -> bool:
+        """Atomically commit one funding settlement.
+
+        Inserts the accrual with ``ON CONFLICT(position_id, settlement_time) DO
+        NOTHING``; when it was already recorded the unit is rolled back and
+        ``False`` is returned, so a restart or replay cannot double-apply the
+        amount. Otherwise the account delta, updated OPEN position, event, and
+        audits commit together and ``True`` is returned.
+        """
+        ...
+
+    def list_funding_accruals(self, position_id: str) -> tuple[FundingAccrualRecord, ...]: ...
 
     def get_trade_log(self, trade_id: str) -> TradeLogRecord | None: ...
 

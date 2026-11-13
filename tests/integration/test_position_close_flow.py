@@ -304,7 +304,12 @@ def test_trade_log_accumulates_entry_and_exit_fees(tmp_path: Path) -> None:
     # Both terms are quantized to 8 dp; the sum is exact at that precision.
     assert Decimal(result.trade_log["fees_usd"]) == expected_fees
     assert result.trade_log["funding_usd"] == "0"
-    assert "funding accrual not in this slice" in result.trade_log["data_quality"]["reasons"]
+    # No recorded funding settlement falls inside this position's holding
+    # window, so funding is a measured zero and is not a quality gap. The
+    # journal is PARTIAL only because no recorded bars cover the window.
+    assert result.trade_log["data_quality"]["status"] == "PARTIAL"
+    assert any("MAE/MFE" in reason for reason in result.trade_log["data_quality"]["reasons"])
+    assert not any("funding" in reason for reason in result.trade_log["data_quality"]["reasons"])
 
 
 def test_a_mark_above_the_stop_creates_no_order(tmp_path: Path) -> None:
