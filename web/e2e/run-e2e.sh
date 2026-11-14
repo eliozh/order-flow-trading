@@ -1,19 +1,20 @@
 #!/usr/bin/env bash
 # Run the slice-01 /system journey, the slice-02 read-only symbol journeys, the
-# slice-08 report journeys, and the slice-29 positions journey against real
-# daemons.
+# slice-08 report journeys, the slice-29 positions journey, and the slice-30
+# journal journeys against real daemons.
 #
 # Starts `oft serve` three times with temporary OFT_DATA_DIRs:
 #   - 127.0.0.1:7622 for the walking-skeleton /system journey;
 #   - 127.0.0.1:7632 for the symbol registry, seeded from the committed
 #     exchangeInfo fixture by the daemon bootstrap;
-#   - 127.0.0.1:7642 for reports/positions, seeded with a backfill, reports, and
-#     one OPEN paper position created through evaluate -> recheck -> accept.
+#   - 127.0.0.1:7642 for reports/positions/journal, seeded with a backfill,
+#     reports, one OPEN paper position, and one CLOSED paper trade created
+#     through evaluate -> recheck -> accept -> stop-mark -> monitor.
 # The fixture market scan is applied to the first daemon, then the daemons are
 # driven by Playwright. Every daemon is stopped before this script exits.
 #
-# Only the positions journey mutates anything: it performs one real paper
-# management POST (with CSRF + Idempotency-Key) against the reports daemon.
+# The positions journey performs one real paper management POST; the journal
+# journey performs one real advisory review POST (with CSRF + Idempotency-Key).
 set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
@@ -30,6 +31,7 @@ REPORTS_BASE_URL="http://127.0.0.1:${REPORTS_PORT}"
 SYSTEM_SCREENS_DIR="$ROOT/.claude/ecc-workflow/screens/e2e"
 SYMBOLS_SCREENS_DIR="$ROOT/.claude/ecc-workflow/screens/e2e02"
 REPORTS_SCREENS_DIR="$ROOT/.claude/ecc-workflow/screens/e2e08"
+JOURNAL_SCREENS_DIR="$ROOT/.claude/ecc-workflow/screens/slice-30"
 MARKET_FIXTURE="$ROOT/tests/fixtures/market/btcusdt_agg-trades_sample.csv"
 EXCHANGE_INFO_FIXTURE="$ROOT/tests/fixtures/binance/exchange_info_sample.json"
 ARCHIVE_FIXTURE_DIR="$ROOT/tests/fixtures/archive"
@@ -345,6 +347,171 @@ if ! curl -fsS -H "Authorization: Bearer $REPORTS_TOKEN" \
   exit 1
 fi
 
+# Slice 30: seed one CLOSED trade for the journal journey on the same reports
+# daemon without touching the OPEN position above. A second starred batch scan
+# yields a fresh opportunity on the still-valid ANALYSIS fixture; it is
+# accepted through the real paper path, closed with a stop mark, and its trade
+# log is marked COMPLETE (a seeded position has no holding-window bars, so its
+# own quality would be PARTIAL). One outcome tag starts with a formula prefix so
+# the browser export proves server-side neutralization.
+JOURNAL_BATCH_JSON="$(curl -fsS -X POST \
+  -H "Authorization: Bearer $REPORTS_TOKEN" \
+  -H "Content-Type: application/json" \
+  -H "Idempotency-Key: e2e-journal-batch" \
+  -d '{"period":"4h","source":"backfill","metrics_only":false,"provider":"stub"}' \
+  "$REPORTS_BASE_URL/api/v1/scans")"
+JOURNAL_REPORT_ID="$(printf '%s' "$JOURNAL_BATCH_JSON" |
+  jq -r '[.data.symbols[] | select(.symbol == "BTCUSDT") | .report_id] | .[0] // empty')"
+if [ -z "$JOURNAL_REPORT_ID" ]; then
+  echo "E2E journal batch scan did not produce a BTCUSDT report" >&2
+  printf '%s\n' "$JOURNAL_BATCH_JSON" >&2
+  cat "$REPORTS_LOG" >&2
+  exit 1
+fi
+JOURNAL_OPPORTUNITY_ID="$(curl -fsS -H "Authorization: Bearer $REPORTS_TOKEN" \
+  "$REPORTS_BASE_URL/api/v1/reports/$JOURNAL_REPORT_ID" |
+  jq -r '.data.llm.opportunity_ids[0] // empty')"
+if [ -z "$JOURNAL_OPPORTUNITY_ID" ]; then
+  echo "E2E journal report has no opportunity" >&2
+  exit 1
+fi
+JOURNAL_TRIGGER_JSON="$(curl -fsS -X POST \
+  -H "Authorization: Bearer $REPORTS_TOKEN" \
+  -H "Content-Type: application/json" \
+  -H "Idempotency-Key: e2e-journal-evaluate" \
+  -d "{\"opportunity_id\":\"$JOURNAL_OPPORTUNITY_ID\"}" \
+  "$REPORTS_BASE_URL/api/v1/triggers/evaluate")"
+JOURNAL_TRIGGER_ID="$(printf '%s' "$JOURNAL_TRIGGER_JSON" |
+  jq -r '.data.trigger.trigger_id // empty')"
+if [ -z "$JOURNAL_TRIGGER_ID" ]; then
+  echo "E2E journal journey could not create a trigger" >&2
+  printf '%s\n' "$JOURNAL_TRIGGER_JSON" >&2
+  cat "$REPORTS_LOG" >&2
+  exit 1
+fi
+curl -fsS -X POST \
+  -H "Authorization: Bearer $REPORTS_TOKEN" \
+  -H "Idempotency-Key: e2e-journal-recheck" \
+  "$REPORTS_BASE_URL/api/v1/triggers/$JOURNAL_TRIGGER_ID/recheck" >/dev/null
+JOURNAL_ACCEPT_JSON="$(curl -fsS -X POST \
+  -H "Authorization: Bearer $REPORTS_TOKEN" \
+  -H "Idempotency-Key: e2e-journal-accept" \
+  "$REPORTS_BASE_URL/api/v1/triggers/$JOURNAL_TRIGGER_ID/accept")"
+JOURNAL_POSITION_ID="$(printf '%s' "$JOURNAL_ACCEPT_JSON" |
+  jq -r '.data.position.position_id // empty')"
+if [ -z "$JOURNAL_POSITION_ID" ]; then
+  echo "E2E journal journey did not create a paper position" >&2
+  printf '%s\n' "$JOURNAL_ACCEPT_JSON" >&2
+  cat "$REPORTS_LOG" >&2
+  exit 1
+fi
+
+# Touch the stop through SQLite (the same fallback the Python e2e uses) and run
+# the real deterministic monitor tick so the trade closes through the app path.
+OFT_DATA_DIR="$REPORTS_DATA_DIR" uv run python - "$JOURNAL_POSITION_ID" <<'PY'
+import json
+import sqlite3
+import sys
+from datetime import UTC, datetime
+
+from oft.config import load_settings
+
+settings = load_settings()
+database = settings.data_dir / "oft.db"
+with sqlite3.connect(database) as connection:
+    row = connection.execute(
+        "SELECT payload_json FROM positions WHERE position_id = ?", (sys.argv[1],)
+    ).fetchone()
+    if row is None:
+        raise SystemExit(f"position {sys.argv[1]} not found")
+    payload = json.loads(row[0])
+    payload["mark_price"] = payload["stop_price"]
+    payload["updated_at"] = datetime.now(UTC).strftime("%Y-%m-%dT%H:%M:%S.%fZ")
+    connection.execute(
+        "UPDATE positions SET payload_json = ? WHERE position_id = ?",
+        (json.dumps(payload, sort_keys=True), sys.argv[1]),
+    )
+    connection.commit()
+PY
+
+JOURNAL_MONITOR_JSON="$(curl -fsS -X POST \
+  -H "Authorization: Bearer $REPORTS_TOKEN" \
+  "$REPORTS_BASE_URL/api/v1/positions/$JOURNAL_POSITION_ID/monitor")"
+JOURNAL_TRADE_ID="$(printf '%s' "$JOURNAL_MONITOR_JSON" |
+  jq -r '.data.trade_log.trade_id // empty')"
+if [ -z "$JOURNAL_TRADE_ID" ]; then
+  echo "E2E journal position did not close into a trade log" >&2
+  printf '%s\n' "$JOURNAL_MONITOR_JSON" >&2
+  cat "$REPORTS_LOG" >&2
+  exit 1
+fi
+
+# Mark the seeded trade COMPLETE so the stats sample is defined, keep one
+# formula-prefixed outcome tag for the export-neutralization assertion, and
+# backdate the close 30 days so the 4w window excludes it while 8w includes it
+# (the period filter must move the table, not only the stats strip).
+OFT_DATA_DIR="$REPORTS_DATA_DIR" uv run python - "$JOURNAL_TRADE_ID" <<'PY'
+import json
+import sqlite3
+import sys
+from datetime import UTC, datetime, timedelta
+
+from oft.config import load_settings
+
+settings = load_settings()
+database = settings.data_dir / "oft.db"
+closed_at = (datetime.now(UTC) - timedelta(days=30)).strftime("%Y-%m-%dT%H:%M:%S.%fZ")
+opened_at = (datetime.now(UTC) - timedelta(days=32)).strftime("%Y-%m-%dT%H:%M:%S.%fZ")
+with sqlite3.connect(database) as connection:
+    row = connection.execute(
+        "SELECT payload_json FROM trade_logs WHERE trade_id = ?", (sys.argv[1],)
+    ).fetchone()
+    if row is None:
+        raise SystemExit(f"trade {sys.argv[1]} not found")
+    payload = json.loads(row[0])
+    payload["data_quality"] = {
+        "status": "COMPLETE",
+        "reasons": [],
+        "gaps": [],
+        "last_event_at": closed_at,
+        "coverage_start": opened_at,
+    }
+    payload["outcome_tags"] = ["=SUM(1,1)", "STOPPED"]
+    payload["opened_at"] = opened_at
+    payload["closed_at"] = closed_at
+    connection.execute(
+        "UPDATE trade_logs SET payload_json = ?, opened_at = ?, closed_at = ? WHERE trade_id = ?",
+        (json.dumps(payload, sort_keys=True), opened_at, closed_at, sys.argv[1]),
+    )
+    connection.commit()
+PY
+
+if ! curl -fsS -H "Authorization: Bearer $REPORTS_TOKEN" \
+  "$REPORTS_BASE_URL/api/v1/journal/$JOURNAL_TRADE_ID" |
+  jq -e --arg id "$JOURNAL_TRADE_ID" \
+    '.ok == true and .data.trade_id == $id and .data.data_quality.status == "COMPLETE"' >/dev/null; then
+  echo "E2E journal trade $JOURNAL_TRADE_ID is not readable through the API" >&2
+  exit 1
+fi
+if ! curl -fsS -H "Authorization: Bearer $REPORTS_TOKEN" \
+  "$REPORTS_BASE_URL/api/v1/journal/stats?period=8w" |
+  jq -e '.ok == true and .data.status == "DEFINED" and .data.sample_size >= 1' >/dev/null; then
+  echo "E2E journal stats are not defined over the seeded trade" >&2
+  exit 1
+fi
+if ! curl -fsS -H "Authorization: Bearer $REPORTS_TOKEN" \
+  "$REPORTS_BASE_URL/api/v1/journal/$JOURNAL_TRADE_ID/review" |
+  jq -e '.ok == true and .data.status == "MISSING"' >/dev/null; then
+  echo "E2E journal trade unexpectedly already has a review" >&2
+  exit 1
+fi
+if ! curl -fsS -H "Authorization: Bearer $REPORTS_TOKEN" \
+  "$REPORTS_BASE_URL/api/v1/journal/export/file?format=csv" |
+  grep -qF "'=SUM(1,1)"; then
+  echo "E2E journal CSV export did not neutralize the formula tag" >&2
+  exit 1
+fi
+
 # Flip the ANALYSIS fixture to a schema-invalid payload: the next batch must
 # mark the data-bearing symbol DEGRADED with a CALC-only report and continue.
 cp "$ROOT/tests/fixtures/llm/invalid_schema.json" \
@@ -455,6 +622,12 @@ export OFT_E2E_BATCH_DEGRADED_ID="$BATCH_DEGRADED_ID"
 export OFT_E2E_MISSING_REPORT_ID="$MISSING_REPORT_ID"
 export OFT_E2E_HOSTILE_REPORT_ID="$HOSTILE_REPORT_ID"
 export OFT_E2E_POSITION_ID="$POSITION_ID"
+export OFT_E2E_JOURNAL_TRADE_ID="$JOURNAL_TRADE_ID"
+export OFT_E2E_JOURNAL_POSITION_ID="$JOURNAL_POSITION_ID"
+export OFT_E2E_JOURNAL_BATCH_ID="$(printf '%s' "$JOURNAL_BATCH_JSON" |
+  jq -r '.data.scan_id // empty')"
+export OFT_E2E_JOURNAL_REPORT_ID="$JOURNAL_REPORT_ID"
+export OFT_E2E_JOURNAL_SCREENS_DIR="$JOURNAL_SCREENS_DIR"
 export OFT_E2E_REPORT_API_TOKEN="$REPORTS_TOKEN"
 export OFT_E2E_DATA_DIR="$SYSTEM_DATA_DIR"
 export OFT_E2E_SCAN_ID="$SCAN_ID"
@@ -466,7 +639,7 @@ export OFT_E2E_REPORT_SCREENS_DIR="$REPORTS_SCREENS_DIR"
 export OFT_E2E_SCREENS_DIR="$REPORTS_SCREENS_DIR"
 export OFT_E2E_REPORT_DIR="$REPORTS_SCREENS_DIR/report"
 
-mkdir -p "$SYSTEM_SCREENS_DIR" "$SYMBOLS_SCREENS_DIR" "$REPORTS_SCREENS_DIR"
+mkdir -p "$SYSTEM_SCREENS_DIR" "$SYMBOLS_SCREENS_DIR" "$REPORTS_SCREENS_DIR" "$JOURNAL_SCREENS_DIR"
 echo "system e2e daemon: $SYSTEM_BASE_URL · data: $SYSTEM_DATA_DIR · scan: $SCAN_ID · delta: $SCAN_DELTA"
 echo "symbol e2e daemon: $SYMBOLS_BASE_URL · data: $SYMBOLS_DATA_DIR · seeded from $EXCHANGE_INFO_FIXTURE"
 echo "report e2e daemon: $REPORTS_BASE_URL · data: $REPORTS_DATA_DIR · report: $REPORT_ID"

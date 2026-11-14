@@ -15,6 +15,8 @@ export interface RouteMatch {
   isPositions: boolean
   positionId: string | null
   isPaper: boolean
+  isJournal: boolean
+  journalTradeId: string | null
 }
 
 function decodeSegment(segment: string): string {
@@ -43,6 +45,7 @@ export function resolveRoute(pathname: string): RouteMatch {
   const opportunityMatch = /^\/opportunities\/([^/]+)$/.exec(path)
   const triggerMatch = /^\/triggers\/([^/]+)$/.exec(path)
   const positionMatch = /^\/positions\/([^/]+)$/.exec(path)
+  const journalMatch = /^\/journal\/([^/]+)$/.exec(path)
   return {
     path,
     inspectorSymbol,
@@ -64,5 +67,9 @@ export function resolveRoute(pathname: string): RouteMatch {
     isPositions: path === '/positions' || positionMatch !== null,
     positionId: positionMatch !== null ? decodeSegment(positionMatch[1]) : null,
     isPaper: path === '/paper',
+    // Only `/journal` or exactly one detail segment is a journal route; a
+    // deeper path falls through to not-found.
+    isJournal: path === '/journal' || journalMatch !== null,
+    journalTradeId: journalMatch !== null ? decodeSegment(journalMatch[1]) : null,
   }
 }
