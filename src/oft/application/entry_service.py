@@ -34,6 +34,7 @@ from oft.application.llm_validation import (
 )
 from oft.application.paper_account import PaperAccountService, compute_equity
 from oft.application.paper_broker import OrderIntent, PaperBroker
+from oft.application.payloads import decode_payload_json
 from oft.application.prompt_builder import KnowledgeInjection
 from oft.application.prompt_service import (
     PromptService,
@@ -225,7 +226,7 @@ class EntryService:
 
     # -- re-check --------------------------------------------------------
 
-    def recheck(self, trigger_id: str) -> dict[str, Any]:
+    def recheck(self, trigger_id: str, *, refresh: bool = False) -> dict[str, Any]:
         trigger = self._trigger(trigger_id)
         payload: dict[str, Any] = json.loads(trigger.payload_json)
         status = str(payload.get("status"))
@@ -245,6 +246,20 @@ class EntryService:
                 "CONFLICT",
                 f"trigger {trigger_id} is {status}; a re-check is not allowed",
             )
+        previous_decision_id = payload.get("entry_decision_id")
+        if not refresh:
+            # The default read path never calls the provider: a persisted entry
+            # decision is reused verbatim. Only an explicit refresh re-runs the
+            # LLM. An id whose row vanished or is unreadable fails closed.
+            persisted = self.get_persisted_entry_decision(trigger_id)
+            if persisted["status"] == "FOUND":
+                return self._persisted_card(trigger_id, payload, persisted)
+            if previous_decision_id:
+                raise EntryRejected(
+                    "DATA_UNAVAILABLE",
+                    f"the persisted entry decision {previous_decision_id} is missing or "
+                    "unreadable; run the re-check with an explicit refresh",
+                )
         if self._provider is None:
             raise EntryRejected(
                 "LLM_PROVIDER_NOT_CONFIGURED",
@@ -406,6 +421,9 @@ class EntryService:
             risk_stage["reasons"] = [str(envelope.get("rejected_reason") or "invalid decision")]
 
         data_quality = self._data_quality(risk_stage, outcome.valid and not no_entry)
+        decision_provenance = envelope.get("provenance")
+        resolved_provenance = decision_provenance if isinstance(decision_provenance, dict) else None
+        refreshed = bool(refresh and previous_decision_id is not None)
         card = self._decision_card(
             trigger_id=trigger_id,
             trigger_payload=updated,
@@ -413,6 +431,8 @@ class EntryService:
             risk_stage=risk_stage,
             data_quality=data_quality,
             error_code=error_code,
+            decision_provenance=resolved_provenance,
+            refreshed=refreshed,
         )
         record = replace(
             trigger,
@@ -425,20 +445,135 @@ class EntryService:
             require_no_order=True,
             require_no_entry_order=True,
         )
+        audit_payload: dict[str, Any] = {
+            "validation_status": outcome.status,
+            "decision_id": decision_id,
+            "status": next_status,
+            "risk_verdict": risk_stage.get("verdict"),
+            "error_code": error_code,
+        }
+        if refreshed:
+            audit_payload["previous_decision_id"] = previous_decision_id
         record_audit(
             self._store,
-            event_type="ENTRY_RECHECK",
+            event_type="ENTRY_RECHECK_REFRESHED" if refreshed else "ENTRY_RECHECK",
             actor={"kind": "LLM", "id": decision_id},
             subject={"kind": "TRIGGER", "id": trigger_id},
-            payload={
-                "validation_status": outcome.status,
-                "decision_id": decision_id,
-                "status": next_status,
-                "risk_verdict": risk_stage.get("verdict"),
-                "error_code": error_code,
-            },
+            payload=audit_payload,
             at=now,
         )
+        return card
+
+    def get_persisted_entry_decision(self, trigger_id: str) -> dict[str, Any]:
+        """Read the trigger's persisted entry decision without any provider call.
+
+        This is the deferred slice-20 read: trigger -> ``entry_decision_id`` ->
+        the LLM ledger row. A missing/unreadable row is reported as ``MISSING``
+        with named reasons; an unknown trigger still raises ``TriggerNotFound``.
+        No orchestrator, adapter, or prompt is touched.
+        """
+        trigger = self._trigger(trigger_id)
+        payload = decode_payload_json(trigger.payload_json, subject=f"trigger {trigger_id}")
+        if payload is None:
+            return self._missing_entry_decision(
+                trigger_id, None, "the trigger payload is unreadable"
+            )
+        entry_decision_id = payload.get("entry_decision_id")
+        if not entry_decision_id:
+            return self._missing_entry_decision(
+                trigger_id, None, "no entry decision is recorded for the trigger"
+            )
+        decision_id = str(entry_decision_id)
+        record = self._store.get_decision(decision_id)
+        if record is None:
+            return self._missing_entry_decision(
+                trigger_id,
+                decision_id,
+                f"the persisted entry decision {decision_id} was not found",
+            )
+        envelope = decode_payload_json(record.payload_json, subject=f"entry decision {decision_id}")
+        if envelope is None:
+            return self._missing_entry_decision(
+                trigger_id,
+                decision_id,
+                f"the persisted entry decision {decision_id} payload is unreadable",
+            )
+        provenance = envelope.get("provenance")
+        resolved_provenance = provenance if isinstance(provenance, dict) else None
+        reasons = (
+            []
+            if resolved_provenance is not None
+            else ["the persisted entry decision carries no provenance"]
+        )
+        return {
+            "trigger_id": trigger_id,
+            "entry_decision_id": record.decision_id,
+            "status": "FOUND",
+            "decision": envelope,
+            "provenance": resolved_provenance,
+            "validation_status": envelope.get("validation_status") or record.validation_status,
+            "confidence": envelope.get("confidence"),
+            "decision_type": envelope.get("decision_type") or record.decision_type,
+            "reasons": reasons,
+            "data_quality": "COMPLETE" if not reasons else "PARTIAL",
+        }
+
+    @staticmethod
+    def _missing_entry_decision(
+        trigger_id: str, decision_id: str | None, reason: str
+    ) -> dict[str, Any]:
+        return {
+            "trigger_id": trigger_id,
+            "entry_decision_id": decision_id,
+            "status": "MISSING",
+            "decision": None,
+            "provenance": None,
+            "validation_status": None,
+            "confidence": None,
+            "decision_type": None,
+            "reasons": [reason],
+            "data_quality": "MISSING",
+        }
+
+    def _persisted_card(
+        self,
+        trigger_id: str,
+        trigger_payload: dict[str, Any],
+        persisted: dict[str, Any],
+    ) -> dict[str, Any]:
+        """Render the ordered decision card from persisted evidence only."""
+        envelope = persisted.get("decision")
+        if not isinstance(envelope, dict):
+            raise EntryRejected("DATA_UNAVAILABLE", "the persisted entry decision is unreadable")
+        risk_verdict = trigger_payload.get("risk_verdict")
+        if isinstance(risk_verdict, dict):
+            risk_stage: dict[str, Any] = {**risk_verdict, "provenance": "CALC"}
+        else:
+            risk_stage = {
+                "verdict": "NOT_EVALUATED",
+                "binding_cap": "NONE",
+                "reasons": ["no risk verdict was persisted for this trigger"],
+                "provenance": "CALC",
+            }
+        entry = envelope.get("entry_recheck")
+        decision_value = entry.get("decision") if isinstance(entry, dict) else None
+        evaluated = (
+            risk_stage.get("verdict") not in {None, "NOT_EVALUATED"}
+            and decision_value != "NO_ENTRY"
+        )
+        provenance = persisted.get("provenance")
+        card = self._decision_card(
+            trigger_id=trigger_id,
+            trigger_payload=trigger_payload,
+            envelope=envelope,
+            risk_stage=risk_stage,
+            data_quality=self._data_quality(risk_stage, evaluated),
+            error_code=None,
+            decision_provenance=provenance if isinstance(provenance, dict) else None,
+            refreshed=False,
+        )
+        card["human_action"] = trigger_payload.get("human_action")
+        card["persisted"] = True
         return card
 
     # -- human actions ---------------------------------------------------
@@ -995,6 +1130,8 @@ class EntryService:
         risk_stage: dict[str, Any],
         data_quality: str,
         error_code: str | None,
+        decision_provenance: dict[str, Any] | None = None,
+        refreshed: bool = False,
     ) -> dict[str, Any]:
         entry = envelope.get("entry_recheck") or {}
         decision_id = envelope.get("decision_id")
@@ -1025,11 +1162,15 @@ class EntryService:
                 "confidence": envelope.get("confidence"),
                 "rationale": envelope.get("rationale"),
                 "reasons": entry.get("reasons", []),
-                "provenance": "LLM",
+                # The entry decision's own provenance (provider/model/prompt/
+                # cost/recorded_at), never a bare stage marker and never raw
+                # prompt text.
+                "provenance": decision_provenance if decision_provenance is not None else "LLM",
             },
             "risk": risk_stage,
             "human_action": None,
             "entry_decision_id": decision_id,
+            "refreshed": refreshed,
         }
 
     def _timeframe(self, opportunity: Any) -> str:

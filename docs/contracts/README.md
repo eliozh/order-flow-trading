@@ -41,6 +41,29 @@ The PRD's hard rule is enforced by four contracts plus the architecture:
 
 `GET /api/v1/opportunities?state=…` returns a read-only projection, not the full contract: each item carries `opportunity_id`, `symbol`, `side`, `state`, `confidence`, `zone {low, high}`, `entry_preference`, `trigger_conditions`, `expires_at`, `created_at`, `updated_at`, and `source`, plus the filtered `total`. A `counts` object gives the server-side COUNT per state (`OPEN`, `TRIGGERED`, `EXPIRED`, `INVALIDATED`) so the ledger's tab counts never depend on the fetched page. Rows render from this projection; they never fetch one full contract per row. The opportunity detail still reuses `opportunity.schema.json`; the ledger's stored provenance has no validation verdict, so the UI labels it "from ledger · not re-validated" rather than inventing one.
 
+### Journal statistics and comparison read models
+
+`GET /api/v1/journal/stats` returns a deterministic statistics read model, not a
+record contract: `status` (`DEFINED`/`UNDEFINED`), `sample_size`, wins/losses/ties,
+`win_rate`, `expectancy_usd`, `avg_r`, `totals`, per-reason `exclusions`, the resolved
+`period {label,start,end,basis}`, and the code-owned `definitions`. Eligible trades are
+persisted trade logs with `data_quality.status = COMPLETE`, no `PARTIAL`/`DATA_PARTIAL`
+outcome tag, a parseable `closed_at` inside the period, and a parseable finite
+`net_pnl_usd`; open positions and excluded rows are counted. With no eligible trade the
+metrics are `UNDEFINED` and every metric is `null` (never zero); the envelope
+`data_quality` is then `MISSING`.
+
+`GET /api/v1/journal/compare/{trade_id}` is a composition of the trade log, the source
+opportunity zone, the trigger-time report snapshot, recorded bars, and the persisted
+entry decision. Each side is `OK`, `N/A`, or `PARTIAL` with named reasons; the overall
+data quality is `COMPLETE` only when every side resolved. `AMBIGUOUS_BAR` is explicit.
+
+`GET /api/v1/journal/export?format=csv|json` writes under
+`<data_dir>/exports/journal-<UTC stamp>.<ext>`. CSV contains only trade-log read fields
+and neutralizes `=`, `+`, `-`, and `@` prefixes with a leading `'`; JSON is a versioned
+`{schema_version, generated_at, period, trades, stats}` document. Neither export
+includes raw prompts, decision payloads, or secrets.
+
 ## Validation pipeline
 
 ```

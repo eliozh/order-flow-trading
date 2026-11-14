@@ -11,6 +11,7 @@ from typing import Any
 import _helpers
 from _registry import validate
 
+from oft.application.journal_service import JournalService
 from oft.application.position_service import PositionService
 from oft.domain.oms import Fill, OrderSide, Position, PositionSide
 from oft.domain.positions import (
@@ -313,3 +314,82 @@ def test_trade_log_provenance_matches_the_recorded_decision_and_report(
         if isinstance(entry, dict) and entry.get("metric_version")
     )
     assert trade["provenance"]["calc_metric_version"] == recorded_metric_version
+
+
+def _closed_with_container(tmp_path: Path) -> tuple[Any, dict[str, Any]]:
+    loop = _helpers.build_loop(tmp_path)
+    container = loop["container"]
+    position = loop["result"].position
+    assert position is not None
+    set_position_mark(
+        container,
+        position["position_id"],
+        position["stop_price"],
+        position["updated_at"],
+    )
+    monitored = PositionService(
+        store=container.store, clock=container.clock, settings=container.settings
+    ).monitor(position["position_id"])
+    assert monitored.trade_log is not None
+    return container, monitored.trade_log
+
+
+def test_journal_stats_marks_an_all_partial_sample_undefined(tmp_path: Path) -> None:
+    container, _trade = _closed_with_container(tmp_path)
+    service = JournalService(container.store, container.clock, container.settings)
+
+    stats = service.stats()
+
+    # The protective-exit journal has no recorded-bar excursion, so it is
+    # PARTIAL and excluded: the metrics must be undefined, never zero.
+    assert stats["status"] == "UNDEFINED"
+    assert stats["win_rate"] is None
+    assert stats["expectancy_usd"] is None
+    assert stats["totals"]["net_pnl_usd"] is None
+    assert stats["data_quality"] == "MISSING"
+
+
+def test_journal_json_export_contains_only_valid_trade_log_documents(
+    tmp_path: Path,
+) -> None:
+    container, trade = _closed_with_container(tmp_path)
+    service = JournalService(container.store, container.clock, container.settings)
+
+    result = service.export("json")
+
+    document = json.loads(Path(result["path"]).read_text(encoding="utf-8"))
+    assert document["schema_version"] == "1.0.0"
+    assert [item["trade_id"] for item in document["trades"]] == [trade["trade_id"]]
+    for item in document["trades"]:
+        validate("trade-log.schema.json", item)
+    assert document["stats"]["definitions"]
+    assert "system_prompt" not in json.dumps(document).lower()
+
+
+def test_journal_csv_export_uses_the_read_model_header(tmp_path: Path) -> None:
+    container, _trade = _closed_with_container(tmp_path)
+    service = JournalService(container.store, container.clock, container.settings)
+
+    result = service.export("csv")
+
+    text = Path(result["path"]).read_text(encoding="utf-8")
+    assert text.splitlines()[0].startswith("trade_id,position_id,environment,symbol")
+    assert result["rows"] == 1
+    assert "system_prompt" not in text
+    assert "raw_output" not in text
+
+
+def test_journal_compare_names_each_unavailable_side(tmp_path: Path) -> None:
+    container, trade = _closed_with_container(tmp_path)
+    service = JournalService(container.store, container.clock, container.settings)
+
+    comparison = service.compare(trade["trade_id"])
+
+    assert comparison["zone"]["status"] in {"INSIDE", "ABOVE_ZONE", "BELOW_ZONE"}
+    assert comparison["slippage"]["status"] == "OK"
+    assert comparison["decision"]["status"] == "OK"
+    # No recorded bar covers the fixed close instant, so first touch is N/A.
+    assert comparison["first_touch"]["status"] == "N/A"
+    assert comparison["first_touch"]["kind"] is None
+    assert comparison["first_touch"]["reasons"]
+    assert comparison["data_quality"] == "PARTIAL"

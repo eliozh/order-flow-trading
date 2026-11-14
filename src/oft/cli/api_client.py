@@ -160,6 +160,20 @@ class ApiClient:
     def get_trigger(self, trigger_id: str) -> dict[str, Any]:
         return self._request("GET", f"/api/v1/triggers/{quote(trigger_id, safe='')}")
 
+    def get_trigger_decision(self, trigger_id: str) -> dict[str, Any]:
+        return self._request("GET", f"/api/v1/triggers/{quote(trigger_id, safe='')}/decision")
+
+    def recheck_trigger(
+        self, trigger_id: str, *, refresh: bool = False, idempotency_key: str
+    ) -> dict[str, Any]:
+        query = "?refresh=true" if refresh else ""
+        return self._request(
+            "POST",
+            f"/api/v1/triggers/{quote(trigger_id, safe='')}/recheck{query}",
+            {},
+            extra_headers={"Idempotency-Key": idempotency_key},
+        )
+
     def evaluate_trigger(
         self, payload: dict[str, Any], *, idempotency_key: str | None = None
     ) -> dict[str, Any]:
@@ -246,6 +260,34 @@ class ApiClient:
 
     def get_trade_log(self, trade_id: str) -> dict[str, Any]:
         return self._request("GET", f"/api/v1/journal/{quote(trade_id, safe='')}")
+
+    def journal_stats(
+        self, *, period: str | None = None, symbol: str | None = None
+    ) -> dict[str, Any]:
+        query = []
+        if period:
+            query.append(f"period={quote(period, safe='')}")
+        if symbol:
+            query.append(f"symbol={quote(symbol, safe='')}")
+        suffix = "?" + "&".join(query) if query else ""
+        return self._request("GET", f"/api/v1/journal/stats{suffix}")
+
+    def journal_compare(self, trade_id: str) -> dict[str, Any]:
+        return self._request("GET", f"/api/v1/journal/compare/{quote(trade_id, safe='')}")
+
+    def journal_export(
+        self,
+        *,
+        format: str = "csv",
+        period: str | None = None,
+        symbol: str | None = None,
+    ) -> dict[str, Any]:
+        query = [f"format={quote(format, safe='')}"]
+        if period:
+            query.append(f"period={quote(period, safe='')}")
+        if symbol:
+            query.append(f"symbol={quote(symbol, safe='')}")
+        return self._request("GET", f"/api/v1/journal/export?{'&'.join(query)}")
 
     # -- Prompts ---------------------------------------------------------
 

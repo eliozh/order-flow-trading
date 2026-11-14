@@ -103,7 +103,7 @@ def test_accept_creates_one_paper_order_and_matches_the_read_models(tmp_path: Pa
         card = _recheck(harness)
         assert card["stage_order"] == ["TRIGGER", "LLM", "RISK", "HUMAN"]
         assert card["trigger"]["provenance"] == "CALC"
-        assert card["llm"]["provenance"] == "LLM"
+        assert card["llm"]["provenance"]["provider"] == "stub"
         assert card["risk"]["provenance"] == "CALC"
         assert card["risk"]["verdict"] in {"ALLOW", "REDUCE"}
         assert card["risk"]["binding_cap"]

@@ -1,4 +1,4 @@
-"""``oft log list|show``: the closed-trade journal (read-only)."""
+"""``oft log list|show|stats|compare|export``: the closed-trade journal (read-only)."""
 
 from __future__ import annotations
 
@@ -114,3 +114,167 @@ def log_show(
         emit_error("NOT_FOUND", f"Trade {trade_id} does not exist.", json_output=json_output)
         raise typer.Exit(code=1)
     typer.echo(json.dumps(envelope, indent=2) if json_output else _render_trade(data))
+
+
+def _render_stats(data: dict[str, Any]) -> str:
+    period = data.get("period") or {}
+    if period:
+        period_text = (
+            f"period {period.get('label', '-')} ({period.get('start', '-')}"
+            f" .. {period.get('end', '-')}, basis {period.get('basis', '-')})"
+        )
+    else:
+        period_text = "period all trades"
+    status = data.get("status", "-")
+    lines = [f"JOURNAL STATS · {period_text}", f"status {status}"]
+    if status == "UNDEFINED":
+        lines.append(str(data.get("reason") or "metrics undefined"))
+    else:
+        lines.append(
+            f"sample size {data.get('sample_size', 0)} · denominator {data.get('denominator', 0)}"
+        )
+    lines.append(
+        f"wins {data.get('wins', 0)} · losses {data.get('losses', 0)} · ties {data.get('ties', 0)}"
+    )
+    win_rate = data.get("win_rate")
+    expectancy = data.get("expectancy_usd")
+    avg_r = data.get("avg_r") or {}
+    avg_r_value = avg_r.get("value")
+    lines.append(f"win rate {win_rate if win_rate is not None else 'N/A'}")
+    lines.append(
+        f"expectancy {expectancy if expectancy is not None else 'N/A'} USD"
+        f" · avg R {avg_r_value if avg_r_value is not None else 'N/A'}"
+        f" ({avg_r.get('samples', 0)} sample(s),"
+        f" {avg_r.get('excluded_null_r', 0)} null-R excluded)"
+    )
+    totals = data.get("totals") or {}
+    lines.append(
+        f"totals gross {totals.get('gross_pnl_usd') or 'N/A'}"
+        f" · fees {totals.get('fees_usd') or 'N/A'}"
+        f" · funding {totals.get('funding_usd') or 'N/A'}"
+        f" · net {totals.get('net_pnl_usd') or 'N/A'}"
+    )
+    exclusions = data.get("exclusions") or {}
+    lines.append(
+        f"excluded open positions {exclusions.get('open_positions', 0)}"
+        f" · partial trades {exclusions.get('partial_trades', 0)}"
+        f" · unreadable {exclusions.get('unreadable_trades', 0)}"
+        f" · outside period {exclusions.get('outside_period', 0)}"
+    )
+    lines.append("definitions:")
+    for name, text in (data.get("definitions") or {}).items():
+        lines.append(f"  {name}: {text}")
+    return "\n".join(lines)
+
+
+@log_app.command("stats")
+def log_stats(
+    period: Annotated[
+        str | None,
+        typer.Option("--period", help="Window: Nd days, Nw weeks, Nm months (30 days)."),
+    ] = None,
+    symbol: Annotated[str | None, typer.Option("--symbol", help="Filter by symbol.")] = None,
+    json_output: Annotated[bool, typer.Option("--json", help="Emit JSON.")] = False,
+) -> None:
+    """Deterministic PnL, win-rate, expectancy, and average-R statistics."""
+    settings = _settings_or_exit(json_output)
+    try:
+        envelope = ApiClient.from_settings(settings).journal_stats(
+            period=period, symbol=symbol.upper() if symbol else None
+        )
+    except ApiClientError as exc:
+        emit_error(exc.code, exc.message, json_output=json_output)
+        raise typer.Exit(code=exit_code_for(exc.code)) from exc
+    data = envelope.get("data") or {}
+    typer.echo(json.dumps(envelope, indent=2) if json_output else _render_stats(data))
+
+
+def _render_compare(data: dict[str, Any]) -> str:
+    lines = [
+        f"COMPARE {data.get('trade_id', '-')} · {data.get('symbol', '-')}"
+        f" · {data.get('side', '-')} · data_quality {data.get('data_quality', '-')}"
+    ]
+    zone = data.get("zone") or {}
+    zone_line = (
+        f"zone {zone.get('status', '-')} · entry {zone.get('entry') or 'N/A'}"
+        f" · low {zone.get('zone_low') or 'N/A'} · high {zone.get('zone_high') or 'N/A'}"
+    )
+    if zone.get("distance_bps") is not None:
+        zone_line += f" · distance {zone['distance_bps']:.4f} bps"
+    lines.append(zone_line)
+    slippage = data.get("slippage") or {}
+    bps = slippage.get("bps")
+    if bps is None:
+        lines.append(f"slippage N/A · {slippage.get('formula', '')}".rstrip())
+    else:
+        lines.append(
+            f"slippage {bps:.4f} bps · reference {slippage.get('reference_price')}"
+            f" as_of {slippage.get('reference_as_of')}"
+        )
+    touch = data.get("first_touch") or {}
+    kind = touch.get("kind")
+    touch_line = (
+        f"first_touch {kind if kind is not None else 'NONE'}"
+        f" at {touch.get('at') or 'N/A'} · {touch.get('status', '-')}"
+    )
+    if touch.get("ambiguous"):
+        touch_line += " · AMBIGUOUS_BAR"
+    lines.append(touch_line)
+    decision = data.get("decision") or {}
+    decision_line = (
+        f"decision {decision.get('decision') or 'N/A'}"
+        f" · direction_agrees {decision.get('direction_agrees')}"
+        f" · matched {decision.get('matched')}"
+    )
+    lines.append(decision_line)
+    for reason in data.get("reasons") or []:
+        lines.append(f"  reason: {reason}")
+    return "\n".join(lines)
+
+
+@log_app.command("compare")
+def log_compare(
+    trade_id: str,
+    json_output: Annotated[bool, typer.Option("--json", help="Emit JSON.")] = False,
+) -> None:
+    """Compare the proposed signal with the realized outcome for one trade."""
+    settings = _settings_or_exit(json_output)
+    try:
+        envelope = ApiClient.from_settings(settings).journal_compare(trade_id)
+    except ApiClientError as exc:
+        emit_error(exc.code, exc.message, json_output=json_output)
+        raise typer.Exit(code=exit_code_for(exc.code)) from exc
+    data = envelope.get("data") or {}
+    typer.echo(json.dumps(envelope, indent=2) if json_output else _render_compare(data))
+
+
+@log_app.command("export")
+def log_export(
+    format: Annotated[
+        str,
+        typer.Option("--format", help="Export format: csv or json."),
+    ] = "csv",
+    period: Annotated[
+        str | None,
+        typer.Option("--period", help="Window: Nd days, Nw weeks, Nm months (30 days)."),
+    ] = None,
+    symbol: Annotated[str | None, typer.Option("--symbol", help="Filter by symbol.")] = None,
+    json_output: Annotated[bool, typer.Option("--json", help="Emit JSON.")] = False,
+) -> None:
+    """Write the journal under the data directory (CSV formulas neutralized)."""
+    settings = _settings_or_exit(json_output)
+    try:
+        envelope = ApiClient.from_settings(settings).journal_export(
+            format=format, period=period, symbol=symbol.upper() if symbol else None
+        )
+    except ApiClientError as exc:
+        emit_error(exc.code, exc.message, json_output=json_output)
+        raise typer.Exit(code=exit_code_for(exc.code)) from exc
+    if json_output:
+        typer.echo(json.dumps(envelope, indent=2))
+        return
+    data = envelope.get("data") or {}
+    typer.echo(
+        f"EXPORTED {data.get('path', '-')} · {data.get('format', '-')}"
+        f" · {data.get('rows', 0)} row(s) · {data.get('bytes', 0)} bytes"
+    )

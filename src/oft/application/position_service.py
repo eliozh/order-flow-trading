@@ -29,13 +29,12 @@ import builtins
 import hashlib
 import json
 import logging
-import re
 from dataclasses import dataclass, replace
 from datetime import UTC, datetime, timedelta
 from decimal import Decimal
 from typing import Any
 
-from oft.adapters.parquet_store import read_bars
+from oft.application import recorded_bars
 from oft.application.execution_gateway import AuthContext, ExecutionGateway, GatewayError
 from oft.application.kill_switch import KillSwitch, record_audit
 from oft.application.paper_account import PaperAccountService
@@ -122,9 +121,7 @@ NO_ACTION = "NO_ACTION"
 
 _MARK_SOURCE_BARS = "BARS"
 _MARK_SOURCE_POSITION = "POSITION"
-_BARS_STATUSES = frozenset({"PUBLISHED", "COMPLETE"})
 _PROVIDER_VALUES = frozenset({"openai", "anthropic", "deepseek", "stub"})
-_PERIOD_TOKEN = re.compile(r"(?:^|/)period=([^/]+)(?:/|$)")
 _FUNDING_RETRY_LIMIT = 3
 _MAX_FUNDING_INTERVAL_HOURS = Decimal("168")
 _MAX_EXPECTED_SETTLEMENTS = 500
@@ -624,11 +621,6 @@ def _mark_at(bars: tuple[dict[str, object], ...], ts: str) -> Decimal | None:
     return None if selected is None else selected[1]
 
 
-def _period_from_path(path: str) -> str | None:
-    match = _PERIOD_TOKEN.search(path)
-    return match.group(1) if match is not None else None
-
-
 def _observation_rank(observation: _MarkObservation) -> tuple[bool, datetime, int]:
     """Newest first; a parseable as-of beats an unparseable one, bar on a tie."""
     parsed = _parse_timestamp(observation.as_of)
@@ -658,7 +650,7 @@ class PositionService:
         # facts share one read per logical series. The service is constructed per
         # request/tick, so this transient state never spans operations.
         self._tick_series: set[tuple[str, str]] | None = None
-        self._tick_cache: dict[tuple[str, str], tuple[dict[str, object], ...]] | None = None
+        self._tick_cache: recorded_bars.SeriesCache | None = None
 
     # -- read models -----------------------------------------------------
 
@@ -1274,26 +1266,17 @@ class PositionService:
         position: Position,
         period: str,
         metric_version: str,
-        cache: dict[tuple[str, str], tuple[dict[str, object], ...]] | None,
+        cache: recorded_bars.SeriesCache | None,
     ) -> tuple[dict[str, object], ...]:
         """Read one logical bars series, reusing it within one operation."""
-        key = (period, metric_version)
-        if cache is not None and key in cache:
-            return cache[key]
-        try:
-            rows = read_bars(
-                self._settings,
-                symbol=position.symbol,
-                period=period,
-                metric_version=metric_version,
-                store=self._store,
-            )
-        except (StoreUnavailableError, OSError, ValueError) as exc:
-            _LOGGER.warning("cannot read bars for %s: %s", position.symbol, exc)
-            rows = ()
-        if cache is not None:
-            cache[key] = rows
-        return rows
+        return recorded_bars.read_series(
+            self._settings,
+            self._store,
+            position.symbol,
+            period,
+            metric_version,
+            cache,
+        ).rows
 
     def _window_bars(
         self,
@@ -1302,51 +1285,21 @@ class PositionService:
         end: str,
         *,
         series: set[tuple[str, str]] | None = None,
-        cache: dict[tuple[str, str], tuple[dict[str, object], ...]] | None = None,
+        cache: recorded_bars.SeriesCache | None = None,
     ) -> tuple[dict[str, object], ...]:
         """The recorded bars whose ``bar_end`` falls inside the holding window."""
-        start_dt = _parse_timestamp(start)
-        end_dt = _parse_timestamp(end)
-        if start_dt is None or end_dt is None:
-            return ()
-        series = self._bar_series(position) if series is None else series
-        best: tuple[dict[str, object], ...] = ()
-        best_end: datetime | None = None
-        for period, metric_version in sorted(series):
-            rows = self._read_series(position, period, metric_version, cache)
-            usable: list[dict[str, object]] = []
-            newest: datetime | None = None
-            for row in rows:
-                bar_end = _parse_timestamp(row.get("bar_end"))
-                if bar_end is None or not (start_dt <= bar_end <= end_dt):
-                    continue
-                usable.append(row)
-                if newest is None or bar_end > newest:
-                    newest = bar_end
-            if newest is not None and (best_end is None or newest > best_end):
-                best_end = newest
-                best = tuple(usable)
-        return best
+        return recorded_bars.window_bars(
+            self._settings,
+            self._store,
+            position.symbol,
+            start,
+            end,
+            series=series,
+            cache=cache,
+        ).rows
 
     def _bar_series(self, position: Position) -> set[tuple[str, str]]:
-        try:
-            entries = self._store.list_manifest()
-        except StoreUnavailableError as exc:
-            _LOGGER.warning("cannot read the manifest for %s: %s", position.symbol, exc)
-            return set()
-        series: set[tuple[str, str]] = set()
-        for entry in entries:
-            if (
-                entry.data_type != "bars"
-                or entry.symbol != position.symbol
-                or entry.status not in _BARS_STATUSES
-            ):
-                continue
-            period = _period_from_path(entry.path)
-            metric_version = entry.metric_version
-            if period is None or metric_version is None:
-                continue
-            series.add((period, metric_version))
+        series, _failed = recorded_bars.bar_series(self._store, position.symbol)
         return series
 
     # -- management tick -------------------------------------------------
@@ -1387,7 +1340,7 @@ class PositionService:
         # funding accrual, and the journal facts share one ``read_bars`` sweep
         # per series instead of four.
         series = self._bar_series(position)
-        cache: dict[tuple[str, str], tuple[dict[str, object], ...]] = {}
+        cache: recorded_bars.SeriesCache = {}
         self._tick_series = series
         self._tick_cache = cache
         window_bars = self._window_bars(
@@ -2020,7 +1973,7 @@ class PositionService:
         bars: tuple[dict[str, object], ...] | None = None,
         history: _FundingHistory | None = None,
         series: set[tuple[str, str]] | None = None,
-        cache: dict[tuple[str, str], tuple[dict[str, object], ...]] | None = None,
+        cache: recorded_bars.SeriesCache | None = None,
         close_reason: str = STOP_TOUCH_RULE,
     ) -> TradeLogContext:
         """Compute the complete journal facts for the upcoming full close."""
@@ -2285,7 +2238,7 @@ class PositionService:
         bars: tuple[dict[str, object], ...] | None = None,
         history: _FundingHistory | None = None,
         series: set[tuple[str, str]] | None = None,
-        cache: dict[tuple[str, str], tuple[dict[str, object], ...]] | None = None,
+        cache: recorded_bars.SeriesCache | None = None,
         funding: dict[str, Any] | None = None,
     ) -> PositionMonitorResult:
         seed = f"{position.position_id}:{mark}:{mark_as_of}"

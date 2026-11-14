@@ -84,7 +84,11 @@ def test_recheck_returns_an_ordered_decision_card(tmp_path: Path) -> None:
     assert card["stage_order"] == ["TRIGGER", "LLM", "RISK", "HUMAN"]
     assert card["trigger_id"] == trigger_id
     assert card["trigger"]["provenance"] == "CALC"
-    assert card["llm"]["provenance"] == "LLM"
+    # The card exposes the entry decision's own provenance, not a bare marker.
+    assert card["llm"]["provenance"]["provider"] == "stub"
+    assert card["llm"]["provenance"]["model"]
+    assert card["llm"]["provenance"]["prompt_version"] >= 1
+    assert card["llm"]["provenance"]["cost"]["currency"] == "USD"
     assert card["llm"]["decision"] == "ENTER_LONG"
     assert card["risk"]["provenance"] == "CALC"
     assert card["risk"]["verdict"] in {"ALLOW", "REDUCE"}
@@ -195,7 +199,7 @@ def test_api_recheck_returns_the_ordered_card(tmp_path: Path) -> None:
     card = body["data"]
     assert card["stage_order"] == ["TRIGGER", "LLM", "RISK", "HUMAN"]
     assert card["trigger"]["provenance"] == "CALC"
-    assert card["llm"]["provenance"] == "LLM"
+    assert card["llm"]["provenance"]["provider"] == "stub"
     assert card["risk"]["provenance"] == "CALC"
 
 
@@ -378,7 +382,7 @@ def test_repeat_recheck_refreshes_the_verdict_metadata(tmp_path: Path) -> None:
         ),
     )
 
-    second = later.recheck(trigger_id)
+    second = later.recheck(trigger_id, refresh=True)
 
     with closing(sqlite3.connect(settings.data_dir / "oft.db")) as connection:
         rows = connection.execute("SELECT computed_at FROM risk_verdicts").fetchall()
