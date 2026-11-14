@@ -13,34 +13,22 @@ from __future__ import annotations
 import json
 import sqlite3
 from collections.abc import Callable
-from dataclasses import dataclass
-from datetime import UTC, date, datetime, timedelta
+from datetime import datetime, timedelta
 from pathlib import Path
 from typing import Any
 
-from fastapi.testclient import TestClient
-from jsonschema import Draft202012Validator
-from referencing import Registry, Resource
-from referencing.jsonschema import DRAFT202012
+import pytest
+from journal_support import (
+    NOW,
+    ROOT,
+    WEB_SRC,
+    _closed_trade,
+    _harness,
+    _open_position,
+    _validate_envelope,
+)
 
-from oft.api.app import create_app
-from oft.application.entry_service import EntryService
-from oft.application.kill_switch import KillSwitch
-from oft.application.position_service import PositionService
-from oft.application.scan_service import ScanRequest, ScanService
-from oft.application.trigger_service import TriggerService
-from oft.clock import FixedClock
 from oft.config import Settings
-from position_support import set_position_mark
-
-ROOT = Path(__file__).resolve().parents[2]
-ARCHIVE = ROOT / "tests" / "fixtures" / "archive"
-FIXTURES = ROOT / "tests" / "fixtures" / "llm"
-CONTRACTS = ROOT / "docs" / "contracts"
-WEB_SRC = ROOT / "web" / "src"
-START = date(2026, 10, 1)
-END = date(2026, 10, 7)
-NOW = datetime(2026, 10, 8, tzinfo=UTC)
 
 TRADE_SUMMARY_FIELDS = {
     "trade_id",
@@ -85,15 +73,6 @@ EXCLUSION_FIELDS = {
 }
 
 
-@dataclass
-class _Harness:
-    app: Any
-    client: TestClient
-    auth: dict[str, str]
-    settings: Settings
-    container: Any
-
-
 class _TickingClock:
     """A monotonic test clock so two exports never share a filename."""
 
@@ -104,92 +83,6 @@ class _TickingClock:
     def now(self) -> datetime:
         self._count += 1
         return self._start + timedelta(seconds=self._count)
-
-
-def _registry() -> Registry:
-    """Every committed schema, so the envelope's local refs resolve offline."""
-    resources = []
-    for path in sorted(CONTRACTS.glob("*.schema.json")):
-        document = json.loads(path.read_text(encoding="utf-8"))
-        resources.append(
-            (document["$id"], Resource.from_contents(document, default_specification=DRAFT202012))
-        )
-    return Registry().with_resources(resources)
-
-
-def _validate_envelope(envelope: dict[str, Any]) -> None:
-    document = json.loads((CONTRACTS / "api-envelope.schema.json").read_text(encoding="utf-8"))
-    errors = sorted(
-        Draft202012Validator(document, registry=_registry()).iter_errors(envelope),
-        key=lambda error: list(error.path),
-    )
-    assert not errors, "\n".join(error.message for error in errors)
-
-
-def _harness(tmp_path: Path, *, clock: Any | None = None) -> _Harness:
-    settings = Settings(
-        env="test",
-        port=8765,
-        data_dir=tmp_path / "data",
-        archive_fixture_dir=ARCHIVE,
-        llm_provider="stub",
-        llm_fixtures_dir=FIXTURES,
-    )
-    app = create_app(settings, clock=clock or FixedClock(NOW))
-    client = TestClient(app)
-    container = app.state.container
-    assert (
-        container.backfill.run(
-            symbol="BTCUSDT", data_type="aggTrades", start=START, end=END
-        ).run.status
-        == "COMPLETE"
-    )
-    return _Harness(
-        app=app,
-        client=client,
-        auth={"Authorization": f"Bearer {app.state.api_token}"},
-        settings=settings,
-        container=container,
-    )
-
-
-def _open_position(
-    harness: _Harness, *, period: str = "4h", key: str = "journal"
-) -> dict[str, Any]:
-    """Run the real scan -> trigger -> accept path and stop short of closing."""
-    container = harness.container
-    ScanService(container=container, lock=container.scan_lock).run(
-        ScanRequest(symbol="BTCUSDT", period=period, metrics_only=False, provider="stub")
-    )
-    opportunities = list(container.store.list_opportunities(state="OPEN"))
-    assert opportunities, "the scan produced no open opportunity"
-    opportunity = opportunities[-1]
-    run = TriggerService(store=container.store, clock=container.clock).evaluate(
-        opportunity.opportunity_id
-    )
-    assert run.trigger is not None
-    kill = KillSwitch(settings=harness.settings, store=container.store, clock=container.clock)
-    accepted = EntryService(
-        store=container.store,
-        clock=container.clock,
-        provider=container.llm_provider,
-        settings=harness.settings,
-        kill_switch=kill,
-    ).accept(run.trigger.trigger_id, idempotency_key=f"{key}-entry")
-    assert accepted.position is not None
-    return accepted.position
-
-
-def _closed_trade(harness: _Harness) -> tuple[dict[str, Any], dict[str, Any]]:
-    position = _open_position(harness, key="journal-close")
-    set_position_mark(harness.settings, position["position_id"], position["stop_price"])
-    closed = PositionService(
-        store=harness.container.store,
-        clock=harness.container.clock,
-        settings=harness.settings,
-    ).monitor(position["position_id"])
-    assert closed.trade_log is not None
-    return position, closed.trade_log
 
 
 def _mutate_trade(
@@ -690,6 +583,7 @@ def test_journal_web_sources_cover_the_required_ui_states() -> None:
     comparison = (WEB_SRC / "components" / "signal-comparison.tsx").read_text(encoding="utf-8")
     band = (WEB_SRC / "components" / "review-band.tsx").read_text(encoding="utf-8")
     api = (WEB_SRC / "api" / "journal.ts").read_text(encoding="utf-8")
+    idempotency = (WEB_SRC / "api" / "idempotency.ts").read_text(encoding="utf-8")
 
     # The stats strip states every metric and its definition, and keeps the
     # honest undefined wording instead of zeroing an empty sample.
@@ -769,7 +663,70 @@ def test_journal_web_sources_cover_the_required_ui_states() -> None:
         assert "/settings" not in source
         assert "/api/v1/live" not in source
 
-    # The review mutation carries the real CSRF + idempotency contract.
-    assert "X-CSRF-Token" in api
-    assert "Idempotency-Key" in api
-    assert "oft_csrf" in api
+    # The review mutation carries the real CSRF + idempotency contract. The
+    # header construction lives in the shared idempotency module (slice-30 fix).
+    assert "mutationHeaders" in api
+    assert "X-CSRF-Token" in idempotency
+    assert "Idempotency-Key" in idempotency
+    assert "oft_csrf" in idempotency
+
+
+def _export_dir(harness: Any) -> Path:
+    return harness.settings.data_dir / "exports"
+
+
+@pytest.mark.parametrize("failure", ["replace", "write", "mkdir"])
+def test_export_write_failure_maps_to_storage_unavailable(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, failure: str
+) -> None:
+    """A directory/write/publish OSError is a 503, never a 500, with no leftovers."""
+    import oft.application.journal_service as journal_service_module
+
+    harness = _harness(tmp_path)
+    try:
+        if failure == "replace":
+
+            def _boom(*_args: Any, **_kwargs: Any) -> None:
+                raise OSError("disk full")
+
+            monkeypatch.setattr(journal_service_module.os, "replace", _boom)
+        elif failure == "write":
+
+            def _boom_fdopen(*_args: Any, **_kwargs: Any) -> Any:
+                raise OSError("disk full")
+
+            monkeypatch.setattr(journal_service_module.os, "fdopen", _boom_fdopen)
+        else:
+            original_mkdir = Path.mkdir
+
+            def _boom_mkdir(self: Path, *args: Any, **kwargs: Any) -> None:
+                # Only the export directory fails; tmp_path setup is untouched.
+                if self.name == "exports":
+                    raise OSError("cannot create export dir")
+                original_mkdir(self, *args, **kwargs)
+
+            monkeypatch.setattr(Path, "mkdir", _boom_mkdir)
+
+        metadata = harness.client.get(
+            "/api/v1/journal/export", params={"format": "csv"}, headers=harness.auth
+        )
+        file_response = harness.client.get(
+            "/api/v1/journal/export/file", params={"format": "json"}, headers=harness.auth
+        )
+        export_dir = _export_dir(harness)
+        leftovers = (
+            sorted(path.name for path in export_dir.iterdir()) if export_dir.exists() else []
+        )
+    finally:
+        harness.client.close()
+
+    for response in (metadata, file_response):
+        assert response.status_code == 503, response.text
+        envelope = response.json()
+        assert envelope["ok"] is False
+        assert envelope["error"]["code"] == "STORAGE_UNAVAILABLE"
+        # The absolute data path never leaks to the client.
+        assert str(harness.settings.data_dir) not in response.text
+
+    # No partial final file and no leftover temp file.
+    assert leftovers == []

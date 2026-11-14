@@ -2,7 +2,7 @@ import { fireEvent, render, screen } from '@testing-library/react'
 import { describe, expect, it, vi } from 'vitest'
 
 import type { JournalReviewData } from '../../api/journal'
-import { ReviewBand } from '../review-band'
+import { ReviewBand, ReviewProvenance } from '../review-band'
 
 function reviewFixture(overrides: Partial<JournalReviewData> = {}): JournalReviewData {
   return {
@@ -159,12 +159,16 @@ describe('ReviewBand', () => {
     expect(screen.getByTestId('journal-review-replay')).toHaveTextContent('幂等重放：复用已存结果')
   })
 
-  it('disables generation in the read-only mobile mode', () => {
+  it('keeps the generation control focusable and described in read-only mode', () => {
     const onGenerate = vi.fn()
     render(<ReviewBand review={reviewFixture()} readonly onGenerate={onGenerate} />)
 
     const button = screen.getByRole('button', { name: /重新生成/ })
-    expect(button).toBeDisabled()
+    expect(button).toHaveAttribute('aria-disabled', 'true')
+    expect(button).not.toBeDisabled()
+    expect(button).toHaveAccessibleDescription(/移动端只读/)
+    button.focus()
+    expect(button).toHaveFocus()
     fireEvent.click(button)
     expect(onGenerate).not.toHaveBeenCalled()
     expect(screen.getByText(/移动端只读/)).toBeInTheDocument()
@@ -202,7 +206,7 @@ describe('ReviewBand', () => {
     expect(screen.getByRole('button', { name: /重试读取复盘/ })).toBeInTheDocument()
   })
 
-  it('marks the band busy and announces progress while generating', () => {
+  it('marks the generation body busy, keeps the live region outside it, and shows visible progress', () => {
     render(
       <ReviewBand
         review={reviewFixture({
@@ -220,8 +224,15 @@ describe('ReviewBand', () => {
       />,
     )
 
-    expect(screen.getByTestId('review-band')).toHaveAttribute('aria-busy', 'true')
-    expect(screen.getByTestId('journal-review-status')).toHaveTextContent('正在生成复盘…')
+    const busyBody = screen.getByTestId('review-band-body')
+    expect(busyBody).toHaveAttribute('aria-busy', 'true')
+    const status = screen.getByTestId('journal-review-status')
+    expect(status).toHaveTextContent('正在生成复盘…')
+    // A polite live region nested in an aria-busy subtree is not announced.
+    expect(busyBody).not.toContainElement(status)
+    expect(status).toHaveAttribute('aria-live', 'polite')
+    // The progress is visible, not only visually hidden.
+    expect(screen.getByTestId('journal-review-generating')).toHaveTextContent('正在生成复盘…')
     const button = screen.getByRole('button', { name: /生成复盘/ })
     expect(button).toHaveAttribute('aria-disabled', 'true')
     expect(button).not.toBeDisabled()
@@ -238,16 +249,86 @@ describe('ReviewBand', () => {
     expect(onGenerate).not.toHaveBeenCalled()
   })
 
-  it('announces a completed generation', () => {
+  it('announces a completed generation with the decision id', () => {
+    render(
+      <ReviewBand review={reviewFixture()} announcement="复盘已生成：REV-9" onGenerate={vi.fn()} />,
+    )
+
+    expect(screen.getByTestId('journal-review-status')).toHaveTextContent('复盘已生成：REV-9')
+    expect(screen.getByTestId('review-band-body')).toHaveAttribute('aria-busy', 'false')
+  })
+
+  it('keeps the retry action visible when a background read also failed', () => {
+    const onGenerate = vi.fn()
     render(
       <ReviewBand
-        review={reviewFixture()}
-        announcement="复盘已生成"
+        review={reviewFixture({
+          status: 'MISSING',
+          decision_id: null,
+          rationale: null,
+          confidence: null,
+          validation_status: null,
+          provenance: null,
+          caveats: [],
+          reason: 'no advisory review is linked to this trade',
+        })}
+        readError="review read down"
+        actionError="review provider down"
+        actionErrorKind="unknown"
+        onGenerate={onGenerate}
+        onRetryRead={vi.fn()}
+      />,
+    )
+
+    expect(screen.getByText(/复盘读取失败：review read down/)).toBeInTheDocument()
+    expect(screen.getByRole('button', { name: /重试读取复盘/ })).toBeInTheDocument()
+    fireEvent.click(screen.getByRole('button', { name: /重试生成/ }))
+    expect(onGenerate).toHaveBeenCalledTimes(1)
+  })
+
+  it('renders an undefined confidence as an em dash without throwing', () => {
+    render(
+      <ReviewBand
+        review={reviewFixture({ confidence: undefined as unknown as number | null })}
         onGenerate={vi.fn()}
       />,
     )
 
-    expect(screen.getByTestId('journal-review-status')).toHaveTextContent('复盘已生成')
-    expect(screen.getByTestId('review-band')).toHaveAttribute('aria-busy', 'false')
+    expect(screen.getByText('Decision')).toBeInTheDocument()
+    expect(screen.getAllByText('—').length).toBeGreaterThan(0)
+  })
+
+  it('drops unknown provenance keys and renders allowlisted hostile values as text', () => {
+    const { container } = render(
+      <ReviewProvenance
+        provenance={{
+          provider: 'stub',
+          model: '<img src=x onerror="alert(1)">',
+          prompt_id: 'javascript:alert(1)',
+          system_prompt: 'leaked system prompt',
+          prompt_body: 'leaked prompt body',
+          api_key: 'sk-live-secret',
+          secret_key: 'super-secret',
+        }}
+      />,
+    )
+
+    // Unknown keys are never rendered.
+    expect(screen.queryByText(/leaked system prompt/)).not.toBeInTheDocument()
+    expect(screen.queryByText(/leaked prompt body/)).not.toBeInTheDocument()
+    expect(screen.queryByText(/sk-live-secret/)).not.toBeInTheDocument()
+    expect(screen.queryByText(/super-secret/)).not.toBeInTheDocument()
+    // Only allowlisted rows render.
+    const terms = container.querySelectorAll('dt')
+    expect(Array.from(terms).map((term) => term.textContent)).toEqual([
+      'Provider',
+      'Model',
+      'Prompt',
+    ])
+    // Allowlisted hostile values render as text nodes, never HTML.
+    expect(screen.getByText('<img src=x onerror="alert(1)">')).toBeInTheDocument()
+    expect(screen.getByText('javascript:alert(1)')).toBeInTheDocument()
+    expect(container.querySelector('img')).toBeNull()
+    expect(container.querySelector('script')).toBeNull()
   })
 })

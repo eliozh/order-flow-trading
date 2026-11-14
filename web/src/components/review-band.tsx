@@ -1,6 +1,8 @@
-import type { JournalReviewData } from '../api/journal'
+import { numberOrNull, type JournalReviewData } from '../api/journal'
 import { confidenceBand } from '../api/reports'
 import { ProvenanceStamp } from './provenance'
+
+const READONLY_NOTE_ID = 'journal-review-readonly-note'
 
 interface ReviewBandProps {
   review: JournalReviewData | null
@@ -90,14 +92,18 @@ export function ReviewProvenance({
 }) {
   const rows = provenanceRows(provenance)
   if (rows.length === 0) {
-    return <p className="band-note">Provenance N/A</p>
+    return (
+      <p className="band-note" lang="en">
+        Provenance N/A
+      </p>
+    )
   }
   return (
     <dl className="band-meta">
       {rows.map(([label, value]) => (
         <div key={label}>
-          <dt>{label}</dt>
-          <dd>{value}</dd>
+          <dt lang="en">{label}</dt>
+          <dd lang="en">{value}</dd>
         </div>
       ))}
     </dl>
@@ -125,15 +131,16 @@ export function ReviewBand({
   onRetryRead,
 }: ReviewBandProps) {
   const band = confidenceBand(review?.confidence ?? null)
+  const confidenceValue = numberOrNull(review?.confidence ?? null)
   const disabled = readonly || generating
   const buttonLabel =
-    actionError !== null
-      ? '重试生成'
-      : review?.status === 'FOUND'
-        ? '重新生成'
-        : '生成复盘'
+    actionError !== null ? '重试生成' : review?.status === 'FOUND' ? '重新生成' : '生成复盘'
   const showAction =
-    !loading && review?.status !== 'PARTIAL' && (readError === null || review?.status === 'FOUND')
+    !loading &&
+    review?.status !== 'PARTIAL' &&
+    // Action copy tells the user to retry after a POST failure; keep the control
+    // visible even when the background read also failed.
+    (actionError !== null || readError === null || review?.status === 'FOUND')
 
   const generate = (): void => {
     if (disabled) {
@@ -148,7 +155,6 @@ export function ReviewBand({
     <section
       className="band band--llm"
       aria-labelledby="journal-review-heading"
-      aria-busy={generating}
       data-testid="review-band"
     >
       <div className="band-head">
@@ -158,105 +164,121 @@ export function ReviewBand({
       <p className="band-note">仅建议：本复盘不会修改任何规则、prompt、风险上限或订单。</p>
 
       {readonly && (
-        <p className="readonly-note" role="note">
+        <p id={READONLY_NOTE_ID} className="readonly-note" role="note">
           移动端只读：复盘生成请在桌面端或 CLI 完成。Kill switch 仍可用。
         </p>
       )}
 
-      {loading && (
-        <p className="status-message" role="status">
-          加载复盘…
-        </p>
-      )}
-
-      <p className="visually-hidden" role="status" data-testid="journal-review-status">
+      {/*
+        The live region is a sibling of the aria-busy subtree on purpose: a
+        polite status nested inside an aria-busy element is not announced, so
+        progress and completion would otherwise be silent for screen readers.
+      */}
+      <p role="status" aria-live="polite" data-testid="journal-review-status">
         {generating ? '正在生成复盘…' : (announcement ?? '')}
       </p>
 
-      {readError !== null && (
-        <div className="journal-review-actions">
-          <p className="llm-reason" role="alert">
-            复盘读取失败：{readError}
+      <div data-testid="review-band-body" aria-busy={generating}>
+        {generating && (
+          <p className="status-message" data-testid="journal-review-generating">
+            正在生成复盘…
           </p>
-          {onRetryRead && (
-            <button type="button" className="btn" onClick={onRetryRead}>
-              重试读取复盘
-            </button>
-          )}
-        </div>
-      )}
+        )}
 
-      {!loading && review?.status === 'FOUND' && (
-        <>
-          <dl className="kv">
-            <dt>Decision</dt>
-            <dd className="mono">{review.decision_id ?? '—'}</dd>
-            <dt>Confidence</dt>
-            <dd className="mono">
-              {review.confidence === null ? '—' : review.confidence.toFixed(2)}{' '}
-              {band && <span className={BAND_CLASSES[band]}>{BAND_LABELS[band]}</span>}
-            </dd>
-            <dt>Validation</dt>
-            <dd className="mono">{review.validation_status ?? '—'}</dd>
-          </dl>
-          {review.rationale !== null && <p className="prose">{review.rationale}</p>}
-          {review.caveats.length > 0 && (
-            <ul className="journal-caveats">
-              {review.caveats.map((caveat, index) => (
-                <li key={`${index}-${caveat.slice(0, 16)}`}>{caveat}</li>
-              ))}
-            </ul>
-          )}
-          <ReviewProvenance provenance={review.provenance} />
-        </>
-      )}
+        {loading && (
+          <p className="status-message" role="status">
+            加载复盘…
+          </p>
+        )}
 
-      {!loading && readError === null && review?.status === 'MISSING' && (
-        <>
-          <p className="llm-reason">尚未生成复盘。</p>
-          {review.reason !== null && <p className="llm-reason">原因：{review.reason}</p>}
-        </>
-      )}
-
-      {!loading && readError === null && review?.status === 'PARTIAL' && (
-        <p className="llm-reason">无法展示建议内容：{review.reason ?? '复盘数据不完整'}</p>
-      )}
-
-      {!loading && readError === null && review === null && <p className="llm-reason">尚未生成复盘。</p>}
-
-      {showAction && (
-        <div className="journal-review-actions">
-          <button
-            type="button"
-            className="btn"
-            disabled={readonly}
-            aria-disabled={disabled}
-            aria-busy={generating}
-            onClick={generate}
-          >
-            {buttonLabel}
-          </button>
-        </div>
-      )}
-
-      {actionError !== null && (
-        <div className="journal-review-actions" role="alert" data-testid="journal-review-error">
-          <p className="llm-reason">复盘生成失败：{actionError}</p>
-          {actionErrorKind === 'unknown' ? (
-            <p className="llm-reason">
-              结果未知：服务器可能已保存复盘。重试会复用同一 Idempotency-Key，服务器将重放已存结果。
+        {readError !== null && (
+          <div className="journal-review-actions">
+            <p className="llm-reason" role="alert">
+              复盘读取失败：{readError}
             </p>
-          ) : (
-            <p className="llm-reason">未生成复盘；可重试。</p>
-          )}
-        </div>
-      )}
+            {onRetryRead && (
+              <button type="button" className="btn" onClick={onRetryRead}>
+                重试读取复盘
+              </button>
+            )}
+          </div>
+        )}
 
-      {review?.idempotent_replay === true && (
-        <p className="band-note" data-testid="journal-review-replay">
-          幂等重放：复用已存结果
-        </p>
-      )}
+        {!loading && review?.status === 'FOUND' && (
+          <>
+            <dl className="kv">
+              <dt lang="en">Decision</dt>
+              <dd className="mono">{review.decision_id ?? '—'}</dd>
+              <dt lang="en">Confidence</dt>
+              <dd className="mono">
+                {confidenceValue === null ? '—' : confidenceValue.toFixed(2)}{' '}
+                {band && <span className={BAND_CLASSES[band]}>{BAND_LABELS[band]}</span>}
+              </dd>
+              <dt lang="en">Validation</dt>
+              <dd className="mono">{review.validation_status ?? '—'}</dd>
+            </dl>
+            {review.rationale !== null && <p className="prose">{review.rationale}</p>}
+            {review.caveats.length > 0 && (
+              <ul className="journal-caveats">
+                {review.caveats.map((caveat, index) => (
+                  <li key={`${index}-${caveat.slice(0, 16)}`}>{caveat}</li>
+                ))}
+              </ul>
+            )}
+            <ReviewProvenance provenance={review.provenance} />
+          </>
+        )}
+
+        {!loading && readError === null && review?.status === 'MISSING' && (
+          <>
+            <p className="llm-reason">尚未生成复盘。</p>
+            {review.reason !== null && <p className="llm-reason">原因：{review.reason}</p>}
+          </>
+        )}
+
+        {!loading && readError === null && review?.status === 'PARTIAL' && (
+          <p className="llm-reason">无法展示建议内容：{review.reason ?? '复盘数据不完整'}</p>
+        )}
+
+        {!loading && readError === null && review === null && (
+          <p className="llm-reason">尚未生成复盘。</p>
+        )}
+
+        {showAction && (
+          <div className="journal-review-actions">
+            <button
+              type="button"
+              className="btn"
+              aria-disabled={disabled}
+              aria-busy={generating}
+              aria-describedby={readonly ? READONLY_NOTE_ID : undefined}
+              onClick={generate}
+            >
+              {buttonLabel}
+            </button>
+          </div>
+        )}
+
+        {actionError !== null && (
+          <div className="journal-review-actions" role="alert" data-testid="journal-review-error">
+            <p className="llm-reason">复盘生成失败：{actionError}</p>
+            {actionErrorKind === 'unknown' ? (
+              <p className="llm-reason">
+                结果未知：服务器可能已保存复盘。重试会复用同一
+                Idempotency-Key，服务器将重放已存结果。
+              </p>
+            ) : (
+              <p className="llm-reason">未生成复盘；可重试。</p>
+            )}
+          </div>
+        )}
+
+        {review?.idempotent_replay === true && (
+          <p className="band-note" data-testid="journal-review-replay">
+            幂等重放：复用已存结果
+          </p>
+        )}
+      </div>
     </section>
   )
 }

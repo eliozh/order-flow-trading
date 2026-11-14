@@ -12,48 +12,21 @@ offers no rule-change action and renders no raw HTML, prompt, or secret.
 from __future__ import annotations
 
 import json
-from dataclasses import dataclass
-from datetime import UTC, date, datetime
 from pathlib import Path
 from typing import Any
 
 import pytest
-from fastapi.testclient import TestClient
-from jsonschema import Draft202012Validator
-from referencing import Registry, Resource
-from referencing.jsonschema import DRAFT202012
+from journal_support import (
+    WEB_SRC,
+    _closed_trade,
+    _harness,
+    _validate_envelope,
+)
 
 import oft.api.routes.journal as journal_route
-from oft.api.app import create_app
 from oft.api.auth import CSRF_COOKIE, CSRF_HEADER, allowed_origins
-from oft.application.entry_service import EntryService
-from oft.application.kill_switch import KillSwitch
-from oft.application.position_service import PositionService
 from oft.application.review_service import ReviewService
-from oft.application.scan_service import ScanRequest, ScanService
-from oft.application.trigger_service import TriggerService
-from oft.clock import FixedClock
-from oft.config import Settings
 from oft.ports.llm import LLMAdapterError
-from position_support import set_position_mark
-
-ROOT = Path(__file__).resolve().parents[2]
-ARCHIVE = ROOT / "tests" / "fixtures" / "archive"
-FIXTURES = ROOT / "tests" / "fixtures" / "llm"
-CONTRACTS = ROOT / "docs" / "contracts"
-WEB_SRC = ROOT / "web" / "src"
-START = date(2026, 10, 1)
-END = date(2026, 10, 7)
-NOW = datetime(2026, 10, 8, tzinfo=UTC)
-
-
-@dataclass
-class _Harness:
-    app: Any
-    client: TestClient
-    auth: dict[str, str]
-    settings: Settings
-    container: Any
 
 
 class _FailingProvider:
@@ -72,81 +45,6 @@ class _FailingProvider:
 
     def estimate_cost(self, request: Any, model: str) -> Any:
         return self._inner.estimate_cost(request, model)
-
-
-def _registry() -> Registry:
-    resources = []
-    for path in sorted(CONTRACTS.glob("*.schema.json")):
-        document = json.loads(path.read_text(encoding="utf-8"))
-        resources.append(
-            (document["$id"], Resource.from_contents(document, default_specification=DRAFT202012))
-        )
-    return Registry().with_resources(resources)
-
-
-def _validate_envelope(envelope: dict[str, Any]) -> None:
-    document = json.loads((CONTRACTS / "api-envelope.schema.json").read_text(encoding="utf-8"))
-    errors = sorted(
-        Draft202012Validator(document, registry=_registry()).iter_errors(envelope),
-        key=lambda error: list(error.path),
-    )
-    assert not errors, "\n".join(error.message for error in errors)
-
-
-def _harness(tmp_path: Path) -> _Harness:
-    settings = Settings(
-        env="test",
-        port=8765,
-        data_dir=tmp_path / "data",
-        archive_fixture_dir=ARCHIVE,
-        llm_provider="stub",
-        llm_fixtures_dir=FIXTURES,
-    )
-    app = create_app(settings, clock=FixedClock(NOW))
-    client = TestClient(app)
-    container = app.state.container
-    assert (
-        container.backfill.run(
-            symbol="BTCUSDT", data_type="aggTrades", start=START, end=END
-        ).run.status
-        == "COMPLETE"
-    )
-    return _Harness(
-        app=app,
-        client=client,
-        auth={"Authorization": f"Bearer {app.state.api_token}"},
-        settings=settings,
-        container=container,
-    )
-
-
-def _closed_trade(harness: _Harness) -> tuple[dict[str, Any], dict[str, Any]]:
-    container = harness.container
-    ScanService(container=container, lock=container.scan_lock).run(
-        ScanRequest(symbol="BTCUSDT", period="4h", metrics_only=False, provider="stub")
-    )
-    opportunities = list(container.store.list_opportunities(state="OPEN"))
-    assert opportunities
-    run = TriggerService(store=container.store, clock=container.clock).evaluate(
-        opportunities[-1].opportunity_id
-    )
-    assert run.trigger is not None
-    kill = KillSwitch(settings=harness.settings, store=container.store, clock=container.clock)
-    accepted = EntryService(
-        store=container.store,
-        clock=container.clock,
-        provider=container.llm_provider,
-        settings=harness.settings,
-        kill_switch=kill,
-    ).accept(run.trigger.trigger_id, idempotency_key="review-e2e-entry")
-    assert accepted.position is not None
-    position = accepted.position
-    set_position_mark(harness.settings, position["position_id"], position["stop_price"])
-    closed = PositionService(
-        store=container.store, clock=container.clock, settings=harness.settings
-    ).monitor(position["position_id"])
-    assert closed.trade_log is not None
-    return position, closed.trade_log
 
 
 def test_review_read_missing_generate_link_and_idempotent_replay(tmp_path: Path) -> None:
@@ -228,10 +126,14 @@ def test_review_post_requires_matching_csrf_for_browser_requests(tmp_path: Path)
         trade_id = trade["trade_id"]
         url = f"/api/v1/journal/{trade_id}/review"
 
-        # Mint a real browser session from the one-time bootstrap secret.
+        # Mint a real browser session from the one-time bootstrap secret. The
+        # bootstrap GET answers 302 by design (it mints a session and redirects
+        # to "/"), so never follow the redirect: "/" is only served when a
+        # web/dist build exists, and `make ci` runs pytest before the build.
         secret = harness.app.state.browser_bootstrap
-        minted = harness.client.get(f"/?bootstrap={secret}")
-        assert minted.status_code == 200, minted.text
+        minted = harness.client.get(f"/?bootstrap={secret}", follow_redirects=False)
+        assert minted.status_code == 302, minted.text
+        assert minted.headers["location"] == "/"
         assert harness.client.cookies.get("oft_session")
         # A cookie-setting GET issues the double-submit CSRF cookie.
         health = harness.client.get("/health")
@@ -331,6 +233,7 @@ def test_review_sources_are_advisory_and_render_no_raw_html() -> None:
     review_source = (WEB_SRC / "components" / "review-band.tsx").read_text(encoding="utf-8")
     detail_source = (WEB_SRC / "routes" / "journal-detail.tsx").read_text(encoding="utf-8")
     api_source = (WEB_SRC / "api" / "journal.ts").read_text(encoding="utf-8")
+    idempotency_source = (WEB_SRC / "api" / "idempotency.ts").read_text(encoding="utf-8")
 
     assert "仅建议，不自动修改规则" in review_source
     # Generate, retry after a failure, and the idempotent-replay note exist.
@@ -352,7 +255,9 @@ def test_review_sources_are_advisory_and_render_no_raw_html() -> None:
     # The band offers no apply/rule-change surface.
     assert "应用" not in review_source
     assert "apply" not in review_source.lower()
-    # Review generation goes through the CSRF + idempotent API client.
-    assert "Idempotency-Key" in api_source
+    # Review generation goes through the CSRF + idempotent API client. The
+    # headers are built by the shared idempotency module (slice-30 fix).
+    assert "mutationHeaders" in api_source
     assert "/review" in api_source
-    assert "X-CSRF-Token" in api_source
+    assert "X-CSRF-Token" in idempotency_source
+    assert "Idempotency-Key" in idempotency_source

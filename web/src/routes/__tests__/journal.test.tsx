@@ -3,9 +3,11 @@ import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
 
 import {
   clearReviewKey,
+  downloadJournalExport,
   durationLabel,
-  fetchJournalExport,
+  exportFilename,
   fetchJournalReview,
+  isJournalTradeData,
   JournalApiError,
   journalExportFileUrl,
   outcomeOf,
@@ -313,6 +315,28 @@ function listEnvelope(
   return envelope({ items, total })
 }
 
+function stubDownloadEnvironment(contentDisposition: string | null, blob: Blob) {
+  const fetchMock = vi.fn<(input: string, init?: RequestInit) => Promise<unknown>>(async () => ({
+    ok: true,
+    status: 200,
+    headers: {
+      get: (name: string) =>
+        name.toLowerCase() === 'content-disposition' ? contentDisposition : null,
+    },
+    blob: async () => blob,
+    json: async () => {
+      throw new Error('not json')
+    },
+  }))
+  vi.stubGlobal('fetch', fetchMock as unknown as typeof fetch)
+  const createObjectURL = vi.fn(() => 'blob:journal-export')
+  const revokeObjectURL = vi.fn()
+  Object.defineProperty(URL, 'createObjectURL', { configurable: true, value: createObjectURL })
+  Object.defineProperty(URL, 'revokeObjectURL', { configurable: true, value: revokeObjectURL })
+  const click = vi.spyOn(HTMLAnchorElement.prototype, 'click').mockImplementation(() => {})
+  return { fetchMock, createObjectURL, revokeObjectURL, click }
+}
+
 async function renderList(
   options: {
     stats?: JournalStatsData
@@ -442,6 +466,8 @@ afterEach(() => {
   vi.restoreAllMocks()
   vi.useRealTimers()
   vi.unstubAllGlobals()
+  delete (URL as unknown as { createObjectURL?: unknown }).createObjectURL
+  delete (URL as unknown as { revokeObjectURL?: unknown }).revokeObjectURL
   document.cookie = 'oft_csrf=; expires=Thu, 01 Jan 1970 00:00:00 GMT'
 })
 
@@ -595,8 +621,7 @@ describe('JournalPage', () => {
     await renderList({
       items: [inside, outside],
       total: 2,
-      fetchStatsFn: async (params) =>
-        envelope(params.period === '4w' ? stats4w : statsFixture()),
+      fetchStatsFn: async (params) => envelope(params.period === '4w' ? stats4w : statsFixture()),
     })
 
     fireEvent.change(screen.getByLabelText('Period'), { target: { value: '4w' } })
@@ -779,23 +804,221 @@ describe('JournalPage', () => {
     await waitFor(() => expect(fetchStatsFn).toHaveBeenCalledTimes(2))
   })
 
+  it('does not let a focus/timer tick discard the in-flight initial load', async () => {
+    let settleStats: ((value: JournalEnvelope<JournalStatsData>) => void) | undefined
+    let statsCalls = 0
+    const fetchStatsFn = vi.fn(() => {
+      statsCalls += 1
+      if (statsCalls === 1) {
+        return new Promise<JournalEnvelope<JournalStatsData>>((resolve) => {
+          settleStats = resolve
+        })
+      }
+      // A background revalidation must never be able to replace the initial
+      // load; if it runs early it fails and would strand the page on loading.
+      return Promise.reject(new Error('background down'))
+    })
+    render(
+      <JournalPage
+        refreshMs={20}
+        fetchStatsFn={fetchStatsFn}
+        fetchListFn={async () => listEnvelope([summaryFixture()])}
+        fetchOpenPositionsFn={async () => ({
+          ok: true,
+          data: { items: [], total: 0 },
+          error: null,
+          meta,
+        })}
+      />,
+    )
+
+    expect(screen.getByText(/加载交易日志/)).toBeInTheDocument()
+    fireEvent(window, new Event('focus'))
+    await act(async () => {
+      await new Promise((resolve) => setTimeout(resolve, 60))
+    })
+    expect(statsCalls).toBe(1)
+    expect(screen.getByText(/加载交易日志/)).toBeInTheDocument()
+
+    await act(async () => {
+      settleStats?.(envelope(statsFixture()))
+    })
+    expect(await screen.findByTestId('journal-stats')).toBeInTheDocument()
+    expect(screen.getByText('BTCUSDT')).toBeInTheDocument()
+  })
+
+  it('retains the last good data and warns when a background refresh fails', async () => {
+    let calls = 0
+    const fetchStatsFn = vi.fn(async () => {
+      calls += 1
+      if (calls === 1) {
+        return envelope(statsFixture())
+      }
+      throw new Error('refresh down')
+    })
+    await renderList({ fetchStatsFn, refreshMs: 60_000 })
+    await screen.findByTestId('journal-stats')
+
+    fireEvent(window, new Event('focus'))
+
+    expect(await screen.findByTestId('journal-refresh-warning')).toHaveTextContent(/refresh down/)
+    expect(screen.getByTestId('journal-stats')).toBeInTheDocument()
+    expect(screen.getByText('BTCUSDT')).toBeInTheDocument()
+  })
+
+  it('treats a null quality row and an unreadable net as PARTIAL under Outcome=PARTIAL', async () => {
+    const nullQuality = summaryFixture({
+      trade_id: 'TRD-NULL',
+      data_quality: null,
+      net_pnl_usd: '482.16',
+      outcome_tags: ['WIN'],
+    })
+    const unreadable = summaryFixture({
+      trade_id: 'TRD-UNREADABLE',
+      net_pnl_usd: 'not-a-number',
+      data_quality: { status: 'COMPLETE', reasons: [] },
+    })
+    expect(outcomeOf(nullQuality)).toBe('PARTIAL')
+    expect(outcomeOf(unreadable)).toBe('PARTIAL')
+    await renderList({ items: [nullQuality, unreadable], total: 2 })
+
+    fireEvent.change(screen.getByLabelText('Outcome'), { target: { value: 'PARTIAL' } })
+    fireEvent.click(screen.getByRole('button', { name: /应用筛选/ }))
+
+    expect(await screen.findByText('TRD-NULL')).toBeInTheDocument()
+    expect(screen.getByText('TRD-UNREADABLE')).toBeInTheDocument()
+    const table = screen.getByRole('table', { name: /已平仓交易/ })
+    expect(within(table).queryByText('WIN')).not.toBeInTheDocument()
+  })
+
+  it('shows only open rows under Outcome=OPEN even when closed rows exist', async () => {
+    await renderList({
+      items: [summaryFixture()],
+      openPositions: [openPositionFixture()],
+    })
+
+    fireEvent.change(screen.getByLabelText('Outcome'), { target: { value: 'OPEN' } })
+    fireEvent.click(screen.getByRole('button', { name: /应用筛选/ }))
+
+    expect(screen.getByTestId('journal-open-row-POS-OPEN-1')).toBeInTheDocument()
+    expect(screen.queryByText('TRD-1')).not.toBeInTheDocument()
+  })
+
+  it('pauses only the table panel and revalidates once on resume', async () => {
+    const fetchStatsFn = vi.fn(async () => envelope(statsFixture()))
+    await renderList({ fetchStatsFn, refreshMs: 20 })
+    await waitFor(() => expect(fetchStatsFn.mock.calls.length).toBeGreaterThanOrEqual(2))
+
+    fireEvent.click(screen.getByRole('button', { name: /暂停交易日志自动刷新/ }))
+    const pausedAt = fetchStatsFn.mock.calls.length
+    expect(screen.getByTestId('journal-panel-pause-stamp')).toHaveTextContent('PAUSED')
+    await act(async () => {
+      await new Promise((resolve) => setTimeout(resolve, 60))
+    })
+    expect(fetchStatsFn).toHaveBeenCalledTimes(pausedAt)
+
+    fireEvent.click(screen.getByRole('button', { name: /继续刷新：暂停交易日志自动刷新/ }))
+    await waitFor(() => expect(fetchStatsFn.mock.calls.length).toBeGreaterThan(pausedAt))
+    expect(screen.queryByTestId('journal-panel-pause-stamp')).not.toBeInTheDocument()
+  })
+
+  it('keeps the global pause dominant over the per-panel control', async () => {
+    const fetchStatsFn = vi.fn(async () => envelope(statsFixture()))
+    render(
+      <JournalPage
+        refreshMs={20}
+        paused
+        fetchStatsFn={fetchStatsFn}
+        fetchListFn={async () => listEnvelope([summaryFixture()])}
+        fetchOpenPositionsFn={async () => ({
+          ok: true,
+          data: { items: [], total: 0 },
+          error: null,
+          meta,
+        })}
+      />,
+    )
+    await screen.findByTestId('journal-stats')
+    expect(fetchStatsFn).toHaveBeenCalledTimes(1)
+
+    fireEvent.click(screen.getByRole('button', { name: /暂停交易日志自动刷新/ }))
+    fireEvent.click(screen.getByRole('button', { name: /继续刷新：暂停交易日志自动刷新/ }))
+    fireEvent(window, new Event('focus'))
+    await act(async () => {
+      await new Promise((resolve) => setTimeout(resolve, 60))
+    })
+    expect(fetchStatsFn).toHaveBeenCalledTimes(1)
+  })
+
+  it('marks the English stat labels and table headers with lang="en"', async () => {
+    await renderList()
+
+    expect(screen.getByText('Net PnL')).toHaveAttribute('lang', 'en')
+    expect(screen.getByText('Win rate')).toHaveAttribute('lang', 'en')
+    expect(screen.getByText('Open excluded')).toHaveAttribute('lang', 'en')
+    const table = screen.getByRole('table', { name: /已平仓交易/ })
+    expect(within(table).getByText('WIN')).toHaveAttribute('lang', 'en')
+  })
+
   it('is read-only at compact width', async () => {
     await renderList({ isCompact: true })
 
     expect(screen.getByText(/移动端只读/)).toBeInTheDocument()
   })
 
-  it('links the server-generated CSV/JSON export for the applied scope', async () => {
+  it('downloads the server export through fetch and uses the filename header', async () => {
+    const { fetchMock, createObjectURL, click } = stubDownloadEnvironment(
+      'attachment; filename="journal-scope.csv"',
+      new Blob(['trade_id\n']),
+    )
     await renderList()
 
-    const csv = screen.getByRole('link', { name: /导出 CSV/ })
-    expect(csv).toHaveAttribute('href', '/api/v1/journal/export/file?format=csv&period=8w')
-    expect(csv).toHaveAttribute('download')
-    const json = screen.getByRole('link', { name: /导出 JSON/ })
-    expect(json).toHaveAttribute('href', '/api/v1/journal/export/file?format=json&period=8w')
-    expect(json).toHaveAttribute('download')
+    fireEvent.click(screen.getByRole('button', { name: /导出 CSV/ }))
+    await waitFor(() => expect(fetchMock).toHaveBeenCalledTimes(1))
+    expect(fetchMock.mock.calls[0][0]).toBe('/api/v1/journal/export/file?format=csv&period=8w')
+    expect(createObjectURL).toHaveBeenCalledTimes(1)
+    expect(click).toHaveBeenCalledTimes(1)
     expect(screen.getByText(/CSV 公式前缀在服务端中和/)).toBeInTheDocument()
   })
+
+  it.each([
+    [401, 'AUTH_REQUIRED', 'authentication required'],
+    [422, 'VALIDATION_FAILED', 'invalid export scope'],
+    [500, 'INTERNAL_ERROR', 'export failed'],
+  ])(
+    'surfaces a %i export failure instead of downloading an error body',
+    async (status, code, message) => {
+      const click = vi.spyOn(HTMLAnchorElement.prototype, 'click').mockImplementation(() => {})
+      vi.stubGlobal(
+        'fetch',
+        vi.fn(async () => ({
+          ok: false,
+          status,
+          headers: { get: () => null },
+          json: async () => ({
+            ok: false,
+            data: null,
+            error: {
+              code,
+              message,
+              category: 'SYSTEM',
+              http_status: status,
+              retryable: false,
+              reference_id: 'REQ-1',
+              details: [],
+            },
+            meta,
+          }),
+        })) as unknown as typeof fetch,
+      )
+      await renderList()
+
+      fireEvent.click(screen.getByRole('button', { name: /导出 JSON/ }))
+      const alert = await screen.findByTestId('journal-export-error')
+      expect(alert).toHaveTextContent(message)
+      expect(click).not.toHaveBeenCalled()
+    },
+  )
 })
 
 describe('JournalDetailPage', () => {
@@ -1144,32 +1367,30 @@ describe('JournalDetailPage', () => {
   it('keeps the idempotency key for a 409 idempotency conflict', async () => {
     const keys: string[] = []
     let call = 0
-    const requestReviewFn = vi.fn(
-      async (_tradeId: string, options: { idempotencyKey: string }) => {
-        keys.push(options.idempotencyKey)
-        call += 1
-        if (call === 1) {
-          throw new JournalApiError(
-            'A request with this Idempotency-Key is still running.',
-            'IDEMPOTENCY_CONFLICT',
-            { httpStatus: 409 },
-          )
-        }
-        return envelope({
-          trade_id: 'TRD-1',
-          decision_id: 'REV-9',
-          status: 'FOUND' as const,
-          advisory: true,
-          rationale: '入场与信号一致。',
-          caveats: [],
-          confidence: 0.62,
-          validation_status: 'VALID',
-          provenance: null,
-          reason: null,
-          idempotent_replay: false,
-        })
-      },
-    )
+    const requestReviewFn = vi.fn(async (_tradeId: string, options: { idempotencyKey: string }) => {
+      keys.push(options.idempotencyKey)
+      call += 1
+      if (call === 1) {
+        throw new JournalApiError(
+          'A request with this Idempotency-Key is still running.',
+          'IDEMPOTENCY_CONFLICT',
+          { httpStatus: 409 },
+        )
+      }
+      return envelope({
+        trade_id: 'TRD-1',
+        decision_id: 'REV-9',
+        status: 'FOUND' as const,
+        advisory: true,
+        rationale: '入场与信号一致。',
+        caveats: [],
+        confidence: 0.62,
+        validation_status: 'VALID',
+        provenance: null,
+        reason: null,
+        idempotent_replay: false,
+      })
+    })
     await renderDetail({ requestReviewFn })
 
     fireEvent.click(screen.getByRole('button', { name: /生成复盘/ }))
@@ -1185,30 +1406,28 @@ describe('JournalDetailPage', () => {
   it('clears the idempotency key for a definitive validation refusal', async () => {
     const keys: string[] = []
     let call = 0
-    const requestReviewFn = vi.fn(
-      async (_tradeId: string, options: { idempotencyKey: string }) => {
-        keys.push(options.idempotencyKey)
-        call += 1
-        if (call === 1) {
-          throw new JournalApiError('invalid review request', 'VALIDATION_FAILED', {
-            httpStatus: 422,
-          })
-        }
-        return envelope({
-          trade_id: 'TRD-1',
-          decision_id: 'REV-9',
-          status: 'FOUND' as const,
-          advisory: true,
-          rationale: '入场与信号一致。',
-          caveats: [],
-          confidence: 0.62,
-          validation_status: 'VALID',
-          provenance: null,
-          reason: null,
-          idempotent_replay: false,
+    const requestReviewFn = vi.fn(async (_tradeId: string, options: { idempotencyKey: string }) => {
+      keys.push(options.idempotencyKey)
+      call += 1
+      if (call === 1) {
+        throw new JournalApiError('invalid review request', 'VALIDATION_FAILED', {
+          httpStatus: 422,
         })
-      },
-    )
+      }
+      return envelope({
+        trade_id: 'TRD-1',
+        decision_id: 'REV-9',
+        status: 'FOUND' as const,
+        advisory: true,
+        rationale: '入场与信号一致。',
+        caveats: [],
+        confidence: 0.62,
+        validation_status: 'VALID',
+        provenance: null,
+        reason: null,
+        idempotent_replay: false,
+      })
+    })
     await renderDetail({ requestReviewFn })
 
     fireEvent.click(screen.getByRole('button', { name: /生成复盘/ }))
@@ -1399,12 +1618,15 @@ describe('JournalDetailPage', () => {
     await screen.findByRole('heading', { name: 'TRD-1' })
   })
 
-  it('is read-only at compact width and keeps the export links usable', async () => {
+  it('is read-only at compact width and keeps the export controls usable', async () => {
     await renderDetail({ isCompact: true })
 
     expect(screen.getAllByText(/移动端只读/).length).toBeGreaterThan(0)
-    expect(screen.getByRole('button', { name: /生成复盘/ })).toBeDisabled()
-    expect(screen.getByRole('link', { name: /导出该标的 CSV/ })).toHaveAttribute('download')
+    const generate = screen.getByRole('button', { name: /生成复盘/ })
+    expect(generate).toHaveAttribute('aria-disabled', 'true')
+    expect(generate).not.toBeDisabled()
+    expect(generate).toHaveAccessibleDescription(/移动端只读/)
+    expect(screen.getByRole('button', { name: /导出该标的 CSV/ })).toBeInTheDocument()
   })
 
   it('freezes review/compare polling while paused and revalidates once on resume', async () => {
@@ -1430,6 +1652,168 @@ describe('JournalDetailPage', () => {
     rerender(<JournalDetailPage {...props} refreshMs={60_000} paused={false} />)
     await waitFor(() => expect(fetchCompareFn).toHaveBeenCalledTimes(2))
   })
+
+  it('rejects the /journal/stats payload as not-found instead of crashing', async () => {
+    render(
+      <JournalDetailPage
+        {...detailProps({
+          fetchTradeFn: async () => envelope(statsFixture() as unknown as JournalTradeData),
+        })}
+      />,
+    )
+
+    expect(
+      await screen.findByRole('heading', { name: '未找到该交易，或交易尚未平仓' }),
+    ).toBeInTheDocument()
+    expect(screen.queryByRole('heading', { name: '时间线' })).not.toBeInTheDocument()
+  })
+
+  it('rejects the /journal/export payload as not-found instead of crashing', async () => {
+    const exportPayload = {
+      format: 'csv',
+      path: '/tmp/export.csv',
+      rows: 1,
+      bytes: 10,
+      neutralized_cells: 0,
+      skipped_unreadable: 0,
+      data_quality: 'COMPLETE',
+    } as unknown as JournalTradeData
+    render(
+      <JournalDetailPage {...detailProps({ fetchTradeFn: async () => envelope(exportPayload) })} />,
+    )
+
+    expect(
+      await screen.findByRole('heading', { name: '未找到该交易，或交易尚未平仓' }),
+    ).toBeInTheDocument()
+  })
+
+  it('validates the detail payload including the requested trade id', () => {
+    expect(isJournalTradeData(tradeFixture(), 'TRD-1')).toBe(true)
+    expect(isJournalTradeData(tradeFixture(), 'TRD-2')).toBe(false)
+    expect(isJournalTradeData({ trade_id: 'TRD-1' }, 'TRD-1')).toBe(false)
+    expect(isJournalTradeData({ ...tradeFixture(), symbol: 7 }, 'TRD-1')).toBe(false)
+    expect(isJournalTradeData({ ...tradeFixture(), signal: null }, 'TRD-1')).toBe(true)
+    expect(isJournalTradeData({ ...tradeFixture(), data_quality: null }, 'TRD-1')).toBe(true)
+  })
+
+  it('renders an undefined or null R multiple as an em dash', async () => {
+    await renderDetail({
+      fetchTradeFn: async () =>
+        envelope(tradeFixture({ r_multiple: undefined as unknown as number | null })),
+    })
+
+    expect(screen.getByText(/R — · WIN/)).toBeInTheDocument()
+  })
+
+  it('renders an undefined review confidence as an em dash without throwing', async () => {
+    await renderDetail({
+      fetchReviewFn: async () =>
+        envelope({
+          ...foundReviewEnvelope().data!,
+          confidence: undefined as unknown as number | null,
+        }),
+    })
+
+    const band = screen.getByTestId('review-band')
+    expect(within(band).getAllByText('—').length).toBeGreaterThan(0)
+    expect(within(band).getByText('入场与信号一致。')).toBeInTheDocument()
+  })
+
+  it('rotates a fresh key for an explicit regenerate after an unknown outcome resolved by a read', async () => {
+    const keys: string[] = []
+    const refreshes: Array<boolean | undefined> = []
+    let posts = 0
+    const fetchReviewFn = vi.fn(async () => foundReviewEnvelope())
+    const requestReviewFn = vi.fn(
+      async (_tradeId: string, options: { refresh?: boolean; idempotencyKey: string }) => {
+        posts += 1
+        keys.push(options.idempotencyKey)
+        refreshes.push(options.refresh)
+        if (posts === 1) {
+          // The refresh may have reached the server: unknown outcome.
+          throw new Error('network down')
+        }
+        return foundReviewEnvelope()
+      },
+    )
+    await renderDetail({ requestReviewFn, fetchReviewFn, refreshMs: 60_000 })
+
+    fireEvent.click(screen.getByRole('button', { name: /重新生成/ }))
+    expect(await screen.findByTestId('journal-review-error')).toHaveTextContent(/network down/)
+    const staleKey = keys[0]
+    expect(refreshes[0]).toBe(true)
+
+    // A background read proves FOUND and clears the stale error.
+    fireEvent(window, new Event('focus'))
+    await waitFor(() =>
+      expect(screen.queryByTestId('journal-review-error')).not.toBeInTheDocument(),
+    )
+
+    fireEvent.click(screen.getByRole('button', { name: /重新生成/ }))
+    await waitFor(() => expect(requestReviewFn).toHaveBeenCalledTimes(2))
+    expect(refreshes[1]).toBe(true)
+    // The explicit regenerate must not replay the stale refresh key.
+    expect(keys[1]).not.toBe(staleKey)
+  })
+
+  it('surfaces a detail export failure instead of downloading an error body', async () => {
+    const click = vi.spyOn(HTMLAnchorElement.prototype, 'click').mockImplementation(() => {})
+    vi.stubGlobal(
+      'fetch',
+      vi.fn(async () => ({
+        ok: false,
+        status: 422,
+        headers: { get: () => null },
+        json: async () => ({
+          ok: false,
+          data: null,
+          error: {
+            code: 'VALIDATION_FAILED',
+            message: 'invalid export symbol',
+            category: 'SYSTEM',
+            http_status: 422,
+            retryable: false,
+            reference_id: 'REQ-1',
+            details: [],
+          },
+          meta,
+        }),
+      })) as unknown as typeof fetch,
+    )
+    await renderDetail()
+
+    fireEvent.click(screen.getByRole('button', { name: /导出该标的 CSV/ }))
+
+    expect(await screen.findByTestId('journal-detail-export-error')).toHaveTextContent(
+      /invalid export symbol/,
+    )
+    expect(click).not.toHaveBeenCalled()
+  })
+
+  it('pauses only the review/compare panel and revalidates once on resume', async () => {
+    const fetchCompareFn = vi.fn(async () => envelope(compareFixture()))
+    await renderDetail({ refreshMs: 20, fetchCompareFn })
+    await waitFor(() => expect(fetchCompareFn.mock.calls.length).toBeGreaterThanOrEqual(2))
+
+    fireEvent.click(screen.getByRole('button', { name: /暂停复盘与对照自动刷新/ }))
+    const pausedAt = fetchCompareFn.mock.calls.length
+    expect(screen.getByTestId('journal-detail-panel-pause-stamp')).toHaveTextContent('PAUSED')
+    await act(async () => {
+      await new Promise((resolve) => setTimeout(resolve, 60))
+    })
+    expect(fetchCompareFn).toHaveBeenCalledTimes(pausedAt)
+
+    fireEvent.click(screen.getByRole('button', { name: /继续刷新：暂停复盘与对照自动刷新/ }))
+    await waitFor(() => expect(fetchCompareFn.mock.calls.length).toBeGreaterThan(pausedAt))
+  })
+
+  it('marks the English detail labels with lang="en"', async () => {
+    await renderDetail()
+
+    expect(screen.getByText('Entry / Exit')).toHaveAttribute('lang', 'en')
+    expect(screen.getByRole('heading', { name: 'Signal snapshot' })).toHaveAttribute('lang', 'en')
+    expect(screen.getAllByText('Decision')[0]).toHaveAttribute('lang', 'en')
+  })
 })
 
 describe('journal API helpers', () => {
@@ -1440,7 +1824,7 @@ describe('journal API helpers', () => {
     expect(journalExportFileUrl({ format: 'json' })).toBe('/api/v1/journal/export/file?format=json')
   })
 
-  it('reads a review with an encoded trade id and exports metadata', async () => {
+  it('reads a review with an encoded trade id', async () => {
     const fetchMock =
       vi.fn<
         (
@@ -1457,25 +1841,70 @@ describe('journal API helpers', () => {
 
     await fetchJournalReview('TRD/1')
     expect(fetchMock.mock.calls[0][0]).toBe('/api/v1/journal/TRD%2F1/review')
+  })
 
-    fetchMock.mockResolvedValueOnce({
-      ok: true,
-      status: 200,
-      json: async () =>
-        envelope({
-          format: 'csv',
-          path: '/tmp/export.csv',
-          rows: 1,
-          bytes: 10,
-          neutralized_cells: 0,
-          skipped_unreadable: 0,
-          data_quality: 'COMPLETE',
-        }),
-    })
-    await fetchJournalExport({ format: 'csv', period: '8w', symbol: 'BTCUSDT' })
-    expect(fetchMock.mock.calls[1][0]).toBe(
-      '/api/v1/journal/export?format=csv&period=8w&symbol=BTCUSDT',
+  it('derives a safe export filename from the header or a stamp fallback', () => {
+    expect(exportFilename('attachment; filename="journal-2026.csv"', 'csv')).toBe(
+      'journal-2026.csv',
     )
+    expect(exportFilename("attachment; filename*=UTF-8''journal%2Dx.json", 'json')).toBe(
+      'journal-x.json',
+    )
+    // A path-shaped filename is reduced to its basename.
+    expect(exportFilename('attachment; filename="../../etc/passwd"', 'csv')).toBe('passwd')
+    expect(exportFilename(null, 'csv', new Date('2026-11-14T12:00:00.000Z'))).toBe(
+      'journal-20261114t120000000z.csv',
+    )
+  })
+
+  it('downloads an export blob and returns the filename from the header', async () => {
+    const { fetchMock, createObjectURL, revokeObjectURL, click } = stubDownloadEnvironment(
+      'attachment; filename="journal-scope.csv"',
+      new Blob(['trade_id\n']),
+    )
+
+    const result = await downloadJournalExport({ format: 'csv', period: '8w' })
+
+    expect(fetchMock.mock.calls[0][0]).toBe('/api/v1/journal/export/file?format=csv&period=8w')
+    expect(result.filename).toBe('journal-scope.csv')
+    expect(createObjectURL).toHaveBeenCalledTimes(1)
+    expect(click).toHaveBeenCalledTimes(1)
+    await act(async () => {
+      await new Promise((resolve) => setTimeout(resolve, 0))
+    })
+    expect(revokeObjectURL).toHaveBeenCalledTimes(1)
+  })
+
+  it('throws a typed error with the envelope message, code, and status', async () => {
+    vi.stubGlobal(
+      'fetch',
+      vi.fn(async () => ({
+        ok: false,
+        status: 401,
+        headers: { get: () => null },
+        json: async () => ({
+          ok: false,
+          data: null,
+          error: {
+            code: 'AUTH_REQUIRED',
+            message: 'authentication required',
+            category: 'AUTH',
+            http_status: 401,
+            retryable: false,
+            reference_id: 'REQ-1',
+            details: [],
+          },
+          meta,
+        }),
+      })) as unknown as typeof fetch,
+    )
+
+    await expect(downloadJournalExport({ format: 'csv' })).rejects.toMatchObject({
+      name: 'JournalApiError',
+      message: 'authentication required',
+      code: 'AUTH_REQUIRED',
+      httpStatus: 401,
+    })
   })
 
   it('posts one review with CSRF, Idempotency-Key, and the refresh query', async () => {
@@ -1517,7 +1946,7 @@ describe('journal API helpers', () => {
     })
   })
 
-  it('classifies a 5xx as unknown and a structured 4xx as definitive', async () => {
+  it('classifies a non-allowlisted 5xx as unknown and a structured 4xx as definitive', async () => {
     const failure = (code: string, status: number) => ({
       ok: false,
       status,
@@ -1552,6 +1981,18 @@ describe('journal API helpers', () => {
     await expect(requestJournalReview('TRD-1', { idempotencyKey: 'k' })).rejects.toMatchObject({
       kind: 'definitive',
       httpStatus: 422,
+    })
+
+    // Status alone never decides the kind: DATA_UNAVAILABLE is a 503 but is
+    // allowlisted as definitive (it may follow a link/audit failure, so a
+    // fresh-key retry relies on the server's link/orphan replay).
+    vi.stubGlobal(
+      'fetch',
+      vi.fn(async () => failure('DATA_UNAVAILABLE', 503)),
+    )
+    await expect(requestJournalReview('TRD-1', { idempotencyKey: 'k' })).rejects.toMatchObject({
+      kind: 'definitive',
+      httpStatus: 503,
     })
   })
 

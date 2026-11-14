@@ -31,7 +31,7 @@ function statusClass(status: string): string {
 }
 
 function Reasons({ side }: { side: JournalComparisonSide }) {
-  return <>{side.reasons.length > 0 ? side.reasons.join('; ') : '—'}</>
+  return <span lang="en">{side.reasons.length > 0 ? side.reasons.join('; ') : '—'}</span>
 }
 
 function Row({
@@ -45,11 +45,17 @@ function Row({
 }) {
   return (
     <tr>
-      <th scope="row">{label}</th>
+      <th scope="row" lang="en">
+        {label}
+      </th>
       <td>
-        <span className={statusClass(side.status)}>{side.status}</span>
+        <span className={statusClass(side.status)} lang="en">
+          {side.status}
+        </span>
       </td>
-      <td className="mono">{detail}</td>
+      <td className="mono" lang="en">
+        {detail}
+      </td>
       <td className="journal-compare-reasons">
         <Reasons side={side} />
       </td>
@@ -100,7 +106,9 @@ export function SignalComparison({ compare, error = null }: SignalComparisonProp
                   detail={`${text(compare.zone.entry)} · zone ${text(
                     compare.zone.zone_low,
                   )}–${text(compare.zone.zone_high)}${
-                    compare.zone.distance_bps === null ? '' : ` · ${compare.zone.distance_bps} bps`
+                    compare.zone.distance_bps === null || compare.zone.distance_bps === undefined
+                      ? ''
+                      : ` · ${compare.zone.distance_bps} bps`
                   }`}
                 />
                 <Row
@@ -108,7 +116,11 @@ export function SignalComparison({ compare, error = null }: SignalComparisonProp
                   side={compare.slippage}
                   detail={`${text(compare.slippage.entry_avg_price)} vs ${text(
                     compare.slippage.reference_price,
-                  )} · ${compare.slippage.bps === null ? '—' : `${compare.slippage.bps} bps`}`}
+                  )} · ${
+                    compare.slippage.bps === null || compare.slippage.bps === undefined
+                      ? '—'
+                      : `${compare.slippage.bps} bps`
+                  }`}
                 />
                 <Row
                   label="First touch"

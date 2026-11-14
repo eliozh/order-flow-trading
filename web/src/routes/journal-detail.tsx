@@ -9,9 +9,9 @@ import {
   fetchJournalReview,
   fetchJournalTrade,
   fetchTriggerDecision,
+  isJournalTradeData,
   JOURNAL_REFRESH_MS,
   JournalApiError,
-  journalExportFileUrl,
   numberOrNull,
   requestJournalReview,
   reviewKeyFor,
@@ -39,30 +39,26 @@ import {
   type PositionHistoryData,
   type PositionHistoryEnvelope,
 } from '../api/positions'
-import { confidenceBand } from '../api/reports'
 import { getTrigger, type TriggerDetailEnvelope, type TriggerPayload } from '../api/triggers'
 import { DataQualityBadge } from '../components/data-quality'
 import {
+  JournalDecisionPanel,
+  JournalExportPanel,
   JournalFills,
   JournalLinks,
   JournalTimeline,
   SignalSnapshot,
 } from '../components/journal-detail-panels'
 import { PausedPanel, PausedStamp } from '../components/paused-state'
+import { PanelPause } from '../components/panel-pause'
 import { ProvenanceStamp } from '../components/provenance'
-import { ReviewBand, ReviewProvenance } from '../components/review-band'
+import { ReviewBand } from '../components/review-band'
 import { SignalComparison } from '../components/signal-comparison'
 import { useCompact } from '../hooks/use-compact'
+import { useJournalExport } from '../hooks/use-journal-export'
 import { useLiveUpdates } from '../hooks/use-live-updates'
 import { usePolling } from '../hooks/use-polling'
 import { useRunGeneration } from '../hooks/use-run-generation'
-
-const BAND_LABELS = { high: '高', medium: '中', low: '低' } as const
-const BAND_CLASSES = {
-  high: 'chip chip--ok',
-  medium: 'chip chip--warn',
-  low: 'chip chip--danger',
-} as const
 
 interface Settled<T> {
   value: T | null
@@ -182,11 +178,16 @@ export function JournalDetailPage({
     kind: 'definitive' | 'unknown'
   } | null>(null)
   const [replayNote, setReplayNote] = useState(false)
+  // The pending key of an explicit refresh attempt that may have reached the
+  // server. It is replayed only by a retry of that same attempt, never by a new
+  // explicit regenerate.
   const pendingRefreshRef = useRef<string | null>(null)
   // Whether the most recent review attempt was an explicit refresh. A retry
   // must replay that exact request: the idempotency hash binds `refresh`, so
   // deriving it from the visible review status would start a new generation.
   const lastAttemptRefreshRef = useRef(false)
+  const [panelPaused, setPanelPaused] = useState(false)
+  const { exporting, exportError, runExport } = useJournalExport()
   const compact = useCompact(isCompact)
   const live = useLiveUpdates()
   const isPaused = paused ?? live.paused
@@ -236,8 +237,12 @@ export function JournalDetailPage({
       if (signal.aborted || !isCurrent(generation)) {
         return
       }
-      if (!trade) {
-        setLoad({ ...emptyLoad(), state: 'error', message: 'The trade response was empty.' })
+      // `/journal/stats` and `/journal/export` are reserved API paths that return
+      // `ok: true` with a non-trade payload. Validate the contract (including the
+      // requested trade id) before dereferencing any field; a mismatch is the
+      // same not-found panel as a 404 and never renders the foreign payload.
+      if (!isJournalTradeData(trade, tradeId)) {
+        setLoad({ ...emptyLoad(), state: 'not-found' })
         return
       }
       const refs = trade.signal
@@ -345,7 +350,7 @@ export function JournalDetailPage({
       const generation = begin()
       return refreshLive(signal, generation)
     },
-    { refreshMs, paused: isPaused },
+    { refreshMs, paused: isPaused || panelPaused },
   )
 
   const regenerate = useCallback(
@@ -361,16 +366,27 @@ export function JournalDetailPage({
       setActionError(null)
       const controller = new AbortController()
       actionController.current = controller
-      // A retry replays the failed attempt with its own key and refresh flag;
-      // only an explicit regenerate starts a new provider generation.
-      const refresh =
-        intent === 'retry' ? lastAttemptRefreshRef.current : intent === 'regenerate'
+      // A retry replays the failed attempt with its own key and refresh flag.
+      // An explicit regenerate is a deliberate new provider generation: it must
+      // never reuse a pending refresh key left behind by an unknown outcome
+      // (a later read may have found the stored review, but the user asked for
+      // a fresh one), so it rotates a new key.
+      const refresh = intent === 'retry' ? lastAttemptRefreshRef.current : intent === 'regenerate'
       lastAttemptRefreshRef.current = refresh
-      const key = refresh
-        ? (pendingRefreshRef.current ?? rotateReviewKey(tradeId))
-        : reviewKeyFor(tradeId)
-      if (refresh) {
+      let key: string
+      if (intent === 'retry') {
+        key = refresh
+          ? (pendingRefreshRef.current ?? rotateReviewKey(tradeId))
+          : reviewKeyFor(tradeId)
+        if (refresh) {
+          pendingRefreshRef.current = key
+        }
+      } else if (intent === 'regenerate') {
+        pendingRefreshRef.current = null
+        key = rotateReviewKey(tradeId)
         pendingRefreshRef.current = key
+      } else {
+        key = reviewKeyFor(tradeId)
       }
       try {
         const result = await requestReviewFn(
@@ -390,7 +406,8 @@ export function JournalDetailPage({
             prev.state === 'ready' ? { ...prev, review: result.data, reviewError: null } : prev,
           )
         }
-        setReviewAnnouncement('复盘已生成')
+        const decisionId = result.data?.decision_id ?? null
+        setReviewAnnouncement(decisionId ? `复盘已生成：${decisionId}` : '复盘已生成')
         const generation = begin()
         try {
           const read = await fetchReviewFn(tradeId, controller.signal)
@@ -525,11 +542,11 @@ export function JournalDetailPage({
         : netValue < 0
           ? 'mono value-down'
           : 'mono value-flat'
-  const rText = trade.r_multiple === null ? '—' : trade.r_multiple.toFixed(2)
+  const rValue = numberOrNull(trade.r_multiple)
+  const rText = rValue === null ? '—' : rValue.toFixed(2)
 
   const decisionConfidence =
     load.entryDecision?.confidence ?? load.entryDecision?.decision?.confidence ?? null
-  const decisionBand = confidenceBand(decisionConfidence)
   const decisionText = load.entryDecision?.decision?.entry_recheck?.decision ?? null
   const decisionRationale = load.entryDecision?.decision?.rationale ?? null
   const decisionId = load.entryDecision?.entry_decision_id ?? refs?.decision_id ?? null
@@ -563,9 +580,10 @@ export function JournalDetailPage({
   const zoneHigh = load.opportunity?.zone.high ?? load.compare?.zone.zone_high ?? null
   const zoneText = zoneLow && zoneHigh ? `${zoneLow} – ${zoneHigh}` : 'N/A'
   const slippage = load.compare?.slippage ?? null
+  const slippageBps = numberOrNull(slippage?.bps ?? null)
   const slippageText =
-    slippage?.status === 'OK' && slippage.bps !== null
-      ? `${slippage.bps} bps · ref ${dash(slippage.reference_price)}`
+    slippage?.status === 'OK' && slippageBps !== null
+      ? `${slippageBps} bps · ref ${dash(slippage.reference_price)}`
       : `N/A — ${slippage?.reasons.join('; ') || 'slippage 不可用'}`
   const invalidationText =
     load.opportunity && load.opportunity.invalidation_conditions.length > 0
@@ -574,7 +592,8 @@ export function JournalDetailPage({
 
   const signalTime = load.opportunity?.created_at ? load.opportunity.created_at : null
   const signalReason =
-    load.opportunityError ?? (opportunityId ? 'opportunity 读取失败' : '交易未记录 opportunity 引用')
+    load.opportunityError ??
+    (opportunityId ? 'opportunity 读取失败' : '交易未记录 opportunity 引用')
   const decisionTime = load.entryDecision?.decision?.persisted_at
     ? load.entryDecision.decision.persisted_at
     : null
@@ -596,7 +615,7 @@ export function JournalDetailPage({
           <h1 id="journal-detail-heading" className="mono" tabIndex={-1}>
             {trade.trade_id}
           </h1>
-          <p className="page-sub">
+          <p className="page-sub" lang="en">
             {trade.symbol} · {trade.side} · closed {trade.closed_at} UTC · {trade.environment}
           </p>
         </div>
@@ -627,44 +646,59 @@ export function JournalDetailPage({
         </p>
       )}
 
+      <div className="action-row">
+        <PanelPause
+          paused={panelPaused}
+          onToggle={() => setPanelPaused((value) => !value)}
+          label="暂停复盘与对照自动刷新"
+          testId="journal-detail-panel-pause"
+        />
+      </div>
+
       <p className="mono-muted">
         {isPaused
           ? '实时更新已暂停：不轮询 review / comparison，也不因窗口聚焦刷新。'
-          : `自动刷新：每 ${Math.round(refreshMs / 1000)}s 轮询 review 与 comparison；窗口聚焦或标签页可见时刷新。`}
+          : panelPaused
+            ? '本面板自动刷新已暂停：保留已加载的复盘与对照；恢复后立即重新校验一次。'
+            : `自动刷新：每 ${Math.round(refreshMs / 1000)}s 轮询 review 与 comparison；窗口聚焦或标签页可见时刷新。`}
       </p>
 
       <div className="detail-cols">
         <div className="stack-sm">
           <dl className="stat-grid">
             <div className="stat">
-              <dt>
+              <dt lang="en">
                 {trade.symbol} {trade.side}
               </dt>
               <dd className={netClass}>{trade.net_pnl_usd}</dd>
-              <dd className="stat-note">
+              <dd className="stat-note" lang="en">
                 R {rText} · {outcomeTags.join(' / ') || '—'}
               </dd>
             </div>
             <div className="stat">
-              <dt>Entry / Exit</dt>
+              <dt lang="en">Entry / Exit</dt>
               <dd className="mono">
                 {dash(trade.entry_avg_price)} / {dash(trade.exit_avg_price)}
               </dd>
-              <dd className="stat-note">size {dash(trade.size)} · tick precision kept</dd>
+              <dd className="stat-note" lang="en">
+                size {dash(trade.size)} · tick precision kept
+              </dd>
             </div>
             <div className="stat">
-              <dt>Duration</dt>
+              <dt lang="en">Duration</dt>
               <dd className="mono">{durationLabel(trade.opened_at, trade.closed_at)}</dd>
-              <dd className="stat-note">
+              <dd className="stat-note" lang="en">
                 {trade.environment} · {trade.closed_at} UTC
               </dd>
             </div>
             <div className="stat">
-              <dt>Fees / Funding</dt>
+              <dt lang="en">Fees / Funding</dt>
               <dd className="mono">
                 {dash(trade.fees_usd)} / {dash(trade.funding_usd)}
               </dd>
-              <dd className="stat-note">net USDT · CALC</dd>
+              <dd className="stat-note" lang="en">
+                net USDT · CALC
+              </dd>
             </div>
           </dl>
 
@@ -725,41 +759,16 @@ export function JournalDetailPage({
         <div className="stack-sm">
           <SignalComparison compare={load.compare} error={load.compareError} />
 
-          <section className="panel" aria-labelledby="journal-decision-heading">
-            <div className="panel-head">
-              <h2 id="journal-decision-heading">LLM 决策记录</h2>
-              <ProvenanceStamp kind="LLM" />
-            </div>
-            {load.entryDecision?.status === 'FOUND' && load.entryDecision.decision ? (
-              <>
-                <dl className="kv">
-                  <dt>Decision</dt>
-                  <dd className="mono">{decisionText ?? 'N/A'}</dd>
-                  <dt>Confidence</dt>
-                  <dd className="mono">
-                    {decisionConfidence === null ? '—' : decisionConfidence.toFixed(2)}{' '}
-                    {decisionBand && (
-                      <span className={BAND_CLASSES[decisionBand]}>
-                        {BAND_LABELS[decisionBand]}
-                      </span>
-                    )}
-                  </dd>
-                  <dt>Validation</dt>
-                  <dd className="mono">{decisionValidation ?? 'N/A'}</dd>
-                  <dt>Decision ID</dt>
-                  <dd className="mono">{decisionId ?? 'N/A'}</dd>
-                </dl>
-                {decisionRationale !== null && (
-                  <p className="prose journal-decision-rationale">{decisionRationale}</p>
-                )}
-                <ReviewProvenance provenance={decisionProvenance} />
-              </>
-            ) : (
-              <p className="panel-foot" data-testid="journal-decision-unavailable">
-                N/A — {decisionReason}
-              </p>
-            )}
-          </section>
+          <JournalDecisionPanel
+            entryDecision={load.entryDecision}
+            decisionText={decisionText}
+            decisionConfidence={decisionConfidence}
+            decisionId={decisionId}
+            decisionValidation={decisionValidation}
+            decisionRationale={decisionRationale}
+            decisionProvenance={decisionProvenance}
+            decisionReason={decisionReason}
+          />
 
           <JournalFills trade={trade} partial={partial} qualityReasons={quality.reasons ?? []} />
 
@@ -770,31 +779,17 @@ export function JournalDetailPage({
             reportId={reportId}
           />
 
-          <section className="panel" aria-labelledby="journal-detail-export-heading">
-            <div className="panel-head">
-              <h2 id="journal-detail-export-heading">导出</h2>
-              <span className="mono-muted">服务端生成 · CSV formula 中和在服务端完成</span>
-            </div>
-            <div className="action-row journal-filter-actions">
-              <a
-                className="btn"
-                href={journalExportFileUrl({ format: 'csv', symbol: trade.symbol })}
-                download
-              >
-                导出该标的 CSV
-              </a>
-              <a
-                className="btn"
-                href={journalExportFileUrl({ format: 'json', symbol: trade.symbol })}
-                download
-              >
-                导出该标的 JSON
-              </a>
-            </div>
-            <p className="panel-foot">
-              导出文件由 API 生成并下载；客户端不生成文件。CSV 公式前缀在服务端中和。
-            </p>
-          </section>
+          <JournalExportPanel
+            headingId="journal-detail-export-heading"
+            csvLabel="导出该标的 CSV"
+            jsonLabel="导出该标的 JSON"
+            exporting={exporting}
+            exportError={exportError}
+            errorTestId="journal-detail-export-error"
+            onExport={(format) => {
+              void runExport(format, { symbol: trade.symbol })
+            }}
+          />
         </div>
       </div>
     </section>

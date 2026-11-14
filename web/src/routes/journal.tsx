@@ -1,4 +1,4 @@
-import { Fragment, useCallback, useEffect, useState } from 'react'
+import { Fragment, useCallback, useEffect, useRef, useState } from 'react'
 import type { FormEvent } from 'react'
 
 import { isAbortError } from '../api/abort'
@@ -6,8 +6,8 @@ import {
   fetchJournalList,
   fetchJournalStats,
   JOURNAL_REFRESH_MS,
-  journalExportFileUrl,
   numberOrNull,
+  outcomeOf,
   type JournalStatsData,
   type JournalStatsEnvelope,
   type JournalPeriod,
@@ -17,10 +17,13 @@ import {
 import { errorMessage } from '../api/errors'
 import { fetchPositions, type PositionData, type PositionListEnvelope } from '../api/positions'
 import { DataQualityBadge } from '../components/data-quality'
+import { JournalExportPanel } from '../components/journal-detail-panels'
 import { JournalTable } from '../components/journal-table'
+import { PanelPause } from '../components/panel-pause'
 import { PausedPanel, PausedStamp } from '../components/paused-state'
 import { ProvenanceStamp } from '../components/provenance'
 import { useCompact } from '../hooks/use-compact'
+import { useJournalExport } from '../hooks/use-journal-export'
 import { useLiveUpdates } from '../hooks/use-live-updates'
 import { usePolling } from '../hooks/use-polling'
 import { useRunGeneration } from '../hooks/use-run-generation'
@@ -65,10 +68,7 @@ function hasFilterValue(filters: Filters): boolean {
  * The period window the table must share with the server stats. `all` has no
  * window (the stats response carries `period: null`).
  */
-function periodWindowOf(
-  filters: Filters,
-  stats: JournalStatsData | null,
-): JournalPeriod | null {
+function periodWindowOf(filters: Filters, stats: JournalStatsData | null): JournalPeriod | null {
   if (filters.period === 'all') {
     return null
   }
@@ -105,22 +105,16 @@ function filterClosedRows(
     if (filters.side !== 'ALL' && trade.side.toUpperCase() !== filters.side) {
       return false
     }
-    if (filters.outcome === 'ALL' || filters.outcome === 'OPEN') {
-      return filters.outcome === 'ALL'
+    if (filters.outcome === 'ALL') {
+      return true
     }
-    const quality = trade.data_quality?.status ?? 'COMPLETE'
-    const tags = trade.outcome_tags ?? []
-    if (filters.outcome === 'PARTIAL') {
-      return quality !== 'COMPLETE' || tags.some((tag) => /PARTIAL/i.test(tag))
-    }
-    if (quality !== 'COMPLETE' || tags.some((tag) => /PARTIAL/i.test(tag))) {
+    // OPEN is a position state, never a closed-row outcome; open positions are
+    // rendered from their own list. The closed-row predicate is `outcomeOf`
+    // itself, so the table chip and the filter can never disagree.
+    if (filters.outcome === 'OPEN') {
       return false
     }
-    const net = numberOrNull(trade.net_pnl_usd)
-    if (net === null) {
-      return false
-    }
-    return filters.outcome === 'WIN' ? net > 0 : filters.outcome === 'LOSS' ? net < 0 : net === 0
+    return outcomeOf(trade) === filters.outcome
   })
 }
 
@@ -181,6 +175,7 @@ export function JournalPage({
     'apply' | 'reset' | null
   >(null)
   const [filterAnnouncement, setFilterAnnouncement] = useState('')
+  const [panelPaused, setPanelPaused] = useState(false)
   // Only period + symbol change the server scope; side/outcome filter the
   // already-fetched table, so they never trigger a stats/list refetch.
   const [serverScope, setServerScope] = useState<{ period: PeriodKey; symbol: string }>({
@@ -191,6 +186,15 @@ export function JournalPage({
   const live = useLiveUpdates()
   const isPaused = paused ?? live.paused
   const { begin, isCurrent } = useRunGeneration()
+  // A background refresh must never invalidate an in-flight initial load. The
+  // polling runner reads this ref (not the effect's closure state) and only
+  // starts a generation once the page is ready.
+  const loadStateRef = useRef(load.state)
+  const { exporting, exportError, runExport } = useJournalExport()
+
+  useEffect(() => {
+    loadStateRef.current = load.state
+  }, [load.state])
 
   const runLoad = useCallback(
     async (signal: AbortSignal, initial: boolean, generation: number): Promise<void> => {
@@ -273,6 +277,11 @@ export function JournalPage({
 
   usePolling(
     (signal) => {
+      // Until the page is ready the initial load owns the generation; a poll
+      // (or focus refresh) must not invalidate it. This mirrors the detail page.
+      if (loadStateRef.current !== 'ready') {
+        return
+      }
       const generation = begin()
       return runLoad(signal, false, generation).catch((error: unknown) => {
         if (!isCurrent(generation)) {
@@ -283,7 +292,7 @@ export function JournalPage({
     },
     {
       refreshMs,
-      paused: isPaused,
+      paused: isPaused || panelPaused,
       onError: (error) => setRefreshError(errorMessage(error)),
     },
   )
@@ -358,17 +367,6 @@ export function JournalPage({
     applyServerScope(DEFAULT_FILTERS)
   }
 
-  const csvHref = journalExportFileUrl({
-    format: 'csv',
-    period: periodParam(applied.period),
-    symbol: applied.symbol || undefined,
-  })
-  const jsonHref = journalExportFileUrl({
-    format: 'json',
-    period: periodParam(applied.period),
-    symbol: applied.symbol || undefined,
-  })
-
   return (
     <section className="system-page" aria-labelledby="journal-heading" data-readonly={compact}>
       <div className="page-head">
@@ -439,7 +437,7 @@ export function JournalPage({
       {showStats && stats && (
         <dl className="stat-grid" data-testid="journal-stats">
           <div className="stat">
-            <dt>Net PnL</dt>
+            <dt lang="en">Net PnL</dt>
             <dd
               className={
                 defined
@@ -451,30 +449,30 @@ export function JournalPage({
             >
               {defined ? (stats.totals.net_pnl_usd ?? '—') : '—'}
             </dd>
-            <dd className="stat-note">
+            <dd className="stat-note" lang="en">
               {defined ? 'USDT · net of fees/funding' : 'metrics undefined'}
             </dd>
           </div>
           <div className="stat">
-            <dt>Win rate</dt>
+            <dt lang="en">Win rate</dt>
             <dd>
               {defined && stats.win_rate !== null ? `${(stats.win_rate * 100).toFixed(1)}%` : '—'}
             </dd>
-            <dd className="stat-note">
+            <dd className="stat-note" lang="en">
               {defined
                 ? `${stats.wins} win / ${stats.sample_size} closed · open excluded`
                 : 'metrics undefined'}
             </dd>
           </div>
           <div className="stat">
-            <dt>Expectancy</dt>
+            <dt lang="en">Expectancy</dt>
             <dd>{defined ? (stats.expectancy_usd ?? '—') : '—'}</dd>
-            <dd className="stat-note">
+            <dd className="stat-note" lang="en">
               {defined ? 'USDT · per closed trade' : 'metrics undefined'}
             </dd>
           </div>
           <div className="stat">
-            <dt>Avg R</dt>
+            <dt lang="en">Avg R</dt>
             <dd>{defined && stats.avg_r.value !== null ? stats.avg_r.value.toFixed(2) : '—'}</dd>
             <dd className="stat-note">
               {defined
@@ -483,17 +481,21 @@ export function JournalPage({
             </dd>
           </div>
           <div className="stat">
-            <dt>Sample</dt>
-            <dd>{defined ? `${stats.sample_size} closed` : '0 closed'}</dd>
-            <dd className="stat-note">
+            <dt lang="en">Sample</dt>
+            <dd lang="en">{defined ? `${stats.sample_size} closed` : '0 closed'}</dd>
+            <dd className="stat-note" lang="en">
               {`${stats.exclusions.open_positions} open excluded · ${stats.exclusions.partial_trades} PARTIAL excluded`}
             </dd>
           </div>
           <div className="stat">
-            <dt>Period</dt>
+            <dt lang="en">Period</dt>
             <dd className="mono">{stats.period?.label ?? periodLabel(applied.period)}</dd>
             <dd className="stat-note">
-              {stats.period ? `${stats.period.start} → ${stats.period.end} UTC` : '全部已平仓交易'}
+              {stats.period ? (
+                <span lang="en">{`${stats.period.start} → ${stats.period.end} UTC`}</span>
+              ) : (
+                '全部已平仓交易'
+              )}
             </dd>
           </div>
         </dl>
@@ -502,8 +504,10 @@ export function JournalPage({
       {showStats && stats?.status === 'UNDEFINED' && (
         <div className="panel" role="status" data-testid="journal-metrics-undefined">
           <div className="panel-head">
-            <h2>metrics undefined</h2>
-            <span className="chip chip--warn">UNDEFINED</span>
+            <h2 lang="en">metrics undefined</h2>
+            <span className="chip chip--warn" lang="en">
+              UNDEFINED
+            </span>
           </div>
           <p className="panel-foot">
             没有可计入的已平仓交易：{stats.reason ?? 'no sample'}。指标不显示为 0——没有样本时
@@ -521,20 +525,22 @@ export function JournalPage({
           <dl className="kv journal-definitions" data-testid="journal-definitions">
             {Object.entries(stats.definitions).map(([name, value]) => (
               <Fragment key={name}>
-                <dt className="mono">{name}</dt>
-                <dd>{value}</dd>
+                <dt className="mono" lang="en">
+                  {name}
+                </dt>
+                <dd lang="en">{value}</dd>
               </Fragment>
             ))}
           </dl>
           <div className="panel-foot">
             <dl className="kv journal-definitions" data-testid="journal-exclusions">
-              <dt>Open excluded</dt>
+              <dt lang="en">Open excluded</dt>
               <dd className="mono">{stats.exclusions.open_positions}</dd>
-              <dt>PARTIAL excluded</dt>
+              <dt lang="en">PARTIAL excluded</dt>
               <dd className="mono">{stats.exclusions.partial_trades}</dd>
-              <dt>Unreadable excluded</dt>
+              <dt lang="en">Unreadable excluded</dt>
               <dd className="mono">{stats.exclusions.unreadable_trades}</dd>
-              <dt>Outside period</dt>
+              <dt lang="en">Outside period</dt>
               <dd className="mono">{stats.exclusions.outside_period}</dd>
             </dl>
           </div>
@@ -552,7 +558,9 @@ export function JournalPage({
         </div>
         <div className="journal-filter-grid">
           <div className="journal-field">
-            <label htmlFor="journal-period">Period</label>
+            <label htmlFor="journal-period" lang="en">
+              Period
+            </label>
             <select
               id="journal-period"
               value={draft.period}
@@ -564,7 +572,9 @@ export function JournalPage({
             </select>
           </div>
           <div className="journal-field">
-            <label htmlFor="journal-symbol">Symbol</label>
+            <label htmlFor="journal-symbol" lang="en">
+              Symbol
+            </label>
             <input
               id="journal-symbol"
               value={draft.symbol}
@@ -573,19 +583,27 @@ export function JournalPage({
             />
           </div>
           <div className="journal-field">
-            <label htmlFor="journal-side">Side</label>
+            <label htmlFor="journal-side" lang="en">
+              Side
+            </label>
             <select
               id="journal-side"
               value={draft.side}
               onChange={(event) => setDraft({ ...draft, side: event.target.value as SideFilter })}
             >
               <option value="ALL">全部</option>
-              <option value="LONG">LONG</option>
-              <option value="SHORT">SHORT</option>
+              <option value="LONG" lang="en">
+                LONG
+              </option>
+              <option value="SHORT" lang="en">
+                SHORT
+              </option>
             </select>
           </div>
           <div className="journal-field">
-            <label htmlFor="journal-outcome">Outcome</label>
+            <label htmlFor="journal-outcome" lang="en">
+              Outcome
+            </label>
             <select
               id="journal-outcome"
               value={draft.outcome}
@@ -594,11 +612,21 @@ export function JournalPage({
               }
             >
               <option value="ALL">全部</option>
-              <option value="WIN">WIN</option>
-              <option value="LOSS">LOSS</option>
-              <option value="TIE">TIE</option>
-              <option value="PARTIAL">PARTIAL</option>
-              <option value="OPEN">OPEN</option>
+              <option value="WIN" lang="en">
+                WIN
+              </option>
+              <option value="LOSS" lang="en">
+                LOSS
+              </option>
+              <option value="TIE" lang="en">
+                TIE
+              </option>
+              <option value="PARTIAL" lang="en">
+                PARTIAL
+              </option>
+              <option value="OPEN" lang="en">
+                OPEN
+              </option>
             </select>
           </div>
         </div>
@@ -616,11 +644,7 @@ export function JournalPage({
         </p>
       </form>
 
-      <p
-        className="visually-hidden"
-        role="status"
-        data-testid="journal-filter-announcement"
-      >
+      <p className="visually-hidden" role="status" data-testid="journal-filter-announcement">
         {filterAnnouncement}
       </p>
 
@@ -666,10 +690,18 @@ export function JournalPage({
         <section className="panel" aria-labelledby="journal-table-heading">
           <div className="panel-head">
             <h2 id="journal-table-heading">已平仓交易</h2>
+            <PanelPause
+              paused={panelPaused}
+              onToggle={() => setPanelPaused((value) => !value)}
+              label="暂停交易日志自动刷新"
+              testId="journal-panel-pause"
+            />
             <span className="mono-muted">
               {isPaused
                 ? '实时更新已暂停'
-                : `每 ${Math.round(refreshMs / 1000)}s 自动刷新；窗口聚焦时立即刷新`}
+                : panelPaused
+                  ? '本面板自动刷新已暂停'
+                  : `每 ${Math.round(refreshMs / 1000)}s 自动刷新；窗口聚焦时立即刷新`}
             </span>
           </div>
           <JournalTable
@@ -692,23 +724,20 @@ export function JournalPage({
       )}
 
       {load.state !== 'error' && (
-        <section className="panel" aria-labelledby="journal-export-heading">
-          <div className="panel-head">
-            <h2 id="journal-export-heading">导出</h2>
-            <span className="mono-muted">服务端生成 · CSV formula 中和在服务端完成</span>
-          </div>
-          <div className="action-row journal-filter-actions">
-            <a className="btn" href={csvHref} download>
-              导出 CSV
-            </a>
-            <a className="btn" href={jsonHref} download>
-              导出 JSON
-            </a>
-          </div>
-          <p className="panel-foot">
-            导出文件由 API 生成并下载；客户端不生成文件。CSV 公式前缀在服务端中和。
-          </p>
-        </section>
+        <JournalExportPanel
+          headingId="journal-export-heading"
+          csvLabel="导出 CSV"
+          jsonLabel="导出 JSON"
+          exporting={exporting}
+          exportError={exportError}
+          errorTestId="journal-export-error"
+          onExport={(format) => {
+            void runExport(format, {
+              period: periodParam(applied.period),
+              symbol: applied.symbol || undefined,
+            })
+          }}
+        />
       )}
     </section>
   )

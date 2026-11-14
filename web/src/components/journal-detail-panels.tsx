@@ -1,8 +1,18 @@
 import type { ReactElement } from 'react'
 
-import type { JournalTradeData } from '../api/journal'
+import { numberOrNull, type EntryDecisionData, type JournalTradeData } from '../api/journal'
 import { dash, type PositionHistoryEvent } from '../api/positions'
+import { confidenceBand } from '../api/reports'
 import type { TriggerPayload } from '../api/triggers'
+import { ProvenanceStamp } from './provenance'
+import { ReviewProvenance } from './review-band'
+
+const BAND_LABELS = { high: '高', medium: '中', low: '低' } as const
+const BAND_CLASSES = {
+  high: 'chip chip--ok',
+  medium: 'chip chip--warn',
+  low: 'chip chip--danger',
+} as const
 
 /** A same-origin link for a referenced id, or a plain N/A when there is none. */
 export function JournalRefLink({
@@ -13,7 +23,7 @@ export function JournalRefLink({
   base: string
 }): ReactElement {
   if (!id) {
-    return <span>N/A</span>
+    return <span lang="en">N/A</span>
   }
   return (
     <a className="rowlink mono" href={`${base}/${encodeURIComponent(id)}`}>
@@ -67,15 +77,17 @@ export function JournalTimeline({
     <section className="panel" aria-labelledby="journal-timeline-heading">
       <div className="panel-head">
         <h2 id="journal-timeline-heading">时间线</h2>
-        <span className="mono-muted">
+        <span className="mono-muted" lang="en">
           signal → trigger → decision → entry → management → exit
         </span>
       </div>
       <ol className="timeline timeline--stages" aria-label="交易时间线">
         <li className={signalTime ? 'acc' : undefined}>
           <div className="tl-time">{signalTime ? `${signalTime} UTC` : 'N/A'}</div>
-          <div className="tl-title">signal created</div>
-          <div className="tl-desc">
+          <div className="tl-title" lang="en">
+            signal created
+          </div>
+          <div className="tl-desc" lang="en">
             {refs?.opportunity_id ?? 'N/A'} · {trade.symbol} {trade.side} · report{' '}
             {refs?.report_id ?? 'N/A'}
           </div>
@@ -83,11 +95,15 @@ export function JournalTimeline({
         </li>
         <li className={trigger ? 'acc' : undefined}>
           <div className="tl-time">{trigger ? `${trigger.triggered_at} UTC` : 'N/A'}</div>
-          <div className="tl-title">triggered</div>
+          <div className="tl-title" lang="en">
+            triggered
+          </div>
           <div className="tl-desc">
-            {trigger
-              ? `snapshot ${trigger.snapshot.as_of} · ${trigger.snapshot.data_quality} · ${trigger.trigger_id}`
-              : `N/A — ${triggerReason}`}
+            {trigger ? (
+              <span lang="en">{`snapshot ${trigger.snapshot.as_of} · ${trigger.snapshot.data_quality} · ${trigger.trigger_id}`}</span>
+            ) : (
+              `N/A — ${triggerReason}`
+            )}
           </div>
         </li>
         <li className={decisionText ? 'acc' : undefined}>
@@ -98,21 +114,25 @@ export function JournalTimeline({
                 ? 'N/A — no decision timestamp'
                 : 'N/A'}
           </div>
-          <div className="tl-title">
+          <div className="tl-title" lang="en">
             {decisionText ? `LLM decision ${decisionText}` : 'LLM decision N/A'}
           </div>
           <div className="tl-desc">
-            {decisionText
-              ? `confidence ${decisionConfidence === null ? 'N/A' : decisionConfidence.toFixed(2)} · ${decisionId ?? 'N/A'} · prompt ${String(
-                  (decisionProvenance?.prompt_id as string | undefined) ?? 'N/A',
-                )}${typeof decisionProvenance?.prompt_version === 'number' ? ` v${decisionProvenance.prompt_version}` : ''}`
-              : `N/A — ${decisionReason}`}
+            {decisionText ? (
+              <span lang="en">{`confidence ${decisionConfidence === null ? 'N/A' : decisionConfidence.toFixed(2)} · ${decisionId ?? 'N/A'} · prompt ${String(
+                (decisionProvenance?.prompt_id as string | undefined) ?? 'N/A',
+              )}${typeof decisionProvenance?.prompt_version === 'number' ? ` v${decisionProvenance.prompt_version}` : ''}`}</span>
+            ) : (
+              `N/A — ${decisionReason}`
+            )}
           </div>
         </li>
         <li className="ok">
           <div className="tl-time">{trade.opened_at} UTC</div>
-          <div className="tl-title">entry</div>
-          <div className="tl-desc">
+          <div className="tl-title" lang="en">
+            entry
+          </div>
+          <div className="tl-desc" lang="en">
             entry {dash(trade.entry_avg_price)} · size {dash(trade.size)} · fees{' '}
             {dash(trade.fees_usd)}
           </div>
@@ -123,7 +143,9 @@ export function JournalTimeline({
               ? `${managementEvents[managementEvents.length - 1].at} UTC`
               : 'N/A'}
           </div>
-          <div className="tl-title">management</div>
+          <div className="tl-title" lang="en">
+            management
+          </div>
           {managementEvents.length > 0 ? (
             <ul className="journal-timeline-events">
               {managementEvents.map((event) => (
@@ -138,8 +160,10 @@ export function JournalTimeline({
         </li>
         <li className={netValue !== null && netValue < 0 ? 'failed' : undefined}>
           <div className="tl-time">{trade.closed_at} UTC</div>
-          <div className="tl-title">exit</div>
-          <div className="tl-desc">
+          <div className="tl-title" lang="en">
+            exit
+          </div>
+          <div className="tl-desc" lang="en">
             exit {dash(trade.exit_avg_price)} · net {trade.net_pnl_usd} ·{' '}
             {trade.outcome_tags.join(' / ') || '—'}
           </div>
@@ -170,21 +194,29 @@ export function SignalSnapshot({
   return (
     <section className="panel" aria-labelledby="journal-snapshot-heading">
       <div className="panel-head">
-        <h2 id="journal-snapshot-heading">Signal snapshot</h2>
-        <span className="mono-muted">CALC · source report</span>
+        <h2 id="journal-snapshot-heading" lang="en">
+          Signal snapshot
+        </h2>
+        <span className="mono-muted" lang="en">
+          CALC · source report
+        </span>
       </div>
       <dl className="kv">
-        <dt>Signal / Opportunity</dt>
-        <dd className="mono">{opportunityId ?? 'N/A'}</dd>
-        <dt>Proposed zone</dt>
-        <dd className="mono">{zoneText}</dd>
-        <dt>Actual entry</dt>
+        <dt lang="en">Signal / Opportunity</dt>
+        <dd className="mono" lang="en">
+          {opportunityId ?? 'N/A'}
+        </dd>
+        <dt lang="en">Proposed zone</dt>
+        <dd className="mono" lang="en">
+          {zoneText}
+        </dd>
+        <dt lang="en">Actual entry</dt>
         <dd className="mono">{dash(entryAvgPrice)}</dd>
-        <dt>Trigger→fill slippage</dt>
+        <dt lang="en">Trigger→fill slippage</dt>
         <dd className="mono">{slippageText}</dd>
-        <dt>Invalidation</dt>
+        <dt lang="en">Invalidation</dt>
         <dd>{invalidationText}</dd>
-        <dt>Source report</dt>
+        <dt lang="en">Source report</dt>
         <dd className="mono">
           <JournalRefLink id={reportId} base="/reports" />
         </dd>
@@ -205,25 +237,31 @@ export function JournalFills({ trade, partial, qualityReasons }: JournalFillsPro
   return (
     <section className="panel" aria-labelledby="journal-fills-heading">
       <div className="panel-head">
-        <h2 id="journal-fills-heading">Fills</h2>
-        {partial && <span className="chip chip--warn">PARTIAL</span>}
+        <h2 id="journal-fills-heading" lang="en">
+          Fills
+        </h2>
+        {partial && (
+          <span className="chip chip--warn" lang="en">
+            PARTIAL
+          </span>
+        )}
       </div>
       <dl className="kv">
-        <dt>Entry fill</dt>
-        <dd className="mono">
+        <dt lang="en">Entry fill</dt>
+        <dd className="mono" lang="en">
           {dash(trade.entry_avg_price)} · size {dash(trade.size)}
         </dd>
-        <dt>Exit fill</dt>
-        <dd className="mono">
+        <dt lang="en">Exit fill</dt>
+        <dd className="mono" lang="en">
           {dash(trade.exit_avg_price)} · size {dash(trade.size)}
         </dd>
-        <dt>Gross / Fees / Funding</dt>
+        <dt lang="en">Gross / Fees / Funding</dt>
         <dd className="mono">
           {dash(trade.gross_pnl_usd)} / {dash(trade.fees_usd)} / {dash(trade.funding_usd)}
         </dd>
-        <dt>Net PnL</dt>
+        <dt lang="en">Net PnL</dt>
         <dd className="mono">{trade.net_pnl_usd}</dd>
-        <dt>Opened / Closed</dt>
+        <dt lang="en">Opened / Closed</dt>
         <dd className="mono">
           {trade.opened_at} / {trade.closed_at}
         </dd>
@@ -231,7 +269,9 @@ export function JournalFills({ trade, partial, qualityReasons }: JournalFillsPro
       {partial && qualityReasons.length > 0 && (
         <ul className="journal-fills-reasons">
           {qualityReasons.map((reason, index) => (
-            <li key={`${index}-${reason.slice(0, 16)}`}>{reason}</li>
+            <li key={`${index}-${reason.slice(0, 16)}`} lang="en">
+              {reason}
+            </li>
           ))}
         </ul>
       )}
@@ -248,7 +288,12 @@ interface JournalLinksProps {
 }
 
 /** The related-record links (trigger, opportunity, position, report). */
-export function JournalLinks({ triggerId, opportunityId, positionId, reportId }: JournalLinksProps) {
+export function JournalLinks({
+  triggerId,
+  opportunityId,
+  positionId,
+  reportId,
+}: JournalLinksProps) {
   return (
     <section className="panel" aria-labelledby="journal-links-heading">
       <div className="panel-head">
@@ -256,21 +301,147 @@ export function JournalLinks({ triggerId, opportunityId, positionId, reportId }:
       </div>
       <div className="journal-links">
         <div>
-          <span className="mono-muted">Trigger</span>{' '}
+          <span className="mono-muted" lang="en">
+            Trigger
+          </span>{' '}
           <JournalRefLink id={triggerId} base="/triggers" />
         </div>
         <div>
-          <span className="mono-muted">Opportunity</span>{' '}
+          <span className="mono-muted" lang="en">
+            Opportunity
+          </span>{' '}
           <JournalRefLink id={opportunityId} base="/opportunities" />
         </div>
         <div>
-          <span className="mono-muted">Position</span>{' '}
+          <span className="mono-muted" lang="en">
+            Position
+          </span>{' '}
           <JournalRefLink id={positionId} base="/positions" />
         </div>
         <div>
-          <span className="mono-muted">Report</span> <JournalRefLink id={reportId} base="/reports" />
+          <span className="mono-muted" lang="en">
+            Report
+          </span>{' '}
+          <JournalRefLink id={reportId} base="/reports" />
         </div>
       </div>
+    </section>
+  )
+}
+
+interface JournalDecisionPanelProps {
+  entryDecision: EntryDecisionData | null
+  decisionText: string | null
+  decisionConfidence: number | null
+  decisionId: string | null
+  decisionValidation: string | null
+  decisionRationale: string | null
+  decisionProvenance: Record<string, unknown> | null
+  decisionReason: string
+}
+
+/** The persisted entry decision, separate from the advisory review band. */
+export function JournalDecisionPanel({
+  entryDecision,
+  decisionText,
+  decisionConfidence,
+  decisionId,
+  decisionValidation,
+  decisionRationale,
+  decisionProvenance,
+  decisionReason,
+}: JournalDecisionPanelProps) {
+  const confidenceValue = numberOrNull(decisionConfidence)
+  const band = confidenceBand(confidenceValue)
+  return (
+    <section className="panel" aria-labelledby="journal-decision-heading">
+      <div className="panel-head">
+        <h2 id="journal-decision-heading">LLM 决策记录</h2>
+        <ProvenanceStamp kind="LLM" />
+      </div>
+      {entryDecision?.status === 'FOUND' && entryDecision.decision ? (
+        <>
+          <dl className="kv">
+            <dt lang="en">Decision</dt>
+            <dd className="mono">{decisionText ?? 'N/A'}</dd>
+            <dt lang="en">Confidence</dt>
+            <dd className="mono">
+              {confidenceValue === null ? '—' : confidenceValue.toFixed(2)}{' '}
+              {band && <span className={BAND_CLASSES[band]}>{BAND_LABELS[band]}</span>}
+            </dd>
+            <dt lang="en">Validation</dt>
+            <dd className="mono">{decisionValidation ?? 'N/A'}</dd>
+            <dt lang="en">Decision ID</dt>
+            <dd className="mono">{decisionId ?? 'N/A'}</dd>
+          </dl>
+          {decisionRationale !== null && (
+            <p className="prose journal-decision-rationale">{decisionRationale}</p>
+          )}
+          <ReviewProvenance provenance={decisionProvenance} />
+        </>
+      ) : (
+        <p className="panel-foot" data-testid="journal-decision-unavailable">
+          N/A — {decisionReason}
+        </p>
+      )}
+    </section>
+  )
+}
+
+interface JournalExportPanelProps {
+  headingId: string
+  csvLabel: string
+  jsonLabel: string
+  exporting: 'csv' | 'json' | null
+  exportError: string | null
+  errorTestId: string
+  onExport: (format: 'csv' | 'json') => void
+}
+
+/** The server-generated export panel shared by the journal list and detail. */
+export function JournalExportPanel({
+  headingId,
+  csvLabel,
+  jsonLabel,
+  exporting,
+  exportError,
+  errorTestId,
+  onExport,
+}: JournalExportPanelProps) {
+  return (
+    <section className="panel" aria-labelledby={headingId}>
+      <div className="panel-head">
+        <h2 id={headingId}>导出</h2>
+        <span className="mono-muted">服务端生成 · CSV formula 中和在服务端完成</span>
+      </div>
+      <div className="action-row journal-filter-actions">
+        <button
+          type="button"
+          className="btn"
+          disabled={exporting !== null}
+          aria-busy={exporting === 'csv'}
+          onClick={() => onExport('csv')}
+        >
+          {exporting === 'csv' ? '正在导出…' : csvLabel}
+        </button>
+        <button
+          type="button"
+          className="btn"
+          disabled={exporting !== null}
+          aria-busy={exporting === 'json'}
+          onClick={() => onExport('json')}
+        >
+          {exporting === 'json' ? '正在导出…' : jsonLabel}
+        </button>
+      </div>
+      {exportError !== null && (
+        <p className="mono-muted" role="alert" data-testid={errorTestId}>
+          导出失败：{exportError}
+        </p>
+      )}
+      <p className="panel-foot">
+        导出文件由 API 生成并下载；客户端不生成文件。CSV 公式前缀在服务端中和。
+      </p>
     </section>
   )
 }

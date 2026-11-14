@@ -21,12 +21,24 @@ interface JournalTableProps {
 function Side({ side }: { side: string }) {
   const upper = side.toUpperCase()
   if (upper === 'SHORT') {
-    return <span className="value-down">▼ SHORT</span>
+    return (
+      <span className="value-down" lang="en">
+        ▼ SHORT
+      </span>
+    )
   }
   if (upper === 'LONG') {
-    return <span className="value-up">▲ LONG</span>
+    return (
+      <span className="value-up" lang="en">
+        ▲ LONG
+      </span>
+    )
   }
-  return <span className="mono">{upper || '—'}</span>
+  return (
+    <span className="mono" lang="en">
+      {upper || '—'}
+    </span>
+  )
 }
 
 function OutcomeChip({ outcome }: { outcome: JournalOutcome }) {
@@ -38,7 +50,11 @@ function OutcomeChip({ outcome }: { outcome: JournalOutcome }) {
         : outcome === 'PARTIAL'
           ? 'chip chip--warn'
           : 'chip'
-  return <span className={className}>{outcome}</span>
+  return (
+    <span className={className} lang="en">
+      {outcome}
+    </span>
+  )
 }
 
 function QualityChip({ status, reasons = [] }: { status: string; reasons?: string[] }) {
@@ -54,10 +70,11 @@ function QualityChip({ status, reasons = [] }: { status: string; reasons?: strin
       className={className}
       title={reasons.length > 0 ? reasons.join('; ') : undefined}
       aria-describedby={reasons.length > 0 ? describedBy : undefined}
+      lang="en"
     >
       {status}
       {reasons.length > 0 && (
-        <span id={describedBy} className="visually-hidden">
+        <span id={describedBy} className="visually-hidden" lang="en">
           {`data quality reasons: ${reasons.join('; ')}`}
         </span>
       )}
@@ -172,7 +189,9 @@ export function JournalTable({
               <td className="mono">—</td>
               <td className="mono">—</td>
               <td>
-                <span className="chip">OPEN excluded</span>
+                <span className="chip" lang="en">
+                  OPEN excluded
+                </span>
               </td>
               <td>
                 <QualityChip
