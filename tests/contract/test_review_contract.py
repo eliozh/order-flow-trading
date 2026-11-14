@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import json
 from pathlib import Path
+from typing import get_args
 
 import _helpers
 import _registry
@@ -12,6 +13,7 @@ from jsonschema import Draft202012Validator
 from oft.application.llm_validation import canonical_schema, validate_output
 from oft.application.position_service import PositionService
 from oft.application.review_service import ReviewService
+from oft.domain.llm_output import Timeframe
 from position_support import set_position_mark
 
 VALID_FIXTURES = (
@@ -101,6 +103,13 @@ def test_the_enum_change_is_additive_and_closed() -> None:
     assert set(output_schema["properties"]) == set(_ORIGINAL_REQUIRED)
     assert "order" not in output_schema["properties"]
     assert "action" not in output_schema["properties"]
+
+
+def test_the_schema_timeframe_enum_is_bound_to_the_python_alias() -> None:
+    schema = canonical_schema()
+    enum = schema["$defs"]["subject"]["properties"]["timeframe"]["enum"]
+
+    assert enum == list(get_args(Timeframe))
 
 
 def test_an_unknown_top_level_field_is_still_rejected() -> None:

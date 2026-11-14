@@ -39,7 +39,17 @@ from oft.application.llm_orchestrator import (
     LLMConfigurationError,
     LLMOrchestrator,
     LLMRuntimeRegistry,
-    provider_configured,
+)
+from oft.application.llm_service_support import (
+    BOUNDED_HISTORY_MAX_BYTES,
+    BOUNDED_HISTORY_MAX_ENTRIES,
+    BOUNDED_HISTORY_TEXT_LIMIT,
+    ProviderSelectionError,
+    bounded_history,
+    decision_provenance,
+    llm_error_code,
+    resolve_provider_name,
+    save_llm_decision,
 )
 from oft.application.llm_usage import total_cost, total_usage
 from oft.application.llm_validation import (
@@ -99,7 +109,6 @@ from oft.ports.llm import (
     sanitize_provider_id,
 )
 from oft.ports.store import (
-    DecisionRecord,
     LLMCallRecord,
     OrderRecord,
     PositionRecord,
@@ -122,10 +131,10 @@ _STOP_REFUSAL_FIELD = "position_management.new_stop_price"
 DAILY_EQUITY_STATE_KEY = "daily_equity_snapshot"
 # The prompt embeds prior management notes; cap the count, each free-text note,
 # and the serialized total so a long-lived position cannot grow the prompt
-# without bound.
-_MANAGEMENT_HISTORY_MAX_ENTRIES = 20
-_MANAGEMENT_HISTORY_TEXT_LIMIT = 200
-_MANAGEMENT_HISTORY_MAX_BYTES = 4096
+# without bound. The values live with the shared review/management helper.
+_MANAGEMENT_HISTORY_MAX_ENTRIES = BOUNDED_HISTORY_MAX_ENTRIES
+_MANAGEMENT_HISTORY_TEXT_LIMIT = BOUNDED_HISTORY_TEXT_LIMIT
+_MANAGEMENT_HISTORY_MAX_BYTES = BOUNDED_HISTORY_MAX_BYTES
 
 
 class ManagementRejected(Exception):
@@ -240,38 +249,8 @@ class _PositionSource:
     trigger_id: str | None
 
 
-def _bounded_management_history(value: object) -> list[dict[str, Any]]:
-    """The newest bounded management-history entries for the prompt.
-
-    Keeps at most ``_MANAGEMENT_HISTORY_MAX_ENTRIES`` newest dict entries,
-    truncates each free-text note/rationale, and drops the oldest entries until
-    the serialized form fits ``_MANAGEMENT_HISTORY_MAX_BYTES``.
-    """
-    if not isinstance(value, list):
-        return []
-    entries: list[dict[str, Any]] = []
-    for item in value[-_MANAGEMENT_HISTORY_MAX_ENTRIES:]:
-        if not isinstance(item, dict):
-            continue
-        entry = dict(item)
-        for key in ("note", "rationale"):
-            text = entry.get(key)
-            if isinstance(text, str) and len(text) > _MANAGEMENT_HISTORY_TEXT_LIMIT:
-                entry[key] = text[:_MANAGEMENT_HISTORY_TEXT_LIMIT]
-        entries.append(entry)
-    while entries and (
-        len(json.dumps(entries, sort_keys=True).encode("utf-8")) > _MANAGEMENT_HISTORY_MAX_BYTES
-    ):
-        entries.pop(0)
-    return entries
-
-
-_LLM_ERROR_CODES = frozenset({"LLM_REFUSED", "LLM_OUTPUT_TRUNCATED", "LLM_SCHEMA_INVALID"})
-
-
-def _llm_error_code(code: str | None) -> str:
-    """Map a validator code to the error catalog's LLM vocabulary."""
-    return code if code in _LLM_ERROR_CODES else "LLM_SCHEMA_INVALID"
+_bounded_management_history = bounded_history
+_llm_error_code = llm_error_code
 
 
 class ManagementCondition(StrEnum):
@@ -1680,32 +1659,25 @@ class ManagementService:
         conditions: Sequence[ManagementCondition] = (),
     ) -> dict[str, Any]:
         amount_usd, price_version, unpriced = total_cost(budgets)
-        return {
-            "provider": result.provider,
-            "model": result.model,
-            "model_snapshot": None,
-            "prompt_id": rendered.prompt_id,
-            "prompt_version": rendered.version,
-            "prompt_hash": rendered.prompt_hash,
-            "knowledge_artifact_hash": knowledge.artifact_id,
-            "knowledge_status": knowledge.status,
-            "knowledge_reason": knowledge.reason,
-            "due_conditions": _condition_values(conditions),
-            "input_hash": input_hash,
-            "schema_version": "1.0.0",
-            "temperature": 0.0,
-            "seed": None,
-            "request_id": sanitize_provider_id(result.request_id, self._secrets),
-            "latency_ms": result.latency_ms,
-            "usage": total_usage(calls),
-            "cost": {
-                "amount_usd": amount_usd,
-                "currency": "USD",
-                "price_version": price_version,
-                "unpriced": unpriced,
-            },
-            "recorded_at": now,
-        }
+        return decision_provenance(
+            provider=result.provider,
+            model=result.model,
+            prompt_id=rendered.prompt_id,
+            prompt_version=rendered.version,
+            prompt_hash=rendered.prompt_hash,
+            knowledge_artifact_hash=knowledge.artifact_id,
+            knowledge_status=knowledge.status,
+            knowledge_reason=knowledge.reason,
+            input_hash=input_hash,
+            request_id=sanitize_provider_id(result.request_id, self._secrets),
+            latency_ms=result.latency_ms,
+            usage=total_usage(calls),
+            amount_usd=amount_usd,
+            price_version=price_version,
+            unpriced=unpriced,
+            recorded_at=now,
+            due_conditions=_condition_values(conditions),
+        )
 
     # -- persistence helpers ---------------------------------------------
 
@@ -1717,16 +1689,15 @@ class ManagementService:
         envelope: dict[str, Any],
         now: str,
     ) -> None:
-        self._store.save_decision(
-            DecisionRecord(
-                decision_id=decision_id,
-                role=LLMRole.MANAGEMENT.value,
-                decision_type="POSITION_MANAGEMENT",
-                validation_status=validation_status,
-                raw_output_hash=raw_output_hash,
-                persisted_at=now,
-                payload_json=json.dumps(envelope, sort_keys=True, allow_nan=False),
-            )
+        save_llm_decision(
+            self._store,
+            decision_id=decision_id,
+            role=LLMRole.MANAGEMENT.value,
+            decision_type="POSITION_MANAGEMENT",
+            validation_status=validation_status,
+            raw_output_hash=raw_output_hash,
+            envelope=envelope,
+            now=now,
         )
 
     def _audit_classification(
@@ -2445,30 +2416,16 @@ class ManagementService:
         }
 
     def _provider_name(self, requested: str | None) -> str:
-        value = (requested or "").strip().lower()
-        if self._provider is None:
-            raise ManagementRejected(
-                "LLM_PROVIDER_NOT_CONFIGURED",
-                "No LLM provider is configured; the management decision cannot run.",
+        try:
+            return resolve_provider_name(
+                self._provider,
+                self._settings,
+                requested,
+                role_label="management",
+                run_label="management decision",
             )
-        name = value or str(getattr(self._provider, "provider", "") or "")
-        if not name:
-            capabilities = getattr(self._provider, "capabilities", None)
-            if callable(capabilities):
-                name = str(getattr(capabilities(), "provider", "") or "")
-        if requested and name != requested.strip().lower():
-            # ``provider_for`` already resolved the request; a mismatch means the
-            # caller named a different provider than the injected adapter.
-            raise ManagementRejected(
-                "LLM_PROVIDER_NOT_CONFIGURED",
-                f"No {requested} provider is configured for the management role.",
-            )
-        if not provider_configured(self._settings, name):
-            raise ManagementRejected(
-                "LLM_PROVIDER_NOT_CONFIGURED",
-                f"No {name or 'LLM'} API key is configured; the management decision cannot run.",
-            )
-        return name
+        except ProviderSelectionError as exc:
+            raise ManagementRejected(exc.code, exc.message) from exc
 
 
 def _decision_id(position_id: str, idempotency_key: str) -> str:

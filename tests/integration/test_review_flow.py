@@ -241,12 +241,33 @@ def test_the_prompt_contains_only_delimited_trade_data_and_knowledge(
 
 
 def test_no_raw_prompt_or_secret_is_stored_or_returned(tmp_path: Path) -> None:
-    settings, container, _position, trade = _closed_trade(tmp_path)
-    secret = "sk-REVIEW-SECRET-DO-NOT-STORE"
+    settings, container, position, trade = _closed_trade(tmp_path)
+    secret = "REVIEW-OPAQUE-SENTINEL-9f3a2c"
     scoped = settings.model_copy(update={"api_token": secret})
     provider = _CountingStub(
         LLMStub(fixtures_dir=FIXTURES, overrides={LLMRole.REVIEW: "review_valid.json"})
     )
+    # Seed the configured secret into an untrusted field so the redaction path is
+    # actually exercised (otherwise the assertion is vacuous).
+    connection = sqlite3.connect(settings.data_dir / "oft.db")
+    try:
+        row = connection.execute(
+            "SELECT payload_json FROM positions WHERE position_id = ?",
+            (position["position_id"],),
+        ).fetchone()
+        assert row is not None
+        payload = json.loads(row[0])
+        payload["management_history"] = [
+            *(payload.get("management_history") or []),
+            {"action": "HOLD", "at": "2026-10-07T00:00:00.000Z", "note": secret},
+        ]
+        connection.execute(
+            "UPDATE positions SET payload_json = ? WHERE position_id = ?",
+            (json.dumps(payload), position["position_id"]),
+        )
+        connection.commit()
+    finally:
+        connection.close()
     service = ReviewService(
         store=container.store,
         clock=container.clock,
@@ -257,6 +278,9 @@ def test_no_raw_prompt_or_secret_is_stored_or_returned(tmp_path: Path) -> None:
 
     result = service.review(trade["trade_id"], idempotency_key="secret")
 
+    prompt = provider.requests[0].user_prompt
+    assert secret not in prompt
+    assert "[REDACTED]" in prompt
     decision = container.store.get_decision(result.decision_id)
     assert decision is not None
     stored = decision.payload_json
@@ -383,16 +407,20 @@ def test_the_api_and_cli_label_the_review_advisory(
         assert data["status"] == "FOUND"
         assert data["validation_status"] == "VALID"
         assert data["rationale"]
+        # M1: a FOUND review maps to COMPLETE in both directions.
+        assert posted.json()["meta"]["data_quality"] == "COMPLETE"
         read = client.get(f"/api/v1/journal/{trade_id}/review", headers=headers)
         assert read.status_code == 200, read.text
         assert read.json()["data"]["decision_id"] == data["decision_id"]
         assert read.json()["data"]["advisory"] is True
+        assert read.json()["meta"]["data_quality"] == "COMPLETE"
 
     from oft.cli.commands import log as log_module
     from oft.cli.main import app as cli_app
 
     class _FakeClient:
         calls: list[dict[str, Any]] = []
+        timeouts: list[float | None] = []
 
         def journal_review(
             self,
@@ -426,34 +454,44 @@ def test_the_api_and_cli_label_the_review_advisory(
                 }
             }
 
+    class _Api:
+        @classmethod
+        def from_settings(cls, settings: Any, *, timeout: float | None = 2.0) -> _FakeClient:
+            _FakeClient.timeouts.append(timeout)
+            return fake
+
     fake = _FakeClient()
-    fake_api = type(
-        "_Api",
-        (),
-        {"from_settings": classmethod(lambda cls, settings: fake)},
-    )
-    monkeypatch.setattr(log_module, "ApiClient", fake_api)
+    monkeypatch.setattr(log_module, "ApiClient", _Api)
     monkeypatch.setattr(log_module, "load_settings", lambda: settings)
 
     plain = CliRunner().invoke(cli_app, ["log", "review", trade_id])
     assert plain.exit_code == 0, plain.output
     assert ADVISORY_LABEL in plain.output
-    assert fake.calls[-1]["idempotency_key"] == f"review:{trade_id}:default"
+    # A plain call uses a fresh key: the route's 24 h cache must never serve the
+    # pre-refresh envelope after a refresh links a new decision (H1).
+    assert fake.calls[-1]["idempotency_key"] != f"review:{trade_id}:default"
+    # The review may block on two 120 s provider calls plus a repair/backoff, so
+    # the CLI applies its finite review deadline rather than ``None`` or the 2 s
+    # default (H2).
+    assert log_module._REVIEW_TIMEOUT_SECONDS == 1200.0
+    assert fake.timeouts[-1] == log_module._REVIEW_TIMEOUT_SECONDS
 
     with_provider = CliRunner().invoke(cli_app, ["log", "review", trade_id, "--provider", "stub"])
     assert with_provider.exit_code == 0, with_provider.output
     assert fake.calls[-1]["provider"] == "stub"
-    assert fake.calls[-1]["idempotency_key"] == f"review:{trade_id}:stub"
-    assert fake.calls[-1]["idempotency_key"] != f"review:{trade_id}:default"
+    assert fake.calls[-1]["idempotency_key"] != fake.calls[-2]["idempotency_key"]
 
     refreshed = CliRunner().invoke(cli_app, ["log", "review", trade_id, "--refresh"])
     assert refreshed.exit_code == 0, refreshed.output
     assert fake.calls[-1]["refresh"] is True
-    assert fake.calls[-1]["idempotency_key"] != f"review:{trade_id}:default"
+    assert fake.calls[-1]["idempotency_key"] != fake.calls[-2]["idempotency_key"]
 
     as_json = CliRunner().invoke(cli_app, ["log", "review", trade_id, "--json"])
     assert as_json.exit_code == 0, as_json.output
     assert json.loads(as_json.stdout)["data"]["advisory"] is True
+    # Every CLI review call carries its own distinct key.
+    keys = [call["idempotency_key"] for call in fake.calls]
+    assert len(set(keys)) == len(keys)
 
 
 def test_untrusted_trade_text_cannot_close_the_position_delimiter(
@@ -641,3 +679,6 @@ def test_a_corrupt_replay_envelope_is_partial_not_a_500(tmp_path: Path) -> None:
     body = response.json()["data"]
     assert body["status"] == "PARTIAL"
     assert body["reason"] == "the stored review fields are malformed"
+    # M1: the envelope quality follows the review status, not a hardcoded
+    # COMPLETE.
+    assert response.json()["meta"]["data_quality"] == "PARTIAL"

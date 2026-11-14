@@ -2,12 +2,19 @@
 
 The review is advisory by construction. It reads the closed trade log, its fill,
 and the bounded management history, renders the seeded ``REVIEW`` prompt, and
-persists a schema-validated ``llm-decision`` envelope. It writes only the
-decisions/budget ledger and the ``trade_logs.review_decision_id`` link; it
+persists a schema-validated ``llm-decision`` envelope. It writes the
+decisions/budget ledger, the orchestrator's ``llm_calls`` rows, the
+``trade_logs.review_decision_id`` link, and a ``REVIEW_GENERATED`` audit. It
 imports no execution gateway, paper broker, position mutation, or risk gate, and
 it can never create an order, change a rule, apply a prompt edit, or alter a
 risk cap. A rejected/refused output is persisted for audit but never linked, so
 the trade metrics and any previous review link stay untouched.
+
+Deliberate size exception: this module stays above the project's 800-line soft
+ceiling because prompt construction, the admission/validation checks, the
+read/replay state machine, and persistence/audit are one cohesive orchestration
+unit with a single shared failure vocabulary. The read/replay block is the first
+candidate for a future extraction; a split must not change behaviour.
 """
 
 from __future__ import annotations
@@ -15,7 +22,7 @@ from __future__ import annotations
 import hashlib
 import json
 from dataclasses import dataclass
-from typing import Any, NoReturn
+from typing import Any, NoReturn, get_args
 
 import structlog
 
@@ -28,7 +35,14 @@ from oft.application.llm_orchestrator import (
     LLMOrchestrator,
     LLMRuntimeRegistry,
     OrchestrationResult,
-    provider_configured,
+)
+from oft.application.llm_service_support import (
+    ProviderSelectionError,
+    bounded_history,
+    decision_provenance,
+    llm_error_code,
+    resolve_provider_name,
+    save_llm_decision,
 )
 from oft.application.llm_usage import total_cost, total_usage
 from oft.application.llm_validation import (
@@ -46,13 +60,17 @@ from oft.application.prompt_service import (
 )
 from oft.application.review_models import (
     ADVISORY_LABEL,
+    VALID_REVIEW_STATUSES,
     ReviewRead,
     ReviewRejected,
     ReviewResult,
+    safe_identifier,
+    validated_link_id,
     validated_review_fields,
     validated_validation_status,
 )
 from oft.config import Settings
+from oft.domain.llm_output import Timeframe
 from oft.domain.prompts import PromptRole
 from oft.domain.time import utc_timestamp
 from oft.ports.clock import ClockPort
@@ -73,14 +91,7 @@ from oft.ports.store import (
 
 _LOGGER = structlog.get_logger(__name__)
 
-_LLM_ERROR_CODES = frozenset({"LLM_REFUSED", "LLM_OUTPUT_TRUNCATED", "LLM_SCHEMA_INVALID"})
-_VALID_REVIEW_STATUSES = frozenset({"VALID", "REPAIRED"})
-_ALLOWED_TIMEFRAMES = frozenset({"1m", "5m", "15m", "1h", "4h", "8h", "1d"})
-# Mirror the management prompt's bounded history so untrusted position data can
-# never grow the review prompt without bound.
-_HISTORY_MAX_ENTRIES = 20
-_HISTORY_TEXT_LIMIT = 200
-_HISTORY_MAX_BYTES = 4096
+_ALLOWED_TIMEFRAMES = frozenset(get_args(Timeframe))
 _RETRY_HINT = "Retry the review to attempt again."
 _TRADE_FIELDS = (
     "trade_id",
@@ -123,8 +134,10 @@ def _review_decision_id(trade_id: str, idempotency_key: str) -> str:
     return f"RVW-{digest.upper()}"
 
 
-def _llm_error_code(code: str | None) -> str:
-    return code if code in _LLM_ERROR_CODES else "LLM_SCHEMA_INVALID"
+_llm_error_code = llm_error_code
+# Mirror the management prompt's bounded history so untrusted position data can
+# never grow the review prompt without bound.
+_bounded_history = bounded_history
 
 
 def _decode_payload(raw: str, *, subject: str) -> dict[str, Any] | None:
@@ -162,27 +175,6 @@ def _neutralize_prompt_value(value: Any) -> Any:
     if isinstance(value, (list, tuple)):
         return [_neutralize_prompt_value(item) for item in value]
     return value
-
-
-def _bounded_history(value: object) -> list[dict[str, Any]]:
-    """The newest bounded management-history entries for the prompt."""
-    if not isinstance(value, list):
-        return []
-    entries: list[dict[str, Any]] = []
-    for item in value[-_HISTORY_MAX_ENTRIES:]:
-        if not isinstance(item, dict):
-            continue
-        entry = dict(item)
-        for key in ("note", "rationale"):
-            text = entry.get(key)
-            if isinstance(text, str) and len(text) > _HISTORY_TEXT_LIMIT:
-                entry[key] = text[:_HISTORY_TEXT_LIMIT]
-        entries.append(entry)
-    while entries and (
-        len(json.dumps(entries, sort_keys=True).encode("utf-8")) > _HISTORY_MAX_BYTES
-    ):
-        entries.pop(0)
-    return entries
 
 
 class ReviewService:
@@ -237,6 +229,12 @@ class ReviewService:
             linked = self._linked_result(trade_id, payload)
             if linked is not None:
                 return linked
+            # A decision persisted by an earlier attempt whose link write failed
+            # is orphaned: recover it instead of paying for a second provider
+            # call. A refresh must still create a new decision.
+            orphaned = self._orphaned_result(trade_id, record)
+            if orphaned is not None:
+                return orphaned
 
         decision_id = _review_decision_id(trade_id, key)
         existing = self._existing_result(trade_id, decision_id)
@@ -352,7 +350,8 @@ class ReviewService:
         now: str,
     ) -> ReviewResult:
         output = outcome.output
-        assert output is not None  # ``valid`` guarantees a parsed output
+        if output is None:
+            raise ReviewRejected("LLM_SCHEMA_INVALID", "the review output was rejected")
         envelope = decision_envelope(
             decision_id=decision_id,
             role=LLMRole.REVIEW.value,
@@ -378,9 +377,9 @@ class ReviewService:
         return ReviewResult(
             trade_id=trade_id,
             decision_id=decision_id,
-            rationale=envelope.get("rationale") or "",
-            caveats=tuple(str(item) for item in envelope.get("caveats") or []),
-            confidence=float(envelope.get("confidence") or 0.0),
+            rationale=output.rationale,
+            caveats=tuple(output.caveats),
+            confidence=output.confidence,
             validation_status=outcome.status,
             provenance=provenance,
         )
@@ -388,7 +387,12 @@ class ReviewService:
     # -- reads -----------------------------------------------------------
 
     def read(self, trade_id: str) -> ReviewRead:
-        """The linked review, provider-free; every failure is a named status."""
+        """The linked review for an existing trade, provider-free.
+
+        A missing trade raises the typed ``NOT_FOUND`` (it is not a read state).
+        Every failure after the trade exists returns a named ``MISSING`` or
+        ``PARTIAL`` status instead of raising.
+        """
         record = self._require_trade(trade_id)
         payload = _decode_payload(record.payload_json, subject=f"trade log {trade_id}")
         if payload is None:
@@ -398,13 +402,22 @@ class ReviewService:
                 reason="the trade log payload is unreadable",
             )
         linked = payload.get("review_decision_id")
-        if not isinstance(linked, str) or not linked.strip():
+        if linked is None:
             return ReviewRead(
                 trade_id=trade_id,
                 status="MISSING",
                 reason="no advisory review is linked to this trade",
             )
-        return self._read_linked_review(trade_id, linked)
+        decision_id = validated_link_id(linked)
+        if decision_id is None:
+            # A present-but-malformed link id must be named, never echoed or
+            # handed to the store (which would raise on the SQL bind).
+            return ReviewRead(
+                trade_id=trade_id,
+                status="PARTIAL",
+                reason="the linked review id is malformed",
+            )
+        return self._read_linked_review(trade_id, decision_id)
 
     def _read_linked_review(self, trade_id: str, linked: str) -> ReviewRead:
         decision = self._store.get_decision(linked)
@@ -441,7 +454,7 @@ class ReviewService:
                 decision_id=linked,
                 reason="the linked review has an unrecognized validation status",
             )
-        if validation_status not in _VALID_REVIEW_STATUSES:
+        if validation_status not in VALID_REVIEW_STATUSES:
             return ReviewRead(
                 trade_id=trade_id,
                 status="PARTIAL",
@@ -472,8 +485,8 @@ class ReviewService:
         return payload
 
     def _linked_result(self, trade_id: str, payload: dict[str, Any]) -> ReviewResult | None:
-        linked = payload.get("review_decision_id")
-        if not isinstance(linked, str) or not linked.strip():
+        linked = validated_link_id(payload.get("review_decision_id"))
+        if linked is None:
             return None
         return self._result_from_decision(trade_id, linked, idempotent_replay=True)
 
@@ -482,14 +495,93 @@ class ReviewService:
             return None
         return self._result_from_decision(trade_id, decision_id, idempotent_replay=True, link=True)
 
-    def _result_from_decision(
+    def _orphaned_result(self, trade_id: str, record: TradeLogRecord) -> ReviewResult | None:
+        """Recover an accepted REVIEW decision whose trade-log link was lost.
+
+        The decision may have been persisted before the link write failed, so a
+        retry with a fresh idempotency key would otherwise pay for a second
+        provider call. Only decisions that authoritatively belong to this trade
+        (same position, symbol, and environment) are candidates; malformed ones
+        are skipped. The newest decision is considered first, and the envelope
+        (not the stored column) is authoritative.
+        """
+        for decision in reversed(self._store.list_decisions(role=LLMRole.REVIEW.value)):
+            envelope = _decode_payload(
+                decision.payload_json, subject=f"decision {decision.decision_id}"
+            )
+            if envelope is None:
+                continue
+            if (
+                envelope.get("role") != LLMRole.REVIEW.value
+                or envelope.get("decision_type") != "REVIEW"
+            ):
+                continue
+            if (
+                validated_validation_status(envelope.get("validation_status"))
+                not in VALID_REVIEW_STATUSES
+            ):
+                continue
+            subject = envelope.get("subject")
+            if not isinstance(subject, dict):
+                continue
+            if (
+                subject.get("position_id") != record.position_id
+                or subject.get("symbol") != record.symbol
+                or subject.get("environment") != record.environment
+            ):
+                continue
+            result = self._result_from_decision(
+                trade_id, decision.decision_id, idempotent_replay=True, link=True
+            )
+            if result.status == "FOUND":
+                _LOGGER.warning(
+                    "review_orphan_adopted",
+                    trade_id=trade_id,
+                    decision_id=decision.decision_id,
+                )
+                return result
+        return None
+
+    def _partial_result(
         self,
         trade_id: str,
         decision_id: str,
         *,
         idempotent_replay: bool,
-        link: bool = False,
+        validation_status: str | None,
+        reason: str,
     ) -> ReviewResult:
+        return ReviewResult(
+            trade_id=trade_id,
+            decision_id=decision_id,
+            validation_status=validation_status,
+            idempotent_replay=idempotent_replay,
+            status="PARTIAL",
+            reason=reason,
+        )
+
+    def _raise_replay_rejection(self, envelope: dict[str, Any]) -> NoReturn:
+        # A tampered ``validation_errors`` value may be any JSON type; only a
+        # list can be indexed. Never let it reach the response as a 500.
+        errors = envelope.get("validation_errors")
+        if not isinstance(errors, list):
+            errors = []
+        first = errors[0] if errors else {}
+        first_code = first.get("code") if isinstance(first, dict) else None
+        # The stored reason/field are untrusted text: only a safe string may be
+        # echoed; otherwise use the code-owned fallback and drop the field.
+        reason = (
+            safe_identifier(envelope.get("rejected_reason")) or "the review decision was rejected"
+        )
+        field = safe_identifier(first.get("field")) if isinstance(first, dict) else None
+        raise ReviewRejected(
+            _llm_error_code(str(first_code or "")),
+            reason,
+            field=field,
+            retryable=False,
+        )
+
+    def _load_review_envelope(self, decision_id: str) -> tuple[DecisionRecord, dict[str, Any]]:
         decision = self._store.get_decision(decision_id)
         if decision is None:
             raise ReviewRejected(
@@ -500,44 +592,149 @@ class ReviewService:
             raise ReviewRejected(
                 "DATA_UNAVAILABLE", f"the review decision {decision_id} is unreadable"
             )
-        if decision.validation_status not in _VALID_REVIEW_STATUSES:
-            errors = envelope.get("validation_errors") or []
-            first = errors[0] if errors else {}
-            first_code = first.get("code") if isinstance(first, dict) else None
-            raise ReviewRejected(
-                _llm_error_code(str(first_code or "")),
-                str(envelope.get("rejected_reason") or "the review decision was rejected"),
-                field=first.get("field") if isinstance(first, dict) else None,
-                retryable=False,
-            )
         if (
             envelope.get("role") != LLMRole.REVIEW.value
             or envelope.get("decision_type") != "REVIEW"
         ):
             raise ReviewRejected("DATA_UNAVAILABLE", f"the decision {decision_id} is not a REVIEW")
+        return decision, envelope
+
+    def _stored_status_or_partial(
+        self,
+        trade_id: str,
+        decision_id: str,
+        envelope: dict[str, Any],
+        *,
+        idempotent_replay: bool,
+    ) -> str | ReviewResult:
+        """The accepted status, or the named PARTIAL for a non-FOUND envelope."""
+        # The persisted envelope is authoritative: the DB column may be a stale
+        # copy, so POST replay and GET must classify the same stored bytes.
+        validation_status = validated_validation_status(envelope.get("validation_status"))
+        if validation_status is None:
+            return self._partial_result(
+                trade_id,
+                decision_id,
+                idempotent_replay=idempotent_replay,
+                validation_status=None,
+                reason="the stored review has an unrecognized validation status",
+            )
+        if validation_status == "REJECTED":
+            self._raise_replay_rejection(envelope)
+        if validation_status not in VALID_REVIEW_STATUSES:
+            return self._partial_result(
+                trade_id,
+                decision_id,
+                idempotent_replay=idempotent_replay,
+                validation_status=validation_status,
+                reason="the linked review was rejected; no advisory text is available",
+            )
+        return validation_status
+
+    def _result_from_decision(
+        self,
+        trade_id: str,
+        decision_id: str,
+        *,
+        idempotent_replay: bool,
+        link: bool = False,
+    ) -> ReviewResult:
+        decision, envelope = self._load_review_envelope(decision_id)
+        status_or_partial = self._stored_status_or_partial(
+            trade_id, decision_id, envelope, idempotent_replay=idempotent_replay
+        )
+        if isinstance(status_or_partial, ReviewResult):
+            return status_or_partial
         fields = validated_review_fields(envelope)
         if fields is None:
             # A tampered stored row must never reach the response model as a
             # 500; report a named PARTIAL with no advisory text instead.
-            return ReviewResult(
-                trade_id=trade_id,
-                decision_id=decision_id,
-                validation_status=str(decision.validation_status),
+            return self._partial_result(
+                trade_id,
+                decision_id,
                 idempotent_replay=idempotent_replay,
-                status="PARTIAL",
+                validation_status=status_or_partial,
                 reason="the stored review fields are malformed",
             )
         if link:
             self._link(trade_id, decision_id)
+        # The decision, link, and audit are three independent writes. If the
+        # audit failed after the link committed, a replay repairs it here; a
+        # genuine audit failure still propagates.
+        self._ensure_generated_audit(
+            trade_id,
+            decision_id,
+            status_or_partial,
+            fields["provenance"],
+            decision.persisted_at,
+        )
         return ReviewResult(
             trade_id=trade_id,
             decision_id=decision_id,
             rationale=fields["rationale"],
             caveats=fields["caveats"],
             confidence=fields["confidence"],
-            validation_status=str(decision.validation_status),
+            validation_status=status_or_partial,
             provenance=fields["provenance"],
             idempotent_replay=idempotent_replay,
+        )
+
+    def _ensure_generated_audit(
+        self,
+        trade_id: str,
+        decision_id: str,
+        validation_status: str,
+        provenance: dict[str, Any],
+        now: str,
+    ) -> None:
+        """Emit the missing ``REVIEW_GENERATED`` audit for a persisted decision."""
+        for event in self._store.list_audit_events_ascending(limit=None):
+            if event.event_type != "REVIEW_GENERATED":
+                continue
+            try:
+                body = json.loads(event.payload_json)
+            except (json.JSONDecodeError, TypeError, ValueError) as exc:
+                # An unreadable existing event means the chain cannot be
+                # verified. Appending a new event would silently duplicate the
+                # audit, so fail closed instead (the payload body is not logged).
+                _LOGGER.error(
+                    "review_audit_event_unreadable",
+                    seq=event.seq,
+                    event_id=event.event_id,
+                    error_type=type(exc).__name__,
+                )
+                raise ReviewRejected(
+                    "DATA_UNAVAILABLE",
+                    "the audit chain contains an unreadable event; "
+                    "the review audit cannot be verified",
+                ) from exc
+            payload = body.get("payload") if isinstance(body, dict) else None
+            if not isinstance(body, dict) or not isinstance(payload, dict):
+                # A parseable but non-object body (or non-dict payload) cannot
+                # be the code-written shape. Treat it like an unreadable event:
+                # appending another event would silently duplicate the audit.
+                self._raise_unreadable_audit(event)
+            if payload.get("decision_id") == decision_id:
+                return
+        self._audit_generated(
+            trade_id=trade_id,
+            decision_id=decision_id,
+            validation_status=validation_status,
+            provenance=provenance,
+            now=now,
+        )
+
+    def _raise_unreadable_audit(self, event: Any) -> NoReturn:
+        """Log and fail closed on an existing event whose body is not an object."""
+        # Only the identity is logged: the body is untrusted and unreadable.
+        _LOGGER.error(
+            "review_audit_event_unreadable",
+            seq=event.seq,
+            event_id=event.event_id,
+        )
+        raise ReviewRejected(
+            "DATA_UNAVAILABLE",
+            "the audit chain contains an unreadable event; the review audit cannot be verified",
         )
 
     # -- context and prompt ---------------------------------------------
@@ -546,12 +743,12 @@ class ReviewService:
         """Resolve the report/scan timeframe exactly once for prompt and subject."""
         raw_signal = payload.get("signal")
         signal: dict[str, Any] = raw_signal if isinstance(raw_signal, dict) else {}
-        trigger_id = signal.get("trigger_id")
-        scan_id = signal.get("scan_id") if isinstance(signal.get("scan_id"), str) else None
-        report_id = signal.get("report_id") if isinstance(signal.get("report_id"), str) else None
-        opportunity_id = (
-            signal.get("opportunity_id") if isinstance(signal.get("opportunity_id"), str) else None
-        )
+        # A tampered non-string or non-UTF-8 id must not reach the store's SQL
+        # bind; ignore it and fall back to the report/scan ids alongside it.
+        trigger_id = safe_identifier(signal.get("trigger_id"))
+        scan_id = safe_identifier(signal.get("scan_id"))
+        report_id = safe_identifier(signal.get("report_id"))
+        opportunity_id = safe_identifier(signal.get("opportunity_id"))
         trigger = self._store.get_trigger_event(trigger_id) if trigger_id else None
         if trigger is not None:
             opportunity_id = trigger.opportunity_id
@@ -566,10 +763,12 @@ class ReviewService:
                     else None
                 )
                 source: dict[str, Any] = raw_source if isinstance(raw_source, dict) else {}
-                if isinstance(source.get("scan_id"), str):
-                    scan_id = source["scan_id"]
-                if isinstance(source.get("report_id"), str):
-                    report_id = source["report_id"]
+                source_scan_id = safe_identifier(source.get("scan_id"))
+                if source_scan_id is not None:
+                    scan_id = source_scan_id
+                source_report_id = safe_identifier(source.get("report_id"))
+                if source_report_id is not None:
+                    report_id = source_report_id
         timeframe: str | None = None
         if report_id:
             report = self._store.get_report(report_id)
@@ -584,33 +783,57 @@ class ReviewService:
                 "DATA_UNAVAILABLE",
                 "the trade has no source report timeframe for the review prompt",
             )
+        assert timeframe is not None
         return _SourceContext(
             timeframe=timeframe,
             scan_id=scan_id,
             report_id=report_id,
             opportunity_id=opportunity_id,
-            trigger_id=trigger_id if isinstance(trigger_id, str) else None,
+            trigger_id=trigger_id,
         )
 
     def _review_context(self, record: TradeLogRecord, payload: dict[str, Any]) -> dict[str, Any]:
-        """Build the prompt's delimited DATA block from persisted records only."""
+        """Build the prompt's delimited DATA block from persisted records only.
+
+        The review fails closed when one of its untrusted inputs is missing or
+        unreadable: a review rendered from absent position/fill data would be
+        persisted and linked as VALID while silently omitting the evidence it
+        claims to assess.
+        """
         trade_view = {field: payload.get(field) for field in _TRADE_FIELDS}
         position_record = self._store.get_position(record.position_id)
-        position_payload = (
-            _decode_payload(position_record.payload_json, subject=f"position {record.position_id}")
-            if position_record is not None
-            else None
+        if position_record is None:
+            _LOGGER.warning("review_position_missing", position_id=record.position_id)
+            raise ReviewRejected(
+                "DATA_UNAVAILABLE",
+                f"the position {record.position_id} for the trade is missing",
+            )
+        position_payload = _decode_payload(
+            position_record.payload_json, subject=f"position {record.position_id}"
         )
-        history = (
-            position_payload.get("management_history")
-            if isinstance(position_payload, dict)
-            else None
-        )
+        if position_payload is None:
+            _LOGGER.warning("review_position_unreadable", position_id=record.position_id)
+            raise ReviewRejected(
+                "DATA_UNAVAILABLE",
+                f"the position {record.position_id} payload is unreadable",
+            )
+        history = position_payload.get("management_history")
         fill_payload: dict[str, Any] | None = None
         if record.order_id:
             fill = self._store.get_fill_by_order_id(record.order_id)
-            if fill is not None:
-                fill_payload = _decode_payload(fill.payload_json, subject=f"fill {fill.fill_id}")
+            if fill is None:
+                _LOGGER.warning("review_fill_missing", order_id=record.order_id)
+                raise ReviewRejected(
+                    "DATA_UNAVAILABLE",
+                    f"the fill for order {record.order_id} is missing",
+                )
+            fill_payload = _decode_payload(fill.payload_json, subject=f"fill {fill.fill_id}")
+            if fill_payload is None:
+                _LOGGER.warning("review_fill_unreadable", fill_id=fill.fill_id)
+                raise ReviewRejected(
+                    "DATA_UNAVAILABLE",
+                    f"the fill {fill.fill_id} payload is unreadable",
+                )
         return {
             "trade": trade_view,
             "fill": fill_payload,
@@ -691,31 +914,24 @@ class ReviewService:
         knowledge: KnowledgeInjection,
     ) -> dict[str, Any]:
         amount_usd, price_version, unpriced = total_cost(budgets)
-        return {
-            "provider": result.provider,
-            "model": result.model,
-            "model_snapshot": None,
-            "prompt_id": rendered.prompt_id,
-            "prompt_version": rendered.version,
-            "prompt_hash": rendered.prompt_hash,
-            "knowledge_artifact_hash": knowledge.artifact_id,
-            "knowledge_status": knowledge.status,
-            "knowledge_reason": knowledge.reason,
-            "input_hash": input_hash,
-            "schema_version": "1.0.0",
-            "temperature": 0.0,
-            "seed": None,
-            "request_id": sanitize_provider_id(result.request_id, self._secrets),
-            "latency_ms": result.latency_ms,
-            "usage": total_usage(calls),
-            "cost": {
-                "amount_usd": amount_usd,
-                "currency": "USD",
-                "price_version": price_version,
-                "unpriced": unpriced,
-            },
-            "recorded_at": now,
-        }
+        return decision_provenance(
+            provider=result.provider,
+            model=result.model,
+            prompt_id=rendered.prompt_id,
+            prompt_version=rendered.version,
+            prompt_hash=rendered.prompt_hash,
+            knowledge_artifact_hash=knowledge.artifact_id,
+            knowledge_status=knowledge.status,
+            knowledge_reason=knowledge.reason,
+            input_hash=input_hash,
+            request_id=sanitize_provider_id(result.request_id, self._secrets),
+            latency_ms=result.latency_ms,
+            usage=total_usage(calls),
+            amount_usd=amount_usd,
+            price_version=price_version,
+            unpriced=unpriced,
+            recorded_at=now,
+        )
 
     # -- persistence -----------------------------------------------------
 
@@ -727,16 +943,15 @@ class ReviewService:
         envelope: dict[str, Any],
         now: str,
     ) -> None:
-        self._store.save_decision(
-            DecisionRecord(
-                decision_id=decision_id,
-                role=LLMRole.REVIEW.value,
-                decision_type="REVIEW",
-                validation_status=validation_status,
-                raw_output_hash=raw_output_hash,
-                persisted_at=now,
-                payload_json=json.dumps(envelope, sort_keys=True, allow_nan=False),
-            )
+        save_llm_decision(
+            self._store,
+            decision_id=decision_id,
+            role=LLMRole.REVIEW.value,
+            decision_type="REVIEW",
+            validation_status=validation_status,
+            raw_output_hash=raw_output_hash,
+            envelope=envelope,
+            now=now,
         )
 
     def _link(self, trade_id: str, decision_id: str) -> None:
@@ -780,28 +995,15 @@ class ReviewService:
         )
 
     def _provider_name(self, requested: str | None) -> str:
-        value = (requested or "").strip().lower()
-        if self._provider is None:
-            raise ReviewRejected(
-                "LLM_PROVIDER_NOT_CONFIGURED",
-                "No LLM provider is configured; the review cannot run.",
+        try:
+            return resolve_provider_name(
+                self._provider,
+                self._settings,
+                requested,
+                role_label="review",
             )
-        name = value or str(getattr(self._provider, "provider", "") or "")
-        if not name:
-            capabilities = getattr(self._provider, "capabilities", None)
-            if callable(capabilities):
-                name = str(getattr(capabilities(), "provider", "") or "")
-        if requested and name != requested.strip().lower():
-            raise ReviewRejected(
-                "LLM_PROVIDER_NOT_CONFIGURED",
-                f"No {requested} provider is configured for the review role.",
-            )
-        if not provider_configured(self._settings, name):
-            raise ReviewRejected(
-                "LLM_PROVIDER_NOT_CONFIGURED",
-                f"No {name or 'LLM'} API key is configured; the review cannot run.",
-            )
-        return name
+        except ProviderSelectionError as exc:
+            raise ReviewRejected(exc.code, exc.message) from exc
 
 
 __all__ = [

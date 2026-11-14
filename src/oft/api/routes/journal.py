@@ -1,4 +1,4 @@
-"""Read the closed-trade journal (minimal list projection, full show)."""
+"""Closed-trade journal API: read endpoints plus the mutating advisory review POST."""
 
 from __future__ import annotations
 
@@ -204,7 +204,7 @@ def review_trade(
         result.to_contract(),
         request_id=new_request_id(),
         provenance="MIXED",
-        data_quality="COMPLETE",
+        data_quality=_REVIEW_QUALITY[result.status],
         idempotent_replay=result.idempotent_replay,
     )
     complete(request, key=key, request_hash=payload_hash, envelope=envelope, status=200)

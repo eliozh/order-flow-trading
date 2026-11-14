@@ -112,6 +112,9 @@ def test_schema_failure_is_repaired_once_with_attempt_two(tmp_path: Path) -> Non
     # The repair prompt carries the validator error and the schema, never a key.
     assert "failed validation" in provider.requests[1].user_prompt
     assert "pattern" in provider.requests[1].user_prompt
+    # The FIRST validator error from invalid_schema.json is carried verbatim, not
+    # just a generic message.
+    assert "'subject' is a required property" in provider.requests[1].user_prompt
 
 
 def test_a_second_schema_failure_is_rejected_and_audited(tmp_path: Path) -> None:

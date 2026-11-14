@@ -10,7 +10,7 @@ from typer.testing import CliRunner
 
 from oft.cli.api_client import ApiClientError
 from oft.cli.commands import log as log_module
-from oft.cli.commands.log import ADVISORY_LABEL, _render_review
+from oft.cli.commands.log import _REVIEW_TIMEOUT_SECONDS, ADVISORY_LABEL, _render_review
 from oft.cli.main import app as cli_app
 from oft.config import Settings
 
@@ -57,8 +57,13 @@ def test_cli_surfaces_an_api_error_and_exits_nonzero(
     settings = Settings(env="test", port=8765, data_dir=tmp_path / "data")
 
     class _FailingClient:
+        timeouts: list[float | None] = []
+
         @classmethod
-        def from_settings(cls, _settings: Settings) -> _FailingClient:
+        def from_settings(
+            cls, _settings: Settings, *, timeout: float | None = 2.0
+        ) -> _FailingClient:
+            cls.timeouts.append(timeout)
             return cls()
 
         def journal_review(self, *_args: Any, **_kwargs: Any) -> dict[str, Any]:
@@ -71,3 +76,8 @@ def test_cli_surfaces_an_api_error_and_exits_nonzero(
 
     assert result.exit_code != 0
     assert "the model refused to review" in result.output
+    # A review may block on the provider for up to two 120 s calls plus a
+    # repair/backoff; the CLI must use its finite review deadline, never the
+    # 2 s default socket timeout (H2).
+    assert _REVIEW_TIMEOUT_SECONDS == 1200.0
+    assert _FailingClient.timeouts == [_REVIEW_TIMEOUT_SECONDS]
