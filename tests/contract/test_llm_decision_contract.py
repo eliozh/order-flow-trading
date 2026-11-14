@@ -24,6 +24,8 @@ def test_valid_llm_fixtures_validate_against_the_provider_schema() -> None:
         "entry_recheck_stopless.json",
         "entry_recheck_oversized.json",
         "entry_recheck_far_mark.json",
+        # The advisory REVIEW output validates through the same provider schema.
+        "review_valid.json",
     ):
         document = json.loads((_helpers.LLM_FIXTURES / name).read_text(encoding="utf-8"))
         errors = list(validator.iter_errors(document))

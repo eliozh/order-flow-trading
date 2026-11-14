@@ -216,6 +216,122 @@ def _stale_jobs_check(store: StorePort, clock: ClockPort) -> CheckResult:
     return CheckResult("jobs.stale", "ok", "no stale RUNNING job runs")
 
 
+def _management_jobs_check(store: StorePort, clock: ClockPort) -> CheckResult:
+    """Report the latest ``position_manage`` run from the read-only job ledger.
+
+    The job type is imported lazily so the health module keeps its small
+    dependency surface. Only the status, window, and error code are rendered;
+    a persisted message is never echoed (it may quote provider text).
+    """
+    from oft.application.jobs import POSITION_MANAGE_JOB_TYPE
+
+    try:
+        latest = store.latest_job_run(POSITION_MANAGE_JOB_TYPE)
+    except Exception as exc:
+        return CheckResult(
+            "jobs.management", "degraded", f"management job ledger unreadable ({exc})"
+        )
+    if latest is None:
+        return CheckResult("jobs.management", "ok", "no management job run recorded yet")
+    status = str(latest.status)
+    window = str(latest.window_start)
+    error_code = str(latest.error_code) if latest.error_code else ""
+    if status == "FAILED":
+        suffix = f" ({error_code})" if error_code else ""
+        return CheckResult(
+            "jobs.management", "degraded", f"last management run FAILED for window {window}{suffix}"
+        )
+    if status == "RUNNING":
+        now = clock.now()
+        try:
+            lease_expires = datetime.fromisoformat(
+                str(latest.lease_expires_at).replace("Z", "+00:00")
+            )
+            expired = lease_expires < now.astimezone(UTC)
+        except (TypeError, ValueError, OverflowError):
+            expired = True
+        if expired:
+            return CheckResult(
+                "jobs.management",
+                "degraded",
+                f"management run for window {window} is RUNNING with an expired lease",
+            )
+        return CheckResult(
+            "jobs.management", "ok", f"management run for window {window} is RUNNING"
+        )
+    return CheckResult("jobs.management", "ok", f"last management run {status} for window {window}")
+
+
+def _funding_idempotency_check(store: StorePort) -> CheckResult:
+    """Verify recorded funding accruals are unique and plausible.
+
+    ``(position_id, settlement_time)`` is the idempotency key, so a duplicate
+    settlement time for one position is a real double-accrual risk. Amount,
+    mark, and size are re-parsed from the persisted rows; a non-finite or
+    implausible value is a degraded read, never a silently accepted zero.
+
+    Only OPEN positions are scanned, so the check is bounded by positions that
+    can still accrue funding. Closed-position accruals are immutable history and
+    cannot be double-settled; a read-only store aggregate over that history is a
+    follow-up (the store port exposes no funding query).
+    """
+    from decimal import Decimal, InvalidOperation
+
+    from oft.domain.pnl import MAX_ABS_MONEY, MAX_ABS_PRICE, MAX_ABS_QUANTITY
+
+    try:
+        positions = store.list_positions(state="OPEN", limit=None)
+    except Exception as exc:
+        return CheckResult("funding.idempotency", "degraded", f"position ledger unreadable ({exc})")
+    checked = 0
+    duplicates = 0
+    invalid = 0
+    for position in positions:
+        try:
+            accruals = store.list_funding_accruals(position.position_id)
+        except Exception as exc:
+            return CheckResult(
+                "funding.idempotency", "degraded", f"funding accruals unreadable ({exc})"
+            )
+        seen: set[str] = set()
+        for accrual in accruals:
+            checked += 1
+            settlement = str(accrual.settlement_time)
+            if settlement in seen:
+                duplicates += 1
+            else:
+                seen.add(settlement)
+            try:
+                amount = Decimal(str(accrual.amount_usd))
+                mark = Decimal(str(accrual.mark_price))
+                size = Decimal(str(accrual.size))
+            except (InvalidOperation, TypeError, ValueError):
+                invalid += 1
+                continue
+            plausible = (
+                amount.is_finite()
+                and abs(amount) <= MAX_ABS_MONEY
+                and mark.is_finite()
+                and 0 < mark <= MAX_ABS_PRICE
+                and size.is_finite()
+                and 0 <= size <= MAX_ABS_QUANTITY
+            )
+            if not plausible:
+                invalid += 1
+    if duplicates or invalid:
+        return CheckResult(
+            "funding.idempotency",
+            "degraded",
+            f"{duplicates} duplicate settlement(s), {invalid} invalid amount(s) "
+            f"across {checked} funding accrual(s)",
+        )
+    return CheckResult(
+        "funding.idempotency",
+        "ok",
+        f"{checked} funding accrual(s) unique and plausible",
+    )
+
+
 def _audit_chain_check(store: StorePort) -> CheckResult:
     """Re-derive the append-only hash chain and report the first broken link."""
     from oft.application.kill_switch import verify_audit_chain
@@ -430,6 +546,8 @@ def build_doctor(
         _disk_check(settings),
         _manifest_orphans_check(settings, store),
         _stale_jobs_check(store, clock),
+        _management_jobs_check(store, clock),
+        _funding_idempotency_check(store),
         _audit_chain_check(store),
         _provider_check(settings),
         _budget_ledger_check(store),

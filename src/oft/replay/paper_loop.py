@@ -37,6 +37,11 @@ from oft.replay.harness import (
     ReplayNonDeterministicError,
     write_atomic,
 )
+from oft.replay.support import (
+    PINNED_OUTCOME_SETTINGS,
+    pinned_fixture_paths,
+    reject_symlink_components,
+)
 
 if TYPE_CHECKING:
     from oft.application.scan_service import ScanRun
@@ -57,45 +62,6 @@ _RUN_ID_RULE = (
 )
 _ATTEMPT_1 = "attempt-1"
 _ATTEMPT_2 = "attempt-2"
-
-# Every setting that can change a fill, fee, account balance, or risk verdict is
-# pinned here. ``Settings`` is a ``BaseSettings`` model, so an ambient
-# ``OFT_PAPER_*``/``OFT_RISK_*`` value would otherwise leak into a replay on a
-# different machine and surface only as a generic non-determinism error.
-_PINNED_OUTCOME_SETTINGS: dict[str, Any] = {
-    "paper_initial_balance": "10000.00",
-    "paper_slippage_bps": "2",
-    "paper_taker_fee_bps": "5",
-    "risk_per_trade_pct": 0.8,
-    "risk_max_concurrent_positions": 3,
-    "risk_daily_loss_pct": 3.0,
-    "risk_max_leverage": 5.0,
-    "risk_max_notional_pct": 20.0,
-    "risk_max_slippage_bps": 25.0,
-    "risk_max_spread_bps": 15.0,
-    "risk_stale_mark_seconds": 60,
-}
-
-
-def _pinned_fixture_paths() -> dict[str, Path]:
-    """The committed fixtures that seed sizing/risk and data-quality outcomes.
-
-    The exchange-info fixture seeds the symbol registry (tick/step/min-notional
-    drive entry sizing and the risk gate); the klines fixture changes the
-    cross-check ``quality_reasons`` and therefore ``data_quality``. Pinning them
-    explicitly keeps an ambient ``OFT_*_FIXTURE`` value from changing a replay.
-    """
-    from oft.config import (
-        DEFAULT_EXCHANGE_INFO_FIXTURE,
-        DEFAULT_FIXTURES_DIR,
-        DEFAULT_KLINES_FIXTURE,
-    )
-
-    return {
-        "fixtures_dir": DEFAULT_FIXTURES_DIR,
-        "klines_fixture": DEFAULT_KLINES_FIXTURE,
-        "exchange_info_fixture": DEFAULT_EXCHANGE_INFO_FIXTURE,
-    }
 
 
 def _fixture_content_digest(path: Path) -> str:
@@ -147,17 +113,6 @@ def validate_run_id(run_id: str) -> str:
     if _RUN_ID_PATTERN.fullmatch(run_id) is None:
         raise ReplayError(_RUN_ID_RULE)
     return run_id
-
-
-def _reject_symlink_components(path: Path, *, stop: Path) -> None:
-    """Refuse a symlinked path component between ``path`` and ``stop`` (lstat)."""
-    current = path
-    while True:
-        if current.is_symlink():
-            raise ReplayError(f"replay path component is a symlink: {current}")
-        if current == stop or current.parent == current:
-            return
-        current = current.parent
 
 
 @dataclass(frozen=True)
@@ -347,7 +302,7 @@ class PaperLoopReplay:
         self._replay_root = self._data_dir / REPLAY_NAMESPACE
         self._paper_loop_root = self._replay_root / PAPER_LOOP_NAMESPACE
         self._run_root = self._paper_loop_root / config.run_id
-        _reject_symlink_components(self._run_root, stop=self._replay_root)
+        reject_symlink_components(self._run_root, stop=self._replay_root)
         if not self._run_root.resolve().is_relative_to(self._paper_loop_root.resolve()):
             raise ReplayError(
                 f"replay run {config.run_id!r} escapes {self._paper_loop_root}; pass a plain run id"
@@ -375,10 +330,10 @@ class PaperLoopReplay:
         # Pin the fixtures that feed sizing, risk, and data quality explicitly:
         # an ambient OFT_FIXTURES_DIR/OFT_KLINES_FIXTURE/OFT_EXCHANGE_INFO_FIXTURE
         # would otherwise change the outcome on another machine.
-        values.update(_pinned_fixture_paths())
+        values.update(pinned_fixture_paths())
         # Explicit values win over ambient environment variables, so a replay on
         # another machine cannot silently change fills, fees, balance, or caps.
-        values.update(_PINNED_OUTCOME_SETTINGS)
+        values.update(PINNED_OUTCOME_SETTINGS)
         if self._config.live_llm:
             # Honour the configured provider (explicit --provider wins), never
             # default to a live provider when none is named.
@@ -405,12 +360,11 @@ class PaperLoopReplay:
                 self._config.llm_fixtures_dir or DEFAULT_LLM_FIXTURES_DIR
             ),
             "pinned_fixtures": {
-                name: _fixture_content_digest(path)
-                for name, path in _pinned_fixture_paths().items()
+                name: _fixture_content_digest(path) for name, path in pinned_fixture_paths().items()
             },
             "llm_model": "fixture",
             "provider": self._config.provider if self._config.live_llm else "stub",
-            "pinned": _PINNED_OUTCOME_SETTINGS,
+            "pinned": PINNED_OUTCOME_SETTINGS,
         }
         return hashlib.sha256(_canonical_json(payload).encode("utf-8")).hexdigest()
 
@@ -454,7 +408,7 @@ class PaperLoopReplay:
     def _attempt_dir(self, attempt: str) -> Path:
         """Resolve one attempt directory and prove it stays in the namespace."""
         raw = self.run_root / attempt
-        _reject_symlink_components(raw, stop=self.run_root)
+        reject_symlink_components(raw, stop=self.run_root)
         resolved = raw.resolve()
         if not resolved.is_relative_to(self._paper_loop_root.resolve()):
             raise ReplayError(f"replay {attempt} escaped the replay namespace")
@@ -578,7 +532,7 @@ class PaperLoopReplay:
         An existing run root fails closed before any write: replay never
         deletes, resets, or overwrites a previous run. Pass a new ``--run-id``.
         """
-        _reject_symlink_components(self._run_root, stop=self._replay_root)
+        reject_symlink_components(self._run_root, stop=self._replay_root)
         if self._run_root.exists():
             raise ReplayError(
                 f"run '{self._config.run_id}' already exists at {self._run_root}; "

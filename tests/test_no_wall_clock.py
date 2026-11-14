@@ -36,12 +36,23 @@ REQUIRED_DETERMINISTIC_MODULES = (
     "domain/risk.py",
     "domain/trigger.py",
     "domain/oms.py",
+    "domain/pnl.py",
+    "domain/positions.py",
+    "domain/management.py",
+    "domain/journal.py",
     "application/entry_service.py",
     "application/execution_gateway.py",
     "application/paper_broker.py",
     "application/budget_ledger.py",
+    "application/position_service.py",
+    "application/management_service.py",
+    "application/management_add.py",
+    "application/journal_service.py",
+    "application/review_service.py",
     "replay/harness.py",
     "replay/llm_source.py",
+    "replay/paper_loop.py",
+    "replay/position_management.py",
 )
 NOW = datetime(2026, 11, 6, 12, 0, 0, tzinfo=UTC)
 
@@ -262,6 +273,8 @@ def test_doctor_reports_every_required_section(tmp_path: Path) -> None:
         "clock",
         "manifest.orphans",
         "jobs.stale",
+        "jobs.management",
+        "funding.idempotency",
         "audit.chain",
         "config.provider",
         "budget.ledger",
@@ -273,6 +286,8 @@ def test_doctor_reports_every_required_section(tmp_path: Path) -> None:
     assert checks["clock"].status == "ok"
     assert checks["manifest.orphans"].status == "ok"
     assert checks["jobs.stale"].status == "ok"
+    assert checks["jobs.management"].status == "ok"
+    assert checks["funding.idempotency"].status == "ok"
     assert checks["audit.chain"].status == "ok"
     assert "AUDIT_CHAIN_OK" in checks["audit.chain"].detail
     assert checks["config.provider"].status == "ok"
@@ -362,6 +377,8 @@ def test_cli_doctor_never_echoes_secrets(tmp_path: Path, monkeypatch: pytest.Mon
         "clock",
         "manifest.orphans",
         "jobs.stale",
+        "jobs.management",
+        "funding.idempotency",
         "audit.chain",
     } <= names
 
@@ -601,6 +618,295 @@ def test_doctor_reports_an_unreadable_budget_ledger(tmp_path: Path) -> None:
             raise RuntimeError("ledger is corrupt")
 
     check = _budget_ledger_check(BrokenStore())  # type: ignore[arg-type]
+
+    assert check.status == "degraded"
+    assert "unreadable" in check.detail
+
+
+# -- slice 31 doctor extensions --------------------------------------------
+
+
+def _job_run(
+    *,
+    job_type: str,
+    status: str,
+    window_start: str = "2026-11-06T12:00:00.000Z",
+    lease_expires_in: timedelta = timedelta(minutes=5),
+    error_code: str | None = None,
+    message: str | None = None,
+) -> JobRunRecord:
+    started = utc_timestamp(NOW - timedelta(minutes=1))
+    return JobRunRecord(
+        run_id=f"JOB-{job_type.upper()}-{status}",
+        job_type=job_type,
+        window_start=window_start,
+        status=status,
+        trigger_source="SCHEDULED",
+        started_at=started,
+        finished_at=None if status == "RUNNING" else utc_timestamp(NOW),
+        error_code=error_code,
+        message=message,
+        lease_owner="test-owner",
+        lease_expires_at=utc_timestamp(NOW + lease_expires_in),
+        heartbeat_at=started,
+    )
+
+
+def test_management_job_check_reports_no_run_yet(tmp_path: Path) -> None:
+    from oft.application.health import _management_jobs_check
+
+    settings = _settings(tmp_path)
+    store = SqliteStore(settings)
+    store.initialize()
+
+    check = _management_jobs_check(store, FixedClock(NOW))
+
+    assert check.status == "ok"
+    assert "no management job run" in check.detail
+
+
+def test_management_job_check_reads_the_position_manage_ledger(tmp_path: Path) -> None:
+    from oft.application.health import _management_jobs_check
+    from oft.application.jobs import POSITION_MANAGE_JOB_TYPE
+
+    settings = _settings(tmp_path)
+    store = SqliteStore(settings)
+    store.initialize()
+    claimed, _, _ = store.claim_job_run(_job_run(job_type=POSITION_MANAGE_JOB_TYPE, status="DONE"))
+    assert claimed
+
+    check = _management_jobs_check(store, FixedClock(NOW))
+
+    assert check.status == "ok"
+    assert "DONE" in check.detail
+
+
+def test_management_job_check_flags_a_failed_run_without_echoing_its_message(
+    tmp_path: Path,
+) -> None:
+    from oft.application.health import _management_jobs_check
+    from oft.application.jobs import POSITION_MANAGE_JOB_TYPE
+
+    settings = _settings(tmp_path)
+    store = SqliteStore(settings)
+    store.initialize()
+    secret_message = "provider key sk-live-should-not-echo"
+    claimed, _, _ = store.claim_job_run(
+        _job_run(
+            job_type=POSITION_MANAGE_JOB_TYPE,
+            status="FAILED",
+            error_code="LLM_PROVIDER_ERROR",
+            message=secret_message,
+        )
+    )
+    assert claimed
+
+    check = _management_jobs_check(store, FixedClock(NOW))
+
+    assert check.status == "degraded"
+    assert "FAILED" in check.detail
+    assert "LLM_PROVIDER_ERROR" in check.detail
+    assert secret_message not in check.detail
+
+
+def test_management_job_check_flags_an_expired_running_lease(tmp_path: Path) -> None:
+    from oft.application.health import _management_jobs_check
+    from oft.application.jobs import POSITION_MANAGE_JOB_TYPE
+
+    settings = _settings(tmp_path)
+    store = SqliteStore(settings)
+    store.initialize()
+    claimed, _, _ = store.claim_job_run(
+        _job_run(
+            job_type=POSITION_MANAGE_JOB_TYPE,
+            status="RUNNING",
+            lease_expires_in=timedelta(minutes=-5),
+        )
+    )
+    assert claimed
+
+    check = _management_jobs_check(store, FixedClock(NOW))
+
+    assert check.status == "degraded"
+    assert "expired lease" in check.detail
+
+
+def test_management_job_check_accepts_a_fresh_running_lease(tmp_path: Path) -> None:
+    from oft.application.health import _management_jobs_check
+    from oft.application.jobs import POSITION_MANAGE_JOB_TYPE
+
+    settings = _settings(tmp_path)
+    store = SqliteStore(settings)
+    store.initialize()
+    claimed, _, _ = store.claim_job_run(
+        _job_run(job_type=POSITION_MANAGE_JOB_TYPE, status="RUNNING")
+    )
+    assert claimed
+
+    check = _management_jobs_check(store, FixedClock(NOW))
+
+    assert check.status == "ok"
+    assert "RUNNING" in check.detail
+
+
+def _accrual(
+    settlement_time: str = "2026-11-06T18:00:00.000Z",
+    *,
+    amount_usd: str = "-0.07",
+    mark_price: str = "70100",
+    size: str = "0.01",
+) -> Any:
+    from types import SimpleNamespace
+
+    return SimpleNamespace(
+        settlement_time=settlement_time,
+        amount_usd=amount_usd,
+        mark_price=mark_price,
+        size=size,
+    )
+
+
+class _FundingStore:
+    def __init__(
+        self,
+        accruals: dict[str, tuple[Any, ...]],
+        *,
+        states: dict[str, str] | None = None,
+    ) -> None:
+        self._accruals = accruals
+        self._states = states or {position_id: "OPEN" for position_id in accruals}
+        self.requested_states: list[str | None] = []
+
+    def list_positions(
+        self, *, state: str | None = None, limit: int | None = 100
+    ) -> tuple[Any, ...]:
+        from types import SimpleNamespace
+
+        self.requested_states.append(state)
+        return tuple(
+            SimpleNamespace(position_id=position_id)
+            for position_id in self._accruals
+            if state is None or self._states[position_id] == state
+        )
+
+    def list_funding_accruals(self, position_id: str) -> tuple[Any, ...]:
+        return self._accruals.get(position_id, ())
+
+
+def test_funding_idempotency_accepts_unique_plausible_settlements() -> None:
+    from oft.application.health import _funding_idempotency_check
+
+    check = _funding_idempotency_check(
+        _FundingStore(
+            {
+                "POS-1": (
+                    _accrual("2026-11-06T18:00:00.000Z"),
+                    _accrual("2026-11-07T02:00:00.000Z", amount_usd="0.05"),
+                )
+            }
+        )  # type: ignore[arg-type]
+    )
+
+    assert check.status == "ok"
+    assert "2 funding accrual(s)" in check.detail
+
+
+def test_funding_idempotency_flags_a_duplicate_settlement() -> None:
+    from oft.application.health import _funding_idempotency_check
+
+    check = _funding_idempotency_check(
+        _FundingStore({"POS-1": (_accrual(), _accrual())})  # type: ignore[arg-type]
+    )
+
+    assert check.status == "degraded"
+    assert "1 duplicate settlement" in check.detail
+
+
+def test_funding_idempotency_scans_only_open_positions() -> None:
+    from oft.application.health import _funding_idempotency_check
+
+    store = _FundingStore(
+        {
+            "POS-OPEN": (_accrual(), _accrual()),
+            "POS-CLOSED": (_accrual(), _accrual()),
+        },
+        states={"POS-OPEN": "OPEN", "POS-CLOSED": "CLOSED"},
+    )
+
+    check = _funding_idempotency_check(store)  # type: ignore[arg-type]
+
+    # Bounded scan: one query over OPEN positions, not every historical row.
+    assert store.requested_states == ["OPEN"]
+    assert check.status == "degraded"
+    assert "1 duplicate settlement" in check.detail
+
+
+def test_funding_idempotency_treats_closed_position_accruals_as_history() -> None:
+    from oft.application.health import _funding_idempotency_check
+
+    store = _FundingStore(
+        {"POS-CLOSED": (_accrual(), _accrual())},
+        states={"POS-CLOSED": "CLOSED"},
+    )
+
+    check = _funding_idempotency_check(store)  # type: ignore[arg-type]
+
+    assert check.status == "ok"
+    assert "0 funding accrual(s)" in check.detail
+
+
+@pytest.mark.parametrize(
+    "accrual",
+    [
+        pytest.param(_accrual(amount_usd="not-money"), id="amount"),
+        pytest.param(_accrual(amount_usd="1e100"), id="amount-range"),
+        pytest.param(_accrual(mark_price="0"), id="mark"),
+        pytest.param(_accrual(mark_price="1e100"), id="mark-range"),
+        pytest.param(_accrual(size="-1"), id="size"),
+    ],
+)
+def test_funding_idempotency_flags_implausible_values(accrual: Any) -> None:
+    from oft.application.health import _funding_idempotency_check
+
+    check = _funding_idempotency_check(
+        _FundingStore({"POS-1": (accrual,)})  # type: ignore[arg-type]
+    )
+
+    assert check.status == "degraded"
+    assert "1 invalid amount" in check.detail
+
+
+def test_funding_idempotency_reports_unreadable_stores() -> None:
+    from oft.application.health import _funding_idempotency_check
+
+    class BrokenPositions:
+        def list_positions(self, **_kwargs: Any) -> tuple[Any, ...]:
+            raise RuntimeError("positions are corrupt")
+
+    class BrokenAccruals(_FundingStore):
+        def list_funding_accruals(self, position_id: str) -> tuple[Any, ...]:
+            raise RuntimeError("accruals are corrupt")
+
+    assert (
+        _funding_idempotency_check(BrokenPositions()).status  # type: ignore[arg-type]
+        == "degraded"
+    )
+    assert (
+        _funding_idempotency_check(
+            BrokenAccruals({"POS-1": ()})  # type: ignore[arg-type]
+        ).status
+        == "degraded"
+    )
+
+
+def test_management_job_check_reports_an_unreadable_ledger() -> None:
+    from oft.application.health import _management_jobs_check
+
+    class BrokenStore:
+        def latest_job_run(self, job_type: str) -> Any:
+            raise RuntimeError("job ledger is corrupt")
+
+    check = _management_jobs_check(BrokenStore(), FixedClock(NOW))  # type: ignore[arg-type]
 
     assert check.status == "degraded"
     assert "unreadable" in check.detail

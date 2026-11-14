@@ -7,6 +7,8 @@ from datetime import UTC, date, datetime
 from pathlib import Path
 from typing import Any
 
+import pytest
+
 from oft.application.entry_service import EntryService
 from oft.application.kill_switch import KillSwitch
 from oft.application.position_service import PositionService
@@ -143,3 +145,59 @@ def test_missing_knowledge_disables_exact_replay_for_the_review(
     assert recorded["knowledge_reason"] == "KNOWLEDGE_ABSENT"
     assert provenance.status == "available"
     assert provenance.exact_replay is False
+
+
+# -- position-management scenario (slice 31) --------------------------------
+
+
+def _scenario(tmp_path: Path, recordings: Path, run_id: str = "review") -> dict[str, Any]:
+    from oft.replay.position_management import (
+        PositionManagementConfig,
+        PositionManagementReplay,
+    )
+
+    config = PositionManagementConfig(
+        symbol="BTCUSDT",
+        archive_fixture_dir=ARCHIVE,
+        backfill_start=START,
+        backfill_end=END,
+        recordings_dir=recordings,
+        run_id=run_id,
+    )
+    result = PositionManagementReplay(data_dir=tmp_path / "data", config=config).run()
+    summary = json.loads(Path(result.summary_path).read_text(encoding="utf-8"))
+    return {"result": result, "outcome": summary["outcome"]}
+
+
+def test_the_scenario_review_is_the_same_advisory_decision_across_runs(
+    tmp_path: Path, position_management_recordings: Path
+) -> None:
+    first = _scenario(tmp_path, position_management_recordings, "review-a")
+    second = _scenario(tmp_path, position_management_recordings, "review-b")
+
+    assert first["outcome"]["review"] == second["outcome"]["review"]
+    assert first["result"].review_decision_id == second["result"].review_decision_id
+    assert first["outcome"]["review"]["status"] == "VALID"
+    # The review is linked to the closed trade, never to a position or order.
+    assert first["outcome"]["trade_log"]["review_decision_id"] == first["result"].review_decision_id
+    assert first["result"].trade_id.startswith("TRD-")
+
+
+def test_a_missing_review_recording_fails_with_the_role_and_input_hash(
+    tmp_path: Path, position_management_recordings: Path
+) -> None:
+    import shutil
+
+    from oft.replay.paper_loop import ReplayRecordingMissingError
+
+    recordings = tmp_path / "recordings"
+    shutil.copytree(position_management_recordings, recordings)
+    shutil.rmtree(recordings / "REVIEW")
+
+    with pytest.raises(ReplayRecordingMissingError) as raised:
+        _scenario(tmp_path, recordings, "missing-review")
+
+    message = str(raised.value)
+    assert "role=REVIEW" in message
+    assert "input_hash=" in message
+    assert "--live-llm" in message

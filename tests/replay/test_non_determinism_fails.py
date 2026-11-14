@@ -6,6 +6,7 @@ import shutil
 from dataclasses import replace
 from datetime import date
 from pathlib import Path
+from typing import Any
 
 import pytest
 
@@ -103,3 +104,66 @@ def test_a_missing_entry_recheck_recording_fails_loudly(
 def test_dot_and_path_like_run_ids_are_rejected(tmp_path: Path, run_id: str) -> None:
     with pytest.raises(ReplayError, match="run_id"):
         _config(tmp_path, run_id=run_id)
+
+
+# -- position-management scenario (slice 31) --------------------------------
+
+
+def _management_config(recordings: Path, *, run_id: str = "management") -> Any:
+    from oft.replay.position_management import PositionManagementConfig
+
+    return PositionManagementConfig(
+        symbol="BTCUSDT",
+        archive_fixture_dir=ARCHIVE,
+        backfill_start=START,
+        backfill_end=END,
+        recordings_dir=recordings,
+        run_id=run_id,
+    )
+
+
+@pytest.mark.parametrize(
+    "field",
+    ["management", "funding", "closed_position", "trade_log", "statistics", "review"],
+)
+def test_a_non_deterministic_management_scenario_fails_loudly(
+    tmp_path: Path,
+    position_management_recordings: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    field: str,
+) -> None:
+    from oft.replay.position_management import (
+        PositionManagementOutcome,
+        PositionManagementReplay,
+    )
+
+    calls = {"count": 0}
+    original = PositionManagementReplay._run_once
+
+    def flaky(self: PositionManagementReplay, attempt: str) -> PositionManagementOutcome:
+        outcome = original(self, attempt)
+        calls["count"] += 1
+        if calls["count"] == 2:
+            value = getattr(outcome, field)
+            if isinstance(value, tuple):
+                return replace(outcome, **{field: (*value, {"mutated": True})})
+            assert isinstance(value, dict)
+            return replace(outcome, **{field: {**value, "mutated": True}})
+        return outcome
+
+    monkeypatch.setattr(PositionManagementReplay, "_run_once", flaky)
+
+    with pytest.raises(ReplayNonDeterministicError, match="non-deterministic"):
+        PositionManagementReplay(
+            data_dir=tmp_path / "data",
+            config=_management_config(position_management_recordings, run_id="flaky"),
+        ).run()
+
+    summary = tmp_path / "data" / "replay" / "position-management" / "flaky" / "summary.json"
+    assert not summary.exists()
+
+
+@pytest.mark.parametrize("run_id", [".", "..", "---", "a/b", "../escape"])
+def test_dot_and_path_like_management_run_ids_are_rejected(tmp_path: Path, run_id: str) -> None:
+    with pytest.raises(ReplayError, match="run_id"):
+        _management_config(tmp_path, run_id=run_id)

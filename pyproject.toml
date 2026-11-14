@@ -205,6 +205,30 @@ forbidden_modules = [
   "ccxt",
 ]
 
+# Slice 31: the management/review decision layer is advisory and must never
+# reach the execution gateway, the paper broker, or a Binance client directly.
+# Both services legitimately reach execution *indirectly* through the position
+# and order services, so only direct imports are forbidden here. The LLM adapter
+# contract above stays narrower (it also forbids indirect chains) and is not
+# weakened.
+[[tool.importlinter.contracts]]
+name = "Management and review services never import execution, broker, or Binance modules"
+type = "forbidden"
+allow_indirect_imports = true
+source_modules = [
+  "oft.application.management_service",
+  "oft.application.review_service",
+]
+forbidden_modules = [
+  "oft.application.execution_gateway",
+  "oft.application.paper_broker",
+  "oft.adapters.binance_rest",
+  "oft.adapters.binance_ws",
+  "binance",
+  "binance_connector",
+  "ccxt",
+]
+
 # The provider boundary is a denylist of every LLM SDK the project may add; the
 # list is intentionally broad so a new adapter import fails closed.
 [[tool.importlinter.contracts]]

@@ -328,3 +328,67 @@ def test_the_cli_maps_every_replay_failure_to_a_non_zero_exit(
 
     assert result.exit_code == 2, result.output
     assert instances[error].args[0] in result.output or error in result.output
+
+
+def test_the_cli_runs_the_position_management_scenario_as_json(
+    tmp_path: Path,
+    position_management_recordings: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from oft.cli.main import app as cli_app
+
+    monkeypatch.setenv("OFT_ENV", "test")
+    monkeypatch.setenv("OFT_DATA", str(tmp_path / "data"))
+    result = CliRunner().invoke(
+        cli_app,
+        [
+            "replay",
+            "run",
+            "--scenario",
+            "position-management",
+            "--archive-fixture-dir",
+            str(ARCHIVE),
+            "--recordings-dir",
+            str(position_management_recordings),
+            "--run-id",
+            "cli-management",
+            "--json",
+        ],
+    )
+
+    assert result.exit_code == 0, result.output
+    envelope = json.loads(result.stdout[result.stdout.index("{") :])
+    data = envelope["data"]
+    assert data["scenario"] == "position-management"
+    assert data["deterministic"] is True
+    assert data["trade_id"].startswith("TRD-")
+    assert data["review_decision_id"].startswith("RVW-")
+    assert data["statistics_status"] in {"DEFINED", "UNDEFINED"}
+    assert Path(data["summary_path"]).is_file()
+    assert envelope["meta"]["data_quality"] == data["data_quality"]
+
+
+def test_the_cli_rejects_an_unknown_scenario(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    result = _invoke(tmp_path, monkeypatch, ["--scenario", "unknown", "--json"])
+
+    assert result.exit_code == 2
+    envelope = _error_envelope(result)
+    assert envelope["error"]["code"] == "VALIDATION_FAILED"
+    assert "unknown replay scenario" in str(envelope["error"]["message"])
+
+
+def test_the_cli_rejects_a_non_4h_period_for_the_management_scenario(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    result = _invoke(
+        tmp_path,
+        monkeypatch,
+        ["--scenario", "position-management", "--period", "1h", "--json"],
+    )
+
+    assert result.exit_code == 2
+    envelope = _error_envelope(result)
+    assert envelope["error"]["code"] == "VALIDATION_FAILED"
+    assert "4h" in str(envelope["error"]["message"])

@@ -3,8 +3,10 @@
 from __future__ import annotations
 
 import json
+import shutil
 from datetime import UTC, date, datetime
 from pathlib import Path
+from types import SimpleNamespace
 from typing import Any
 
 import pytest
@@ -19,6 +21,15 @@ from oft.bootstrap import build_container
 from oft.clock import FixedClock
 from oft.config import Settings
 from oft.ports.llm import LLMRole
+from oft.replay.paper_loop import (
+    ReplayRecordingInvalidError,
+    ReplayRecordingMissingError,
+)
+from oft.replay.position_management import (
+    PositionManagementConfig,
+    PositionManagementReplay,
+    PositionManagementReplayError,
+)
 
 ROOT = Path(__file__).resolve().parents[2]
 ARCHIVE = ROOT / "tests" / "fixtures" / "archive"
@@ -118,3 +129,185 @@ def test_a_replayed_management_call_creates_no_new_rows(tmp_path: Path) -> None:
     assert again.idempotent_replay is True
     assert container.store.count_orders() == orders
     assert container.store.count_fills() == fills
+
+
+# -- position-management scenario (slice 31) --------------------------------
+
+
+def _scenario_replay(
+    tmp_path: Path,
+    *,
+    live_llm: bool = False,
+    provider: str | None = None,
+    period: str = "4h",
+    run_id: str = "management",
+) -> PositionManagementReplay:
+    config = PositionManagementConfig(
+        symbol="BTCUSDT",
+        archive_fixture_dir=ARCHIVE,
+        backfill_start=START,
+        backfill_end=END,
+        recordings_dir=tmp_path / "recordings",
+        period=period,
+        live_llm=live_llm,
+        provider=provider,
+        run_id=run_id,
+    )
+    return PositionManagementReplay(data_dir=tmp_path / "data", config=config)
+
+
+def _scenario(tmp_path: Path, recordings: Path, run_id: str = "management") -> dict[str, Any]:
+    config = PositionManagementConfig(
+        symbol="BTCUSDT",
+        archive_fixture_dir=ARCHIVE,
+        backfill_start=START,
+        backfill_end=END,
+        recordings_dir=recordings,
+        run_id=run_id,
+    )
+    result = PositionManagementReplay(data_dir=tmp_path / "data", config=config).run()
+    summary = json.loads(Path(result.summary_path).read_text(encoding="utf-8"))
+    return {"result": result, "outcome": summary["outcome"]}
+
+
+@pytest.mark.replay
+def test_the_scenario_executes_every_management_action_from_recorded_outputs(
+    tmp_path: Path, position_management_recordings: Path
+) -> None:
+    run = _scenario(tmp_path, position_management_recordings)
+
+    steps = run["outcome"]["management"]
+    assert [step["action"] for step in steps] == [
+        "PARTIAL_CLOSE",
+        "ADD",
+        "HOLD",
+        "FULL_CLOSE",
+    ]
+    assert [step["status"] for step in steps] == [
+        "EXECUTED",
+        "EXECUTED",
+        "NO_ACTION",
+        "EXECUTED",
+    ]
+    assert [step["executed"] for step in steps] == [True, True, False, True]
+    # HOLD creates no order/fill; it must not invent an execution.
+    assert steps[2]["order_id"] is None
+    assert steps[2]["fill_id"] is None
+    assert all(step["decision_id"].startswith("MGD-") for step in steps)
+
+
+@pytest.mark.replay
+def test_the_scenario_management_ids_are_identical_across_two_fresh_stores(
+    tmp_path: Path, position_management_recordings: Path
+) -> None:
+    first = _scenario(tmp_path, position_management_recordings, "management-a")
+    second = _scenario(tmp_path, position_management_recordings, "management-b")
+
+    left = first["outcome"]["management"]
+    right = second["outcome"]["management"]
+    assert left == right
+    for step in left:
+        assert step["decision_id"] == step["decision_id"].upper()
+    assert first["outcome"]["position_id"] == second["outcome"]["position_id"]
+
+
+@pytest.mark.replay
+def test_a_missing_management_recording_fails_with_the_role_and_input_hash(
+    tmp_path: Path, position_management_recordings: Path
+) -> None:
+    recordings = tmp_path / "recordings"
+    shutil.copytree(position_management_recordings, recordings)
+    shutil.rmtree(recordings / "MANAGEMENT")
+
+    with pytest.raises(ReplayRecordingMissingError) as raised:
+        _scenario(tmp_path, recordings, "missing-management")
+
+    message = str(raised.value)
+    assert "role=MANAGEMENT" in message
+    assert "input_hash=" in message
+    assert "--live-llm" in message
+    summary = tmp_path / "data" / "replay" / "position-management" / "missing-management"
+    assert not (summary / "summary.json").exists()
+
+
+@pytest.mark.replay
+def test_a_tampered_management_recording_fails_as_invalid(
+    tmp_path: Path, position_management_recordings: Path
+) -> None:
+    recordings = tmp_path / "recordings"
+    shutil.copytree(position_management_recordings, recordings)
+    recording = sorted((recordings / "MANAGEMENT").glob("*.json"))[0]
+    payload = json.loads(recording.read_text(encoding="utf-8"))
+    payload["raw_text"] = payload["raw_text"] + "tampered"
+    recording.write_text(json.dumps(payload), encoding="utf-8")
+
+    with pytest.raises(ReplayRecordingInvalidError):
+        _scenario(tmp_path, recordings, "tampered-management")
+
+
+@pytest.mark.replay
+def test_live_llm_resolves_the_environment_configured_provider(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # ``--live-llm`` without ``--provider`` must honour OFT_LLM_PROVIDER, as the
+    # entry scenario does. Resolving the settings never calls the provider.
+    monkeypatch.setenv("OFT_LLM_PROVIDER", "deepseek")
+    replay = _scenario_replay(tmp_path, live_llm=True)
+
+    settings = replay._settings(tmp_path / "attempt-1")
+
+    assert settings.llm_provider == "deepseek"
+
+
+@pytest.mark.replay
+def test_an_explicit_provider_wins_over_the_environment(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setenv("OFT_LLM_PROVIDER", "deepseek")
+    replay = _scenario_replay(tmp_path, live_llm=True, provider="openai")
+
+    assert replay._settings(tmp_path / "attempt-1").llm_provider == "openai"
+
+
+@pytest.mark.replay
+def test_a_read_only_scenario_stays_pinned_to_the_offline_stub(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # A read-only/capture replay never inherits an ambient live provider.
+    monkeypatch.setenv("OFT_LLM_PROVIDER", "deepseek")
+    replay = _scenario_replay(tmp_path)
+
+    assert replay._settings(tmp_path / "attempt-1").llm_provider == "stub"
+
+
+@pytest.mark.replay
+@pytest.mark.parametrize("period", ["1h", "2h", "8h", "4H"])
+def test_the_scenario_refuses_a_period_other_than_4h(tmp_path: Path, period: str) -> None:
+    # The seeded bars, funding offsets, and step clock are a fixed 4h cadence;
+    # any other label would publish a bar whose span contradicts its period.
+    with pytest.raises(PositionManagementReplayError, match="4h"):
+        _scenario_replay(tmp_path, period=period)
+
+
+class _PositionStore:
+    def __init__(self, *position_ids: str) -> None:
+        self._position_ids = position_ids
+
+    def list_positions(
+        self, *, state: str | None = None, limit: int | None = 100
+    ) -> tuple[Any, ...]:
+        return tuple(SimpleNamespace(position_id=pid) for pid in self._position_ids)
+
+
+def _position_container(*position_ids: str) -> Any:
+    return SimpleNamespace(store=_PositionStore(*position_ids))
+
+
+@pytest.mark.replay
+def test_position_id_requires_exactly_one_position(tmp_path: Path) -> None:
+    replay = _scenario_replay(tmp_path)
+
+    assert replay._position_id(_position_container("POS-ONE")) == "POS-ONE"
+    for produced in ((), ("POS-ONE", "POS-TWO")):
+        with pytest.raises(PositionManagementReplayError, match="exactly one"):
+            replay._position_id(_position_container(*produced))
