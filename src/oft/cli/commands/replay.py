@@ -13,7 +13,7 @@ import json
 from dataclasses import asdict
 from datetime import UTC, date, datetime
 from pathlib import Path
-from typing import Annotated, Any, NoReturn
+from typing import Annotated, Any, Literal, NoReturn, cast
 
 import typer
 
@@ -21,14 +21,18 @@ from oft.api.envelope import new_request_id, success_envelope
 from oft.api.errors import ERROR_CATALOG
 from oft.application.entry_service import EntryRejected
 from oft.cli.commands.doctor import emit_error
-from oft.config import ConfigError, load_settings
+from oft.config import ConfigError, Environment, load_settings
 from oft.domain.time import utc_timestamp
 from oft.replay.harness import (
     ReplayError,
     ReplayLivePathError,
     ReplayNonDeterministicError,
 )
-from oft.replay.llm_source import LLMRecordingError, LLMRecordingInvalid
+from oft.replay.llm_source import (
+    LLMRecordingError,
+    LLMRecordingInvalid,
+    RecordingErrorCode,
+)
 from oft.replay.paper_loop import (
     DEFAULT_REPLAY_NOW,
     PaperLoopConfig,
@@ -54,9 +58,9 @@ SCENARIOS = ("entry", "position-management")
 # Recording failures have no dedicated catalog code yet. Map them to the
 # closest existing code so JSON consumers never see a misleading 500
 # ``INTERNAL_ERROR``; every code is asserted against the catalog before emit.
-_RECORDING_ERROR_CODES: dict[str, str] = {
-    "LLM_RECORDING_MISSING": "DATA_UNAVAILABLE",
-    "LLM_RECORDING_INVALID": "VALIDATION_FAILED",
+_RECORDING_ERROR_CODES: dict[RecordingErrorCode, str] = {
+    RecordingErrorCode.MISSING: "DATA_UNAVAILABLE",
+    RecordingErrorCode.INVALID: "VALIDATION_FAILED",
 }
 
 
@@ -68,7 +72,10 @@ def _catalog_code(code: str) -> str:
     unknown code to ``VALIDATION_FAILED`` would hide a programming error (and
     make the membership assert in ``_fail`` meaningless for that path).
     """
-    resolved = _RECORDING_ERROR_CODES.get(code, code)
+    try:
+        resolved = _RECORDING_ERROR_CODES[RecordingErrorCode(code)]
+    except (ValueError, KeyError):
+        resolved = code
     if resolved not in ERROR_CATALOG:
         raise ReplayError(
             f"replay error code {code!r} has no ERROR_CATALOG mapping; "
@@ -167,6 +174,13 @@ def replay_run(
             help="Record outputs from the offline fixture provider (no network).",
         ),
     ] = False,
+    force_recordings: Annotated[
+        bool,
+        typer.Option(
+            "--force-recordings",
+            help="Explicitly overwrite a different existing recording.",
+        ),
+    ] = False,
     provider: Annotated[
         str | None,
         typer.Option(
@@ -225,6 +239,11 @@ def replay_run(
                 "no archive fixture directory configured; pass --archive-fixture-dir",
                 json_output=json_output,
             )
+        if recordings_dir is None:
+            _fail(
+                "--recordings-dir is required; pass one populated by --capture or --live-llm",
+                json_output=json_output,
+            )
         if resolved_scenario == "entry":
             config = PaperLoopConfig(
                 symbol=symbol,
@@ -232,11 +251,12 @@ def replay_run(
                 backfill_start=_parse_date(start),
                 backfill_end=_parse_date(end),
                 period=period,
-                recordings_dir=recordings_dir,
+                recordings_dir=Path(recordings_dir),
                 live_llm=live_llm,
                 capture_recordings=capture_recordings,
+                force_recordings=force_recordings,
                 provider=provider,
-                environment=environment,
+                environment=Environment(environment.strip().lower()),
                 now=resolved_now,
                 run_id=resolved_run_id,
             )
@@ -249,12 +269,15 @@ def replay_run(
                 archive_fixture_dir=Path(resolved_archive),
                 backfill_start=_parse_date(start),
                 backfill_end=_parse_date(end),
-                period=period,
-                recordings_dir=recordings_dir,
+                # The frozen 4h cadence is validated by the config; the cast
+                # only satisfies the ``Literal["4h"]`` field type.
+                period=cast(Literal["4h"], period),
+                recordings_dir=Path(recordings_dir),
                 live_llm=live_llm,
                 capture_recordings=capture_recordings,
+                force_recordings=force_recordings,
                 provider=provider,
-                environment=environment,
+                environment=Environment(environment.strip().lower()),
                 now=resolved_now,
                 run_id=resolved_run_id,
             )

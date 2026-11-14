@@ -634,10 +634,11 @@ def _job_run(
     lease_expires_in: timedelta = timedelta(minutes=5),
     error_code: str | None = None,
     message: str | None = None,
+    heartbeat_in: timedelta = timedelta(minutes=-1),
 ) -> JobRunRecord:
-    started = utc_timestamp(NOW - timedelta(minutes=1))
+    started = utc_timestamp(NOW + heartbeat_in)
     return JobRunRecord(
-        run_id=f"JOB-{job_type.upper()}-{status}",
+        run_id=f"JOB-{job_type.upper()}-{status}-{window_start}",
         job_type=job_type,
         window_start=window_start,
         status=status,
@@ -777,6 +778,9 @@ class _FundingStore:
         self._states = states or {position_id: "OPEN" for position_id in accruals}
         self.requested_states: list[str | None] = []
 
+    def integrity_check(self) -> bool:
+        return True
+
     def list_positions(
         self, *, state: str | None = None, limit: int | None = 100
     ) -> tuple[Any, ...]:
@@ -880,6 +884,9 @@ def test_funding_idempotency_reports_unreadable_stores() -> None:
     from oft.application.health import _funding_idempotency_check
 
     class BrokenPositions:
+        def integrity_check(self) -> bool:
+            return True
+
         def list_positions(self, **_kwargs: Any) -> tuple[Any, ...]:
             raise RuntimeError("positions are corrupt")
 
@@ -903,10 +910,116 @@ def test_management_job_check_reports_an_unreadable_ledger() -> None:
     from oft.application.health import _management_jobs_check
 
     class BrokenStore:
-        def latest_job_run(self, job_type: str) -> Any:
+        def integrity_check(self) -> bool:
+            return True
+
+        def list_job_runs(
+            self, job_type: str | None = None, limit: int = 50, offset: int = 0
+        ) -> Any:
             raise RuntimeError("job ledger is corrupt")
 
     check = _management_jobs_check(BrokenStore(), FixedClock(NOW))  # type: ignore[arg-type]
 
     assert check.status == "degraded"
     assert "unreadable" in check.detail
+
+
+def test_server_unavailable_reads_as_unknown_not_ok(tmp_path: Path) -> None:
+    from oft.application.health import (
+        _funding_idempotency_check,
+        _management_jobs_check,
+    )
+
+    settings = Settings(env="test", port=8765, data_dir=tmp_path / "missing")
+    store = SqliteStore(settings)  # deliberately not initialized: no database file
+
+    for check in (
+        _management_jobs_check(store, FixedClock(NOW)),
+        _funding_idempotency_check(store),
+    ):
+        assert check.status == "unknown"
+        assert "unavailable" in check.detail
+
+
+def test_management_job_check_aggregates_across_positions_in_one_window(
+    tmp_path: Path,
+) -> None:
+    from oft.application.health import _management_jobs_check
+    from oft.application.jobs import POSITION_MANAGE_JOB_TYPE
+
+    settings = _settings(tmp_path)
+    store = SqliteStore(settings)
+    store.initialize()
+    boundary = "2026-11-06T12:00:00.000Z"
+    failed, _, _ = store.claim_job_run(
+        _job_run(
+            job_type=POSITION_MANAGE_JOB_TYPE,
+            status="FAILED",
+            window_start=f"{boundary}#POS-A",
+            error_code="POSITION_READ_FAILED",
+            heartbeat_in=timedelta(minutes=-10),
+        )
+    )
+    done, _, _ = store.claim_job_run(
+        _job_run(
+            job_type=POSITION_MANAGE_JOB_TYPE,
+            status="DONE",
+            window_start=f"{boundary}#POS-B",
+            heartbeat_in=timedelta(minutes=0),
+        )
+    )
+    assert failed and done
+
+    check = _management_jobs_check(store, FixedClock(NOW))
+
+    # A newer DONE row for another position must not mask the FAILED row.
+    assert check.status == "degraded"
+    assert "FAILED" in check.detail
+    assert boundary in check.detail
+    assert "#POS" not in check.detail
+
+
+def test_management_job_check_flags_a_done_row_with_a_typed_error(tmp_path: Path) -> None:
+    from oft.application.health import _management_jobs_check
+    from oft.application.jobs import POSITION_MANAGE_JOB_TYPE
+
+    settings = _settings(tmp_path)
+    store = SqliteStore(settings)
+    store.initialize()
+    claimed, _, _ = store.claim_job_run(
+        _job_run(
+            job_type=POSITION_MANAGE_JOB_TYPE,
+            status="DONE",
+            window_start="2026-11-06T12:00:00.000Z#POS-A",
+            error_code="MANAGEMENT_REJECTED",
+        )
+    )
+    assert claimed
+
+    check = _management_jobs_check(store, FixedClock(NOW))
+
+    # A DONE row carrying a typed per-position error is a PARTIAL window.
+    assert check.status == "degraded"
+    assert "PARTIAL" in check.detail
+    assert "MANAGEMENT_REJECTED" in check.detail
+
+
+def test_daemon_offline_maps_to_degraded_not_offline(tmp_path: Path) -> None:
+    from typing import get_args
+
+    from oft.application.health import DoctorReport
+
+    settings = _settings(tmp_path)
+    store = SqliteStore(settings)
+    store.initialize()
+
+    report = build_doctor(
+        settings,
+        store,
+        FixtureMarketData(),
+        FixedClock(NOW),
+        daemon=DaemonProbe(state="OFFLINE", detail="test listener down"),
+    )
+
+    assert report.status == "DEGRADED"
+    assert "OFFLINE" not in get_args(DoctorReport.__annotations__["status"])

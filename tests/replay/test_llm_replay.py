@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import hashlib
 import json
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta
 from pathlib import Path
 
 import pytest
@@ -19,9 +19,11 @@ from oft.ports.llm import (
     ProviderCapabilities,
 )
 from oft.replay.llm_source import (
+    RECORDING_FORMAT_VERSION,
     LLMRecordingError,
     LLMRecordingInvalid,
     RecordedLLMSource,
+    RecordingErrorCode,
     RecordingLLMSource,
 )
 
@@ -153,28 +155,44 @@ def _write_recording(root: Path, payload: object) -> Path:
 
 
 @pytest.mark.parametrize(
-    "payload",
+    ("payload", "match"),
     [
-        [],  # not a JSON object
-        {  # recorded for a different role
-            "role": "ANALYSIS",
-            "input_hash": INPUT_HASH,
-            "raw_text": "x",
-            "content_hash": hashlib.sha256(b"x").hexdigest(),
-        },
-        {  # recorded for a different input hash
-            "role": "ENTRY_RECHECK",
-            "input_hash": "b" * 64,
-            "raw_text": "x",
-            "content_hash": hashlib.sha256(b"x").hexdigest(),
-        },
-        {"role": "ENTRY_RECHECK", "input_hash": INPUT_HASH},  # no raw_text
+        ([], "not an object"),  # not a JSON object
+        (
+            {  # recorded for a different role
+                "recording_format_version": RECORDING_FORMAT_VERSION,
+                "role": "ANALYSIS",
+                "input_hash": INPUT_HASH,
+                "raw_text": "x",
+                "content_hash": hashlib.sha256(b"x").hexdigest(),
+            },
+            "different role",
+        ),
+        (
+            {  # recorded for a different input hash
+                "recording_format_version": RECORDING_FORMAT_VERSION,
+                "role": "ENTRY_RECHECK",
+                "input_hash": "b" * 64,
+                "raw_text": "x",
+                "content_hash": hashlib.sha256(b"x").hexdigest(),
+            },
+            "different input hash",
+        ),
+        (
+            {  # no raw_text
+                "recording_format_version": RECORDING_FORMAT_VERSION,
+                "role": "ENTRY_RECHECK",
+                "input_hash": INPUT_HASH,
+            },
+            "no raw_text",
+        ),
     ],
+    ids=["not-an-object", "different-role", "different-input-hash", "missing-raw-text"],
 )
-def test_a_malformed_recording_fails_closed(tmp_path: Path, payload: object) -> None:
+def test_a_malformed_recording_fails_closed(tmp_path: Path, payload: object, match: str) -> None:
     _write_recording(tmp_path, payload)
 
-    with pytest.raises(LLMRecordingInvalid):
+    with pytest.raises(LLMRecordingInvalid, match=match):
         RecordedLLMSource(recordings_dir=tmp_path).complete(_request())
 
 
@@ -239,3 +257,124 @@ def test_the_recorded_source_is_explicitly_unpriced(tmp_path: Path) -> None:
     assert estimate.unpriced is True
     assert estimate.price_version == "recorded/v1"
     assert source.capabilities().provider == "stub"
+
+
+# -- H1: an existing recording is never silently overwritten ------------------
+
+
+def _written_recording(tmp_path: Path) -> Path:
+    source = RecordingLLMSource(inner=_stub(), recordings_dir=tmp_path, clock=FixedClock(NOW))
+    source.complete(_request())
+    return tmp_path / "ENTRY_RECHECK" / f"{INPUT_HASH}.json"
+
+
+def test_recording_identical_content_is_an_idempotent_no_op(tmp_path: Path) -> None:
+    path = _written_recording(tmp_path)
+    before = path.read_bytes()
+
+    # A later clock would change ``recorded_at`` if the file were rewritten.
+    again = RecordingLLMSource(
+        inner=_stub(), recordings_dir=tmp_path, clock=FixedClock(NOW + timedelta(hours=1))
+    )
+    returned = again.record(
+        _request(),
+        _stub().complete(_request()),
+    )
+
+    assert returned == path
+    assert path.read_bytes() == before
+
+
+def test_recording_different_content_fails_without_force(tmp_path: Path) -> None:
+    _written_recording(tmp_path)
+
+    source = RecordingLLMSource(
+        inner=_FakeProvider('{"note": "different"}'),
+        recordings_dir=tmp_path,
+        clock=FixedClock(NOW + timedelta(hours=1)),
+    )
+    with pytest.raises(LLMRecordingInvalid) as raised:
+        source.complete(_request())
+
+    message = str(raised.value)
+    assert "ENTRY_RECHECK" in message
+    assert INPUT_HASH in message
+    assert "--force-recordings" in message
+
+
+def test_recording_different_content_overwrites_with_force(tmp_path: Path) -> None:
+    path = _written_recording(tmp_path)
+    before = json.loads(path.read_text(encoding="utf-8"))
+
+    source = RecordingLLMSource(
+        inner=_FakeProvider('{"note": "different"}'),
+        recordings_dir=tmp_path,
+        clock=FixedClock(NOW + timedelta(hours=1)),
+        force=True,
+    )
+    source.complete(_request())
+
+    after = json.loads(path.read_text(encoding="utf-8"))
+    assert after["raw_text"] != before["raw_text"]
+    assert after["provider"] == "openai"
+    assert after["recording_format_version"] == RECORDING_FORMAT_VERSION
+
+
+# -- H2: the recording format version is validated ---------------------------
+
+
+def _version_payload(version: object | None) -> dict[str, object]:
+    raw_text = "recorded"
+    payload: dict[str, object] = {
+        "role": "ENTRY_RECHECK",
+        "input_hash": INPUT_HASH,
+        "provider": "stub",
+        "model": "fixture",
+        "raw_text": raw_text,
+        "content_hash": hashlib.sha256(raw_text.encode()).hexdigest(),
+        "refusal": False,
+        "truncated": False,
+    }
+    if version is not None:
+        payload["recording_format_version"] = version
+    return payload
+
+
+@pytest.mark.parametrize("version", [None, "9.9.9"])
+def test_a_missing_or_mismatched_recording_format_version_fails_closed(
+    tmp_path: Path, version: object | None
+) -> None:
+    _write_recording(tmp_path, _version_payload(version))
+
+    with pytest.raises(LLMRecordingInvalid, match="recording_format_version"):
+        RecordedLLMSource(recordings_dir=tmp_path).complete(_request())
+
+
+# -- M6: one typed recording-error taxonomy ----------------------------------
+
+
+def test_recording_errors_share_one_typed_taxonomy() -> None:
+    from oft.replay.paper_loop import (
+        ReplayRecordingInvalidError,
+        ReplayRecordingMissingError,
+    )
+
+    assert LLMRecordingError.code is RecordingErrorCode.MISSING
+    assert LLMRecordingInvalid.code is RecordingErrorCode.INVALID
+    assert ReplayRecordingMissingError.code is RecordingErrorCode.MISSING
+    assert ReplayRecordingInvalidError.code is RecordingErrorCode.INVALID
+    assert RecordingErrorCode.MISSING.value == "LLM_RECORDING_MISSING"
+    assert RecordingErrorCode.INVALID.value == "LLM_RECORDING_INVALID"
+
+
+# -- M10: the pinned settings are frozen and must be real Settings fields -----
+
+
+def test_pinned_outcome_settings_is_frozen_and_matches_settings_fields() -> None:
+    from oft.config import Settings
+    from oft.replay.support import PINNED_OUTCOME_SETTINGS
+
+    with pytest.raises(TypeError):
+        PINNED_OUTCOME_SETTINGS["paper_initial_balance"] = "1.00"  # type: ignore[index]
+
+    assert set(PINNED_OUTCOME_SETTINGS) <= set(Settings.model_fields)

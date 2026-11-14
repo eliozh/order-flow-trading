@@ -9,9 +9,11 @@ statistics → recorded REVIEW — against committed market fixtures and
 
 Everything below is offline. No Telegram token, no Binance credential, no live
 LLM provider, and no network access is required: the default provider is the
-offline fixture stub. Replay writes only `$OFT_DATA_DIR/replay/...`; it never
-opens the live database, paper account, orders, positions, trade logs, or budget
-ledger.
+offline fixture stub. Run/attempt stores and summaries are written only under
+`$OFT_DATA_DIR/replay/...`; the explicit `--capture`/`--live-llm` recording path
+additionally writes `<recordings_dir>/<ROLE>/<input_hash>.json` outside that
+namespace by design. Replay never opens the live database, paper account,
+orders, positions, trade logs, or budget ledger.
 
 ## Prerequisites
 
@@ -71,13 +73,14 @@ daemon              OK        listening on 127.0.0.1:7611
 STATUS  READY
 ```
 
-`jobs.management` reads the latest `position_manage` row from the read-only job
-ledger and degrades on `FAILED` or an expired `RUNNING` lease; it never echoes a
-persisted message. `funding.idempotency` verifies the recorded accruals are
-unique per `(position, settlement_time)` and plausible. Neither check prints a
-secret. With the daemon down the `daemon` check reports `OFFLINE`, `STATUS`
-becomes `DEGRADED`, and the command still exits 0 (ADR-0003: diagnostics are
-informational).
+`jobs.management` aggregates the latest `position_manage` window (one ledger row
+per position via `latest_job_summary`) and degrades on `FAILED`, `PARTIAL`, or an
+expired `RUNNING` lease; it reports `unknown` when the database cannot be read
+and never echoes a persisted message. `funding.idempotency` verifies the recorded
+accruals are unique per `(position, settlement_time)` and plausible. Neither
+check prints a secret. With the daemon down the `daemon` check reports `OFFLINE`,
+`STATUS` becomes `DEGRADED`, and the command still exits 0 (ADR-0003: diagnostics
+are informational).
 
 JSON mode keeps the standard envelope:
 
@@ -115,6 +118,14 @@ The capture run itself executes the scenario twice. Attempt 2 reads only the
 recordings attempt 1 wrote, so the `deterministic=true` line already proves the
 recordings are replayable.
 
+Capture layout: the recording files live under `<recordings_dir>/<ROLE>/` for
+the four roles `ANALYSIS`, `ENTRY_RECHECK`, `MANAGEMENT`, and `REVIEW`, each
+named `<input_hash>.json`. A recording is redacted JSON carrying
+`recording_format_version` and a `content_hash` of the recorded text.
+Re-capturing identical content is an idempotent no-op (the file is not
+rewritten); a different result for the same `(role, input_hash)` is refused
+unless you explicitly pass `--force-recordings` to overwrite it deliberately.
+
 The journal reports `stats=UNDEFINED` on purpose: this scenario performs a
 partial close, and the documented eligibility rule excludes `PARTIAL` trades
 from the metrics while counting them. Open/partial trades are never counted as
@@ -122,8 +133,13 @@ zero.
 
 ## 4. Replay the recorded scenario offline
 
-The read-only replay never calls a provider. A missing or tampered recording
-fails closed with a typed error naming the role and input hash:
+The read-only replay never calls a provider. A missing recording for
+`MANAGEMENT`, `REVIEW`, or `ENTRY_RECHECK` fails closed with a typed error naming
+the role and input hash; a tampered or unreadable recording fails closed with a
+typed error naming the file. An `ANALYSIS` recording failure is surfaced through the
+scenario's "no OPEN opportunity" error on either scenario (a typed recording
+error whose message names `role=ANALYSIS`), not as a per-trade error naming the
+input hash:
 
 ```bash
 uv run oft replay run \
@@ -193,8 +209,13 @@ invalidate the other.
 - `run_id must contain at least one letter or digit` — `.`, `..`, and path-like
   ids are refused before any filesystem write.
 - `the partial-close remainder is below the recorded step or minimum notional` —
-  the recorded sizing escalated to a full close; this is expected behaviour in
-  the scenario, not a failure.
+  the recorded sizing escalated the partial close to a full close. This is not
+  expected: escalation closes the whole position, so the next ADD aborts with
+  `POSITION_STATE_INVALID`, the scenario fails, and no summary is written.
+  Re-capture the recordings with a non-escalating partial-close fraction.
+- `a different recorded LLM output already exists for role=... input_hash=...` —
+  a re-capture produced different text for a published recording. Inspect it and,
+  only if the change is intended, capture again with `--force-recordings`.
 
 ## What is intentionally out of scope
 

@@ -59,7 +59,7 @@ class ReadinessReport:
 
 @dataclass(frozen=True)
 class DoctorReport:
-    status: Literal["READY", "DEGRADED", "OFFLINE"]
+    status: Literal["READY", "DEGRADED"]
     version: str
     checked_at: str
     checks: tuple[CheckResult, ...]
@@ -216,41 +216,60 @@ def _stale_jobs_check(store: StorePort, clock: ClockPort) -> CheckResult:
     return CheckResult("jobs.stale", "ok", "no stale RUNNING job runs")
 
 
-def _management_jobs_check(store: StorePort, clock: ClockPort) -> CheckResult:
-    """Report the latest ``position_manage`` run from the read-only job ledger.
+def _database_unavailable(store: StorePort, check: str) -> CheckResult | None:
+    """Return an ``unknown`` result when the store cannot confirm its database.
 
-    The job type is imported lazily so the health module keeps its small
-    dependency surface. Only the status, window, and error code are rendered;
+    The store port turns an absent database into empty results, so a check that
+    only counts rows would report ``ok`` from nothing. Callers gate on this
+    before reading, and a check that cannot verify reports ``unknown`` rather
+    than false assurance (M1).
+    """
+    try:
+        available = store.integrity_check()
+    except Exception:  # pragma: no cover - defensive boundary
+        available = False
+    if available:
+        return None
+    return CheckResult(check, "unknown", f"database unavailable; {check} not verified")
+
+
+def _management_jobs_check(store: StorePort, clock: ClockPort) -> CheckResult:
+    """Report the aggregate result of the latest ``position_manage`` window.
+
+    ``position_manage`` writes one row per ``"{window}#{position_id}"`` key, so
+    the newest single row (ordered by heartbeat) is not the window status: a
+    FAILED row for one position would be masked by a later DONE row for
+    another. The aggregate ``latest_job_summary`` is the same read path the API
+    and CLI use. Only the status, boundary window, and error code are rendered;
     a persisted message is never echoed (it may quote provider text).
     """
-    from oft.application.jobs import POSITION_MANAGE_JOB_TYPE
+    from oft.application.jobs import POSITION_MANAGE_JOB_TYPE, latest_job_summary
 
+    unavailable = _database_unavailable(store, "jobs.management")
+    if unavailable is not None:
+        return unavailable
     try:
-        latest = store.latest_job_run(POSITION_MANAGE_JOB_TYPE)
+        summary = latest_job_summary(store, POSITION_MANAGE_JOB_TYPE)
     except Exception as exc:
         return CheckResult(
             "jobs.management", "degraded", f"management job ledger unreadable ({exc})"
         )
-    if latest is None:
+    if summary is None:
         return CheckResult("jobs.management", "ok", "no management job run recorded yet")
-    status = str(latest.status)
-    window = str(latest.window_start)
-    error_code = str(latest.error_code) if latest.error_code else ""
-    if status == "FAILED":
+    status = summary.status
+    # ``latest_job_summary`` surfaces the boundary ISO timestamp, never the
+    # internal ``"<ts>#<position_id>"`` ledger key.
+    window = summary.window_start
+    error_code = summary.error_code or ""
+    if status in ("FAILED", "PARTIAL"):
         suffix = f" ({error_code})" if error_code else ""
         return CheckResult(
-            "jobs.management", "degraded", f"last management run FAILED for window {window}{suffix}"
+            "jobs.management",
+            "degraded",
+            f"last management run {status} for window {window}{suffix}",
         )
     if status == "RUNNING":
-        now = clock.now()
-        try:
-            lease_expires = datetime.fromisoformat(
-                str(latest.lease_expires_at).replace("Z", "+00:00")
-            )
-            expired = lease_expires < now.astimezone(UTC)
-        except (TypeError, ValueError, OverflowError):
-            expired = True
-        if expired:
+        if _window_lease_expired(store, POSITION_MANAGE_JOB_TYPE, window, clock):
             return CheckResult(
                 "jobs.management",
                 "degraded",
@@ -260,6 +279,27 @@ def _management_jobs_check(store: StorePort, clock: ClockPort) -> CheckResult:
             "jobs.management", "ok", f"management run for window {window} is RUNNING"
         )
     return CheckResult("jobs.management", "ok", f"last management run {status} for window {window}")
+
+
+def _window_lease_expired(store: StorePort, job_type: str, window: str, clock: ClockPort) -> bool:
+    """True when any RUNNING row in the window has an expired/unparseable lease."""
+    now = clock.now().astimezone(UTC)
+    try:
+        runs = store.list_job_runs(job_type)
+    except Exception:
+        return True
+    for run in runs:
+        if str(run.window_start).split("#", 1)[0] != window:
+            continue
+        if str(run.status) != "RUNNING":
+            continue
+        try:
+            lease_expires = datetime.fromisoformat(str(run.lease_expires_at).replace("Z", "+00:00"))
+        except (TypeError, ValueError, OverflowError):
+            return True
+        if lease_expires < now:
+            return True
+    return False
 
 
 def _funding_idempotency_check(store: StorePort) -> CheckResult:
@@ -279,6 +319,9 @@ def _funding_idempotency_check(store: StorePort) -> CheckResult:
 
     from oft.domain.pnl import MAX_ABS_MONEY, MAX_ABS_PRICE, MAX_ABS_QUANTITY
 
+    unavailable = _database_unavailable(store, "funding.idempotency")
+    if unavailable is not None:
+        return unavailable
     try:
         positions = store.list_positions(state="OPEN", limit=None)
     except Exception as exc:
@@ -563,7 +606,7 @@ def build_doctor(
         ),
     )
     if probe.state == "OFFLINE":
-        overall: Literal["READY", "DEGRADED", "OFFLINE"] = "DEGRADED"
+        overall: Literal["READY", "DEGRADED"] = "DEGRADED"
     elif all(check.status in ("ok", "unknown") for check in checks):
         overall = "READY"
     else:

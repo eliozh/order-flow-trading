@@ -392,3 +392,19 @@ def test_the_cli_rejects_a_non_4h_period_for_the_management_scenario(
     envelope = _error_envelope(result)
     assert envelope["error"]["code"] == "VALIDATION_FAILED"
     assert "4h" in str(envelope["error"]["message"])
+
+
+def test_the_cli_requires_a_recordings_directory(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from oft.cli.main import app as cli_app
+
+    monkeypatch.setenv("OFT_ENV", "test")
+    monkeypatch.setenv("OFT_DATA", str(tmp_path / "data"))
+    result = CliRunner().invoke(
+        cli_app,
+        ["replay", "run", "--archive-fixture-dir", str(ARCHIVE)],
+    )
+
+    assert result.exit_code == 2
+    assert "--recordings-dir" in result.output

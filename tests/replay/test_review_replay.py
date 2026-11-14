@@ -151,22 +151,9 @@ def test_missing_knowledge_disables_exact_replay_for_the_review(
 
 
 def _scenario(tmp_path: Path, recordings: Path, run_id: str = "review") -> dict[str, Any]:
-    from oft.replay.position_management import (
-        PositionManagementConfig,
-        PositionManagementReplay,
-    )
+    from conftest import run_position_management
 
-    config = PositionManagementConfig(
-        symbol="BTCUSDT",
-        archive_fixture_dir=ARCHIVE,
-        backfill_start=START,
-        backfill_end=END,
-        recordings_dir=recordings,
-        run_id=run_id,
-    )
-    result = PositionManagementReplay(data_dir=tmp_path / "data", config=config).run()
-    summary = json.loads(Path(result.summary_path).read_text(encoding="utf-8"))
-    return {"result": result, "outcome": summary["outcome"]}
+    return run_position_management(tmp_path, recordings, run_id)
 
 
 def test_the_scenario_review_is_the_same_advisory_decision_across_runs(

@@ -4,29 +4,37 @@ from __future__ import annotations
 
 import json
 import shutil
+from dataclasses import replace
 from datetime import UTC, date, datetime
+from decimal import Decimal
 from pathlib import Path
 from types import SimpleNamespace
 from typing import Any
 
 import pytest
 
+from conftest import position_management_config, run_position_management
 from oft.adapters.llm_stub import LLMStub
 from oft.application.entry_service import EntryService
 from oft.application.kill_switch import KillSwitch
 from oft.application.management_service import ManagementService
+from oft.application.position_service import PositionCloseError, PositionService
 from oft.application.scan_service import ScanRequest, ScanService
 from oft.application.trigger_service import TriggerService
 from oft.bootstrap import build_container
 from oft.clock import FixedClock
 from oft.config import Settings
+from oft.domain.risk import ManagementAction, ManagementStatus
 from oft.ports.llm import LLMRole
+from oft.replay.harness import ReplayError
 from oft.replay.paper_loop import (
     ReplayRecordingInvalidError,
     ReplayRecordingMissingError,
 )
 from oft.replay.position_management import (
-    PositionManagementConfig,
+    ManagementStepExecution,
+    ManagementStepOutcome,
+    PositionManagementOutcome,
     PositionManagementReplay,
     PositionManagementReplayError,
 )
@@ -142,32 +150,17 @@ def _scenario_replay(
     period: str = "4h",
     run_id: str = "management",
 ) -> PositionManagementReplay:
-    config = PositionManagementConfig(
-        symbol="BTCUSDT",
-        archive_fixture_dir=ARCHIVE,
-        backfill_start=START,
-        backfill_end=END,
-        recordings_dir=tmp_path / "recordings",
-        period=period,
+    config = replace(
+        position_management_config(tmp_path / "recordings", run_id=run_id),
         live_llm=live_llm,
         provider=provider,
-        run_id=run_id,
+        period=period,
     )
     return PositionManagementReplay(data_dir=tmp_path / "data", config=config)
 
 
 def _scenario(tmp_path: Path, recordings: Path, run_id: str = "management") -> dict[str, Any]:
-    config = PositionManagementConfig(
-        symbol="BTCUSDT",
-        archive_fixture_dir=ARCHIVE,
-        backfill_start=START,
-        backfill_end=END,
-        recordings_dir=recordings,
-        run_id=run_id,
-    )
-    result = PositionManagementReplay(data_dir=tmp_path / "data", config=config).run()
-    summary = json.loads(Path(result.summary_path).read_text(encoding="utf-8"))
-    return {"result": result, "outcome": summary["outcome"]}
+    return run_position_management(tmp_path, recordings, run_id)
 
 
 @pytest.mark.replay
@@ -227,6 +220,21 @@ def test_a_missing_management_recording_fails_with_the_role_and_input_hash(
     assert "input_hash=" in message
     assert "--live-llm" in message
     summary = tmp_path / "data" / "replay" / "position-management" / "missing-management"
+    assert not (summary / "summary.json").exists()
+
+
+@pytest.mark.replay
+def test_a_missing_analysis_recording_raises_the_typed_recording_error(
+    tmp_path: Path, position_management_recordings: Path
+) -> None:
+    recordings = tmp_path / "recordings"
+    shutil.copytree(position_management_recordings, recordings)
+    shutil.rmtree(recordings / "ANALYSIS")
+
+    with pytest.raises(ReplayRecordingMissingError, match="role=ANALYSIS"):
+        _scenario(tmp_path, recordings, "missing-analysis")
+
+    summary = tmp_path / "data" / "replay" / "position-management" / "missing-analysis"
     assert not (summary / "summary.json").exists()
 
 
@@ -311,3 +319,305 @@ def test_position_id_requires_exactly_one_position(tmp_path: Path) -> None:
     for produced in ((), ("POS-ONE", "POS-TWO")):
         with pytest.raises(PositionManagementReplayError, match="exactly one"):
             replay._position_id(_position_container(*produced))
+
+
+# -- H5: funding accrual is validated, never silently zero -------------------
+
+
+@pytest.mark.replay
+def test_the_scenario_accrues_every_seeded_funding_settlement(
+    tmp_path: Path, position_management_recordings: Path
+) -> None:
+    run = _scenario(tmp_path, position_management_recordings, "funding-success")
+    funding = run["outcome"]["funding"]
+
+    assert funding["accrued"] == 2
+    assert funding["reasons"] == []
+    assert Decimal(run["outcome"]["trade_log"]["funding_usd"]) != 0
+
+
+@pytest.mark.replay
+def test_a_degraded_funding_accrual_fails_typed_without_a_summary(
+    tmp_path: Path, position_management_recordings: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setattr(
+        PositionService,
+        "accrue_funding",
+        lambda self, position_id, *, now=None: {
+            "position_id": position_id,
+            "accrued": 0,
+            "reasons": ("funding settlement missing",),
+        },
+    )
+
+    with pytest.raises(PositionManagementReplayError, match="funding accrual is degraded"):
+        _scenario(tmp_path, position_management_recordings, "funding-degraded")
+
+    summary = tmp_path / "data" / "replay" / "position-management" / "funding-degraded"
+    assert not (summary / "summary.json").exists()
+
+
+@pytest.mark.replay
+def test_the_trade_funding_term_is_required_to_parse_and_be_non_zero() -> None:
+    with pytest.raises(PositionManagementReplayError, match="unreadable"):
+        PositionManagementReplay._validate_trade_funding({"funding_usd": "not-money"})
+    with pytest.raises(PositionManagementReplayError, match="zero"):
+        PositionManagementReplay._validate_trade_funding({"funding_usd": "0"})
+    with pytest.raises(PositionManagementReplayError, match="non-finite"):
+        PositionManagementReplay._validate_trade_funding({"funding_usd": "NaN"})
+
+    # A parsed, non-zero term is accepted (the scenario's real success path).
+    PositionManagementReplay._validate_trade_funding({"funding_usd": "-0.07"})
+
+
+# -- M2: a typed position-close failure is translated ------------------------
+
+
+@pytest.mark.replay
+def test_a_position_close_error_is_raised_as_a_typed_replay_error(
+    tmp_path: Path, position_management_recordings: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    def escalate(self: Any, position_id: str, *, idempotency_key: str, **_: Any) -> Any:
+        raise PositionCloseError(
+            "POSITION_STATE_INVALID", "the partial close escalated to a full close"
+        )
+
+    monkeypatch.setattr(ManagementService, "manage", escalate)
+
+    with pytest.raises(PositionManagementReplayError, match="POSITION_STATE_INVALID"):
+        _scenario(tmp_path, position_management_recordings, "close-escalated")
+
+    summary = tmp_path / "data" / "replay" / "position-management" / "close-escalated"
+    assert not (summary / "summary.json").exists()
+
+
+# -- M8: a mismatched management result fails loudly -------------------------
+
+
+@pytest.mark.replay
+def test_a_management_step_that_does_not_match_the_spec_fails_typed(
+    tmp_path: Path, position_management_recordings: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    def mismatched(self: Any, position_id: str, *, idempotency_key: str, **_: Any) -> Any:
+        return SimpleNamespace(
+            action=ManagementAction.HOLD,
+            status=ManagementStatus.NO_ACTION,
+            executed=False,
+            decision_id="MGD-MISMATCH",
+            order=None,
+            fill=None,
+        )
+
+    monkeypatch.setattr(ManagementService, "manage", mismatched)
+
+    with pytest.raises(PositionManagementReplayError, match="returned action HOLD"):
+        _scenario(tmp_path, position_management_recordings, "step-mismatch")
+
+    summary = tmp_path / "data" / "replay" / "position-management" / "step-mismatch"
+    assert not (summary / "summary.json").exists()
+
+
+# -- M7: executed/not-executed is a union, not a pair of loose fields --------
+
+
+@pytest.mark.replay
+def test_an_executed_step_requires_an_execution() -> None:
+    with pytest.raises(PositionManagementReplayError, match="execution"):
+        ManagementStepOutcome(
+            action=ManagementAction.PARTIAL_CLOSE,
+            decision_id="MGD-1",
+            status=ManagementStatus.EXECUTED,
+            execution=None,
+            size_after="0.01",
+        )
+
+
+@pytest.mark.replay
+def test_a_non_executed_step_forbids_an_execution() -> None:
+    with pytest.raises(PositionManagementReplayError, match="execution"):
+        ManagementStepOutcome(
+            action=ManagementAction.HOLD,
+            decision_id="MGD-1",
+            status=ManagementStatus.NO_ACTION,
+            execution=ManagementStepExecution(order_id="ORD-1", fill_id="FIL-1"),
+            size_after="0.01",
+        )
+
+
+@pytest.mark.replay
+@pytest.mark.parametrize(
+    ("field", "build"),
+    [
+        (
+            "decision_id",
+            lambda: ManagementStepOutcome(
+                ManagementAction.HOLD, "", ManagementStatus.NO_ACTION, None, "0.01"
+            ),
+        ),
+        (
+            "size_after",
+            lambda: ManagementStepOutcome(
+                ManagementAction.HOLD, "MGD-1", ManagementStatus.NO_ACTION, None, " "
+            ),
+        ),
+        ("order_id", lambda: ManagementStepExecution(order_id="", fill_id="FIL-1")),
+        ("fill_id", lambda: ManagementStepExecution(order_id="ORD-1", fill_id="")),
+    ],
+)
+def test_a_management_step_requires_non_empty_ids(field: str, build: Any) -> None:
+    with pytest.raises(PositionManagementReplayError, match=field):
+        build()
+
+
+@pytest.mark.replay
+def test_the_management_step_payload_keeps_the_flat_json_shape() -> None:
+    step = ManagementStepOutcome(
+        action=ManagementAction.PARTIAL_CLOSE,
+        decision_id="MGD-1",
+        status=ManagementStatus.EXECUTED,
+        execution=ManagementStepExecution(order_id="ORD-1", fill_id="FIL-1"),
+        size_after="0.01",
+    )
+
+    assert step.to_payload() == {
+        "action": "PARTIAL_CLOSE",
+        "decision_id": "MGD-1",
+        "status": "EXECUTED",
+        "executed": True,
+        "size_after": "0.01",
+        "order_id": "ORD-1",
+        "fill_id": "FIL-1",
+    }
+
+
+# -- H3/M9: success artifacts require validated identity fields -------------
+
+
+def _source_outcome(tmp_path: Path, recordings: Path) -> PositionManagementOutcome:
+    replay = PositionManagementReplay(
+        data_dir=tmp_path / "source-data",
+        config=position_management_config(recordings, run_id="source-outcome"),
+    )
+    return replay._run_once("attempt-1")
+
+
+@pytest.mark.replay
+def test_an_empty_review_decision_id_leaves_no_summary(
+    tmp_path: Path, position_management_recordings: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    outcome = _source_outcome(tmp_path, position_management_recordings)
+    broken = replace(outcome, review={"decision_id": "", "status": "VALID", "envelope": {}})
+    replay = PositionManagementReplay(
+        data_dir=tmp_path / "broken-data",
+        config=position_management_config(position_management_recordings, run_id="no-review"),
+    )
+    monkeypatch.setattr(PositionManagementReplay, "_run_once", lambda self, attempt: broken)
+
+    with pytest.raises(PositionManagementReplayError, match="review_decision_id"):
+        replay.run()
+
+    assert not (replay.run_root / "summary.json").exists()
+
+
+@pytest.mark.replay
+def test_a_missing_trade_log_data_quality_leaves_no_summary(
+    tmp_path: Path, position_management_recordings: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    outcome = _source_outcome(tmp_path, position_management_recordings)
+    broken_trade = {key: value for key, value in outcome.trade_log.items() if key != "data_quality"}
+    broken = replace(outcome, trade_log=broken_trade)
+    replay = PositionManagementReplay(
+        data_dir=tmp_path / "broken-data",
+        config=position_management_config(position_management_recordings, run_id="no-quality"),
+    )
+    monkeypatch.setattr(PositionManagementReplay, "_run_once", lambda self, attempt: broken)
+
+    with pytest.raises(PositionManagementReplayError, match="data_quality"):
+        replay.run()
+
+    assert not (replay.run_root / "summary.json").exists()
+
+
+# -- M12: the explicit outcome projection carries no generated ids ----------
+
+
+@pytest.mark.replay
+def test_the_scenario_outcome_carries_no_generated_scan_or_report_ids(
+    tmp_path: Path, position_management_recordings: Path
+) -> None:
+    run = _scenario(tmp_path, position_management_recordings, "no-generated-ids")
+
+    text = json.dumps(run["outcome"])
+    assert "scan_id" not in text
+    assert "report_id" not in text
+
+
+# -- M15: --live-llm is exercised for the management scenario ---------------
+
+
+@pytest.mark.replay
+def test_live_llm_calls_the_provider_once_per_recorded_request(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from oft.ports.llm import LLMRequest, LLMResult
+
+    calls = {"count": 0}
+    original = LLMStub.complete
+
+    def counting(self: LLMStub, request: LLMRequest) -> LLMResult:
+        calls["count"] += 1
+        return original(self, request)
+
+    monkeypatch.setattr(LLMStub, "complete", counting)
+    replay = _scenario_replay(tmp_path, live_llm=True, provider="stub", run_id="live")
+
+    result = replay.run()
+
+    recorded = sorted((tmp_path / "recordings").rglob("*.json"))
+    summary = json.loads(Path(result.summary_path).read_text(encoding="utf-8"))
+    assert summary["deterministic"] is True
+    assert recorded
+    assert calls["count"] == len(recorded)
+
+
+@pytest.mark.replay
+def test_live_llm_without_a_configured_provider_fails_typed(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.delenv("OFT_LLM_PROVIDER", raising=False)
+    replay = _scenario_replay(tmp_path, live_llm=True, run_id="no-provider")
+
+    with pytest.raises(ReplayError, match="no live LLM provider"):
+        replay.run()
+
+
+# -- M11: the summary carries a fixture identity digest ---------------------
+
+
+@pytest.mark.replay
+def test_the_summary_carries_a_fixture_identity_digest(
+    tmp_path: Path, position_management_recordings: Path
+) -> None:
+    run = _scenario(tmp_path, position_management_recordings, "identity")
+
+    digest = run["summary"]["identity_digest"]
+    assert len(digest) == 64
+    assert set(digest) <= set("0123456789abcdef")
+
+
+@pytest.mark.replay
+def test_the_identity_digest_is_checkout_independent_and_content_sensitive(
+    tmp_path: Path, position_management_recordings: Path
+) -> None:
+    first = tmp_path / "recordings-a"
+    second = tmp_path / "recordings-b"
+    shutil.copytree(position_management_recordings, first)
+    shutil.copytree(position_management_recordings, second)
+
+    left = _scenario(tmp_path / "left", first, "identity-a")
+    right = _scenario(tmp_path / "right", second, "identity-b")
+    assert left["summary"]["identity_digest"] == right["summary"]["identity_digest"]
+
+    (second / "EXTRA.txt").write_text("different input", encoding="utf-8")
+    changed = _scenario(tmp_path / "changed", second, "identity-c")
+    assert changed["summary"]["identity_digest"] != left["summary"]["identity_digest"]

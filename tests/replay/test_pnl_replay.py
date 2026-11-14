@@ -2,40 +2,20 @@
 
 from __future__ import annotations
 
-import json
-from datetime import date
 from decimal import Decimal
 from pathlib import Path
 from typing import Any
 
 import pytest
 
+from conftest import run_position_management
 from oft.domain.pnl import net_pnl_usd
-from oft.replay.position_management import (
-    PositionManagementConfig,
-    PositionManagementReplay,
-)
 
 pytestmark = pytest.mark.replay
 
-ROOT = Path(__file__).resolve().parents[2]
-ARCHIVE = ROOT / "tests" / "fixtures" / "archive"
-START = date(2026, 10, 1)
-END = date(2026, 10, 7)
-
 
 def _scenario(tmp_path: Path, recordings: Path, run_id: str) -> dict[str, Any]:
-    config = PositionManagementConfig(
-        symbol="BTCUSDT",
-        archive_fixture_dir=ARCHIVE,
-        backfill_start=START,
-        backfill_end=END,
-        recordings_dir=recordings,
-        run_id=run_id,
-    )
-    result = PositionManagementReplay(data_dir=tmp_path / run_id, config=config).run()
-    summary = json.loads(Path(result.summary_path).read_text(encoding="utf-8"))
-    return {"result": result, "summary": summary, "outcome": summary["outcome"]}
+    return run_position_management(tmp_path, recordings, run_id, data_dir=tmp_path / run_id)
 
 
 def _stable_summary_bytes(summary_path: str, run_id: str) -> bytes:
