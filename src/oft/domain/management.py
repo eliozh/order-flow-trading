@@ -47,12 +47,33 @@ class PartialClosePlan:
 
     ``escalated`` is ``True`` when the requested slice would leave a remainder
     below the recorded step/minimum; the caller then executes a ``FULL_CLOSE``
-    and records ``reason`` so the escalation is never silent.
+    and records ``reason`` so the escalation is never silent. ``size`` is the
+    position size the plan was computed from, so the invariants below can be
+    checked without trusting the caller.
     """
 
+    size: Decimal
     quantity: Decimal
     escalated: bool
     reason: str | None
+
+    def __post_init__(self) -> None:
+        if not self.size.is_finite() or self.size <= 0:
+            raise ValueError("a partial-close plan requires a positive position size")
+        if not self.quantity.is_finite() or self.quantity <= 0:
+            raise ValueError("a partial-close plan requires a positive quantity")
+        if self.quantity > self.size:
+            raise ValueError("a partial-close quantity cannot exceed the position size")
+        if self.escalated:
+            if self.quantity != self.size:
+                raise ValueError("an escalated plan must close the whole position")
+            if not self.reason:
+                raise ValueError("an escalated plan must record its reason")
+        else:
+            if self.reason is not None:
+                raise ValueError("a non-escalated plan must not carry an escalation reason")
+            if self.quantity >= self.size:
+                raise ValueError("a non-escalated plan must leave a remainder")
 
 
 def _finite_float(value: object) -> float | None:
@@ -179,20 +200,24 @@ def validate_position_management(
     raw_stop = payload.get("new_stop_price")
     raw_targets = payload.get("new_targets")
     targets: list[object] = []
-    if raw_targets is not None:
-        if not isinstance(raw_targets, list):
-            issues.append(
-                ManagementIssue(
-                    "position_management.new_targets",
-                    "TARGET_INVALID",
-                    "new_targets must be a list",
-                )
-            )
-        else:
-            targets = list(raw_targets)
 
-    issues.extend(_stop_issue(position, raw_stop, reference=reference))
-    issues.extend(_target_issues(position, targets, field="position_management.new_targets"))
+    # A FULL_CLOSE neither forbids nor applies the stop/target fields: the
+    # position is leaving, so an ignored field must never reject the needed
+    # reduce-only close (for example a stale stop above the mark).
+    if action is not ManagementAction.FULL_CLOSE:
+        if raw_targets is not None:
+            if not isinstance(raw_targets, list):
+                issues.append(
+                    ManagementIssue(
+                        "position_management.new_targets",
+                        "TARGET_INVALID",
+                        "new_targets must be a list",
+                    )
+                )
+            else:
+                targets = list(raw_targets)
+        issues.extend(_stop_issue(position, raw_stop, reference=reference))
+        issues.extend(_target_issues(position, targets, field="position_management.new_targets"))
 
     if action is ManagementAction.HOLD:
         if fraction is not None:
@@ -346,6 +371,7 @@ def plan_partial_close(
         raise ManagementSizingError("the partial-close fraction rounds to zero")
     if quantity >= size:
         return PartialClosePlan(
+            size=size,
             quantity=size,
             escalated=True,
             reason="the requested slice is the whole position; escalated to FULL_CLOSE",
@@ -359,6 +385,7 @@ def plan_partial_close(
     below_notional = min_notional > 0 and remainder_notional < min_notional
     if below_step or below_notional:
         return PartialClosePlan(
+            size=size,
             quantity=size,
             escalated=True,
             reason=(
@@ -366,7 +393,7 @@ def plan_partial_close(
                 "notional; escalated to FULL_CLOSE"
             ),
         )
-    return PartialClosePlan(quantity=quantity, escalated=False, reason=None)
+    return PartialClosePlan(size=size, quantity=quantity, escalated=False, reason=None)
 
 
 __all__ = [

@@ -621,7 +621,7 @@ class ManagementUpdateRecord:
     """
 
     position: PositionRecord
-    audits: tuple[AuditEventDraft, ...] = ()
+    audits: tuple[AuditEventDraft, ...]
 
 
 @dataclass(frozen=True)

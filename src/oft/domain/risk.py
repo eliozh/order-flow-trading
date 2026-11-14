@@ -26,6 +26,8 @@ from decimal import ROUND_DOWN, Decimal
 from enum import StrEnum
 from typing import Any
 
+from oft.domain.oms import PositionSide
+
 RISK_VERDICT_TTL_SECONDS = 30
 RISK_CAPS_STATE_KEY = "risk_caps"
 MAX_LEVERAGE_CEILING = 125.0
@@ -61,6 +63,14 @@ class ManagementAction(StrEnum):
     PARTIAL_CLOSE = "PARTIAL_CLOSE"
     FULL_CLOSE = "FULL_CLOSE"
     ADD = "ADD"
+
+
+class ManagementStatus(StrEnum):
+    """The closed outcome vocabulary of one management request."""
+
+    NO_ACTION = "NO_ACTION"
+    EXECUTED = "EXECUTED"
+    BLOCKED = "BLOCKED"
 
 
 class StopChange(StrEnum):
@@ -258,16 +268,26 @@ class ManagementClassification:
 
     The kill switch permits risk-reducing management (a reduce-only close or a
     tighter stop) and blocks risk-increasing management (an add or a looser or
-    removed stop). ``HOLD`` with no change writes nothing and is never blocked.
+    removed stop). ``HOLD`` with no change writes no order (it still records its
+    management-history entry and audit) and is never blocked.
     """
 
     risk_increasing: bool
     stop_change: StopChange
     reasons: tuple[str, ...]
 
+    def __post_init__(self) -> None:
+        # A loosened or removed stop is risk-increasing by definition; a
+        # classification that disagrees could bypass the kill switch and the
+        # management path's stop guard.
+        if not self.risk_increasing and self.stop_change in (StopChange.LOOSEN, StopChange.REMOVE):
+            raise ValueError("a loosened or removed stop must be risk-increasing")
+
 
 def _stop_change(
-    position_side: str, current_stop: Decimal | None, new_stop: Decimal | None
+    position_side: PositionSide,
+    current_stop: Decimal | None,
+    new_stop: Decimal | None,
 ) -> StopChange:
     # The provider schema cannot distinguish "no new stop" from "remove the
     # stop", so a null ``new_stop_price`` means "leave the stop unchanged".
@@ -278,7 +298,7 @@ def _stop_change(
         return StopChange.SET
     if new_stop == current_stop:
         return StopChange.NONE
-    if position_side == "LONG":
+    if position_side is PositionSide.LONG:
         return StopChange.TIGHTEN if new_stop > current_stop else StopChange.LOOSEN
     return StopChange.TIGHTEN if new_stop < current_stop else StopChange.LOOSEN
 
@@ -286,7 +306,7 @@ def _stop_change(
 def classify_management_intent(
     *,
     action: str,
-    position_side: str,
+    position_side: PositionSide,
     current_stop: Decimal | None,
     new_stop_price: Decimal | None,
     remove_stop: bool = False,
@@ -301,15 +321,17 @@ def classify_management_intent(
     normalized = action.strip().upper()
     if normalized not in ManagementAction.__members__:
         raise ValueError(f"unknown management action {action!r}")
-    if position_side not in {"LONG", "SHORT"}:
-        raise ValueError("position_side must be LONG or SHORT")
+    try:
+        side = PositionSide(position_side)
+    except ValueError as exc:
+        raise ValueError("position_side must be LONG or SHORT") from exc
     resolved = ManagementAction(normalized)
     if resolved is ManagementAction.FULL_CLOSE:
         change = StopChange.NONE
     elif remove_stop:
         change = StopChange.REMOVE
     else:
-        change = _stop_change(position_side, current_stop, new_stop_price)
+        change = _stop_change(side, current_stop, new_stop_price)
     reasons: list[str] = []
     increasing = False
     if resolved is ManagementAction.ADD:

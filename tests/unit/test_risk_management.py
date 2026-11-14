@@ -6,8 +6,10 @@ from decimal import Decimal
 
 import pytest
 
+from oft.domain.oms import PositionSide
 from oft.domain.risk import (
     ManagementAction,
+    ManagementClassification,
     StopChange,
     add_risk_quantity,
     classify_management_intent,
@@ -19,7 +21,7 @@ from oft.domain.risk import (
 def _classify(
     action: str,
     *,
-    side: str = "LONG",
+    side: PositionSide = PositionSide.LONG,
     current: str | None = "69000.00",
     new: str | None = None,
     remove_stop: bool = False,
@@ -69,8 +71,8 @@ def test_long_stop_tightening_reduces_and_loosening_increases() -> None:
 
 
 def test_short_stop_tightening_reduces_and_loosening_increases() -> None:
-    tighter = _classify("HOLD", side="SHORT", new="68500.00")
-    looser = _classify("HOLD", side="SHORT", new="70000.00")
+    tighter = _classify("HOLD", side=PositionSide.SHORT, new="68500.00")
+    looser = _classify("HOLD", side=PositionSide.SHORT, new="70000.00")
 
     assert tighter.stop_change is StopChange.TIGHTEN
     assert tighter.risk_increasing is False
@@ -116,7 +118,12 @@ def test_unknown_action_or_side_is_rejected() -> None:
     with pytest.raises(ValueError):
         _classify("SCALE_IN")
     with pytest.raises(ValueError):
-        _classify("HOLD", side="FLAT")
+        classify_management_intent(
+            action="HOLD",
+            position_side="FLAT",  # type: ignore[arg-type]
+            current_stop=Decimal("69000.00"),
+            new_stop_price=None,
+        )
 
 
 def test_management_helpers_name_the_verdict_and_exit_boundaries() -> None:
@@ -164,6 +171,28 @@ def test_add_risk_quantity_rejects_unusable_inputs(
 
 def test_every_action_classification_is_stable_for_a_repeated_input() -> None:
     for action in ManagementAction:
-        first = _classify(action.value, side="LONG", current="69000", new="69500")
-        second = _classify(action.value, side="LONG", current="69000", new="69500")
+        first = _classify(action.value, side=PositionSide.LONG, current="69000", new="69500")
+        second = _classify(action.value, side=PositionSide.LONG, current="69000", new="69500")
         assert first == second
+
+
+def test_a_classification_cannot_disagree_with_the_stop_direction() -> None:
+    """M11: LOOSEN/REMOVE implies risk_increasing, so the state is unrepresentable."""
+    with pytest.raises(ValueError):
+        ManagementClassification(
+            risk_increasing=False,
+            stop_change=StopChange.LOOSEN,
+            reasons=(),
+        )
+    with pytest.raises(ValueError):
+        ManagementClassification(
+            risk_increasing=False,
+            stop_change=StopChange.REMOVE,
+            reasons=(),
+        )
+    allowed = ManagementClassification(
+        risk_increasing=True,
+        stop_change=StopChange.LOOSEN,
+        reasons=("loosening the stop increases risk",),
+    )
+    assert allowed.risk_increasing is True

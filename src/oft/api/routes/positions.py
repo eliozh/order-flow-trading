@@ -27,13 +27,18 @@ from oft.api.schemas.position import (
     PositionMonitorData,
 )
 from oft.application.kill_switch import KillSwitch
-from oft.application.management_service import ManagementRejected, ManagementService
+from oft.application.management_service import (
+    ManagementRejected,
+    ManagementResult,
+    ManagementService,
+)
 from oft.application.position_service import (
     DATA_STALE,
     PositionCloseError,
     PositionNotFound,
     PositionService,
 )
+from oft.domain.risk import ManagementStatus
 
 router = APIRouter()
 
@@ -232,7 +237,7 @@ def manage_position(
         result.to_contract(),
         request_id=new_request_id(),
         provenance="MIXED",
-        data_quality=_management_quality(result.risk),
+        data_quality=_management_quality(result),
         idempotent_replay=result.idempotent_replay,
     )
     complete(request, key=key, request_hash=payload_hash, envelope=envelope, status=200)
@@ -240,8 +245,17 @@ def manage_position(
     return envelope
 
 
-def _management_quality(risk: dict[str, Any] | None) -> str:
-    """PARTIAL when the risk stage names an unmeasured input; never a false COMPLETE."""
+def _management_quality(result: ManagementResult) -> str:
+    """PARTIAL when risk evidence is missing or names an unmeasured input.
+
+    An executed action with no persisted risk verdict is never reported
+    COMPLETE; HOLD/NO_ACTION legitimately carry no risk evidence.
+    """
+    if result.executed and result.risk is None:
+        return "PARTIAL"
+    if result.status is ManagementStatus.BLOCKED:
+        return "PARTIAL"
+    risk = result.risk
     if isinstance(risk, dict) and risk.get("stale_inputs"):
         return "PARTIAL"
     if isinstance(risk, dict) and risk.get("verdict") == "BLOCK":

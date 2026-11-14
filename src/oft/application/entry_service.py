@@ -13,7 +13,7 @@ from __future__ import annotations
 import hashlib
 import json
 from dataclasses import dataclass, replace
-from decimal import Decimal, InvalidOperation
+from decimal import Decimal
 from typing import Any
 
 from oft.application.budget_ledger import BudgetEntry, BudgetLedger
@@ -26,6 +26,7 @@ from oft.application.llm_orchestrator import (
     LLMRuntimeRegistry,
     provider_configured,
 )
+from oft.application.llm_usage import total_cost, total_usage
 from oft.application.llm_validation import (
     decision_envelope,
     hash_text,
@@ -63,7 +64,6 @@ from oft.ports.llm import (
     LLMRequest,
     LLMResult,
     LLMRole,
-    LLMUsage,
     sanitize_provider_id,
 )
 from oft.ports.store import (
@@ -83,49 +83,6 @@ ENTRY_PROMPT_VERSION = 1
 # accept/reject/recheck paths also consult the OMS ledger, so a crashed accept
 # (order committed, trigger update lost) is reconciled instead of overwritten.
 _PRE_ACCEPT_STATUSES = frozenset({"PENDING_RECHECK", "RECHECKED"})
-
-_USAGE_FIELDS = (
-    "input_tokens",
-    "output_tokens",
-    "cache_read_tokens",
-    "cache_write_tokens",
-    "reasoning_tokens",
-)
-
-
-def _total_usage(calls: list[LLMCallRecord]) -> dict[str, int]:
-    """Sum usage across every call row of a decision (including repairs)."""
-    totals = dict.fromkeys(_USAGE_FIELDS, 0)
-    for call in calls:
-        try:
-            payload = json.loads(call.usage_json or "{}")
-        except (json.JSONDecodeError, TypeError, ValueError):
-            continue
-        if not isinstance(payload, dict):
-            continue
-        for field in _USAGE_FIELDS:
-            value = payload.get(field)
-            if isinstance(value, int) and not isinstance(value, bool):
-                totals[field] += value
-    return LLMUsage(**totals).to_contract()
-
-
-def _total_cost(budgets: list[BudgetEntry]) -> tuple[str, str, bool]:
-    """Sum cost across every budget row of a decision (including repairs)."""
-    if not budgets:
-        return "0", "stub/v1", True
-    amount = Decimal("0")
-    price_version = "stub/v1"
-    unpriced = False
-    for entry in budgets:
-        payload = entry.payload
-        try:
-            amount += Decimal(str(payload.get("cost_usd", "0")))
-        except (InvalidOperation, TypeError, ValueError):
-            continue
-        price_version = str(payload.get("price_version") or price_version)
-        unpriced = unpriced or bool(payload.get("unpriced", True))
-    return format(amount, "f"), price_version, unpriced
 
 
 class EntryRejected(Exception):
@@ -390,7 +347,7 @@ class EntryService:
                 validation_status=outcome.status,
                 raw_output_hash=outcome.raw_output_hash,
                 persisted_at=now,
-                payload_json=json.dumps(envelope, sort_keys=True),
+                payload_json=json.dumps(envelope, sort_keys=True, allow_nan=False),
             )
         )
         entry_payload = envelope.get("entry_recheck") or {}
@@ -1126,7 +1083,7 @@ class EntryService:
         knowledge_status: str | None,
         knowledge_reason: str | None,
     ) -> dict[str, Any]:
-        amount_usd, price_version, unpriced = _total_cost(budgets)
+        amount_usd, price_version, unpriced = total_cost(budgets)
         return {
             "provider": result.provider,
             "model": result.model,
@@ -1143,7 +1100,7 @@ class EntryService:
             "seed": None,
             "request_id": sanitize_provider_id(result.request_id, self._secrets),
             "latency_ms": result.latency_ms,
-            "usage": _total_usage(calls),
+            "usage": total_usage(calls),
             "cost": {
                 "amount_usd": amount_usd,
                 "currency": "USD",

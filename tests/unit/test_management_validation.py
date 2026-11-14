@@ -292,3 +292,21 @@ def test_plan_partial_close_rejects_unusable_inputs() -> None:
 def test_round_down_to_step_handles_a_missing_step() -> None:
     assert round_down_to_step(Decimal("1.2345"), Decimal("0")) == Decimal("1.2345")
     assert round_down_to_step(Decimal("1.2345"), Decimal("0.01")) == Decimal("1.23")
+
+
+def test_partial_close_plan_rejects_contradictory_states() -> None:
+    """M12: the plan's escalation and quantity invariants are unrepresentable."""
+    from oft.domain.management import PartialClosePlan
+
+    with pytest.raises(ValueError):
+        PartialClosePlan(size=Decimal("1"), quantity=Decimal("1"), escalated=True, reason=None)
+    with pytest.raises(ValueError):
+        PartialClosePlan(
+            size=Decimal("1"), quantity=Decimal("0.5"), escalated=True, reason="escalated"
+        )
+    with pytest.raises(ValueError):
+        PartialClosePlan(size=Decimal("1"), quantity=Decimal("1"), escalated=False, reason=None)
+    with pytest.raises(ValueError):
+        PartialClosePlan(size=Decimal("1"), quantity=Decimal("0.5"), escalated=False, reason="why")
+    with pytest.raises(ValueError):
+        PartialClosePlan(size=Decimal("1"), quantity=Decimal("2"), escalated=False, reason=None)

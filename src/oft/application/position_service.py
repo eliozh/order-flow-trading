@@ -83,8 +83,11 @@ from oft.domain.positions import (
 from oft.domain.risk import (
     RISK_VERDICT_TTL_SECONDS,
     BindingCap,
+    ManagementAction,
     RiskVerdict,
+    StopChange,
     Verdict,
+    classify_management_intent,
     verdict_to_contract,
 )
 from oft.domain.time import utc_timestamp
@@ -1515,7 +1518,11 @@ class PositionService:
         now: str,
         purpose: str,
     ) -> str:
-        """Persist the code-owned ALLOW verdict an exit/add management order binds to."""
+        """Persist the code-owned ALLOW verdict a management exit order binds to.
+
+        An ``ADD`` uses its own risk verdict (:mod:`oft.application.management_add`)
+        and never binds this one.
+        """
         risk_verdict_id = deterministic_id("RISK-MGD", f"{decision_id}:{purpose}:{quantity}:{mark}")
         self._persist_verdict(
             risk_verdict_id=risk_verdict_id,
@@ -1564,13 +1571,6 @@ class PositionService:
                     "POSITION_STATE_INVALID", "a full close must close the whole position"
                 )
             trade_context = self.full_close_context(context, close_reason=close_reason)
-        self._persist_mark(
-            position.position_id,
-            context.payload,
-            context.payload_json,
-            context.mark,
-            context.mark_as_of,
-        )
         intent = OrderIntent(
             symbol=position.symbol,
             side=reducing_side(position.side),
@@ -1594,10 +1594,33 @@ class PositionService:
             trade_log=trade_context,
             note=note,
         )
+        return self._submit_management_intent(context, intent)
+
+    def _submit_management_intent(
+        self,
+        context: ManagementMark,
+        intent: OrderIntent,
+    ) -> BrokerResult:
+        """Persist the decision mark, then submit one management intent.
+
+        The persist-mark, ``AuthContext``, gateway submit, and typed error
+        mapping are shared; each intent keeps its own risk amount, side,
+        purpose, and trade context intact.
+        """
+        self._persist_mark(
+            context.position.position_id,
+            context.payload,
+            context.payload_json,
+            context.mark,
+            context.mark_as_of,
+        )
         try:
             return self._gateway.submit(
                 intent,
-                AuthContext(actor_id="management_service", approval_id=approval_id),
+                AuthContext(
+                    actor_id="management_service",
+                    approval_id=intent.approval_id,
+                ),
                 mark_price=context.mark,
                 mark_as_of=context.mark_as_of,
             )
@@ -1634,13 +1657,6 @@ class PositionService:
             raise PositionCloseError(
                 "DATA_UNAVAILABLE", "the add risk at the mark is implausible"
             ) from exc
-        self._persist_mark(
-            position.position_id,
-            context.payload,
-            context.payload_json,
-            context.mark,
-            context.mark_as_of,
-        )
         intent = OrderIntent(
             symbol=position.symbol,
             side=increasing_side(position.side),
@@ -1662,23 +1678,16 @@ class PositionService:
             trigger_id=position.source_trigger_id,
             note=note,
         )
-        try:
-            return self._gateway.submit(
-                intent,
-                AuthContext(actor_id="management_service", approval_id=approval_id),
-                mark_price=context.mark,
-                mark_as_of=context.mark_as_of,
-            )
-        except (GatewayError, BrokerError) as exc:
-            raise PositionCloseError(exc.code, exc.message) from exc
+        return self._submit_management_intent(context, intent)
 
     def record_management_hold(
         self, position_id: str, *, decision_id: str, note: str, now: str
     ) -> dict[str, Any]:
         """Persist a HOLD action in ``management_history`` plus its audit.
 
-        HOLD writes no order, fill, or trade log. The history action is one of
-        the contract's management actions; the audit event carries the LLM
+        HOLD creates no order, fill, or trade log, but it does persist the
+        management-history entry and its audit event. The history action is one
+        of the contract's management actions; the audit event carries the LLM
         decision provenance.
         """
         record = self._store.get_position(position_id)
@@ -1735,9 +1744,12 @@ class PositionService:
         LLM-facing validation used (falling back to the position's own recorded
         mark and then the average entry) -- so a profit-locking trailing stop is
         accepted here exactly when it was accepted upstream. A caller cannot
-        persist a stop that would never protect the position. No management
-        history action is written (stop updates are not in the contract's action
-        enum); the change is recorded in the audit chain as ``STOP_UPDATED``.
+        persist a stop that would never protect the position, and it cannot
+        loosen or remove the stop either: that would be a risk-increasing change
+        the management path forbids (defense in depth for replay and any direct
+        caller). No management history action is written (stop updates are not
+        in the contract's action enum); the change is recorded in the audit chain
+        as ``STOP_UPDATED``.
         """
         record = self._store.get_position(position_id)
         if record is None:
@@ -1760,6 +1772,19 @@ class PositionService:
                     )
                 side_reference = reference or position.mark_price or position.avg_entry_price
                 validate_stop_side(position.side, side_reference, stop_price)
+                current_stop = position.stop_price
+                if current_stop is not None:
+                    change = classify_management_intent(
+                        action=ManagementAction.PARTIAL_CLOSE.value,
+                        position_side=position.side,
+                        current_stop=current_stop,
+                        new_stop_price=stop_price,
+                    ).stop_change
+                    if change in (StopChange.LOOSEN, StopChange.REMOVE):
+                        raise PositionError(
+                            "RISK_BLOCKED",
+                            "a management action may not loosen or remove the protective stop",
+                        )
             except PositionError as exc:
                 raise PositionCloseError(exc.code, exc.message) from exc
         updated = dict(payload)
@@ -2451,7 +2476,10 @@ class PositionService:
         )
         requested_payload = {
             "entry_price": str(mark),
-            "stop_price": str(position.stop_price),
+            # A stop-less position has no protective stop; persist the contract's
+            # decimal "0" (as the ADD gate does) rather than the Python string
+            # "None", which is not a valid decimal.
+            "stop_price": "0" if position.stop_price is None else str(position.stop_price),
             "quantity": str(resolved_quantity),
             "risk_pct": 0.0,
             "leverage": position.leverage,

@@ -23,9 +23,9 @@ from __future__ import annotations
 import hashlib
 import json
 from collections.abc import Sequence
-from dataclasses import dataclass
-from decimal import Decimal, InvalidOperation
-from typing import Any
+from dataclasses import dataclass, replace
+from decimal import Decimal
+from typing import Any, NoReturn
 
 from oft.application.budget_ledger import BudgetEntry, BudgetLedger
 from oft.application.entry_service import RiskCapsError, effective_caps
@@ -37,6 +37,7 @@ from oft.application.llm_orchestrator import (
     LLMRuntimeRegistry,
     provider_configured,
 )
+from oft.application.llm_usage import total_cost, total_usage
 from oft.application.llm_validation import (
     ValidationIssue,
     decision_envelope,
@@ -52,6 +53,8 @@ from oft.application.management_add import (
 from oft.application.paper_account import PaperAccountService, compute_equity
 from oft.application.position_service import (
     ManagementMark,
+    PositionCloseError,
+    PositionNotFound,
     PositionService,
 )
 from oft.application.prompt_builder import KnowledgeInjection
@@ -66,13 +69,15 @@ from oft.domain.management import (
     plan_partial_close,
     validate_position_management,
 )
-from oft.domain.oms import Position
+from oft.domain.oms import Position, PositionSide
 from oft.domain.pnl import json_decimal
 from oft.domain.prompts import PromptRole
 from oft.domain.risk import (
     BindingCap,
     ManagementAction,
     ManagementClassification,
+    ManagementStatus,
+    StopChange,
     Verdict,
     add_risk_quantity,
     classify_management_intent,
@@ -85,22 +90,22 @@ from oft.ports.llm import (
     LLMRequest,
     LLMResult,
     LLMRole,
-    LLMUsage,
     sanitize_provider_id,
 )
 from oft.ports.store import (
     DecisionRecord,
     LLMCallRecord,
+    OrderRecord,
     StorePort,
 )
 
-_USAGE_FIELDS = (
-    "input_tokens",
-    "output_tokens",
-    "cache_read_tokens",
-    "cache_write_tokens",
-    "reasoning_tokens",
-)
+_STOP_REFUSAL_FIELD = "position_management.new_stop_price"
+# The prompt embeds prior management notes; cap the count, each free-text note,
+# and the serialized total so a long-lived position cannot grow the prompt
+# without bound.
+_MANAGEMENT_HISTORY_MAX_ENTRIES = 20
+_MANAGEMENT_HISTORY_TEXT_LIMIT = 200
+_MANAGEMENT_HISTORY_MAX_BYTES = 4096
 
 
 class ManagementRejected(Exception):
@@ -114,13 +119,32 @@ class ManagementRejected(Exception):
 
 
 @dataclass(frozen=True)
+class ManagementRefusal:
+    """One typed refusal attached to an executed management result.
+
+    The stop-loosening guard is independent of the reduce-only execution: the
+    close may succeed while its companion stop change is refused. The typed
+    shape means the audit writer and the API response can never read a missing
+    key, and ``to_contract`` keeps the wire format identical to the historical
+    ``{code, field, message}`` dicts.
+    """
+
+    code: str
+    field: str
+    message: str
+
+    def to_contract(self) -> dict[str, str]:
+        return {"code": self.code, "field": self.field, "message": self.message}
+
+
+@dataclass(frozen=True)
 class ManagementResult:
     """The outcome of one ``oft pos manage`` / API management call."""
 
     position_id: str
     decision_id: str
-    action: str
-    status: str
+    action: ManagementAction
+    status: ManagementStatus
     executed: bool
     reason_code: str
     reason: str | None = None
@@ -131,14 +155,39 @@ class ManagementResult:
     position: dict[str, Any] | None = None
     trade_log: dict[str, Any] | None = None
     account: dict[str, Any] | None = None
+    # Additive typed refusals (for example a PARTIAL_CLOSE whose companion
+    # stop-loosening was refused while the reduce-only close still executed).
+    refusals: tuple[ManagementRefusal, ...] = ()
     idempotent_replay: bool = False
+
+    def __post_init__(self) -> None:
+        # Coerce the closed vocabularies so callers may pass their string values
+        # while the result still cannot carry an unknown action/status.
+        object.__setattr__(self, "action", ManagementAction(self.action))
+        object.__setattr__(self, "status", ManagementStatus(self.status))
+        if not self.reason_code.strip():
+            raise ValueError("a management result requires a non-empty reason_code")
+        if self.status is ManagementStatus.EXECUTED:
+            if not self.executed:
+                raise ValueError("an EXECUTED result must set executed=True")
+            if self.order is None or self.fill is None:
+                raise ValueError("an EXECUTED result requires its order and fill")
+            if self.action is ManagementAction.FULL_CLOSE and self.trade_log is None:
+                raise ValueError("an EXECUTED FULL_CLOSE requires its trade log")
+        else:
+            if self.executed:
+                raise ValueError("a non-executed result must not set executed=True")
+            if self.order is not None or self.fill is not None:
+                raise ValueError("a non-executed result must not carry an order or fill")
+            if self.trade_log is not None:
+                raise ValueError("a non-executed result must not carry a trade log")
 
     def to_contract(self) -> dict[str, Any]:
         return {
             "position_id": self.position_id,
             "decision_id": self.decision_id,
-            "action": self.action,
-            "status": self.status,
+            "action": self.action.value,
+            "status": self.status.value,
             "executed": self.executed,
             "reason_code": self.reason_code,
             "reason": self.reason,
@@ -149,6 +198,7 @@ class ManagementResult:
             "position": self.position,
             "trade_log": self.trade_log,
             "account": self.account,
+            "refusals": [item.to_contract() for item in self.refusals],
             "idempotent_replay": self.idempotent_replay,
         }
 
@@ -164,37 +214,30 @@ class _PositionSource:
     trigger_id: str | None
 
 
-def _total_usage(calls: Sequence[LLMCallRecord]) -> dict[str, int]:
-    totals = dict.fromkeys(_USAGE_FIELDS, 0)
-    for call in calls:
-        try:
-            payload = json.loads(call.usage_json or "{}")
-        except (json.JSONDecodeError, TypeError, ValueError):
-            continue
-        if not isinstance(payload, dict):
-            continue
-        for field in _USAGE_FIELDS:
-            value = payload.get(field)
-            if isinstance(value, int) and not isinstance(value, bool):
-                totals[field] += value
-    return LLMUsage(**totals).to_contract()
+def _bounded_management_history(value: object) -> list[dict[str, Any]]:
+    """The newest bounded management-history entries for the prompt.
 
-
-def _total_cost(budgets: list[BudgetEntry]) -> tuple[str, str, bool]:
-    if not budgets:
-        return "0", "stub/v1", True
-    amount = Decimal("0")
-    price_version = "stub/v1"
-    unpriced = False
-    for entry in budgets:
-        payload = entry.payload
-        try:
-            amount += Decimal(str(payload.get("cost_usd", "0")))
-        except (InvalidOperation, TypeError, ValueError):
+    Keeps at most ``_MANAGEMENT_HISTORY_MAX_ENTRIES`` newest dict entries,
+    truncates each free-text note/rationale, and drops the oldest entries until
+    the serialized form fits ``_MANAGEMENT_HISTORY_MAX_BYTES``.
+    """
+    if not isinstance(value, list):
+        return []
+    entries: list[dict[str, Any]] = []
+    for item in value[-_MANAGEMENT_HISTORY_MAX_ENTRIES:]:
+        if not isinstance(item, dict):
             continue
-        price_version = str(payload.get("price_version") or price_version)
-        unpriced = unpriced or bool(payload.get("unpriced", True))
-    return format(amount, "f"), price_version, unpriced
+        entry = dict(item)
+        for key in ("note", "rationale"):
+            text = entry.get(key)
+            if isinstance(text, str) and len(text) > _MANAGEMENT_HISTORY_TEXT_LIMIT:
+                entry[key] = text[:_MANAGEMENT_HISTORY_TEXT_LIMIT]
+        entries.append(entry)
+    while entries and (
+        len(json.dumps(entries, sort_keys=True).encode("utf-8")) > _MANAGEMENT_HISTORY_MAX_BYTES
+    ):
+        entries.pop(0)
+    return entries
 
 
 _LLM_ERROR_CODES = frozenset({"LLM_REFUSED", "LLM_OUTPUT_TRUNCATED", "LLM_SCHEMA_INVALID"})
@@ -277,6 +320,12 @@ class ManagementService:
         except (LLMConfigurationError, LLMAdapterError) as exc:
             raise ManagementRejected(exc.code, exc.message) from exc
         outcome = orchestration.outcome
+        # The MANAGEMENT call (plus a possible repair) can take tens of
+        # seconds; anchor every derived timestamp -- provenance, envelope,
+        # verdict expiry, gate inputs, and audits -- to a clock read AFTER it
+        # returns, so a slow valid response cannot persist an already-expired
+        # verdict (H1).
+        context = replace(context, now=utc_timestamp(self._clock.now()))
         final = orchestration.final_result
         calls = list(orchestration.calls)
         budgets = list(orchestration.budgets)
@@ -374,52 +423,176 @@ class ManagementService:
             },
         }
 
-        classification = classify_management_intent(
+        return self._dispatch_authorized(
+            context,
+            decision_id=decision_id,
             action=action,
-            position_side=context.position.side.value,
-            current_stop=context.position.stop_price,
-            new_stop_price=json_decimal(management.get("new_stop_price")),
+            management=management,
+            llm_view=llm_view,
         )
-        self._audit_classification(context, decision_id, action, classification)
-        if classification.risk_increasing:
-            try:
-                self._kill_switch.require_clear()
-            except KillSwitchActive as exc:
-                raise ManagementRejected(exc.code, exc.message) from exc
 
-        if action == ManagementAction.HOLD.value:
-            position_payload = self._positions.record_management_hold(
-                position_id,
-                decision_id=decision_id,
-                note=_note(management),
-                now=context.now,
+    # -- classification and dispatch -------------------------------------
+
+    def _dispatch_authorized(
+        self,
+        context: ManagementMark,
+        *,
+        decision_id: str,
+        action: str,
+        management: dict[str, Any],
+        llm_view: dict[str, Any],
+        idempotent_replay: bool = False,
+    ) -> ManagementResult:
+        """Classify, apply the kill-switch policy, execute, and record the outcome.
+
+        Every request that reaches this point appends a ``MANAGEMENT_OUTCOME``
+        audit event: ``EXECUTED``/``BLOCKED``/``NO_ACTION`` are terminal, while a
+        ``REFUSED`` outcome (kill switch, missing contract/caps, gate or
+        validation error) is not, so a same-key replay may re-attempt it. This
+        is the one post-validation dispatch path shared by the live call and the
+        replay re-attempt.
+        """
+        position = context.position
+        try:
+            classification = classify_management_intent(
+                action=action,
+                position_side=position.side,
+                current_stop=position.stop_price,
+                new_stop_price=json_decimal(management.get("new_stop_price")),
             )
-            return self._result(
-                context,
+            self._audit_classification(context, decision_id, action, classification)
+            if classification.risk_increasing:
+                self._kill_switch.require_clear()
+
+            if action == ManagementAction.HOLD.value:
+                position_payload = self._positions.record_management_hold(
+                    position.position_id,
+                    decision_id=decision_id,
+                    note=_note(management),
+                    now=context.now,
+                )
+                result = self._result(
+                    context,
+                    decision_id=decision_id,
+                    action=action,
+                    status=ManagementStatus.NO_ACTION,
+                    executed=False,
+                    reason_code="HOLD",
+                    reason="the management decision was HOLD; no order was created",
+                    llm=llm_view,
+                    position=position_payload,
+                )
+            elif action == ManagementAction.FULL_CLOSE.value:
+                result = self._full_close(
+                    context, decision_id=decision_id, llm=llm_view, reason=None
+                )
+            elif action == ManagementAction.PARTIAL_CLOSE.value:
+                result = self._partial_close(
+                    context, decision_id=decision_id, management=management, llm=llm_view
+                )
+            elif action == ManagementAction.ADD.value:
+                result = self._add(
+                    context, decision_id=decision_id, management=management, llm=llm_view
+                )
+            else:
+                # The action vocabulary is closed and already validated above; a
+                # value that reaches here is a single-repair bug, never an
+                # implicit ADD.
+                raise ManagementRejected(
+                    "LLM_SCHEMA_INVALID", f"unsupported management action {action!r}"
+                )
+        except KillSwitchActive as exc:
+            self._record_outcome(
+                position_id=position.position_id,
+                at=context.now,
                 decision_id=decision_id,
                 action=action,
-                status="NO_ACTION",
-                executed=False,
-                reason_code="HOLD",
-                reason="the management decision was HOLD; no order was created",
-                llm=llm_view,
-                position=position_payload,
+                outcome="REFUSED",
+                reason_code=exc.code,
+                message=exc.message,
+                terminal=False,
             )
-
-        if action == ManagementAction.FULL_CLOSE.value:
-            return self._full_close(context, decision_id=decision_id, llm=llm_view, reason=None)
-
-        if action == ManagementAction.PARTIAL_CLOSE.value:
-            return self._partial_close(
-                context, decision_id=decision_id, management=management, llm=llm_view
+            raise ManagementRejected(exc.code, exc.message) from exc
+        except (ManagementRejected, PositionCloseError, PositionNotFound) as exc:
+            self._record_outcome(
+                position_id=position.position_id,
+                at=context.now,
+                decision_id=decision_id,
+                action=action,
+                outcome="REFUSED",
+                reason_code=exc.code,
+                message=exc.message,
+                terminal=False,
             )
+            raise
+        self._record_outcome_from_result(
+            position_id=position.position_id,
+            at=context.now,
+            decision_id=decision_id,
+            result=result,
+        )
+        return replace(result, idempotent_replay=True) if idempotent_replay else result
 
-        if action == ManagementAction.ADD.value:
-            return self._add(context, decision_id=decision_id, management=management, llm=llm_view)
+    def _record_outcome(
+        self,
+        *,
+        position_id: str,
+        at: str,
+        decision_id: str,
+        action: str,
+        outcome: str,
+        reason_code: str,
+        message: str | None,
+        terminal: bool,
+        risk: dict[str, Any] | None = None,
+    ) -> None:
+        payload: dict[str, Any] = {
+            "decision_id": decision_id,
+            "action": action,
+            "outcome": outcome,
+            "reason_code": reason_code,
+            "message": message,
+            "terminal": terminal,
+        }
+        if risk is not None:
+            payload["risk"] = risk
+        record_audit(
+            self._store,
+            event_type="MANAGEMENT_OUTCOME",
+            actor={"kind": "SYSTEM", "id": "management_service"},
+            subject={"kind": "POSITION", "id": position_id},
+            payload=payload,
+            at=at,
+        )
 
-        # The action vocabulary is closed and already validated above; a value
-        # that reaches here is a single-repair bug, never an implicit ADD.
-        raise ManagementRejected("LLM_SCHEMA_INVALID", f"unsupported management action {action!r}")
+    def _record_outcome_from_result(
+        self,
+        *,
+        position_id: str,
+        at: str,
+        decision_id: str,
+        result: ManagementResult,
+    ) -> None:
+        if result.status is ManagementStatus.EXECUTED:
+            outcome = "EXECUTED"
+            terminal = True
+        elif result.status is ManagementStatus.BLOCKED:
+            outcome = "BLOCKED"
+            terminal = True
+        else:
+            outcome = "NO_ACTION"
+            terminal = True
+        self._record_outcome(
+            position_id=position_id,
+            at=at,
+            decision_id=decision_id,
+            action=result.action.value,
+            outcome=outcome,
+            reason_code=result.reason_code,
+            message=result.reason,
+            terminal=terminal,
+            risk=result.risk,
+        )
 
     # -- execution paths -------------------------------------------------
 
@@ -531,7 +704,9 @@ class ManagementService:
             approval_id=approval_id,
             note=_note(management),
         )
-        self._apply_stop_targets(context, decision_id=decision_id, management=management)
+        refusals = self._apply_stop_targets(
+            context, decision_id=decision_id, action=purpose, management=management
+        )
         position_payload = self._read_position_payload(position.position_id)
         return self._result(
             context,
@@ -540,12 +715,15 @@ class ManagementService:
             status="EXECUTED",
             executed=True,
             reason_code="PARTIAL_CLOSE",
-            reason="the position was partially reduced by the management decision",
+            reason=_executed_reason(
+                "the position was partially reduced by the management decision", refusals
+            ),
             llm=llm,
             risk=self._risk_view(risk_verdict_id),
             order=result.order.to_contract(),
             fill=result.fill.to_contract(),
             position=position_payload,
+            refusals=tuple(refusals),
         )
 
     def _add(
@@ -678,7 +856,12 @@ class ManagementService:
             leverage=position.leverage,
             note=_note(management),
         )
-        self._apply_stop_targets(context, decision_id=decision_id, management=management)
+        refusals = self._apply_stop_targets(
+            context,
+            decision_id=decision_id,
+            action=ManagementAction.ADD.value,
+            management=management,
+        )
         position_payload = self._read_position_payload(position.position_id)
         clamped = requested_quantity is not None and requested_quantity != allowed_quantity
         return self._result(
@@ -688,16 +871,18 @@ class ManagementService:
             status="EXECUTED",
             executed=True,
             reason_code="ADD",
-            reason=(
+            reason=_executed_reason(
                 f"the add was clamped to the stricter cap ({execution.binding_cap.value})"
                 if clamped
-                else "the add was executed within every cap"
+                else "the add was executed within every cap",
+                refusals,
             ),
             llm=llm,
             risk=execution.to_view(),
             order=result.order.to_contract(),
             fill=result.fill.to_contract(),
             position=position_payload,
+            refusals=tuple(refusals),
         )
 
     def _apply_stop_targets(
@@ -705,8 +890,16 @@ class ManagementService:
         context: ManagementMark,
         *,
         decision_id: str,
+        action: str,
         management: dict[str, Any],
-    ) -> None:
+    ) -> list[ManagementRefusal]:
+        """Apply the validated stop/target changes, refusing any stop loosening.
+
+        The manual management path forbids every stop loosening/removal. A
+        loosened stop is never applied, but it does not discard the companion
+        reduce-only close (already executed) or valid target changes. The
+        refusal is audited and returned so the caller can surface it.
+        """
         new_stop = json_decimal(management.get("new_stop_price"))
         raw_targets = management.get("new_targets") or []
         targets = (
@@ -715,7 +908,25 @@ class ManagementService:
             else None
         )
         if new_stop is None and targets is None:
-            return
+            return []
+        refusals: list[ManagementRefusal] = []
+        if new_stop is not None:
+            refusal = self._stop_refusal(
+                side=context.position.side,
+                current_stop=context.position.stop_price,
+                new_stop=new_stop,
+            )
+            if refusal is not None:
+                refusals.append(refusal)
+                self._audit_stop_refused(
+                    context,
+                    decision_id=decision_id,
+                    action=action,
+                    refusal=refusal,
+                )
+                new_stop = None
+        if new_stop is None and targets is None:
+            return refusals
         # ``None`` means "leave the stop unchanged": a target-only change must
         # never synthesize a placeholder stop (it is contract-invalid and would
         # be treated as "no stop" by the protective-exit tick).
@@ -726,6 +937,54 @@ class ManagementService:
             decision_id=decision_id,
             now=context.now,
             reference=context.mark,
+        )
+        return refusals
+
+    @staticmethod
+    def _stop_refusal(
+        *,
+        side: PositionSide,
+        current_stop: Decimal | None,
+        new_stop: Decimal,
+    ) -> ManagementRefusal | None:
+        """A typed refusal when the proposed stop loosens/removes the current one."""
+        if current_stop is None:
+            return None
+        change = classify_management_intent(
+            action=ManagementAction.PARTIAL_CLOSE.value,
+            position_side=side,
+            current_stop=current_stop,
+            new_stop_price=new_stop,
+        ).stop_change
+        if change not in (StopChange.LOOSEN, StopChange.REMOVE):
+            return None
+        return ManagementRefusal(
+            code="RISK_BLOCKED",
+            field=_STOP_REFUSAL_FIELD,
+            message="a management action may not loosen or remove the protective stop",
+        )
+
+    def _audit_stop_refused(
+        self,
+        context: ManagementMark,
+        *,
+        decision_id: str,
+        action: str,
+        refusal: ManagementRefusal,
+    ) -> None:
+        record_audit(
+            self._store,
+            event_type="MANAGEMENT_STOP_REFUSED",
+            actor={"kind": "SYSTEM", "id": "management_service"},
+            subject={"kind": "POSITION", "id": context.position.position_id},
+            payload={
+                "decision_id": decision_id,
+                "action": action,
+                "code": refusal.code,
+                "field": refusal.field,
+                "message": refusal.message,
+            },
+            at=context.now,
         )
 
     # -- risk gate -------------------------------------------------------
@@ -797,7 +1056,7 @@ class ManagementService:
             "realized_pnl_usd": payload.get("realized_pnl_usd"),
             "opened_at": position.opened_at,
             "updated_at": position.updated_at,
-            "management_history": history if isinstance(history, list) else [],
+            "management_history": _bounded_management_history(history),
         }
 
     def _knowledge_injection(self) -> KnowledgeInjection:
@@ -868,7 +1127,7 @@ class ManagementService:
         now: str,
         knowledge: KnowledgeInjection,
     ) -> dict[str, Any]:
-        amount_usd, price_version, unpriced = _total_cost(budgets)
+        amount_usd, price_version, unpriced = total_cost(budgets)
         return {
             "provider": result.provider,
             "model": result.model,
@@ -885,7 +1144,7 @@ class ManagementService:
             "seed": None,
             "request_id": sanitize_provider_id(result.request_id, self._secrets),
             "latency_ms": result.latency_ms,
-            "usage": _total_usage(calls),
+            "usage": total_usage(calls),
             "cost": {
                 "amount_usd": amount_usd,
                 "currency": "USD",
@@ -913,7 +1172,7 @@ class ManagementService:
                 validation_status=validation_status,
                 raw_output_hash=raw_output_hash,
                 persisted_at=now,
-                payload_json=json.dumps(envelope, sort_keys=True),
+                payload_json=json.dumps(envelope, sort_keys=True, allow_nan=False),
             )
         )
 
@@ -988,14 +1247,15 @@ class ManagementService:
         fill: dict[str, Any] | None = None,
         position: dict[str, Any] | None = None,
         trade_log: dict[str, Any] | None = None,
+        refusals: tuple[ManagementRefusal, ...] = (),
         idempotent_replay: bool = False,
     ) -> ManagementResult:
         account = self._paper.summary()
         return ManagementResult(
             position_id=context.position.position_id,
             decision_id=decision_id,
-            action=action,
-            status=status,
+            action=ManagementAction(action),
+            status=ManagementStatus(status),
             executed=executed,
             reason_code=reason_code,
             reason=reason,
@@ -1005,6 +1265,7 @@ class ManagementService:
             fill=fill,
             position=position,
             trade_log=trade_log,
+            refusals=refusals,
             account={
                 "account_id": account["account_id"],
                 "balance": account["balance"],
@@ -1023,15 +1284,24 @@ class ManagementService:
         *,
         provider_name: str | None,
     ) -> ManagementResult | None:
+        """Return the stored outcome, or re-attempt an unexecuted valid decision.
+
+        Replay fails closed: a stored payload that cannot be parsed into the
+        closed action vocabulary, or an executed action missing its order/fill
+        (or, for a full close, its matching trade log), is a typed
+        ``DATA_UNAVAILABLE``. A decision whose execution was refused for a
+        transient reason is re-attempted through the same post-validation
+        dispatch path, without re-running the LLM, re-saving the decision, or
+        creating a second order.
+        """
         record = self._store.get_decision(decision_id)
         if record is None:
             return None
-        payload = json.loads(record.payload_json)
-        if not isinstance(payload, dict):
-            raise ManagementRejected(
-                "DATA_UNAVAILABLE", "the stored management decision is unreadable"
-            )
-        recorded_provider = (payload.get("provenance") or {}).get("provider")
+        payload = self._decode_stored(
+            record.payload_json, "the stored management decision is unreadable"
+        )
+        provenance = payload.get("provenance")
+        recorded_provider = provenance.get("provider") if isinstance(provenance, dict) else None
         if (
             provider_name
             and isinstance(recorded_provider, str)
@@ -1049,12 +1319,13 @@ class ManagementService:
                 str(payload.get("rejected_reason") or "the management decision was rejected"),
                 field=first.get("field"),
             )
-        management = payload.get("position_management") or {}
-        action = str(management.get("action") or "HOLD")
+        action, management = self._stored_management(payload)
         position_record = self._store.get_position(position_id)
         if position_record is None:
             raise ManagementRejected("POSITION_NOT_FOUND", f"position {position_id} does not exist")
-        position_payload = json.loads(position_record.payload_json)
+        position_payload = self._decode_stored(
+            position_record.payload_json, f"the stored position {position_id} is unreadable"
+        )
         history = position_payload.get("management_history") or []
         entry = next(
             (
@@ -1066,33 +1337,58 @@ class ManagementService:
         )
         llm_view = {
             "decision_id": decision_id,
-            "action": action,
+            "action": action.value,
             "validation_status": record.validation_status,
             "confidence": payload.get("confidence"),
             "rationale": payload.get("rationale"),
-            "provenance": payload.get("provenance"),
+            "provenance": provenance,
         }
-        if entry is None:
+        order, purpose = self._replay_order(decision_id, action, entry)
+        if order is not None:
+            return self._replayed_executed(
+                position_id=position_id,
+                decision_id=decision_id,
+                action=action.value,
+                purpose=purpose or action.value,
+                order=order,
+                position_payload=position_payload,
+                management=management,
+                llm_view=llm_view,
+            )
+        outcome = self._last_outcome(decision_id)
+        if outcome is not None and outcome.get("terminal") and outcome.get("outcome") == "BLOCKED":
+            risk = outcome.get("risk")
             return ManagementResult(
                 position_id=position_id,
                 decision_id=decision_id,
                 action=action,
-                status="BLOCKED",
+                status=ManagementStatus.BLOCKED,
                 executed=False,
-                reason_code="RISK_BLOCKED",
-                reason="the original management action was blocked; no order was created",
+                reason_code=str(outcome.get("reason_code") or "RISK_BLOCKED"),
+                reason=str(
+                    outcome.get("message")
+                    or "the original management action was blocked; no order was created"
+                ),
                 llm=llm_view,
+                risk=risk if isinstance(risk, dict) else None,
                 position=position_payload,
                 account=self._account_view(),
                 idempotent_replay=True,
             )
-        order_id = entry.get("executed_order_id")
-        if order_id is None:
+        if outcome is not None and outcome.get("terminal") and outcome.get("outcome") == "EXECUTED":
+            # The stored result says an order committed but no deterministic-key
+            # or history-referenced order exists: never re-execute a possibly
+            # committed action, and never report EXECUTED without its evidence.
+            raise ManagementRejected(
+                "DATA_UNAVAILABLE",
+                "the recorded management execution has no order or fill",
+            )
+        if action is ManagementAction.HOLD and entry is not None:
             return ManagementResult(
                 position_id=position_id,
                 decision_id=decision_id,
                 action=action,
-                status="NO_ACTION",
+                status=ManagementStatus.NO_ACTION,
                 executed=False,
                 reason_code="HOLD",
                 reason="the original management decision was HOLD; no order was created",
@@ -1101,69 +1397,264 @@ class ManagementService:
                 account=self._account_view(),
                 idempotent_replay=True,
             )
-        order = self._store.get_order(str(order_id))
-        if order is None:
-            raise ManagementRejected(
-                "DATA_UNAVAILABLE", f"the replayed order {order_id} is missing"
-            )
-        if position_payload.get("state") == "OPEN":
-            # A stop/target update is a second transaction after the fill. If it
-            # was lost (crash between the two commits), a same-key replay must
-            # apply it idempotently instead of reporting success with the stale
-            # stop still in place.
-            position_payload = self._reconcile_replayed_change(
-                position_id=position_id,
-                decision_id=decision_id,
-                decision=payload,
-                position_payload=position_payload,
-            )
-        order_payload = json.loads(order.payload_json)
-        fill = self._store.get_fill_by_order_id(str(order_id))
-        trade = self._store.get_trade_log_for_position(position_id)
-        return ManagementResult(
+        return self._reattempt_replay(
             position_id=position_id,
             decision_id=decision_id,
             action=action,
-            status="EXECUTED",
+            management=management,
+            llm_view=llm_view,
+        )
+
+    @staticmethod
+    def _decode_stored(raw: str, message: str) -> dict[str, Any]:
+        try:
+            payload = json.loads(raw)
+        except (json.JSONDecodeError, TypeError, ValueError) as exc:
+            raise ManagementRejected("DATA_UNAVAILABLE", message) from exc
+        if not isinstance(payload, dict):
+            raise ManagementRejected("DATA_UNAVAILABLE", message)
+        return payload
+
+    @staticmethod
+    def _stored_management(payload: dict[str, Any]) -> tuple[ManagementAction, dict[str, Any]]:
+        management = payload.get("position_management")
+        if not isinstance(management, dict):
+            raise ManagementRejected(
+                "DATA_UNAVAILABLE",
+                "the stored management decision has no position_management payload",
+            )
+        raw_action = management.get("action")
+        try:
+            action = ManagementAction(str(raw_action))
+        except ValueError as exc:
+            raise ManagementRejected(
+                "DATA_UNAVAILABLE",
+                f"the stored management decision has an unknown action {raw_action!r}",
+            ) from exc
+        return action, management
+
+    def _replay_order(
+        self,
+        decision_id: str,
+        action: ManagementAction,
+        entry: dict[str, Any] | None,
+    ) -> tuple[OrderRecord | None, str | None]:
+        """The committed order for this decision, by history row or deterministic key."""
+        if entry is not None and entry.get("executed_order_id") is not None:
+            order_id = str(entry["executed_order_id"])
+            order = self._store.get_order(order_id)
+            if order is None:
+                raise ManagementRejected(
+                    "DATA_UNAVAILABLE", f"the replayed order {order_id} is missing"
+                )
+            return order, order.purpose or action.value
+        purposes = [action.value]
+        if action is ManagementAction.PARTIAL_CLOSE:
+            # A slice that rounds to zero or leaves a sub-minimum remainder
+            # escalates to a full close under the FULL_CLOSE order key.
+            purposes.append(ManagementAction.FULL_CLOSE.value)
+        for purpose in purposes:
+            order = self._store.get_order_by_idempotency(_order_key(decision_id, purpose))
+            if order is not None:
+                return order, purpose
+        return None, None
+
+    def _replayed_executed(
+        self,
+        *,
+        position_id: str,
+        decision_id: str,
+        action: str,
+        purpose: str,
+        order: OrderRecord,
+        position_payload: dict[str, Any],
+        management: dict[str, Any],
+        llm_view: dict[str, Any],
+    ) -> ManagementResult:
+        """Reconstruct an executed result only from complete, matching evidence.
+
+        A stop/target change whose second transaction was lost is reconciled
+        only while its pre-change snapshot still matches; when that cannot be
+        verified the replay raises a typed ``DATA_UNAVAILABLE`` instead of
+        reporting ``EXECUTED`` with the change silently dropped (see
+        :meth:`_reconcile_replayed_change`).
+        """
+        if order.decision_id is not None and order.decision_id != decision_id:
+            raise ManagementRejected(
+                "DATA_UNAVAILABLE", "the replayed order belongs to a different decision"
+            )
+        order_payload = self._decode_stored(
+            order.payload_json, f"the replayed order {order.order_id} is unreadable"
+        )
+        fill = self._store.get_fill_by_order_id(order.order_id)
+        if fill is None:
+            raise ManagementRejected(
+                "DATA_UNAVAILABLE", f"the replayed fill for order {order.order_id} is missing"
+            )
+        fill_payload = self._decode_stored(
+            fill.payload_json, f"the replayed fill {fill.fill_id} is unreadable"
+        )
+        trade_payload: dict[str, Any] | None = None
+        if purpose == ManagementAction.FULL_CLOSE.value:
+            trade = self._store.get_trade_log_for_position(position_id)
+            if trade is None or trade.decision_id != decision_id:
+                raise ManagementRejected(
+                    "DATA_UNAVAILABLE",
+                    "the replayed full close has no trade log for this decision",
+                )
+            trade_payload = self._decode_stored(
+                trade.payload_json, f"the replayed trade log {trade.trade_id} is unreadable"
+            )
+        refusals: list[ManagementRefusal] = []
+        if position_payload.get("state") == "OPEN":
+            # A stop/target update is a second transaction after the fill. If it
+            # was lost (a crash between the two commits), a same-key replay must
+            # apply it idempotently instead of reporting success with the stale
+            # stop still in place.
+            position_payload, refusals = self._reconcile_replayed_change(
+                position_id=position_id,
+                decision_id=decision_id,
+                action=action,
+                management=management,
+                position_payload=position_payload,
+            )
+        reason = _executed_reason("the original management result was replayed", refusals)
+        return ManagementResult(
+            position_id=position_id,
+            decision_id=decision_id,
+            action=ManagementAction(action),
+            status=ManagementStatus.EXECUTED,
             executed=True,
             reason_code=action,
-            reason="the original management result was replayed",
+            reason=reason,
             llm=llm_view,
-            risk=self._risk_view(str(order_payload.get("risk_verdict_id") or "")),
+            risk=self._risk_view(order.risk_verdict_id),
             order=order_payload,
-            fill=None if fill is None else json.loads(fill.payload_json),
+            fill=fill_payload,
             position=position_payload,
-            trade_log=None if trade is None else json.loads(trade.payload_json),
+            trade_log=trade_payload,
             account=self._account_view(),
+            refusals=tuple(refusals),
             idempotent_replay=True,
         )
+
+    def _reattempt_replay(
+        self,
+        *,
+        position_id: str,
+        decision_id: str,
+        action: ManagementAction,
+        management: dict[str, Any],
+        llm_view: dict[str, Any],
+    ) -> ManagementResult:
+        """Re-execute a stored VALID/REPAIRED decision that never executed.
+
+        The LLM is not called and the decision is not re-saved; the fresh
+        recorded mark and clock make the deterministic order key the only write,
+        and a pre-existing order (including an ``ORDER_DUPLICATE`` race) is
+        reconstructed rather than duplicated.
+        """
+        try:
+            context = self._positions.management_mark(position_id)
+        except (PositionCloseError, PositionNotFound) as exc:
+            self._record_outcome(
+                position_id=position_id,
+                at=utc_timestamp(self._clock.now()),
+                decision_id=decision_id,
+                action=action.value,
+                outcome="REFUSED",
+                reason_code=exc.code,
+                message=exc.message,
+                terminal=False,
+            )
+            raise
+        context = replace(context, now=utc_timestamp(self._clock.now()))
+        try:
+            return self._dispatch_authorized(
+                context,
+                decision_id=decision_id,
+                action=action.value,
+                management=management,
+                llm_view=llm_view,
+                idempotent_replay=True,
+            )
+        except (ManagementRejected, PositionCloseError) as exc:
+            if exc.code != "ORDER_DUPLICATE":
+                raise
+            order, purpose = self._replay_order(decision_id, action, None)
+            if order is None:
+                raise
+            position_record = self._store.get_position(position_id)
+            if position_record is None:
+                raise ManagementRejected(
+                    "POSITION_NOT_FOUND", f"position {position_id} does not exist"
+                ) from exc
+            position_payload = self._decode_stored(
+                position_record.payload_json, f"the stored position {position_id} is unreadable"
+            )
+            return self._replayed_executed(
+                position_id=position_id,
+                decision_id=decision_id,
+                action=action.value,
+                purpose=purpose or action.value,
+                order=order,
+                position_payload=position_payload,
+                management=management,
+                llm_view=llm_view,
+            )
+
+    def _last_outcome(self, decision_id: str) -> dict[str, Any] | None:
+        """The most recent recorded outcome for this decision, if any."""
+        for event in reversed(self._store.list_audit_events_ascending(limit=None)):
+            if event.event_type != "MANAGEMENT_OUTCOME":
+                continue
+            try:
+                body = json.loads(event.payload_json)
+            except (json.JSONDecodeError, TypeError, ValueError):
+                continue
+            payload = body.get("payload") if isinstance(body, dict) else None
+            if isinstance(payload, dict) and payload.get("decision_id") == decision_id:
+                return payload
+        return None
 
     def _reconcile_replayed_change(
         self,
         *,
         position_id: str,
         decision_id: str,
-        decision: dict[str, Any],
+        action: str,
+        management: dict[str, Any],
         position_payload: dict[str, Any],
-    ) -> dict[str, Any]:
+    ) -> tuple[dict[str, Any], list[ManagementRefusal]]:
         """Idempotently apply a stored stop/target change missing from the row.
 
         A stop/target update is a second transaction after the fill. If it was
         lost (a crash between the two commits), a same-key replay must apply it
-        exactly once. The write is guarded so a stale key can never roll back a
-        newer change: the matched decision must be the last management action,
-        the row must still carry the pre-change stop/targets recorded at decision
-        time, and the recovered stop is validated against the decision-time mark.
-        When any of these cannot be established the replay returns the stored
-        result untouched (fail closed).
+        exactly once. Detection is evidence-based, not assumed:
+
+        * When this decision's ``STOP_UPDATED`` audit exists the change was
+          applied; the replay returns ``EXECUTED`` untouched, preserving the
+          stale-key no-rollback behavior.
+        * When it does not exist and the decision carries a change, the write is
+          reconciled only while the row still equals the pre-change
+          ``MANAGEMENT_CLASSIFIED`` snapshot. Later ``HOLD`` entries change no
+          stop/targets and are ignored; a later non-``HOLD`` management action,
+          or ambiguous ordering, blocks reconciliation.
+        * When any guard cannot be established (missing snapshot, persisted
+          values that differ from the snapshot without an applied audit,
+          ambiguous ordering) the replay fails closed: it writes a
+          ``MANAGEMENT_RECONCILE_SKIPPED`` audit and raises a typed
+          ``DATA_UNAVAILABLE``. It never reports ``EXECUTED`` while silently
+          dropping the change.
+
+        A loosened/removed stop is never re-applied; its typed refusal is
+        surfaced instead.
         """
-        management = decision.get("position_management") or {}
-        action = str(management.get("action") or "")
         if action not in {
             ManagementAction.PARTIAL_CLOSE.value,
             ManagementAction.ADD.value,
         }:
-            return position_payload
+            return position_payload, []
         new_stop = json_decimal(management.get("new_stop_price"))
         raw_targets = management.get("new_targets") or []
         targets = (
@@ -1172,24 +1663,37 @@ class ManagementService:
             else None
         )
         if new_stop is None and targets is None:
-            return position_payload
+            return position_payload, []
+        if self._management_change_applied(decision_id):
+            # The stop/target transaction committed, so its change is already in
+            # the row (or was superseded by a newer one). Never rewrite it.
+            return position_payload, []
         history = position_payload.get("management_history")
-        if not isinstance(history, list) or not history:
-            return position_payload
-        last = history[-1]
-        if not isinstance(last, dict) or last.get("decision_id") != decision_id:
-            # A later management action exists; its stop/targets win.
-            return position_payload
+        reason = self._unordered_change_reason(history, decision_id)
+        if reason is not None:
+            self._skip_reconcile(
+                position_id=position_id,
+                decision_id=decision_id,
+                action=action,
+                reason=reason,
+            )
         snapshot = self._management_snapshot(decision_id)
         if snapshot is None:
-            # No pre-change snapshot: a crash gap cannot be distinguished from a
-            # stale key replaying over a newer change, so do not rewrite.
-            return position_payload
+            self._skip_reconcile(
+                position_id=position_id,
+                decision_id=decision_id,
+                action=action,
+                reason="the pre-change management snapshot is missing",
+            )
         persisted_stop = json_decimal(position_payload.get("stop_price"))
         recorded_stop = json_decimal(snapshot.get("stop_price"))
         if persisted_stop != recorded_stop:
-            # The row no longer carries the values this decision changed from.
-            return position_payload
+            self._skip_reconcile(
+                position_id=position_id,
+                decision_id=decision_id,
+                action=action,
+                reason="the stored stop no longer matches the pre-change snapshot",
+            )
         persisted_targets = [
             json_decimal(target) for target in (position_payload.get("target_prices") or [])
         ]
@@ -1197,23 +1701,57 @@ class ManagementService:
             json_decimal(target) for target in (snapshot.get("target_prices") or [])
         ]
         if persisted_targets != recorded_targets:
-            return position_payload
-        stop_applied = new_stop is None or persisted_stop == new_stop
-        targets_applied = targets is None or list(targets) == persisted_targets
-        if stop_applied and targets_applied:
-            return position_payload
-        decision_mark = json_decimal(snapshot.get("mark_price"))
-        if new_stop is not None and decision_mark is None:
-            return position_payload
+            self._skip_reconcile(
+                position_id=position_id,
+                decision_id=decision_id,
+                action=action,
+                reason="the stored targets no longer match the pre-change snapshot",
+            )
+        try:
+            side = PositionSide(str(position_payload.get("side") or ""))
+        except ValueError:
+            self._skip_reconcile(
+                position_id=position_id,
+                decision_id=decision_id,
+                action=action,
+                reason="the stored position side is invalid",
+            )
+        refusals: list[ManagementRefusal] = []
         try:
             classification = classify_management_intent(
                 action=action,
-                position_side=str(position_payload.get("side") or ""),
+                position_side=side,
                 current_stop=recorded_stop,
                 new_stop_price=new_stop,
             )
         except ValueError:
-            return position_payload
+            self._skip_reconcile(
+                position_id=position_id,
+                decision_id=decision_id,
+                action=action,
+                reason="the recovered stop change cannot be classified",
+            )
+        if new_stop is not None:
+            refusal = self._stop_refusal(
+                side=side,
+                current_stop=persisted_stop,
+                new_stop=new_stop,
+            )
+            if refusal is not None:
+                refusals.append(refusal)
+                new_stop = None
+        stop_applied = new_stop is None or persisted_stop == new_stop
+        targets_applied = targets is None or list(targets) == persisted_targets
+        if stop_applied and targets_applied:
+            return position_payload, refusals
+        decision_mark = json_decimal(snapshot.get("mark_price"))
+        if new_stop is not None and decision_mark is None:
+            self._skip_reconcile(
+                position_id=position_id,
+                decision_id=decision_id,
+                action=action,
+                reason="the pre-change mark is missing",
+            )
         now = utc_timestamp(self._clock.now())
         record_audit(
             self._store,
@@ -1229,18 +1767,85 @@ class ManagementService:
             },
             at=now,
         )
-        if classification.risk_increasing:
-            try:
-                self._kill_switch.require_clear()
-            except KillSwitchActive as exc:
-                raise ManagementRejected(exc.code, exc.message) from exc
-        return self._positions.apply_management_stop(
+        updated = self._positions.apply_management_stop(
             position_id,
             stop_price=new_stop,
             target_prices=targets,
             decision_id=decision_id,
             now=now,
             reference=decision_mark,
+        )
+        return updated, refusals
+
+    def _management_change_applied(self, decision_id: str) -> bool:
+        """Whether this decision's stop/target transaction committed.
+
+        The ``STOP_UPDATED`` audit is written atomically with the row change, so
+        its presence (with this decision's id in the payload) is the evidence
+        that the change was applied. Its absence is the only state in which a
+        replay may reconcile.
+        """
+        for event in reversed(self._store.list_audit_events_ascending(limit=None)):
+            if event.event_type != "STOP_UPDATED":
+                continue
+            try:
+                body = json.loads(event.payload_json)
+            except (json.JSONDecodeError, TypeError, ValueError):
+                continue
+            payload = body.get("payload") if isinstance(body, dict) else None
+            if isinstance(payload, dict) and payload.get("decision_id") == decision_id:
+                return True
+        return False
+
+    @staticmethod
+    def _unordered_change_reason(history: object, decision_id: str) -> str | None:
+        """Why ordering blocks reconciliation, or ``None`` when it is safe.
+
+        The decision's own history entry must exist: the order, fill, and
+        history row commit atomically, so a missing entry means the timeline
+        cannot be trusted. Later ``HOLD`` entries change no stop/targets and are
+        ignored; any later non-``HOLD`` management action owns the row, and an
+        unreadable later entry makes the ordering ambiguous. Both fail closed.
+        """
+        if not isinstance(history, list):
+            return "the recorded management history is unreadable"
+        index: int | None = None
+        for position, entry in enumerate(history):
+            if isinstance(entry, dict) and entry.get("decision_id") == decision_id:
+                index = position
+        if index is None:
+            return "the recorded management history has no entry for this decision"
+        for entry in history[index + 1 :]:
+            if not isinstance(entry, dict):
+                return "the recorded management history has an unreadable later entry"
+            if entry.get("action") != ManagementAction.HOLD.value:
+                return "a later management action owns this position"
+        return None
+
+    def _skip_reconcile(
+        self,
+        *,
+        position_id: str,
+        decision_id: str,
+        action: str,
+        reason: str,
+    ) -> NoReturn:
+        """Audit and fail closed when a lost change cannot be verified."""
+        record_audit(
+            self._store,
+            event_type="MANAGEMENT_RECONCILE_SKIPPED",
+            actor={"kind": "SYSTEM", "id": "management_service"},
+            subject={"kind": "POSITION", "id": position_id},
+            payload={
+                "decision_id": decision_id,
+                "action": action,
+                "reason": reason,
+            },
+            at=utc_timestamp(self._clock.now()),
+        )
+        raise ManagementRejected(
+            "DATA_UNAVAILABLE",
+            f"the replayed management change cannot be verified: {reason}",
         )
 
     def _management_snapshot(self, decision_id: str) -> dict[str, Any] | None:
@@ -1323,6 +1928,14 @@ def _approval_id(decision_id: str, purpose: str) -> str:
     return f"APR-{digest.upper()}"
 
 
+def _executed_reason(base: str, refusals: Sequence[ManagementRefusal]) -> str:
+    """Append the typed refusal code(s) to an executed result's reason text."""
+    if not refusals:
+        return base
+    codes = ", ".join(item.code for item in refusals)
+    return f"{base}; the stop change was refused ({codes})"
+
+
 def _note(management: dict[str, Any]) -> str:
     rationale = str(management.get("rationale") or "").strip()
     urgency = str(management.get("urgency") or "")
@@ -1334,4 +1947,4 @@ def _note(management: dict[str, Any]) -> str:
     return base
 
 
-__all__ = ["ManagementRejected", "ManagementResult", "ManagementService"]
+__all__ = ["ManagementRefusal", "ManagementRejected", "ManagementResult", "ManagementService"]

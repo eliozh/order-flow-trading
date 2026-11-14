@@ -247,8 +247,10 @@ def persist_add_execution_verdict(
     risk_cap = actual_risk.quantize(_EIGHT_DP, rounding=ROUND_UP)
     payload = verdict_to_contract(execution, requested_payload=_requested_payload(gate))
     # Derive the persisted verdict from the execution evaluation. Only the
-    # operator-facing binding cap and the clamped size/risk override the raw
-    # verdict, and the leverage is the clamped value the gateway will compare.
+    # operator-facing binding cap, the clamped size/risk, and the recomputed
+    # ``inputs_hash`` (the request quantity is intentionally excluded) override
+    # the raw verdict, and the leverage is the clamped value the gateway will
+    # compare.
     payload["verdict"] = execution.verdict.value
     payload["binding_cap"] = binding_cap.value
     payload["allowed"]["quantity"] = str(allowed_quantity)

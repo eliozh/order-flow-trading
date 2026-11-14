@@ -25,6 +25,16 @@ class PositionManageRequest(BaseModel):
     provider: str | None = Field(default=None, min_length=1, max_length=32)
 
 
+class PositionManageRefusal(BaseModel):
+    """One typed refusal attached to an executed management result."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    code: str
+    field: str
+    message: str
+
+
 class PositionManageData(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
@@ -42,6 +52,7 @@ class PositionManageData(BaseModel):
     position: dict[str, Any] | None = None
     trade_log: dict[str, Any] | None = None
     account: dict[str, Any] | None = None
+    refusals: list[PositionManageRefusal] = Field(default_factory=list)
     idempotent_replay: bool = False
 
 
@@ -67,6 +78,7 @@ __all__ = [
     "EnvelopeMeta",
     "PositionListData",
     "PositionManageData",
+    "PositionManageRefusal",
     "PositionManageRequest",
     "PositionMonitorData",
 ]

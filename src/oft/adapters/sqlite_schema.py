@@ -2214,8 +2214,9 @@ def _migrate_v24(connection: sqlite3.Connection) -> None:
         _table_exists(connection, "prompt_templates")
         and _table_exists(connection, "prompt_versions")
     ):
-        # A fresh database has no prompt tables yet; ``_SCHEMA_SQL`` creates and
-        # seeds them later in ``initialize_database``.
+        # A fresh database has no prompt tables yet; ``_SCHEMA_SQL`` creates
+        # them and ``_seed_prompt_defaults`` seeds them later in
+        # ``initialize_database``.
         return
     if connection.in_transaction:
         connection.commit()

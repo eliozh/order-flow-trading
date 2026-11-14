@@ -190,8 +190,9 @@ class ExecutionGateway:
 
         An exit does not need the entry trigger/stop/equity-digest binding: the
         verdict only has to belong to the same decision, cover the exit
-        quantity, name the same symbol/side as the position, and the intent must
-        be reduce-only against an OPEN position that carries a source trigger.
+        quantity, name the same symbol/side as the position, and the verdict's
+        trigger must equal the position's own source trigger. The intent must be
+        reduce-only against an OPEN position that carries a source trigger.
         ADR-0006 also forbids trusting the caller: the submitted close mark must
         equal the position's recorded mark, so an exit cannot be priced from an
         invented or stale price that the position row does not carry.

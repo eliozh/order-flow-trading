@@ -1,0 +1,23 @@
+{
+  "decision_type": "POSITION_MANAGEMENT",
+  "subject": {
+    "symbol": "BTCUSDT",
+    "timeframe": "4h",
+    "as_of": "2026-10-08T00:01:00.000Z"
+  },
+  "confidence": 0.61,
+  "rationale": "Exit now; the carried stop/target fields are ignored for a full close.",
+  "caveats": ["The stop and target fields are intentionally invalid and must be ignored"],
+  "analysis": null,
+  "opportunity": null,
+  "entry_recheck": null,
+  "position_management": {
+    "action": "FULL_CLOSE",
+    "close_fraction": null,
+    "add_risk_pct": null,
+    "new_stop_price": "99000.00",
+    "new_targets": ["1.00"],
+    "rationale": "The setup invalidated; the ignored stop/targets must not reject the exit.",
+    "urgency": "HIGH"
+  }
+}
