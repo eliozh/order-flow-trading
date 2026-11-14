@@ -24,7 +24,8 @@ import hashlib
 import json
 from collections.abc import Sequence
 from dataclasses import dataclass, replace
-from decimal import Decimal
+from datetime import UTC, date, datetime
+from decimal import Decimal, InvalidOperation
 from typing import Any, NoReturn
 
 from oft.application.budget_ledger import BudgetEntry, BudgetLedger
@@ -71,6 +72,7 @@ from oft.domain.management import (
 )
 from oft.domain.oms import Position, PositionSide
 from oft.domain.pnl import json_decimal
+from oft.domain.positions import PositionError, position_from_contract
 from oft.domain.prompts import PromptRole
 from oft.domain.risk import (
     BindingCap,
@@ -96,7 +98,9 @@ from oft.ports.store import (
     DecisionRecord,
     LLMCallRecord,
     OrderRecord,
+    PositionRecord,
     StorePort,
+    TradeLogRecord,
 )
 
 _STOP_REFUSAL_FIELD = "position_management.new_stop_price"
@@ -248,6 +252,134 @@ def _llm_error_code(code: str | None) -> str:
     return code if code in _LLM_ERROR_CODES else "LLM_SCHEMA_INVALID"
 
 
+CADENCE_CONDITION = "CADENCE"
+FUNDING_SETTLEMENT_CONDITION = "FUNDING_SETTLEMENT"
+RISK_BREACH_CONDITION = "RISK_BREACH"
+
+
+@dataclass(frozen=True)
+class ManagementDue:
+    """Whether the automated cadence should ask for a management decision."""
+
+    due: bool
+    conditions: tuple[str, ...] = ()
+    reason: str = ""
+
+
+def _decimal_or_none(value: object) -> Decimal | None:
+    if value is None:
+        return None
+    try:
+        parsed = Decimal(str(value))
+    except (ArithmeticError, TypeError, ValueError):
+        return None
+    return parsed if parsed.is_finite() else None
+
+
+def _parse_utc(value: object) -> datetime | None:
+    if not isinstance(value, str) or not value.strip():
+        return None
+    try:
+        parsed = datetime.fromisoformat(value.replace("Z", "+00:00"))
+    except (TypeError, ValueError, OverflowError):
+        return None
+    if parsed.tzinfo is None:
+        parsed = parsed.replace(tzinfo=UTC)
+    return parsed
+
+
+def utc_day(timestamp: str) -> date | None:
+    """The UTC calendar day for a recorded timestamp, or ``None``."""
+    parsed = _parse_utc(timestamp)
+    return None if parsed is None else parsed.astimezone(UTC).date()
+
+
+def realized_net_for_day(trades: Sequence[TradeLogRecord], day: date) -> Decimal:
+    """The signed net realized PnL of the trades closed on the UTC day.
+
+    Gains and losses are both counted: a net-positive day contributes a
+    positive value (and therefore no daily loss), which is what an
+    account-level daily-loss measure must see.
+    """
+    total = Decimal("0")
+    for trade in trades:
+        closed = _parse_utc(trade.closed_at)
+        if closed is None or closed.astimezone(UTC).date() != day:
+            continue
+        net = _decimal_or_none(trade.net_pnl_usd)
+        if net is not None:
+            total += net
+    return total
+
+
+def unrealized_net_for_position(
+    side: str, avg_entry: Decimal, size: Decimal, mark: Decimal
+) -> Decimal:
+    """The position's signed unrealized PnL at its recorded mark."""
+    if side == "SHORT":
+        return (avg_entry - mark) * size
+    if side == "LONG":
+        return (mark - avg_entry) * size
+    raise ValueError(f"unsupported position side {side!r}")
+
+
+@dataclass(frozen=True)
+class ManagementRiskContext:
+    """One account-level daily-loss measurement for a management window.
+
+    The runner builds this once per ``run_window`` and passes it to every
+    per-position ``due_conditions`` call, so the trade log and open-position
+    reads do not repeat once per position. ``unrealized_net is None`` means the
+    measurement is unmeasured (a missing, non-finite, or stale recorded mark);
+    callers must then report no breach rather than fabricate one.
+    """
+
+    day: date | None
+    realized_net: Decimal
+    unrealized_net: Decimal | None
+    equity: Decimal
+
+    @property
+    def measured(self) -> bool:
+        return self.day is not None and self.unrealized_net is not None
+
+    @property
+    def daily_loss(self) -> Decimal | None:
+        """The positive net loss for the UTC day, or ``None`` when unmeasured."""
+        if self.day is None or self.unrealized_net is None:
+            return None
+        total = self.realized_net + self.unrealized_net
+        return -total if total < 0 else Decimal("0")
+
+    @classmethod
+    def unmeasured(cls) -> ManagementRiskContext:
+        """A context that deliberately reports no measurement.
+
+        The runner passes it when the account-level inputs are not needed (the
+        ``RISK_BREACH`` condition is disabled or no management provider is
+        configured) or when the measurement failed. An explicit unmeasured value
+        tells ``due_conditions`` not to fall back to a fresh per-position read;
+        ``daily_loss`` is ``None``, so no breach is reported.
+        """
+        return cls(
+            day=None,
+            realized_net=Decimal("0"),
+            unrealized_net=None,
+            equity=Decimal("0"),
+        )
+
+
+def daily_loss_breach(*, equity: Decimal, loss: Decimal, risk_pct: float) -> bool:
+    """Whether the measured daily loss strictly exceeds the configured cap."""
+    if equity <= 0:
+        return False
+    try:
+        limit = equity * Decimal(str(risk_pct)) / Decimal("100")
+    except (ArithmeticError, InvalidOperation, ValueError):
+        return False
+    return loss > limit
+
+
 class ManagementService:
     def __init__(
         self,
@@ -258,12 +390,16 @@ class ManagementService:
         settings: Settings,
         kill_switch: KillSwitch,
         runtime: LLMRuntimeRegistry | None = None,
+        funding_settlement_enabled: bool = True,
+        risk_breach_enabled: bool = True,
     ) -> None:
         self._store = store
         self._clock = clock
         self._provider = provider
         self._settings = settings
         self._kill_switch = kill_switch
+        self._funding_settlement_enabled = funding_settlement_enabled
+        self._risk_breach_enabled = risk_breach_enabled
         self._budget = BudgetLedger(store=store, settings=settings)
         self._orchestrator = (
             LLMOrchestrator(
@@ -282,6 +418,138 @@ class ManagementService:
         self._secrets = secret_values_from_settings(settings)
         self._prompts = PromptService(store=store, clock=clock, secret_values=self._secrets)
         self._knowledge = KnowledgeService(settings=settings, clock=clock)
+
+    # -- due/condition evaluation ---------------------------------------
+
+    @property
+    def configured(self) -> bool:
+        """Whether a management LLM provider is wired in."""
+        return self._provider is not None
+
+    def due_conditions(
+        self,
+        position_id: str,
+        *,
+        window_start: str,
+        window_end: str,
+        now: str,
+        funding_settlement_enabled: bool | None = None,
+        risk_breach_enabled: bool | None = None,
+        risk_context: ManagementRiskContext | None = None,
+    ) -> ManagementDue:
+        """Evaluate whether the cadence should ask for a decision now.
+
+        The runner calls this only at a window boundary, so ``CADENCE`` is the
+        baseline condition for every readable OPEN position. ``FUNDING_SETTLEMENT``
+        and ``RISK_BREACH`` are additive conditions gated by their toggles. The
+        runner passes the window's frozen account-level ``risk_context`` so the
+        daily-loss inputs are read once for all positions; a direct caller that
+        omits it gets a fresh measurement. This method never calls the LLM,
+        executes anything, or writes an order.
+        """
+        record = self._store.get_position(position_id)
+        if record is None:
+            return ManagementDue(False, (), f"position {position_id} does not exist")
+        try:
+            payload = json.loads(record.payload_json)
+        except (json.JSONDecodeError, TypeError, ValueError):
+            return ManagementDue(False, (), f"the position {position_id} payload is unreadable")
+        if not isinstance(payload, dict):
+            return ManagementDue(False, (), f"the position {position_id} payload is unreadable")
+        state = payload.get("state")
+        if state != "OPEN":
+            return ManagementDue(False, (), f"position {position_id} is {state}, not OPEN")
+        try:
+            position_from_contract(payload)
+        except PositionError as exc:
+            return ManagementDue(False, (), exc.message)
+
+        conditions: list[str] = [CADENCE_CONDITION]
+        funding_enabled = (
+            self._funding_settlement_enabled
+            if funding_settlement_enabled is None
+            else funding_settlement_enabled
+        )
+        if funding_enabled and self._positions.funding_settlement_in_window(
+            position_id, window_start, window_end
+        ):
+            conditions.append(FUNDING_SETTLEMENT_CONDITION)
+        risk_enabled = (
+            self._risk_breach_enabled if risk_breach_enabled is None else risk_breach_enabled
+        )
+        if risk_enabled:
+            measured = risk_context if risk_context is not None else self.risk_context(now=now)
+            if self._risk_breach(measured):
+                conditions.append(RISK_BREACH_CONDITION)
+        return ManagementDue(True, tuple(conditions), "due: " + ", ".join(conditions))
+
+    def risk_context(
+        self,
+        *,
+        now: str,
+        open_records: Sequence[PositionRecord] | None = None,
+    ) -> ManagementRiskContext:
+        """Measure the account-level daily loss once for a cadence window.
+
+        The loss is the signed net realized PnL for the UTC day plus the signed
+        unrealized PnL of every OPEN position at its recorded mark. If any open
+        position's mark is missing, non-finite, unreadable, or older than
+        ``risk_stale_mark_seconds`` the measurement is unmeasured (``None``):
+        the caller must then report no breach. No mark is fabricated.
+        """
+        day = utc_day(now)
+        realized = (
+            realized_net_for_day(self._store.list_trade_logs(limit=None), day)
+            if day is not None
+            else Decimal("0")
+        )
+        records = (
+            open_records
+            if open_records is not None
+            else self._store.list_positions(state="OPEN", limit=None)
+        )
+        account = self._paper.ensure()
+        cash = _decimal_or_none(account.balance)
+        if cash is None:
+            return ManagementRiskContext(day, realized, None, Decimal("0"))
+        payloads: list[dict[str, Any]] = []
+        try:
+            for record in records:
+                payload = json.loads(record.payload_json)
+                if not isinstance(payload, dict):
+                    raise ValueError("a position payload must be a JSON object")
+                payloads.append(payload)
+        except (json.JSONDecodeError, TypeError, ValueError):
+            return ManagementRiskContext(day, realized, None, cash)
+        equity, view = compute_equity(cash, payloads)
+        if view.stale_inputs:
+            return ManagementRiskContext(day, realized, None, equity)
+        now_instant = self._clock.now()
+        stale_seconds = int(self._settings.risk_stale_mark_seconds)
+        unrealized = Decimal("0")
+        for payload in payloads:
+            mark = _decimal_or_none(payload.get("mark_price"))
+            size = _decimal_or_none(payload.get("size"))
+            avg_entry = _decimal_or_none(payload.get("avg_entry_price"))
+            mark_as_of = _parse_utc(payload.get("mark_as_of"))
+            side = str(payload.get("side", "LONG"))
+            if mark is None or size is None or avg_entry is None or mark_as_of is None:
+                return ManagementRiskContext(day, realized, None, equity)
+            if (now_instant - mark_as_of).total_seconds() > stale_seconds:
+                return ManagementRiskContext(day, realized, None, equity)
+            try:
+                unrealized += unrealized_net_for_position(side, avg_entry, size, mark)
+            except ValueError:
+                return ManagementRiskContext(day, realized, None, equity)
+        return ManagementRiskContext(day, realized, unrealized, equity)
+
+    def _risk_breach(self, context: ManagementRiskContext) -> bool:
+        loss = context.daily_loss
+        if loss is None:
+            return False
+        return daily_loss_breach(
+            equity=context.equity, loss=loss, risk_pct=self._settings.risk_daily_loss_pct
+        )
 
     # -- entry point -----------------------------------------------------
 
@@ -1947,4 +2215,18 @@ def _note(management: dict[str, Any]) -> str:
     return base
 
 
-__all__ = ["ManagementRefusal", "ManagementRejected", "ManagementResult", "ManagementService"]
+__all__ = [
+    "CADENCE_CONDITION",
+    "FUNDING_SETTLEMENT_CONDITION",
+    "ManagementDue",
+    "ManagementRefusal",
+    "ManagementRejected",
+    "ManagementResult",
+    "ManagementRiskContext",
+    "ManagementService",
+    "RISK_BREACH_CONDITION",
+    "daily_loss_breach",
+    "realized_net_for_day",
+    "unrealized_net_for_position",
+    "utc_day",
+]

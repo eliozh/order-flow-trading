@@ -8,8 +8,12 @@ import pytest
 
 from oft.application.scheduler import (
     BOUNDARY_HOURS,
+    MANAGEMENT_JOB_ID,
+    POSITION_MONITOR_JOB_ID,
     CatchUpPlan,
+    ManagementDaemonScheduler,
     MissedWindow,
+    PositionMonitorDaemonScheduler,
     ScheduleState,
     align_to_boundary,
     boundary_hours,
@@ -301,4 +305,187 @@ def test_fire_records_skipped_windows_and_runs_the_latest_due_window() -> None:
 
     assert jobs == [DAY.replace(hour=12)]
     assert missed == [DAY.replace(hour=8)]
+    scheduler.shutdown()
+
+
+# -- slice 26: position-monitor interval and management cadence ---------------
+
+
+def test_position_monitor_interval_config_bounds_and_default() -> None:
+    from pydantic import ValidationError
+
+    from oft.config import CONFIG_INVALID, ConfigError, Settings, load_settings
+
+    assert Settings().position_monitor_interval_seconds == 15
+    assert Settings(position_monitor_interval_seconds=5).position_monitor_interval_seconds == 5
+    assert Settings(position_monitor_interval_seconds=60).position_monitor_interval_seconds == 60
+    with pytest.raises(ValidationError):
+        Settings(position_monitor_interval_seconds=4)
+    with pytest.raises(ValidationError):
+        Settings(position_monitor_interval_seconds=61)
+    with pytest.raises(ConfigError) as error:
+        load_settings(position_monitor_interval_seconds=0)
+    assert error.value.code == CONFIG_INVALID
+
+
+def test_management_cadence_override_resolution() -> None:
+    from oft.config import CONFIG_INVALID, ConfigError, Settings, load_settings
+
+    assert Settings().management_cadence is None
+    assert Settings(management_cadence="8h").management_cadence == "8h"
+    # The value is normalized against the supported scan periods.
+    assert Settings(management_cadence=" 4H ").management_cadence == "4h"
+    assert Settings(management_cadence="").management_cadence is None
+    with pytest.raises(ConfigError) as error:
+        load_settings(management_cadence="1h")
+    assert error.value.code == CONFIG_INVALID
+
+
+def test_management_condition_toggles_default_true() -> None:
+    from oft.config import Settings
+
+    defaults = Settings()
+    assert defaults.management_funding_settlement_enabled is True
+    assert defaults.management_risk_breach_enabled is True
+    disabled = Settings(
+        management_funding_settlement_enabled=False,
+        management_risk_breach_enabled=False,
+    )
+    assert disabled.management_funding_settlement_enabled is False
+    assert disabled.management_risk_breach_enabled is False
+
+
+def test_management_window_alignment_uses_the_scan_boundary() -> None:
+    """A management window is the half-open scan window containing the instant."""
+    instant = DAY.replace(hour=13, minute=5)
+    start, end = window_for(instant, "4h")
+    assert (start, end) == (DAY.replace(hour=12), DAY.replace(hour=16))
+    start8, end8 = window_for(instant, "8h")
+    assert (start8, end8) == (DAY.replace(hour=8), DAY.replace(hour=16))
+
+
+def test_position_monitor_scheduler_is_single_instance_with_coalescing() -> None:
+    scheduler = PositionMonitorDaemonScheduler(
+        interval_seconds=15,
+        job=lambda: None,
+    )
+
+    job = scheduler.scheduler.get_job(POSITION_MONITOR_JOB_ID)
+    assert job is not None
+    assert job.max_instances == 1
+    assert job.coalesce is True
+    assert job.trigger.interval.total_seconds() == 15
+    assert job.misfire_grace_time == 15
+    scheduler.shutdown()  # no-op when not running
+
+
+def test_management_scheduler_fires_at_the_next_scan_boundary() -> None:
+    from oft.clock import FixedClock
+
+    now = DAY.replace(hour=5, minute=30)
+    jobs: list[datetime] = []
+    scheduler = ManagementDaemonScheduler(
+        clock=FixedClock(now),
+        job=jobs.append,
+        period_provider=lambda: "4h",
+    )
+    scheduler._schedule_next()
+
+    expected = run_at(next_boundary(now, "4h"), "4h")
+    job = scheduler.scheduler.get_job(MANAGEMENT_JOB_ID)
+    assert job is not None
+    assert job.max_instances == 1
+    assert job.coalesce is True
+    assert scheduler.next_run() == expected
+    run_date = job.trigger.run_date
+    assert abs(run_date.timestamp() - expected.timestamp()) < 1
+    scheduler.shutdown()
+
+
+def test_management_scheduler_picks_up_a_scan_period_change() -> None:
+    from oft.clock import FixedClock
+
+    now = DAY.replace(hour=2, minute=30)
+    period = {"value": "4h"}
+    scheduler = ManagementDaemonScheduler(
+        clock=FixedClock(now),
+        job=lambda _window: None,
+        period_provider=lambda: period["value"],
+    )
+    assert scheduler.next_run() == run_at(next_boundary(now, "4h"), "4h")
+
+    period["value"] = "8h"
+    assert scheduler.next_run() == run_at(next_boundary(now, "8h"), "8h")
+    scheduler.shutdown()
+
+
+def test_management_scheduler_never_catches_up_after_a_late_fire() -> None:
+    class _MutableClock:
+        def __init__(self, instant: datetime) -> None:
+            self.instant = instant
+
+        def now(self) -> datetime:
+            return self.instant
+
+    clock = _MutableClock(DAY.replace(hour=5, minute=30))
+    jobs: list[datetime] = []
+    scheduler = ManagementDaemonScheduler(
+        clock=clock,
+        job=jobs.append,
+        period_provider=lambda: "4h",
+    )
+    scheduler._schedule_next()
+
+    # The 08:00 window was missed; a late fire runs only the current window.
+    clock.instant = DAY.replace(hour=12, minute=5)
+    scheduler._fire()
+
+    assert jobs == [DAY.replace(hour=12)]
+    expected_next = run_at(next_boundary(clock.instant, "4h"), "4h")
+    assert scheduler.next_run() == expected_next
+    scheduler.shutdown()
+
+
+def test_management_scheduler_rearms_at_a_pending_period_change_boundary() -> None:
+    """A pending 8h -> 4h change effective at 04:00 must not skip 04:00."""
+    from oft.clock import FixedClock
+
+    now = DAY.replace(hour=3)
+    state = ScheduleState(
+        period="8h",
+        pending_period="4h",
+        effective_from=DAY.replace(hour=4),
+        jitter_seconds_max=0,
+    )
+    scheduler = ManagementDaemonScheduler(
+        clock=FixedClock(now),
+        job=lambda _window: None,
+        # The old period-only path reports 8h here and computes 08:00.
+        period_provider=lambda: "8h",
+        state_provider=lambda: state,
+    )
+
+    assert scheduler.next_run() == DAY.replace(hour=4)
+    assert scheduler.next_run() != DAY.replace(hour=8)
+    scheduler._schedule_next()
+    job = scheduler.scheduler.get_job(MANAGEMENT_JOB_ID)
+    assert job is not None
+    assert abs(job.trigger.run_date.timestamp() - DAY.replace(hour=4).timestamp()) < 1
+    # The dead ``_due_window`` state from the scan scheduler was removed.
+    assert not hasattr(scheduler, "_due_window")
+    scheduler.shutdown()
+
+
+def test_management_scheduler_falls_back_to_the_period_provider() -> None:
+    from oft.clock import FixedClock
+
+    now = DAY.replace(hour=2, minute=30)
+    scheduler = ManagementDaemonScheduler(
+        clock=FixedClock(now),
+        job=lambda _window: None,
+        period_provider=lambda: "8h",
+        state_provider=None,
+    )
+
+    assert scheduler.next_run() == run_at(next_boundary(now, "8h"), "8h")
     scheduler.shutdown()

@@ -455,3 +455,141 @@ class TriggerDaemonScheduler:
     def shutdown(self, *, wait: bool = False) -> None:
         if self._scheduler.running:
             self._scheduler.shutdown(wait=wait)
+
+
+POSITION_MONITOR_JOB_ID = "position_monitor"
+MANAGEMENT_JOB_ID = "position_manage"
+
+
+class PositionMonitorDaemonScheduler:
+    """The position-monitor interval scheduler (code-only protective tick).
+
+    Mirrors :class:`TriggerDaemonScheduler`: ``max_instances=1`` and
+    ``coalesce=True`` skip an overlapping tick, and the small misfire grace
+    avoids replaying missed windows. Only the current interval window is ever
+    claimed by :class:`oft.application.jobs.PositionMonitorRunner`.
+    """
+
+    def __init__(
+        self,
+        *,
+        interval_seconds: int,
+        job: Callable[[], Any],
+        timezone: str = "UTC",
+    ) -> None:
+        if interval_seconds <= 0:
+            raise ValueError("interval_seconds must be positive")
+        self._interval_seconds = interval_seconds
+        self._scheduler = BackgroundScheduler(timezone=timezone)
+        self._scheduler.add_job(
+            job,
+            trigger=IntervalTrigger(seconds=interval_seconds, timezone=timezone),
+            id=POSITION_MONITOR_JOB_ID,
+            replace_existing=True,
+            max_instances=1,
+            coalesce=True,
+            misfire_grace_time=max(1, min(MISFIRE_GRACE_SECONDS, interval_seconds)),
+        )
+
+    @property
+    def scheduler(self) -> BackgroundScheduler:
+        return self._scheduler
+
+    @property
+    def interval_seconds(self) -> int:
+        return self._interval_seconds
+
+    def start(self) -> None:
+        self._scheduler.start()
+
+    def shutdown(self, *, wait: bool = False) -> None:
+        if self._scheduler.running:
+            self._scheduler.shutdown(wait=wait)
+
+
+class ManagementDaemonScheduler:
+    """The scan-aligned management cadence; it never catches up.
+
+    A ``DateTrigger`` is re-armed for the next scan boundary after every fire.
+    When a live :class:`ScheduleState` is supplied through ``state_provider``,
+    its ``next_run``/``period_at`` semantics are used, so a pending period
+    change re-arms at its transition boundary instead of being skipped until
+    the old period's next boundary. Without a state the ``period_provider``
+    fallback is used. A late fire runs only the window containing the current
+    clock instant: an older missed window is never replayed (ADR-0007).
+    """
+
+    def __init__(
+        self,
+        *,
+        clock: ClockPort,
+        job: Callable[[datetime], Any],
+        period_provider: Callable[[], str],
+        state_provider: Callable[[], ScheduleState] | None = None,
+        timezone: str = "UTC",
+    ) -> None:
+        self._clock = clock
+        self._job = job
+        self._period_provider = period_provider
+        self._state_provider = state_provider
+        self._scheduler = BackgroundScheduler(timezone=timezone)
+
+    @property
+    def scheduler(self) -> BackgroundScheduler:
+        return self._scheduler
+
+    def _schedule_state(self) -> ScheduleState | None:
+        return None if self._state_provider is None else self._state_provider()
+
+    def next_run(self, now: datetime | None = None) -> datetime:
+        resolved = now or self._clock.now()
+        state = self._schedule_state()
+        if state is None:
+            period = validate_period(self._period_provider())
+            return run_at(next_boundary(resolved, period), period)
+        scheduled = state.next_run(resolved)
+        effective = state.effective_from
+        if (
+            state.pending_period is not None
+            and effective is not None
+            and resolved < effective < scheduled
+        ):
+            # The pending period begins at a boundary of the new period; run
+            # that window instead of waiting for the old period's next one.
+            return run_at(
+                effective,
+                state.pending_period,
+                max_jitter=state.jitter_seconds_max,
+            )
+        return scheduled
+
+    def start(self) -> None:
+        self._schedule_next()
+        self._scheduler.start()
+
+    def shutdown(self, *, wait: bool = False) -> None:
+        if self._scheduler.running:
+            self._scheduler.shutdown(wait=wait)
+
+    def _schedule_next(self) -> None:
+        fire_at = self.next_run()
+        self._scheduler.add_job(
+            self._fire,
+            trigger=DateTrigger(run_date=fire_at, timezone="UTC"),
+            id=MANAGEMENT_JOB_ID,
+            replace_existing=True,
+            max_instances=1,
+            coalesce=True,
+            misfire_grace_time=None,
+        )
+
+    def _fire(self) -> None:
+        now = self._clock.now()
+        state = self._schedule_state()
+        period = validate_period(self._period_provider()) if state is None else state.period_at(now)
+        # No catch-up: only the window containing the current instant runs.
+        window = align_to_boundary(now, period)
+        try:
+            self._job(window)
+        finally:
+            self._schedule_next()

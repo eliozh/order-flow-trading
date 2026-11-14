@@ -69,6 +69,7 @@ from oft.domain.positions import (
     MANUAL_CLOSE_RULE,
     PARTIAL_CLOSE,
     STOP_TOUCH_RULE,
+    CloseOutcome,
     PositionError,
     TradeLogContext,
     evaluate_protective_exit,
@@ -113,6 +114,9 @@ _LOGGER = logging.getLogger(__name__)
 DATA_STALE = "DATA_STALE"
 STOP_NOT_TOUCHED = "STOP_NOT_TOUCHED"
 STOP_TOUCH = "STOP_TOUCH"
+# The code-only protective-exit reason is single-sourced as
+# ``oft.application.jobs.PROTECTIVE_STOP``; the journal's close reason stays the
+# domain's ``STOP_TOUCH`` vocabulary (``CloseOutcome`` validates it).
 CLOSED = "CLOSED"
 NO_ACTION = "NO_ACTION"
 
@@ -865,6 +869,37 @@ class PositionService:
         """
         return self._accrue_with_retry(position_id, now or self._now())
 
+    def funding_settlement_in_window(self, position_id: str, start: str, end: str) -> str | None:
+        """The first recorded funding settlement inside ``[start, end)``.
+
+        Read-only: it never accrues, executes, or mutates state. A missing or
+        non-OPEN position (and an unreadable window) yields ``None`` so the
+        management due logic reports nothing rather than raising.
+        """
+        record = self._store.get_position(position_id)
+        if record is None:
+            return None
+        payload = decode_payload_json(record.payload_json, subject=f"position {position_id}")
+        if payload is None or payload.get("state") != "OPEN":
+            return None
+        try:
+            position = position_from_contract(payload)
+        except PositionError:
+            return None
+        start_dt = _parse_timestamp(start)
+        end_dt = _parse_timestamp(end)
+        if start_dt is None or end_dt is None or start_dt >= end_dt:
+            return None
+        try:
+            history = self._funding_history(position)
+        except (StoreUnavailableError, PositionError):
+            return None
+        for point in history.points:
+            ts = _parse_timestamp(point.ts)
+            if ts is not None and start_dt <= ts < end_dt:
+                return point.ts
+        return None
+
     def _accrue_with_retry(
         self,
         position_id: str,
@@ -1498,15 +1533,10 @@ class PositionService:
         outcome authority (``close_reason``) drives the flags so the journal and
         its outcome tags cannot disagree.
         """
-        built = self._trade_log_context(context.position, context.payload, context.now)
-        manual = close_reason == MANUAL_CLOSE_RULE
-        return replace(
-            built,
-            close_reason=close_reason,
-            stopped=not manual,
-            target=False,
-            manual=manual,
+        built = self._trade_log_context(
+            context.position, context.payload, context.now, close_reason=close_reason
         )
+        return built
 
     def persist_management_exit_verdict(
         self,
@@ -1947,8 +1977,10 @@ class PositionService:
         history: _FundingHistory | None = None,
         series: set[tuple[str, str]] | None = None,
         cache: dict[tuple[str, str], tuple[dict[str, object], ...]] | None = None,
+        close_reason: str = STOP_TOUCH_RULE,
     ) -> TradeLogContext:
         """Compute the complete journal facts for the upcoming full close."""
+        outcome = CloseOutcome.from_reason(close_reason)
         source = self._source_facts(position)
         reasons = list(source.reasons)
         bars = (
@@ -2027,8 +2059,10 @@ class PositionService:
             entry_notional_usd=entry_notional,
             data_quality_status=status,
             data_quality_reasons=tuple(reasons),
-            close_reason=STOP_TOUCH_RULE,
-            stopped=True,
+            close_reason=close_reason,
+            stopped=outcome.stopped,
+            target=outcome.target,
+            manual=outcome.manual,
             had_partial_close=had_partial_close,
             traded_quantity=traded_quantity,
         )

@@ -14,12 +14,20 @@ import typer
 
 from oft.api.envelope import new_request_id, success_envelope
 from oft.application.jobs import (
+    POSITION_MANAGE_JOB_TYPE,
+    POSITION_MONITOR_JOB_TYPE,
     TRIGGER_JOB_TYPE,
     JobLedger,
+    ManagementJobRunner,
+    PositionMonitorRunner,
     ScheduledScanRunner,
     TriggerJobRunner,
+    job_summary_payload,
+    latest_job_summary,
 )
 from oft.application.scheduler import (
+    ManagementDaemonScheduler,
+    PositionMonitorDaemonScheduler,
     ScanDaemonScheduler,
     ScheduleState,
     TriggerDaemonScheduler,
@@ -148,6 +156,19 @@ def _last_scheduled_run(settings: Settings) -> Any:
     return None
 
 
+def _latest_job_payloads(settings: Settings) -> dict[str, Any]:
+    """The aggregated latest-window status of the slice-26 jobs."""
+    from oft.bootstrap import build_container
+
+    store = build_container(settings).store
+    return {
+        "position_monitor": job_summary_payload(
+            latest_job_summary(store, POSITION_MONITOR_JOB_TYPE)
+        ),
+        "position_manage": job_summary_payload(latest_job_summary(store, POSITION_MANAGE_JOB_TYPE)),
+    }
+
+
 def _status_payload(settings: Settings, state: ScheduleState) -> dict[str, Any]:
     from oft.clock import SystemClock
 
@@ -156,6 +177,7 @@ def _status_payload(settings: Settings, state: ScheduleState) -> dict[str, Any]:
     now = SystemClock().now()
     last = _last_scheduled_run(settings)
     schedule = state.next_run_payload(now)
+    latest_jobs = _latest_job_payloads(settings)
     return {
         "state": "RUNNING" if running else "OFFLINE",
         "pid": pid if running else None,
@@ -173,6 +195,7 @@ def _status_payload(settings: Settings, state: ScheduleState) -> dict[str, Any]:
             if last is not None
             else None
         ),
+        "jobs": latest_jobs,
         "generated_at": utc_timestamp(now),
     }
 
@@ -220,9 +243,15 @@ def daemon_start(
     _run_live_ingestion(settings, replay_file, symbols, container=container)
     scheduler = _start_scheduler(settings, state, container=container)
     trigger_scheduler = _start_trigger_scheduler(settings, container=container)
+    monitor_scheduler = _start_position_monitor_scheduler(settings, container=container)
+    management_scheduler = _start_management_scheduler(
+        settings, state, container=container, scan_scheduler=scheduler
+    )
     try:
         _run_uvicorn(settings)
     finally:
+        management_scheduler.shutdown()
+        monitor_scheduler.shutdown()
         trigger_scheduler.shutdown()
         scheduler.shutdown()
         pid_path(settings).unlink(missing_ok=True)
@@ -305,6 +334,115 @@ def _start_trigger_scheduler(
     scheduler = TriggerDaemonScheduler(
         interval_seconds=settings.trigger_interval_seconds,
         job=runner.run_tick,
+    )
+    scheduler.start()
+    return scheduler
+
+
+def _start_position_monitor_scheduler(
+    settings: Settings,
+    *,
+    container: Any,
+) -> PositionMonitorDaemonScheduler:
+    """Start the code-only 15 s protective/mark tick.
+
+    A killed process can leave a ``position_monitor`` row RUNNING forever; the
+    runner only ever claims the current interval window, so expired leases are
+    repaired at start.
+    """
+    from oft.application.position_service import PositionService
+
+    reaped = container.store.fail_stale_job_runs(
+        job_type=POSITION_MONITOR_JOB_TYPE,
+        now=utc_timestamp(container.clock.now()),
+    )
+    if reaped:
+        _LOGGER.warning("position_monitor_stale_runs_reaped", count=reaped)
+    ledger = JobLedger(store=container.store, clock=container.clock)
+    service = PositionService(
+        store=container.store, clock=container.clock, settings=container.settings
+    )
+    runner = PositionMonitorRunner(
+        service,
+        ledger,
+        container.clock,
+        interval_seconds=settings.position_monitor_interval_seconds,
+    )
+    scheduler = PositionMonitorDaemonScheduler(
+        interval_seconds=settings.position_monitor_interval_seconds,
+        job=runner.run_tick,
+    )
+    scheduler.start()
+    return scheduler
+
+
+def _start_management_scheduler(
+    settings: Settings,
+    state: ScheduleState,
+    *,
+    container: Any,
+    scan_scheduler: ScanDaemonScheduler | None = None,
+) -> ManagementDaemonScheduler:
+    """Start the scan-aligned management cadence (no catch-up).
+
+    The runner is rebuilt per fire from the active scan period, so a pending
+    scan-period change is picked up at the next boundary. When no explicit
+    ``OFT_MANAGEMENT_CADENCE`` overrides the scan period, the live scan
+    schedule state is wired in so a pending change re-arms at its transition
+    boundary. The durable ledger claims each ``(position, window)`` once, so
+    overlap, restart, and a late fire can never duplicate a decision or order.
+    """
+    from oft.application.kill_switch import KillSwitch
+    from oft.application.management_service import ManagementService
+
+    reaped = container.store.fail_stale_job_runs(
+        job_type=POSITION_MANAGE_JOB_TYPE,
+        now=utc_timestamp(container.clock.now()),
+    )
+    if reaped:
+        _LOGGER.warning("management_stale_runs_reaped", count=reaped)
+    ledger = JobLedger(store=container.store, clock=container.clock)
+    service = ManagementService(
+        store=container.store,
+        clock=container.clock,
+        provider=container.llm_provider,
+        settings=container.settings,
+        kill_switch=KillSwitch(
+            settings=container.settings,
+            store=container.store,
+            clock=container.clock,
+        ),
+        runtime=container.llm_runtime,
+        funding_settlement_enabled=settings.management_funding_settlement_enabled,
+        risk_breach_enabled=settings.management_risk_breach_enabled,
+    )
+
+    def _current_state() -> ScheduleState:
+        return scan_scheduler.state if scan_scheduler is not None else state
+
+    def _period() -> str:
+        if settings.management_cadence:
+            return settings.management_cadence
+        return _current_state().period_at(container.clock.now())
+
+    def _run_current(window: datetime) -> Any:
+        runner = ManagementJobRunner(
+            service,
+            ledger,
+            container.clock,
+            period=_period(),
+            funding_settlement_enabled=settings.management_funding_settlement_enabled,
+            risk_breach_enabled=settings.management_risk_breach_enabled,
+        )
+        return runner.run_window(window)
+
+    scheduler = ManagementDaemonScheduler(
+        clock=container.clock,
+        job=_run_current,
+        period_provider=_period,
+        # An explicit management cadence is independent of the scan schedule;
+        # only the scan-aligned default can use the live schedule state.
+        state_provider=None if settings.management_cadence else _current_state,
     )
     scheduler.start()
     return scheduler
