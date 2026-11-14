@@ -498,7 +498,9 @@ def test_a_blocked_add_decision_creates_no_order_and_names_the_binding_cap(
     assert data["trade_log"] is None
     assert data["risk"]["verdict"] == "BLOCK"
     assert data["risk"]["binding_cap"] == "MAX_POSITIONS"
-    assert "daily_loss_usd" in data["risk"]["stale_inputs"]
+    # C1: the daily loss is now measured and passed to the gate, so it is no
+    # longer an unmeasured input (the spread/slippage inputs still are).
+    assert "daily_loss_usd" not in data["risk"]["stale_inputs"]
     assert result["meta"]["data_quality"] == "PARTIAL"
 
     # A blocked management action writes no order/fill/journal row.

@@ -77,6 +77,23 @@ def test_a_hold_decision_and_position_validate_the_contracts(tmp_path: Path) -> 
     assert envelope["position_management"]["action"] == "HOLD"
 
 
+def test_a_decision_provenance_may_carry_due_conditions(tmp_path: Path) -> None:
+    """H3: the additive due-condition provenance is a valid envelope field."""
+    state = _manage(tmp_path, "management_hold.json")
+    container = state["loop"]["container"]
+    decision = container.store.get_decision(state["result"].decision_id)
+    assert decision is not None
+    envelope = json.loads(decision.payload_json)
+    envelope["provenance"]["due_conditions"] = ["CADENCE", "RISK_BREACH"]
+
+    validate("llm-decision.schema.json", envelope)
+
+    corrupted = json.loads(decision.payload_json)
+    corrupted["provenance"]["due_conditions"] = ["NOT_A_CONDITION"]
+    with pytest.raises(AssertionError):
+        validate("llm-decision.schema.json", corrupted)
+
+
 def test_a_partial_close_order_and_position_validate_the_contracts(tmp_path: Path) -> None:
     state = _manage(tmp_path, "management_partial_close.json")
     container = state["loop"]["container"]

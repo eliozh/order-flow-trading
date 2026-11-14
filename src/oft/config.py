@@ -146,6 +146,14 @@ class Settings(BaseSettings):
     trigger_interval_seconds: int = Field(default=15, ge=5, le=60)
     trigger_stale_after_seconds: int = Field(default=60, ge=1)
 
+    # Position monitor cadence (code-only protective/stale tick) and the
+    # management cadence. ``management_cadence`` overrides the scan period;
+    # ``None`` follows the active scan period (ADR-0007).
+    position_monitor_interval_seconds: int = Field(default=15, ge=5, le=60)
+    management_cadence: str | None = None
+    management_funding_settlement_enabled: bool = True
+    management_risk_breach_enabled: bool = True
+
     api_token: SecretStr | None = None
     binance_api_key: SecretStr | None = None
     binance_api_secret: SecretStr | None = None
@@ -180,6 +188,24 @@ class Settings(BaseSettings):
             return None
         normalized = value.strip().lower()
         return normalized or None
+
+    @field_validator("management_cadence")
+    @classmethod
+    def _normalize_management_cadence(cls, value: str | None) -> str | None:
+        """Validate an explicit management cadence against the scan periods.
+
+        Kept as a small local check (not an import of the scheduler) so
+        ``config`` remains a leaf module for the import-linter adapter contract;
+        the values mirror ``oft.application.scheduler.SCAN_PERIODS``.
+        """
+        if value is None:
+            return None
+        normalized = value.strip().lower()
+        if not normalized:
+            return None
+        if normalized not in {"4h", "8h"}:
+            raise ValueError(f"management_cadence must be one of ('4h', '8h'), got {normalized!r}")
+        return normalized
 
     @field_validator(
         "llm_model_analysis",

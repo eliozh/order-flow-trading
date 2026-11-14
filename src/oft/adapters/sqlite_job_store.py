@@ -143,6 +143,24 @@ class JobStoreMixin(SqliteConnectionMixin, SqliteAuditMixin):
             )
         return cursor.rowcount
 
+    def expire_job_leases(self, *, job_type: str, now: str) -> int:
+        """Expire every RUNNING lease without finishing the row.
+
+        The row stays ``RUNNING`` with the same ``run_id`` so the normal claim
+        path reclaims it (idempotently replaying its work). This is the startup
+        recovery for a job whose restart catch-up must run, unlike
+        :meth:`fail_stale_job_runs` which marks the row terminally ``FAILED``.
+        """
+        with closing(self._connect()) as connection, connection:
+            cursor = connection.execute(
+                """
+                UPDATE job_runs SET lease_expires_at = ?
+                WHERE job_type = ? AND status = 'RUNNING'
+                """,
+                (now, job_type),
+            )
+        return cursor.rowcount
+
     def delete_job_run(self, run_id: str) -> bool:
         with closing(self._connect()) as connection, connection:
             cursor = connection.execute(

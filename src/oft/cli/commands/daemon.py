@@ -14,15 +14,24 @@ import typer
 
 from oft.api.envelope import new_request_id, success_envelope
 from oft.application.jobs import (
+    POSITION_MANAGE_JOB_TYPE,
+    POSITION_MONITOR_JOB_TYPE,
     TRIGGER_JOB_TYPE,
     JobLedger,
+    ManagementJobOutcome,
+    ManagementJobRunner,
+    PositionMonitorRunner,
     ScheduledScanRunner,
     TriggerJobRunner,
+    latest_jobs_payload,
 )
 from oft.application.scheduler import (
+    ManagementDaemonScheduler,
+    PositionMonitorDaemonScheduler,
     ScanDaemonScheduler,
     ScheduleState,
     TriggerDaemonScheduler,
+    align_to_boundary,
     resolve_schedule_settings,
 )
 from oft.cli.commands.doctor import emit_error
@@ -148,6 +157,13 @@ def _last_scheduled_run(settings: Settings) -> Any:
     return None
 
 
+def _latest_job_payloads(settings: Settings) -> dict[str, Any]:
+    """The aggregated latest-window status of the slice-26 jobs."""
+    from oft.bootstrap import build_container
+
+    return latest_jobs_payload(build_container(settings).store)
+
+
 def _status_payload(settings: Settings, state: ScheduleState) -> dict[str, Any]:
     from oft.clock import SystemClock
 
@@ -156,6 +172,7 @@ def _status_payload(settings: Settings, state: ScheduleState) -> dict[str, Any]:
     now = SystemClock().now()
     last = _last_scheduled_run(settings)
     schedule = state.next_run_payload(now)
+    latest_jobs = _latest_job_payloads(settings)
     return {
         "state": "RUNNING" if running else "OFFLINE",
         "pid": pid if running else None,
@@ -173,6 +190,7 @@ def _status_payload(settings: Settings, state: ScheduleState) -> dict[str, Any]:
             if last is not None
             else None
         ),
+        "jobs": latest_jobs,
         "generated_at": utc_timestamp(now),
     }
 
@@ -220,9 +238,15 @@ def daemon_start(
     _run_live_ingestion(settings, replay_file, symbols, container=container)
     scheduler = _start_scheduler(settings, state, container=container)
     trigger_scheduler = _start_trigger_scheduler(settings, container=container)
+    monitor_scheduler = _start_position_monitor_scheduler(settings, container=container)
+    management_scheduler = _start_management_scheduler(
+        settings, state, container=container, scan_scheduler=scheduler
+    )
     try:
         _run_uvicorn(settings)
     finally:
+        management_scheduler.shutdown()
+        monitor_scheduler.shutdown()
         trigger_scheduler.shutdown()
         scheduler.shutdown()
         pid_path(settings).unlink(missing_ok=True)
@@ -308,6 +332,174 @@ def _start_trigger_scheduler(
     )
     scheduler.start()
     return scheduler
+
+
+def _start_position_monitor_scheduler(
+    settings: Settings,
+    *,
+    container: Any,
+) -> PositionMonitorDaemonScheduler:
+    """Start the code-only 15 s protective/mark tick.
+
+    A killed process can leave a ``position_monitor`` row RUNNING forever; the
+    runner only ever claims the current interval window, so expired leases are
+    repaired at start.
+    """
+    from oft.application.position_service import PositionService
+
+    reaped = container.store.fail_stale_job_runs(
+        job_type=POSITION_MONITOR_JOB_TYPE,
+        now=utc_timestamp(container.clock.now()),
+    )
+    if reaped:
+        _LOGGER.warning("position_monitor_stale_runs_reaped", count=reaped)
+    ledger = JobLedger(store=container.store, clock=container.clock)
+    service = PositionService(
+        store=container.store, clock=container.clock, settings=container.settings
+    )
+    runner = PositionMonitorRunner(
+        service,
+        ledger,
+        container.clock,
+        interval_seconds=settings.position_monitor_interval_seconds,
+    )
+    scheduler = PositionMonitorDaemonScheduler(
+        interval_seconds=settings.position_monitor_interval_seconds,
+        job=runner.run_tick,
+    )
+    scheduler.start()
+    return scheduler
+
+
+def _start_management_scheduler(
+    settings: Settings,
+    state: ScheduleState,
+    *,
+    container: Any,
+    scan_scheduler: ScanDaemonScheduler | None = None,
+) -> ManagementDaemonScheduler:
+    """Start the scan-aligned management cadence.
+
+    The runner is rebuilt per fire from the active scan period, so a pending
+    scan-period change is picked up at the next boundary. When no explicit
+    ``OFT_MANAGEMENT_CADENCE`` overrides the scan period, the live scan
+    schedule state is wired in so a pending change re-arms at its transition
+    boundary. The durable ledger claims each ``(position, window)`` once, so
+    overlap, restart, and a late fire can never duplicate a decision or order.
+
+    ADR-0007 also requires one management run for the open positions after a
+    restart; outside the test environment that catch-up runs once for the
+    current window after the scan catch-up (ledger-deduped). Missed periodic
+    windows are not replayed.
+    """
+    from oft.application.kill_switch import KillSwitch
+    from oft.application.management_service import ManagementService
+
+    # A killed process can leave per-position management rows RUNNING. Expire
+    # (do not finish) them so the restart catch-up below reclaims the same rows
+    # and replays their decisions idempotently; the periodic cadence can also
+    # reclaim them later if the catch-up itself crashes.
+    expired = container.store.expire_job_leases(
+        job_type=POSITION_MANAGE_JOB_TYPE,
+        now=utc_timestamp(container.clock.now()),
+    )
+    if expired:
+        _LOGGER.warning("management_leases_expired", count=expired)
+    ledger = JobLedger(store=container.store, clock=container.clock)
+    service = ManagementService(
+        store=container.store,
+        clock=container.clock,
+        provider=container.llm_provider,
+        settings=container.settings,
+        kill_switch=KillSwitch(
+            settings=container.settings,
+            store=container.store,
+            clock=container.clock,
+        ),
+        runtime=container.llm_runtime,
+        funding_settlement_enabled=settings.management_funding_settlement_enabled,
+        risk_breach_enabled=settings.management_risk_breach_enabled,
+    )
+
+    def _current_state() -> ScheduleState:
+        return scan_scheduler.state if scan_scheduler is not None else state
+
+    def _period() -> str:
+        if settings.management_cadence:
+            return settings.management_cadence
+        return _current_state().period_at(container.clock.now())
+
+    def _run_current(window: datetime) -> Any:
+        runner = _management_runner(service, ledger, container, settings, _period())
+        return runner.run_window(window_start=window)
+
+    scheduler = ManagementDaemonScheduler(
+        clock=container.clock,
+        job=_run_current,
+        period_provider=_period,
+        # An explicit management cadence is independent of the scan schedule;
+        # only the scan-aligned default can use the live schedule state.
+        state_provider=None if settings.management_cadence else _current_state,
+    )
+    # Mirror the scan catch-up: run the current window once for the open
+    # positions after a restart. The ledger dedupes it, so a restart inside the
+    # same window writes nothing new. Tests keep the startup path side-effect
+    # free, matching the scan catch-up's env gate.
+    if settings.env != "test":
+        _catch_up_management_on_start(container, service, ledger, settings, state)
+    scheduler.start()
+    return scheduler
+
+
+def _management_runner(
+    service: Any,
+    ledger: JobLedger,
+    container: Any,
+    settings: Settings,
+    period: str,
+) -> ManagementJobRunner:
+    """One management runner for both the periodic fire and the restart catch-up."""
+    return ManagementJobRunner(
+        service,
+        ledger,
+        container.clock,
+        period=period,
+        funding_settlement_enabled=settings.management_funding_settlement_enabled,
+        risk_breach_enabled=settings.management_risk_breach_enabled,
+    )
+
+
+def _catch_up_management_on_start(
+    container: Any,
+    service: Any,
+    ledger: JobLedger,
+    settings: Settings,
+    state: ScheduleState,
+) -> ManagementJobOutcome | None:
+    """Run the current management window once after a restart (ADR-0007).
+
+    Only the window containing the current clock instant is claimed, and only
+    once: a second startup in the same window loses the ledger claim and writes
+    nothing. Startup has already expired any RUNNING lease, so a crashed
+    current-window row is reclaimed and its decision replayed. A failure is
+    logged and never aborts daemon startup.
+    """
+    try:
+        now = container.clock.now()
+        period = settings.management_cadence or state.period_at(now)
+        window = align_to_boundary(now, period)
+        runner = _management_runner(service, ledger, container, settings, period)
+        outcome = runner.run_window(window_start=window)
+        _LOGGER.info(
+            "management_restart_catch_up",
+            window_start=utc_timestamp(window),
+            status=outcome.status.value,
+            reason=outcome.reason,
+        )
+        return outcome
+    except Exception as exc:  # noqa: BLE001 - startup must survive a catch-up failure
+        _LOGGER.warning("management_restart_catch_up_failed", error=str(exc))
+        return None
 
 
 def _catch_up_on_start(container: Any, state: ScheduleState) -> None:
