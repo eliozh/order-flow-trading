@@ -32,7 +32,7 @@ _ROLE_DECISION_TYPES: dict[str, frozenset[str]] = {
     "ANALYSIS": frozenset({"MARKET_ANALYSIS", "OPPORTUNITY_PROPOSAL"}),
     "ENTRY_RECHECK": frozenset({"ENTRY_RECHECK"}),
     "MANAGEMENT": frozenset({"POSITION_MANAGEMENT"}),
-    "REVIEW": frozenset({"MARKET_ANALYSIS", "POSITION_MANAGEMENT"}),
+    "REVIEW": frozenset({"REVIEW"}),
 }
 
 _PAYLOAD_BY_DECISION = {
@@ -44,11 +44,13 @@ _PAYLOAD_BY_DECISION = {
 
 # OPPORTUNITY_PROPOSAL also carries its supporting analysis; everything else is
 # closed so a non-null payload cannot ride along with the wrong decision type.
+# REVIEW is advisory by construction: it may carry no payload at all.
 _ALLOWED_PAYLOADS_BY_DECISION: dict[str, frozenset[str]] = {
     "MARKET_ANALYSIS": frozenset({"analysis"}),
     "OPPORTUNITY_PROPOSAL": frozenset({"analysis", "opportunity"}),
     "ENTRY_RECHECK": frozenset({"entry_recheck"}),
     "POSITION_MANAGEMENT": frozenset({"position_management"}),
+    "REVIEW": frozenset(),
 }
 
 _PAYLOAD_FIELDS = ("analysis", "opportunity", "entry_recheck", "position_management")
@@ -257,7 +259,11 @@ class Subject(_Model):
 
 class DecisionOutput(_Model):
     decision_type: Literal[
-        "MARKET_ANALYSIS", "OPPORTUNITY_PROPOSAL", "ENTRY_RECHECK", "POSITION_MANAGEMENT"
+        "MARKET_ANALYSIS",
+        "OPPORTUNITY_PROPOSAL",
+        "ENTRY_RECHECK",
+        "POSITION_MANAGEMENT",
+        "REVIEW",
     ]
     subject: Subject
     confidence: float
@@ -408,6 +414,11 @@ def semantic_errors(output: DecisionOutput, *, role: str) -> tuple[SemanticError
             )
 
     errors.extend(_text_errors("rationale", output.rationale))
+    if output.decision_type == "REVIEW" and not output.rationale.strip():
+        # A review is its rationale: an empty advisory decision is not usable.
+        errors.append(
+            SemanticError("rationale", "RATIONALE_REQUIRED", "a REVIEW requires a rationale")
+        )
     for index, caveat in enumerate(output.caveats):
         errors.extend(_text_errors(f"caveats[{index}]", caveat))
     errors.extend(_timestamp_errors("subject.as_of", output.subject.as_of))

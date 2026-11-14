@@ -1,8 +1,9 @@
-"""``oft log list|show|stats|compare|export``: the closed-trade journal (read-only)."""
+"""``oft log list|show|stats|compare|export|review``: the closed-trade journal."""
 
 from __future__ import annotations
 
 import json
+import uuid
 from typing import Annotated, Any
 
 import typer
@@ -10,6 +11,8 @@ import typer
 from oft.cli.api_client import ApiClient, ApiClientError
 from oft.cli.commands.doctor import emit_error, exit_code_for
 from oft.config import ConfigError, load_settings
+
+ADVISORY_LABEL = "ADVISORY ONLY — suggests, never changes rules/prompts/risk or orders"
 
 log_app = typer.Typer(
     help="Closed-trade journal (read-only; PnL is fixed by code).",
@@ -278,3 +281,60 @@ def log_export(
         f"EXPORTED {data.get('path', '-')} · {data.get('format', '-')}"
         f" · {data.get('rows', 0)} row(s) · {data.get('bytes', 0)} bytes"
     )
+
+
+def _render_review(data: dict[str, Any]) -> str:
+    lines = [
+        ADVISORY_LABEL,
+        f"REVIEW {data.get('trade_id', '-')} · status {data.get('status', '-')}"
+        f" · decision {data.get('decision_id') or '-'}"
+        f" · validation {data.get('validation_status') or '-'}"
+        f" · confidence {data.get('confidence') if data.get('confidence') is not None else '-'}",
+    ]
+    if data.get("idempotent_replay"):
+        lines.append("reused the linked review (no provider call)")
+    if data.get("rationale"):
+        lines.append(f"rationale: {data['rationale']}")
+    for caveat in data.get("caveats") or []:
+        lines.append(f"caveat: {caveat}")
+    if data.get("reason"):
+        lines.append(f"reason: {data['reason']}")
+    return "\n".join(lines)
+
+
+@log_app.command("review")
+def log_review(
+    trade_id: str,
+    refresh: Annotated[
+        bool,
+        typer.Option("--refresh", help="Supersede the linked review with a new decision."),
+    ] = False,
+    provider: Annotated[
+        str | None,
+        typer.Option("--provider", help="LLM provider name (defaults to the configured one)."),
+    ] = None,
+    json_output: Annotated[bool, typer.Option("--json", help="Emit JSON.")] = False,
+) -> None:
+    """Ask for an advisory LLM review of one closed trade (never executes)."""
+    settings = _settings_or_exit(json_output)
+    # A plain review reuses the linked decision for the same trade; a refresh
+    # must use a fresh key so the server persists a new decision and retains it.
+    # The provider is part of the key because it is part of the API request
+    # hash: a plain call and a ``--provider`` call must not collide (HTTP 409).
+    provider_slug = (provider or "").strip().lower() or "default"
+    idempotency_key = uuid.uuid4().hex if refresh else f"review:{trade_id}:{provider_slug}"
+    try:
+        envelope = ApiClient.from_settings(settings).journal_review(
+            trade_id,
+            refresh=refresh,
+            provider=provider,
+            idempotency_key=idempotency_key,
+        )
+    except ApiClientError as exc:
+        emit_error(exc.code, exc.message, json_output=json_output)
+        raise typer.Exit(code=exit_code_for(exc.code)) from exc
+    data = envelope.get("data") or {}
+    if json_output:
+        typer.echo(json.dumps(envelope, indent=2))
+        return
+    typer.echo(_render_review(data))

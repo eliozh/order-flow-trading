@@ -275,6 +275,30 @@ class ApiClient:
     def journal_compare(self, trade_id: str) -> dict[str, Any]:
         return self._request("GET", f"/api/v1/journal/compare/{quote(trade_id, safe='')}")
 
+    def journal_review(
+        self,
+        trade_id: str,
+        *,
+        refresh: bool = False,
+        provider: str | None = None,
+        idempotency_key: str,
+    ) -> dict[str, Any]:
+        query = []
+        if refresh:
+            query.append("refresh=true")
+        if provider:
+            query.append(f"provider={quote(provider, safe='')}")
+        suffix = "?" + "&".join(query) if query else ""
+        return self._request(
+            "POST",
+            f"/api/v1/journal/{quote(trade_id, safe='')}/review{suffix}",
+            {},
+            extra_headers={"Idempotency-Key": idempotency_key},
+        )
+
+    def get_journal_review(self, trade_id: str) -> dict[str, Any]:
+        return self._request("GET", f"/api/v1/journal/{quote(trade_id, safe='')}/review")
+
     def journal_export(
         self,
         *,

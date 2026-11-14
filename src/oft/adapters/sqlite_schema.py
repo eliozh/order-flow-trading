@@ -33,7 +33,7 @@ from oft.domain.prompts import (
 _LOGGER = logging.getLogger(__name__)
 
 
-_SCHEMA_VERSION = 24
+_SCHEMA_VERSION = 25
 # ``PRAGMA journal_mode=WAL`` needs an exclusive lock and does not reliably
 # consult the busy handler, so a concurrent initializer can still see
 # SQLITE_BUSY with the timeout installed. Retry the switch briefly.
@@ -291,7 +291,8 @@ _TRADE_LOGS_DEFINITION = """
     order_id TEXT NOT NULL REFERENCES orders(order_id),
     fill_id TEXT NOT NULL REFERENCES fills(fill_id),
     risk_verdict_id TEXT NOT NULL REFERENCES risk_verdicts(risk_verdict_id),
-    decision_id TEXT NOT NULL REFERENCES decisions(decision_id)
+    decision_id TEXT NOT NULL REFERENCES decisions(decision_id),
+    review_decision_id TEXT REFERENCES decisions(decision_id)
 """
 # Exactly the actions the application writes to the management timeline.
 _POSITION_EVENT_ACTIONS = ("FULL_CLOSE", "PARTIAL_CLOSE", "ADD", "FUNDING")
@@ -322,6 +323,7 @@ _TRADE_LOGS_INDEXES = (
     "CREATE INDEX IF NOT EXISTS trade_logs_symbol_closed "
     "ON trade_logs(symbol, closed_at DESC, trade_id ASC);",
     "CREATE INDEX IF NOT EXISTS trade_logs_account_id ON trade_logs(account_id);",
+    "CREATE INDEX IF NOT EXISTS trade_logs_review_decision ON trade_logs(review_decision_id);",
 )
 _POSITION_EVENTS_TABLE = (
     f"CREATE TABLE IF NOT EXISTS position_events ({_POSITION_EVENTS_DEFINITION});"
@@ -1470,14 +1472,20 @@ def _migrate_v17(connection: sqlite3.Connection) -> None:
 
 
 def _seed_prompt_defaults(connection: sqlite3.Connection) -> None:
-    """Seed the built-in ANALYSIS/ENTRY_RECHECK/MANAGEMENT templates as active v1.
+    """Seed the built-in ANALYSIS/ENTRY_RECHECK/MANAGEMENT/REVIEW templates.
 
     ``INSERT OR IGNORE`` keeps the seed idempotent; an operator's edits and
     activations are never overwritten by a later initialize. ``MANAGEMENT`` was
-    added in v24 so the management path has a versioned, pinnable template.
+    added in v24 and ``REVIEW`` in v25 so each LLM role has a versioned,
+    pinnable template.
     """
     now = _PROMPT_SEED_CREATED_AT
-    for role in (PromptRole.ANALYSIS, PromptRole.ENTRY_RECHECK, PromptRole.MANAGEMENT):
+    for role in (
+        PromptRole.ANALYSIS,
+        PromptRole.ENTRY_RECHECK,
+        PromptRole.MANAGEMENT,
+        PromptRole.REVIEW,
+    ):
         user_id = PROMPT_IDS[role]
         system_id = SYSTEM_PROMPT_IDS[role]
         for prompt_id in (user_id, system_id):
@@ -2230,6 +2238,47 @@ def _migrate_v24(connection: sqlite3.Connection) -> None:
         raise
 
 
+def _migrate_v25(connection: sqlite3.Connection) -> None:
+    """Seed the REVIEW prompt family and link reviews from trade logs (slice 28).
+
+    ``REVIEW`` joins the seeded roles so the advisory review path renders
+    through the same immutable prompt lifecycle as every other role. The
+    ``trade_logs.review_decision_id`` column is additive: a populated v24
+    database keeps every row and payload byte-identical, and the column is
+    indexed so a persisted review can be found from either side. Both steps are
+    idempotent; a fresh database has no tables yet, so ``_SCHEMA_SQL`` creates
+    the v25 shape and seeds the prompts afterwards.
+    """
+    if not (
+        _table_exists(connection, "prompt_templates") or _table_exists(connection, "trade_logs")
+    ):
+        return
+    if connection.in_transaction:
+        connection.commit()
+    connection.execute("BEGIN IMMEDIATE")
+    try:
+        if _table_exists(connection, "trade_logs"):
+            columns = {row[1] for row in connection.execute("PRAGMA table_info(trade_logs)")}
+            if "review_decision_id" not in columns:
+                connection.execute(
+                    "ALTER TABLE trade_logs ADD COLUMN "
+                    "review_decision_id TEXT REFERENCES decisions(decision_id)"
+                )
+            connection.execute(
+                "CREATE INDEX IF NOT EXISTS trade_logs_review_decision "
+                "ON trade_logs(review_decision_id)"
+            )
+        if _table_exists(connection, "prompt_templates") and _table_exists(
+            connection, "prompt_versions"
+        ):
+            _seed_prompt_defaults(connection)
+        connection.execute("COMMIT")
+    except Exception:
+        if connection.in_transaction:
+            connection.execute("ROLLBACK")
+        raise
+
+
 def _opportunity_conditions_pk(
     connection: sqlite3.Connection,
 ) -> tuple[str, ...]:
@@ -2399,7 +2448,7 @@ def _enable_wal(connection: sqlite3.Connection) -> None:
 
 
 def initialize_database(settings: Settings) -> None:
-    """Create the data directory and the schema, currently v24.
+    """Create the data directory and the schema, currently v25.
 
     v19 adds the trigger snapshot provenance columns (``snapshot_hash``,
     ``as_of``, ``data_quality``, ``condition_count``) and backfills them from
@@ -2411,7 +2460,10 @@ def initialize_database(settings: Settings) -> None:
     (unique ``position_id + settlement_time``, recording the side and size the
     amount was priced on) and widens the event action CHECK to
     ``PARTIAL_CLOSE``/``ADD``/``FUNDING``. v24 seeds the ``MANAGEMENT`` prompt
-    family (idempotent) for the position-management path.
+    family (idempotent) for the position-management path. v25 seeds the
+    ``REVIEW`` prompt family and adds the nullable
+    ``trade_logs.review_decision_id`` link (indexed), preserving every existing
+    trade-log row and payload.
     """
     settings.data_dir.mkdir(parents=True, exist_ok=True)
     settings.data_dir.chmod(0o700)
@@ -2477,6 +2529,8 @@ def initialize_database(settings: Settings) -> None:
             _migrate_v23(connection)
         if _schema_version(connection) < 24 or not _migration_recorded(connection, 24):
             _migrate_v24(connection)
+        if _schema_version(connection) < 25 or not _migration_recorded(connection, 25):
+            _migrate_v25(connection)
         _ensure_opportunity_conditions_shape(connection)
         _ensure_funding_accruals_shape(connection)
         with connection:
@@ -2581,7 +2635,11 @@ def initialize_database(settings: Settings) -> None:
             )
             connection.execute(
                 "INSERT OR IGNORE INTO schema_migrations (version, applied_at) VALUES (?, ?)",
-                (_SCHEMA_VERSION, "2026-11-14T12:00:00.000Z"),
+                (24, "2026-11-14T12:00:00.000Z"),
+            )
+            connection.execute(
+                "INSERT OR IGNORE INTO schema_migrations (version, applied_at) VALUES (?, ?)",
+                (25, "2026-11-14T18:00:00.000Z"),
             )
             _seed_prompt_defaults(connection)
             _ensure_reports_symbol_index(connection)

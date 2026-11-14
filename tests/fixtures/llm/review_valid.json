@@ -1,0 +1,15 @@
+{
+  "decision_type": "REVIEW",
+  "subject": {
+    "symbol": "BTCUSDT",
+    "timeframe": "4h",
+    "as_of": "2026-10-08T00:00:00.000Z"
+  },
+  "confidence": 0.62,
+  "rationale": "The entry followed the proposed zone and the exit was a protective stop; the loss stayed within the pre-declared risk.",
+  "caveats": ["The result is one sample and does not imply edge", "Advisory only; no rule or risk change is proposed"],
+  "analysis": null,
+  "opportunity": null,
+  "entry_recheck": null,
+  "position_management": null
+}

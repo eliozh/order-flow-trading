@@ -577,6 +577,8 @@ class TradeLogRecord:
     fill_id: str = ""
     risk_verdict_id: str = ""
     decision_id: str = ""
+    # The advisory ``REVIEW`` decision linked to this trade, if reviewed.
+    review_decision_id: str | None = None
 
 
 @dataclass(frozen=True)
@@ -1211,6 +1213,17 @@ class StorePort(Protocol):
     def list_funding_accruals(self, position_id: str) -> tuple[FundingAccrualRecord, ...]: ...
 
     def get_trade_log(self, trade_id: str) -> TradeLogRecord | None: ...
+
+    def link_trade_log_review(self, trade_id: str, *, decision_id: str) -> bool:
+        """Atomically record the advisory review decision on a trade log.
+
+        Sets the ``review_decision_id`` column and the matching payload field in
+        one transaction, leaving every other payload field and metric untouched.
+        Returns ``False`` when the trade row does not exist; an unreadable
+        payload is reported by raising :class:`ValueError` so a caller can
+        surface a typed ``DATA_UNAVAILABLE`` rather than overwrite it.
+        """
+        ...
 
     def get_trade_log_for_position(self, position_id: str) -> TradeLogRecord | None: ...
 

@@ -92,6 +92,18 @@ and neutralizes `=`, `+`, `-`, and `@` prefixes with a leading `'`; JSON is a ve
 id) rather than silently dropped, so it agrees with the statistics'
 `unreadable_trades`. Neither export includes raw prompts, decision payloads, or secrets.
 
+### Advisory trade review
+
+A closed trade may carry one linked `REVIEW` decision (`trade_logs.review_decision_id`,
+`trade-log.review_decision_id`). The provider-facing decision uses `rationale` and
+`caveats` for the qualitative assessment and `subject.position_id` to name the reviewed
+trade; it returns `decision_type = REVIEW` with every role payload
+(`analysis`/`opportunity`/`entry_recheck`/`position_management`) explicitly `null`. A
+review is **advisory only**: it can summarize and suggest, but it carries no executable
+payload, cannot create or change an order, position, risk cap, prompt, or rule, and no
+endpoint applies a review's suggestions. `decision_type` gained `REVIEW` as an additive
+enum value; every existing required field and `additionalProperties: false` is unchanged.
+
 ## Validation pipeline
 
 ```

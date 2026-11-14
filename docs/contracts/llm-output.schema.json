@@ -805,7 +805,8 @@
         "MARKET_ANALYSIS",
         "OPPORTUNITY_PROPOSAL",
         "ENTRY_RECHECK",
-        "POSITION_MANAGEMENT"
+        "POSITION_MANAGEMENT",
+        "REVIEW"
       ]
     },
     "subject": {

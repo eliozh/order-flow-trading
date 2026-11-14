@@ -536,11 +536,12 @@ class PromptService:
     def active_for(self, role: str | PromptRole) -> ActivePrompt:
         """The explicitly active version for a role.
 
-        Seeded roles (ANALYSIS/ENTRY_RECHECK/MANAGEMENT) fail closed when their
-        template row or active version is unreadable: silently substituting the
-        built-in v1 would bypass an operator's activation and record false
-        provenance. Only never-seeded roles (REVIEW) use the built-in default,
-        and that fallback is logged.
+        Every role (ANALYSIS/ENTRY_RECHECK/MANAGEMENT/REVIEW) is seeded at
+        initialize time, so a missing template row or active version fails
+        closed: silently substituting the built-in v1 would bypass an
+        operator's activation and record false provenance. The built-in default
+        remains only for a role an older caller explicitly removed from
+        ``SEEDED_ROLES``, and that fallback is logged.
         """
         resolved_role = _resolve_role(role)
         prompt_id = PROMPT_IDS[resolved_role]
@@ -706,11 +707,20 @@ class PromptService:
                 knowledge_status=knowledge_status,
                 knowledge_reason=knowledge_reason,
             )
+        # A review rendered with absent knowledge cannot be replayed exactly:
+        # the advisory text depended on a knowledge block that no longer exists.
+        # Only the REVIEW prompt is affected (``KnowledgeInjection.exact_replay``
+        # is false exactly when its status is ABSENT); earlier decision types keep
+        # their prior behaviour, and a REVIEW decision with no recorded knowledge
+        # status (pre-slice 28) still replays.
+        knowledge_replayable = not (
+            prompt_id == PROMPT_IDS[PromptRole.REVIEW] and knowledge_status == "ABSENT"
+        )
         return PromptProvenance(
             status="available",
             prompt_id=prompt_id,
             version=version,
-            exact_replay=True,
+            exact_replay=knowledge_replayable,
             code=None,
             prompt_hash=recorded_hash,
             body_hash=record.body_hash,

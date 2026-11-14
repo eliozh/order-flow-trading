@@ -893,6 +893,44 @@ class PaperOmsStoreMixin(SqliteConnectionMixin, SqliteAuditMixin):
             connection.close()
         return _row_to_trade_log(row) if row is not None else None
 
+    def link_trade_log_review(self, trade_id: str, *, decision_id: str) -> bool:
+        """Link one advisory review decision without touching any metric.
+
+        The column and the payload field are written in one ``BEGIN IMMEDIATE``
+        transaction, so a concurrent reader never sees only one side. Every
+        other payload field is preserved byte-for-byte (the payload is re-dumped
+        sorted, matching how the broker rendered it). A missing row returns
+        ``False``; an unreadable payload raises ``ValueError`` rather than being
+        replaced.
+        """
+        connection = self._connect()
+        try:
+            connection.execute("BEGIN IMMEDIATE")
+            row = connection.execute(
+                "SELECT payload_json FROM trade_logs WHERE trade_id = ?", (trade_id,)
+            ).fetchone()
+            if row is None:
+                connection.execute("COMMIT")
+                return False
+            try:
+                payload = json.loads(str(row[0]))
+            except (json.JSONDecodeError, TypeError, ValueError) as exc:
+                raise ValueError(f"trade log {trade_id} payload is unreadable") from exc
+            if not isinstance(payload, dict):
+                raise ValueError(f"trade log {trade_id} payload is not an object")
+            payload["review_decision_id"] = decision_id
+            connection.execute(
+                "UPDATE trade_logs SET payload_json = ?, review_decision_id = ? WHERE trade_id = ?",
+                (json.dumps(payload, sort_keys=True), decision_id, trade_id),
+            )
+            connection.execute("COMMIT")
+            return True
+        except BaseException:
+            connection.rollback()
+            raise
+        finally:
+            connection.close()
+
     def get_trade_log_for_position(self, position_id: str) -> TradeLogRecord | None:
         connection = self._connect_read_only()
         if connection is None:
@@ -1064,6 +1102,7 @@ def _row_to_paper_account(row: sqlite3.Row) -> PaperAccountRecord:
 
 
 def _row_to_trade_log(row: sqlite3.Row) -> TradeLogRecord:
+    keys = row.keys()
     return TradeLogRecord(
         trade_id=row["trade_id"],
         position_id=row["position_id"],
@@ -1080,6 +1119,7 @@ def _row_to_trade_log(row: sqlite3.Row) -> TradeLogRecord:
         fill_id=row["fill_id"],
         risk_verdict_id=row["risk_verdict_id"],
         decision_id=row["decision_id"],
+        review_decision_id=(row["review_decision_id"] if "review_decision_id" in keys else None),
     )
 
 

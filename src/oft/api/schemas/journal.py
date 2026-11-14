@@ -4,7 +4,7 @@ from __future__ import annotations
 
 from typing import Any, Literal
 
-from pydantic import BaseModel, ConfigDict, model_validator
+from pydantic import BaseModel, ConfigDict, field_validator, model_validator
 
 from oft.api.schemas.envelope import Envelope, EnvelopeMeta
 
@@ -206,6 +206,44 @@ class JournalCompareData(BaseModel):
     data_quality: Literal["COMPLETE", "PARTIAL", "MISSING"]
 
 
+class JournalReviewData(BaseModel):
+    """One advisory review (a persisted decision or a named missing state)."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    trade_id: str
+    decision_id: str | None = None
+    status: Literal["FOUND", "MISSING", "PARTIAL"]
+    advisory: bool
+    rationale: str | None = None
+    caveats: list[str] = []
+    confidence: float | None = None
+    validation_status: str | None = None
+    provenance: dict[str, Any] | None = None
+    reason: str | None = None
+    idempotent_replay: bool = False
+
+
+class JournalReviewRequest(BaseModel):
+    """The idempotency payload for a review request (query values only)."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    refresh: bool = False
+    provider: str | None = None
+
+    @field_validator("provider")
+    @classmethod
+    def _normalize_provider(cls, value: str | None) -> str | None:
+        # The CLI derives its idempotency key from the stripped/lowered
+        # provider; hash the same normalized value so case/whitespace variants
+        # replay instead of conflicting.
+        if value is None:
+            return None
+        normalized = value.strip().lower()
+        return normalized or None
+
+
 __all__ = [
     "Envelope",
     "EnvelopeMeta",
@@ -217,6 +255,8 @@ __all__ = [
     "JournalExportData",
     "JournalFirstTouchData",
     "JournalPeriod",
+    "JournalReviewData",
+    "JournalReviewRequest",
     "JournalSlippageData",
     "JournalStatsData",
     "JournalTotals",

@@ -385,9 +385,21 @@ def test_active_for_fails_closed_when_the_active_version_row_is_missing(
 
 
 def test_active_for_uses_the_built_in_default_for_a_never_seeded_role_and_logs(
-    tmp_path: Path, caplog: pytest.LogCaptureFixture
+    tmp_path: Path,
+    caplog: pytest.LogCaptureFixture,
+    monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    service, _store = _service(tmp_path)
+    # REVIEW is normally seeded (slice 28); keep the fallback branch covered by
+    # removing it from the seeded set and hiding its template for this test.
+    import oft.application.prompt_service as prompt_service_module
+
+    service, store = _service(tmp_path)
+    monkeypatch.setattr(
+        prompt_service_module,
+        "SEEDED_ROLES",
+        frozenset(PromptRole) - {PromptRole.REVIEW},
+    )
+    monkeypatch.setattr(store, "get_prompt_template", lambda prompt_id: None)
 
     with caplog.at_level(logging.INFO, logger="oft.application.prompt_service"):
         active = service.active_for(PromptRole.REVIEW)
