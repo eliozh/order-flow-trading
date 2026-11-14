@@ -15,6 +15,7 @@ import json
 import logging
 import os
 from collections.abc import Mapping
+from contextlib import suppress
 from datetime import UTC, datetime
 from decimal import Decimal
 from typing import Any
@@ -406,10 +407,12 @@ class JournalService:
             window=window,
         )
         stats_contract = stats.to_contract()
-        exports_dir = self._settings.data_dir / "exports"
-        exports_dir.mkdir(parents=True, exist_ok=True)
+        export_dir = self._settings.data_dir / "exports"
         stamp = now.strftime("%Y%m%dT%H%M%S%fZ")
-        path = exports_dir / f"journal-{stamp}.{resolved_format}"
+        path = export_dir / f"journal-{stamp}.{resolved_format}"
+        # Publish atomically: write a sibling temp file, then rename it into
+        # place. A failure never leaves a partial final file or a stray temp.
+        temp_path = export_dir / f".{path.name}.{os.getpid()}.{os.urandom(6).hex()}.tmp"
         neutralized_cells = 0
         if resolved_format == "csv":
             rendered = csv_document(export_trades)
@@ -426,9 +429,28 @@ class JournalService:
                 },
                 sort_keys=True,
             )
-        descriptor = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_EXCL, _EXPORT_FILE_MODE)
-        with os.fdopen(descriptor, "w", encoding="utf-8") as handle:
-            handle.write(text)
+        descriptor: int | None = None
+        try:
+            # Directory preparation is part of the guarded filesystem work: a
+            # permission/IO failure here is a storage failure, not a 500.
+            export_dir.mkdir(parents=True, exist_ok=True)
+            descriptor = os.open(temp_path, os.O_WRONLY | os.O_CREAT | os.O_EXCL, _EXPORT_FILE_MODE)
+            with os.fdopen(descriptor, "w", encoding="utf-8") as handle:
+                # The file object now owns the descriptor; never close it twice.
+                descriptor = None
+                handle.write(text)
+            os.replace(temp_path, path)
+        except (OSError, FileExistsError) as exc:
+            # Never leak the absolute path; the daemon log keeps the detail.
+            if descriptor is not None:
+                with suppress(OSError):
+                    os.close(descriptor)
+            with suppress(OSError):
+                temp_path.unlink()
+            _LOGGER.warning("journal export write failed: %s", exc)
+            raise JournalError(
+                "STORAGE_UNAVAILABLE", "the export file could not be written"
+            ) from exc
         return {
             "format": resolved_format,
             "path": str(path),

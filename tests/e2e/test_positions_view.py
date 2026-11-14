@@ -379,6 +379,7 @@ def test_positions_web_sources_are_read_only_and_safe() -> None:
     pnl = (WEB_SRC / "components" / "pnl-breakdown.tsx").read_text(encoding="utf-8")
     timeline = (WEB_SRC / "components" / "management-timeline.tsx").read_text(encoding="utf-8")
     api = (WEB_SRC / "api" / "positions.ts").read_text(encoding="utf-8")
+    idempotency = (WEB_SRC / "api" / "idempotency.ts").read_text(encoding="utf-8")
     # The detail screen's markup spans the route plus its extracted model,
     # management panel, and management hook.
     detail_screen = detail + model + panel + management
@@ -401,9 +402,15 @@ def test_positions_web_sources_are_read_only_and_safe() -> None:
     assert "不会发送到交易所" in detail_screen
     assert "管理动作已禁用" in detail_screen
     assert "LLM 提议" in timeline and "CALC 校验" in timeline and "执行" in timeline
-    assert "X-CSRF-Token" in api
-    assert "Idempotency-Key" in api
-    assert "oft_csrf" in api
+    # The management mutation still carries CSRF + Idempotency-Key. The header
+    # construction is shared with the journal review client, so assert the
+    # positions module wires in the shared helpers and the header names live in
+    # the shared idempotency module.
+    assert "mutationHeaders" in api
+    assert "from './idempotency'" in api
+    assert "X-CSRF-Token" in idempotency
+    assert "Idempotency-Key" in idempotency
+    assert "oft_csrf" in idempotency
     assert "MARK_FRESHNESS_MS" in api
     assert "state=OPEN" in api
     # The list is a labelled, keyboard-scrollable region.

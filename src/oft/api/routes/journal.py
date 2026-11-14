@@ -2,9 +2,11 @@
 
 from __future__ import annotations
 
+from pathlib import Path as FilePath
 from typing import Any, Literal
 
 from fastapi import APIRouter, Header, Path, Query, Request
+from fastapi.responses import FileResponse
 
 from oft.api.envelope import new_request_id, success_envelope
 from oft.api.errors import ERROR_CATALOG, ApiError
@@ -148,6 +150,34 @@ def export_journal(
         request_id=new_request_id(),
         provenance="CALC",
         data_quality=str(result.get("data_quality") or "MISSING"),
+    )
+
+
+_EXPORT_MEDIA_TYPES = {"csv": "text/csv", "json": "application/json"}
+
+
+@router.get("/api/v1/journal/export/file")
+def export_journal_file(
+    request: Request,
+    format: Literal["csv", "json"] = Query(default="csv"),
+    period: str | None = Query(default=None, max_length=16),
+    symbol: str | None = Query(default=None, max_length=24),
+) -> FileResponse:
+    """Generate an export and return the just-written file for download.
+
+    The route accepts only query parameters (format/period/symbol); it never
+    accepts a path, so a caller cannot read an arbitrary file. CSV formula
+    neutralization happens in ``JournalService.export`` before the file exists.
+    """
+    try:
+        result = _journal_service(request).export(fmt=format, period=period, symbol=symbol)
+    except JournalError as exc:
+        raise ApiError(exc.code, exc.message) from exc
+    path = FilePath(str(result["path"]))
+    return FileResponse(
+        path,
+        media_type=_EXPORT_MEDIA_TYPES[str(result["format"])],
+        filename=path.name,
     )
 
 

@@ -1,5 +1,7 @@
 import { isAbortError } from './abort'
+import { numberOrNull as num, type ApiEnvelope } from './contract'
 import { errorMessage } from './errors'
+import { createPendingKeyStore, mutationHeaders, newIdempotencyKey } from './idempotency'
 import type { ApiError, ApiMeta } from './status'
 
 export type { ApiError, ApiMeta }
@@ -224,12 +226,7 @@ export interface PositionManageData {
   due_conditions: string[]
 }
 
-export interface PositionEnvelope<T> {
-  ok: boolean
-  data: T | null
-  error: ApiError | null
-  meta: ApiMeta
-}
+export type PositionEnvelope<T> = ApiEnvelope<T>
 
 export type PositionListEnvelope = PositionEnvelope<PositionListData>
 export type PositionDetailEnvelope = PositionEnvelope<PositionData>
@@ -270,17 +267,6 @@ export class PositionApiError extends Error {
   }
 }
 
-function readCookie(name: string): string | null {
-  if (typeof document === 'undefined') {
-    return null
-  }
-  const match = document.cookie
-    .split(';')
-    .map((part) => part.trim())
-    .find((part) => part.startsWith(`${name}=`))
-  return match ? decodeURIComponent(match.slice(name.length + 1)) : null
-}
-
 /**
  * Generate a fresh idempotency key for one logical management request.
  *
@@ -290,69 +276,27 @@ function readCookie(name: string): string | null {
  * of creating a second order.
  */
 export function managementIdempotencyKey(prefix = 'web-manage'): string {
-  if (typeof crypto !== 'undefined' && typeof crypto.randomUUID === 'function') {
-    return `${prefix}-${crypto.randomUUID()}`
-  }
-  return `${prefix}-${Date.now()}-${Math.random().toString(16).slice(2)}`
+  return newIdempotencyKey(prefix)
 }
 
 /** Session-scoped storage key for one position's pending management key. */
 export const MANAGEMENT_KEY_PREFIX = 'oft.position.manage.'
 
-/** In-memory fallback when sessionStorage is unavailable (private mode, SSR). */
-const memoryManagementKeys = new Map<string, string>()
-
-function sessionStore(): Storage | null {
-  if (typeof window === 'undefined') {
-    return null
-  }
-  try {
-    return window.sessionStorage
-  } catch {
-    return null
-  }
-}
-
-function managementStorageKey(positionId: string): string {
-  return `${MANAGEMENT_KEY_PREFIX}${positionId}`
-}
+const managementKeys = createPendingKeyStore('web-manage', MANAGEMENT_KEY_PREFIX)
 
 /** The pending key for one position, or null when none is stored. */
 export function storedManagementKey(positionId: string): string | null {
-  const store = sessionStore()
-  if (store) {
-    try {
-      const stored = store.getItem(managementStorageKey(positionId))
-      if (stored !== null) {
-        return stored
-      }
-    } catch {
-      // Fall through to the in-memory fallback.
-    }
-  }
-  return memoryManagementKeys.get(positionId) ?? null
+  return managementKeys.storedKey(positionId)
 }
 
 /** Create and store a new key for one position (a deliberate new request). */
 export function rotateManagementKey(positionId: string): string {
-  const key = managementIdempotencyKey(`web-manage-${positionId}`)
-  const store = sessionStore()
-  if (store) {
-    try {
-      store.setItem(managementStorageKey(positionId), key)
-      memoryManagementKeys.delete(positionId)
-      return key
-    } catch {
-      // Fall through to the in-memory fallback.
-    }
-  }
-  memoryManagementKeys.set(positionId, key)
-  return key
+  return managementKeys.rotateKey(positionId)
 }
 
 /** The stored key for this position, or a fresh one when none exists. */
 export function managementKeyFor(positionId: string): string {
-  return storedManagementKey(positionId) ?? rotateManagementKey(positionId)
+  return managementKeys.keyFor(positionId)
 }
 
 /**
@@ -361,28 +305,7 @@ export function managementKeyFor(positionId: string): string {
  * request then rotates to a fresh key. An unknown outcome keeps it.
  */
 export function clearManagementKey(positionId: string): void {
-  const store = sessionStore()
-  if (store) {
-    try {
-      store.removeItem(managementStorageKey(positionId))
-    } catch {
-      // The in-memory fallback is cleared below regardless.
-    }
-  }
-  memoryManagementKeys.delete(positionId)
-}
-
-function mutationHeaders(idempotencyKey: string): Record<string, string> {
-  const headers: Record<string, string> = {
-    Accept: 'application/json',
-    'Content-Type': 'application/json',
-    'Idempotency-Key': idempotencyKey,
-  }
-  const csrf = readCookie('oft_csrf')
-  if (csrf) {
-    headers['X-CSRF-Token'] = csrf
-  }
-  return headers
+  managementKeys.clearKey(positionId)
 }
 
 async function requestEnvelope<T>(
@@ -504,14 +427,6 @@ export async function requestManagement(
       timeoutMs: MANAGE_TIMEOUT_MS,
     },
   )
-}
-
-function num(value: string | number | null | undefined): number | null {
-  if (value === null || value === undefined || value === '') {
-    return null
-  }
-  const parsed = typeof value === 'number' ? value : Number(value)
-  return Number.isFinite(parsed) ? parsed : null
 }
 
 /** Direction sign: LONG is +1, SHORT is -1. */

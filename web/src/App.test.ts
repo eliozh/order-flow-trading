@@ -60,4 +60,26 @@ describe('resolveRoute', () => {
     expect(deep.isOpportunities).toBe(false)
     expect(deep.opportunityId).toBeNull()
   })
+
+  it('routes the journal list and exactly one trade detail segment', () => {
+    const list = resolveRoute('/journal')
+    expect(list.isJournal).toBe(true)
+    expect(list.journalTradeId).toBeNull()
+
+    const detail = resolveRoute('/journal/TRD%2D1')
+    expect(detail.isJournal).toBe(true)
+    expect(detail.journalTradeId).toBe('TRD-1')
+
+    // A deeper path is not a journal route; it falls through to not-found.
+    const deep = resolveRoute('/journal/TRD-1/extra')
+    expect(deep.isJournal).toBe(false)
+    expect(deep.journalTradeId).toBeNull()
+  })
+
+  it('keeps the journal route distinct from paper and positions', () => {
+    expect(resolveRoute('/journal').isPaper).toBe(false)
+    expect(resolveRoute('/journal').isPositions).toBe(false)
+    expect(resolveRoute('/paper').isJournal).toBe(false)
+    expect(resolveRoute('/positions/POS-1').isJournal).toBe(false)
+  })
 })

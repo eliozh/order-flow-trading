@@ -28,13 +28,18 @@ export function DataQualityBadge({ status, reasons = [] }: DataQualityBadgeProps
       <span
         className={CLASS_NAMES[status] ?? 'chip'}
         role="note"
+        lang="en"
         aria-label={`Data quality ${status}. ${explanation}`}
       >
         {status}
       </span>
-      {status !== 'COMPLETE' && <span className="quality-reason">{explanation}</span>}
+      {status !== 'COMPLETE' && (
+        <span className="quality-reason" lang="en">
+          {explanation}
+        </span>
+      )}
       {reasons.length > 0 && (
-        <span className="quality-reason">
+        <span className="quality-reason" lang="en">
           {reasons.length} quality reason{reasons.length === 1 ? '' : 's'} recorded.
         </span>
       )}

@@ -9,13 +9,14 @@ const reportDir = process.env.OFT_E2E_REPORT_DIR ?? `${screensDir}/report`
 /**
  * Chromium-only E2E config for the walking-skeleton `/system` journey, the
  * slice-02 read-only symbol registry journeys, the slice-08 report journeys,
- * and the slice-29 positions journey.
+ * the slice-29 positions journey, and the slice-30 journal journeys.
  *
  * Three daemons are started by `e2e/run-e2e.sh` (temporary data dirs, fixture
- * scan, exchangeInfo seed, backfill/report, and one seeded OPEN paper position
- * already applied). All suites are read-only except the positions journey,
- * which performs exactly one real paper management POST against the reports
- * daemon. Run them with:
+ * scan, exchangeInfo seed, backfill/report, one seeded OPEN paper position, and
+ * one seeded CLOSED paper trade already applied). All suites are read-only
+ * except the positions journey (one paper management POST) and the journal
+ * journey (one advisory review POST), both against the reports daemon. Run
+ * them with:
  *
  *   npm --prefix web run test:e2e
  */
@@ -42,6 +43,11 @@ export default defineConfig({
     {
       name: 'positions',
       testMatch: /positions\.spec\.ts/,
+      use: { ...devices['Desktop Chrome'], baseURL: reportsBaseURL },
+    },
+    {
+      name: 'journal',
+      testMatch: /journal\.spec\.ts/,
       use: { ...devices['Desktop Chrome'], baseURL: reportsBaseURL },
     },
     {

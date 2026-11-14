@@ -72,6 +72,8 @@ _SPA_ENTRY_PATHS = frozenset(
         "/paper",
         "/positions",
         "/positions/",
+        "/journal",
+        "/journal/",
     }
 )
 _LOOPBACK_HOSTS = frozenset({"127.0.0.1", "localhost", "::1"})
@@ -146,6 +148,7 @@ def _is_spa_entry(path: str) -> bool:
         or path.startswith("/opportunities/")
         or path.startswith("/triggers/")
         or path.startswith("/positions/")
+        or path.startswith("/journal/")
     )
 
 

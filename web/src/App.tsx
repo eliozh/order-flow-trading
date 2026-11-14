@@ -5,6 +5,8 @@ import { useStatusBar } from './hooks/use-status-bar'
 import { resolveRoute } from './routes/route-match'
 import { OpportunityDetailPage } from './routes/opportunity-detail'
 import { OpportunitiesPage } from './routes/opportunities'
+import { JournalDetailPage } from './routes/journal-detail'
+import { JournalPage } from './routes/journal'
 import { PaperPage } from './routes/paper'
 import { PositionDetailPage } from './routes/position-detail'
 import { PositionsPage } from './routes/positions'
@@ -49,6 +51,8 @@ export default function App() {
             <TriggerDetailPage key={route.triggerId} triggerId={route.triggerId} />
           ) : route.positionId !== null ? (
             <PositionDetailPage key={route.positionId} positionId={route.positionId} />
+          ) : route.journalTradeId !== null ? (
+            <JournalDetailPage key={route.journalTradeId} tradeId={route.journalTradeId} />
           ) : route.isScans ? (
             <ScansPage />
           ) : route.isReports ? (
@@ -59,6 +63,8 @@ export default function App() {
             <TriggersPage />
           ) : route.isPositions ? (
             <PositionsPage />
+          ) : route.isJournal ? (
+            <JournalPage />
           ) : route.isPaper ? (
             <PaperPage />
           ) : route.isWatchlist ? (
@@ -71,7 +77,7 @@ export default function App() {
               <p className="status-message">
                 Open <code>/watchlist</code>, <code>/scans</code>, <code>/reports</code>,{' '}
                 <code>/opportunities</code>, <code>/triggers</code>, <code>/positions</code>,{' '}
-                <code>/paper</code>, or <code>/system</code>.
+                <code>/journal</code>, <code>/paper</code>, or <code>/system</code>.
               </p>
             </section>
           )}
