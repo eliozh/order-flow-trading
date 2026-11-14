@@ -24,7 +24,10 @@ import {
   type TriggerRejectEnvelope,
 } from '../api/triggers'
 import { DecisionCard, type AnalysisProvenance } from '../components/decision-card'
+import { errorMessage } from '../api/errors'
+import { recordField } from '../api/records'
 import { useNarrowCompact } from '../hooks/use-compact'
+import { useDialogFocus } from '../hooks/use-dialog-focus'
 
 interface TriggerDetailPageProps {
   triggerId: string
@@ -97,10 +100,6 @@ function rotateRecheckKey(triggerId: string): string {
   return key
 }
 
-function errorMessage(error: unknown): string {
-  return error instanceof Error ? error.message : 'Unknown error'
-}
-
 function analysisOf(opportunity: OpportunityData | null | undefined): AnalysisProvenance | null {
   const llm = opportunity?.provenance?.llm
   if (!llm) {
@@ -154,95 +153,6 @@ function cardFromTrigger(trigger: TriggerPayload, recheckError?: string | null):
     risk: trigger.risk_verdict,
     human_action: trigger.human_action,
   }
-}
-
-function recordField(
-  record: Record<string, unknown> | null | undefined,
-  key: string,
-): string | null {
-  const value = record?.[key]
-  return typeof value === 'string' || typeof value === 'number' ? String(value) : null
-}
-
-function focusables(panel: HTMLElement | null): HTMLElement[] {
-  if (!panel) {
-    return []
-  }
-  return Array.from(
-    panel.querySelectorAll<HTMLElement>(
-      'button:not([disabled]), [href], input:not([disabled]), select:not([disabled]), textarea:not([disabled]), [tabindex]:not([tabindex="-1"])',
-    ),
-  )
-}
-
-/** Modal focus contract shared by the accept and reject dialogs. */
-function useDialogFocus(open: boolean, onClose: () => void) {
-  const panelRef = useRef<HTMLDivElement>(null)
-  const restoreRef = useRef<HTMLElement | null>(null)
-
-  useEffect(() => {
-    if (!open || typeof document === 'undefined') {
-      return
-    }
-    restoreRef.current =
-      document.activeElement instanceof HTMLElement ? document.activeElement : null
-    const panel = panelRef.current
-    const initial =
-      panel?.querySelector<HTMLElement>('[data-autofocus]') ?? focusables(panel)[0] ?? panel
-    initial?.focus()
-
-    const shell = document.querySelector('.app-shell')
-    const shellWasInert = shell?.hasAttribute('inert') ?? false
-    shell?.setAttribute('inert', '')
-    const previousOverflow = document.body.style.overflow
-    document.body.style.overflow = 'hidden'
-
-    function onKeyDown(event: KeyboardEvent): void {
-      if (event.key === 'Escape') {
-        event.preventDefault()
-        onClose()
-        return
-      }
-      if (event.key !== 'Tab') {
-        return
-      }
-      const items = focusables(panel)
-      if (items.length === 0) {
-        event.preventDefault()
-        panel?.focus()
-        return
-      }
-      const first = items[0]
-      const last = items[items.length - 1]
-      if (
-        event.shiftKey &&
-        (document.activeElement === first || document.activeElement === panel)
-      ) {
-        event.preventDefault()
-        last.focus()
-      } else if (!event.shiftKey && document.activeElement === last) {
-        event.preventDefault()
-        first.focus()
-      }
-    }
-
-    document.addEventListener('keydown', onKeyDown, true)
-    return () => {
-      document.removeEventListener('keydown', onKeyDown, true)
-      document.body.style.overflow = previousOverflow
-      if (!shellWasInert) {
-        shell?.removeAttribute('inert')
-      }
-      const target = restoreRef.current
-      if (target && target.isConnected) {
-        target.focus()
-      } else {
-        document.getElementById('trigger-detail-heading')?.focus()
-      }
-    }
-  }, [open, onClose])
-
-  return panelRef
 }
 
 export function TriggerDetailPage({
@@ -364,8 +274,12 @@ export function TriggerDetailPage({
     actionController.current?.abort()
     setRejectOpen(false)
   }, [])
-  const acceptPanelRef = useDialogFocus(acceptOpen, closeAccept)
-  const rejectPanelRef = useDialogFocus(rejectOpen, closeReject)
+  const acceptPanelRef = useDialogFocus(acceptOpen, closeAccept, {
+    fallbackFocusId: 'trigger-detail-heading',
+  })
+  const rejectPanelRef = useDialogFocus(rejectOpen, closeReject, {
+    fallbackFocusId: 'trigger-detail-heading',
+  })
 
   async function manualRecheck(): Promise<void> {
     const controller = new AbortController()

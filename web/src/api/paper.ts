@@ -1,3 +1,4 @@
+import { fetchWithTimeout } from './request-timeout'
 import type { ApiError, ApiMeta } from './status'
 
 export type { ApiError, ApiMeta }
@@ -121,15 +122,18 @@ async function requestEnvelope<T>(
   options: { method?: 'GET' | 'POST' | 'DELETE'; signal?: AbortSignal } = {},
 ): Promise<PaperEnvelope<T>> {
   const method = options.method ?? 'GET'
-  const response = await fetch(path, {
-    method,
-    headers:
-      method === 'GET'
-        ? { Accept: 'application/json' }
-        : { Accept: 'application/json', ...csrfHeader() },
-    credentials: 'same-origin',
-    signal: options.signal,
-  })
+  const response = await fetchWithTimeout(
+    path,
+    {
+      method,
+      headers:
+        method === 'GET'
+          ? { Accept: 'application/json' }
+          : { Accept: 'application/json', ...csrfHeader() },
+      credentials: 'same-origin',
+    },
+    options.signal,
+  )
   let envelope: PaperEnvelope<T> | null = null
   try {
     envelope = (await response.json()) as PaperEnvelope<T>

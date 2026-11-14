@@ -1,13 +1,19 @@
 #!/usr/bin/env bash
-# Run the slice-01 /system journey and the slice-02 read-only symbol journeys
-# against real daemons.
+# Run the slice-01 /system journey, the slice-02 read-only symbol journeys, the
+# slice-08 report journeys, and the slice-29 positions journey against real
+# daemons.
 #
-# Starts `oft serve` twice with temporary OFT_DATA_DIRs:
+# Starts `oft serve` three times with temporary OFT_DATA_DIRs:
 #   - 127.0.0.1:7622 for the walking-skeleton /system journey;
 #   - 127.0.0.1:7632 for the symbol registry, seeded from the committed
-#     exchangeInfo fixture by the daemon bootstrap.
-# The fixture market scan is applied to the first daemon, then both daemons are
+#     exchangeInfo fixture by the daemon bootstrap;
+#   - 127.0.0.1:7642 for reports/positions, seeded with a backfill, reports, and
+#     one OPEN paper position created through evaluate -> recheck -> accept.
+# The fixture market scan is applied to the first daemon, then the daemons are
 # driven by Playwright. Every daemon is stopped before this script exits.
+#
+# Only the positions journey mutates anything: it performs one real paper
+# management POST (with CSRF + Idempotency-Key) against the reports daemon.
 set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
@@ -285,6 +291,60 @@ if ! printf '%s' "$BATCH_JSON" | jq -e '
   exit 1
 fi
 
+# Slice 29: seed one OPEN paper position for the browser journey before the
+# degraded fixture flip. Restore the valid ANALYSIS fixture first (the batch
+# scan above consumed it and the re-check must use it), then drive the real
+# trigger -> recheck -> accept path over HTTP with the reports bearer token.
+cp "$ROOT/tests/fixtures/llm/opportunity_valid.json" "$LLM_FIXTURES_DIR/opportunity_valid.json"
+BATCH_REPORT_ID="$(printf '%s' "$BATCH_JSON" |
+  jq -r '[.data.symbols[] | select(.symbol == "BTCUSDT") | .report_id] | .[0]')"
+if [ -z "$BATCH_REPORT_ID" ] || [ "$BATCH_REPORT_ID" = "null" ]; then
+  echo "E2E valid batch scan has no BTCUSDT report for the positions journey" >&2
+  printf '%s\n' "$BATCH_JSON" >&2
+  exit 1
+fi
+POSITION_OPPORTUNITY_ID="$(curl -fsS -H "Authorization: Bearer $REPORTS_TOKEN" \
+  "$REPORTS_BASE_URL/api/v1/reports/$BATCH_REPORT_ID" |
+  jq -r '.data.llm.opportunity_ids[0] // empty')"
+if [ -z "$POSITION_OPPORTUNITY_ID" ]; then
+  echo "E2E batch report has no opportunity for the positions journey" >&2
+  exit 1
+fi
+TRIGGER_JSON="$(curl -fsS -X POST \
+  -H "Authorization: Bearer $REPORTS_TOKEN" \
+  -H "Content-Type: application/json" \
+  -H "Idempotency-Key: e2e-position-evaluate" \
+  -d "{\"opportunity_id\":\"$POSITION_OPPORTUNITY_ID\"}" \
+  "$REPORTS_BASE_URL/api/v1/triggers/evaluate")"
+TRIGGER_ID="$(printf '%s' "$TRIGGER_JSON" | jq -r '.data.trigger.trigger_id // empty')"
+if [ -z "$TRIGGER_ID" ]; then
+  echo "E2E positions journey could not create a trigger" >&2
+  printf '%s\n' "$TRIGGER_JSON" >&2
+  cat "$REPORTS_LOG" >&2
+  exit 1
+fi
+curl -fsS -X POST \
+  -H "Authorization: Bearer $REPORTS_TOKEN" \
+  -H "Idempotency-Key: e2e-position-recheck" \
+  "$REPORTS_BASE_URL/api/v1/triggers/$TRIGGER_ID/recheck" >/dev/null
+ACCEPT_JSON="$(curl -fsS -X POST \
+  -H "Authorization: Bearer $REPORTS_TOKEN" \
+  -H "Idempotency-Key: e2e-position-accept" \
+  "$REPORTS_BASE_URL/api/v1/triggers/$TRIGGER_ID/accept")"
+POSITION_ID="$(printf '%s' "$ACCEPT_JSON" | jq -r '.data.position.position_id // empty')"
+if [ -z "$POSITION_ID" ]; then
+  echo "E2E positions journey did not create a paper position" >&2
+  printf '%s\n' "$ACCEPT_JSON" >&2
+  cat "$REPORTS_LOG" >&2
+  exit 1
+fi
+if ! curl -fsS -H "Authorization: Bearer $REPORTS_TOKEN" \
+  "$REPORTS_BASE_URL/api/v1/positions/$POSITION_ID" |
+  jq -e --arg id "$POSITION_ID" '.ok == true and .data.position_id == $id' >/dev/null; then
+  echo "E2E position $POSITION_ID is not readable through the API" >&2
+  exit 1
+fi
+
 # Flip the ANALYSIS fixture to a schema-invalid payload: the next batch must
 # mark the data-bearing symbol DEGRADED with a CALC-only report and continue.
 cp "$ROOT/tests/fixtures/llm/invalid_schema.json" \
@@ -394,6 +454,8 @@ export OFT_E2E_BATCH_ID="$BATCH_ID"
 export OFT_E2E_BATCH_DEGRADED_ID="$BATCH_DEGRADED_ID"
 export OFT_E2E_MISSING_REPORT_ID="$MISSING_REPORT_ID"
 export OFT_E2E_HOSTILE_REPORT_ID="$HOSTILE_REPORT_ID"
+export OFT_E2E_POSITION_ID="$POSITION_ID"
+export OFT_E2E_REPORT_API_TOKEN="$REPORTS_TOKEN"
 export OFT_E2E_DATA_DIR="$SYSTEM_DATA_DIR"
 export OFT_E2E_SCAN_ID="$SCAN_ID"
 export OFT_E2E_SCAN_DELTA="$SCAN_DELTA"

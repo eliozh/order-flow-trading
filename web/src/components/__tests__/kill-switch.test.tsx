@@ -198,4 +198,29 @@ describe('KillSwitchBar', () => {
 
     await waitFor(() => expect(status).toHaveBeenCalledTimes(2))
   })
+
+  it('closes the resume dialog and releases inert/scroll when the switch becomes inactive', async () => {
+    let active = true
+    render(
+      <div className="app-shell">
+        <KillSwitchBar
+          fetchStatusFn={async () => envelope(active)}
+          activateFn={async () => envelope(true)}
+          deactivateFn={async () => envelope(false)}
+        />
+      </div>,
+    )
+
+    fireEvent.click(await screen.findByRole('button', { name: /Kill switch 开启，可停止新订单/ }))
+    expect(screen.getByRole('dialog', { name: /关闭 Kill switch/ })).toBeInTheDocument()
+    expect(document.querySelector('.app-shell')).toHaveAttribute('inert')
+    expect(document.body.style.overflow).toBe('hidden')
+
+    active = false
+    fireEvent(window, new Event('focus'))
+
+    await waitFor(() => expect(screen.queryByRole('dialog')).not.toBeInTheDocument())
+    expect(document.querySelector('.app-shell')).not.toHaveAttribute('inert')
+    expect(document.body.style.overflow).toBe('')
+  })
 })

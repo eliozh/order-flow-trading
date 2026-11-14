@@ -1,3 +1,4 @@
+import { fetchWithTimeout, MUTATION_TIMEOUT_MS, READ_TIMEOUT_MS } from './request-timeout'
 import type { ApiError, ApiMeta } from './status'
 
 export type { ApiError, ApiMeta }
@@ -258,18 +259,22 @@ async function requestEnvelope<T>(
 ): Promise<TriggerEnvelope<T>> {
   const method = options.method ?? 'GET'
   const mutating = method !== 'GET'
-  const response = await fetch(path, {
-    method,
-    headers: mutating
-      ? mutationHeaders({
-          idempotencyKey: options.idempotencyKey,
-          json: options.body !== undefined,
-        })
-      : { Accept: 'application/json' },
-    body: options.body === undefined ? undefined : JSON.stringify(options.body),
-    credentials: 'same-origin',
-    signal: options.signal,
-  })
+  const response = await fetchWithTimeout(
+    path,
+    {
+      method,
+      headers: mutating
+        ? mutationHeaders({
+            idempotencyKey: options.idempotencyKey,
+            json: options.body !== undefined,
+          })
+        : { Accept: 'application/json' },
+      body: options.body === undefined ? undefined : JSON.stringify(options.body),
+      credentials: 'same-origin',
+    },
+    options.signal,
+    mutating ? MUTATION_TIMEOUT_MS : READ_TIMEOUT_MS,
+  )
   let envelope: TriggerEnvelope<T> | null = null
   try {
     envelope = (await response.json()) as TriggerEnvelope<T>

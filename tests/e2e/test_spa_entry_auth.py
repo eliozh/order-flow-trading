@@ -24,8 +24,18 @@ def _app(settings: Settings, tmp_path: Path, monkeypatch: pytest.MonkeyPatch) ->
     return create_app(settings)
 
 
-@pytest.mark.parametrize("path", ["/triggers", "/triggers/TRG-1/", "/paper"])
-def test_trigger_and_paper_deep_links_require_auth(
+@pytest.mark.parametrize(
+    "path",
+    [
+        "/triggers",
+        "/triggers/TRG-1/",
+        "/paper",
+        "/positions",
+        "/positions/",
+        "/positions/POS-1/",
+    ],
+)
+def test_spa_entry_deep_links_require_auth(
     path: str,
     settings: Settings,
     tmp_path: Path,
@@ -43,8 +53,12 @@ def test_trigger_and_paper_deep_links_require_auth(
     assert app.state.api_token not in response.text
 
 
-def test_authorized_trigger_deep_link_serves_the_spa_shell(
-    settings: Settings, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+@pytest.mark.parametrize("path", ["/triggers", "/positions"])
+def test_authorized_spa_deep_link_serves_the_spa_shell(
+    path: str,
+    settings: Settings,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     app = _app(settings, tmp_path, monkeypatch)
     secret = app.state.browser_bootstrap
@@ -52,7 +66,7 @@ def test_authorized_trigger_deep_link_serves_the_spa_shell(
     with TestClient(app) as client:
         minted = client.get("/", params={"bootstrap": secret}, follow_redirects=False)
         assert minted.status_code == 302
-        response = client.get("/triggers")
+        response = client.get(path)
 
     assert response.status_code == 200
     assert 'id="root"' in response.text

@@ -1,3 +1,4 @@
+import { fetchWithTimeout } from './request-timeout'
 import type { ApiError, ApiMeta } from './status'
 
 export type { ApiError, ApiMeta }
@@ -159,11 +160,11 @@ async function getEnvelope<T>(
   path: string,
   signal?: AbortSignal,
 ): Promise<{ ok: boolean; data: T | null; error: ApiError | null; meta: ApiMeta }> {
-  const response = await fetch(path, {
-    headers: { Accept: 'application/json' },
-    credentials: 'same-origin',
+  const response = await fetchWithTimeout(
+    path,
+    { headers: { Accept: 'application/json' }, credentials: 'same-origin' },
     signal,
-  })
+  )
   let envelope: { ok: boolean; data: T | null; error: ApiError | null; meta: ApiMeta } | null = null
   try {
     envelope = (await response.json()) as {

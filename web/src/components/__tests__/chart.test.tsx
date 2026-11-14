@@ -282,6 +282,24 @@ describe('Chart', () => {
     expect(container.querySelector('img')).toBeNull()
     expect(screen.getAllByText(hostile).length).toBeGreaterThan(0)
   })
+
+  it('draws the entry marker when the entry is outside the bar price range', () => {
+    render(
+      <Chart
+        symbol="BTCUSDT"
+        timeframe="4h"
+        bars={bars}
+        metrics={metrics}
+        quality="PARTIAL"
+        qualityReasons={[]}
+        entryPrice="70016.0004"
+      />,
+    )
+
+    expect(screen.getByTestId('chart-entry-marker')).toBeInTheDocument()
+    expect(screen.getByText(/ENTRY 70016\.0004/)).toBeInTheDocument()
+    expect(screen.getByRole('figure')).toHaveAccessibleDescription(/Entry marker at 70016\.0004/)
+  })
 })
 
 describe('Chart accessibility and alignment', () => {
@@ -345,10 +363,7 @@ describe('Chart accessibility and alignment', () => {
     expect(toggle).toHaveAttribute('aria-expanded', 'false')
 
     fireEvent.click(toggle)
-    expect(screen.getByRole('table', { name: /chart data table/i })).toHaveAttribute(
-      'id',
-      tableId,
-    )
+    expect(screen.getByRole('table', { name: /chart data table/i })).toHaveAttribute('id', tableId)
   })
 
   it('labels panes in fixed CSS px, exposes the zero line, and tab-stops only the table', () => {
@@ -409,8 +424,12 @@ describe('Chart accessibility and alignment', () => {
     expect(third).toHaveTextContent('▼')
     expect(first).toHaveAccessibleName(/up/i)
     expect(third).toHaveAccessibleName(/down/i)
-    expect(screen.getByTestId('chart-candles').querySelectorAll('[data-direction="up"]')).toHaveLength(2)
-    expect(screen.getByTestId('chart-candles').querySelectorAll('[data-direction="down"]')).toHaveLength(1)
+    expect(
+      screen.getByTestId('chart-candles').querySelectorAll('[data-direction="up"]'),
+    ).toHaveLength(2)
+    expect(
+      screen.getByTestId('chart-candles').querySelectorAll('[data-direction="down"]'),
+    ).toHaveLength(1)
   })
 
   it('distinguishes direction by text and sign, not hue alone', () => {

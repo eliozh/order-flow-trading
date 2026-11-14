@@ -1,4 +1,4 @@
-import { useEffect, useId, useState } from 'react'
+import { memo, useEffect, useId, useState } from 'react'
 import type { KeyboardEvent } from 'react'
 
 import type { MetricsDocument, SnapshotBar } from '../api/reports'
@@ -16,6 +16,11 @@ interface ChartProps {
   qualityReasons?: string[]
   selectedBarStart?: string
   onSelectBar?: (barStart: string) => void
+  /**
+   * Additive, optional entry marker: one horizontal rule at this price and a
+   * text label. It adds no indicator, pane, or series.
+   */
+  entryPrice?: string | number | null
 }
 
 const WIDTH = 760
@@ -36,12 +41,24 @@ function numeric(value: string | null): number {
   return Number.isFinite(parsed) ? parsed : 0
 }
 
-function priceRange(bars: SnapshotBar[]): { min: number; max: number } {
+/**
+ * The drawn price domain. An entry marker price is folded into the domain so
+ * the marker is always inside the plotted range (the report snapshot predates
+ * entry, so the entry is often above or below every bar).
+ */
+function priceRange(
+  bars: SnapshotBar[],
+  anchor: number | null = null,
+): { min: number; max: number } {
   let min = Number.POSITIVE_INFINITY
   let max = Number.NEGATIVE_INFINITY
   for (const bar of bars) {
     min = Math.min(min, numeric(bar.low))
     max = Math.max(max, numeric(bar.high))
+  }
+  if (anchor !== null && Number.isFinite(anchor)) {
+    min = Math.min(min, anchor)
+    max = Math.max(max, anchor)
   }
   const pad = Math.max((max - min) * 0.08, 0.01)
   return { min: min - pad, max: max + pad }
@@ -56,7 +73,7 @@ function signedText(value: string): string {
   return signedDecimal(value)
 }
 
-export function Chart({
+function ChartComponent({
   symbol,
   timeframe,
   bars,
@@ -65,6 +82,7 @@ export function Chart({
   qualityReasons = [],
   selectedBarStart,
   onSelectBar,
+  entryPrice = null,
 }: ChartProps) {
   const plotId = useId()
   const tableId = `${plotId}-table`
@@ -108,7 +126,14 @@ export function Chart({
     )
   }
 
-  const range = priceRange(bars)
+  const entryValue =
+    entryPrice === null || entryPrice === undefined || entryPrice === '' ? null : Number(entryPrice)
+  const entryText = entryValue === null ? null : String(entryPrice)
+  const anchoredEntry = entryValue !== null && Number.isFinite(entryValue) ? entryValue : null
+  const range = priceRange(bars, anchoredEntry)
+  // The entry is part of the price domain above, so a finite entry always has a
+  // Y position and an off-range entry renders as an in-scale marker.
+  const entryY = anchoredEntry === null ? null : yForPrice(anchoredEntry, range)
   const slot = (WIDTH - PADDING * 2) / bars.length
   const candleWidth = Math.max(slot * 0.55, 3)
   const selectedBar = bars.find((bar) => bar.bar_start === selected) ?? bars[bars.length - 1]
@@ -162,8 +187,9 @@ export function Chart({
     >
       <figcaption id={summaryId} className="visually-hidden">
         Candlestick chart with {bars.length} bars. Price range {range.min.toFixed(2)} to{' '}
-        {range.max.toFixed(2)}. Volume, CVD, volume profile, and footprint are shown; the data
-        table carries the same values.
+        {range.max.toFixed(2)}. Volume, CVD, volume profile, and footprint are shown; the data table
+        carries the same values.
+        {entryY !== null && entryText !== null ? ` Entry marker at ${entryText}.` : ''}
       </figcaption>
       <div className="chart-head">
         <span className="chart-symbol">{symbol}</span>
@@ -208,145 +234,170 @@ export function Chart({
             <span>POC {metrics.volume_profile.poc}</span>
           </div>
           <div className="chart-canvas">
-          <div className="chart-axis-labels" data-testid="chart-axis-labels" aria-hidden="true">
-            <span
-              data-testid="price-label-max"
-              style={{ top: `${(PRICE_TOP / HEIGHT) * 100}%`, transform: 'translateY(-50%)' }}
+            <div className="chart-axis-labels" data-testid="chart-axis-labels" aria-hidden="true">
+              <span
+                data-testid="price-label-max"
+                style={{ top: `${(PRICE_TOP / HEIGHT) * 100}%`, transform: 'translateY(-50%)' }}
+              >
+                {range.max.toFixed(2)}
+              </span>
+              <span
+                data-testid="price-label-mid"
+                style={{
+                  top: `${((PRICE_TOP + PRICE_HEIGHT / 2) / HEIGHT) * 100}%`,
+                  transform: 'translateY(-50%)',
+                }}
+              >
+                {((range.max + range.min) / 2).toFixed(2)}
+              </span>
+              <span
+                data-testid="price-label-min"
+                style={{
+                  top: `${((PRICE_TOP + PRICE_HEIGHT) / HEIGHT) * 100}%`,
+                  transform: 'translateY(-50%)',
+                }}
+              >
+                {range.min.toFixed(2)}
+              </span>
+            </div>
+            <svg
+              className="chart-svg"
+              viewBox={`0 0 ${WIDTH} ${HEIGHT}`}
+              role="presentation"
+              focusable="false"
+              aria-hidden="true"
+              data-testid="chart-plot"
             >
-              {range.max.toFixed(2)}
-            </span>
-            <span
-              data-testid="price-label-mid"
-              style={{
-                top: `${((PRICE_TOP + PRICE_HEIGHT / 2) / HEIGHT) * 100}%`,
-                transform: 'translateY(-50%)',
-              }}
-            >
-              {((range.max + range.min) / 2).toFixed(2)}
-            </span>
-            <span
-              data-testid="price-label-min"
-              style={{
-                top: `${((PRICE_TOP + PRICE_HEIGHT) / HEIGHT) * 100}%`,
-                transform: 'translateY(-50%)',
-              }}
-            >
-              {range.min.toFixed(2)}
-            </span>
-          </div>
-          <svg
-            className="chart-svg"
-            viewBox={`0 0 ${WIDTH} ${HEIGHT}`}
-            role="presentation"
-            focusable="false"
-            aria-hidden="true"
-            data-testid="chart-plot"
-          >
-            <g className="chart-grid">
-              <line
-                data-testid="grid-price-top"
-                x1={PADDING}
-                y1={PRICE_TOP}
-                x2={WIDTH - PADDING}
-                y2={PRICE_TOP}
-              />
-              <line
-                data-testid="grid-price-mid"
-                x1={PADDING}
-                y1={PRICE_TOP + PRICE_HEIGHT / 2}
-                x2={WIDTH - PADDING}
-                y2={PRICE_TOP + PRICE_HEIGHT / 2}
-              />
-              <line
-                data-testid="grid-price-bottom"
-                x1={PADDING}
-                y1={PRICE_TOP + PRICE_HEIGHT}
-                x2={WIDTH - PADDING}
-                y2={PRICE_TOP + PRICE_HEIGHT}
-              />
-            </g>
-            <g data-testid="chart-candles">
-              {bars.map((bar, index) => {
-                const x = PADDING + slot * index + slot / 2
-                const openY = yForPrice(numeric(bar.open), range)
-                const closeY = yForPrice(numeric(bar.close), range)
-                const up = numeric(bar.close) >= numeric(bar.open)
-                const top = Math.min(openY, closeY)
-                const bodyHeight = Math.max(Math.abs(closeY - openY), 1)
-                return (
-                  <g
-                    key={bar.bar_start}
-                    className={up ? 'candle-up' : 'candle-down'}
-                    data-direction={up ? 'up' : 'down'}
+              <g className="chart-grid">
+                <line
+                  data-testid="grid-price-top"
+                  x1={PADDING}
+                  y1={PRICE_TOP}
+                  x2={WIDTH - PADDING}
+                  y2={PRICE_TOP}
+                />
+                <line
+                  data-testid="grid-price-mid"
+                  x1={PADDING}
+                  y1={PRICE_TOP + PRICE_HEIGHT / 2}
+                  x2={WIDTH - PADDING}
+                  y2={PRICE_TOP + PRICE_HEIGHT / 2}
+                />
+                <line
+                  data-testid="grid-price-bottom"
+                  x1={PADDING}
+                  y1={PRICE_TOP + PRICE_HEIGHT}
+                  x2={WIDTH - PADDING}
+                  y2={PRICE_TOP + PRICE_HEIGHT}
+                />
+              </g>
+              <g data-testid="chart-candles">
+                {bars.map((bar, index) => {
+                  const x = PADDING + slot * index + slot / 2
+                  const openY = yForPrice(numeric(bar.open), range)
+                  const closeY = yForPrice(numeric(bar.close), range)
+                  const up = numeric(bar.close) >= numeric(bar.open)
+                  const top = Math.min(openY, closeY)
+                  const bodyHeight = Math.max(Math.abs(closeY - openY), 1)
+                  return (
+                    <g
+                      key={bar.bar_start}
+                      className={up ? 'candle-up' : 'candle-down'}
+                      data-direction={up ? 'up' : 'down'}
+                    >
+                      <line
+                        x1={x}
+                        y1={yForPrice(numeric(bar.high), range)}
+                        x2={x}
+                        y2={yForPrice(numeric(bar.low), range)}
+                      />
+                      <rect
+                        x={x - candleWidth / 2}
+                        y={top}
+                        width={candleWidth}
+                        height={bodyHeight}
+                      />
+                    </g>
+                  )
+                })}
+              </g>
+              {entryY !== null && entryText !== null && (
+                <g className="chart-entry-marker" data-testid="chart-entry-marker">
+                  <line
+                    x1={PADDING}
+                    y1={entryY}
+                    x2={WIDTH - PADDING}
+                    y2={entryY}
+                    data-testid="chart-entry-line"
+                  />
+                  <text
+                    x={WIDTH - PADDING - 4}
+                    y={entryY - 4}
+                    textAnchor="end"
+                    className="chart-label"
+                    data-testid="chart-entry-label"
                   >
-                    <line
-                      x1={x}
-                      y1={yForPrice(numeric(bar.high), range)}
-                      x2={x}
-                      y2={yForPrice(numeric(bar.low), range)}
+                    ENTRY {entryText}
+                  </text>
+                </g>
+              )}
+              <g data-testid="chart-volume-profile">
+                {metrics.volume_profile.bins.map((bin) => {
+                  const width = (numeric(bin.volume) / maxProfileVolume) * 110
+                  const midPrice = (numeric(bin.price_low) + numeric(bin.price_high)) / 2
+                  const y = Math.min(
+                    Math.max(yForPrice(midPrice, range) - 5, PRICE_TOP),
+                    PRICE_TOP + PRICE_HEIGHT - 10,
+                  )
+                  return (
+                    <rect
+                      key={`${bin.price_low}-${bin.price_high}`}
+                      className={bin.is_poc ? 'vp-bin vp-bin--poc' : 'vp-bin'}
+                      x={PADDING}
+                      y={y}
+                      width={Math.max(width, 1)}
+                      height={10}
                     />
-                    <rect x={x - candleWidth / 2} y={top} width={candleWidth} height={bodyHeight} />
-                  </g>
-                )
-              })}
-            </g>
-            <g data-testid="chart-volume-profile">
-              {metrics.volume_profile.bins.map((bin) => {
-                const width = (numeric(bin.volume) / maxProfileVolume) * 110
-                const midPrice = (numeric(bin.price_low) + numeric(bin.price_high)) / 2
-                const y = Math.min(
-                  Math.max(yForPrice(midPrice, range) - 5, PRICE_TOP),
-                  PRICE_TOP + PRICE_HEIGHT - 10,
-                )
-                return (
-                  <rect
-                    key={`${bin.price_low}-${bin.price_high}`}
-                    className={bin.is_poc ? 'vp-bin vp-bin--poc' : 'vp-bin'}
-                    x={PADDING}
-                    y={y}
-                    width={Math.max(width, 1)}
-                    height={10}
-                  />
-                )
-              })}
-            </g>
-            <g data-testid="chart-volume">
-              {bars.map((bar, index) => {
-                const height = (numeric(bar.volume) / maxVolume) * VOLUME_HEIGHT
-                const x = PADDING + slot * index + slot / 2
-                return (
-                  <rect
-                    key={`vol-${bar.bar_start}`}
-                    className={numeric(bar.delta) >= 0 ? 'vol-up' : 'vol-down'}
-                    data-direction={numeric(bar.delta) >= 0 ? 'up' : 'down'}
-                    x={x - candleWidth / 2}
-                    y={VOLUME_TOP + VOLUME_HEIGHT - height}
-                    width={candleWidth}
-                    height={Math.max(height, 1)}
-                  />
-                )
-              })}
-            </g>
-            <g data-testid="chart-cvd">
-              <line
-                className="cvd-zero"
-                x1={PADDING}
-                y1={CVD_TOP + ((cvdMax - 0) / cvdSpan) * CVD_HEIGHT}
-                x2={WIDTH - PADDING}
-                y2={CVD_TOP + ((cvdMax - 0) / cvdSpan) * CVD_HEIGHT}
-              />
-              <polyline
-                className="cvd-line"
-                points={bars
-                  .map((bar, index) => {
-                    const x = PADDING + slot * index + slot / 2
-                    const y = CVD_TOP + ((cvdMax - numeric(bar.cvd)) / cvdSpan) * CVD_HEIGHT
-                    return `${x},${y}`
-                  })
-                  .join(' ')}
-              />
-            </g>
-          </svg>
+                  )
+                })}
+              </g>
+              <g data-testid="chart-volume">
+                {bars.map((bar, index) => {
+                  const height = (numeric(bar.volume) / maxVolume) * VOLUME_HEIGHT
+                  const x = PADDING + slot * index + slot / 2
+                  return (
+                    <rect
+                      key={`vol-${bar.bar_start}`}
+                      className={numeric(bar.delta) >= 0 ? 'vol-up' : 'vol-down'}
+                      data-direction={numeric(bar.delta) >= 0 ? 'up' : 'down'}
+                      x={x - candleWidth / 2}
+                      y={VOLUME_TOP + VOLUME_HEIGHT - height}
+                      width={candleWidth}
+                      height={Math.max(height, 1)}
+                    />
+                  )
+                })}
+              </g>
+              <g data-testid="chart-cvd">
+                <line
+                  className="cvd-zero"
+                  x1={PADDING}
+                  y1={CVD_TOP + ((cvdMax - 0) / cvdSpan) * CVD_HEIGHT}
+                  x2={WIDTH - PADDING}
+                  y2={CVD_TOP + ((cvdMax - 0) / cvdSpan) * CVD_HEIGHT}
+                />
+                <polyline
+                  className="cvd-line"
+                  points={bars
+                    .map((bar, index) => {
+                      const x = PADDING + slot * index + slot / 2
+                      const y = CVD_TOP + ((cvdMax - numeric(bar.cvd)) / cvdSpan) * CVD_HEIGHT
+                      return `${x},${y}`
+                    })
+                    .join(' ')}
+                />
+              </g>
+            </svg>
           </div>
         </div>
 
@@ -402,72 +453,77 @@ export function Chart({
           // eslint-disable-next-line jsx-a11y/no-noninteractive-tabindex
           tabIndex={0}
         >
-        <table className="data-table chart-table" id={tableId} aria-label="Chart data table">
-          <caption className="visually-hidden">
-            Chart data table with the same values drawn in the chart ({plotId}).
-          </caption>
-          <thead>
-            <tr>
-              <th scope="col">Time</th>
-              <th scope="col">O</th>
-              <th scope="col">H</th>
-              <th scope="col">L</th>
-              <th scope="col">C</th>
-              <th scope="col">Vol</th>
-              <th scope="col">Delta</th>
-              <th scope="col">CVD</th>
-              <th scope="col">Dir</th>
-            </tr>
-          </thead>
-          <tbody>
-            {bars.map((bar) => (
-              <tr key={`row-${bar.bar_start}`}>
-                <td className="mono">{utcLabel(bar.bar_start)}</td>
-                <td className="mono">{bar.open}</td>
-                <td className="mono">{bar.high}</td>
-                <td className="mono">{bar.low}</td>
-                <td className="mono">{bar.close}</td>
-                <td className="mono">{bar.volume}</td>
-                <td className={bar.delta.startsWith('-') ? 'value-down' : 'value-up'}>
-                  {signedText(bar.delta)}
-                </td>
-                <td className={bar.cvd.startsWith('-') ? 'value-down' : 'value-up'}>
-                  {signedText(bar.cvd)}
-                </td>
-                <td>
-                  {numeric(bar.close) >= numeric(bar.open) ? 'up' : 'down'}
-                </td>
+          {' '}
+          <table className="data-table chart-table" id={tableId} aria-label="Chart data table">
+            <caption className="visually-hidden">
+              Chart data table with the same values drawn in the chart ({plotId}).
+            </caption>
+            <thead>
+              <tr>
+                <th scope="col">Time</th>
+                <th scope="col">O</th>
+                <th scope="col">H</th>
+                <th scope="col">L</th>
+                <th scope="col">C</th>
+                <th scope="col">Vol</th>
+                <th scope="col">Delta</th>
+                <th scope="col">CVD</th>
+                <th scope="col">Dir</th>
               </tr>
-            ))}
-          </tbody>
-        </table>
-        <table className="data-table chart-vp-table" aria-label="Volume profile data table">
-          <caption className="visually-hidden">
-            Volume profile bins with price range, volume, POC, and value-area membership.
-          </caption>
-          <thead>
-            <tr>
-              <th scope="col">Price low</th>
-              <th scope="col">Price high</th>
-              <th scope="col">Volume</th>
-              <th scope="col">POC</th>
-              <th scope="col">Value area</th>
-            </tr>
-          </thead>
-          <tbody>
-            {metrics.volume_profile.bins.map((bin) => (
-              <tr key={`vp-row-${bin.price_low}-${bin.price_high}`}>
-                <td className="mono">{bin.price_low}</td>
-                <td className="mono">{bin.price_high}</td>
-                <td className="mono">{bin.volume}</td>
-                <td>{bin.is_poc ? 'POC' : '—'}</td>
-                <td>{bin.in_value_area ? 'yes' : 'no'}</td>
+            </thead>
+            <tbody>
+              {bars.map((bar) => (
+                <tr key={`row-${bar.bar_start}`}>
+                  <td className="mono">{utcLabel(bar.bar_start)}</td>
+                  <td className="mono">{bar.open}</td>
+                  <td className="mono">{bar.high}</td>
+                  <td className="mono">{bar.low}</td>
+                  <td className="mono">{bar.close}</td>
+                  <td className="mono">{bar.volume}</td>
+                  <td className={bar.delta.startsWith('-') ? 'value-down' : 'value-up'}>
+                    {signedText(bar.delta)}
+                  </td>
+                  <td className={bar.cvd.startsWith('-') ? 'value-down' : 'value-up'}>
+                    {signedText(bar.cvd)}
+                  </td>
+                  <td>{numeric(bar.close) >= numeric(bar.open) ? 'up' : 'down'}</td>
+                </tr>
+              ))}
+            </tbody>
+          </table>
+          <table className="data-table chart-vp-table" aria-label="Volume profile data table">
+            <caption className="visually-hidden">
+              Volume profile bins with price range, volume, POC, and value-area membership.
+            </caption>
+            <thead>
+              <tr>
+                <th scope="col">Price low</th>
+                <th scope="col">Price high</th>
+                <th scope="col">Volume</th>
+                <th scope="col">POC</th>
+                <th scope="col">Value area</th>
               </tr>
-            ))}
-          </tbody>
-        </table>
+            </thead>
+            <tbody>
+              {metrics.volume_profile.bins.map((bin) => (
+                <tr key={`vp-row-${bin.price_low}-${bin.price_high}`}>
+                  <td className="mono">{bin.price_low}</td>
+                  <td className="mono">{bin.price_high}</td>
+                  <td className="mono">{bin.volume}</td>
+                  <td>{bin.is_poc ? 'POC' : '—'}</td>
+                  <td>{bin.in_value_area ? 'yes' : 'no'}</td>
+                </tr>
+              ))}
+            </tbody>
+          </table>
         </div>
       )}
     </figure>
   )
 }
+
+/**
+ * Memoized so the 5s position revalidation does not rebuild the whole SVG
+ * tree; the report/snapshot props are not replaced by a poll.
+ */
+export const Chart = memo(ChartComponent)
