@@ -7,12 +7,15 @@ const screensDir = process.env.OFT_E2E_SCREENS_DIR ?? '../.claude/ecc-workflow/s
 const reportDir = process.env.OFT_E2E_REPORT_DIR ?? `${screensDir}/report`
 
 /**
- * Chromium-only E2E config for the walking-skeleton `/system` journey and the
- * slice-02 read-only symbol registry journeys.
+ * Chromium-only E2E config for the walking-skeleton `/system` journey, the
+ * slice-02 read-only symbol registry journeys, the slice-08 report journeys,
+ * and the slice-29 positions journey.
  *
- * Both daemons are started by `e2e/run-e2e.sh` (temporary data dirs, fixture
- * scan and exchangeInfo seed already applied) so the suites are read-only.
- * Run them with:
+ * Three daemons are started by `e2e/run-e2e.sh` (temporary data dirs, fixture
+ * scan, exchangeInfo seed, backfill/report, and one seeded OPEN paper position
+ * already applied). All suites are read-only except the positions journey,
+ * which performs exactly one real paper management POST against the reports
+ * daemon. Run them with:
  *
  *   npm --prefix web run test:e2e
  */
@@ -36,6 +39,11 @@ export default defineConfig({
     video: 'retain-on-failure',
   },
   projects: [
+    {
+      name: 'positions',
+      testMatch: /positions\.spec\.ts/,
+      use: { ...devices['Desktop Chrome'], baseURL: reportsBaseURL },
+    },
     {
       name: 'system',
       testMatch: /system\.spec\.ts/,

@@ -1,4 +1,4 @@
-import { useEffect, useId, useState } from 'react'
+import { memo, useEffect, useId, useState } from 'react'
 import type { KeyboardEvent } from 'react'
 
 import type { MetricsDocument, SnapshotBar } from '../api/reports'
@@ -73,7 +73,7 @@ function signedText(value: string): string {
   return signedDecimal(value)
 }
 
-export function Chart({
+function ChartComponent({
   symbol,
   timeframe,
   bars,
@@ -453,6 +453,7 @@ export function Chart({
           // eslint-disable-next-line jsx-a11y/no-noninteractive-tabindex
           tabIndex={0}
         >
+          {' '}
           <table className="data-table chart-table" id={tableId} aria-label="Chart data table">
             <caption className="visually-hidden">
               Chart data table with the same values drawn in the chart ({plotId}).
@@ -520,3 +521,9 @@ export function Chart({
     </figure>
   )
 }
+
+/**
+ * Memoized so the 5s position revalidation does not rebuild the whole SVG
+ * tree; the report/snapshot props are not replaced by a poll.
+ */
+export const Chart = memo(ChartComponent)

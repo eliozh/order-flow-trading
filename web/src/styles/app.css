@@ -279,6 +279,24 @@ code {
   color: var(--oft-status-warn);
 }
 
+/* Pushes the global pause control to the right edge of the status bar. */
+.sb-grow {
+  flex: 1;
+}
+
+.sb-pause {
+  flex: none;
+  min-height: 28px;
+}
+
+/* The kill-switch bar stays above an open dialog overlay so the focused stop
+   control and its focus ring remain visible (DESIGN A2.4/A6). The dialog still
+   paints above all page content. */
+.kill-switch-bar {
+  position: relative;
+  z-index: 30;
+}
+
 /* /system shell */
 .system-page {
   display: flex;
@@ -569,9 +587,14 @@ code {
 }
 
 @media (max-width: 768px) {
+  /* The pause control is 44px on touch; let the bar grow and stop clipping so
+     its :focus-visible ring is never cut off (DESIGN A6/A12). */
   .statusbar {
     gap: 8px;
     padding: 0 8px;
+    height: auto;
+    min-height: 44px;
+    overflow: visible;
   }
 
   /* Keep the environment chip visible and announced at mobile widths. */
@@ -1513,4 +1536,3 @@ code {
     min-height: 44px;
   }
 }
-

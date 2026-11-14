@@ -1,20 +1,13 @@
 import { utcLabel } from '../api/reports'
 import type { PositionManageData, PositionManagementEntry } from '../api/positions'
 import { dash } from '../api/positions'
+import { recordField } from '../api/records'
 
 interface ManagementTimelineProps {
   /** Persisted ``management_history`` entries from the position payload. */
   entries?: PositionManagementEntry[]
   /** The validated result of the current management request, when one ran. */
   result?: PositionManageData | null
-}
-
-function recordField(
-  record: Record<string, unknown> | null | undefined,
-  key: string,
-): string | null {
-  const value = record?.[key]
-  return typeof value === 'string' || typeof value === 'number' ? String(value) : null
 }
 
 function confidenceText(value: number | null | undefined): string {

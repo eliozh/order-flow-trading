@@ -273,6 +273,18 @@ def test_manage_hold_returns_llm_calc_and_status_without_an_order(
     # The HOLD persists in the timeline the detail renders; no position change.
     assert data["position"]["state"] == "OPEN"
     assert data["position"]["size"] == position["size"]
+    # The managed position snapshot carries the additive resolved mark too.
+    assert set(data["position"]) >= {
+        "resolved_mark_price",
+        "resolved_mark_as_of",
+        "resolved_mark_source",
+    }
+    assert Decimal(data["position"]["resolved_mark_price"]) > 0
+    resolved_as_of = datetime.fromisoformat(
+        str(data["position"]["resolved_mark_as_of"]).replace("Z", "+00:00")
+    )
+    assert resolved_as_of.tzinfo is not None
+    assert data["position"]["resolved_mark_source"] in {"BARS", "POSITION"}
     assert _orders_total(harness) == before
 
     shown = harness.client.get(f"/api/v1/positions/{position['position_id']}", headers=harness.auth)
@@ -317,6 +329,13 @@ def test_duplicate_key_replays_and_creates_no_second_order(
     assert Decimal(order["quantity"]) == Decimal(fill["quantity"])
     updated = first_data["position"]
     assert updated["state"] == "OPEN"
+    assert set(updated) >= {
+        "resolved_mark_price",
+        "resolved_mark_as_of",
+        "resolved_mark_source",
+    }
+    assert Decimal(updated["resolved_mark_price"]) > 0
+    assert updated["resolved_mark_source"] in {"BARS", "POSITION"}
     assert Decimal(updated["size"]) == Decimal(position["size"]) - Decimal(fill["quantity"])
     entry = updated["management_history"][-1]
     assert entry["action"] == "PARTIAL_CLOSE"

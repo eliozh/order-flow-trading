@@ -233,8 +233,15 @@ def manage_position(
     except BaseException:
         release(request, key=key)
         raise
+    contract = result.to_contract()
+    managed = contract.get("position")
+    if isinstance(managed, dict):
+        # A management result carries a position snapshot; expose the same
+        # server-resolved mark the list/detail read models do. Decorate before
+        # ``complete`` so a replay returns the identical envelope.
+        contract["position"] = _service(request).with_resolved_mark(managed)
     envelope = success_envelope(
-        result.to_contract(),
+        contract,
         request_id=new_request_id(),
         provenance="MIXED",
         data_quality=_management_quality(result),

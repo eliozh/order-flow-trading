@@ -4,16 +4,23 @@ import {
   formatAge,
   formatSignedMoney,
   formatSignedPercent,
+  markAsOf,
   markState,
   netPnl,
   pnlPct,
   rMultiple,
+  resolvedMark,
 } from '../api/positions'
+import { utcLabel } from '../api/reports'
 
 interface PositionTableProps {
   positions: PositionData[]
   /** Deterministic clock for age and mark freshness (defaults to Date.now()). */
   now?: number
+  /** The unfiltered ledger total; when larger than the page the view is PARTIAL. */
+  total?: number
+  /** True when the server reports a next page for this query. */
+  truncated?: boolean
 }
 
 function Side({ side }: { side: string }) {
@@ -72,16 +79,43 @@ function EmptyState() {
  * The open-position ledger: every documented column, with a mark that is
  * explicitly STALE/PARTIAL instead of a fabricated PnL. Rows link to detail.
  */
-export function PositionTable({ positions, now = Date.now() }: PositionTableProps) {
+export function PositionTable({
+  positions,
+  now = Date.now(),
+  total = positions.length,
+  truncated = false,
+}: PositionTableProps) {
   if (positions.length === 0) {
+    // A page with no rows is never "no open positions" when the ledger total is
+    // non-zero: say that this page is empty and the aggregate is PARTIAL.
+    if (total > 0) {
+      return (
+        <div className="panel empty-panel" role="status" data-testid="position-table-page-empty">
+          <p className="kicker" lang="en">
+            PAGE EMPTY · TOTAL {total}
+          </p>
+          <h2>本页没有持仓行</h2>
+          <p className="panel-foot" style={{ borderTop: 0, padding: '8px 0' }}>
+            台账共有 {total} 个未平仓持仓，但当前页未返回任何行；不把该页当作“没有未平仓持仓”。
+            汇总标记为 PARTIAL。
+          </p>
+        </div>
+      )
+    }
     return <EmptyState />
   }
+
+  const captionTotal =
+    total > positions.length ? `，共 ${total} 个（本页 ${positions.length} 个）` : ''
 
   return (
     // eslint-disable-next-line jsx-a11y/no-noninteractive-tabindex -- keyboard-scrollable table
     <div className="table-wrap" role="region" tabIndex={0} aria-label="未平仓持仓表">
       <table className="data-table position-table">
-        <caption className="visually-hidden">未平仓持仓，{positions.length} 个，Paper</caption>
+        <caption className="visually-hidden">
+          未平仓持仓，{positions.length} 个，Paper{captionTotal}
+          {truncated ? '，存在下一页：汇总为 PARTIAL' : ''}
+        </caption>
         <thead lang="en">
           <tr>
             <th scope="col">Symbol</th>
@@ -103,6 +137,7 @@ export function PositionTable({ positions, now = Date.now() }: PositionTableProp
         <tbody>
           {positions.map((position) => {
             const state = markState(position, now)
+            const mark = resolvedMark(position)
             const net = netPnl(position)
             const pct = pnlPct(position)
             const r = rMultiple(position)
@@ -131,13 +166,14 @@ export function PositionTable({ positions, now = Date.now() }: PositionTableProp
                     </>
                   ) : (
                     <>
-                      {position.mark_price}
+                      {mark}
                       {state === 'STALE' && (
                         <>
                           {' '}
                           <span className="chip chip--warn">STALE</span>
                         </>
                       )}
+                      <div className="cell-sub">as of {utcLabel(markAsOf(position))} UTC</div>
                     </>
                   )}
                 </td>
@@ -172,6 +208,12 @@ export function PositionTable({ positions, now = Date.now() }: PositionTableProp
           })}
         </tbody>
       </table>
+      {truncated && (
+        <p className="status-message" role="status" data-testid="position-table-truncated">
+          列表已分页：仅显示本页 {positions.length} / {total} 个持仓；汇总为 PARTIAL，不把本页当作
+          完整台账。
+        </p>
+      )}
     </div>
   )
 }

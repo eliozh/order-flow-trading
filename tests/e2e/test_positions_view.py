@@ -12,7 +12,7 @@ from __future__ import annotations
 
 import json
 from dataclasses import dataclass
-from datetime import date
+from datetime import UTC, date, datetime
 from decimal import Decimal
 from pathlib import Path
 from typing import Any
@@ -23,8 +23,12 @@ from referencing import Registry, Resource
 from referencing.jsonschema import DRAFT202012
 
 from oft.api.app import create_app
+from oft.application import recorded_bars
 from oft.bootstrap import build_container
+from oft.clock import FixedClock
 from oft.config import Settings
+from oft.domain.time import utc_timestamp
+from oft.ports.clock import ClockPort
 
 ROOT = Path(__file__).resolve().parents[2]
 ARCHIVE = ROOT / "tests" / "fixtures" / "archive"
@@ -74,6 +78,7 @@ class _Harness:
     app: Any
     client: TestClient
     auth: dict[str, str]
+    settings: Settings
 
 
 def _registry() -> Registry:
@@ -97,7 +102,7 @@ def _validate_envelope(envelope: dict[str, Any]) -> None:
     assert not errors, "\n".join(error.message for error in errors)
 
 
-def _harness(tmp_path: Path) -> _Harness:
+def _harness(tmp_path: Path, *, clock: ClockPort | None = None) -> _Harness:
     settings = Settings(
         env="test",
         port=8765,
@@ -113,10 +118,10 @@ def _harness(tmp_path: Path) -> _Harness:
         ).run.status
         == "COMPLETE"
     )
-    app = create_app(settings)
+    app = create_app(settings, clock=clock)
     client = TestClient(app)
     auth = {"Authorization": f"Bearer {app.state.api_token}"}
-    return _Harness(app=app, client=client, auth=auth)
+    return _Harness(app=app, client=client, auth=auth, settings=settings)
 
 
 def _open_position(harness: _Harness) -> dict[str, Any]:
@@ -153,6 +158,21 @@ def _open_position(harness: _Harness) -> dict[str, Any]:
     )
     assert accepted.status_code == 201, accepted.text
     return accepted.json()["data"]["position"]
+
+
+def _newest_recorded_bar_end(harness: _Harness, symbol: str) -> str:
+    """The newest recorded published bar ``bar_end`` for one symbol."""
+    store = harness.app.state.container.store
+    series, _failed = recorded_bars.bar_series(store, symbol)
+    newest: datetime | None = None
+    for period, metric_version in sorted(series):
+        read = recorded_bars.read_series(harness.settings, store, symbol, period, metric_version)
+        for row in read.rows:
+            parsed = recorded_bars.parse_timestamp(row.get("bar_end"))
+            if parsed is not None and (newest is None or parsed > newest):
+                newest = parsed
+    assert newest is not None, "no recorded bar series was published"
+    return utc_timestamp(newest)
 
 
 def test_empty_position_ledger_is_explicit(tmp_path: Path) -> None:
@@ -229,6 +249,17 @@ def test_position_list_and_detail_expose_the_documented_contract(tmp_path: Path)
     assert "source_decision_id" in item
     assert item["opened_at"]
     assert set(item["data_quality"]) >= {"status", "reasons"}
+    # The server-resolved mark is exposed additively so the UI never derives
+    # freshness/PnL from the entry/exit-only stored mark.
+    assert set(item) >= {
+        "resolved_mark_price",
+        "resolved_mark_as_of",
+        "resolved_mark_source",
+    }
+    assert Decimal(item["resolved_mark_price"]) > 0
+    parsed_as_of = datetime.fromisoformat(str(item["resolved_mark_as_of"]).replace("Z", "+00:00"))
+    assert parsed_as_of.tzinfo is not None
+    assert item["resolved_mark_source"] in {"BARS", "POSITION"}
 
     assert detail.status_code == 200, detail.text
     detail_envelope = detail.json()
@@ -285,14 +316,73 @@ def test_position_list_and_detail_expose_the_documented_contract(tmp_path: Path)
     assert history_envelope["meta"]["data_quality"] == pnl["data_quality"]["status"]
 
 
+def test_resolved_mark_comes_from_the_recorded_bars_not_the_stored_row(
+    tmp_path: Path,
+) -> None:
+    open_instant = datetime(2026, 10, 5, tzinfo=UTC)
+    read_instant = datetime(2026, 10, 7, 12, tzinfo=UTC)
+
+    opening = _harness(tmp_path, clock=FixedClock(open_instant))
+    try:
+        created = _open_position(opening)
+    finally:
+        opening.client.close()
+    stored_updated_at = created["updated_at"]
+
+    later = _harness(tmp_path, clock=FixedClock(read_instant))
+    try:
+        # A later scan publishes the newer recorded bars the resolver prefers.
+        # The stored row still records the entry-time mark and its as-of.
+        scan = later.client.post(
+            "/api/v1/scans",
+            json={
+                "symbol": "BTCUSDT",
+                "period": "4h",
+                "source": "backfill",
+                "metrics_only": False,
+                "provider": "stub",
+            },
+            headers={**later.auth, "Idempotency-Key": "positions-resolved-scan"},
+        )
+        assert scan.status_code == 201, scan.text
+        detail = later.client.get(f"/api/v1/positions/{created['position_id']}", headers=later.auth)
+        listed = later.client.get("/api/v1/positions", params={"state": "OPEN"}, headers=later.auth)
+        newest_bar_end = _newest_recorded_bar_end(later, "BTCUSDT")
+    finally:
+        later.client.close()
+
+    assert detail.status_code == 200, detail.text
+    detail_envelope = detail.json()
+    _validate_envelope(detail_envelope)
+    item = detail_envelope["data"]
+    assert item["resolved_mark_source"] == "BARS"
+    assert item["resolved_mark_as_of"] == newest_bar_end
+    # The resolved as-of is the newly recorded bar, not the older stored row.
+    assert item["resolved_mark_as_of"] != stored_updated_at
+    assert item["updated_at"] == stored_updated_at
+    assert Decimal(item["resolved_mark_price"]) > 0
+
+    assert listed.status_code == 200, listed.text
+    rows = listed.json()["data"]["items"]
+    assert len(rows) == 1
+    assert rows[0]["resolved_mark_source"] == "BARS"
+    assert rows[0]["resolved_mark_as_of"] == newest_bar_end
+
+
 def test_positions_web_sources_are_read_only_and_safe() -> None:
     positions = (WEB_SRC / "routes" / "positions.tsx").read_text(encoding="utf-8")
     detail = (WEB_SRC / "routes" / "position-detail.tsx").read_text(encoding="utf-8")
+    model = (WEB_SRC / "routes" / "position-detail-model.ts").read_text(encoding="utf-8")
+    panel = (WEB_SRC / "components" / "position-management-panel.tsx").read_text(encoding="utf-8")
+    management = (WEB_SRC / "hooks" / "use-position-management.ts").read_text(encoding="utf-8")
     table = (WEB_SRC / "components" / "position-table.tsx").read_text(encoding="utf-8")
     pnl = (WEB_SRC / "components" / "pnl-breakdown.tsx").read_text(encoding="utf-8")
     timeline = (WEB_SRC / "components" / "management-timeline.tsx").read_text(encoding="utf-8")
     api = (WEB_SRC / "api" / "positions.ts").read_text(encoding="utf-8")
-    source = positions + detail + table + pnl + timeline + api
+    # The detail screen's markup spans the route plus its extracted model,
+    # management panel, and management hook.
+    detail_screen = detail + model + panel + management
+    source = positions + detail_screen + table + pnl + timeline + api
 
     # Required labels and states.
     for label in ("未平仓持仓", "STALE", "PARTIAL", "fetchPositions", "data-readonly={compact}"):
@@ -300,16 +390,16 @@ def test_positions_web_sources_are_read_only_and_safe() -> None:
     assert "没有未平仓持仓" in table
     assert "Paper" in table and "Live" in table
     assert "Price PnL" in pnl and "Net uPnL" in pnl and "Funding" in pnl
-    assert "请求管理" in detail
+    assert "请求管理" in detail_screen
     assert "fetchPositionHistory" in detail
-    assert "requestManagement" in detail
+    assert "requestManagement" in detail_screen
     # Requesting management requires an explicit confirmation dialog and states
     # the paper-only consequence; a STALE mark disables the action.
-    assert 'role="dialog"' in detail
-    assert "aria-modal" in detail
-    assert "确认请求管理" in detail
-    assert "不会发送到交易所" in detail
-    assert "管理动作已禁用" in detail
+    assert 'role="dialog"' in detail_screen
+    assert "aria-modal" in detail_screen
+    assert "确认请求管理" in detail_screen
+    assert "不会发送到交易所" in detail_screen
+    assert "管理动作已禁用" in detail_screen
     assert "LLM 提议" in timeline and "CALC 校验" in timeline and "执行" in timeline
     assert "X-CSRF-Token" in api
     assert "Idempotency-Key" in api
@@ -333,7 +423,17 @@ def test_positions_web_sources_are_read_only_and_safe() -> None:
     # No journal/review UI and no live control in this slice (any file). Assert
     # specific UI markers, not the bare substring "review" (which would also
     # reject innocuous words such as "preview").
-    for page in (positions, detail, table, pnl, timeline, api):
+    for page in (
+        positions,
+        detail,
+        model,
+        panel,
+        management,
+        table,
+        pnl,
+        timeline,
+        api,
+    ):
         assert "/journal" not in page
         assert "JournalPage" not in page
         assert "trade-review" not in page.lower()

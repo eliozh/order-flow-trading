@@ -664,12 +664,41 @@ class PositionService:
         self, *, state: str | None = None, limit: int = 100, offset: int = 0
     ) -> tuple[dict[str, Any], ...]:
         items: list[dict[str, Any]] = []
-        for record in self._store.list_positions(state=state, limit=limit, offset=offset):
-            payload = decode_payload_json(
-                record.payload_json, subject=f"position {record.position_id}"
-            )
-            if payload is not None:
-                items.append(payload)
+        # Resolve the published series once per symbol and keep one series cache
+        # per symbol for the whole page, so a multi-row list neither re-queries
+        # the manifest per row nor discards another symbol's cached parquet
+        # reads. ``SeriesCache`` is keyed by ``(period, metric_version)`` only,
+        # so it must never be shared across symbols. The service is per request;
+        # the previous state is restored in ``finally``.
+        series_by_symbol: dict[str, set[tuple[str, str]]] = {}
+        caches_by_symbol: dict[str, recorded_bars.SeriesCache] = {}
+        previous_series = self._tick_series
+        previous_cache = self._tick_cache
+        try:
+            for record in self._store.list_positions(state=state, limit=limit, offset=offset):
+                payload = decode_payload_json(
+                    record.payload_json, subject=f"position {record.position_id}"
+                )
+                if payload is None:
+                    continue
+                symbol = str(payload.get("symbol") or "")
+                if symbol:
+                    if symbol not in series_by_symbol:
+                        series_by_symbol[symbol], _failed = recorded_bars.bar_series(
+                            self._store, symbol
+                        )
+                        caches_by_symbol[symbol] = {}
+                    self._tick_series = series_by_symbol[symbol]
+                    self._tick_cache = caches_by_symbol[symbol]
+                else:
+                    # A payload without a symbol cannot be constructed below;
+                    # leave the per-row fallback untouched for the null path.
+                    self._tick_series = None
+                    self._tick_cache = None
+                items.append(self.with_resolved_mark(payload))
+        finally:
+            self._tick_series = previous_series
+            self._tick_cache = previous_cache
         return tuple(items)
 
     def count(self, *, state: str | None = None) -> int:
@@ -679,7 +708,38 @@ class PositionService:
         record = self._store.get_position(position_id)
         if record is None:
             raise PositionNotFound(position_id)
-        return self._decode(record.payload_json, subject=f"position {position_id}")
+        payload = self._decode(record.payload_json, subject=f"position {position_id}")
+        return self.with_resolved_mark(payload)
+
+    def with_resolved_mark(self, payload: dict[str, Any]) -> dict[str, Any]:
+        """Return a new payload carrying the server-resolved recorded mark.
+
+        The UI cannot derive mark freshness from the stored ``mark_price`` and
+        ``updated_at`` alone: the backend writes those only at entry/exit, while
+        the mark resolver prefers a newer recorded bar close. This decorates the
+        payload additively with the resolver's ``(price, as_of, source)`` using
+        the same rule as the monitor/management paths and the injected clock.
+        The stored payload is never mutated, and decoration never raises: an
+        unreadable position or a resolution failure yields null fields.
+        """
+        decorated = dict(payload)
+        decorated["resolved_mark_price"] = None
+        decorated["resolved_mark_as_of"] = None
+        decorated["resolved_mark_source"] = None
+        try:
+            position = position_from_contract(payload)
+            now_dt = self._clock.now()
+            if now_dt.tzinfo is None:
+                now_dt = now_dt.replace(tzinfo=UTC)
+            observation = self._resolve_mark(position, payload, now_dt.astimezone(UTC))
+        except (PositionError, KeyError, TypeError, ValueError, ArithmeticError):
+            return decorated
+        if observation is None:
+            return decorated
+        decorated["resolved_mark_price"] = decimal_str(observation.mark)
+        decorated["resolved_mark_as_of"] = observation.as_of
+        decorated["resolved_mark_source"] = observation.source
+        return decorated
 
     def history(self, position_id: str) -> dict[str, Any]:
         """The position's accounting timeline: events, funding, and PnL terms.

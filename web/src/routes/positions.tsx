@@ -13,8 +13,14 @@ import {
   type PositionData,
   type PositionListEnvelope,
 } from '../api/positions'
+import { errorMessage } from '../api/errors'
+import type { ApiMeta } from '../api/status'
 import { PositionTable } from '../components/position-table'
+import { PausedPanel, PausedStamp } from '../components/paused-state'
 import { useCompact } from '../hooks/use-compact'
+import { useLiveUpdates } from '../hooks/use-live-updates'
+import { usePolling } from '../hooks/use-polling'
+import { useRunGeneration } from '../hooks/use-run-generation'
 
 interface PositionsPageProps {
   fetchPositionsFn?: (signal?: AbortSignal) => Promise<PositionListEnvelope>
@@ -23,113 +29,140 @@ interface PositionsPageProps {
   now?: number
   /** Revalidation cadence (default 5s). */
   refreshMs?: number
+  /** Override the global pause state (unit tests); defaults to the context. */
+  paused?: boolean
 }
 
 interface PositionsState {
   state: 'loading' | 'ready' | 'error'
   items: PositionData[]
   total: number
+  hasNext: boolean
   message?: string
 }
 
-function errorMessage(error: unknown): string {
-  return error instanceof Error ? error.message : 'Unknown error'
+interface PaginationMeta {
+  has_next?: boolean
+  total?: number
+}
+
+/** Read the additive pagination block without trusting its shape. */
+function readPagination(meta: ApiMeta | null | undefined): PaginationMeta {
+  const pagination = meta?.pagination
+  if (typeof pagination !== 'object' || pagination === null) {
+    return {}
+  }
+  const record = pagination as Record<string, unknown>
+  const total = typeof record.total === 'number' ? record.total : undefined
+  const hasNext = typeof record.has_next === 'boolean' ? record.has_next : undefined
+  return { has_next: hasNext, total }
 }
 
 /**
  * The open-position ledger: exposure, aggregate uPnL, risk utilization, margin,
  * and every documented column. A missing mark is excluded from the aggregate
- * (never treated as zero) and the summary is labelled PARTIAL. There is no
- * mutating control here; management is requested from the detail surface.
+ * (never treated as zero) and the summary is labelled PARTIAL. An incomplete
+ * page (``has_next`` or ``items.length < total``) is also PARTIAL: the fetched
+ * page is never presented as the whole ledger. There is no mutating control
+ * here; management is requested from the detail surface.
  */
 export function PositionsPage({
   fetchPositionsFn = fetchPositions,
   isCompact,
   now,
   refreshMs = POSITION_REFRESH_MS,
+  paused,
 }: PositionsPageProps) {
   const [load, setLoad] = useState<PositionsState>({
     state: 'loading',
     items: [],
     total: 0,
+    hasNext: false,
   })
   const [refreshError, setRefreshError] = useState<string | null>(null)
+  const [retryToken, setRetryToken] = useState(0)
   const compact = useCompact(isCompact)
+  const live = useLiveUpdates()
+  const isPaused = paused ?? live.paused
   const clock = now ?? Date.now()
+  const { begin, isCurrent } = useRunGeneration()
 
   const runLoad = useCallback(
-    async (signal: AbortSignal, initial: boolean): Promise<void> => {
+    async (signal: AbortSignal, initial: boolean, generation: number): Promise<void> => {
       if (initial) {
-        setLoad({ state: 'loading', items: [], total: 0 })
+        setLoad({ state: 'loading', items: [], total: 0, hasNext: false })
       }
       const envelope = await fetchPositionsFn(signal)
-      if (signal.aborted) {
+      // Only the most recently started run may apply: a late initial rejection
+      // must not replace a ready page, and a stale poll must not regress a
+      // newer initial/retry result.
+      if (signal.aborted || !isCurrent(generation)) {
         return
       }
       const data = envelope.data
       if (!data) {
         throw new Error('The positions response was empty.')
       }
-      setLoad({ state: 'ready', items: data.items, total: data.total })
+      const pagination = readPagination(envelope.meta)
+      const total = pagination.total ?? data.total
+      const hasNext = pagination.has_next ?? data.items.length < total
+      setLoad({ state: 'ready', items: data.items, total, hasNext })
       setRefreshError(null)
     },
-    [fetchPositionsFn],
+    [fetchPositionsFn, isCurrent],
   )
 
+  // The initial load always runs, including while paused.
   useEffect(() => {
     const controller = new AbortController()
-    runLoad(controller.signal, true).catch((error: unknown) => {
+    const generation = begin()
+    runLoad(controller.signal, true, generation).catch((error: unknown) => {
       if (controller.signal.aborted || isAbortError(error)) {
         return
       }
-      setLoad({ state: 'error', items: [], total: 0, message: errorMessage(error) })
+      if (!isCurrent(generation)) {
+        return
+      }
+      setLoad({
+        state: 'error',
+        items: [],
+        total: 0,
+        hasNext: false,
+        message: errorMessage(error),
+      })
     })
     return () => {
       controller.abort()
     }
-  }, [runLoad])
+  }, [runLoad, retryToken, begin, isCurrent])
 
-  // Revalidate on a 5s cadence and immediately when the window regains focus or
-  // the tab becomes visible. A refresh failure keeps the last values and shows
-  // a non-blocking warning instead of blanking the table.
-  useEffect(() => {
-    let controller: AbortController | null = null
-    const revalidate = (): void => {
-      controller?.abort()
-      const next = new AbortController()
-      controller = next
-      runLoad(next.signal, false).catch((error: unknown) => {
-        if (next.signal.aborted || isAbortError(error)) {
+  // Freeze the 5s cadence and the focus/visibility revalidation while paused;
+  // resuming performs exactly one immediate revalidation.
+  usePolling(
+    (signal) => {
+      const generation = begin()
+      return runLoad(signal, false, generation).catch((error: unknown) => {
+        // A stale poll's failure is not the current page state.
+        if (!isCurrent(generation)) {
           return
         }
-        setRefreshError(errorMessage(error))
+        throw error
       })
-    }
-    const interval = window.setInterval(revalidate, refreshMs)
-    const onFocus = (): void => {
-      revalidate()
-    }
-    const onVisibility = (): void => {
-      if (document.visibilityState === 'visible') {
-        revalidate()
-      }
-    }
-    window.addEventListener('focus', onFocus)
-    document.addEventListener('visibilitychange', onVisibility)
-    return () => {
-      window.clearInterval(interval)
-      window.removeEventListener('focus', onFocus)
-      document.removeEventListener('visibilitychange', onVisibility)
-      controller?.abort()
-    }
-  }, [runLoad, refreshMs])
+    },
+    {
+      refreshMs,
+      paused: isPaused,
+      onError: (error) => setRefreshError(errorMessage(error)),
+    },
+  )
 
   const aggregate = aggregateNetPnl(load.items, clock)
   const notional = sumNotional(load.items)
   const margin = sumMargin(load.items)
   const riskPct = sumRiskPct(load.items)
   const openCount = load.state === 'ready' ? Math.max(load.total, load.items.length) : 0
-  const partial = aggregate.missing > 0
+  const truncated = load.hasNext || load.items.length < load.total
+  const partial = aggregate.missing > 0 || truncated
   const stale = aggregate.stale > 0
 
   return (
@@ -152,6 +185,7 @@ export function PositionsPage({
           <span className="env-chip env-chip--paper" lang="en">
             PAPER
           </span>
+          {isPaused && <PausedStamp testId="positions-paused-stamp" />}
         </div>
       </div>
 
@@ -160,6 +194,8 @@ export function PositionsPage({
           移动端只读：持仓列表在 768px 及以下不可编辑。管理动作在持仓详情发起；Kill switch 仍可用。
         </p>
       )}
+
+      {isPaused && <PausedPanel testId="positions-paused" />}
 
       {load.state === 'loading' && (
         <p className="status-message" role="status">
@@ -175,6 +211,17 @@ export function PositionsPage({
           <p className="panel-foot">
             {load.message} — 显示失败，不伪造任何 PnL 或 mark；Kill switch 仍可用。
           </p>
+          <div className="action-row" style={{ padding: '0 16px 16px' }}>
+            <button
+              type="button"
+              className="btn"
+              onClick={() => {
+                setRetryToken((value) => value + 1)
+              }}
+            >
+              重试加载持仓
+            </button>
+          </div>
         </div>
       )}
 
@@ -202,14 +249,16 @@ export function PositionsPage({
                 {partial ? (
                   <span className="chip chip--warn">PARTIAL</span>
                 ) : (
-                  <span lang="en">net = price − fees + funding · CALC</span>
+                  <span lang="en">price + accumulated gross − fees + funding · CALC</span>
                 )}
               </dd>
             </div>
             <div className="stat">
               <dt lang="en">Notional</dt>
               <dd className="mono">{formatMoney(notional)}</dd>
-              <dd className="stat-note">USDT · {load.items.length} 个持仓 · Σ notional_usd</dd>
+              <dd className="stat-note">
+                USDT · {load.items.length} / {load.total} 个持仓 · Σ notional_usd
+              </dd>
             </div>
             <div className="stat">
               <dt lang="en">Risk utilization</dt>
@@ -230,15 +279,18 @@ export function PositionsPage({
           {(partial || stale) && (
             <div className="panel" role="status">
               <div className="panel-head">
-                <h2>部分 mark 不完整</h2>
+                <h2>部分 mark 不完整或列表未完整返回</h2>
                 <span className={partial ? 'chip chip--warn' : 'chip'}>
                   {partial ? 'PARTIAL' : 'STALE'}
                 </span>
               </div>
               <p className="panel-foot">
-                {partial
-                  ? `${aggregate.missing} 个持仓缺少 mark：其 uPnL 不计入合计，绝不当作 0。`
-                  : '存在已过期的 mark。'}
+                {truncated
+                  ? `列表已分页：本页 ${load.items.length} / ${load.total} 个持仓，汇总只覆盖本页。`
+                  : ''}
+                {aggregate.missing > 0
+                  ? ` ${aggregate.missing} 个持仓缺少 mark：其 uPnL 不计入合计，绝不当作 0。`
+                  : ''}
                 {stale ? ` ${aggregate.stale} 个 mark 已过期并标 STALE，保留最后值。` : ''}{' '}
                 管理动作可能被保守的风险门阻断。
               </p>
@@ -249,13 +301,20 @@ export function PositionsPage({
             <div className="panel-head">
               <h2 id="positions-table-heading">持仓列表</h2>
               <span className="mono-muted">
-                {load.items.length} / {load.total} · 每 5s 自动刷新；窗口聚焦时立即刷新
+                {load.items.length} / {load.total} ·{' '}
+                {isPaused ? '实时更新已暂停' : '每 5s 自动刷新；窗口聚焦时立即刷新'}
               </span>
             </div>
-            <PositionTable positions={load.items} now={clock} />
+            <PositionTable
+              positions={load.items}
+              now={clock}
+              total={load.total}
+              truncated={truncated}
+            />
             <p className="panel-foot">
-              uPnL 由 mark、已记录费用与已记录资金费计算（CALC）；mark 缺失时标 STALE 且不写零。
-              风险上限由服务端强制，本页不自行推断上限分母。
+              uPnL 由 resolved mark、累计已实现 gross、已记录费用与已记录资金费计算（CALC）； mark
+              缺失时标 STALE 且不写零。mark 的 as-of 单独展示。风险上限由服务端强制，本页不
+              自行推断上限分母。
             </p>
           </section>
         </>

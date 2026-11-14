@@ -1,6 +1,7 @@
 import { useCallback, useEffect, useRef, useState } from 'react'
 import { createPortal } from 'react-dom'
 
+import { errorMessage } from '../api/errors'
 import {
   activateKillSwitch,
   deactivateKillSwitch,
@@ -8,6 +9,7 @@ import {
   type KillSwitchEnvelope,
   type KillSwitchStatus,
 } from '../api/paper'
+import { useDialogFocus } from '../hooks/use-dialog-focus'
 
 interface KillSwitchBarProps {
   fetchStatusFn?: () => Promise<KillSwitchEnvelope>
@@ -16,94 +18,6 @@ interface KillSwitchBarProps {
 }
 
 const REFRESH_MS = 15000
-
-function message(error: unknown): string {
-  return error instanceof Error ? error.message : 'Unknown error'
-}
-
-function focusables(panel: HTMLElement | null): HTMLElement[] {
-  if (!panel) {
-    return []
-  }
-  return Array.from(
-    panel.querySelectorAll<HTMLElement>(
-      'button:not([disabled]), [href], input:not([disabled]), select:not([disabled]), textarea:not([disabled]), [tabindex]:not([tabindex="-1"])',
-    ),
-  )
-}
-
-/**
- * Modal focus contract: initial focus, Tab/Shift+Tab trap, Escape from
- * anywhere, inert background, locked body scroll, and focus restoration.
- */
-function useDialogFocus(open: boolean, onClose: () => void) {
-  const panelRef = useRef<HTMLDivElement>(null)
-  const restoreRef = useRef<HTMLElement | null>(null)
-
-  useEffect(() => {
-    if (!open || typeof document === 'undefined') {
-      return
-    }
-    restoreRef.current =
-      document.activeElement instanceof HTMLElement ? document.activeElement : null
-    const panel = panelRef.current
-    const initial =
-      panel?.querySelector<HTMLElement>('[data-autofocus]') ?? focusables(panel)[0] ?? panel
-    initial?.focus()
-
-    const shell = document.querySelector('.app-shell')
-    const shellWasInert = shell?.hasAttribute('inert') ?? false
-    shell?.setAttribute('inert', '')
-    const previousOverflow = document.body.style.overflow
-    document.body.style.overflow = 'hidden'
-
-    function onKeyDown(event: KeyboardEvent): void {
-      if (event.key === 'Escape') {
-        event.preventDefault()
-        onClose()
-        return
-      }
-      if (event.key !== 'Tab') {
-        return
-      }
-      const items = focusables(panel)
-      if (items.length === 0) {
-        event.preventDefault()
-        panel?.focus()
-        return
-      }
-      const first = items[0]
-      const last = items[items.length - 1]
-      if (
-        event.shiftKey &&
-        (document.activeElement === first || document.activeElement === panel)
-      ) {
-        event.preventDefault()
-        last.focus()
-      } else if (!event.shiftKey && document.activeElement === last) {
-        event.preventDefault()
-        first.focus()
-      }
-    }
-
-    document.addEventListener('keydown', onKeyDown, true)
-    return () => {
-      document.removeEventListener('keydown', onKeyDown, true)
-      document.body.style.overflow = previousOverflow
-      if (!shellWasInert) {
-        shell?.removeAttribute('inert')
-      }
-      const target = restoreRef.current
-      if (target && target.isConnected) {
-        target.focus()
-      } else {
-        document.getElementById('kill-switch-heading')?.focus()
-      }
-    }
-  }, [open, onClose])
-
-  return panelRef
-}
 
 /**
  * The global kill switch. Stopping is always allowed and immediate; resuming
@@ -145,7 +59,7 @@ export function KillSwitchBar({
       }
     } catch (error: unknown) {
       if (mounted.current) {
-        setProbeError(message(error))
+        setProbeError(errorMessage(error))
       }
     }
   }, [fetchStatusFn])
@@ -181,7 +95,7 @@ export function KillSwitchBar({
         setAnnouncement('Kill switch 已启用：新订单已停止。')
       }
     } catch (error: unknown) {
-      const errorText = message(error)
+      const errorText = errorMessage(error)
       setActionError(errorText)
       setAnnouncement(`Kill switch 启用失败：${errorText}`)
     } finally {
@@ -202,7 +116,7 @@ export function KillSwitchBar({
       setToken('')
     } catch (error: unknown) {
       // Keep the dialog open and show the failure next to the token input.
-      const errorText = message(error)
+      const errorText = errorMessage(error)
       setActionError(errorText)
       setAnnouncement(`Kill switch 恢复失败：${errorText}`)
     } finally {
@@ -232,8 +146,22 @@ export function KillSwitchBar({
     setOpen(true)
   }
 
-  const panelRef = useDialogFocus(open, closeDialog)
+  // The resume dialog only makes sense while the switch is active. If a probe
+  // flips it inactive while the dialog is open, close it and release the inert
+  // background/scroll lock; the focus hook is also gated so it can never stay
+  // active for a dialog that is no longer rendered.
   const active = status?.active === true
+  useEffect(() => {
+    if (open && !active) {
+      setOpen(false)
+      setToken('')
+      setActionError(null)
+    }
+  }, [open, active])
+
+  const panelRef = useDialogFocus(open && active, closeDialog, {
+    fallbackFocusId: 'kill-switch-heading',
+  })
   const unknown = status === null
   const chipClass = unknown ? 'chip' : active ? 'chip chip--danger' : 'chip chip--ok'
 

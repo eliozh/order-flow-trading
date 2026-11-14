@@ -1,6 +1,39 @@
+import { isAbortError } from './abort'
+import { errorMessage } from './errors'
 import type { ApiError, ApiMeta } from './status'
 
 export type { ApiError, ApiMeta }
+
+/** Upper bound on one positions read; a hang becomes a typed TIMEOUT error. */
+export const FETCH_TIMEOUT_MS = 15_000
+
+/**
+ * Upper bound on one management mutation. The server's LLM stage can take up
+ * to ~45s per attempt, so the read timeout would abort a request that may still
+ * execute. A timeout here is still classified as an unknown outcome.
+ */
+export const MANAGE_TIMEOUT_MS = 120_000
+
+/**
+ * Envelope error codes that prove a management request was rejected before any
+ * execution. Only these may clear the pending key and claim nothing was
+ * created. Everything else — notably `IDEMPOTENCY_CONFLICT` (a concurrent
+ * request with the same key is still running) and `CONFLICT` (raised after a
+ * close committed) — is an unknown outcome.
+ */
+export const DEFINITIVE_MANAGE_REFUSAL_CODES: ReadonlySet<string> = new Set([
+  'VALIDATION_FAILED',
+  'AUTH_REQUIRED',
+  'AUTH_INVALID',
+  'CSRF_INVALID',
+  'ORIGIN_FORBIDDEN',
+  'HOST_FORBIDDEN',
+  'IDEMPOTENCY_KEY_REQUIRED',
+  'KILL_SWITCH_ACTIVE',
+  'RISK_BLOCKED',
+  'RISK_DATA_INCOMPLETE',
+  'LIVE_DISABLED',
+])
 
 /**
  * A mark older than this is STALE; management is conservatively gated on it.
@@ -49,6 +82,15 @@ export interface PositionData {
   entry_price: string
   avg_entry_price: string
   mark_price: string | null
+  /**
+   * Server-resolved mark for freshness/PnL. Optional for older payloads; when
+   * absent the UI falls back to ``mark_price`` (documented, never fabricated).
+   */
+  resolved_mark_price?: string | null
+  /** When the resolved mark was observed. Falls back to ``updated_at``. */
+  resolved_mark_as_of?: string | null
+  /** Where the resolved mark came from, when the server names it. */
+  resolved_mark_source?: 'BARS' | 'POSITION' | null
   notional_usd: string
   /** Persisted as null on OPEN positions; the UI computes the CALC term. */
   unrealized_pnl_usd: string | null
@@ -194,13 +236,37 @@ export type PositionDetailEnvelope = PositionEnvelope<PositionData>
 export type PositionHistoryEnvelope = PositionEnvelope<PositionHistoryData>
 export type PositionManageEnvelope = PositionEnvelope<PositionManageData>
 
+/**
+ * A persistence/refusal failure classification.
+ *
+ * ``refusal`` is a pre-execution rejection whose envelope code is in
+ * ``DEFINITIVE_MANAGE_REFUSAL_CODES``: nothing was written, so retrying with a
+ * fresh key is safe. ``unknown`` covers everything else (including 409
+ * ``IDEMPOTENCY_CONFLICT``/``CONFLICT``, ``NOT_FOUND``, ``DATA_UNAVAILABLE``,
+ * transport failures, timeouts, and 5xx): the server may have executed, so the
+ * caller must keep the Idempotency-Key and retry with the same one.
+ */
+export type PositionApiErrorKind = 'refusal' | 'unknown'
+
 export class PositionApiError extends Error {
   readonly code: string | undefined
+  readonly httpStatus: number | undefined
+  readonly kind: PositionApiErrorKind
 
-  constructor(message: string, code?: string) {
+  constructor(
+    message: string,
+    code?: string,
+    options: { httpStatus?: number; kind?: PositionApiErrorKind } = {},
+  ) {
     super(message)
     this.name = 'PositionApiError'
     this.code = code
+    this.httpStatus = options.httpStatus
+    // Never derive this from the HTTP status range: a 4xx such as 409 is not
+    // necessarily definitive. Only the pre-execution code allowlist is.
+    this.kind =
+      options.kind ??
+      (code !== undefined && DEFINITIVE_MANAGE_REFUSAL_CODES.has(code) ? 'refusal' : 'unknown')
   }
 }
 
@@ -216,14 +282,94 @@ function readCookie(name: string): string | null {
 }
 
 /**
- * One stable key for one logical management request. Duplicate clicks or a
- * retry of the same request must reuse it so the server replays, never doubles.
+ * Generate a fresh idempotency key for one logical management request.
+ *
+ * This always returns a new key; it neither stores nor stabilises one. Callers
+ * must persist one key per position/logical request (see ``managementKeyFor``)
+ * and reuse it across retries so the server replays the stored result instead
+ * of creating a second order.
  */
 export function managementIdempotencyKey(prefix = 'web-manage'): string {
   if (typeof crypto !== 'undefined' && typeof crypto.randomUUID === 'function') {
     return `${prefix}-${crypto.randomUUID()}`
   }
   return `${prefix}-${Date.now()}-${Math.random().toString(16).slice(2)}`
+}
+
+/** Session-scoped storage key for one position's pending management key. */
+export const MANAGEMENT_KEY_PREFIX = 'oft.position.manage.'
+
+/** In-memory fallback when sessionStorage is unavailable (private mode, SSR). */
+const memoryManagementKeys = new Map<string, string>()
+
+function sessionStore(): Storage | null {
+  if (typeof window === 'undefined') {
+    return null
+  }
+  try {
+    return window.sessionStorage
+  } catch {
+    return null
+  }
+}
+
+function managementStorageKey(positionId: string): string {
+  return `${MANAGEMENT_KEY_PREFIX}${positionId}`
+}
+
+/** The pending key for one position, or null when none is stored. */
+export function storedManagementKey(positionId: string): string | null {
+  const store = sessionStore()
+  if (store) {
+    try {
+      const stored = store.getItem(managementStorageKey(positionId))
+      if (stored !== null) {
+        return stored
+      }
+    } catch {
+      // Fall through to the in-memory fallback.
+    }
+  }
+  return memoryManagementKeys.get(positionId) ?? null
+}
+
+/** Create and store a new key for one position (a deliberate new request). */
+export function rotateManagementKey(positionId: string): string {
+  const key = managementIdempotencyKey(`web-manage-${positionId}`)
+  const store = sessionStore()
+  if (store) {
+    try {
+      store.setItem(managementStorageKey(positionId), key)
+      memoryManagementKeys.delete(positionId)
+      return key
+    } catch {
+      // Fall through to the in-memory fallback.
+    }
+  }
+  memoryManagementKeys.set(positionId, key)
+  return key
+}
+
+/** The stored key for this position, or a fresh one when none exists. */
+export function managementKeyFor(positionId: string): string {
+  return storedManagementKey(positionId) ?? rotateManagementKey(positionId)
+}
+
+/**
+ * Forget the pending key after a definitive outcome: a success, or a
+ * pre-execution refusal (an allowlisted envelope code). The next logical
+ * request then rotates to a fresh key. An unknown outcome keeps it.
+ */
+export function clearManagementKey(positionId: string): void {
+  const store = sessionStore()
+  if (store) {
+    try {
+      store.removeItem(managementStorageKey(positionId))
+    } catch {
+      // The in-memory fallback is cleared below regardless.
+    }
+  }
+  memoryManagementKeys.delete(positionId)
 }
 
 function mutationHeaders(idempotencyKey: string): Record<string, string> {
@@ -246,32 +392,74 @@ async function requestEnvelope<T>(
     body?: unknown
     idempotencyKey?: string
     signal?: AbortSignal
+    /** Override the read timeout (mutations use MANAGE_TIMEOUT_MS). */
+    timeoutMs?: number
   } = {},
 ): Promise<PositionEnvelope<T>> {
   const method = options.method ?? 'GET'
-  const response = await fetch(path, {
-    method,
-    headers:
-      method === 'GET'
-        ? { Accept: 'application/json' }
-        : mutationHeaders(options.idempotencyKey ?? ''),
-    body: method === 'GET' ? undefined : JSON.stringify(options.body ?? {}),
-    credentials: 'same-origin',
-    signal: options.signal,
-  })
-  let envelope: PositionEnvelope<T> | null = null
+  // Compose the caller's abort signal with our own timeout. A timeout aborts
+  // the same fetch but is surfaced as a typed TIMEOUT error, never a silent
+  // AbortError, so the UI can offer a retry.
+  const controller = new AbortController()
+  const external = options.signal
+  const forwardAbort = (): void => controller.abort()
+  if (external) {
+    if (external.aborted) {
+      controller.abort()
+    } else {
+      external.addEventListener('abort', forwardAbort, { once: true })
+    }
+  }
+  let timedOut = false
+  const timeout = setTimeout(() => {
+    timedOut = true
+    controller.abort()
+  }, options.timeoutMs ?? FETCH_TIMEOUT_MS)
+
   try {
-    envelope = (await response.json()) as PositionEnvelope<T>
-  } catch {
-    envelope = null
+    const response = await fetch(path, {
+      method,
+      headers:
+        method === 'GET'
+          ? { Accept: 'application/json' }
+          : mutationHeaders(options.idempotencyKey ?? ''),
+      body: method === 'GET' ? undefined : JSON.stringify(options.body ?? {}),
+      credentials: 'same-origin',
+      signal: controller.signal,
+    })
+    let envelope: PositionEnvelope<T> | null = null
+    try {
+      envelope = (await response.json()) as PositionEnvelope<T>
+    } catch {
+      envelope = null
+    }
+    if (!response.ok || !envelope || !envelope.ok || envelope.data === null) {
+      throw new PositionApiError(
+        envelope?.error?.message ?? `Position request failed with HTTP ${response.status}`,
+        envelope?.error?.code,
+        { httpStatus: response.status },
+      )
+    }
+    return envelope
+  } catch (error: unknown) {
+    if (timedOut) {
+      throw new PositionApiError('The position request timed out.', 'TIMEOUT', {
+        kind: 'unknown',
+      })
+    }
+    // A caller-driven abort is cleanup, never a user-visible failure.
+    if (isAbortError(error) || (external?.aborted ?? false)) {
+      throw error
+    }
+    if (error instanceof PositionApiError) {
+      throw error
+    }
+    // A network failure is never definitive: the request may have executed.
+    throw new PositionApiError(errorMessage(error), undefined, { kind: 'unknown' })
+  } finally {
+    clearTimeout(timeout)
+    external?.removeEventListener('abort', forwardAbort)
   }
-  if (!response.ok || !envelope || !envelope.ok || envelope.data === null) {
-    throw new PositionApiError(
-      envelope?.error?.message ?? `Position request failed with HTTP ${response.status}`,
-      envelope?.error?.code,
-    )
-  }
-  return envelope
 }
 
 /** The open-position ledger; closed trades are the journal's business (slice 30). */
@@ -306,7 +494,15 @@ export async function requestManagement(
 ): Promise<PositionManageEnvelope> {
   return requestEnvelope<PositionManageData>(
     `/api/v1/positions/${encodeURIComponent(positionId)}/manage`,
-    { method: 'POST', body: {}, idempotencyKey, signal },
+    {
+      method: 'POST',
+      body: {},
+      idempotencyKey,
+      signal,
+      // The server LLM stage may run for tens of seconds; never abort a
+      // mutation that may still execute with the short read timeout.
+      timeoutMs: MANAGE_TIMEOUT_MS,
+    },
   )
 }
 
@@ -323,10 +519,46 @@ export function sideSign(side: string): 1 | -1 {
   return side.toUpperCase() === 'SHORT' ? -1 : 1
 }
 
+/**
+ * The server-resolved mark, falling back to the persisted ``mark_price`` for
+ * older payloads that do not carry the additive fields. Never fabricated.
+ */
+export function resolvedMark(position: PositionData): string | null {
+  if (num(position.resolved_mark_price) !== null) {
+    return position.resolved_mark_price ?? null
+  }
+  return position.mark_price
+}
+
+/** When the resolved mark was observed; falls back to ``updated_at``. */
+export function markAsOf(position: PositionData): string {
+  return position.resolved_mark_as_of ?? position.updated_at
+}
+
+/**
+ * The accumulated gross realized term. The server records ``realized_pnl_usd``
+ * when a partial close has happened; an OPEN position with no PARTIAL_CLOSE in
+ * its management history has realized exactly zero. When a partial close
+ * happened but the gross is unmeasured, this stays null (never a fake zero).
+ */
+export function accumulatedGross(position: PositionData): number | null {
+  const recorded = num(position.realized_pnl_usd)
+  if (recorded !== null) {
+    return recorded
+  }
+  const partiallyClosed = position.management_history.some(
+    (entry) => entry.action.toUpperCase() === 'PARTIAL_CLOSE',
+  )
+  if (position.state === 'OPEN' && !partiallyClosed) {
+    return 0
+  }
+  return null
+}
+
 /** The mark-to-entry price term; null when the mark is unmeasured. */
 export function pricePnl(
   position: PositionData,
-  mark: string | number | null = position.mark_price,
+  mark: string | number | null = resolvedMark(position),
 ): number | null {
   const markValue = num(mark)
   const entry = num(position.avg_entry_price) ?? num(position.entry_price)
@@ -345,18 +577,22 @@ export function recordedFunding(position: PositionData): number | null {
   return num(position.funding_usd)
 }
 
-/** Price PnL plus recorded fees (a cost) and recorded funding (signed cash flow). */
+/**
+ * Net uPnL if the position were closed now: price PnL (unrealized) plus the
+ * accumulated gross (realized) minus recorded fees plus recorded funding.
+ */
 export function netPnl(
   position: PositionData,
-  mark: string | number | null = position.mark_price,
+  mark: string | number | null = resolvedMark(position),
 ): number | null {
   const price = pricePnl(position, mark)
+  const gross = accumulatedGross(position)
   const fees = recordedFees(position)
   const funding = recordedFunding(position)
-  if (price === null || fees === null || funding === null) {
+  if (price === null || gross === null || fees === null || funding === null) {
     return null
   }
-  return price - fees + funding
+  return price + gross - fees + funding
 }
 
 /** Entry notional is the average entry times the current size. */
@@ -372,7 +608,7 @@ export function entryNotional(position: PositionData): number | null {
 /** Net PnL as a percentage of entry notional; null when either is unmeasured. */
 export function pnlPct(
   position: PositionData,
-  mark: string | number | null = position.mark_price,
+  mark: string | number | null = resolvedMark(position),
 ): number | null {
   const net = netPnl(position, mark)
   const notional = entryNotional(position)
@@ -385,7 +621,7 @@ export function pnlPct(
 /** R multiple = net PnL / the risk recorded at entry. */
 export function rMultiple(
   position: PositionData,
-  mark: string | number | null = position.mark_price,
+  mark: string | number | null = resolvedMark(position),
 ): number | null {
   const net = netPnl(position, mark)
   const risk = num(position.risk_amount_usd)
@@ -397,16 +633,21 @@ export function rMultiple(
 
 export type MarkState = 'FRESH' | 'STALE' | 'MISSING'
 
-/** Mark freshness derived from the persisted mark and its ``updated_at``. */
+/**
+ * Mark freshness derived from the resolved mark and its as-of timestamp.
+ *
+ * The server resolves a fresh bar mark even when the persisted ``updated_at``
+ * only moves on entry/exit; the persisted pair is the documented fallback.
+ */
 export function markState(position: PositionData, nowMs: number): MarkState {
-  if (num(position.mark_price) === null) {
+  if (num(resolvedMark(position)) === null) {
     return 'MISSING'
   }
-  const updated = Date.parse(position.updated_at)
-  if (Number.isNaN(updated)) {
+  const asOf = Date.parse(markAsOf(position))
+  if (Number.isNaN(asOf)) {
     return 'STALE'
   }
-  return nowMs - updated > MARK_FRESHNESS_MS ? 'STALE' : 'FRESH'
+  return nowMs - asOf > MARK_FRESHNESS_MS ? 'STALE' : 'FRESH'
 }
 
 export function sumNotional(positions: PositionData[]): number {

@@ -1,51 +1,44 @@
 import { render, screen, within } from '@testing-library/react'
 import { describe, expect, it } from 'vitest'
 
-import type { PositionData } from '../../api/positions'
 import { PositionTable } from '../position-table'
+import {
+  FRESH_MARK_AS_OF,
+  NOW,
+  positionFixture,
+  STALE_MARK_AS_OF,
+} from '../../test/positions-fixtures'
 
-const NOW = Date.parse('2026-11-06T12:00:00.000Z')
-
-function position(overrides: Partial<PositionData> = {}): PositionData {
-  return {
+function btcShort(overrides: Parameters<typeof positionFixture>[0] = {}) {
+  return positionFixture({
     position_id: 'POS-1',
-    account_id: 'ACC-PAPER',
-    environment: 'PAPER',
     symbol: 'BTCUSDT',
     side: 'SHORT',
-    state: 'OPEN',
     size: '0.042',
     entry_price: '97340.00',
     avg_entry_price: '97340.00',
     mark_price: '96842.10',
+    resolved_mark_price: '96842.10',
+    resolved_mark_as_of: FRESH_MARK_AS_OF,
     notional_usd: '4088.28',
-    unrealized_pnl_usd: null,
-    unrealized_pnl_pct: null,
     stop_price: '98210.00',
     target_prices: ['95120.00', '94500.00'],
     leverage: 3,
-    margin_mode: 'ISOLATED',
     margin_usd: '1362.76',
     risk_amount_usd: '136.28',
     risk_pct: 0.62,
     fees_usd: '2.04',
     funding_usd: '1.00',
-    realized_pnl_usd: null,
     opened_at: '2026-11-05T06:00:00.000Z',
-    updated_at: '2026-11-06T11:59:50.000Z',
-    closed_at: null,
-    exit_price: null,
     source_trigger_id: null,
     source_decision_id: null,
-    management_history: [],
-    data_quality: { status: 'COMPLETE', reasons: [] },
     ...overrides,
-  }
+  })
 }
 
 describe('PositionTable', () => {
   it('renders all documented columns inside a labelled scrollable region with a caption', () => {
-    render(<PositionTable positions={[position()]} now={NOW} />)
+    render(<PositionTable positions={[btcShort()]} now={NOW} />)
 
     const region = screen.getByRole('region', { name: /未平仓持仓/ })
     expect(region).toHaveAttribute('tabindex', '0')
@@ -86,12 +79,30 @@ describe('PositionTable', () => {
     expect(within(row).getByText('PAPER')).toBeInTheDocument()
   })
 
-  it('labels a stale mark as STALE and keeps the last measured values', () => {
+  it('renders the resolved mark and its as-of label', () => {
     render(
       <PositionTable
-        positions={[position({ updated_at: '2026-11-06T10:00:00.000Z' })]}
+        positions={[
+          btcShort({
+            mark_price: '1.00',
+            resolved_mark_price: '99000.00',
+            resolved_mark_as_of: FRESH_MARK_AS_OF,
+            resolved_mark_source: 'BARS',
+          }),
+        ]}
         now={NOW}
       />,
+    )
+
+    const row = screen.getByRole('row', { name: /BTCUSDT/ })
+    expect(within(row).getByText('99000.00')).toBeInTheDocument()
+    expect(within(row).queryByText('1.00')).not.toBeInTheDocument()
+    expect(within(row).getByText(/as of .* UTC/)).toBeInTheDocument()
+  })
+
+  it('labels a stale resolved mark as STALE and keeps the last measured values', () => {
+    render(
+      <PositionTable positions={[btcShort({ resolved_mark_as_of: STALE_MARK_AS_OF })]} now={NOW} />,
     )
 
     const row = screen.getByRole('row', { name: /BTCUSDT/ })
@@ -100,13 +111,26 @@ describe('PositionTable', () => {
     expect(within(row).getByText('+19.87')).toBeInTheDocument()
   })
 
+  it('falls back to the persisted mark when the resolved fields are absent', () => {
+    const legacy = btcShort()
+    delete legacy.resolved_mark_price
+    delete legacy.resolved_mark_as_of
+    render(<PositionTable positions={[legacy]} now={NOW} />)
+
+    const row = screen.getByRole('row', { name: /BTCUSDT/ })
+    expect(within(row).getByText('96842.10')).toBeInTheDocument()
+    expect(within(row).getByText('+19.87')).toBeInTheDocument()
+  })
+
   it('renders a dash and no fabricated PnL when the mark is missing', () => {
     render(
       <PositionTable
         positions={[
-          position({
+          btcShort({
             symbol: 'XAUUSDT',
             mark_price: null,
+            resolved_mark_price: null,
+            resolved_mark_as_of: null,
             data_quality: { status: 'PARTIAL', reasons: ['mark missing'] },
           }),
         ]}
@@ -119,6 +143,22 @@ describe('PositionTable', () => {
     expect(within(row).getByText(/PARTIAL/)).toBeInTheDocument()
     expect(within(row).queryByText(/^[+-]\d/)).toBeNull()
     expect(within(row).getAllByText('—').length).toBeGreaterThan(0)
+  })
+
+  it('never shows the empty state when the ledger total is non-zero', () => {
+    render(<PositionTable positions={[]} now={NOW} total={3} truncated />)
+
+    expect(screen.queryByRole('heading', { name: '没有未平仓持仓' })).not.toBeInTheDocument()
+    expect(screen.getByTestId('position-table-page-empty')).toHaveTextContent(/台账共有 3/)
+    expect(screen.getByTestId('position-table-page-empty')).toHaveTextContent(/PARTIAL/)
+  })
+
+  it('marks a truncated page as PARTIAL in the caption and a visible note', () => {
+    render(<PositionTable positions={[btcShort()]} now={NOW} total={4} truncated />)
+
+    const table = screen.getByRole('table', { name: /未平仓持仓/ })
+    expect(table.querySelector('caption')).toHaveTextContent(/存在下一页/)
+    expect(screen.getByTestId('position-table-truncated')).toHaveTextContent(/1 \/ 4/)
   })
 
   it('explains the empty state and links only to opportunities and paper', () => {
