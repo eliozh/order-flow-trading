@@ -92,6 +92,21 @@ and neutralizes `=`, `+`, `-`, and `@` prefixes with a leading `'`; JSON is a ve
 id) rather than silently dropped, so it agrees with the statistics'
 `unreadable_trades`. Neither export includes raw prompts, decision payloads, or secrets.
 
+### Advisory trade review
+
+A closed trade may carry one linked `REVIEW` decision (`trade_logs.review_decision_id`,
+`trade-log.review_decision_id`). The provider-facing decision uses `rationale` and
+`caveats` for the qualitative assessment; its `subject` carries only `symbol`,
+`timeframe`, and `as_of`. The **persisted** decision's `subject` additionally carries
+the code-built `position_id` (plus the resolved scan/report/opportunity/trigger ids and
+environment), so the reviewed trade is named by the service, never by the provider.
+The review returns `decision_type = REVIEW` with every role payload
+(`analysis`/`opportunity`/`entry_recheck`/`position_management`) explicitly `null`. A
+review is **advisory only**: it can summarize and suggest, but it carries no executable
+payload, cannot create or change an order, position, risk cap, prompt, or rule, and no
+endpoint applies a review's suggestions. `decision_type` gained `REVIEW` as an additive
+enum value; every existing required field and `additionalProperties: false` is unchanged.
+
 ## Validation pipeline
 
 ```
@@ -148,7 +163,7 @@ A rejected output never creates an opportunity, never reaches the risk gate, and
 | Triggers | `GET /api/v1/triggers[/{id}]`, `GET /api/v1/triggers/{id}/decision`, `POST /api/v1/triggers/{id}/{recheck,accept,reject}` |
 | Positions | `GET /api/v1/positions[/{id}]`, `POST /api/v1/positions/{id}/manage` |
 | Paper | `GET /api/v1/paper/{account,orders,fills,equity}`, `POST /api/v1/paper/reset` |
-| Journal | `GET /api/v1/journal[/{trade_id}]`, `/stats`, `/compare/{trade_id}`, `/export` |
+| Journal | `GET /api/v1/journal[/{trade_id}]`, `/stats`, `/compare/{trade_id}`, `/export`, `POST/GET /api/v1/journal/{trade_id}/review` |
 | Settings | `GET/PUT /api/v1/settings/{llm,prompts,risk,scan,budget,telegram,live}` |
 | Live/kill | `GET /api/v1/live/status`, `POST /api/v1/live/{enable,disable}`, `POST/DELETE /api/v1/kill-switch` |
 | Data | `POST /api/v1/backfill`, `GET /api/v1/backfill/{run_id}`, `GET /api/v1/data/quality` |

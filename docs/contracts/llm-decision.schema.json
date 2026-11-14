@@ -37,7 +37,13 @@
     },
     "decision_type": {
       "type": "string",
-      "enum": ["MARKET_ANALYSIS", "OPPORTUNITY_PROPOSAL", "ENTRY_RECHECK", "POSITION_MANAGEMENT"]
+      "enum": [
+        "MARKET_ANALYSIS",
+        "OPPORTUNITY_PROPOSAL",
+        "ENTRY_RECHECK",
+        "POSITION_MANAGEMENT",
+        "REVIEW"
+      ]
     },
     "role": {
       "type": "string",

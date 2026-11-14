@@ -1,8 +1,9 @@
-"""``oft log list|show|stats|compare|export``: the closed-trade journal (read-only)."""
+"""``oft log list|show|stats|compare|export|review``: the closed-trade journal."""
 
 from __future__ import annotations
 
 import json
+import uuid
 from typing import Annotated, Any
 
 import typer
@@ -11,8 +12,21 @@ from oft.cli.api_client import ApiClient, ApiClientError
 from oft.cli.commands.doctor import emit_error, exit_code_for
 from oft.config import ConfigError, load_settings
 
+ADVISORY_LABEL = "ADVISORY ONLY — suggests, never changes rules/prompts/risk or orders"
+# ``_RETRY_ATTEMPTS = 2`` applies to both the initial invocation and the repair
+# invocation, and each attempt may consume up to the 120 s REVIEW provider
+# timeout: 2 invocations x 2 attempts x 120 s = 480 s of provider time, plus
+# concurrency-slot waits and backoff. The 1200 s deadline is a finite bound
+# comfortably above that worst case, avoiding the 2 s default socket timeout
+# (H2) without an unbounded wait.
+_REVIEW_TIMEOUT_SECONDS = 1200.0
+
 log_app = typer.Typer(
-    help="Closed-trade journal (read-only; PnL is fixed by code).",
+    help=(
+        "Closed-trade journal (PnL is fixed by code). The advisory review writes "
+        "only the REVIEW decision plus its budget/call ledger rows, trade-log "
+        "link, and audit; it never changes PnL, rules, risk, or orders."
+    ),
     no_args_is_help=True,
     add_completion=False,
 )
@@ -278,3 +292,66 @@ def log_export(
         f"EXPORTED {data.get('path', '-')} · {data.get('format', '-')}"
         f" · {data.get('rows', 0)} row(s) · {data.get('bytes', 0)} bytes"
     )
+
+
+def _render_review(data: dict[str, Any]) -> str:
+    lines = [
+        ADVISORY_LABEL,
+        f"REVIEW {data.get('trade_id', '-')} · status {data.get('status', '-')}"
+        f" · decision {data.get('decision_id') or '-'}"
+        f" · validation {data.get('validation_status') or '-'}"
+        f" · confidence {data.get('confidence') if data.get('confidence') is not None else '-'}",
+    ]
+    if data.get("idempotent_replay"):
+        lines.append("reused the linked review (no provider call)")
+    if data.get("rationale"):
+        lines.append(f"rationale: {data['rationale']}")
+    for caveat in data.get("caveats") or []:
+        lines.append(f"caveat: {caveat}")
+    if data.get("reason"):
+        lines.append(f"reason: {data['reason']}")
+    return "\n".join(lines)
+
+
+@log_app.command("review")
+def log_review(
+    trade_id: str,
+    refresh: Annotated[
+        bool,
+        typer.Option("--refresh", help="Supersede the linked review with a new decision."),
+    ] = False,
+    provider: Annotated[
+        str | None,
+        typer.Option("--provider", help="LLM provider name (defaults to the configured one)."),
+    ] = None,
+    json_output: Annotated[bool, typer.Option("--json", help="Emit JSON.")] = False,
+) -> None:
+    """Ask for an advisory LLM review of one closed trade (never executes)."""
+    settings = _settings_or_exit(json_output)
+    # Every call gets a fresh key. The route caches a successful review for 24 h
+    # per key, so reusing a deterministic key would serve the OLD envelope after
+    # a ``--refresh`` linked a new decision. The service already dedupes through
+    # the linked decision, so a plain call with a new key is provider-free when a
+    # review is linked.
+    idempotency_key = uuid.uuid4().hex
+    try:
+        # The server can make up to four 120 s provider calls (two invocations
+        # x two attempts) plus backoff, and concurrency-slot waits can add more;
+        # the 1200 s deadline exceeds that provider-time bound while still
+        # bounding the CLI wait.
+        envelope = ApiClient.from_settings(
+            settings, timeout=_REVIEW_TIMEOUT_SECONDS
+        ).journal_review(
+            trade_id,
+            refresh=refresh,
+            provider=provider,
+            idempotency_key=idempotency_key,
+        )
+    except ApiClientError as exc:
+        emit_error(exc.code, exc.message, json_output=json_output)
+        raise typer.Exit(code=exit_code_for(exc.code)) from exc
+    data = envelope.get("data") or {}
+    if json_output:
+        typer.echo(json.dumps(envelope, indent=2))
+        return
+    typer.echo(_render_review(data))

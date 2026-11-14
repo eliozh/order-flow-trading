@@ -162,6 +162,34 @@ def test_missing_pinned_system_version_disables_exact_replay(tmp_path: Path) -> 
     assert resolution.code == "PROMPT_VERSION_MISSING"
 
 
+def test_a_review_with_absent_knowledge_disables_exact_replay(tmp_path: Path) -> None:
+    loop = _helpers.build_loop(tmp_path)
+    container = loop["container"]
+    service = PromptService(store=container.store, clock=container.clock)
+    decision = json.loads(container.store.list_decisions(role="ANALYSIS")[0].payload_json)
+    review = json.loads(json.dumps(decision))
+    review["role"] = "REVIEW"
+    review["decision_type"] = "REVIEW"
+    review["provenance"]["prompt_id"] = "review"
+    review["provenance"]["prompt_version"] = 1
+    review["provenance"]["knowledge_status"] = "ABSENT"
+    review["provenance"]["knowledge_reason"] = "KNOWLEDGE_ABSENT"
+    review["provenance"]["knowledge_artifact_hash"] = None
+
+    resolution = service.resolve_decision(review)
+
+    assert resolution.status == "available"
+    assert resolution.exact_replay is False
+    assert resolution.knowledge_status == "ABSENT"
+
+    # The same knowledge state on an ANALYSIS decision keeps its prior
+    # behaviour: only the review's knowledge dependency disables replay.
+    analysis = json.loads(json.dumps(decision))
+    analysis["provenance"]["knowledge_status"] = "ABSENT"
+    analysis["provenance"]["knowledge_reason"] = "KNOWLEDGE_ABSENT"
+    assert service.resolve_decision(analysis).exact_replay is True
+
+
 def test_rendered_prompts_and_hash_inputs_never_carry_a_secret(tmp_path: Path) -> None:
     api_secret = "api-token-super-secret-value"
     provider_secret = "sk-openai-super-secret-value"

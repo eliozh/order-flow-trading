@@ -12,6 +12,7 @@ from oft.api.schemas.journal import (
     JournalCompareData,
     JournalExportData,
     JournalFirstTouchData,
+    JournalReviewRequest,
     JournalSlippageData,
     JournalStatsData,
     JournalZoneData,
@@ -240,3 +241,11 @@ def test_the_compare_quality_is_a_closed_literal() -> None:
     assert JournalCompareData.model_validate(payload).data_quality == "MISSING"
     with pytest.raises(ValidationError):
         JournalCompareData.model_validate({**payload, "data_quality": "STALE"})
+
+
+def test_the_review_request_normalizes_the_provider() -> None:
+    assert JournalReviewRequest(provider=" Stub ").provider == "stub"
+    assert JournalReviewRequest(provider="STUB").provider == "stub"
+    assert JournalReviewRequest(provider="   ").provider is None
+    assert JournalReviewRequest(provider=None).provider is None
+    assert JournalReviewRequest().provider is None

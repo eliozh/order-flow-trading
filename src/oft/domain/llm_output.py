@@ -32,7 +32,7 @@ _ROLE_DECISION_TYPES: dict[str, frozenset[str]] = {
     "ANALYSIS": frozenset({"MARKET_ANALYSIS", "OPPORTUNITY_PROPOSAL"}),
     "ENTRY_RECHECK": frozenset({"ENTRY_RECHECK"}),
     "MANAGEMENT": frozenset({"POSITION_MANAGEMENT"}),
-    "REVIEW": frozenset({"MARKET_ANALYSIS", "POSITION_MANAGEMENT"}),
+    "REVIEW": frozenset({"REVIEW"}),
 }
 
 _PAYLOAD_BY_DECISION = {
@@ -44,14 +44,28 @@ _PAYLOAD_BY_DECISION = {
 
 # OPPORTUNITY_PROPOSAL also carries its supporting analysis; everything else is
 # closed so a non-null payload cannot ride along with the wrong decision type.
+# REVIEW is advisory by construction: it may carry no payload at all.
+#
+# This pairing is a runtime guard, not a schema one: the flat provider-facing
+# schema keeps every payload optional because JSON Schema cannot express a
+# discriminated union per ``decision_type`` without duplicating the document
+# shape. ``semantic_errors`` enforces the pairing after schema validation, and
+# ``tests/unit/test_review_semantics.py`` covers every rejected payload.
 _ALLOWED_PAYLOADS_BY_DECISION: dict[str, frozenset[str]] = {
     "MARKET_ANALYSIS": frozenset({"analysis"}),
     "OPPORTUNITY_PROPOSAL": frozenset({"analysis", "opportunity"}),
     "ENTRY_RECHECK": frozenset({"entry_recheck"}),
     "POSITION_MANAGEMENT": frozenset({"position_management"}),
+    "REVIEW": frozenset(),
 }
 
 _PAYLOAD_FIELDS = ("analysis", "opportunity", "entry_recheck", "position_management")
+
+# The provider-facing timeframe vocabulary. The literal is duplicated in the
+# JSON Schema (which cannot import Python); a contract test binds the schema
+# enum to this alias so the two cannot drift. Other report and resampling
+# vocabularies are separate and do not derive from this alias.
+Timeframe = Literal["1m", "5m", "15m", "1h", "4h", "8h", "1d"]
 
 
 @dataclass(frozen=True)
@@ -251,13 +265,17 @@ class PositionManagement(_Model):
 
 class Subject(_Model):
     symbol: str = Field(pattern=r"^[A-Z0-9]{2,24}$")
-    timeframe: Literal["1m", "5m", "15m", "1h", "4h", "8h", "1d"]
+    timeframe: Timeframe
     as_of: str
 
 
 class DecisionOutput(_Model):
     decision_type: Literal[
-        "MARKET_ANALYSIS", "OPPORTUNITY_PROPOSAL", "ENTRY_RECHECK", "POSITION_MANAGEMENT"
+        "MARKET_ANALYSIS",
+        "OPPORTUNITY_PROPOSAL",
+        "ENTRY_RECHECK",
+        "POSITION_MANAGEMENT",
+        "REVIEW",
     ]
     subject: Subject
     confidence: float
@@ -319,22 +337,53 @@ def _unsafe(value: str) -> bool:
     return any(pattern.search(value) for pattern in _UNSAFE_PATTERNS)
 
 
-def _text_errors(field: str, value: str) -> list[SemanticError]:
-    errors: list[SemanticError] = []
+def _utf8_encodable(value: str) -> bool:
+    """Whether ``value`` can be encoded as UTF-8 (lone surrogates cannot)."""
+    try:
+        value.encode("utf-8")
+    except UnicodeEncodeError:
+        return False
+    return True
+
+
+def _text_violations(value: str) -> list[str]:
+    """The write path's text-safety rules, in the order errors are reported."""
+    violations: list[str] = []
     if len(value) > MAX_RATIONALE_CHARS:
-        errors.append(
-            SemanticError(field, "RATIONALE_TOO_LONG", f"{field} exceeds the bounded length")
-        )
+        violations.append("length")
     if _CONTROL_CHARS.search(value):
-        errors.append(SemanticError(field, "UNSAFE_TEXT", f"{field} contains a control character"))
+        violations.append("control")
     if _unsafe(value):
-        errors.append(
-            SemanticError(
-                field,
-                "UNSAFE_TEXT",
-                f"{field} contains a markdown fence or embedded instruction",
-            )
-        )
+        violations.append("unsafe")
+    if not _utf8_encodable(value):
+        # A provider JSON escape like ``"\ud800"`` parses to a lone surrogate:
+        # valid JSON and schema-shaped, but unencodable, so persisting it would
+        # make the response layer raise after the review was linked.
+        violations.append("utf8")
+    return violations
+
+
+def text_is_safe(value: str) -> bool:
+    """Whether model-controlled text passes the write path's safety rules.
+
+    Shared with the read path so a tampered stored row cannot carry text (an
+    overlong rationale, terminal controls, a markdown fence, an embedded
+    instruction) the write path would have rejected.
+    """
+    return not _text_violations(value)
+
+
+def _text_errors(field: str, value: str) -> list[SemanticError]:
+    messages = {
+        "length": ("RATIONALE_TOO_LONG", f"{field} exceeds the bounded length"),
+        "control": ("UNSAFE_TEXT", f"{field} contains a control character"),
+        "unsafe": ("UNSAFE_TEXT", f"{field} contains a markdown fence or embedded instruction"),
+        "utf8": ("UNSAFE_TEXT", f"{field} is not valid UTF-8"),
+    }
+    errors: list[SemanticError] = []
+    for violation in _text_violations(value):
+        code, message = messages[violation]
+        errors.append(SemanticError(field, code, message))
     return errors
 
 
@@ -408,6 +457,11 @@ def semantic_errors(output: DecisionOutput, *, role: str) -> tuple[SemanticError
             )
 
     errors.extend(_text_errors("rationale", output.rationale))
+    if output.decision_type == "REVIEW" and not output.rationale.strip():
+        # A review is its rationale: an empty advisory decision is not usable.
+        errors.append(
+            SemanticError("rationale", "RATIONALE_REQUIRED", "a REVIEW requires a rationale")
+        )
     for index, caveat in enumerate(output.caveats):
         errors.extend(_text_errors(f"caveats[{index}]", caveat))
     errors.extend(_timestamp_errors("subject.as_of", output.subject.as_of))

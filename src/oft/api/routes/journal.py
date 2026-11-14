@@ -1,28 +1,65 @@
-"""Read the closed-trade journal (minimal list projection, full show)."""
+"""Closed-trade journal API: read endpoints plus the mutating advisory review POST."""
 
 from __future__ import annotations
 
 from typing import Any, Literal
 
-from fastapi import APIRouter, Path, Query, Request
+from fastapi import APIRouter, Header, Path, Query, Request
 
 from oft.api.envelope import new_request_id, success_envelope
-from oft.api.errors import ApiError
+from oft.api.errors import ERROR_CATALOG, ApiError
+from oft.api.idempotency import (
+    complete,
+    release,
+    reserve,
+)
+from oft.api.idempotency import (
+    idempotency_key as require_idempotency_key,
+)
+from oft.api.idempotency import (
+    request_hash as compute_request_hash,
+)
 from oft.api.schemas.journal import (
     Envelope,
     JournalCompareData,
     JournalExportData,
+    JournalReviewData,
+    JournalReviewRequest,
     JournalStatsData,
     TradeLogListData,
 )
 from oft.application.journal_service import JournalError, JournalService
+from oft.application.review_service import ReviewRejected, ReviewService
 
 router = APIRouter()
+_REVIEW_QUALITY = {"FOUND": "COMPLETE", "PARTIAL": "PARTIAL", "MISSING": "MISSING"}
 
 
 def _journal_service(request: Request) -> JournalService:
     container = request.app.state.container
     return JournalService(container.store, container.clock, container.settings)
+
+
+def _review_service(request: Request, provider: str | None) -> ReviewService:
+    container = request.app.state.container
+    return ReviewService(
+        store=container.store,
+        clock=container.clock,
+        settings=container.settings,
+        provider=container.provider_for(provider),
+        runtime=container.llm_runtime,
+    )
+
+
+def _review_error(exc: ReviewRejected) -> ApiError:
+    """Map a review code through the catalog exactly like the management route."""
+    code = exc.code if exc.code in ERROR_CATALOG else "CONFLICT"
+    details = (
+        [{"field": exc.field, "code": exc.code, "message": exc.message}]
+        if exc.field is not None
+        else []
+    )
+    return ApiError(code, exc.message, details=details)
 
 
 def trade_log_summary(payload: dict[str, Any]) -> dict[str, Any]:
@@ -129,6 +166,69 @@ def journal_compare(
         request_id=new_request_id(),
         provenance="MIXED",
         data_quality=str(comparison.get("data_quality") or "MISSING"),
+    )
+
+
+@router.post(
+    "/api/v1/journal/{trade_id}/review",
+    response_model=Envelope[JournalReviewData],
+)
+def review_trade(
+    request: Request,
+    trade_id: str = Path(min_length=1, max_length=64, pattern=r"^[A-Za-z0-9._:-]+$"),
+    refresh: bool = Query(default=False),
+    provider: str | None = Query(default=None, max_length=32),
+    idempotency_key: str | None = Header(default=None, alias="Idempotency-Key"),
+) -> Any:
+    """Persist one advisory LLM review and link it from the trade log."""
+    key = require_idempotency_key(idempotency_key)
+    payload = JournalReviewRequest(refresh=refresh, provider=provider)
+    payload_hash = compute_request_hash(payload)
+    replay = reserve(request, key=key, request_hash=payload_hash)
+    if replay is not None:
+        return replay
+    try:
+        result = _review_service(request, payload.provider).review(
+            trade_id,
+            refresh=refresh,
+            idempotency_key=key,
+            provider_name=payload.provider,
+        )
+    except ReviewRejected as exc:
+        release(request, key=key)
+        raise _review_error(exc) from exc
+    except BaseException:
+        release(request, key=key)
+        raise
+    envelope = success_envelope(
+        result.to_contract(),
+        request_id=new_request_id(),
+        provenance="MIXED",
+        data_quality=_REVIEW_QUALITY[result.status],
+        idempotent_replay=result.idempotent_replay,
+    )
+    complete(request, key=key, request_hash=payload_hash, envelope=envelope, status=200)
+    return envelope
+
+
+@router.get(
+    "/api/v1/journal/{trade_id}/review",
+    response_model=Envelope[JournalReviewData],
+)
+def read_trade_review(
+    request: Request,
+    trade_id: str = Path(min_length=1, max_length=64, pattern=r"^[A-Za-z0-9._:-]+$"),
+) -> dict[str, Any]:
+    """The linked advisory review (provider-free; named MISSING/PARTIAL states)."""
+    try:
+        read = _review_service(request, None).read(trade_id)
+    except ReviewRejected as exc:
+        raise _review_error(exc) from exc
+    return success_envelope(
+        read.to_contract(),
+        request_id=new_request_id(),
+        provenance="MIXED",
+        data_quality=_REVIEW_QUALITY[read.status],
     )
 
 
