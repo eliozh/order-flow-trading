@@ -24,6 +24,7 @@ import hashlib
 import json
 import re
 from collections.abc import Iterable
+from enum import StrEnum
 from pathlib import Path
 
 from oft.domain.time import utc_timestamp
@@ -42,12 +43,31 @@ from oft.replay.harness import write_atomic
 RECORDING_FORMAT_VERSION = "1.0.0"
 RECORDED_PRICE_VERSION = "recorded/v1"
 _SEGMENT_PATTERN = re.compile(r"^[A-Za-z0-9_-]{1,128}$")
+# The stable content a re-record must agree on; ``recorded_at`` is not part of
+# the decision because it only says when the same bytes were captured.
+_RECORDING_CONTENT_KEYS = (
+    "role",
+    "input_hash",
+    "provider",
+    "model",
+    "raw_text",
+    "content_hash",
+    "refusal",
+    "truncated",
+)
+
+
+class RecordingErrorCode(StrEnum):
+    """One typed taxonomy for every recorded-LLM failure (M6)."""
+
+    MISSING = "LLM_RECORDING_MISSING"
+    INVALID = "LLM_RECORDING_INVALID"
 
 
 class LLMRecordingError(LLMAdapterError):
     """No recording exists for a request; replay refuses to invent one."""
 
-    code = "LLM_RECORDING_MISSING"
+    code = RecordingErrorCode.MISSING
     retryable = False
 
     def __init__(self, role: str, input_hash: str, recordings_dir: Path) -> None:
@@ -63,7 +83,7 @@ class LLMRecordingError(LLMAdapterError):
 class LLMRecordingInvalid(LLMAdapterError):
     """A recording exists but is unreadable, tampered, or for another request."""
 
-    code = "LLM_RECORDING_INVALID"
+    code = RecordingErrorCode.INVALID
     retryable = False
 
 
@@ -126,6 +146,12 @@ class RecordedLLMSource:
             raise LLMRecordingInvalid(f"recorded LLM output is unreadable: {path.name}") from exc
         if not isinstance(payload, dict):
             raise LLMRecordingInvalid(f"recorded LLM output is not an object: {path.name}")
+        if payload.get("recording_format_version") != RECORDING_FORMAT_VERSION:
+            raise LLMRecordingInvalid(
+                "recorded LLM output has a missing or incompatible recording_format_version: "
+                f"{payload.get('recording_format_version')!r}; expected "
+                f"{RECORDING_FORMAT_VERSION!r}"
+            )
         if payload.get("role") != request.role.value:
             raise LLMRecordingInvalid("recorded LLM output is for a different role")
         if payload.get("input_hash") != request.input_hash:
@@ -164,11 +190,13 @@ class RecordingLLMSource:
         recordings_dir: Path,
         clock: ClockPort,
         secrets: Iterable[str] = (),
+        force: bool = False,
     ) -> None:
         self._inner = inner
         self._root = Path(recordings_dir).expanduser().resolve()
         self._clock = clock
         self._secrets = tuple(value for value in secrets if value)
+        self._force = force
 
     @property
     def provider(self) -> str:
@@ -185,10 +213,30 @@ class RecordingLLMSource:
         self.record(request, result)
         return result
 
-    def record(self, request: LLMRequest, result: LLMResult) -> Path:
+    @staticmethod
+    def _same_content(existing: object, payload: dict[str, object]) -> bool:
+        if not isinstance(existing, dict):
+            return False
+        return all(existing.get(key) == payload.get(key) for key in _RECORDING_CONTENT_KEYS)
+
+    def record(
+        self,
+        request: LLMRequest,
+        result: LLMResult,
+        *,
+        force: bool | None = None,
+    ) -> Path:
+        """Persist one recording; never silently overwrite different content.
+
+        An existing recording with identical semantic content is an idempotent
+        no-op. Different content already published for the same
+        ``(role, input_hash)`` is refused unless ``force`` (or the constructor
+        flag) says the operator deliberately wants to replace it.
+        """
+        overwrite = self._force if force is None else force
         redacted_text = redact(result.raw_text, self._secrets)
         path = _recording_path(self._root, request.role.value, request.input_hash)
-        payload = {
+        payload: dict[str, object] = {
             "recording_format_version": RECORDING_FORMAT_VERSION,
             "role": request.role.value,
             "input_hash": request.input_hash,
@@ -201,6 +249,19 @@ class RecordingLLMSource:
             "truncated": result.truncated,
             "recorded_at": utc_timestamp(self._clock.now()),
         }
+        if path.is_file():
+            try:
+                existing: object = json.loads(path.read_text(encoding="utf-8"))
+            except (OSError, json.JSONDecodeError):
+                existing = None
+            if self._same_content(existing, payload):
+                return path
+            if not overwrite:
+                raise LLMRecordingInvalid(
+                    "a different recorded LLM output already exists for "
+                    f"role={request.role.value} input_hash={request.input_hash}; "
+                    "pass --force-recordings to overwrite it deliberately"
+                )
         write_atomic(path, json.dumps(payload, indent=2, sort_keys=True) + "\n")
         return path
 
@@ -210,5 +271,6 @@ __all__ = [
     "LLMRecordingInvalid",
     "RECORDING_FORMAT_VERSION",
     "RecordedLLMSource",
+    "RecordingErrorCode",
     "RecordingLLMSource",
 ]

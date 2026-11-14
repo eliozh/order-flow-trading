@@ -6,6 +6,7 @@ import shutil
 from dataclasses import replace
 from datetime import date
 from pathlib import Path
+from typing import Any
 
 import pytest
 
@@ -103,3 +104,100 @@ def test_a_missing_entry_recheck_recording_fails_loudly(
 def test_dot_and_path_like_run_ids_are_rejected(tmp_path: Path, run_id: str) -> None:
     with pytest.raises(ReplayError, match="run_id"):
         _config(tmp_path, run_id=run_id)
+
+
+# -- position-management scenario (slice 31) --------------------------------
+
+
+def _management_config(recordings: Path, *, run_id: str = "management") -> Any:
+    from conftest import position_management_config
+
+    return position_management_config(recordings, run_id=run_id)
+
+
+@pytest.mark.parametrize(
+    "field",
+    ["management", "funding", "closed_position", "trade_log", "statistics", "review"],
+)
+def test_a_non_deterministic_management_scenario_fails_loudly(
+    tmp_path: Path,
+    position_management_recordings: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    field: str,
+) -> None:
+    from oft.replay.position_management import (
+        PositionManagementOutcome,
+        PositionManagementReplay,
+    )
+
+    calls = {"count": 0}
+    original = PositionManagementReplay._run_once
+
+    def flaky(self: PositionManagementReplay, attempt: str) -> PositionManagementOutcome:
+        outcome = original(self, attempt)
+        calls["count"] += 1
+        if calls["count"] == 2:
+            value = getattr(outcome, field)
+            if field == "management":
+                # The steps are typed; mutate one valid step rather than
+                # appending a raw dict that the projection cannot serialize.
+                last = value[-1]
+                return replace(
+                    outcome,
+                    management=(*value, replace(last, size_after=f"{last.size_after}0")),
+                )
+            if isinstance(value, tuple):
+                return replace(outcome, **{field: (*value, {"mutated": True})})
+            assert isinstance(value, dict)
+            return replace(outcome, **{field: {**value, "mutated": True}})
+        return outcome
+
+    monkeypatch.setattr(PositionManagementReplay, "_run_once", flaky)
+
+    with pytest.raises(ReplayNonDeterministicError, match="non-deterministic"):
+        PositionManagementReplay(
+            data_dir=tmp_path / "data",
+            config=_management_config(position_management_recordings, run_id="flaky"),
+        ).run()
+
+    summary = tmp_path / "data" / "replay" / "position-management" / "flaky" / "summary.json"
+    assert not summary.exists()
+
+
+@pytest.mark.parametrize("run_id", [".", "..", "---", "a/b", "../escape"])
+def test_dot_and_path_like_management_run_ids_are_rejected(tmp_path: Path, run_id: str) -> None:
+    with pytest.raises(ReplayError, match="run_id"):
+        _management_config(tmp_path, run_id=run_id)
+
+
+def test_recording_propagation_uses_the_typed_code_not_the_reason_text() -> None:
+    from types import SimpleNamespace
+
+    from oft.replay.paper_loop import (
+        ReplayRecordingInvalidError,
+        ReplayRecordingMissingError,
+    )
+    from oft.replay.support import raise_no_replay_opportunity
+
+    # A reason string that merely mentions a recording must not be sniffed.
+    mismatched_reason = SimpleNamespace(
+        llm_state={
+            "error_code": "",
+            "reason": "no recorded LLM output for role=ANALYSIS",
+        }
+    )
+    with pytest.raises(ReplayError) as unrelated:
+        raise_no_replay_opportunity(mismatched_reason)
+    assert type(unrelated.value) is ReplayError
+
+    missing = SimpleNamespace(
+        llm_state={"error_code": "LLM_RECORDING_MISSING", "reason": "wording may change"}
+    )
+    with pytest.raises(ReplayRecordingMissingError):
+        raise_no_replay_opportunity(missing)
+
+    invalid = SimpleNamespace(
+        llm_state={"error_code": "LLM_RECORDING_INVALID", "reason": "wording may change"}
+    )
+    with pytest.raises(ReplayRecordingInvalidError):
+        raise_no_replay_opportunity(invalid)

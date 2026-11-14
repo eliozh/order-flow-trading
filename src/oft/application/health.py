@@ -59,7 +59,7 @@ class ReadinessReport:
 
 @dataclass(frozen=True)
 class DoctorReport:
-    status: Literal["READY", "DEGRADED", "OFFLINE"]
+    status: Literal["READY", "DEGRADED"]
     version: str
     checked_at: str
     checks: tuple[CheckResult, ...]
@@ -214,6 +214,165 @@ def _stale_jobs_check(store: StorePort, clock: ClockPort) -> CheckResult:
             f"{len(stale)} stale RUNNING job run(s); recover or fail them",
         )
     return CheckResult("jobs.stale", "ok", "no stale RUNNING job runs")
+
+
+def _database_unavailable(store: StorePort, check: str) -> CheckResult | None:
+    """Return an ``unknown`` result when the store cannot confirm its database.
+
+    The store port turns an absent database into empty results, so a check that
+    only counts rows would report ``ok`` from nothing. Callers gate on this
+    before reading, and a check that cannot verify reports ``unknown`` rather
+    than false assurance (M1).
+    """
+    try:
+        available = store.integrity_check()
+    except Exception:  # pragma: no cover - defensive boundary
+        available = False
+    if available:
+        return None
+    return CheckResult(check, "unknown", f"database unavailable; {check} not verified")
+
+
+def _management_jobs_check(store: StorePort, clock: ClockPort) -> CheckResult:
+    """Report the aggregate result of the latest ``position_manage`` window.
+
+    ``position_manage`` writes one row per ``"{window}#{position_id}"`` key, so
+    the newest single row (ordered by heartbeat) is not the window status: a
+    FAILED row for one position would be masked by a later DONE row for
+    another. The aggregate ``latest_job_summary`` is the same read path the API
+    and CLI use. Only the status, boundary window, and error code are rendered;
+    a persisted message is never echoed (it may quote provider text).
+    """
+    from oft.application.jobs import POSITION_MANAGE_JOB_TYPE, latest_job_summary
+
+    unavailable = _database_unavailable(store, "jobs.management")
+    if unavailable is not None:
+        return unavailable
+    try:
+        summary = latest_job_summary(store, POSITION_MANAGE_JOB_TYPE)
+    except Exception as exc:
+        return CheckResult(
+            "jobs.management", "degraded", f"management job ledger unreadable ({exc})"
+        )
+    if summary is None:
+        return CheckResult("jobs.management", "ok", "no management job run recorded yet")
+    status = summary.status
+    # ``latest_job_summary`` surfaces the boundary ISO timestamp, never the
+    # internal ``"<ts>#<position_id>"`` ledger key.
+    window = summary.window_start
+    error_code = summary.error_code or ""
+    if status in ("FAILED", "PARTIAL"):
+        suffix = f" ({error_code})" if error_code else ""
+        return CheckResult(
+            "jobs.management",
+            "degraded",
+            f"last management run {status} for window {window}{suffix}",
+        )
+    if status == "RUNNING":
+        if _window_lease_expired(store, POSITION_MANAGE_JOB_TYPE, window, clock):
+            return CheckResult(
+                "jobs.management",
+                "degraded",
+                f"management run for window {window} is RUNNING with an expired lease",
+            )
+        return CheckResult(
+            "jobs.management", "ok", f"management run for window {window} is RUNNING"
+        )
+    return CheckResult("jobs.management", "ok", f"last management run {status} for window {window}")
+
+
+def _window_lease_expired(store: StorePort, job_type: str, window: str, clock: ClockPort) -> bool:
+    """True when any RUNNING row in the window has an expired/unparseable lease."""
+    now = clock.now().astimezone(UTC)
+    try:
+        runs = store.list_job_runs(job_type)
+    except Exception:
+        return True
+    for run in runs:
+        if str(run.window_start).split("#", 1)[0] != window:
+            continue
+        if str(run.status) != "RUNNING":
+            continue
+        try:
+            lease_expires = datetime.fromisoformat(str(run.lease_expires_at).replace("Z", "+00:00"))
+        except (TypeError, ValueError, OverflowError):
+            return True
+        if lease_expires < now:
+            return True
+    return False
+
+
+def _funding_idempotency_check(store: StorePort) -> CheckResult:
+    """Verify recorded funding accruals are unique and plausible.
+
+    ``(position_id, settlement_time)`` is the idempotency key, so a duplicate
+    settlement time for one position is a real double-accrual risk. Amount,
+    mark, and size are re-parsed from the persisted rows; a non-finite or
+    implausible value is a degraded read, never a silently accepted zero.
+
+    Only OPEN positions are scanned, so the check is bounded by positions that
+    can still accrue funding. Closed-position accruals are immutable history and
+    cannot be double-settled; a read-only store aggregate over that history is a
+    follow-up (the store port exposes no funding query).
+    """
+    from decimal import Decimal, InvalidOperation
+
+    from oft.domain.pnl import MAX_ABS_MONEY, MAX_ABS_PRICE, MAX_ABS_QUANTITY
+
+    unavailable = _database_unavailable(store, "funding.idempotency")
+    if unavailable is not None:
+        return unavailable
+    try:
+        positions = store.list_positions(state="OPEN", limit=None)
+    except Exception as exc:
+        return CheckResult("funding.idempotency", "degraded", f"position ledger unreadable ({exc})")
+    checked = 0
+    duplicates = 0
+    invalid = 0
+    for position in positions:
+        try:
+            accruals = store.list_funding_accruals(position.position_id)
+        except Exception as exc:
+            return CheckResult(
+                "funding.idempotency", "degraded", f"funding accruals unreadable ({exc})"
+            )
+        seen: set[str] = set()
+        for accrual in accruals:
+            checked += 1
+            settlement = str(accrual.settlement_time)
+            if settlement in seen:
+                duplicates += 1
+            else:
+                seen.add(settlement)
+            try:
+                amount = Decimal(str(accrual.amount_usd))
+                mark = Decimal(str(accrual.mark_price))
+                size = Decimal(str(accrual.size))
+            except (InvalidOperation, TypeError, ValueError):
+                invalid += 1
+                continue
+            plausible = (
+                amount.is_finite()
+                and abs(amount) <= MAX_ABS_MONEY
+                and mark.is_finite()
+                and 0 < mark <= MAX_ABS_PRICE
+                and size.is_finite()
+                and 0 <= size <= MAX_ABS_QUANTITY
+            )
+            if not plausible:
+                invalid += 1
+    if duplicates or invalid:
+        return CheckResult(
+            "funding.idempotency",
+            "degraded",
+            f"{duplicates} duplicate settlement(s), {invalid} invalid amount(s) "
+            f"across {checked} funding accrual(s)",
+        )
+    return CheckResult(
+        "funding.idempotency",
+        "ok",
+        f"{checked} funding accrual(s) unique and plausible",
+    )
 
 
 def _audit_chain_check(store: StorePort) -> CheckResult:
@@ -430,6 +589,8 @@ def build_doctor(
         _disk_check(settings),
         _manifest_orphans_check(settings, store),
         _stale_jobs_check(store, clock),
+        _management_jobs_check(store, clock),
+        _funding_idempotency_check(store),
         _audit_chain_check(store),
         _provider_check(settings),
         _budget_ledger_check(store),
@@ -445,7 +606,7 @@ def build_doctor(
         ),
     )
     if probe.state == "OFFLINE":
-        overall: Literal["READY", "DEGRADED", "OFFLINE"] = "DEGRADED"
+        overall: Literal["READY", "DEGRADED"] = "DEGRADED"
     elif all(check.status in ("ok", "unknown") for check in checks):
         overall = "READY"
     else:

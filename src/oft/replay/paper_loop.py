@@ -19,7 +19,6 @@ Safety rules:
 
 from __future__ import annotations
 
-import hashlib
 import json
 import re
 from collections.abc import Mapping
@@ -27,8 +26,9 @@ from dataclasses import asdict, dataclass
 from dataclasses import replace as replace_dataclass
 from datetime import UTC, date, datetime
 from pathlib import Path
-from typing import TYPE_CHECKING, Any, Literal, NoReturn
+from typing import TYPE_CHECKING, Any, Literal
 
+from oft.config import Environment
 from oft.domain.trigger import CONTRACT_DATA_QUALITIES
 from oft.replay.harness import (
     REPLAY_NAMESPACE,
@@ -37,18 +37,33 @@ from oft.replay.harness import (
     ReplayNonDeterministicError,
     write_atomic,
 )
+from oft.replay.support import (
+    READ_ONLY_ENVIRONMENTS,
+    ReplayRecordingError,
+    ReplayRecordingInvalidError,
+    ReplayRecordingMissingError,
+    build_replay_settings,
+    canonical_json,
+    guard_new_run_root,
+    guard_replay_run_root,
+    project_stable_opportunity_source,
+    raise_no_replay_opportunity,
+    replay_identity_digest,
+    resolve_attempt_dir,
+    resolve_recordings_dir,
+    resolve_summary_path,
+)
 
 if TYPE_CHECKING:
-    from oft.application.scan_service import ScanRun
     from oft.bootstrap import AppContainer
     from oft.config import Settings
     from oft.ports.llm import LLMPort
     from oft.ports.store import DecisionRecord
 
 PAPER_LOOP_NAMESPACE = "paper-loop"
+SCENARIO_VERSION = "1"
 DEFAULT_REPLAY_ENVIRONMENT = "PAPER"
 DEFAULT_REPLAY_NOW = datetime(2026, 11, 6, 12, 0, 0, tzinfo=UTC)
-_READ_ONLY_ENVIRONMENTS = frozenset({"PAPER", "TEST"})
 # At least one alphanumeric is required, so "." and ".." are never run ids.
 _RUN_ID_PATTERN = re.compile(r"^(?=.*[A-Za-z0-9])[A-Za-z0-9._-]{1,64}$")
 _RUN_ID_RULE = (
@@ -58,106 +73,12 @@ _RUN_ID_RULE = (
 _ATTEMPT_1 = "attempt-1"
 _ATTEMPT_2 = "attempt-2"
 
-# Every setting that can change a fill, fee, account balance, or risk verdict is
-# pinned here. ``Settings`` is a ``BaseSettings`` model, so an ambient
-# ``OFT_PAPER_*``/``OFT_RISK_*`` value would otherwise leak into a replay on a
-# different machine and surface only as a generic non-determinism error.
-_PINNED_OUTCOME_SETTINGS: dict[str, Any] = {
-    "paper_initial_balance": "10000.00",
-    "paper_slippage_bps": "2",
-    "paper_taker_fee_bps": "5",
-    "risk_per_trade_pct": 0.8,
-    "risk_max_concurrent_positions": 3,
-    "risk_daily_loss_pct": 3.0,
-    "risk_max_leverage": 5.0,
-    "risk_max_notional_pct": 20.0,
-    "risk_max_slippage_bps": 25.0,
-    "risk_max_spread_bps": 15.0,
-    "risk_stale_mark_seconds": 60,
-}
-
-
-def _pinned_fixture_paths() -> dict[str, Path]:
-    """The committed fixtures that seed sizing/risk and data-quality outcomes.
-
-    The exchange-info fixture seeds the symbol registry (tick/step/min-notional
-    drive entry sizing and the risk gate); the klines fixture changes the
-    cross-check ``quality_reasons`` and therefore ``data_quality``. Pinning them
-    explicitly keeps an ambient ``OFT_*_FIXTURE`` value from changing a replay.
-    """
-    from oft.config import (
-        DEFAULT_EXCHANGE_INFO_FIXTURE,
-        DEFAULT_FIXTURES_DIR,
-        DEFAULT_KLINES_FIXTURE,
-    )
-
-    return {
-        "fixtures_dir": DEFAULT_FIXTURES_DIR,
-        "klines_fixture": DEFAULT_KLINES_FIXTURE,
-        "exchange_info_fixture": DEFAULT_EXCHANGE_INFO_FIXTURE,
-    }
-
-
-def _fixture_content_digest(path: Path) -> str:
-    """Hash fixture *contents*, so identical fixtures share a digest across checkouts.
-
-    Absolute resolved paths differ between two clones even when every fixture
-    byte is identical; hashing the file names (relative to the fixture root) and
-    their bytes keeps ``settings_digest`` checkout-independent. A missing path
-    hashes the stable ``missing`` marker instead of raising while writing a
-    summary (the missing fixture would already have failed the replay earlier).
-    """
-    resolved = Path(path).expanduser()
-    try:
-        if resolved.is_dir():
-            digest = hashlib.sha256()
-            for file_path in sorted(item for item in resolved.rglob("*") if item.is_file()):
-                relative = file_path.relative_to(resolved).as_posix()
-                digest.update(relative.encode("utf-8") + b"\0")
-                digest.update(file_path.read_bytes())
-                digest.update(b"\0")
-            return digest.hexdigest()
-        if resolved.is_file():
-            return hashlib.sha256(resolved.read_bytes()).hexdigest()
-    except OSError as exc:
-        raise ReplayError(f"cannot read replay fixture {resolved}: {exc}") from exc
-    return "missing"
-
-
-class ReplayRecordingError(ReplayError):
-    """A recorded LLM output is missing or unusable; replay fails closed."""
-
-    code = "VALIDATION_FAILED"
-
-
-class ReplayRecordingMissingError(ReplayRecordingError):
-    """No recording exists for a request; replay never invents one."""
-
-    code = "DATA_UNAVAILABLE"
-
-
-class ReplayRecordingInvalidError(ReplayRecordingError):
-    """A recording exists but is unreadable, tampered, or for another request."""
-
-    code = "VALIDATION_FAILED"
-
 
 def validate_run_id(run_id: str) -> str:
     """Reject ``.``, ``..``, and path-like ids before they reach the filesystem."""
     if _RUN_ID_PATTERN.fullmatch(run_id) is None:
         raise ReplayError(_RUN_ID_RULE)
     return run_id
-
-
-def _reject_symlink_components(path: Path, *, stop: Path) -> None:
-    """Refuse a symlinked path component between ``path`` and ``stop`` (lstat)."""
-    current = path
-    while True:
-        if current.is_symlink():
-            raise ReplayError(f"replay path component is a symlink: {current}")
-        if current == stop or current.parent == current:
-            return
-        current = current.parent
 
 
 @dataclass(frozen=True)
@@ -168,32 +89,30 @@ class PaperLoopConfig:
     archive_fixture_dir: Path
     backfill_start: date
     backfill_end: date
+    recordings_dir: Path
     period: str = "4h"
-    recordings_dir: Path | None = None
     live_llm: bool = False
     capture_recordings: bool = False
+    force_recordings: bool = False
     provider: str | None = None
-    environment: str = DEFAULT_REPLAY_ENVIRONMENT
+    environment: Environment = Environment.PAPER
     now: datetime = DEFAULT_REPLAY_NOW
     run_id: str = "paper-loop"
     llm_fixtures_dir: Path | None = None
 
     def __post_init__(self) -> None:
-        if self.environment.strip().upper() not in _READ_ONLY_ENVIRONMENTS:
+        environment = Environment(self.environment.strip().lower())
+        if environment not in READ_ONLY_ENVIRONMENTS:
             raise ReplayLivePathError(
                 f"replay refuses environment {self.environment!r}; "
                 "only PAPER/TEST replay is supported and a live order path is never opened"
             )
+        object.__setattr__(self, "environment", environment)
         if self.now.tzinfo is None:
             raise ReplayError("paper-loop replay requires a timezone-aware fixed clock")
         if self.backfill_end < self.backfill_start:
             raise ReplayError("backfill_end must be on or after backfill_start")
         validate_run_id(self.run_id)
-        if self.recordings_dir is None:
-            raise ReplayError(
-                "recordings_dir is required; pass --recordings-dir first, then populate it "
-                "with --capture (offline stub) or --live-llm (explicit provider)."
-            )
 
 
 @dataclass(frozen=True)
@@ -281,13 +200,7 @@ class PaperLoopResult:
 
 def _stable_opportunity(payload: dict[str, Any]) -> dict[str, Any]:
     """Drop the two ids a scan generates randomly; everything else is pinned."""
-    copy: dict[str, Any] = json.loads(json.dumps(payload))
-    source = copy.get("source")
-    if isinstance(source, dict):
-        copy["source"] = {
-            key: value for key, value in source.items() if key not in {"scan_id", "report_id"}
-        }
-    return copy
+    return project_stable_opportunity_source(payload)
 
 
 def _stable_outcome(outcome: PaperLoopOutcome) -> dict[str, Any]:
@@ -300,11 +213,6 @@ def _stable_outcome(outcome: PaperLoopOutcome) -> dict[str, Any]:
     stable = asdict(outcome)
     stable["opportunity"] = _stable_opportunity(outcome.opportunity)
     return stable
-
-
-def _canonical_json(payload: Any) -> str:
-    """Deterministic comparison text; the paper loop carries floats, unlike metrics."""
-    return json.dumps(payload, sort_keys=True, separators=(",", ":"), ensure_ascii=False)
 
 
 def _decision_payload(decision: DecisionRecord | None) -> dict[str, Any]:
@@ -347,11 +255,12 @@ class PaperLoopReplay:
         self._replay_root = self._data_dir / REPLAY_NAMESPACE
         self._paper_loop_root = self._replay_root / PAPER_LOOP_NAMESPACE
         self._run_root = self._paper_loop_root / config.run_id
-        _reject_symlink_components(self._run_root, stop=self._replay_root)
-        if not self._run_root.resolve().is_relative_to(self._paper_loop_root.resolve()):
-            raise ReplayError(
-                f"replay run {config.run_id!r} escapes {self._paper_loop_root}; pass a plain run id"
-            )
+        guard_replay_run_root(
+            run_root=self._run_root,
+            replay_root=self._replay_root,
+            scenario_root=self._paper_loop_root,
+            run_id=config.run_id,
+        )
 
     @property
     def replay_root(self) -> Path:
@@ -362,61 +271,36 @@ class PaperLoopReplay:
         return self._run_root
 
     def _settings(self, attempt_dir: Path) -> Settings:
-        from oft.config import DEFAULT_LLM_FIXTURES_DIR, Settings
+        return build_replay_settings(
+            attempt_dir=attempt_dir,
+            archive_fixture_dir=self._config.archive_fixture_dir,
+            llm_fixtures_dir=self._config.llm_fixtures_dir,
+            live_llm=self._config.live_llm,
+            provider=self._config.provider,
+        )
 
-        values: dict[str, Any] = {
-            "env": "test",
-            "port": 8765,
-            "data_dir": attempt_dir,
-            "archive_fixture_dir": self._config.archive_fixture_dir,
-            "llm_model": "fixture",
-            "llm_fixtures_dir": self._config.llm_fixtures_dir or DEFAULT_LLM_FIXTURES_DIR,
-        }
-        # Pin the fixtures that feed sizing, risk, and data quality explicitly:
-        # an ambient OFT_FIXTURES_DIR/OFT_KLINES_FIXTURE/OFT_EXCHANGE_INFO_FIXTURE
-        # would otherwise change the outcome on another machine.
-        values.update(_pinned_fixture_paths())
-        # Explicit values win over ambient environment variables, so a replay on
-        # another machine cannot silently change fills, fees, balance, or caps.
-        values.update(_PINNED_OUTCOME_SETTINGS)
-        if self._config.live_llm:
-            # Honour the configured provider (explicit --provider wins), never
-            # default to a live provider when none is named.
-            if self._config.provider is not None:
-                values["llm_provider"] = self._config.provider
-        else:
-            values["llm_provider"] = "stub"
-        return Settings(**values)
-
-    def _settings_digest(self) -> str:
+    def _identity_digest(self) -> str:
         """A stable, checkout-independent digest of the inputs behind a replay.
 
         Fixtures are hashed by content, not by absolute path: two checkouts with
-        byte-identical fixtures produce the same digest.
+        byte-identical fixtures produce the same digest. The shared builder keeps
+        this digest and the position-management identity digest consistent.
         """
-        from oft.config import DEFAULT_LLM_FIXTURES_DIR
-
-        payload = {
-            "symbol": self._config.symbol,
-            "period": self._config.period,
-            "environment": self._config.environment.upper(),
-            "archive_fixture_digest": _fixture_content_digest(self._config.archive_fixture_dir),
-            "llm_fixtures_digest": _fixture_content_digest(
-                self._config.llm_fixtures_dir or DEFAULT_LLM_FIXTURES_DIR
-            ),
-            "pinned_fixtures": {
-                name: _fixture_content_digest(path)
-                for name, path in _pinned_fixture_paths().items()
-            },
-            "llm_model": "fixture",
-            "provider": self._config.provider if self._config.live_llm else "stub",
-            "pinned": _PINNED_OUTCOME_SETTINGS,
-        }
-        return hashlib.sha256(_canonical_json(payload).encode("utf-8")).hexdigest()
+        return replay_identity_digest(
+            scenario=PAPER_LOOP_NAMESPACE,
+            scenario_version=SCENARIO_VERSION,
+            symbol=self._config.symbol,
+            period=self._config.period,
+            environment=self._config.environment.upper(),
+            archive_fixture_dir=self._config.archive_fixture_dir,
+            llm_fixtures_dir=self._config.llm_fixtures_dir,
+            recordings_dir=self._recordings_dir(),
+            live_llm=self._config.live_llm,
+            provider=self._config.provider,
+        )
 
     def _recordings_dir(self) -> Path:
-        assert self._config.recordings_dir is not None
-        return Path(self._config.recordings_dir).expanduser().resolve()
+        return resolve_recordings_dir(self._config.recordings_dir)
 
     def _source(
         self,
@@ -445,6 +329,7 @@ class PaperLoopReplay:
             recordings_dir=self._recordings_dir(),
             clock=container.clock,
             secrets=secret_values_from_settings(settings),
+            force=self._config.force_recordings,
         )
 
     @staticmethod
@@ -453,12 +338,11 @@ class PaperLoopReplay:
 
     def _attempt_dir(self, attempt: str) -> Path:
         """Resolve one attempt directory and prove it stays in the namespace."""
-        raw = self.run_root / attempt
-        _reject_symlink_components(raw, stop=self.run_root)
-        resolved = raw.resolve()
-        if not resolved.is_relative_to(self._paper_loop_root.resolve()):
-            raise ReplayError(f"replay {attempt} escaped the replay namespace")
-        return resolved
+        return resolve_attempt_dir(
+            run_root=self.run_root,
+            namespace_root=self._paper_loop_root,
+            attempt=attempt,
+        )
 
     def _run_once(self, attempt: str) -> PaperLoopOutcome:
         from oft.application.entry_service import EntryService
@@ -498,7 +382,7 @@ class PaperLoopReplay:
         )
         opportunities = container.store.list_opportunities(state="OPEN")
         if not opportunities:
-            self._raise_no_opportunity(scan)
+            raise_no_replay_opportunity(scan)
         opportunity = opportunities[0]
 
         trigger_run = TriggerService(store=container.store, clock=container.clock).evaluate(
@@ -550,54 +434,32 @@ class PaperLoopReplay:
             risk_verdict=result.risk_verdict,
         )
 
-    @staticmethod
-    def _raise_no_opportunity(scan: ScanRun) -> NoReturn:
-        llm_state = scan.llm_state or {}
-        reason = str(llm_state.get("reason") or "")
-        code = str(llm_state.get("error_code") or "")
-        if code == "LLM_RECORDING_INVALID":
-            raise ReplayRecordingInvalidError(
-                "recorded LLM output is invalid or tampered; refusing to replay it. "
-                "Inspect and re-capture deliberately (never overwrite a published "
-                "recording blindly): " + (reason or "unknown reason")
-            )
-        if (
-            code == "LLM_RECORDING_MISSING"
-            or "LLM_RECORDING_MISSING" in reason
-            or "no recorded LLM output" in reason
-        ):
-            raise ReplayRecordingMissingError(
-                "no recorded LLM output for role=ANALYSIS; record one with --capture "
-                "(offline stub) or --live-llm (explicit provider): " + (reason or "unknown reason")
-            )
-        raise ReplayError("replay produced no OPEN opportunity; " + (reason or "unknown reason"))
-
     def run(self) -> PaperLoopResult:
         """Run the loop twice, compare every stable value, and write a summary.
 
         An existing run root fails closed before any write: replay never
         deletes, resets, or overwrites a previous run. Pass a new ``--run-id``.
         """
-        _reject_symlink_components(self._run_root, stop=self._replay_root)
-        if self._run_root.exists():
-            raise ReplayError(
-                f"run '{self._config.run_id}' already exists at {self._run_root}; "
-                "pass a new --run-id (replay never deletes or overwrites a run)"
-            )
+        guard_new_run_root(
+            run_root=self._run_root,
+            replay_root=self._replay_root,
+            run_id=self._config.run_id,
+        )
 
         first = self._run_once(_ATTEMPT_1)
         second = self._run_once(_ATTEMPT_2)
         left = _stable_outcome(first)
         right = _stable_outcome(second)
-        if _canonical_json(left) != _canonical_json(right):
+        if canonical_json(left) != canonical_json(right):
             raise ReplayNonDeterministicError(
                 "paper-loop replay is non-deterministic: attempt-1 and attempt-2 produced "
                 "different decisions, triggers, orders, fills, positions, or account values"
             )
 
-        summary_path = (self.run_root / "summary.json").resolve()
-        if not summary_path.is_relative_to(self._replay_root.resolve()):
-            raise ReplayError("replay summary escaped the replay namespace")
+        summary_path = resolve_summary_path(
+            run_root=self.run_root,
+            replay_root=self._replay_root,
+        )
 
         # Validate the artifacts and build the value object before writing the
         # summary: a run that cannot produce an order, fill, or position (or a
@@ -644,10 +506,10 @@ class PaperLoopReplay:
             "period": self._config.period,
             "attempts": 2,
             "deterministic": True,
-            "settings_digest": self._settings_digest(),
+            "identity_digest": self._identity_digest(),
             "outcome": left,
         }
-        write_atomic(summary_path, _canonical_json(summary))
+        write_atomic(summary_path, canonical_json(summary))
         return result
 
 

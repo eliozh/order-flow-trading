@@ -13,7 +13,7 @@ import json
 from dataclasses import asdict
 from datetime import UTC, date, datetime
 from pathlib import Path
-from typing import Annotated, Any, NoReturn
+from typing import Annotated, Any, Literal, NoReturn, cast
 
 import typer
 
@@ -21,14 +21,18 @@ from oft.api.envelope import new_request_id, success_envelope
 from oft.api.errors import ERROR_CATALOG
 from oft.application.entry_service import EntryRejected
 from oft.cli.commands.doctor import emit_error
-from oft.config import ConfigError, load_settings
+from oft.config import ConfigError, Environment, load_settings
 from oft.domain.time import utc_timestamp
 from oft.replay.harness import (
     ReplayError,
     ReplayLivePathError,
     ReplayNonDeterministicError,
 )
-from oft.replay.llm_source import LLMRecordingError, LLMRecordingInvalid
+from oft.replay.llm_source import (
+    LLMRecordingError,
+    LLMRecordingInvalid,
+    RecordingErrorCode,
+)
 from oft.replay.paper_loop import (
     DEFAULT_REPLAY_NOW,
     PaperLoopConfig,
@@ -37,6 +41,11 @@ from oft.replay.paper_loop import (
     ReplayRecordingError,
     validate_run_id,
 )
+from oft.replay.position_management import (
+    PositionManagementConfig,
+    PositionManagementReplay,
+    PositionManagementResult,
+)
 
 replay_app = typer.Typer(
     help="Deterministic paper-loop replay (offline; replay namespace only).",
@@ -44,13 +53,14 @@ replay_app = typer.Typer(
 )
 
 _EXIT_FAILED = 2
+SCENARIOS = ("entry", "position-management")
 
 # Recording failures have no dedicated catalog code yet. Map them to the
 # closest existing code so JSON consumers never see a misleading 500
 # ``INTERNAL_ERROR``; every code is asserted against the catalog before emit.
-_RECORDING_ERROR_CODES: dict[str, str] = {
-    "LLM_RECORDING_MISSING": "DATA_UNAVAILABLE",
-    "LLM_RECORDING_INVALID": "VALIDATION_FAILED",
+_RECORDING_ERROR_CODES: dict[RecordingErrorCode, str] = {
+    RecordingErrorCode.MISSING: "DATA_UNAVAILABLE",
+    RecordingErrorCode.INVALID: "VALIDATION_FAILED",
 }
 
 
@@ -62,7 +72,10 @@ def _catalog_code(code: str) -> str:
     unknown code to ``VALIDATION_FAILED`` would hide a programming error (and
     make the membership assert in ``_fail`` meaningless for that path).
     """
-    resolved = _RECORDING_ERROR_CODES.get(code, code)
+    try:
+        resolved = _RECORDING_ERROR_CODES[RecordingErrorCode(code)]
+    except (ValueError, KeyError):
+        resolved = code
     if resolved not in ERROR_CATALOG:
         raise ReplayError(
             f"replay error code {code!r} has no ERROR_CATALOG mapping; "
@@ -97,7 +110,7 @@ def _fail(message: str, *, json_output: bool, code: str = "VALIDATION_FAILED") -
     raise typer.Exit(code=_EXIT_FAILED)
 
 
-def _result_payload(result: PaperLoopResult) -> dict[str, Any]:
+def _result_payload(result: PaperLoopResult | PositionManagementResult) -> dict[str, Any]:
     return asdict(result)
 
 
@@ -112,6 +125,20 @@ def _render(result: PaperLoopResult) -> str:
             f"fill      {result.fill.fill_id} @ {result.fill.price} fee {result.fill.fee}",
             f"position  {result.position.position_id} size {result.position.size} "
             f"notional {result.position.notional_usd}",
+            f"summary   {result.summary_path}",
+        )
+    )
+
+
+def _render_position_management(result: PositionManagementResult) -> str:
+    return "\n".join(
+        (
+            f"replay {result.run_id} · scenario={result.scenario} "
+            f"· deterministic={str(result.deterministic).lower()}",
+            f"position  {result.position_id}",
+            f"trade     {result.trade_id} · data_quality={result.data_quality}",
+            f"journal   stats={result.statistics_status}",
+            f"review    {result.review_decision_id}",
             f"summary   {result.summary_path}",
         )
     )
@@ -147,6 +174,13 @@ def replay_run(
             help="Record outputs from the offline fixture provider (no network).",
         ),
     ] = False,
+    force_recordings: Annotated[
+        bool,
+        typer.Option(
+            "--force-recordings",
+            help="Explicitly overwrite a different existing recording.",
+        ),
+    ] = False,
     provider: Annotated[
         str | None,
         typer.Option(
@@ -155,6 +189,13 @@ def replay_run(
     ] = None,
     symbol: Annotated[str, typer.Option("--symbol")] = "BTCUSDT",
     period: Annotated[str, typer.Option("--period")] = "4h",
+    scenario: Annotated[
+        str,
+        typer.Option(
+            "--scenario",
+            help="Replay scenario: entry (default) or position-management (journal+review).",
+        ),
+    ] = "entry",
     start: Annotated[
         str, typer.Option("--start", help="Backfill start date (YYYY-MM-DD).")
     ] = "2026-10-01",
@@ -172,36 +213,77 @@ def replay_run(
         str,
         typer.Option("--now", help="Fixed clock instant (ISO-8601 UTC)."),
     ] = "2026-11-06T12:00:00Z",
-    run_id: Annotated[str, typer.Option("--run-id")] = "paper-loop",
+    run_id: Annotated[
+        str | None, typer.Option("--run-id", help="Output run id (defaults per scenario).")
+    ] = None,
     json_output: Annotated[bool, typer.Option("--json", help="Emit the replay as JSON.")] = False,
 ) -> None:
-    """Replay the decision -> trigger -> entry -> paper fill loop twice."""
+    """Replay the entry loop, or the management/journal/review scenario, twice."""
     resolved_now = DEFAULT_REPLAY_NOW
     try:
         settings = load_settings()
         resolved_now = _parse_datetime(now)
-        validate_run_id(run_id)
+        resolved_scenario = scenario.strip().lower()
+        if resolved_scenario not in SCENARIOS:
+            _fail(
+                f"unknown replay scenario {scenario!r}; expected one of {', '.join(SCENARIOS)}",
+                json_output=json_output,
+            )
+        resolved_run_id = run_id or (
+            "paper-loop" if resolved_scenario == "entry" else "position-management"
+        )
+        validate_run_id(resolved_run_id)
         resolved_archive = archive_fixture_dir or settings.archive_fixture_dir
         if resolved_archive is None:
             _fail(
                 "no archive fixture directory configured; pass --archive-fixture-dir",
                 json_output=json_output,
             )
-        config = PaperLoopConfig(
-            symbol=symbol,
-            archive_fixture_dir=Path(resolved_archive),
-            backfill_start=_parse_date(start),
-            backfill_end=_parse_date(end),
-            period=period,
-            recordings_dir=recordings_dir,
-            live_llm=live_llm,
-            capture_recordings=capture_recordings,
-            provider=provider,
-            environment=environment,
-            now=resolved_now,
-            run_id=run_id,
-        )
-        result = PaperLoopReplay(data_dir=settings.data_dir, config=config).run()
+        if recordings_dir is None:
+            _fail(
+                "--recordings-dir is required; pass one populated by --capture or --live-llm",
+                json_output=json_output,
+            )
+        if resolved_scenario == "entry":
+            config = PaperLoopConfig(
+                symbol=symbol,
+                archive_fixture_dir=Path(resolved_archive),
+                backfill_start=_parse_date(start),
+                backfill_end=_parse_date(end),
+                period=period,
+                recordings_dir=Path(recordings_dir),
+                live_llm=live_llm,
+                capture_recordings=capture_recordings,
+                force_recordings=force_recordings,
+                provider=provider,
+                environment=Environment(environment.strip().lower()),
+                now=resolved_now,
+                run_id=resolved_run_id,
+            )
+            result: PaperLoopResult | PositionManagementResult = PaperLoopReplay(
+                data_dir=settings.data_dir, config=config
+            ).run()
+        else:
+            management_config = PositionManagementConfig(
+                symbol=symbol,
+                archive_fixture_dir=Path(resolved_archive),
+                backfill_start=_parse_date(start),
+                backfill_end=_parse_date(end),
+                # The frozen 4h cadence is validated by the config; the cast
+                # only satisfies the ``Literal["4h"]`` field type.
+                period=cast(Literal["4h"], period),
+                recordings_dir=Path(recordings_dir),
+                live_llm=live_llm,
+                capture_recordings=capture_recordings,
+                force_recordings=force_recordings,
+                provider=provider,
+                environment=Environment(environment.strip().lower()),
+                now=resolved_now,
+                run_id=resolved_run_id,
+            )
+            result = PositionManagementReplay(
+                data_dir=settings.data_dir, config=management_config
+            ).run()
     except ReplayLivePathError as exc:
         _fail(str(exc), json_output=json_output, code="LIVE_DISABLED")
     except ReplayRecordingError as exc:
@@ -234,5 +316,7 @@ def replay_run(
                 indent=2,
             )
         )
+    elif isinstance(result, PositionManagementResult):
+        typer.echo(_render_position_management(result))
     else:
         typer.echo(_render(result))

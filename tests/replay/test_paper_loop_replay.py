@@ -30,9 +30,9 @@ from oft.replay.paper_loop import (
     PaperPositionSummary,
     ReplayError,
     _decision_payload,
-    _fixture_content_digest,
     _trigger_data_quality,
 )
+from oft.replay.support import fixture_content_digest
 
 pytestmark = pytest.mark.replay
 
@@ -273,11 +273,11 @@ def test_the_fixture_content_digest_ignores_the_checkout_path(tmp_path: Path) ->
     (first / "sample.csv").write_text("symbol,volume\nBTCUSDT,1\n", encoding="utf-8")
     (second / "sample.csv").write_text("symbol,volume\nBTCUSDT,1\n", encoding="utf-8")
 
-    assert _fixture_content_digest(first) == _fixture_content_digest(second)
+    assert fixture_content_digest(first) == fixture_content_digest(second)
 
     (second / "sample.csv").write_text("symbol,volume\nBTCUSDT,2\n", encoding="utf-8")
 
-    assert _fixture_content_digest(first) != _fixture_content_digest(second)
+    assert fixture_content_digest(first) != fixture_content_digest(second)
 
 
 def test_replaying_the_same_scenario_twice_is_identical(
@@ -405,10 +405,10 @@ def test_ambient_paper_and_risk_settings_cannot_change_a_replay(
     perturbed = _paper_loop(tmp_path / "perturbed", replay_recordings)
 
     assert _outcome(perturbed) == _outcome(baseline)
-    assert _summary(perturbed)["settings_digest"] == _summary(baseline)["settings_digest"]
+    assert _summary(perturbed)["identity_digest"] == _summary(baseline)["identity_digest"]
 
 
-def test_the_settings_digest_is_independent_of_the_checkout_fixture_path(
+def test_the_identity_digest_is_independent_of_the_checkout_fixture_path(
     tmp_path: Path, replay_recordings: Path
 ) -> None:
     first_archive = tmp_path / "checkout-a" / "archive"
@@ -431,7 +431,7 @@ def test_the_settings_digest_is_independent_of_the_checkout_fixture_path(
     second = run(tmp_path / "second", second_archive)
 
     # Byte-identical fixtures in different checkout directories share a digest.
-    assert first["settings_digest"] == second["settings_digest"]
+    assert first["identity_digest"] == second["identity_digest"]
     assert first["outcome"] == second["outcome"]
 
 

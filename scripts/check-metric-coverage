@@ -4,10 +4,11 @@
 Run after ``pytest --cov=oft --cov-branch``. The gate covers the deterministic
 metric core (CVD, delta, footprint, volume profile, funding, OI,
 liquidations, versioning, and the exact-decimal renderer) plus the risk gate,
-the trigger state machine, and the OMS state machine. These modules have no
-I/O and are fully unit-testable, so partial branches are regressions rather
-than acceptable gaps. Targets are package-relative paths because names such as
-``risk.py`` and ``trigger.py`` also exist in other packages.
+the trigger state machine, the OMS/position state machine, and the deterministic
+PnL/management/journal arithmetic. These modules have no I/O and are fully
+unit-testable, so partial branches are regressions rather than acceptable gaps.
+Targets are package-relative paths because names such as ``risk.py`` and
+``trigger.py`` also exist in other packages.
 """
 
 from __future__ import annotations
@@ -30,6 +31,10 @@ TARGETS = (
     "domain/risk.py",
     "domain/trigger.py",
     "domain/oms.py",
+    "domain/pnl.py",
+    "domain/positions.py",
+    "domain/management.py",
+    "domain/journal.py",
 )
 DEFAULT_DATA_FILE = ".coverage"
 
