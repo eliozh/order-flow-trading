@@ -1,14 +1,33 @@
-"""Read the position ledger, its accounting history, and run one management tick."""
+"""Read the position ledger, its accounting history, and run one management action."""
 
 from __future__ import annotations
 
 from typing import Any
 
-from fastapi import APIRouter, Path, Query, Request
+from fastapi import APIRouter, Header, Path, Query, Request, Response
 
 from oft.api.envelope import new_request_id, success_envelope
 from oft.api.errors import ERROR_CATALOG, ApiError
-from oft.api.schemas.position import Envelope, PositionListData, PositionMonitorData
+from oft.api.idempotency import (
+    complete,
+    release,
+    reserve,
+)
+from oft.api.idempotency import (
+    idempotency_key as require_idempotency_key,
+)
+from oft.api.idempotency import (
+    request_hash as compute_request_hash,
+)
+from oft.api.schemas.position import (
+    Envelope,
+    PositionListData,
+    PositionManageData,
+    PositionManageRequest,
+    PositionMonitorData,
+)
+from oft.application.kill_switch import KillSwitch
+from oft.application.management_service import ManagementRejected, ManagementService
 from oft.application.position_service import (
     DATA_STALE,
     PositionCloseError,
@@ -35,11 +54,44 @@ def _service(request: Request) -> PositionService:
     )
 
 
+def _management_service(request: Request, provider: str | None) -> ManagementService:
+    container = request.app.state.container
+    kill_switch = KillSwitch(
+        settings=container.settings, store=container.store, clock=container.clock
+    )
+    return ManagementService(
+        store=container.store,
+        clock=container.clock,
+        provider=container.provider_for(provider),
+        settings=container.settings,
+        kill_switch=kill_switch,
+        runtime=container.llm_runtime,
+    )
+
+
 def _api_error(exc: PositionCloseError) -> ApiError:
     code = _ERROR_MAP.get(exc.code, exc.code)
     if code not in ERROR_CATALOG:
         code = "CONFLICT"
     return ApiError(code, exc.message)
+
+
+def _management_error(exc: ManagementRejected) -> ApiError:
+    """Map a management code through the same catalog fallback as ``_api_error``.
+
+    ``ManagementRejected`` can carry a service-only code (for example
+    ``POSITION_NOT_FOUND`` on a replay whose row vanished); passing it straight
+    to ``ApiError`` would raise ``KeyError`` and turn a typed 404 into a 500.
+    """
+    code = _ERROR_MAP.get(exc.code, exc.code)
+    if code not in ERROR_CATALOG:
+        code = "CONFLICT"
+    details = (
+        [{"field": exc.field, "code": exc.code, "message": exc.message}]
+        if exc.field is not None
+        else []
+    )
+    return ApiError(code, exc.message, details=details)
 
 
 @router.get("/api/v1/positions", response_model=Envelope[PositionListData])
@@ -141,3 +193,57 @@ def monitor_position(
         data_quality=quality,
         idempotent_replay=result.idempotent_replay,
     )
+
+
+@router.post(
+    "/api/v1/positions/{position_id}/manage",
+    response_model=Envelope[PositionManageData],
+)
+def manage_position(
+    payload: PositionManageRequest,
+    request: Request,
+    response: Response,
+    position_id: str = Path(min_length=1, max_length=64, pattern=r"^[A-Za-z0-9._:-]+$"),
+    idempotency_key: str | None = Header(default=None, alias="Idempotency-Key"),
+) -> Any:
+    """Obtain a validated management decision and execute it (paper only)."""
+    key = require_idempotency_key(idempotency_key)
+    payload_hash = compute_request_hash(payload)
+    replay = reserve(request, key=key, request_hash=payload_hash)
+    if replay is not None:
+        return replay
+    try:
+        result = _management_service(request, payload.provider).manage(
+            position_id, idempotency_key=key, provider_name=payload.provider
+        )
+    except ManagementRejected as exc:
+        release(request, key=key)
+        raise _management_error(exc) from exc
+    except PositionNotFound as exc:
+        release(request, key=key)
+        raise ApiError("NOT_FOUND", exc.message) from exc
+    except PositionCloseError as exc:
+        release(request, key=key)
+        raise _api_error(exc) from exc
+    except BaseException:
+        release(request, key=key)
+        raise
+    envelope = success_envelope(
+        result.to_contract(),
+        request_id=new_request_id(),
+        provenance="MIXED",
+        data_quality=_management_quality(result.risk),
+        idempotent_replay=result.idempotent_replay,
+    )
+    complete(request, key=key, request_hash=payload_hash, envelope=envelope, status=200)
+    response.status_code = 200
+    return envelope
+
+
+def _management_quality(risk: dict[str, Any] | None) -> str:
+    """PARTIAL when the risk stage names an unmeasured input; never a false COMPLETE."""
+    if isinstance(risk, dict) and risk.get("stale_inputs"):
+        return "PARTIAL"
+    if isinstance(risk, dict) and risk.get("verdict") == "BLOCK":
+        return "PARTIAL"
+    return "COMPLETE"

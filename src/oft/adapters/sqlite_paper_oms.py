@@ -24,6 +24,7 @@ from oft.ports.store import (
     FillRecord,
     FundingAccrualCommit,
     FundingAccrualRecord,
+    ManagementUpdateRecord,
     OmsCommit,
     OmsConflictError,
     OrderRecord,
@@ -566,6 +567,30 @@ class PaperOmsStoreMixin(SqliteConnectionMixin, SqliteAuditMixin):
         # the "duplicate/no-op" None that a funding accrual can.
         assert result is not None, "an adjustment commit must write the position"
         return result
+
+    def save_management_update(self, record: ManagementUpdateRecord) -> bool:
+        """Commit an order-less management update and its audits atomically.
+
+        Used by ``HOLD`` and by a stop/target change. The optimistic payload
+        guard makes a concurrent adjustment surface as ``OmsConflictError`` so
+        the caller can re-read instead of losing the other write.
+        """
+        connection = self._connect()
+        try:
+            connection.execute("BEGIN IMMEDIATE")
+            for draft in record.audits:
+                self._insert_audit_event(connection, draft)
+            _update_open_position(connection, record.position)
+            connection.commit()
+            return True
+        except sqlite3.IntegrityError as exc:
+            connection.rollback()
+            raise OmsConflictError(_close_conflict_kind(str(exc))) from exc
+        except BaseException:
+            connection.rollback()
+            raise
+        finally:
+            connection.close()
 
     def save_funding_accrual(self, record: FundingAccrualCommit) -> bool:
         """Commit one funding settlement once; a replay applies nothing.

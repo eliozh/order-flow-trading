@@ -1,8 +1,9 @@
-"""``oft pos list|show|history|monitor``: the position ledger and management tick."""
+"""``oft pos list|show|history|monitor|manage``: the position ledger and management."""
 
 from __future__ import annotations
 
 import json
+import uuid
 from typing import Annotated, Any
 
 import typer
@@ -13,8 +14,8 @@ from oft.config import ConfigError, load_settings
 
 pos_app = typer.Typer(
     help=(
-        "Position ledger, accounting history, and the deterministic protective-exit tick "
-        "(no target, live, or exchange path)."
+        "Position ledger, accounting history, the deterministic protective-exit tick, "
+        "and the LLM management decision (paper only; no live path)."
     ),
     no_args_is_help=True,
     add_completion=False,
@@ -217,3 +218,77 @@ def pos_monitor(
         typer.echo(f"  order {order.get('order_id', '-')} · {order.get('status', '-')}")
     if data.get("idempotent_replay"):
         typer.echo("  (idempotent replay: no new rows were created)")
+
+
+def _render_management(data: dict[str, Any]) -> str:
+    lines = [
+        f"MANAGE {data.get('position_id', '-')} · {data.get('action', '-')}"
+        f" · {data.get('status', '-')}",
+        f"decision {data.get('decision_id', '-')} · executed {data.get('executed')}",
+    ]
+    if data.get("reason"):
+        lines.append(f"  reason: {data['reason']}")
+    risk = data.get("risk") or {}
+    if risk:
+        lines.append(
+            f"risk {risk.get('verdict', '-')} · cap {risk.get('binding_cap', '-')}"
+            f" · allowed {((risk.get('allowed') or {}).get('quantity')) or '-'}"
+        )
+        stale = risk.get("stale_inputs") or []
+        if stale:
+            lines.append("  stale: " + ", ".join(str(name) for name in stale))
+    llm = data.get("llm") or {}
+    provenance = llm.get("provenance") or {}
+    if provenance:
+        cost = provenance.get("cost") or {}
+        lines.append(
+            f"llm {provenance.get('provider', '-')}/{provenance.get('model', '-')}"
+            f" · prompt v{provenance.get('prompt_version', '-')}"
+            f" · cost {cost.get('amount_usd', '-')} {cost.get('currency', 'USD')}"
+        )
+    order = data.get("order") or {}
+    if order:
+        lines.append(
+            f"  order {order.get('order_id', '-')} · {order.get('status', '-')}"
+            f" · {order.get('side', '-')} {order.get('quantity', '-')}"
+        )
+    fill = data.get("fill") or {}
+    if fill:
+        lines.append(
+            f"  fill {fill.get('fill_id', '-')} · price {fill.get('price', '-')}"
+            f" · qty {fill.get('quantity', '-')}"
+        )
+    trade = data.get("trade_log") or {}
+    if trade:
+        lines.append(f"  trade {trade.get('trade_id', '-')} · net {trade.get('net_pnl_usd', '-')}")
+    if data.get("idempotent_replay"):
+        lines.append("  (idempotent replay: no new rows were created)")
+    return "\n".join(lines)
+
+
+@pos_app.command("manage")
+def pos_manage(
+    position_id: str,
+    idempotency_key: Annotated[
+        str | None,
+        typer.Option("--idempotency-key", help="Reuse a key to replay the same manage call."),
+    ] = None,
+    provider: Annotated[
+        str | None,
+        typer.Option("--provider", help="LLM provider override for the management role."),
+    ] = None,
+    json_output: Annotated[bool, typer.Option("--json", help="Emit JSON.")] = False,
+) -> None:
+    """Obtain a validated HOLD/PARTIAL_CLOSE/FULL_CLOSE/ADD decision and execute it."""
+    settings = _settings_or_exit(json_output)
+    key = idempotency_key or f"cli-manage-{uuid.uuid4().hex}"
+    payload = {"provider": provider} if provider else {}
+    try:
+        envelope = ApiClient.from_settings(settings).manage_position(
+            position_id, payload, idempotency_key=key
+        )
+    except ApiClientError as exc:
+        emit_error(exc.code, exc.message, json_output=json_output)
+        raise typer.Exit(code=exit_code_for(exc.code)) from exc
+    data = envelope.get("data") or {}
+    typer.echo(json.dumps(envelope, indent=2) if json_output else _render_management(data))

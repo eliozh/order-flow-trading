@@ -224,6 +224,20 @@ class ApiClient:
     def monitor_position(self, position_id: str) -> dict[str, Any]:
         return self._request("POST", f"/api/v1/positions/{quote(position_id, safe='')}/monitor", {})
 
+    def manage_position(
+        self,
+        position_id: str,
+        payload: dict[str, Any] | None = None,
+        *,
+        idempotency_key: str,
+    ) -> dict[str, Any]:
+        return self._request(
+            "POST",
+            f"/api/v1/positions/{quote(position_id, safe='')}/manage",
+            payload or {},
+            extra_headers={"Idempotency-Key": idempotency_key},
+        )
+
     def list_trade_logs(self, *, symbol: str | None = None, limit: int = 100) -> dict[str, Any]:
         query = f"?limit={limit}"
         if symbol:

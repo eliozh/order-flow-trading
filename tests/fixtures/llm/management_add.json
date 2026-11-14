@@ -1,0 +1,23 @@
+{
+  "decision_type": "POSITION_MANAGEMENT",
+  "subject": {
+    "symbol": "BTCUSDT",
+    "timeframe": "4h",
+    "as_of": "2026-10-08T00:01:00.000Z"
+  },
+  "confidence": 0.66,
+  "rationale": "Add on the confirmed continuation with a small incremental risk.",
+  "caveats": [],
+  "analysis": null,
+  "opportunity": null,
+  "entry_recheck": null,
+  "position_management": {
+    "action": "ADD",
+    "close_fraction": null,
+    "add_risk_pct": 0.4,
+    "new_stop_price": null,
+    "new_targets": [],
+    "rationale": "Add a quarter-sized increment at the same stop.",
+    "urgency": "MEDIUM"
+  }
+}

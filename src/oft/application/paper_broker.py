@@ -72,6 +72,11 @@ from oft.ports.store import (
 
 _EIGHT_DP = Decimal("0.00000001")
 _DEFAULT_ACCOUNT_ID = "ACC-PAPER"
+# The purposes whose orders reduce an existing position. The single
+# representation derives ``reduce_only`` from this set, so a management
+# PARTIAL_CLOSE/FULL_CLOSE takes the exit path and an ADD does not. Exported so
+# the gateway's kill-switch classification cannot drift from this vocabulary.
+REDUCE_ONLY_PURPOSES = frozenset({"EXIT", "PARTIAL_CLOSE", "FULL_CLOSE"})
 
 
 class BrokerError(Exception):
@@ -107,19 +112,29 @@ class OrderIntent:
     trigger_id: str | None = None
     position_id: str | None = None
     reduce_only: bool = False
+    # The journal outcome for a full close. Derived from the management action
+    # (a manual management close is not a "protective stop touched"), and
+    # deliberately excluded from ``hash()``: it is a journal fact, not an order
+    # intent field.
+    close_reason: str = STOP_TOUCH_RULE
     # Service-owned journal facts rendered atomically with a full close. It is
     # deliberately excluded from ``hash()``: it is derived from the position, not
     # part of the order intent.
     trade_log: TradeLogContext | None = None
+    # The management decision's note (or escalation reason) recorded on the
+    # position history and audit. Excluded from ``hash()``: it is narrative, not
+    # part of the order intent, so it cannot change a deterministic order id.
+    note: str = ""
 
     def __post_init__(self) -> None:
         # One closed representation: ``purpose`` is the authority and
         # ``reduce_only`` is derived from it, so the gateway (AND) and the
-        # broker (OR) can never disagree. The intent hash now includes the
-        # normalized purpose and the derived flag.
+        # broker (OR) can never disagree. A management PARTIAL_CLOSE/FULL_CLOSE
+        # is reduce-only; an ADD is not. The intent hash includes the normalized
+        # purpose and the derived flag.
         purpose = self.purpose.upper()
         object.__setattr__(self, "purpose", purpose)
-        object.__setattr__(self, "reduce_only", purpose == "EXIT")
+        object.__setattr__(self, "reduce_only", purpose in REDUCE_ONLY_PURPOSES)
 
     def hash(self) -> str:
         return intent_hash(
@@ -600,7 +615,7 @@ class PaperBroker:
             fill_price, quote_quantity, fee, cash_delta = self._exit_amounts(intent, mark_price)
             reduce_only = True
             audit_event_type = "POSITION_PARTIAL_CLOSE"
-            note = "partial close"
+            note = intent.note or "partial close"
         else:
             fill_price, quote_quantity, fee = _fill_amounts(
                 intent.side,
@@ -612,7 +627,7 @@ class PaperBroker:
             cash_delta = _cash_flow(intent.side, quote_quantity, fee)
             reduce_only = False
             audit_event_type = "POSITION_ADDED"
-            note = "add to position"
+            note = intent.note or "add to position"
         digest, client_id, order_id, fill_id = _intent_ids(intent)
         fill = _fill_for(
             intent,
@@ -641,6 +656,7 @@ class PaperBroker:
                     at=now,
                     decision_id=intent.decision_id,
                     accumulated_gross=accumulated_gross,
+                    note=note,
                 )
                 payload = partial_result.payload
                 event = partial_result.event
@@ -651,6 +667,7 @@ class PaperBroker:
                     at=now,
                     decision_id=intent.decision_id,
                     accumulated_gross=accumulated_gross,
+                    note=note,
                 )
                 payload = add_result.payload
                 event = add_result.event
@@ -759,7 +776,7 @@ class PaperBroker:
             fill=fill,
             now=now,
         )
-        close_reason = STOP_TOUCH_RULE
+        close_reason = intent.close_reason
         try:
             close = close_full(
                 position,
@@ -768,6 +785,7 @@ class PaperBroker:
                 decision_id=intent.decision_id,
                 accumulated_gross=prior_gross,
                 close_reason=close_reason,
+                note=intent.note or None,
             )
         except PositionError as exc:
             raise BrokerError(exc.message, code=exc.code) from exc
@@ -1067,7 +1085,7 @@ def _exit_audits(
                 "fill_id": fill_id,
                 "exit_price": str(fill_price),
                 "realized_pnl_usd": str(close.net_pnl_usd),
-                "rule": "STOP_TOUCH",
+                "rule": intent.close_reason,
                 "environment": intent.environment,
             },
             created_at=now,

@@ -390,9 +390,9 @@ def test_active_for_uses_the_built_in_default_for_a_never_seeded_role_and_logs(
     service, _store = _service(tmp_path)
 
     with caplog.at_level(logging.INFO, logger="oft.application.prompt_service"):
-        active = service.active_for(PromptRole.MANAGEMENT)
+        active = service.active_for(PromptRole.REVIEW)
 
-    assert active.prompt_id == "management"
+    assert active.prompt_id == "review"
     assert active.version == 1
     assert any("built-in" in record.message for record in caplog.records)
 

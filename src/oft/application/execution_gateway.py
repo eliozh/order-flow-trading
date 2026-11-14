@@ -13,13 +13,18 @@ from decimal import Decimal
 
 from oft.application.kill_switch import KillSwitch, record_audit
 from oft.application.paper_account import compute_equity
-from oft.application.paper_broker import BrokerResult, OrderIntent, PaperBroker
+from oft.application.paper_broker import (
+    REDUCE_ONLY_PURPOSES,
+    BrokerResult,
+    OrderIntent,
+    PaperBroker,
+)
 from oft.domain.risk import RiskRequest, verdict_inputs_hash
 from oft.domain.time import utc_timestamp
 from oft.ports.clock import ClockPort
 from oft.ports.store import OmsConflictError, RiskVerdictRecord, StorePort
 
-_RISK_REDUCING_PURPOSES = frozenset({"EXIT"})
+_RISK_REDUCING_PURPOSES = REDUCE_ONLY_PURPOSES
 
 
 def _decimal_or_none(value: object) -> Decimal | None:
@@ -63,7 +68,7 @@ class IntentClassification:
 
 
 def classify_intent(intent: OrderIntent) -> IntentClassification:
-    """A reduce-only EXIT reduces risk; everything else increases it."""
+    """A reduce-only exit/partial/full close reduces risk; everything else increases it."""
     if intent.reduce_only and intent.purpose.upper() in _RISK_REDUCING_PURPOSES:
         return IntentClassification(True, "reduce-only exit")
     return IntentClassification(False, "risk-increasing intent")
