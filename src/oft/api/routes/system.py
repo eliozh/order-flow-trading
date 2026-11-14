@@ -10,12 +10,7 @@ from fastapi import APIRouter, Request
 from oft.api.envelope import new_request_id, success_envelope
 from oft.api.errors import error_response
 from oft.application.health import build_readiness
-from oft.application.jobs import (
-    POSITION_MANAGE_JOB_TYPE,
-    POSITION_MONITOR_JOB_TYPE,
-    job_summary_payload,
-    latest_job_summary,
-)
+from oft.application.jobs import latest_jobs_payload
 from oft.application.status import build_status
 
 router = APIRouter()
@@ -97,14 +92,7 @@ def status(request: Request) -> dict[str, Any]:
     # Additive slice-26 job surface; no existing status field is renamed or
     # removed and the envelope is unchanged. The shared helper aggregates the
     # latest boundary window, so per-position rows cannot disagree with it.
-    data["jobs"] = {
-        "position_monitor": job_summary_payload(
-            latest_job_summary(container.store, POSITION_MONITOR_JOB_TYPE)
-        ),
-        "position_manage": job_summary_payload(
-            latest_job_summary(container.store, POSITION_MANAGE_JOB_TYPE)
-        ),
-    }
+    data["jobs"] = latest_jobs_payload(container.store)
     return success_envelope(
         data,
         request_id=new_request_id(),

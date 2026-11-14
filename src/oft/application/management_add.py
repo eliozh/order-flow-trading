@@ -65,6 +65,10 @@ class AddGateInputs:
     stale_inputs: tuple[str, ...]
     requested_quantity: Decimal | None
     requested_pct: float
+    # The measured account-level daily loss. ``None`` means unmeasured; the
+    # unattended ADD path refuses before reaching the gate in that case, but
+    # the type still allows an explicit unmeasured value for manual callers.
+    daily_loss_usd: Decimal | None = None
 
 
 @dataclass(frozen=True)
@@ -139,7 +143,7 @@ def _evaluate(gate: AddGateInputs, *, quantity: Decimal | None) -> RiskVerdict:
         caps=gate.caps,
         equity=gate.equity,
         open_positions=gate.open_positions,
-        daily_loss_usd=None,
+        daily_loss_usd=gate.daily_loss_usd,
         mark_price=gate.mark,
         mark_as_of=gate.mark_as_of,
         now=gate.now,
@@ -172,13 +176,21 @@ def _save_verdict(
             payload_json=json.dumps(payload, sort_keys=True),
             spread_bps=None,
             expected_slippage_bps=None,
-            daily_loss_usd=None,
+            daily_loss_usd=None if gate.daily_loss_usd is None else str(gate.daily_loss_usd),
         )
     )
 
 
+def _require_daily_loss(gate: AddGateInputs) -> Decimal:
+    """A direct caller must supply a measured loss; ``None`` never means zero."""
+    if gate.daily_loss_usd is None:
+        raise AddGateError("DATA_UNAVAILABLE", "the daily loss is unmeasured; the add is refused")
+    return gate.daily_loss_usd
+
+
 def evaluate_add(gate: AddGateInputs) -> AddEvaluation:
     """Compute and persist the pre-execution verdict (the requested vs allowed)."""
+    _require_daily_loss(gate)
     try:
         verdict = _evaluate(gate, quantity=gate.requested_quantity)
     except (KeyError, TypeError, ValueError, ArithmeticError) as exc:
@@ -226,6 +238,7 @@ def persist_add_execution_verdict(
     different allowed quantity means the gate no longer authorizes this add, so
     the request is refused instead of rewriting the answer to ``ALLOW``.
     """
+    _require_daily_loss(gate)
     try:
         execution = _evaluate(gate, quantity=allowed_quantity)
     except (KeyError, TypeError, ValueError, ArithmeticError) as exc:
@@ -274,7 +287,7 @@ def persist_add_execution_verdict(
         open_positions=gate.open_positions,
         spread_bps=None,
         expected_slippage_bps=None,
-        daily_loss_usd=None,
+        daily_loss_usd=gate.daily_loss_usd,
     )
     risk_verdict_id = _risk_verdict_id(gate, allowed_quantity, "execution")
     _save_verdict(

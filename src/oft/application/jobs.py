@@ -6,6 +6,13 @@ named ``job_locks`` serialize non-periodic work. ``job_locks`` is a SQLite
 lease table, so the claim is safe across processes (the daemon is the sole
 writer; readers use WAL snapshots). The daemon reconstructs state from these
 tables plus ``scan_symbols`` after a restart; no in-memory flag is trusted.
+
+Deliberate size exception: this module stays above the project's 800-line soft
+ceiling because the durable ledger, the three scheduled runners, and their
+closed outcome vocabularies are one cohesive job-orchestration unit. Every
+runner shares the same claim/finish policy, so splitting them would duplicate
+the lease and status semantics. The largest separable concerns (scan service,
+position service, management service) already live in their own modules.
 """
 
 from __future__ import annotations
@@ -16,17 +23,23 @@ from contextlib import suppress
 from dataclasses import dataclass
 from datetime import UTC, date, datetime, timedelta
 from decimal import Decimal, InvalidOperation
+from enum import StrEnum
 from typing import Any, Protocol
 
 import structlog
 
 from oft.application.management_service import (
+    ManagementCondition,
     ManagementRejected,
     ManagementResult,
     ManagementRiskContext,
     ManagementService,
 )
-from oft.application.position_service import PositionMonitorResult, PositionService
+from oft.application.position_service import (
+    PositionCloseError,
+    PositionMonitorResult,
+    PositionService,
+)
 from oft.application.scan_service import (
     ScanAlreadyRunning,
     ScanError,
@@ -41,6 +54,7 @@ from oft.application.scheduler import (
     validate_period,
 )
 from oft.application.trigger_service import TriggerBatchOutcome, TriggerService
+from oft.domain.risk import ManagementStatus
 from oft.domain.time import utc_timestamp
 from oft.ports.clock import ClockPort
 from oft.ports.store import (
@@ -73,6 +87,62 @@ DONE = "DONE"
 FAILED = "FAILED"
 PARTIAL = "PARTIAL"
 MISSED = "MISSED"
+SKIPPED = "SKIPPED"
+
+
+class PositionTickStatus(StrEnum):
+    """The closed outcome vocabulary for one position inside a monitor tick."""
+
+    CLOSED = "CLOSED"
+    NO_ACTION = "NO_ACTION"
+    ERROR = "ERROR"
+
+
+class PositionMonitorStatus(StrEnum):
+    """The closed aggregate status of one ``position_monitor`` tick."""
+
+    DONE = "DONE"
+    PARTIAL = "PARTIAL"
+    SKIPPED = "SKIPPED"
+    FAILED = "FAILED"
+
+
+class ManagementPositionStatus(StrEnum):
+    """The closed per-position outcome of one management window.
+
+    ``REFUSED`` is a typed decision refusal (the kill switch, a gate block, a
+    provider rejection); ``FAILED`` is a hard failure such as a crash or a
+    transient provider outage that must be retried. They are deliberately
+    distinct so a refused position is not reported as an infrastructure fault
+    (and vice versa).
+    """
+
+    DONE = "DONE"
+    REFUSED = "REFUSED"
+    SKIPPED = "SKIPPED"
+    FAILED = "FAILED"
+
+
+class ManagementWindowStatus(StrEnum):
+    """The closed aggregate status of one management window."""
+
+    DONE = "DONE"
+    PARTIAL = "PARTIAL"
+    SKIPPED = "SKIPPED"
+    FAILED = "FAILED"
+
+
+# Transient LLM/infrastructure codes finish FAILED so the next window retries
+# honestly instead of recording a terminal refusal (M15).
+_TRANSIENT_MANAGEMENT_CODES = frozenset({"LLM_TIMEOUT", "LLM_RATE_LIMITED", "UPSTREAM_UNAVAILABLE"})
+# Routine position-state skips are expected, not failures. Every other
+# ``PositionCloseError`` is classified explicitly: gate/broker refusals are
+# REFUSED, and everything else (DATA_UNAVAILABLE, CONFLICT, ...) is a hard
+# failure so a broken read is not hidden as a skip (silent-failure N1).
+_ROUTINE_POSITION_SKIP_CODES = frozenset({"DATA_STALE", "POSITION_STATE_INVALID"})
+_POSITION_REFUSAL_CODES = frozenset(
+    {"RISK_BLOCKED", "ORDER_REJECTED", "RISK_VERDICT_MISSING", "RISK_VERDICT_INVALID"}
+)
 _LOGGER = structlog.get_logger(__name__)
 _TERMINAL_SCAN_STAGES = frozenset({"DONE", "DEGRADED", "FAILED"})
 _FAILED_STAGE_BY_CODE = {
@@ -98,12 +168,14 @@ class JobClaim:
     reclaimed: bool = False
     reason: str = ""
 
-    @property
-    def run_id(self) -> str | None:
-        return self.run.run_id if self.run is not None else None
+    def __post_init__(self) -> None:
+        # A claimed attempt always owns the run it will finish. A refused
+        # attempt may still carry the existing run so callers can report it.
+        if self.claimed and self.run is None:
+            raise ValueError("a claimed job claim requires its run row")
 
     @property
-    def running_scan_id(self) -> str | None:
+    def run_id(self) -> str | None:
         return self.run.run_id if self.run is not None else None
 
 
@@ -678,7 +750,7 @@ class ScheduledScanRunner:
             period=period,
         )
         if not claim.claimed or claim.run is None:
-            raise ScanAlreadyRunning(running_scan_id=claim.running_scan_id)
+            raise ScanAlreadyRunning(running_scan_id=claim.run_id)
         run = claim.run
         stop = threading.Event()
         beat = threading.Thread(
@@ -1029,25 +1101,14 @@ class TriggerJobRunner:
         message: str | None = None,
     ) -> bool:
         """Finish the run, never letting a ledger write replace the real error."""
-        try:
-            finished = self._ledger.finish(
-                run.run_id,
-                status,
-                error_code=error_code,
-                message=message,
-                owner=run.lease_owner,
-            )
-        except Exception as exc:  # noqa: BLE001 - the tick outcome must survive
-            _LOGGER.warning(
-                "trigger_job_finish_failed",
-                run_id=run.run_id,
-                status=status,
-                error=str(exc),
-            )
-            return False
-        if not finished:
-            _LOGGER.warning("trigger_job_finish_rejected", run_id=run.run_id, status=status)
-        return bool(finished)
+        return _finish_run_safely(
+            self._ledger,
+            run,
+            status,
+            error_code=error_code,
+            message=message,
+            log_prefix="trigger_job",
+        )
 
 
 def _finish_run_safely(
@@ -1057,8 +1118,13 @@ def _finish_run_safely(
     *,
     error_code: str | None = None,
     message: str | None = None,
+    log_prefix: str = "job",
 ) -> bool:
-    """Finish a run, never letting a ledger write replace the real outcome."""
+    """Finish a run, never letting a ledger write replace the real outcome.
+
+    This is the one finish policy shared by every runner; ``log_prefix`` keeps
+    the historical per-job event names while the behaviour stays identical.
+    """
     try:
         finished = ledger.finish(
             run.run_id,
@@ -1068,10 +1134,12 @@ def _finish_run_safely(
             owner=run.lease_owner,
         )
     except Exception as exc:  # noqa: BLE001 - the tick outcome must survive
-        _LOGGER.warning("job_finish_failed", run_id=run.run_id, status=status, error=str(exc))
+        _LOGGER.warning(
+            f"{log_prefix}_finish_failed", run_id=run.run_id, status=status, error=str(exc)
+        )
         return False
     if not finished:
-        _LOGGER.warning("job_finish_rejected", run_id=run.run_id, status=status)
+        _LOGGER.warning(f"{log_prefix}_finish_rejected", run_id=run.run_id, status=status)
     return bool(finished)
 
 
@@ -1080,14 +1148,19 @@ class PositionTickResult:
     """The outcome for one position inside a ``position_monitor`` tick."""
 
     position_id: str
-    status: str
+    status: PositionTickStatus
     reason_code: str
     reason: str | None = None
     error: str | None = None
 
+    def __post_init__(self) -> None:
+        object.__setattr__(self, "status", PositionTickStatus(self.status))
+        if not self.reason_code.strip():
+            raise ValueError("a position tick result requires a non-empty reason_code")
+
     @property
     def closed(self) -> bool:
-        return self.status == "CLOSED"
+        return self.status is PositionTickStatus.CLOSED
 
 
 @dataclass(frozen=True)
@@ -1098,8 +1171,28 @@ class PositionMonitorOutcome:
     run: JobRunRecord | None = None
     positions_total: int = 0
     results: tuple[PositionTickResult, ...] = ()
-    errors: tuple[str, ...] = ()
     reason: str = ""
+    reason_code: str = ""
+    status: PositionMonitorStatus = PositionMonitorStatus.DONE
+
+    def __post_init__(self) -> None:
+        object.__setattr__(self, "status", PositionMonitorStatus(self.status))
+        errored = any(item.status is PositionTickStatus.ERROR for item in self.results)
+        if self.status is PositionMonitorStatus.DONE and errored:
+            raise ValueError("a DONE position monitor outcome cannot contain ERROR results")
+        if self.status is PositionMonitorStatus.PARTIAL and not errored:
+            raise ValueError("a PARTIAL position monitor outcome requires an ERROR result")
+        if self.status is PositionMonitorStatus.SKIPPED and self.claimed:
+            raise ValueError("only a not-claimed tick may be SKIPPED")
+        if self.status is PositionMonitorStatus.FAILED and not self.reason_code.strip():
+            raise ValueError("a FAILED position monitor outcome requires a reason_code")
+
+    @property
+    def errors(self) -> tuple[str, ...]:
+        """The position ids whose tick failed; derived, so it cannot disagree."""
+        return tuple(
+            item.position_id for item in self.results if item.status is PositionTickStatus.ERROR
+        )
 
     @property
     def closed_position_ids(self) -> tuple[str, ...]:
@@ -1117,10 +1210,17 @@ def _position_counts_message(results: tuple[PositionTickResult, ...], total: int
 class PositionMonitorRunner:
     """One code-only protective/stale tick over every OPEN position.
 
-    The 15 s window is claimed once in the durable ledger, so an overlapping
+    The interval window is claimed once in the durable ledger, so an overlapping
     tick or a restart in the same window writes nothing. Only
     :meth:`PositionService.monitor` runs: no management service and no LLM port
     is reachable from this path.
+
+    Side effect at the job boundary: every tick's per-position monitor first
+    accrues the recorded funding settlements inside the holding window. That
+    mutates ``funding``, writes funding events, and debits/credits the paper
+    account cash before the stop rule is evaluated. The accrual is keyed by
+    ``(position_id, settlement_time)``, so it is idempotent across ticks and
+    restarts.
     """
 
     def __init__(
@@ -1151,26 +1251,45 @@ class PositionMonitorRunner:
             source=POSITION_MONITOR_JOB_TYPE,
         )
         if not claim.claimed or claim.run is None:
-            return PositionMonitorOutcome(claimed=False, run=claim.run, reason=claim.reason)
+            return PositionMonitorOutcome(
+                claimed=False,
+                run=claim.run,
+                reason=claim.reason,
+                status=PositionMonitorStatus.SKIPPED,
+            )
         run = claim.run
         try:
             records = self._ledger.store.list_positions(state="OPEN", limit=None)
         except Exception as exc:  # noqa: BLE001 - a read failure must finish the run
-            _finish_run_safely(self._ledger, run, FAILED, error_code="JOB_FAILED", message=str(exc))
+            _finish_run_safely(
+                self._ledger,
+                run,
+                FAILED,
+                error_code="POSITION_READ_FAILED",
+                message=str(exc),
+            )
             finished = self._ledger.store.get_job_run(run.run_id) or run
-            return PositionMonitorOutcome(claimed=True, run=finished, reason="failed", errors=())
+            return PositionMonitorOutcome(
+                claimed=True,
+                run=finished,
+                status=PositionMonitorStatus.FAILED,
+                reason_code="POSITION_READ_FAILED",
+                reason="position_read_failed",
+            )
 
         results: list[PositionTickResult] = []
-        errors: list[str] = []
         for record in records:
             try:
                 result = self._positions.monitor(record.position_id)
+                # The conversion lives inside the guard too: an unexpected
+                # source status becomes this position's ERROR instead of
+                # aborting the tick and orphaning the RUNNING row (C2).
+                results.append(self._tick_result(result))
             except Exception as exc:  # noqa: BLE001 - one position never aborts the tick
-                errors.append(record.position_id)
                 results.append(
                     PositionTickResult(
                         record.position_id,
-                        "ERROR",
+                        PositionTickStatus.ERROR,
                         "MONITOR_FAILED",
                         error=str(exc),
                     )
@@ -1182,9 +1301,12 @@ class PositionMonitorRunner:
                     error=str(exc),
                 )
                 continue
-            results.append(self._tick_result(result))
 
+        errors = tuple(
+            item.position_id for item in results if item.status is PositionTickStatus.ERROR
+        )
         status = PARTIAL if errors else DONE
+        monitor_status = PositionMonitorStatus.PARTIAL if errors else PositionMonitorStatus.DONE
         _finish_run_safely(
             self._ledger,
             run,
@@ -1197,8 +1319,8 @@ class PositionMonitorRunner:
             run=finished,
             positions_total=len(records),
             results=tuple(results),
-            errors=tuple(errors),
             reason="partial" if errors else "done",
+            status=monitor_status,
         )
 
     @staticmethod
@@ -1206,7 +1328,7 @@ class PositionMonitorRunner:
         reason_code = PROTECTIVE_STOP if result.status == "CLOSED" else result.reason_code
         return PositionTickResult(
             position_id=result.position_id,
-            status=result.status,
+            status=PositionTickStatus(result.status),
             reason_code=reason_code,
             reason=result.reason,
         )
@@ -1217,12 +1339,23 @@ class ManagementPositionOutcome:
     """The per-position outcome of one management cadence window."""
 
     position_id: str
-    status: str
+    status: ManagementPositionStatus
     reason_code: str = ""
     message: str | None = None
     action: str | None = None
     claimed: bool = True
-    rejected: bool = False
+    # The typed refusal code when ``status`` is REFUSED; ``None`` for a hard
+    # failure, a skip, or a completed decision.
+    refusal_code: str | None = None
+
+    def __post_init__(self) -> None:
+        object.__setattr__(self, "status", ManagementPositionStatus(self.status))
+        if not self.reason_code.strip():
+            raise ValueError("a management position outcome requires a reason_code")
+        if self.status is ManagementPositionStatus.REFUSED and self.refusal_code is None:
+            object.__setattr__(self, "refusal_code", self.reason_code)
+        if self.status is not ManagementPositionStatus.REFUSED and self.refusal_code is not None:
+            raise ValueError("only a REFUSED outcome carries a refusal_code")
 
 
 @dataclass(frozen=True)
@@ -1232,8 +1365,11 @@ class ManagementJobOutcome:
     window_start: datetime
     window_end: datetime
     results: tuple[ManagementPositionOutcome, ...] = ()
-    status: str = DONE
+    status: ManagementWindowStatus = ManagementWindowStatus.DONE
     reason: str = ""
+
+    def __post_init__(self) -> None:
+        object.__setattr__(self, "status", ManagementWindowStatus(self.status))
 
 
 class ManagementJobRunner:
@@ -1243,8 +1379,13 @@ class ManagementJobRunner:
     overlapping tick, a restart, or a second runner at the same clock cannot ask
     the LLM or write a second order. The deterministic idempotency key
     ``auto-{period}-{window_start}`` makes a reclaimed window reuse the stored
-    decision. Missed windows are never replayed: only the window containing the
-    supplied instant is ever claimed.
+    decision.
+
+    ADR-0007 requires one management run for the open positions after a restart;
+    the daemon performs that catch-up explicitly in addition to the periodic
+    cadence. Missed *periodic* windows are still never replayed: only the
+    window containing the supplied instant is ever claimed, and a caller-supplied
+    ``window_start`` that is not the current window is refused without claiming.
     """
 
     def __init__(
@@ -1268,11 +1409,26 @@ class ManagementJobRunner:
     def period(self) -> str:
         return self._period
 
-    def run_window(self, now: datetime | None = None) -> ManagementJobOutcome:
+    def run_window(
+        self, now: datetime | None = None, *, window_start: datetime | None = None
+    ) -> ManagementJobOutcome:
         instant = now or self._clock.now()
-        window_start = align_to_boundary(instant, self._period)
-        window_end = window_start + timedelta(hours=PERIOD_HOURS[self._period])
-        window_start_text = utc_timestamp(window_start)
+        current = align_to_boundary(instant, self._period)
+        if window_start is not None:
+            if window_start.tzinfo is None or window_start.utcoffset() is None:
+                raise ValueError("window_start must be timezone-aware UTC")
+            supplied = window_start.astimezone(UTC)
+            if supplied != current:
+                # A stale/foreign window can no longer act: the ledger is not
+                # touched, so a missed window is never replayed (M9).
+                return ManagementJobOutcome(
+                    window_start=supplied,
+                    window_end=supplied + timedelta(hours=PERIOD_HOURS[self._period]),
+                    status=ManagementWindowStatus.SKIPPED,
+                    reason="window_not_current",
+                )
+        window_end = current + timedelta(hours=PERIOD_HOURS[self._period])
+        window_start_text = utc_timestamp(current)
         window_end_text = utc_timestamp(window_end)
         now_text = utc_timestamp(instant)
         try:
@@ -1281,27 +1437,31 @@ class ManagementJobRunner:
             # No row is claimed yet, so this failure cannot orphan a RUNNING row.
             _LOGGER.warning("management_window_position_read_failed", error=str(exc))
             return ManagementJobOutcome(
-                window_start=window_start,
+                window_start=current,
                 window_end=window_end,
-                status=FAILED,
+                status=ManagementWindowStatus.FAILED,
                 reason="position_read_failed",
             )
         if not records:
-            return self._empty_window(window_start, window_end, window_start_text)
+            return self._empty_window(current, window_end, window_start_text)
         # One account-level daily-loss measurement for the whole window; the
         # per-position evaluations reuse it instead of rescanning the journal.
         # The measurement is only needed when it can actually be consumed, and a
-        # failure must not cost an otherwise usable cadence window.
+        # failure must not cost an otherwise usable cadence window. No provider
+        # means no decision can be made, so no read is attempted at all (H3).
         risk_context = ManagementRiskContext.unmeasured()
         if self._risk_breach_enabled and self._service.configured:
             try:
                 risk_context = self._service.risk_context(now=now_text, open_records=records)
             except Exception as exc:  # noqa: BLE001 - an optional measure never aborts
                 _LOGGER.warning("management_window_risk_context_failed", error=str(exc))
+                risk_context = ManagementRiskContext.unmeasured(
+                    "the account-level risk measurement failed"
+                )
         results = tuple(
             self._run_position(
                 record.position_id,
-                window_start=window_start,
+                window_start=current,
                 window_end=window_end,
                 window_start_text=window_start_text,
                 window_end_text=window_end_text,
@@ -1310,14 +1470,29 @@ class ManagementJobRunner:
             )
             for record in records
         )
-        status = PARTIAL if any(item.rejected for item in results) else DONE
+        status = self._aggregate_status(results)
+        reason = "done" if status is ManagementWindowStatus.DONE else status.value.lower()
         return ManagementJobOutcome(
-            window_start=window_start,
+            window_start=current,
             window_end=window_end,
             results=results,
             status=status,
-            reason="partial" if status == PARTIAL else "done",
+            reason=reason,
         )
+
+    @staticmethod
+    def _aggregate_status(
+        results: tuple[ManagementPositionOutcome, ...],
+    ) -> ManagementWindowStatus:
+        """A hard failure dominates a refusal, which dominates a completed row."""
+        statuses = {item.status for item in results}
+        if ManagementPositionStatus.FAILED in statuses:
+            return ManagementWindowStatus.FAILED
+        if ManagementPositionStatus.REFUSED in statuses:
+            return ManagementWindowStatus.PARTIAL
+        if ManagementPositionStatus.DONE in statuses:
+            return ManagementWindowStatus.DONE
+        return ManagementWindowStatus.SKIPPED
 
     def _empty_window(
         self, window_start: datetime, window_end: datetime, window_start_text: str
@@ -1340,7 +1515,7 @@ class ManagementJobRunner:
         return ManagementJobOutcome(
             window_start=window_start,
             window_end=window_end,
-            status=DONE,
+            status=ManagementWindowStatus.DONE,
             reason="no_open_positions" if claim.claimed else claim.reason,
         )
 
@@ -1364,8 +1539,23 @@ class ManagementJobRunner:
             period=self._period,
         )
         if not claim.claimed or claim.run is None:
-            return ManagementPositionOutcome(position_id, "SKIPPED", claim.reason, claimed=False)
+            return ManagementPositionOutcome(
+                position_id, ManagementPositionStatus.SKIPPED, claim.reason, claimed=False
+            )
         run = claim.run
+        # No provider can decide anything: skip before the funding/trade-log/mark
+        # reads so an unconfigured daemon does no per-window measurement work.
+        if not self._service.configured:
+            message = "no management LLM provider is configured"
+            return self._finish_position(
+                run,
+                position_id,
+                ManagementPositionStatus.SKIPPED,
+                reason_code="NO_LLM_PROVIDER",
+                message=message,
+                ledger_status=SKIPPED,
+                ledger_error_code="NO_LLM_PROVIDER",
+            )
         try:
             due = self._service.due_conditions(
                 position_id,
@@ -1377,36 +1567,84 @@ class ManagementJobRunner:
                 risk_context=risk_context,
             )
             if not due.due:
-                _finish_run_safely(
-                    self._ledger, run, "SKIPPED", error_code="NOT_DUE", message=due.reason
-                )
-                return ManagementPositionOutcome(
-                    position_id, "SKIPPED", "NOT_DUE", message=due.reason
-                )
-            if not self._service.configured:
-                _finish_run_safely(
-                    self._ledger,
+                return self._finish_position(
                     run,
-                    "SKIPPED",
-                    error_code="NO_LLM_PROVIDER",
-                    message="no management LLM provider is configured",
-                )
-                return ManagementPositionOutcome(
                     position_id,
-                    "SKIPPED",
-                    "NO_LLM_PROVIDER",
-                    message="no management LLM provider is configured",
+                    ManagementPositionStatus.SKIPPED,
+                    reason_code="NOT_DUE",
+                    message=due.reason,
+                    ledger_status=SKIPPED,
+                    ledger_error_code="NOT_DUE",
                 )
-            result = self._run_management(position_id, window_start_text)
+            result = self._run_management(position_id, window_start_text, conditions=due.conditions)
         except ManagementRejected as exc:
-            # A typed refusal is a recorded per-position outcome, not a crash.
-            _finish_run_safely(self._ledger, run, DONE, error_code=exc.code, message=exc.message)
-            return ManagementPositionOutcome(
+            if exc.code in _TRANSIENT_MANAGEMENT_CODES:
+                # An honest retry: a transient provider/infra failure is not a
+                # terminal refusal, so the row and the outcome are FAILED (M15).
+                _LOGGER.warning(
+                    "management_job_transient_failure",
+                    run_id=run.run_id,
+                    position_id=position_id,
+                    error_code=exc.code,
+                )
+                return self._finish_position(
+                    run,
+                    position_id,
+                    ManagementPositionStatus.FAILED,
+                    reason_code=exc.code,
+                    message=exc.message,
+                    ledger_status=FAILED,
+                    ledger_error_code=exc.code,
+                )
+            # A typed decision refusal is a recorded per-position outcome, not a
+            # crash: REFUSED with its code, distinct from FAILED.
+            return self._finish_position(
+                run,
                 position_id,
-                DONE,
-                exc.code,
+                ManagementPositionStatus.REFUSED,
+                reason_code=exc.code,
                 message=exc.message,
-                rejected=True,
+                ledger_status=DONE,
+                ledger_error_code=exc.code,
+            )
+        except PositionCloseError as exc:
+            # Every code is logged. Only routine stale/invalid-state refusals
+            # skip; gate/broker refusals are REFUSED; everything else (a
+            # broken read, a conflict) is a hard failure, never a silent skip.
+            _LOGGER.warning(
+                "management_position_closed_error",
+                run_id=run.run_id,
+                position_id=position_id,
+                error_code=exc.code,
+            )
+            if exc.code in _ROUTINE_POSITION_SKIP_CODES:
+                return self._finish_position(
+                    run,
+                    position_id,
+                    ManagementPositionStatus.SKIPPED,
+                    reason_code=exc.code,
+                    message=exc.message,
+                    ledger_status=SKIPPED,
+                    ledger_error_code=exc.code,
+                )
+            if exc.code in _POSITION_REFUSAL_CODES:
+                return self._finish_position(
+                    run,
+                    position_id,
+                    ManagementPositionStatus.REFUSED,
+                    reason_code=exc.code,
+                    message=exc.message,
+                    ledger_status=DONE,
+                    ledger_error_code=exc.code,
+                )
+            return self._finish_position(
+                run,
+                position_id,
+                ManagementPositionStatus.FAILED,
+                reason_code=exc.code,
+                message=exc.message,
+                ledger_status=FAILED,
+                ledger_error_code=exc.code,
             )
         except Exception as exc:  # noqa: BLE001 - one position never aborts the window
             _LOGGER.warning(
@@ -1415,32 +1653,89 @@ class ManagementJobRunner:
                 position_id=position_id,
                 error=str(exc),
             )
-            _finish_run_safely(self._ledger, run, FAILED, error_code="JOB_FAILED", message=str(exc))
-            return ManagementPositionOutcome(
-                position_id, FAILED, "JOB_FAILED", message=str(exc), rejected=True
+            return self._finish_position(
+                run,
+                position_id,
+                ManagementPositionStatus.FAILED,
+                reason_code="JOB_FAILED",
+                message=str(exc),
+                ledger_status=FAILED,
+                ledger_error_code="JOB_FAILED",
             )
+        conditions_text = ",".join(item.value for item in due.conditions)
         message = (
             f"action={result.action.value} status={result.status.value} "
-            f"executed={str(result.executed).lower()}"
+            f"executed={str(result.executed).lower()} conditions={conditions_text}"
         )
-        _finish_run_safely(self._ledger, run, DONE, message=message)
-        return ManagementPositionOutcome(
+        if result.status is ManagementStatus.BLOCKED:
+            # A gate block is a typed refusal: the decision ran and is recorded,
+            # but no order was authorized.
+            return self._finish_position(
+                run,
+                position_id,
+                ManagementPositionStatus.REFUSED,
+                reason_code=result.reason_code,
+                message=message,
+                action=result.action.value,
+                ledger_status=DONE,
+                ledger_error_code=result.reason_code,
+            )
+        return self._finish_position(
+            run,
             position_id,
-            DONE,
-            result.reason_code,
+            ManagementPositionStatus.DONE,
+            reason_code=result.reason_code,
             message=message,
             action=result.action.value,
+            ledger_status=DONE,
         )
 
-    def _run_management(self, position_id: str, window_start_text: str) -> ManagementResult:
+    def _finish_position(
+        self,
+        run: JobRunRecord,
+        position_id: str,
+        status: ManagementPositionStatus,
+        *,
+        reason_code: str,
+        message: str | None,
+        action: str | None = None,
+        ledger_status: str = DONE,
+        ledger_error_code: str | None = None,
+    ) -> ManagementPositionOutcome:
+        """Finish one claimed per-position row and return its closed outcome."""
+        _finish_run_safely(
+            self._ledger,
+            run,
+            ledger_status,
+            error_code=ledger_error_code,
+            message=message,
+        )
+        return ManagementPositionOutcome(
+            position_id,
+            status,
+            reason_code,
+            message=message,
+            action=action,
+            refusal_code=reason_code if status is ManagementPositionStatus.REFUSED else None,
+        )
+
+    def _run_management(
+        self,
+        position_id: str,
+        window_start_text: str,
+        *,
+        conditions: tuple[ManagementCondition, ...] = (),
+    ) -> ManagementResult:
         return self._service.manage(
             position_id,
             idempotency_key=f"auto-{self._period}-{window_start_text}",
+            conditions=conditions,
         )
 
 
-# Worst first: the aggregate status of a window is its most severe row.
-JOB_STATUS_PRECEDENCE = (FAILED, PARTIAL, RUNNING, "SKIPPED", DONE)
+# Worst first: the aggregate status of a window is its most severe row. A window
+# that did real work reports DONE over SKIPPED (M18).
+JOB_STATUS_PRECEDENCE = (FAILED, PARTIAL, RUNNING, DONE, SKIPPED)
 
 
 @dataclass(frozen=True)
@@ -1485,10 +1780,11 @@ def _effective_status(run: JobRunRecord) -> str:
 def latest_job_summary(store: StorePort, job_type: str, *, limit: int = 200) -> JobSummary | None:
     """Aggregate the latest boundary window across its per-position rows.
 
-    Status precedence is ``FAILED > PARTIAL > RUNNING > SKIPPED > DONE``. A
-    DONE row carrying a typed ``error_code`` (a recorded per-position refusal)
-    counts as ``PARTIAL``. The surfaced ``window_start`` is the boundary ISO
-    timestamp, never the internal ``"<ts>#<position_id>"`` key.
+    Status precedence is ``FAILED > PARTIAL > RUNNING > DONE > SKIPPED``: a
+    window that did real work reports DONE over SKIPPED. A DONE row carrying a
+    typed ``error_code`` (a recorded per-position refusal) counts as
+    ``PARTIAL``. The surfaced ``window_start`` is the boundary ISO timestamp,
+    never the internal ``"<ts>#<position_id>"`` key.
     """
     runs = store.list_job_runs(job_type, limit=limit)
     if not runs:
@@ -1525,6 +1821,20 @@ def job_summary_payload(summary: JobSummary | None) -> dict[str, str | None] | N
     return None if summary is None else summary.to_payload()
 
 
+def latest_jobs_payload(store: StorePort) -> dict[str, dict[str, str | None] | None]:
+    """The latest-window status of the slice-26 jobs, shared by API and CLI.
+
+    One store read path means the HTTP status and ``oft daemon status`` cannot
+    disagree about a window (M12).
+    """
+    return {
+        "position_monitor": job_summary_payload(
+            latest_job_summary(store, POSITION_MONITOR_JOB_TYPE)
+        ),
+        "position_manage": job_summary_payload(latest_job_summary(store, POSITION_MANAGE_JOB_TYPE)),
+    }
+
+
 __all__ = [
     "DEFAULT_LEASE_SECONDS",
     "DEFAULT_POSITION_MONITOR_INTERVAL_SECONDS",
@@ -1535,9 +1845,12 @@ __all__ = [
     "JobClaim",
     "JobLedger",
     "JobSummary",
+    "ManagementCondition",
     "ManagementJobOutcome",
     "ManagementJobRunner",
     "ManagementPositionOutcome",
+    "ManagementPositionStatus",
+    "ManagementWindowStatus",
     "MISSED",
     "PARTIAL",
     "POSITION_MANAGE_JOB_TYPE",
@@ -1546,7 +1859,9 @@ __all__ = [
     "PROTECTIVE_STOP",
     "PositionMonitorOutcome",
     "PositionMonitorRunner",
+    "PositionMonitorStatus",
     "PositionTickResult",
+    "PositionTickStatus",
     "RestartState",
     "RUNNING",
     "SCAN_JOB_TYPE",
@@ -1559,5 +1874,6 @@ __all__ = [
     "TriggerJobRunner",
     "align_interval",
     "job_summary_payload",
+    "latest_jobs_payload",
     "latest_job_summary",
 ]

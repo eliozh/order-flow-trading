@@ -12,13 +12,17 @@ import sqlite3
 from datetime import UTC, date, datetime, timedelta
 from decimal import Decimal
 from pathlib import Path
+from typing import Any
 
 import pytest
 
+import oft.application.management_service as management_service_module
 from oft.adapters.sqlite_store import SqliteStore
+from oft.application.entry_service import caps_from_settings
 from oft.application.kill_switch import KillSwitch
 from oft.application.management_service import (
     CADENCE_CONDITION,
+    DAILY_EQUITY_STATE_KEY,
     FUNDING_SETTLEMENT_CONDITION,
     RISK_BREACH_CONDITION,
     ManagementRiskContext,
@@ -63,7 +67,6 @@ def _payload(**overrides: object) -> dict[str, object]:
         "entry_price": "70000.00",
         "avg_entry_price": "70000.00",
         "mark_price": "70000.00",
-        "mark_as_of": NOW_TEXT,
         "notional_usd": "700.00",
         "stop_price": "69000.00",
         "target_prices": [],
@@ -135,6 +138,15 @@ def _insert_trade(
             ),
         )
         connection.commit()
+
+
+def _seed_day_start(store: SqliteStore, day: date, equity: str) -> None:
+    """Persist the UTC-day-start equity snapshot the loss is measured against."""
+    store.set_system_state(
+        DAILY_EQUITY_STATE_KEY,
+        json.dumps({"day": day.isoformat(), "equity": equity}),
+        updated_at=NOW_TEXT,
+    )
 
 
 def _service(
@@ -258,7 +270,9 @@ def test_risk_breach_is_not_reported_when_the_loss_is_not_measured(tmp_path: Pat
     settings = _settings(tmp_path)
     store = _store(settings)
     stale_at = utc_timestamp(NOW - timedelta(seconds=120))
-    _insert_position(settings, _payload(mark_as_of=stale_at))
+    # The real contract carries the stored mark's observation time in
+    # ``updated_at``; no synthetic ``mark_as_of`` field exists.
+    _insert_position(settings, _payload(updated_at=stale_at))
     _insert_trade(settings, "TRADE-LOSS", "POS-CLOSED-1", NOW_TEXT, "-400.00")
     service = _service(settings, store)
 
@@ -318,15 +332,17 @@ def test_risk_breach_fires_when_the_measured_loss_exceeds_the_cap(tmp_path: Path
 def test_a_fresh_mark_with_a_recorded_losing_trade_breaches(tmp_path: Path) -> None:
     settings = _settings(tmp_path)
     store = _store(settings)
-    _insert_position(settings, _payload(mark_price="69999.00", mark_as_of=NOW_TEXT))
+    _insert_position(settings, _payload(mark_price="69999.00"))
     _insert_trade(settings, "TRADE-LOSS", "POS-CLOSED-1", NOW_TEXT, "-400.00")
     service = _service(settings, store)
 
     context = service.risk_context(now=NOW_TEXT)
 
     assert context.measured is True
-    # A tiny unrealized loss on top of the realized loss still breaches.
-    assert context.daily_loss == Decimal("400.01000")
+    # The day's first observation seeds the baseline from current equity, so the
+    # already-present intraday mark move is excluded here; the realized loss
+    # alone still breaches.
+    assert context.daily_loss == Decimal("400.00")
     assert RISK_BREACH_CONDITION in _due(service).conditions
 
 
@@ -344,17 +360,21 @@ def test_a_small_measured_loss_does_not_breach(tmp_path: Path) -> None:
 def test_two_underwater_positions_breach_the_cap_together(tmp_path: Path) -> None:
     settings = _settings(tmp_path)
     store = _store(settings)
-    # Each position loses 200 (0.01 * (50,000 - 70,000)), below the ~315 cap
-    # measured with one position; together they lose 400, above the ~330 cap.
+    # Each position loses 200 (0.01 * (50,000 - 70,000)), below the ~321 cap in
+    # the one-position world (day start 10,700); together they lose 400, above
+    # the ~342 cap in the two-position world (day start 11,400).
     _insert_position(
         settings,
         _payload(
             position_id="POS-A",
             mark_price="50000.00",
-            mark_as_of=NOW_TEXT,
         ),
     )
+    _seed_day_start(store, NOW.date(), "10700")
     service = _service(settings, store)
+    one_position = service.risk_context(now=NOW_TEXT)
+    assert one_position.measured is True
+    assert one_position.daily_loss == Decimal("200.0000")
     assert RISK_BREACH_CONDITION not in _due(service, "POS-A").conditions
 
     _insert_position(
@@ -362,9 +382,9 @@ def test_two_underwater_positions_breach_the_cap_together(tmp_path: Path) -> Non
         _payload(
             position_id="POS-B",
             mark_price="50000.00",
-            mark_as_of=NOW_TEXT,
         ),
     )
+    _seed_day_start(store, NOW.date(), "11400")
     context = service.risk_context(now=NOW_TEXT)
 
     assert context.unrealized_net == Decimal("-400.0000")
@@ -387,10 +407,13 @@ def test_a_net_positive_day_does_not_breach_despite_a_losing_fill(tmp_path: Path
     assert RISK_BREACH_CONDITION not in _due(service).conditions
 
 
-def test_daily_loss_breach_is_strictly_greater_than_the_configured_pct() -> None:
-    assert daily_loss_breach(equity=Decimal("10000"), loss=Decimal("301"), risk_pct=3.0) is True
-    assert daily_loss_breach(equity=Decimal("10000"), loss=Decimal("300"), risk_pct=3.0) is False
-    assert daily_loss_breach(equity=Decimal("0"), loss=Decimal("1"), risk_pct=3.0) is False
+def test_daily_loss_breach_reaches_the_configured_pct() -> None:
+    caps = caps_from_settings(None)
+    assert caps.daily_loss_pct == 3.0
+    # ``>=`` matches the execution gate: a loss exactly at the cap blocks.
+    assert daily_loss_breach(equity=Decimal("10000"), loss=Decimal("300"), caps=caps) is True
+    assert daily_loss_breach(equity=Decimal("10000"), loss=Decimal("299.99"), caps=caps) is False
+    assert daily_loss_breach(equity=Decimal("0"), loss=Decimal("1"), caps=caps) is False
 
 
 def test_realized_net_for_day_sums_gains_and_losses_of_the_current_utc_day() -> None:
@@ -430,6 +453,74 @@ def test_configured_reflects_whether_a_provider_was_injected(tmp_path: Path) -> 
 
     assert _service(settings, store).configured is False
     assert _service(settings, store, provider=_Provider()).configured is True
+
+
+class _LogRecorder:
+    """Capture the module's structured warnings without depending on config."""
+
+    def __init__(self) -> None:
+        self.events: list[tuple[str, dict[str, Any]]] = []
+
+    def warning(self, event: str, **kwargs: Any) -> None:
+        self.events.append((event, kwargs))
+
+
+def test_unmeasured_risk_names_its_reason_in_the_due_reason(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """M13: a degraded measurement is visible, not a silent no-breach."""
+    settings = _settings(tmp_path)
+    store = _store(settings)
+    stale_at = utc_timestamp(NOW - timedelta(seconds=120))
+    _insert_position(settings, _payload(updated_at=stale_at))
+    service = _service(settings, store)
+    recorder = _LogRecorder()
+    monkeypatch.setattr(management_service_module, "_LOGGER", recorder)
+
+    due = _due(service)
+
+    assert due.due is True
+    assert RISK_BREACH_CONDITION not in due.conditions
+    assert "risk_unmeasured" in due.reason
+    assert "stale recorded mark" in due.reason
+    assert any(event == "management_risk_unmeasured" for event, _ in recorder.events)
+
+
+def test_a_corrupt_trade_row_makes_the_realized_measure_unmeasured(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """M14: a corrupt row must not silently understate the day's realized loss."""
+    settings = _settings(tmp_path)
+    store = _store(settings)
+    _insert_position(settings, _payload())
+    _insert_trade(settings, "TRADE-BAD", "POS-CLOSED-1", "not-a-timestamp", "-400.00")
+    service = _service(settings, store)
+    recorder = _LogRecorder()
+    monkeypatch.setattr(management_service_module, "_LOGGER", recorder)
+
+    context = service.risk_context(now=NOW_TEXT)
+
+    assert context.measured is False
+    assert context.daily_loss is None
+    assert context.degraded_reason is not None
+    assert "TRADE-BAD" in context.degraded_reason
+    assert any(
+        event == "management_risk_unmeasured" and "TRADE-BAD" in kwargs.get("reason", "")
+        for event, kwargs in recorder.events
+    )
+
+
+def test_a_non_finite_net_pnl_row_makes_the_realized_measure_unmeasured(tmp_path: Path) -> None:
+    settings = _settings(tmp_path)
+    store = _store(settings)
+    _insert_position(settings, _payload())
+    _insert_trade(settings, "TRADE-NAN", "POS-CLOSED-1", NOW_TEXT, "NaN")
+    service = _service(settings, store)
+
+    context = service.risk_context(now=NOW_TEXT)
+
+    assert context.measured is False
+    assert context.degraded_reason is not None and "TRADE-NAN" in context.degraded_reason
 
 
 def _trade(trade_id: str, closed_at: str, net: str) -> TradeLogRecord:
@@ -541,3 +632,78 @@ def test_funding_settlement_in_window_ignores_a_non_open_position(tmp_path: Path
         service._positions.funding_settlement_in_window(POSITION_ID, WINDOW_START, WINDOW_END)
         is None
     )
+
+
+def test_the_risk_breach_uses_the_persisted_caps_source(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """M2: a persisted tighter daily-loss cap changes the due trigger."""
+    settings = _settings(tmp_path)
+    store = _store(settings)
+    _insert_position(settings, _payload())
+    # Equity is 10,700; a 150 loss is between the persisted 1% (~107) and the
+    # configured 3% (~321) caps.
+    _seed_day_start(store, NOW.date(), "10850")
+    store.set_system_state("risk_caps", json.dumps({"daily_loss_pct": 1.0}), updated_at=NOW_TEXT)
+    service = _service(settings, store)
+
+    context = service.risk_context(now=NOW_TEXT)
+
+    assert context.daily_loss == Decimal("150")
+    assert RISK_BREACH_CONDITION in _due(service).conditions
+
+
+def test_corrupt_persisted_caps_logs_and_reports_no_breach(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    settings = _settings(tmp_path)
+    store = _store(settings)
+    _insert_position(settings, _payload())
+    _seed_day_start(store, NOW.date(), "12000")
+    store.set_system_state("risk_caps", "{not-json", updated_at=NOW_TEXT)
+    service = _service(settings, store)
+    recorder = _LogRecorder()
+    monkeypatch.setattr(management_service_module, "_LOGGER", recorder)
+
+    due = _due(service)
+
+    assert due.due is True
+    assert RISK_BREACH_CONDITION not in due.conditions
+    assert any(event == "management_risk_caps_unavailable" for event, _ in recorder.events)
+
+
+def test_a_new_utc_day_reseeds_the_snapshot_without_inherited_drawdown(
+    tmp_path: Path,
+) -> None:
+    settings = _settings(tmp_path)
+    store = _store(settings)
+    _insert_position(settings, _payload())
+    _seed_day_start(store, date(2026, 10, 7), "99999")
+    service = _service(settings, store)
+
+    context = service.risk_context(now=NOW_TEXT)
+
+    assert context.measured is True
+    assert context.daily_loss == Decimal("0")
+    snapshot = json.loads(store.get_system_state(DAILY_EQUITY_STATE_KEY) or "{}")
+    assert snapshot["day"] == "2026-10-08"
+    assert Decimal(snapshot["equity"]) == context.equity
+
+
+def test_a_corrupt_day_start_snapshot_is_unmeasured(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    settings = _settings(tmp_path)
+    store = _store(settings)
+    _insert_position(settings, _payload())
+    store.set_system_state(DAILY_EQUITY_STATE_KEY, "not-json", updated_at=NOW_TEXT)
+    service = _service(settings, store)
+    recorder = _LogRecorder()
+    monkeypatch.setattr(management_service_module, "_LOGGER", recorder)
+
+    context = service.risk_context(now=NOW_TEXT)
+
+    assert context.measured is False
+    assert context.daily_loss is None
+    assert context.degraded_reason == "the UTC day-start equity snapshot is unavailable"
+    assert any(event == "management_day_start_equity_corrupt" for event, _ in recorder.events)

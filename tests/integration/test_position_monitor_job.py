@@ -14,8 +14,11 @@ from decimal import Decimal
 from pathlib import Path
 from typing import Any
 
+import pytest
+
 from oft.application.jobs import (
     DONE,
+    FAILED,
     PARTIAL,
     POSITION_MANAGE_JOB_TYPE,
     POSITION_MONITOR_JOB_TYPE,
@@ -137,6 +140,8 @@ def test_one_tick_closes_only_the_stop_hit_position_with_protective_stop(
     outcome = _runner(container).run_tick(NOW)
 
     assert outcome.claimed is True
+    assert outcome.status == "DONE"
+    assert outcome.errors == ()
     assert outcome.run is not None and outcome.run.status == DONE
     hit_result = _result_for(outcome, hit)
     keep_result = _result_for(outcome, keep)
@@ -193,6 +198,7 @@ def test_a_second_tick_in_the_same_window_loses_the_claim_and_writes_nothing(
 
     assert first.claimed is True
     assert second.claimed is False
+    assert second.status == "SKIPPED"
     assert second.run is not None and first.run is not None
     assert second.run.run_id == first.run.run_id
     assert second.reason == "duplicate"
@@ -225,9 +231,102 @@ def test_one_raising_position_does_not_abort_the_tick_and_marks_it_partial(
     outcome = runner.run_tick(NOW)
 
     assert outcome.claimed is True
+    assert outcome.status == "PARTIAL"
     assert outcome.run is not None and outcome.run.status == PARTIAL
+    # ``errors`` is derived from the ERROR results, so the two cannot disagree.
     assert outcome.errors == (broken,)
+    assert set(outcome.errors) == {
+        item.position_id for item in outcome.results if item.status == "ERROR"
+    }
     assert _result_for(outcome, fine).status == "NO_ACTION"
+
+
+def test_a_position_read_failure_finishes_failed_with_a_typed_code(
+    tmp_path: Path, monkeypatch: Any
+) -> None:
+    """M6: a read failure is FAILED with a named code, never a bare reason."""
+    container = _container(tmp_path)
+
+    def _unavailable(*args: Any, **kwargs: Any) -> Any:
+        raise RuntimeError("store unavailable")
+
+    monkeypatch.setattr(container.store, "list_positions", _unavailable)
+
+    outcome = _runner(container).run_tick(NOW)
+
+    assert outcome.claimed is True
+    assert outcome.status == "FAILED"
+    assert outcome.reason_code == "POSITION_READ_FAILED"
+    assert outcome.reason == "position_read_failed"
+    assert outcome.errors == ()
+    runs = container.store.list_job_runs(POSITION_MONITOR_JOB_TYPE)
+    assert len(runs) == 1
+    assert runs[0].status == FAILED
+    assert runs[0].error_code == "POSITION_READ_FAILED"
+
+
+def test_an_unexpected_source_status_becomes_a_per_position_error(tmp_path: Path) -> None:
+    """C2: a bad source status is one ERROR, never an aborted tick/RUNNING row."""
+    container = _container(tmp_path)
+    position_id = _open_long(container, "BOGUS")
+    set_position_mark(container, position_id, "70000", as_of=NOW_TEXT)
+
+    class _BogusService:
+        def monitor(self, monitor_position_id: str) -> Any:
+            return type(
+                "_Result",
+                (),
+                {
+                    "position_id": monitor_position_id,
+                    "status": "NOT_A_REAL_STATUS",
+                    "reason_code": "SOURCE_STATUS",
+                    "reason": None,
+                },
+            )()
+
+    ledger = JobLedger(store=container.store, clock=FixedClock(NOW))
+    runner = PositionMonitorRunner(_BogusService(), ledger, FixedClock(NOW))  # type: ignore[arg-type]
+
+    outcome = runner.run_tick(NOW)
+
+    assert outcome.status == "PARTIAL"
+    assert outcome.errors == (position_id,)
+    result = _result_for(outcome, position_id)
+    assert result.status == "ERROR"
+    assert result.reason_code == "MONITOR_FAILED"
+    runs = container.store.list_job_runs(POSITION_MONITOR_JOB_TYPE)
+    assert len(runs) == 1
+    assert runs[0].status == PARTIAL
+
+
+def test_position_monitor_outcome_invariants_are_validated() -> None:
+    from oft.application.jobs import (
+        PositionMonitorOutcome,
+        PositionMonitorStatus,
+        PositionTickResult,
+        PositionTickStatus,
+    )
+
+    with pytest.raises(ValueError):
+        PositionMonitorOutcome(claimed=True, status=PositionMonitorStatus.FAILED)
+    errored = PositionTickResult("POS", PositionTickStatus.ERROR, "MONITOR_FAILED")
+    with pytest.raises(ValueError):
+        PositionMonitorOutcome(claimed=True, results=(errored,), status="DONE")
+    with pytest.raises(ValueError):
+        PositionMonitorOutcome(claimed=True, status="PARTIAL")
+    with pytest.raises(ValueError):
+        PositionMonitorOutcome(claimed=True, status="SKIPPED")
+    outcome = PositionMonitorOutcome(
+        claimed=True,
+        status="FAILED",
+        reason_code="POSITION_READ_FAILED",
+    )
+    assert outcome.status is PositionMonitorStatus.FAILED
+    assert outcome.errors == ()
+    partial = PositionMonitorOutcome(claimed=True, results=(errored,), status="PARTIAL")
+    assert partial.errors == ("POS",)
+    skipped = PositionMonitorOutcome(claimed=False, status="SKIPPED")
+    assert skipped.status is PositionMonitorStatus.SKIPPED
 
 
 def test_the_monitor_tick_uses_no_llm_even_for_the_protective_close(
@@ -307,6 +406,62 @@ def test_the_daemon_management_scheduler_uses_the_scan_period_and_no_positions(
     assert runs[0].status == DONE
 
 
+def test_the_daemon_management_scheduler_honors_an_explicit_cadence(
+    tmp_path: Path, monkeypatch: Any
+) -> None:
+    """M5: ``OFT_MANAGEMENT_CADENCE`` pins the period and detaches the scan state."""
+    container = _container(tmp_path)
+    settings = Settings(
+        env="test",
+        port=8765,
+        data_dir=container.settings.data_dir,
+        management_cadence="8h",
+    )
+    monkeypatch.setattr(daemon_module, "ManagementDaemonScheduler", _StubScheduler)
+
+    scheduler = daemon_module._start_management_scheduler(
+        settings, ScheduleState(period="4h"), container=container
+    )
+
+    assert scheduler.kwargs["period_provider"]() == "8h"
+    assert scheduler.kwargs["state_provider"] is None
+
+
+def test_the_daemon_management_start_skips_restart_catch_up_in_test_env(
+    tmp_path: Path, monkeypatch: Any
+) -> None:
+    container = _container(tmp_path)
+    monkeypatch.setattr(daemon_module, "ManagementDaemonScheduler", _StubScheduler)
+    calls: list[Any] = []
+    monkeypatch.setattr(
+        daemon_module, "_catch_up_management_on_start", lambda *args, **kwargs: calls.append(args)
+    )
+
+    daemon_module._start_management_scheduler(
+        container.settings, ScheduleState(period="4h"), container=container
+    )
+
+    assert calls == []
+
+
+def test_the_daemon_management_start_runs_restart_catch_up_outside_test_env(
+    tmp_path: Path, monkeypatch: Any
+) -> None:
+    container = _container(tmp_path)
+    settings = container.settings.model_copy(update={"env": "paper"})
+    monkeypatch.setattr(daemon_module, "ManagementDaemonScheduler", _StubScheduler)
+    calls: list[Any] = []
+    monkeypatch.setattr(
+        daemon_module, "_catch_up_management_on_start", lambda *args, **kwargs: calls.append(args)
+    )
+
+    daemon_module._start_management_scheduler(
+        settings, ScheduleState(period="4h"), container=container
+    )
+
+    assert len(calls) == 1
+
+
 def test_daemon_status_includes_the_latest_monitor_and_management_jobs(
     tmp_path: Path,
 ) -> None:
@@ -336,3 +491,49 @@ def test_daemon_status_includes_the_latest_monitor_and_management_jobs(
     assert payload["jobs"]["position_manage"]["status"] == "SKIPPED"
     assert payload["jobs"]["position_manage"]["error_code"] == "NO_LLM_PROVIDER"
     assert payload["jobs"]["position_manage"]["window_start"] == utc_timestamp(window)
+
+
+def test_daemon_start_orders_scan_catch_up_before_management(
+    tmp_path: Path, monkeypatch: Any
+) -> None:
+    """H4: the scan start (and its catch-up) precedes the management catch-up."""
+    container = _container(tmp_path)
+    events: list[str] = []
+    monkeypatch.setattr(
+        "oft.cli.main._resolve_serve_settings", lambda *args, **kwargs: container.settings
+    )
+    monkeypatch.setattr("oft.cli.main._run_live_ingestion", lambda *args, **kwargs: None)
+    monkeypatch.setattr("oft.cli.main._run_uvicorn", lambda *args, **kwargs: None)
+    monkeypatch.setattr(
+        daemon_module, "_schedule_state", lambda settings: ScheduleState(period="4h")
+    )
+    monkeypatch.setattr("oft.bootstrap.build_container", lambda *args, **kwargs: container)
+
+    def _scan(settings: Any, state: Any, *, container: Any = None) -> Any:
+        events.append("scan")
+        return _StubScheduler()
+
+    def _trigger(settings: Any, *, container: Any) -> Any:
+        events.append("trigger")
+        return _StubScheduler()
+
+    def _monitor(settings: Any, *, container: Any) -> Any:
+        events.append("monitor")
+        return _StubScheduler()
+
+    def _management(
+        settings: Any, state: Any, *, container: Any, scan_scheduler: Any = None
+    ) -> Any:
+        events.append("management")
+        return _StubScheduler()
+
+    monkeypatch.setattr(daemon_module, "_start_scheduler", _scan)
+    monkeypatch.setattr(daemon_module, "_start_trigger_scheduler", _trigger)
+    monkeypatch.setattr(daemon_module, "_start_position_monitor_scheduler", _monitor)
+    monkeypatch.setattr(daemon_module, "_start_management_scheduler", _management)
+
+    daemon_module.daemon_start()
+
+    # ``_start_scheduler`` runs the scan catch-up before returning; management
+    # is started (and catches up) only afterwards.
+    assert events == ["scan", "trigger", "monitor", "management"]

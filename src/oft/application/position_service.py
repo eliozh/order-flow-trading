@@ -1504,6 +1504,50 @@ class PositionService:
             now=now,
         )
 
+    def recorded_mark(
+        self,
+        position_id: str,
+        *,
+        record: PositionRecord | None = None,
+        payload: dict[str, Any] | None = None,
+    ) -> tuple[Decimal, str] | None:
+        """The position's newest recorded ``(mark, as_of)``, or ``None``.
+
+        Uses the same resolver as the monitor/management paths (the newest
+        published bar close, then the stored ``mark_price``/``updated_at``) so a
+        loss measurement values the account at a real mark. Missing or corrupt
+        rows return ``None`` instead of raising: the caller reports a degraded
+        measurement, never a fabricated mark or price.
+
+        A caller that already read the row (and optionally decoded its payload)
+        passes them in so the window measurement does not read or decode the
+        same position twice.
+        """
+        try:
+            if record is None:
+                record = self._store.get_position(position_id)
+                if record is None:
+                    return None
+            if payload is None:
+                payload = self._decode(record.payload_json, subject=f"position {position_id}")
+            position = position_from_contract(payload)
+            now_dt = self._clock.now()
+            if now_dt.tzinfo is None:
+                now_dt = now_dt.replace(tzinfo=UTC)
+            observation = self._resolve_mark(position, payload, now_dt.astimezone(UTC))
+        except (
+            KeyError,
+            TypeError,
+            ValueError,
+            ArithmeticError,
+            PositionError,
+            PositionCloseError,
+        ):
+            return None
+        if observation is None:
+            return None
+        return observation.mark, observation.as_of
+
     def persist_management_mark(self, context: ManagementMark) -> ManagementMark:
         """Write the chosen recorded mark to the OPEN row and return a fresh context.
 

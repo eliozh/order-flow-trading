@@ -54,6 +54,8 @@ class PositionManageData(BaseModel):
     account: dict[str, Any] | None = None
     refusals: list[PositionManageRefusal] = Field(default_factory=list)
     idempotent_replay: bool = False
+    # Additive: the due conditions that authorized an automated window decision.
+    due_conditions: list[str] = Field(default_factory=list)
 
 
 class PositionMonitorData(BaseModel):

@@ -9,6 +9,7 @@ import pytest
 from oft.application.scheduler import (
     BOUNDARY_HOURS,
     MANAGEMENT_JOB_ID,
+    MANAGEMENT_STAGGER_SECONDS,
     POSITION_MONITOR_JOB_ID,
     CatchUpPlan,
     ManagementDaemonScheduler,
@@ -391,7 +392,9 @@ def test_management_scheduler_fires_at_the_next_scan_boundary() -> None:
     )
     scheduler._schedule_next()
 
-    expected = run_at(next_boundary(now, "4h"), "4h")
+    expected = run_at(next_boundary(now, "4h"), "4h") + timedelta(
+        seconds=MANAGEMENT_STAGGER_SECONDS
+    )
     job = scheduler.scheduler.get_job(MANAGEMENT_JOB_ID)
     assert job is not None
     assert job.max_instances == 1
@@ -412,10 +415,11 @@ def test_management_scheduler_picks_up_a_scan_period_change() -> None:
         job=lambda _window: None,
         period_provider=lambda: period["value"],
     )
-    assert scheduler.next_run() == run_at(next_boundary(now, "4h"), "4h")
+    stagger = timedelta(seconds=MANAGEMENT_STAGGER_SECONDS)
+    assert scheduler.next_run() == run_at(next_boundary(now, "4h"), "4h") + stagger
 
     period["value"] = "8h"
-    assert scheduler.next_run() == run_at(next_boundary(now, "8h"), "8h")
+    assert scheduler.next_run() == run_at(next_boundary(now, "8h"), "8h") + stagger
     scheduler.shutdown()
 
 
@@ -441,7 +445,9 @@ def test_management_scheduler_never_catches_up_after_a_late_fire() -> None:
     scheduler._fire()
 
     assert jobs == [DAY.replace(hour=12)]
-    expected_next = run_at(next_boundary(clock.instant, "4h"), "4h")
+    expected_next = run_at(next_boundary(clock.instant, "4h"), "4h") + timedelta(
+        seconds=MANAGEMENT_STAGGER_SECONDS
+    )
     assert scheduler.next_run() == expected_next
     scheduler.shutdown()
 
@@ -465,12 +471,13 @@ def test_management_scheduler_rearms_at_a_pending_period_change_boundary() -> No
         state_provider=lambda: state,
     )
 
-    assert scheduler.next_run() == DAY.replace(hour=4)
-    assert scheduler.next_run() != DAY.replace(hour=8)
+    stagger = timedelta(seconds=MANAGEMENT_STAGGER_SECONDS)
+    assert scheduler.next_run() == DAY.replace(hour=4) + stagger
+    assert scheduler.next_run() != DAY.replace(hour=8) + stagger
     scheduler._schedule_next()
     job = scheduler.scheduler.get_job(MANAGEMENT_JOB_ID)
     assert job is not None
-    assert abs(job.trigger.run_date.timestamp() - DAY.replace(hour=4).timestamp()) < 1
+    assert abs(job.trigger.run_date.timestamp() - (DAY.replace(hour=4) + stagger).timestamp()) < 1
     # The dead ``_due_window`` state from the scan scheduler was removed.
     assert not hasattr(scheduler, "_due_window")
     scheduler.shutdown()
@@ -487,5 +494,7 @@ def test_management_scheduler_falls_back_to_the_period_provider() -> None:
         state_provider=None,
     )
 
-    assert scheduler.next_run() == run_at(next_boundary(now, "8h"), "8h")
+    assert scheduler.next_run() == run_at(next_boundary(now, "8h"), "8h") + timedelta(
+        seconds=MANAGEMENT_STAGGER_SECONDS
+    )
     scheduler.shutdown()

@@ -8,7 +8,7 @@ from pathlib import Path
 import pytest
 
 from oft.adapters.sqlite_store import SqliteStore, database_path
-from oft.application.jobs import JobLedger, RestartState, ScheduledScanRunner
+from oft.application.jobs import JobClaim, JobLedger, RestartState, ScheduledScanRunner
 from oft.clock import FixedClock
 from oft.config import Settings
 from oft.domain.time import utc_timestamp
@@ -41,6 +41,37 @@ def test_job_tables_are_created_idempotently(tmp_path: Path) -> None:
         versions = {row[0] for row in connection.execute("SELECT version FROM schema_migrations")}
     assert {"job_runs", "job_locks", "scan_symbols"} <= tables
     assert versions == set(range(1, 25))
+
+
+def test_a_claimed_job_claim_requires_its_run() -> None:
+    """M7: a claimed attempt always owns the run it will finish."""
+    with pytest.raises(ValueError):
+        JobClaim(claimed=True)
+    refused = JobClaim(claimed=False)
+    assert refused.run is None
+    assert refused.run_id is None
+
+
+def test_expire_job_leases_keeps_a_running_row_reclaimable(tmp_path: Path) -> None:
+    """B: expiring leaves RUNNING (not FAILED) so the normal claim reclaims it."""
+    store = _store(tmp_path)
+    ledger = JobLedger(store=store, clock=FixedClock(NOW))
+    first = ledger.claim(
+        "position_manage", "2026-11-07T08:00:00.000Z#POS", source="position_manage"
+    )
+    assert first.claimed and first.run is not None
+
+    assert store.expire_job_leases(job_type="position_manage", now=utc_timestamp(NOW)) == 1
+
+    running = store.get_job_run(first.run.run_id)
+    assert running is not None and running.status == "RUNNING"
+    later = JobLedger(store=store, clock=FixedClock(NOW + timedelta(seconds=1)))
+    reclaimed = later.claim(
+        "position_manage", "2026-11-07T08:00:00.000Z#POS", source="position_manage"
+    )
+    assert reclaimed.claimed is True
+    assert reclaimed.reclaimed is True
+    assert reclaimed.run_id == first.run.run_id
 
 
 def test_duplicate_job_claim_is_skipped(tmp_path: Path) -> None:

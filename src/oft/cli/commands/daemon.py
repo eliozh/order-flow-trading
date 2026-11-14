@@ -18,12 +18,12 @@ from oft.application.jobs import (
     POSITION_MONITOR_JOB_TYPE,
     TRIGGER_JOB_TYPE,
     JobLedger,
+    ManagementJobOutcome,
     ManagementJobRunner,
     PositionMonitorRunner,
     ScheduledScanRunner,
     TriggerJobRunner,
-    job_summary_payload,
-    latest_job_summary,
+    latest_jobs_payload,
 )
 from oft.application.scheduler import (
     ManagementDaemonScheduler,
@@ -31,6 +31,7 @@ from oft.application.scheduler import (
     ScanDaemonScheduler,
     ScheduleState,
     TriggerDaemonScheduler,
+    align_to_boundary,
     resolve_schedule_settings,
 )
 from oft.cli.commands.doctor import emit_error
@@ -160,13 +161,7 @@ def _latest_job_payloads(settings: Settings) -> dict[str, Any]:
     """The aggregated latest-window status of the slice-26 jobs."""
     from oft.bootstrap import build_container
 
-    store = build_container(settings).store
-    return {
-        "position_monitor": job_summary_payload(
-            latest_job_summary(store, POSITION_MONITOR_JOB_TYPE)
-        ),
-        "position_manage": job_summary_payload(latest_job_summary(store, POSITION_MANAGE_JOB_TYPE)),
-    }
+    return latest_jobs_payload(build_container(settings).store)
 
 
 def _status_payload(settings: Settings, state: ScheduleState) -> dict[str, Any]:
@@ -383,7 +378,7 @@ def _start_management_scheduler(
     container: Any,
     scan_scheduler: ScanDaemonScheduler | None = None,
 ) -> ManagementDaemonScheduler:
-    """Start the scan-aligned management cadence (no catch-up).
+    """Start the scan-aligned management cadence.
 
     The runner is rebuilt per fire from the active scan period, so a pending
     scan-period change is picked up at the next boundary. When no explicit
@@ -391,16 +386,25 @@ def _start_management_scheduler(
     schedule state is wired in so a pending change re-arms at its transition
     boundary. The durable ledger claims each ``(position, window)`` once, so
     overlap, restart, and a late fire can never duplicate a decision or order.
+
+    ADR-0007 also requires one management run for the open positions after a
+    restart; outside the test environment that catch-up runs once for the
+    current window after the scan catch-up (ledger-deduped). Missed periodic
+    windows are not replayed.
     """
     from oft.application.kill_switch import KillSwitch
     from oft.application.management_service import ManagementService
 
-    reaped = container.store.fail_stale_job_runs(
+    # A killed process can leave per-position management rows RUNNING. Expire
+    # (do not finish) them so the restart catch-up below reclaims the same rows
+    # and replays their decisions idempotently; the periodic cadence can also
+    # reclaim them later if the catch-up itself crashes.
+    expired = container.store.expire_job_leases(
         job_type=POSITION_MANAGE_JOB_TYPE,
         now=utc_timestamp(container.clock.now()),
     )
-    if reaped:
-        _LOGGER.warning("management_stale_runs_reaped", count=reaped)
+    if expired:
+        _LOGGER.warning("management_leases_expired", count=expired)
     ledger = JobLedger(store=container.store, clock=container.clock)
     service = ManagementService(
         store=container.store,
@@ -426,15 +430,8 @@ def _start_management_scheduler(
         return _current_state().period_at(container.clock.now())
 
     def _run_current(window: datetime) -> Any:
-        runner = ManagementJobRunner(
-            service,
-            ledger,
-            container.clock,
-            period=_period(),
-            funding_settlement_enabled=settings.management_funding_settlement_enabled,
-            risk_breach_enabled=settings.management_risk_breach_enabled,
-        )
-        return runner.run_window(window)
+        runner = _management_runner(service, ledger, container, settings, _period())
+        return runner.run_window(window_start=window)
 
     scheduler = ManagementDaemonScheduler(
         clock=container.clock,
@@ -444,8 +441,65 @@ def _start_management_scheduler(
         # only the scan-aligned default can use the live schedule state.
         state_provider=None if settings.management_cadence else _current_state,
     )
+    # Mirror the scan catch-up: run the current window once for the open
+    # positions after a restart. The ledger dedupes it, so a restart inside the
+    # same window writes nothing new. Tests keep the startup path side-effect
+    # free, matching the scan catch-up's env gate.
+    if settings.env != "test":
+        _catch_up_management_on_start(container, service, ledger, settings, state)
     scheduler.start()
     return scheduler
+
+
+def _management_runner(
+    service: Any,
+    ledger: JobLedger,
+    container: Any,
+    settings: Settings,
+    period: str,
+) -> ManagementJobRunner:
+    """One management runner for both the periodic fire and the restart catch-up."""
+    return ManagementJobRunner(
+        service,
+        ledger,
+        container.clock,
+        period=period,
+        funding_settlement_enabled=settings.management_funding_settlement_enabled,
+        risk_breach_enabled=settings.management_risk_breach_enabled,
+    )
+
+
+def _catch_up_management_on_start(
+    container: Any,
+    service: Any,
+    ledger: JobLedger,
+    settings: Settings,
+    state: ScheduleState,
+) -> ManagementJobOutcome | None:
+    """Run the current management window once after a restart (ADR-0007).
+
+    Only the window containing the current clock instant is claimed, and only
+    once: a second startup in the same window loses the ledger claim and writes
+    nothing. Startup has already expired any RUNNING lease, so a crashed
+    current-window row is reclaimed and its decision replayed. A failure is
+    logged and never aborts daemon startup.
+    """
+    try:
+        now = container.clock.now()
+        period = settings.management_cadence or state.period_at(now)
+        window = align_to_boundary(now, period)
+        runner = _management_runner(service, ledger, container, settings, period)
+        outcome = runner.run_window(window_start=window)
+        _LOGGER.info(
+            "management_restart_catch_up",
+            window_start=utc_timestamp(window),
+            status=outcome.status.value,
+            reason=outcome.reason,
+        )
+        return outcome
+    except Exception as exc:  # noqa: BLE001 - startup must survive a catch-up failure
+        _LOGGER.warning("management_restart_catch_up_failed", error=str(exc))
+        return None
 
 
 def _catch_up_on_start(container: Any, state: ScheduleState) -> None:

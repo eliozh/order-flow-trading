@@ -517,7 +517,7 @@ def _run_metrics_scan(request: Request, payload: ScanCreateRequest) -> dict[str,
         symbol=payload.symbol,
     )
     if not claim.claimed:
-        conflict = ScanAlreadyRunning(running_scan_id=claim.running_scan_id)
+        conflict = ScanAlreadyRunning(running_scan_id=claim.run_id)
         raise ApiError(
             conflict.code,
             conflict.message,
