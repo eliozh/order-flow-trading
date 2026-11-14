@@ -12,6 +12,8 @@ export interface RouteMatch {
   opportunityId: string | null
   isTriggers: boolean
   triggerId: string | null
+  isPositions: boolean
+  positionId: string | null
   isPaper: boolean
 }
 
@@ -40,6 +42,7 @@ export function resolveRoute(pathname: string): RouteMatch {
   const reportMatch = /^\/reports\/([^/]+)$/.exec(path)
   const opportunityMatch = /^\/opportunities\/([^/]+)$/.exec(path)
   const triggerMatch = /^\/triggers\/([^/]+)$/.exec(path)
+  const positionMatch = /^\/positions\/([^/]+)$/.exec(path)
   return {
     path,
     inspectorSymbol,
@@ -56,6 +59,10 @@ export function resolveRoute(pathname: string): RouteMatch {
     opportunityId: opportunityMatch !== null ? decodeSegment(opportunityMatch[1]) : null,
     isTriggers: path === '/triggers',
     triggerId: triggerMatch !== null ? decodeSegment(triggerMatch[1]) : null,
+    // Same rule as opportunities: only `/positions` or exactly one detail
+    // segment is a position route.
+    isPositions: path === '/positions' || positionMatch !== null,
+    positionId: positionMatch !== null ? decodeSegment(positionMatch[1]) : null,
     isPaper: path === '/paper',
   }
 }

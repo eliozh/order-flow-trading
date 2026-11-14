@@ -216,6 +216,22 @@ export function KillSwitchBar({
     setActionError(null)
   }, [])
 
+  // A resume dialog must never stack on another modal (for example the
+  // management dialog that stays open while a mutation settles). The management
+  // trap never includes this control, and this click guard is the last line.
+  function openResumeDialog(): void {
+    if (
+      typeof document !== 'undefined' &&
+      document.querySelector('[role="dialog"][aria-modal="true"]')
+    ) {
+      setAnnouncement('另一个弹窗已打开：请先关闭它，再恢复订单发送。')
+      return
+    }
+    setActionError(null)
+    setToken('')
+    setOpen(true)
+  }
+
   const panelRef = useDialogFocus(open, closeDialog)
   const active = status?.active === true
   const unknown = status === null
@@ -269,13 +285,10 @@ export function KillSwitchBar({
         <button
           type="button"
           className="btn"
+          data-kill-switch-action="resume"
           aria-label="Kill switch 开启，可停止新订单"
           disabled={acting}
-          onClick={() => {
-            setActionError(null)
-            setToken('')
-            setOpen(true)
-          }}
+          onClick={openResumeDialog}
         >
           Kill switch 开启，可停止新订单
         </button>
@@ -283,6 +296,7 @@ export function KillSwitchBar({
         <button
           type="button"
           className="btn"
+          data-kill-switch-action="activate"
           aria-label="启用 Kill switch（立即停止新订单）"
           disabled={acting}
           onClick={() => {

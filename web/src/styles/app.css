@@ -1442,3 +1442,75 @@ code {
 .btn--muted {
   cursor: not-allowed;
 }
+
+/* Slice 29: positions and position detail. */
+.cell-sub {
+  color: var(--oft-text-muted);
+  font-family: var(--oft-font-mono);
+  font-size: 10px;
+  font-weight: 400;
+  letter-spacing: 0.02em;
+  overflow-wrap: anywhere;
+}
+
+.position-table {
+  min-width: 960px;
+}
+
+.position-table th[scope='row'] {
+  text-align: left;
+  font-weight: 400;
+}
+
+.pnl-table {
+  min-width: 420px;
+}
+
+.mgmt-timeline {
+  margin-top: var(--oft-space-3);
+}
+
+.mgmt-timeline .timeline {
+  border-top: 1px solid var(--oft-border-subtle);
+}
+
+.timeline--stages li.acc {
+  border-left-color: var(--oft-accent);
+}
+
+.timeline--stages li.ok {
+  border-left-color: var(--oft-status-ok);
+}
+
+.timeline--stages li.failed {
+  border-left-color: var(--oft-status-danger);
+}
+
+.refusal-list {
+  margin: 0;
+  padding: var(--oft-space-2) var(--oft-space-4);
+  list-style: none;
+  border-top: 1px solid var(--oft-border-subtle);
+  color: var(--oft-status-danger);
+}
+
+.chart-entry-marker line {
+  stroke: var(--oft-accent);
+  stroke-dasharray: 6 3;
+  stroke-width: 1.5;
+}
+
+.chart-entry-marker text {
+  fill: var(--oft-accent);
+}
+
+@media (max-width: 768px) {
+  .position-table {
+    min-width: 880px;
+  }
+
+  .action-row .btn {
+    min-height: 44px;
+  }
+}
+

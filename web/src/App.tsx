@@ -5,6 +5,8 @@ import { resolveRoute } from './routes/route-match'
 import { OpportunityDetailPage } from './routes/opportunity-detail'
 import { OpportunitiesPage } from './routes/opportunities'
 import { PaperPage } from './routes/paper'
+import { PositionDetailPage } from './routes/position-detail'
+import { PositionsPage } from './routes/positions'
 import { ReportDetailPage } from './routes/report-detail'
 import { ReportsPage } from './routes/reports'
 import { ScanDetailPage } from './routes/scan-detail'
@@ -43,6 +45,8 @@ export default function App() {
           <OpportunityDetailPage key={route.opportunityId} opportunityId={route.opportunityId} />
         ) : route.triggerId !== null ? (
           <TriggerDetailPage key={route.triggerId} triggerId={route.triggerId} />
+        ) : route.positionId !== null ? (
+          <PositionDetailPage key={route.positionId} positionId={route.positionId} />
         ) : route.isScans ? (
           <ScansPage />
         ) : route.isReports ? (
@@ -51,6 +55,8 @@ export default function App() {
           <OpportunitiesPage />
         ) : route.isTriggers ? (
           <TriggersPage />
+        ) : route.isPositions ? (
+          <PositionsPage />
         ) : route.isPaper ? (
           <PaperPage />
         ) : route.isWatchlist ? (
@@ -62,8 +68,8 @@ export default function App() {
             <h1>Not found</h1>
             <p className="status-message">
               Open <code>/watchlist</code>, <code>/scans</code>, <code>/reports</code>,{' '}
-              <code>/opportunities</code>, <code>/triggers</code>, <code>/paper</code>, or{' '}
-              <code>/system</code>.
+              <code>/opportunities</code>, <code>/triggers</code>, <code>/positions</code>,{' '}
+              <code>/paper</code>, or <code>/system</code>.
             </p>
           </section>
         )}
