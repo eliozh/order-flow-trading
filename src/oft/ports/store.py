@@ -923,6 +923,14 @@ class StorePort(Protocol):
 
     def get_decision(self, decision_id: str) -> DecisionRecord | None: ...
 
+    def get_decisions(self, decision_ids: Sequence[str]) -> dict[str, DecisionRecord]:
+        """Read several decisions in one parameterized query, keyed by id.
+
+        Missing ids are simply absent from the mapping; this is the batched
+        read used by list projections so one page does not issue N point reads.
+        """
+        ...
+
     def list_decisions(self, *, role: str | None = None) -> tuple[DecisionRecord, ...]: ...
 
     # -- Prompt templates and immutable versions (ADR-0009) --------------
@@ -1137,7 +1145,7 @@ class StorePort(Protocol):
         self, *, state: str | None = None, limit: int | None = 100, offset: int = 0
     ) -> tuple[PositionRecord, ...]: ...
 
-    def count_positions(self, *, state: str | None = None) -> int: ...
+    def count_positions(self, *, state: str | None = None, symbol: str | None = None) -> int: ...
 
     def get_position(self, position_id: str) -> PositionRecord | None: ...
 

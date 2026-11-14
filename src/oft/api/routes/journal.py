@@ -2,16 +2,27 @@
 
 from __future__ import annotations
 
-from typing import Any
+from typing import Any, Literal
 
 from fastapi import APIRouter, Path, Query, Request
 
 from oft.api.envelope import new_request_id, success_envelope
 from oft.api.errors import ApiError
-from oft.api.schemas.journal import Envelope, TradeLogListData
-from oft.application.payloads import decode_payload_json
+from oft.api.schemas.journal import (
+    Envelope,
+    JournalCompareData,
+    JournalExportData,
+    JournalStatsData,
+    TradeLogListData,
+)
+from oft.application.journal_service import JournalError, JournalService
 
 router = APIRouter()
+
+
+def _journal_service(request: Request) -> JournalService:
+    container = request.app.state.container
+    return JournalService(container.store, container.clock, container.settings)
 
 
 def trade_log_summary(payload: dict[str, Any]) -> dict[str, Any]:
@@ -43,15 +54,11 @@ def list_journal(
     limit: int = Query(default=100, ge=1, le=500),
     offset: int = Query(default=0, ge=0, le=1_000_000),
 ) -> dict[str, Any]:
-    store = request.app.state.container.store
     resolved_symbol = symbol.upper() if symbol else None
-    records = store.list_trade_logs(symbol=resolved_symbol, limit=limit, offset=offset)
-    items: list[dict[str, Any]] = []
-    for record in records:
-        payload = decode_payload_json(record.payload_json, subject=f"trade log {record.trade_id}")
-        if payload is not None:
-            items.append(trade_log_summary(payload))
-    total = store.count_trade_logs(symbol=resolved_symbol)
+    service = _journal_service(request)
+    listed = service.list(symbol=resolved_symbol, limit=limit, offset=offset)
+    items = [trade_log_summary(payload) for payload in listed["items"]]
+    total = int(listed["total"])
     has_next = offset + len(items) < total
     return success_envelope(
         {"items": items, "total": total},
@@ -68,18 +75,72 @@ def list_journal(
     )
 
 
+@router.get("/api/v1/journal/stats", response_model=Envelope[JournalStatsData])
+def journal_stats(
+    request: Request,
+    period: str | None = Query(default=None, max_length=16),
+    symbol: str | None = Query(default=None, max_length=24),
+) -> dict[str, Any]:
+    """Deterministic PnL/win-rate/expectancy/avg-R statistics with exclusions."""
+    try:
+        stats = _journal_service(request).stats(period=period, symbol=symbol)
+    except JournalError as exc:
+        raise ApiError(exc.code, exc.message) from exc
+    return success_envelope(
+        stats,
+        request_id=new_request_id(),
+        provenance="CALC",
+        data_quality=str(stats.get("data_quality") or "MISSING"),
+    )
+
+
+@router.get("/api/v1/journal/export", response_model=Envelope[JournalExportData])
+def export_journal(
+    request: Request,
+    format: Literal["csv", "json"] = Query(default="csv"),
+    period: str | None = Query(default=None, max_length=16),
+    symbol: str | None = Query(default=None, max_length=24),
+) -> dict[str, Any]:
+    """Write a CSV/JSON export under the data directory and report its path."""
+    try:
+        result = _journal_service(request).export(fmt=format, period=period, symbol=symbol)
+    except JournalError as exc:
+        raise ApiError(exc.code, exc.message) from exc
+    return success_envelope(
+        result,
+        request_id=new_request_id(),
+        provenance="CALC",
+        data_quality=str(result.get("data_quality") or "MISSING"),
+    )
+
+
+@router.get("/api/v1/journal/compare/{trade_id}", response_model=Envelope[JournalCompareData])
+def journal_compare(
+    request: Request,
+    trade_id: str = Path(min_length=1, max_length=64, pattern=r"^[A-Za-z0-9._:-]+$"),
+) -> dict[str, Any]:
+    """The signal-vs-outcome comparison for one closed trade."""
+    try:
+        comparison = _journal_service(request).compare(trade_id)
+    except JournalError as exc:
+        raise ApiError(exc.code, exc.message) from exc
+    return success_envelope(
+        comparison,
+        request_id=new_request_id(),
+        provenance="MIXED",
+        data_quality=str(comparison.get("data_quality") or "MISSING"),
+    )
+
+
 @router.get("/api/v1/journal/{trade_id}", response_model=Envelope[dict[str, Any]])
 def read_journal_trade(
     request: Request,
     trade_id: str = Path(min_length=1, max_length=64, pattern=r"^[A-Za-z0-9._:-]+$"),
 ) -> dict[str, Any]:
-    store = request.app.state.container.store
-    record = store.get_trade_log(trade_id)
-    if record is None:
-        raise ApiError("NOT_FOUND", f"Trade {trade_id} does not exist.")
-    payload = decode_payload_json(record.payload_json, subject=f"trade log {trade_id}")
-    if payload is None:
-        raise ApiError("DATA_UNAVAILABLE", f"Trade {trade_id} payload is unreadable.")
+    try:
+        payload = _journal_service(request).show(trade_id)
+    except JournalError as exc:
+        raise ApiError(exc.code, exc.message) from exc
     return success_envelope(
         payload,
         request_id=new_request_id(),

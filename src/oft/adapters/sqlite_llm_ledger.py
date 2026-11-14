@@ -9,7 +9,7 @@ from __future__ import annotations
 import json
 import sqlite3
 import uuid
-from collections.abc import Callable
+from collections.abc import Callable, Sequence
 from contextlib import closing
 from dataclasses import replace
 from decimal import ROUND_HALF_UP, Decimal, InvalidOperation
@@ -137,6 +137,24 @@ class LLMStoreMixin(SqliteConnectionMixin, SqliteAuditMixin):
         finally:
             connection.close()
         return _row_to_decision(row) if row is not None else None
+
+    def get_decisions(self, decision_ids: Sequence[str]) -> dict[str, DecisionRecord]:
+        """Read several decisions in one parameterized ``IN (...)`` query."""
+        ids = tuple(dict.fromkeys(decision_ids))
+        if not ids:
+            return {}
+        connection = self._connect_read_only()
+        if connection is None:
+            return {}
+        placeholders = ", ".join("?" for _ in ids)
+        try:
+            rows = connection.execute(
+                f"SELECT * FROM decisions WHERE decision_id IN ({placeholders})",
+                ids,
+            ).fetchall()
+        finally:
+            connection.close()
+        return {record.decision_id: record for record in map(_row_to_decision, rows)}
 
     def list_decisions(self, *, role: str | None = None) -> tuple[DecisionRecord, ...]:
         connection = self._connect_read_only()

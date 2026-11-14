@@ -84,7 +84,11 @@ def test_recheck_returns_an_ordered_decision_card(tmp_path: Path) -> None:
     assert card["stage_order"] == ["TRIGGER", "LLM", "RISK", "HUMAN"]
     assert card["trigger_id"] == trigger_id
     assert card["trigger"]["provenance"] == "CALC"
-    assert card["llm"]["provenance"] == "LLM"
+    # The card exposes the entry decision's own provenance, not a bare marker.
+    assert card["llm"]["provenance"]["provider"] == "stub"
+    assert card["llm"]["provenance"]["model"]
+    assert card["llm"]["provenance"]["prompt_version"] >= 1
+    assert card["llm"]["provenance"]["cost"]["currency"] == "USD"
     assert card["llm"]["decision"] == "ENTER_LONG"
     assert card["risk"]["provenance"] == "CALC"
     assert card["risk"]["verdict"] in {"ALLOW", "REDUCE"}
@@ -195,7 +199,7 @@ def test_api_recheck_returns_the_ordered_card(tmp_path: Path) -> None:
     card = body["data"]
     assert card["stage_order"] == ["TRIGGER", "LLM", "RISK", "HUMAN"]
     assert card["trigger"]["provenance"] == "CALC"
-    assert card["llm"]["provenance"] == "LLM"
+    assert card["llm"]["provenance"]["provider"] == "stub"
     assert card["risk"]["provenance"] == "CALC"
 
 
@@ -378,15 +382,18 @@ def test_repeat_recheck_refreshes_the_verdict_metadata(tmp_path: Path) -> None:
         ),
     )
 
-    second = later.recheck(trigger_id)
+    second = later.recheck(trigger_id, refresh=True)
 
     with closing(sqlite3.connect(settings.data_dir / "oft.db")) as connection:
-        rows = connection.execute("SELECT computed_at FROM risk_verdicts").fetchall()
-    assert len(rows) == 1
-    # The deterministic id is reused, but the metadata must describe the latest
-    # re-check, not the first (DB-3).
-    assert rows[0][0] == second["risk"]["computed_at"]
-    assert rows[0][0] != first["risk"]["computed_at"]
+        rows = connection.execute(
+            "SELECT risk_verdict_id, computed_at FROM risk_verdicts ORDER BY computed_at"
+        ).fetchall()
+    # A refresh persists a NEW decision (and therefore a new deterministic
+    # verdict id) while retaining the previous rows; the latest verdict metadata
+    # must describe the latest re-check, not the first (DB-3).
+    assert len(rows) == 2
+    assert rows[-1][1] == second["risk"]["computed_at"]
+    assert rows[-1][1] != first["risk"]["computed_at"]
     audits = [
         event
         for event in container.store.list_audit_events_ascending()
@@ -532,6 +539,10 @@ def test_recheck_reconciles_a_committed_order_whose_trigger_update_was_lost(
     assert calls["count"] == 0
     assert card["status"] == "ACCEPTED"
     assert card["reconciled"] is True
+    # The reconciled card reads the persisted decision's structured provenance,
+    # never a bare "LLM" stage marker.
+    assert card["llm"]["provenance"]["provider"] == "stub"
+    assert card["llm"]["provenance"]["prompt_id"] == "entry_recheck"
     assert card["order"]["order_id"] == order_id
     assert card["position"] is not None
     healed = container.store.get_trigger_event(trigger_id)

@@ -819,17 +819,23 @@ class PaperOmsStoreMixin(SqliteConnectionMixin, SqliteAuditMixin):
             connection.close()
         return tuple(_row_to_position(row) for row in rows)
 
-    def count_positions(self, *, state: str | None = None) -> int:
+    def count_positions(self, *, state: str | None = None, symbol: str | None = None) -> int:
         connection = self._connect_read_only()
         if connection is None:
             return 0
+        clauses: list[str] = []
+        params: list[object] = []
+        if state is not None:
+            clauses.append("state = ?")
+            params.append(state)
+        if symbol is not None:
+            clauses.append("symbol = ?")
+            params.append(symbol)
+        where = f" WHERE {' AND '.join(clauses)}" if clauses else ""
         try:
-            if state is None:
-                row = connection.execute("SELECT COUNT(*) AS total FROM positions").fetchone()
-            else:
-                row = connection.execute(
-                    "SELECT COUNT(*) AS total FROM positions WHERE state = ?", (state,)
-                ).fetchone()
+            row = connection.execute(
+                f"SELECT COUNT(*) AS total FROM positions{where}", tuple(params)
+            ).fetchone()
         finally:
             connection.close()
         return int(row["total"]) if row is not None else 0

@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+from collections.abc import Mapping, Sequence
 from datetime import UTC
 from decimal import Decimal
 from typing import Any
@@ -33,6 +34,7 @@ from oft.api.schemas.trigger import (
 from oft.application.entry_service import EntryRejected, EntryService
 from oft.application.kill_switch import KillSwitch
 from oft.application.opportunity_service import OpportunityNotFound
+from oft.application.payloads import decode_payload_json
 from oft.application.trigger_service import (
     TriggerError,
     TriggerNotFound,
@@ -40,6 +42,7 @@ from oft.application.trigger_service import (
     trigger_summary,
 )
 from oft.domain.time import utc_timestamp
+from oft.ports.store import DecisionRecord
 
 router = APIRouter()
 
@@ -86,11 +89,77 @@ def _entry_service(request: Request, trigger_id: str) -> EntryService:
     )
 
 
+def _decision_entry_service(request: Request) -> EntryService:
+    """A provider-free service for the persisted entry-decision read.
+
+    ``get_persisted_entry_decision`` only touches the store, so this route must
+    never resolve a provider adapter (a missing/rotated provider key cannot turn
+    a pure read into a 500).
+    """
+    container = request.app.state.container
+    kill_switch = KillSwitch(
+        settings=container.settings, store=container.store, clock=container.clock
+    )
+    return EntryService(
+        store=container.store,
+        clock=container.clock,
+        provider=None,
+        settings=container.settings,
+        kill_switch=kill_switch,
+        runtime=container.llm_runtime,
+    )
+
+
 def _verdict_quality(verdict: Any) -> str:
     """An envelope is COMPLETE only when the embedded verdict has no stale inputs."""
     if isinstance(verdict, dict) and verdict.get("stale_inputs"):
         return "PARTIAL"
     return "COMPLETE"
+
+
+def _decision_confidence(
+    decisions: Mapping[str, DecisionRecord], entry_decision_id: object
+) -> float | None:
+    """Read the batched persisted entry decision's confidence; no provider call."""
+    if not isinstance(entry_decision_id, str) or not entry_decision_id:
+        return None
+    record = decisions.get(entry_decision_id)
+    if record is None:
+        return None
+    payload = decode_payload_json(
+        record.payload_json, subject=f"entry decision {entry_decision_id}"
+    )
+    if payload is None:
+        return None
+    confidence = payload.get("confidence")
+    if isinstance(confidence, bool) or not isinstance(confidence, (int, float)):
+        return None
+    return float(confidence)
+
+
+def _trigger_list_item(
+    decisions: Mapping[str, DecisionRecord], payload: dict[str, Any]
+) -> dict[str, Any]:
+    """The list projection plus the persisted provenance fields.
+
+    The extra fields are read-only projections: they are never written back into
+    the stored trigger row, whose contract forbids additional properties.
+    """
+    item = trigger_summary(payload)
+    item["environment"] = payload.get("environment")
+    item["risk_verdict"] = payload.get("risk_verdict")
+    item["confidence"] = _decision_confidence(decisions, payload.get("entry_decision_id"))
+    return item
+
+
+def _decision_page(store: Any, payloads: Sequence[Mapping[str, Any]]) -> dict[str, DecisionRecord]:
+    """One batched decision read for a page's ``entry_decision_id`` values."""
+    ids = [
+        str(value)
+        for value in (payload.get("entry_decision_id") for payload in payloads)
+        if isinstance(value, str) and value
+    ]
+    return store.get_decisions(ids) if ids else {}
 
 
 @router.get("/api/v1/triggers")
@@ -102,15 +171,15 @@ def list_triggers(
     offset: int = Query(default=0, ge=0),
 ) -> dict[str, Any]:
     service = _trigger_service(request)
-    items = [
-        trigger_summary(payload)
-        for payload in service.list(
-            opportunity_id=opportunity_id,
-            status=status,
-            limit=limit,
-            offset=offset,
-        )
-    ]
+    store = request.app.state.container.store
+    payloads = service.list(
+        opportunity_id=opportunity_id,
+        status=status,
+        limit=limit,
+        offset=offset,
+    )
+    decisions = _decision_page(store, payloads)
+    items = [_trigger_list_item(decisions, payload) for payload in payloads]
     total = service.count(opportunity_id=opportunity_id, status=status)
     has_next = offset + len(items) < total
     return success_envelope(
@@ -254,22 +323,47 @@ def evaluate_all_triggers(
     return envelope
 
 
+@router.get("/api/v1/triggers/{trigger_id}/decision", response_model=Envelope[dict[str, Any]])
+def read_trigger_decision(
+    request: Request,
+    trigger_id: str = Path(min_length=1, max_length=64, pattern=r"^[A-Za-z0-9._:-]+$"),
+) -> dict[str, Any]:
+    """Read the persisted entry decision and its provenance (no provider call)."""
+    try:
+        result = _decision_entry_service(request).get_persisted_entry_decision(trigger_id)
+    except TriggerNotFound as exc:
+        raise ApiError("NOT_FOUND", str(exc)) from exc
+    return success_envelope(
+        result,
+        request_id=new_request_id(),
+        provenance="MIXED",
+        data_quality=str(result.get("data_quality") or "MISSING"),
+    )
+
+
 @router.post("/api/v1/triggers/{trigger_id}/recheck", response_model=Envelope[dict[str, Any]])
 def recheck_trigger(
     request: Request,
     trigger_id: str = Path(min_length=1, max_length=64, pattern=r"^[A-Za-z0-9._:-]+$"),
+    refresh: bool = Query(default=False),
     idempotency_key: str | None = Header(default=None, alias="Idempotency-Key"),
 ) -> Any:
-    """Run the LLM entry re-check for one trigger (ADR-0003 surface)."""
+    """Read the persisted entry re-check, or supersede it with ``?refresh=true`` (ADR-0003).
+
+    The default reuses a recorded decision. A trigger with no recorded decision
+    bootstraps its first one through the provider (audited as ``ENTRY_RECHECK``);
+    ``?refresh=true`` writes a new row only when superseding a previous one and
+    audits ``ENTRY_RECHECK_REFRESHED``.
+    """
     key = require_idempotency_key(idempotency_key)
     request_hash = hashlib.sha256(
-        json.dumps({"trigger_id": trigger_id}, sort_keys=True).encode("utf-8")
+        json.dumps({"trigger_id": trigger_id, "refresh": refresh}, sort_keys=True).encode("utf-8")
     ).hexdigest()
     replay = reserve(request, key=key, request_hash=request_hash)
     if replay is not None:
         return replay
     try:
-        result = _entry_service(request, trigger_id).recheck(trigger_id)
+        result = _entry_service(request, trigger_id).recheck(trigger_id, refresh=refresh)
     except EntryRejected as exc:
         release(request, key=key)
         raise ApiError(exc.code, exc.message) from exc

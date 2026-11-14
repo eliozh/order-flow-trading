@@ -5,7 +5,6 @@ from __future__ import annotations
 import json
 import uuid
 from typing import Annotated, Any
-from urllib.parse import quote
 
 import typer
 
@@ -68,13 +67,57 @@ def trigger_list(
         )
 
 
+def _render_persisted_decision(data: dict[str, Any]) -> str:
+    """Render the persisted entry decision and its provenance (or an explicit N/A)."""
+    status = str(data.get("status") or "")
+    lines = [f"ENTRY DECISION {data.get('trigger_id', '-')} · {status}"]
+    for reason in data.get("reasons") or []:
+        lines.append(f"  reason: {reason}")
+    if status != "FOUND":
+        lines.append("N/A: no persisted entry decision")
+        return "\n".join(lines)
+    provenance = data.get("provenance") or {}
+    cost = provenance.get("cost") or {}
+    decision = data.get("decision") or {}
+    entry = decision.get("entry_recheck") or {}
+    lines.append(f"entry_decision_id {data.get('entry_decision_id', '-')}")
+    lines.append(f"decision {entry.get('decision') or 'N/A'}")
+    lines.append(
+        f"provenance {provenance.get('provider', '-')}/{provenance.get('model', '-')}"
+        f" · prompt {provenance.get('prompt_id', '-')}"
+        f" v{provenance.get('prompt_version', '-')}"
+        f" · cost {cost.get('amount_usd', '-')} {cost.get('currency', 'USD')}"
+    )
+    lines.append(
+        f"validation {data.get('validation_status') or '-'}"
+        f" · confidence {data.get('confidence')}"
+        f" · {data.get('decision_type') or '-'}"
+    )
+    return "\n".join(lines)
+
+
 @trigger_app.command("show")
 def trigger_show(
     trigger_id: str,
+    decision: Annotated[
+        bool,
+        typer.Option("--decision", help="Render the persisted entry decision provenance."),
+    ] = False,
     json_output: Annotated[bool, typer.Option("--json", help="Emit JSON.")] = False,
 ) -> None:
     """Show one trigger with condition results and snapshot provenance."""
     settings = _settings_or_exit(json_output)
+    if decision:
+        try:
+            envelope = ApiClient.from_settings(settings).get_trigger_decision(trigger_id)
+        except ApiClientError as exc:
+            emit_error(exc.code, exc.message, json_output=json_output)
+            raise typer.Exit(code=exit_code_for(exc.code)) from exc
+        data = envelope.get("data") or {}
+        typer.echo(
+            json.dumps(envelope, indent=2) if json_output else _render_persisted_decision(data)
+        )
+        return
     try:
         envelope = ApiClient.from_settings(settings).get_trigger(trigger_id)
     except ApiClientError as exc:
@@ -244,10 +287,30 @@ def _render_decision_card(card: dict[str, Any]) -> str:
         f"TRIGGER {trigger.get('trigger_id', '-')} · {trigger.get('symbol', '-')}"
         f" · {trigger.get('side', '-')} · {trigger.get('status', '-')} · CALC",
         f"LLM {llm.get('decision', '-')} · {llm.get('validation_status', '-')}"
-        f" · confidence {llm.get('confidence', '-')} · LLM",
-        f"RISK {verdict or '-'} · binding {risk.get('binding_cap', '-')} · CALC",
-        f"STATUS {status or '-'} · data_quality {card.get('data_quality', '-')}",
+        f" · confidence {llm.get('confidence', '-')}",
     ]
+    provenance = llm.get("provenance")
+    if isinstance(provenance, dict):
+        cost = provenance.get("cost") or {}
+        lines.append(
+            f"  provenance {provenance.get('provider', '-')}/{provenance.get('model', '-')}"
+            f" · prompt {provenance.get('prompt_id', '-')}"
+            f" v{provenance.get('prompt_version', '-')}"
+            f" · cost {cost.get('amount_usd', '-')} {cost.get('currency', 'USD')}"
+        )
+    else:
+        lines.append("  provenance unavailable")
+    lines.extend(
+        [
+            f"RISK {verdict or '-'} · binding {risk.get('binding_cap', '-')} · CALC",
+            f"STATUS {status or '-'} · data_quality {card.get('data_quality', '-')}",
+        ]
+    )
+    if card.get("refreshed"):
+        lines.append(
+            "refreshed · a new persisted decision now supersedes the previous one, "
+            "which is retained for the audit trail"
+        )
     reasons = risk.get("reasons") or []
     for reason in reasons:
         lines.append(f"  reason: {reason}")
@@ -278,23 +341,28 @@ def _render_decision_card(card: dict[str, Any]) -> str:
 @trigger_app.command("recheck")
 def trigger_recheck(
     trigger_id: str,
+    refresh: Annotated[
+        bool,
+        typer.Option(
+            "--refresh",
+            help=(
+                "Supersede the persisted decision with a new provider run; without it a "
+                "recorded decision is reused (a trigger with none bootstraps its first)."
+            ),
+        ),
+    ] = False,
     idempotency_key: Annotated[
         str | None,
         typer.Option("--idempotency-key", help="Reuse a key to replay the same re-check."),
     ] = None,
     json_output: Annotated[bool, typer.Option("--json", help="Emit JSON.")] = False,
 ) -> None:
-    """Run the entry re-check and render the ordered decision card."""
+    """Read the persisted entry re-check, or refresh it explicitly."""
     settings = _settings_or_exit(json_output)
     key = idempotency_key or f"cli-recheck-{uuid.uuid4().hex}"
     client = ApiClient.from_settings(settings)
     try:
-        envelope = client._request(
-            "POST",
-            f"/api/v1/triggers/{quote(trigger_id, safe='')}/recheck",
-            {},
-            extra_headers={"Idempotency-Key": key},
-        )
+        envelope = client.recheck_trigger(trigger_id, refresh=refresh, idempotency_key=key)
     except ApiClientError as exc:
         emit_error(exc.code, exc.message, json_output=json_output)
         raise typer.Exit(code=exit_code_for(exc.code)) from exc

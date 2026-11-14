@@ -98,6 +98,32 @@ export interface DecisionCardTrigger {
   provenance?: string
 }
 
+export interface DecisionProvenance {
+  provider: string
+  model: string
+  model_snapshot: string | null
+  prompt_id: string
+  prompt_version: number
+  prompt_hash: string
+  knowledge_artifact_hash: string | null
+  knowledge_status: string | null
+  knowledge_reason: string | null
+  input_hash: string
+  schema_version: string
+  temperature: number
+  seed: string | null
+  request_id: string
+  latency_ms: number
+  usage: Record<string, number>
+  cost: {
+    amount_usd: string | null
+    currency: string
+    price_version: string
+    unpriced: boolean
+  }
+  recorded_at: string
+}
+
 export interface DecisionCardLlm {
   decision_id?: string | null
   decision?: string | null
@@ -111,7 +137,17 @@ export interface DecisionCardLlm {
   prompt_version?: number
   cost?: { amount_usd?: string | null; currency?: string; unpriced?: boolean }
   usage?: { total_tokens?: number }
-  provenance?: string
+  provenance?: DecisionProvenance | null
+}
+
+/**
+ * @deprecated Pre-slice-27 cards carried a bare stage marker as `provenance`.
+ * The backend now always emits the structured `DecisionProvenance` object (or
+ * null); this variant exists only so older fixtures keep compiling and must not
+ * be produced by new code.
+ */
+export interface LegacyDecisionCardLlm extends Omit<DecisionCardLlm, 'provenance'> {
+  provenance?: 'CALC' | 'LLM' | 'MIXED' | null
 }
 
 export interface DecisionCard {
@@ -123,7 +159,7 @@ export interface DecisionCard {
   error_code?: string | null
   stage_order?: string[]
   trigger: DecisionCardTrigger
-  llm: DecisionCardLlm
+  llm: DecisionCardLlm | LegacyDecisionCardLlm
   risk: RiskVerdict | null
   human_action: TriggerHumanAction | null
 }
