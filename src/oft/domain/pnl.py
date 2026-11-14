@@ -69,6 +69,23 @@ def plain_money_str(value: Decimal) -> str:
     return format(amount, "f")
 
 
+def json_decimal(value: object) -> Decimal | None:
+    """Parse one optional JSON-sourced decimal, or ``None`` when unusable.
+
+    This is the single parser for values that arrive from an external document
+    (an LLM payload or a stored contract row). ``None`` means "absent"; an
+    unparseable or non-finite value is also ``None`` so a corrupt input never
+    reaches money arithmetic. Callers must not treat ``None`` as a measured zero.
+    """
+    if value is None:
+        return None
+    try:
+        parsed = Decimal(str(value))
+    except (ArithmeticError, TypeError, ValueError):
+        return None
+    return parsed if parsed.is_finite() else None
+
+
 def gross_pnl_usd(
     side: str,
     entry_price: Decimal,
@@ -410,6 +427,7 @@ __all__ = [
     "first_touch",
     "funding_amount_usd",
     "gross_pnl_usd",
+    "json_decimal",
     "mae_mfe_from_bars",
     "mae_mfe_from_sized_bars",
     "money_str",

@@ -201,6 +201,53 @@ class PositionManagement(_Model):
     rationale: str
     urgency: Literal["LOW", "MEDIUM", "HIGH"]
 
+    @model_validator(mode="after")
+    def _bind_action_fields(self) -> PositionManagement:
+        """Tie each action to exactly the fields it consumes.
+
+        ``FULL_CLOSE`` neither forbids nor applies the stop/targets (the
+        position is leaving); every other action's fields are strict so a
+        mismatched payload is a typed ``PYDANTIC_INVALID`` before it can reach
+        execution.
+        """
+        action = self.action
+        if action == "HOLD":
+            if self.close_fraction is not None:
+                raise ValueError("HOLD must not carry a close_fraction")
+            if self.add_risk_pct is not None:
+                raise ValueError("HOLD must not carry an add_risk_pct")
+            if self.new_stop_price is not None:
+                raise ValueError("HOLD must not carry a new_stop_price")
+            if self.new_targets:
+                raise ValueError("HOLD must not carry new_targets")
+            return self
+        if action == "PARTIAL_CLOSE":
+            if self.close_fraction is None:
+                raise ValueError("PARTIAL_CLOSE requires a close_fraction")
+            if not math.isfinite(self.close_fraction) or not 0 < self.close_fraction < 1:
+                raise ValueError(
+                    "PARTIAL_CLOSE close_fraction must be finite and strictly between 0 and 1"
+                )
+            if self.add_risk_pct is not None:
+                raise ValueError("PARTIAL_CLOSE must not carry an add_risk_pct")
+            return self
+        if action == "FULL_CLOSE":
+            if self.close_fraction is not None:
+                raise ValueError("FULL_CLOSE must not carry a close_fraction")
+            if self.add_risk_pct is not None:
+                raise ValueError("FULL_CLOSE must not carry an add_risk_pct")
+            return self
+        # ADD
+        if self.add_risk_pct is None:
+            raise ValueError("ADD requires an add_risk_pct")
+        if not math.isfinite(self.add_risk_pct) or not 0 < self.add_risk_pct <= 100:
+            raise ValueError("ADD add_risk_pct must be finite and greater than 0 and at most 100")
+        if self.close_fraction is not None:
+            raise ValueError("ADD must not carry a close_fraction")
+        if self.new_stop_price is not None:
+            raise ValueError("ADD must not carry a new_stop_price")
+        return self
+
 
 class Subject(_Model):
     symbol: str = Field(pattern=r"^[A-Z0-9]{2,24}$")
@@ -237,6 +284,18 @@ def _number_errors(field: str, value: str | None) -> list[SemanticError]:
     if value is None or _decimal(value) is not None:
         return []
     return [SemanticError(field, "NUMBER_INVALID", f"{field} must be a decimal number")]
+
+
+def _finite_number_errors(field: str, value: float | None) -> list[SemanticError]:
+    """A present, non-finite (NaN/Infinity) JSON number is invalid.
+
+    JSON Schema's ``"number"`` type and Python's ``json`` parser both admit the
+    bare ``NaN``/``Infinity`` tokens, so a provider-supplied float must be
+    finite-checked here before it reaches ``json.dumps(..., allow_nan=False)``.
+    """
+    if value is None or math.isfinite(value):
+        return []
+    return [SemanticError(field, "NUMBER_INVALID", f"{field} must be a finite number")]
 
 
 def _numbers_errors(field: str, values: list[str]) -> list[SemanticError]:
@@ -402,6 +461,16 @@ def semantic_errors(output: DecisionOutput, *, role: str) -> tuple[SemanticError
                 opportunity.risk_request.take_profits,
             )
         )
+        errors.extend(
+            _finite_number_errors(
+                "opportunity.risk_request.risk_pct", opportunity.risk_request.risk_pct
+            )
+        )
+        errors.extend(
+            _finite_number_errors(
+                "opportunity.risk_request.leverage", opportunity.risk_request.leverage
+            )
+        )
         for index, trigger in enumerate(opportunity.trigger_conditions):
             params = trigger.params
             prefix = f"opportunity.trigger_conditions[{index}].params"
@@ -502,6 +571,12 @@ def semantic_errors(output: DecisionOutput, *, role: str) -> tuple[SemanticError
                         intent.quote_notional_usd,
                     )
                 )
+                errors.extend(
+                    _finite_number_errors("entry_recheck.order_intent.risk_pct", intent.risk_pct)
+                )
+                errors.extend(
+                    _finite_number_errors("entry_recheck.order_intent.leverage", intent.leverage)
+                )
                 side = "LONG" if entry.decision == "ENTER_LONG" else "SHORT"
                 errors.extend(
                     _stop_side_errors(
@@ -515,9 +590,30 @@ def semantic_errors(output: DecisionOutput, *, role: str) -> tuple[SemanticError
     management = output.position_management
     if management is not None:
         errors.extend(_text_errors("position_management.rationale", management.rationale))
-        errors.extend(
-            _number_errors("position_management.new_stop_price", management.new_stop_price)
-        )
-        errors.extend(_numbers_errors("position_management.new_targets", management.new_targets))
+        # A FULL_CLOSE neither forbids nor applies the stop/targets: validate
+        # them only for actions that consume the fields, so an ignored field can
+        # never reject the reduce-only close.
+        if management.action != "FULL_CLOSE":
+            errors.extend(
+                _number_errors("position_management.new_stop_price", management.new_stop_price)
+            )
+            errors.extend(
+                _numbers_errors("position_management.new_targets", management.new_targets)
+            )
+        # JSON Schema's "number" admits NaN/Infinity (Python's JSON parser
+        # accepts the bare tokens), so the finite check belongs here: a
+        # non-finite fraction or percentage must never reach persistence.
+        for field, value in (
+            ("close_fraction", management.close_fraction),
+            ("add_risk_pct", management.add_risk_pct),
+        ):
+            if value is not None and not math.isfinite(value):
+                errors.append(
+                    SemanticError(
+                        f"position_management.{field}",
+                        "NUMBER_INVALID",
+                        f"position_management.{field} must be a finite number",
+                    )
+                )
 
     return tuple(errors)

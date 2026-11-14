@@ -65,30 +65,39 @@ from oft.domain.pnl import (
 )
 from oft.domain.positions import (
     ADD,
+    FULL_CLOSE,
+    MANUAL_CLOSE_RULE,
     PARTIAL_CLOSE,
     STOP_TOUCH_RULE,
     PositionError,
     TradeLogContext,
     evaluate_protective_exit,
+    increasing_side,
     management_decision_id,
     payload_has_partial_close,
     position_from_contract,
     recorded_partial_close,
     reducing_side,
+    validate_stop_side,
 )
 from oft.domain.risk import (
     RISK_VERDICT_TTL_SECONDS,
     BindingCap,
+    ManagementAction,
     RiskVerdict,
+    StopChange,
     Verdict,
+    classify_management_intent,
     verdict_to_contract,
 )
 from oft.domain.time import utc_timestamp
 from oft.ports.clock import ClockPort
 from oft.ports.store import (
+    AuditEventDraft,
     DecisionRecord,
     FundingAccrualCommit,
     FundingAccrualRecord,
+    ManagementUpdateRecord,
     OmsConflictError,
     OrderRecord,
     PositionEventRecord,
@@ -242,6 +251,23 @@ class _MarkObservation:
     mark: Decimal
     as_of: str
     source: str
+
+
+@dataclass(frozen=True)
+class ManagementMark:
+    """A fresh, recorded mark for one OPEN position and the row it came from.
+
+    The management path resolves the mark and applies the same stale rule as
+    the protective-exit tick, then hands this value to the exit/add helpers so
+    the gateway's independent re-read sees the same recorded mark.
+    """
+
+    position: Position
+    payload: dict[str, Any]
+    payload_json: str
+    mark: Decimal
+    mark_as_of: str
+    now: str
 
 
 @dataclass(frozen=True)
@@ -1393,6 +1419,443 @@ class PositionService:
             funding=funding,
         )
 
+    # -- management planning (slice 25) ----------------------------------
+
+    def management_mark(self, position_id: str) -> ManagementMark:
+        """Resolve the fresh recorded mark the management decision acts on.
+
+        Raises ``PositionNotFound`` for an unknown position,
+        ``POSITION_STATE_INVALID`` for a non-OPEN one, and a typed
+        ``DATA_UNAVAILABLE``/``DATA_STALE`` when no fresh mark exists. No order
+        is created here; the caller validates the LLM proposal first.
+        """
+        record = self._store.get_position(position_id)
+        if record is None:
+            raise PositionNotFound(position_id)
+        payload = self._decode(record.payload_json, subject=f"position {position_id}")
+        if payload.get("state") != "OPEN":
+            raise PositionCloseError(
+                "POSITION_STATE_INVALID",
+                f"position {position_id} is {payload.get('state')}, not OPEN",
+            )
+        try:
+            position = position_from_contract(payload)
+        except PositionError as exc:
+            raise PositionCloseError(exc.code, exc.message) from exc
+        if position.source_trigger_id is None:
+            raise PositionCloseError(
+                "DATA_UNAVAILABLE",
+                "the position has no source trigger; the management decision cannot be bound",
+            )
+        now = self._now()
+        now_dt = _parse_timestamp(now)
+        if now_dt is None:  # pragma: no cover - ``_now`` always renders a timestamp
+            raise PositionCloseError("DATA_UNAVAILABLE", "the service clock is unreadable")
+        observation = self._resolve_mark(position, payload, now_dt)
+        if observation is None:
+            raise PositionCloseError("DATA_UNAVAILABLE", "the position has no recorded mark price")
+        if self._is_stale(now, observation.as_of):
+            raise PositionCloseError(
+                "DATA_STALE",
+                f"the recorded mark is older than {self._stale_seconds}s; "
+                "no management decision was executed",
+            )
+        return ManagementMark(
+            position=position,
+            payload=payload,
+            payload_json=record.payload_json,
+            mark=observation.mark,
+            mark_as_of=observation.as_of,
+            now=now,
+        )
+
+    def persist_management_mark(self, context: ManagementMark) -> ManagementMark:
+        """Write the chosen recorded mark to the OPEN row and return a fresh context.
+
+        The ADD risk verdict digest binds the account equity measured at the
+        same recorded mark the gateway will re-read, so the mark is persisted
+        before the gate is evaluated (a later exit path does the same).
+        """
+        self._persist_mark(
+            context.position.position_id,
+            context.payload,
+            context.payload_json,
+            context.mark,
+            context.mark_as_of,
+        )
+        record = self._store.get_position(context.position.position_id)
+        if record is None:  # pragma: no cover - the row was just updated
+            raise PositionNotFound(context.position.position_id)
+        payload = self._decode(
+            record.payload_json, subject=f"position {context.position.position_id}"
+        )
+        return replace(context, payload=payload, payload_json=record.payload_json)
+
+    def full_close_context(self, context: ManagementMark, *, close_reason: str) -> TradeLogContext:
+        """The complete journal facts for a management full close.
+
+        A management close is manual rather than a protective stop touch; the
+        outcome authority (``close_reason``) drives the flags so the journal and
+        its outcome tags cannot disagree.
+        """
+        built = self._trade_log_context(context.position, context.payload, context.now)
+        manual = close_reason == MANUAL_CLOSE_RULE
+        return replace(
+            built,
+            close_reason=close_reason,
+            stopped=not manual,
+            target=False,
+            manual=manual,
+        )
+
+    def persist_management_exit_verdict(
+        self,
+        *,
+        position: Position,
+        decision_id: str,
+        quantity: Decimal,
+        mark: Decimal,
+        now: str,
+        purpose: str,
+    ) -> str:
+        """Persist the code-owned ALLOW verdict a management exit order binds to.
+
+        An ``ADD`` uses its own risk verdict (:mod:`oft.application.management_add`)
+        and never binds this one.
+        """
+        risk_verdict_id = deterministic_id("RISK-MGD", f"{decision_id}:{purpose}:{quantity}:{mark}")
+        self._persist_verdict(
+            risk_verdict_id=risk_verdict_id,
+            decision_id=decision_id,
+            position=position,
+            mark=mark,
+            now=now,
+            quantity=quantity,
+            purpose=purpose,
+            reason="risk-reducing management exit",
+        )
+        return risk_verdict_id
+
+    def prepare_management_exit(
+        self,
+        context: ManagementMark,
+        *,
+        decision_id: str,
+        purpose: str,
+        quantity: Decimal,
+        idempotency_key: str,
+        risk_verdict_id: str,
+        approval_id: str,
+        note: str,
+    ) -> BrokerResult:
+        """Submit one reduce-only management close through the gateway.
+
+        A ``FULL_CLOSE`` requires (and commits exactly one) trade log; a
+        ``PARTIAL_CLOSE`` passes no context and keeps the position OPEN. The
+        chosen mark is persisted first so the gateway's re-read matches.
+        """
+        position = context.position
+        if purpose not in {PARTIAL_CLOSE, FULL_CLOSE}:
+            raise PositionCloseError(
+                "POSITION_STATE_INVALID", f"{purpose} is not a management exit"
+            )
+        if quantity <= 0 or quantity > position.size:
+            raise PositionCloseError(
+                "POSITION_STATE_INVALID", "the management exit quantity is invalid"
+            )
+        close_reason = MANUAL_CLOSE_RULE
+        trade_context: TradeLogContext | None = None
+        if purpose == FULL_CLOSE:
+            if quantity != position.size:
+                raise PositionCloseError(
+                    "POSITION_STATE_INVALID", "a full close must close the whole position"
+                )
+            trade_context = self.full_close_context(context, close_reason=close_reason)
+        intent = OrderIntent(
+            symbol=position.symbol,
+            side=reducing_side(position.side),
+            order_type=OrderType.MARKET,
+            quantity=quantity,
+            price=None,
+            stop_price=position.stop_price,
+            take_profits=(),
+            leverage=position.leverage,
+            decision_id=decision_id,
+            risk_verdict_id=risk_verdict_id,
+            approval_id=approval_id,
+            idempotency_key=idempotency_key,
+            position_side=position.side,
+            risk_amount_usd=Decimal("0"),
+            risk_pct=0.0,
+            purpose=purpose,
+            position_id=position.position_id,
+            trigger_id=position.source_trigger_id,
+            close_reason=close_reason,
+            trade_log=trade_context,
+            note=note,
+        )
+        return self._submit_management_intent(context, intent)
+
+    def _submit_management_intent(
+        self,
+        context: ManagementMark,
+        intent: OrderIntent,
+    ) -> BrokerResult:
+        """Persist the decision mark, then submit one management intent.
+
+        The persist-mark, ``AuthContext``, gateway submit, and typed error
+        mapping are shared; each intent keeps its own risk amount, side,
+        purpose, and trade context intact.
+        """
+        self._persist_mark(
+            context.position.position_id,
+            context.payload,
+            context.payload_json,
+            context.mark,
+            context.mark_as_of,
+        )
+        try:
+            return self._gateway.submit(
+                intent,
+                AuthContext(
+                    actor_id="management_service",
+                    approval_id=intent.approval_id,
+                ),
+                mark_price=context.mark,
+                mark_as_of=context.mark_as_of,
+            )
+        except (GatewayError, BrokerError) as exc:
+            raise PositionCloseError(exc.code, exc.message) from exc
+
+    def prepare_management_add(
+        self,
+        context: ManagementMark,
+        *,
+        decision_id: str,
+        quantity: Decimal,
+        idempotency_key: str,
+        risk_verdict_id: str,
+        approval_id: str,
+        stop_price: Decimal,
+        leverage: float,
+        note: str = "",
+    ) -> BrokerResult:
+        """Submit one position-increasing add through the gateway.
+
+        The add never creates a second position; the broker updates the one OPEN
+        row. The risk amount is recomputed in code from the submitted mark and
+        the position's protective stop, never from the LLM payload.
+        """
+        position = context.position
+        if quantity <= 0:
+            raise PositionCloseError("POSITION_STATE_INVALID", "the add quantity is invalid")
+        if stop_price <= 0:
+            raise PositionCloseError("POSITION_STATE_INVALID", "the add requires a stop")
+        try:
+            risk_amount = quantize_money(abs(context.mark - stop_price) * quantity)
+        except (ArithmeticError, ValueError) as exc:
+            raise PositionCloseError(
+                "DATA_UNAVAILABLE", "the add risk at the mark is implausible"
+            ) from exc
+        intent = OrderIntent(
+            symbol=position.symbol,
+            side=increasing_side(position.side),
+            order_type=OrderType.MARKET,
+            quantity=quantity,
+            price=None,
+            stop_price=stop_price,
+            take_profits=(),
+            leverage=leverage,
+            decision_id=decision_id,
+            risk_verdict_id=risk_verdict_id,
+            approval_id=approval_id,
+            idempotency_key=idempotency_key,
+            position_side=position.side,
+            risk_amount_usd=risk_amount,
+            risk_pct=0.0,
+            purpose=ADD,
+            position_id=position.position_id,
+            trigger_id=position.source_trigger_id,
+            note=note,
+        )
+        return self._submit_management_intent(context, intent)
+
+    def record_management_hold(
+        self, position_id: str, *, decision_id: str, note: str, now: str
+    ) -> dict[str, Any]:
+        """Persist a HOLD action in ``management_history`` plus its audit.
+
+        HOLD creates no order, fill, or trade log, but it does persist the
+        management-history entry and its audit event. The history action is one
+        of the contract's management actions; the audit event carries the LLM
+        decision provenance.
+        """
+        record = self._store.get_position(position_id)
+        if record is None:
+            raise PositionNotFound(position_id)
+        payload = self._decode(record.payload_json, subject=f"position {position_id}")
+        if payload.get("state") != "OPEN":
+            raise PositionCloseError(
+                "POSITION_STATE_INVALID",
+                f"position {position_id} is {payload.get('state')}, not OPEN",
+            )
+        history = payload.get("management_history")
+        if not isinstance(history, list):
+            raise PositionCloseError(
+                "DATA_UNAVAILABLE", "the position management history is corrupt"
+            )
+        updated = dict(payload)
+        updated["management_history"] = [
+            *history,
+            {
+                "decision_id": decision_id,
+                "action": "HOLD",
+                "at": now,
+                "executed_order_id": None,
+                "note": note,
+            },
+        ]
+        return self._save_management_payload(
+            record,
+            updated,
+            now=now,
+            event_type="MANAGEMENT_HOLD",
+            payload={"decision_id": decision_id, "action": "HOLD"},
+        )
+
+    def apply_management_stop(
+        self,
+        position_id: str,
+        *,
+        stop_price: Decimal | None,
+        target_prices: tuple[Decimal, ...] | None,
+        decision_id: str,
+        now: str,
+        reference: Decimal | None = None,
+    ) -> dict[str, Any]:
+        """Apply a validated stop and/or target change to the OPEN position row.
+
+        ``stop_price=None`` means "leave the stop unchanged"; a target-only
+        change on a stop-less position must never synthesize a placeholder stop
+        (a persisted ``0`` is contract-invalid). A supplied stop is checked for
+        positivity independently of :func:`validate_stop_side`, because a caller
+        that bypasses the domain validation must still be refused. The stop's
+        side is revalidated against ``reference`` -- the same recorded mark the
+        LLM-facing validation used (falling back to the position's own recorded
+        mark and then the average entry) -- so a profit-locking trailing stop is
+        accepted here exactly when it was accepted upstream. A caller cannot
+        persist a stop that would never protect the position, and it cannot
+        loosen or remove the stop either: that would be a risk-increasing change
+        the management path forbids (defense in depth for replay and any direct
+        caller). No management history action is written (stop updates are not
+        in the contract's action enum); the change is recorded in the audit chain
+        as ``STOP_UPDATED``.
+        """
+        record = self._store.get_position(position_id)
+        if record is None:
+            raise PositionNotFound(position_id)
+        payload = self._decode(record.payload_json, subject=f"position {position_id}")
+        if payload.get("state") != "OPEN":
+            raise PositionCloseError(
+                "POSITION_STATE_INVALID",
+                f"position {position_id} is {payload.get('state')}, not OPEN",
+            )
+        if stop_price is None and target_prices is None:
+            return payload
+        if stop_price is not None:
+            try:
+                position = position_from_contract(payload)
+                if not stop_price.is_finite() or stop_price <= 0 or stop_price > MAX_ABS_PRICE:
+                    raise PositionError(
+                        "POSITION_STATE_INVALID",
+                        "the management stop must be a positive price",
+                    )
+                side_reference = reference or position.mark_price or position.avg_entry_price
+                validate_stop_side(position.side, side_reference, stop_price)
+                current_stop = position.stop_price
+                if current_stop is not None:
+                    change = classify_management_intent(
+                        action=ManagementAction.PARTIAL_CLOSE.value,
+                        position_side=position.side,
+                        current_stop=current_stop,
+                        new_stop_price=stop_price,
+                    ).stop_change
+                    if change in (StopChange.LOOSEN, StopChange.REMOVE):
+                        raise PositionError(
+                            "RISK_BLOCKED",
+                            "a management action may not loosen or remove the protective stop",
+                        )
+            except PositionError as exc:
+                raise PositionCloseError(exc.code, exc.message) from exc
+        updated = dict(payload)
+        if stop_price is not None:
+            updated["stop_price"] = str(stop_price)
+        if target_prices is not None:
+            updated["target_prices"] = [str(price) for price in target_prices]
+        return self._save_management_payload(
+            record,
+            updated,
+            now=now,
+            event_type="STOP_UPDATED",
+            payload={
+                "decision_id": decision_id,
+                "stop_price": None if stop_price is None else str(stop_price),
+                "targets": (
+                    None if target_prices is None else [str(price) for price in target_prices]
+                ),
+            },
+        )
+
+    def _save_management_payload(
+        self,
+        record: PositionRecord,
+        updated: dict[str, Any],
+        *,
+        now: str,
+        event_type: str,
+        payload: dict[str, Any],
+    ) -> dict[str, Any]:
+        """Commit an order-less management payload change and its audit atomically.
+
+        Like the funding path, this never advances ``updated_at``: that field is
+        the recorded mark's as-of, and moving it without moving ``mark_price``
+        would make an old stored price look like the newest, freshest
+        observation. Only the optimistic version moves.
+        """
+        updated["version"] = int(updated.get("version", 1)) + 1
+        try:
+            self._store.save_management_update(
+                ManagementUpdateRecord(
+                    position=PositionRecord(
+                        position_id=record.position_id,
+                        account_id=record.account_id,
+                        environment=record.environment,
+                        symbol=record.symbol,
+                        state="OPEN",
+                        opened_at=str(updated.get("opened_at") or record.opened_at),
+                        payload_json=json.dumps(updated, sort_keys=True),
+                        expected_payload_json=record.payload_json,
+                    ),
+                    audits=(
+                        AuditEventDraft(
+                            event_type=event_type,
+                            actor={
+                                "kind": "LLM",
+                                "id": str(payload.get("decision_id") or "management"),
+                            },
+                            subject={"kind": "POSITION", "id": record.position_id},
+                            payload=payload,
+                            created_at=now,
+                        ),
+                    ),
+                )
+            )
+        except OmsConflictError as exc:
+            raise PositionCloseError(
+                "CONFLICT", "the position changed concurrently; retry the management action"
+            ) from exc
+        return updated
+
     def _resolve_mark(
         self,
         position: Position,
@@ -1980,10 +2443,14 @@ class PositionService:
         position: Position,
         mark: Decimal,
         now: str,
+        quantity: Decimal | None = None,
+        purpose: str = "EXIT",
+        reason: str = "risk-reducing protective exit",
     ) -> None:
+        resolved_quantity = position.size if quantity is None else quantity
         expires_at = utc_timestamp(_parse(now) + timedelta(seconds=RISK_VERDICT_TTL_SECONDS))
         try:
-            notional = quantize_money(mark * position.size)
+            notional = quantize_money(mark * resolved_quantity)
         except (ArithmeticError, ValueError) as exc:
             raise PositionCloseError(
                 "DATA_UNAVAILABLE",
@@ -1991,17 +2458,17 @@ class PositionService:
             ) from exc
         verdict = RiskVerdict(
             verdict=Verdict.ALLOW,
-            requested_quantity=position.size,
-            allowed_quantity=position.size,
+            requested_quantity=resolved_quantity,
+            allowed_quantity=resolved_quantity,
             allowed_notional_usd=notional,
             allowed_leverage=position.leverage,
             risk_amount_usd=Decimal("0"),
             binding_cap=BindingCap.NONE,
-            reasons=("risk-reducing protective exit",),
+            reasons=(reason,),
             computed_at=now,
             expires_at=expires_at,
             inputs_hash=hashlib.sha256(
-                f"{risk_verdict_id}:{mark}:{position.size}".encode()
+                f"{risk_verdict_id}:{mark}:{resolved_quantity}".encode()
             ).hexdigest(),
             stale_inputs=(),
             entry_price=mark,
@@ -2009,8 +2476,11 @@ class PositionService:
         )
         requested_payload = {
             "entry_price": str(mark),
-            "stop_price": str(position.stop_price),
-            "quantity": str(position.size),
+            # A stop-less position has no protective stop; persist the contract's
+            # decimal "0" (as the ADD gate does) rather than the Python string
+            # "None", which is not a valid decimal.
+            "stop_price": "0" if position.stop_price is None else str(position.stop_price),
+            "quantity": str(resolved_quantity),
             "risk_pct": 0.0,
             "leverage": position.leverage,
             "notional_usd": str(notional),
@@ -2044,7 +2514,7 @@ class PositionService:
             payload={
                 "verdict": Verdict.ALLOW.value,
                 "binding_cap": BindingCap.NONE.value,
-                "purpose": "EXIT",
+                "purpose": purpose,
             },
             at=now,
         )
@@ -2089,6 +2559,7 @@ class PositionService:
 __all__ = [
     "CLOSED",
     "DATA_STALE",
+    "ManagementMark",
     "NO_ACTION",
     "STOP_NOT_TOUCHED",
     "STOP_TOUCH",

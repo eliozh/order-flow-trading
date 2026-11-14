@@ -1,0 +1,23 @@
+{
+  "decision_type": "POSITION_MANAGEMENT",
+  "subject": {
+    "symbol": "BTCUSDT",
+    "timeframe": "4h",
+    "as_of": "2026-10-08T00:01:00.000Z"
+  },
+  "confidence": 0.55,
+  "rationale": "Reduce the position and move the stop to the wrong side.",
+  "caveats": ["The proposed stop is invalid for a long position"],
+  "analysis": null,
+  "opportunity": null,
+  "entry_recheck": null,
+  "position_management": {
+    "action": "PARTIAL_CLOSE",
+    "close_fraction": 0.5,
+    "add_risk_pct": null,
+    "new_stop_price": "99000.00",
+    "new_targets": [],
+    "rationale": "This stop is above the mark and must be rejected.",
+    "urgency": "MEDIUM"
+  }
+}

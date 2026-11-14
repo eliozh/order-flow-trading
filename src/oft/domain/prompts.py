@@ -76,7 +76,9 @@ ROLE_BY_PROMPT_ID: Mapping[str, PromptRole] = {
 
 # Roles whose built-in templates are seeded at initialize time. A missing
 # template row for one of these is data loss, never a reason to fall back.
-SEEDED_ROLES: frozenset[PromptRole] = frozenset({PromptRole.ANALYSIS, PromptRole.ENTRY_RECHECK})
+SEEDED_ROLES: frozenset[PromptRole] = frozenset(
+    {PromptRole.ANALYSIS, PromptRole.ENTRY_RECHECK, PromptRole.MANAGEMENT}
+)
 
 DEFAULT_SYSTEM_BODIES: Mapping[PromptRole, str] = {
     PromptRole.ANALYSIS: (

@@ -373,3 +373,104 @@ def test_repaired_decision_provenance_uses_the_final_call_and_sums_attempts(
     assert sum((Decimal(record.cost_usd) for record in budgets), Decimal("0")) == Decimal(
         "12.50000000"
     )
+
+
+def test_management_action_field_mismatch_is_a_typed_pydantic_issue() -> None:
+    """M9: an action/field mismatch fails as PYDANTIC_INVALID, not silently."""
+    document = json.loads(_text("management_hold.json"))
+    document["position_management"]["close_fraction"] = 0.5
+
+    outcome = validate_output(json.dumps(document), role="MANAGEMENT")
+
+    assert outcome.status == "REJECTED"
+    assert outcome.output is None
+    assert outcome.errors[0].code == "PYDANTIC_INVALID"
+
+
+_MANAGEMENT_RANGE_CASES = (
+    pytest.param("management_partial_close.json", "close_fraction", 1.5, id="fraction-above-one"),
+    pytest.param("management_partial_close.json", "close_fraction", -0.1, id="fraction-negative"),
+    pytest.param("management_partial_close.json", "close_fraction", 0.0, id="fraction-zero"),
+    pytest.param("management_partial_close.json", "close_fraction", 1.0, id="fraction-one"),
+    pytest.param(
+        "management_partial_close.json", "close_fraction", float("nan"), id="fraction-nan"
+    ),
+    pytest.param(
+        "management_partial_close.json", "close_fraction", float("inf"), id="fraction-infinity"
+    ),
+    pytest.param("management_add.json", "add_risk_pct", 0.0, id="add-risk-zero"),
+    pytest.param("management_add.json", "add_risk_pct", -1.0, id="add-risk-negative"),
+    pytest.param("management_add.json", "add_risk_pct", 100.1, id="add-risk-above-100"),
+    pytest.param("management_add.json", "add_risk_pct", float("nan"), id="add-risk-nan"),
+    pytest.param("management_add.json", "add_risk_pct", float("inf"), id="add-risk-infinity"),
+)
+
+
+@pytest.mark.parametrize(("fixture", "field", "value"), _MANAGEMENT_RANGE_CASES)
+def test_out_of_range_management_numbers_are_repairable_pydantic_issues(
+    fixture: str, field: str, value: float
+) -> None:
+    """M9: action/field ranges are typed PYDANTIC_INVALID and the repair pass fixes them."""
+    document = json.loads(_text(fixture))
+    document["position_management"][field] = value
+
+    rejected = validate_output(json.dumps(document), role="MANAGEMENT")
+
+    assert rejected.status == "REJECTED"
+    assert rejected.output is None
+    assert rejected.errors[0].code == "PYDANTIC_INVALID"
+
+    repaired = validate_output(
+        json.dumps(document),
+        role="MANAGEMENT",
+        repair=lambda _message: _text(fixture),
+    )
+
+    assert repaired.status == "REPAIRED"
+    assert repaired.output is not None
+    assert repaired.repaired is True
+
+
+class _RawTextProvider:
+    """Returns one fixed raw document on every attempt (including the repair)."""
+
+    provider = "stub"
+
+    def __init__(self, raw_text: str) -> None:
+        self._raw_text = raw_text
+        self.calls = 0
+
+    def capabilities(self) -> ProviderCapabilities:
+        return ProviderCapabilities(provider="stub", strict_schema=True)
+
+    def complete(self, request: LLMRequest) -> LLMResult:
+        self.calls += 1
+        return LLMResult(
+            provider="stub",
+            model="fixture",
+            raw_text=self._raw_text,
+            usage=LLMUsage(),
+            request_id=f"raw-{self.calls}",
+        )
+
+    def estimate_cost(self, request: LLMRequest, model: str) -> CostEstimate:
+        return CostEstimate(amount_usd="0", price_version="stub/v1", unpriced=True)
+
+
+def test_a_non_finite_risk_number_is_rejected_without_a_serialization_error(
+    tmp_path: Path,
+) -> None:
+    """N1: the old path accepted NaN then crashed in ``json.dumps(allow_nan=False)``."""
+    document = json.loads(_text("opportunity_valid.json"))
+    document["opportunity"]["risk_request"]["risk_pct"] = float("nan")
+    raw = json.dumps(document)
+    assert "NaN" in raw  # the provider emitted the bare non-JSON token
+
+    outcome, store = _analyze(tmp_path, _RawTextProvider(raw))
+
+    assert outcome.validation_status == "REJECTED"
+    assert outcome.opportunity is None
+    assert any(error["code"] == "NUMBER_INVALID" for error in outcome.decision["validation_errors"])
+    decision = store.get_decision(outcome.decision_id)
+    assert decision is not None
+    assert "NaN" not in decision.payload_json

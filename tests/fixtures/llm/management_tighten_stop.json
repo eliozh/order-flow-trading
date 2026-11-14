@@ -1,0 +1,23 @@
+{
+  "decision_type": "POSITION_MANAGEMENT",
+  "subject": {
+    "symbol": "BTCUSDT",
+    "timeframe": "4h",
+    "as_of": "2026-10-08T00:01:00.000Z"
+  },
+  "confidence": 0.62,
+  "rationale": "Reduce half and tighten the stop to protect the remainder.",
+  "caveats": [],
+  "analysis": null,
+  "opportunity": null,
+  "entry_recheck": null,
+  "position_management": {
+    "action": "PARTIAL_CLOSE",
+    "close_fraction": 0.5,
+    "add_risk_pct": null,
+    "new_stop_price": "69500.00",
+    "new_targets": [],
+    "rationale": "Take half off and keep the stop unchanged.",
+    "urgency": "MEDIUM"
+  }
+}

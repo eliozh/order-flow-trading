@@ -458,3 +458,164 @@ def test_control_character_in_a_key_zone_note_is_rejected() -> None:
     output = DecisionOutput.model_validate(_output(analysis=analysis))
 
     assert "UNSAFE_TEXT" in _codes(output)
+
+
+def _management_document(**overrides: object) -> dict:
+    position_management: dict[str, object] = {
+        "action": "HOLD",
+        "close_fraction": None,
+        "add_risk_pct": None,
+        "new_stop_price": None,
+        "new_targets": [],
+        "rationale": "hold the position",
+        "urgency": "LOW",
+    }
+    position_management.update(overrides)
+    return {
+        "decision_type": "POSITION_MANAGEMENT",
+        "subject": BASE["subject"],
+        "confidence": 0.5,
+        "rationale": "Hold.",
+        "caveats": [],
+        "analysis": None,
+        "opportunity": None,
+        "entry_recheck": None,
+        "position_management": position_management,
+    }
+
+
+@pytest.mark.parametrize(
+    "overrides",
+    (
+        {"close_fraction": 0.5},
+        {"add_risk_pct": 0.4},
+        {"new_stop_price": "69000.00"},
+        {"new_targets": ["72000.00"]},
+        {"action": "PARTIAL_CLOSE"},
+        {"action": "PARTIAL_CLOSE", "close_fraction": 0.5, "add_risk_pct": 0.4},
+        {"action": "FULL_CLOSE", "close_fraction": 0.5},
+        {"action": "FULL_CLOSE", "add_risk_pct": 0.4},
+        {"action": "ADD"},
+        {"action": "ADD", "add_risk_pct": 0.4, "close_fraction": 0.5},
+        {"action": "ADD", "add_risk_pct": 0.4, "new_stop_price": "69500.00"},
+    ),
+)
+def test_management_action_field_consistency_is_enforced(overrides: dict) -> None:
+    """M9: an action/field mismatch is a typed PYDANTIC_INVALID at parse time."""
+    from pydantic import ValidationError
+
+    with pytest.raises(ValidationError):
+        DecisionOutput.model_validate(_management_document(**overrides))
+
+
+def test_full_close_ignores_its_stop_and_targets_fields() -> None:
+    """M3/M9: FULL_CLOSE neither forbids nor applies the ignored fields."""
+    document = _management_document(
+        action="FULL_CLOSE",
+        new_stop_price="99000.00",
+        new_targets=["1.00"],
+    )
+
+    output = DecisionOutput.model_validate(document)
+
+    assert semantic_errors(output, role="MANAGEMENT") == ()
+
+
+@pytest.mark.parametrize(
+    ("action", "field"),
+    (("PARTIAL_CLOSE", "close_fraction"), ("ADD", "add_risk_pct")),
+)
+@pytest.mark.parametrize("value", (float("nan"), float("inf"), float("-inf")))
+def test_non_finite_management_numbers_are_rejected(action: str, field: str, value: float) -> None:
+    """M5/M9: NaN/Infinity is now caught at parse time (typed PYDANTIC_INVALID)."""
+    from pydantic import ValidationError
+
+    document = _management_document(action=action, **{field: value})
+
+    with pytest.raises(ValidationError):
+        DecisionOutput.model_validate(document)
+
+
+@pytest.mark.parametrize(
+    ("action", "field"),
+    (("PARTIAL_CLOSE", "close_fraction"), ("ADD", "add_risk_pct")),
+)
+@pytest.mark.parametrize("value", (float("nan"), float("inf")))
+def test_mutated_non_finite_management_numbers_are_rejected_by_semantics(
+    action: str, field: str, value: float
+) -> None:
+    """M5 defense in depth: a mutated model that bypasses parse still fails closed."""
+    output = DecisionOutput.model_validate(_management_document(action=action, **{field: 0.5}))
+    assert output.position_management is not None
+    setattr(output.position_management, field, value)
+
+    errors = semantic_errors(output, role="MANAGEMENT")
+
+    assert "NUMBER_INVALID" in {error.code for error in errors}
+    assert f"position_management.{field}" in {
+        error.field for error in errors if error.code == "NUMBER_INVALID"
+    }
+
+
+@pytest.mark.parametrize("field", ("risk_pct", "leverage"))
+@pytest.mark.parametrize("value", (float("nan"), float("inf"), float("-inf")))
+def test_non_finite_opportunity_risk_numbers_are_rejected(field: str, value: float) -> None:
+    """N1: a non-finite provider risk number is typed NUMBER_INVALID, never valid."""
+    opportunity = dict(BASE["opportunity"])
+    opportunity["risk_request"] = {
+        **BASE["opportunity"]["risk_request"],
+        field: value,
+    }
+
+    output = DecisionOutput.model_validate(_output(opportunity=opportunity))
+    errors = semantic_errors(output, role="ANALYSIS")
+
+    assert "NUMBER_INVALID" in {error.code for error in errors}
+    assert f"opportunity.risk_request.{field}" in {
+        error.field for error in errors if error.code == "NUMBER_INVALID"
+    }
+
+
+@pytest.mark.parametrize("field", ("risk_pct", "leverage"))
+@pytest.mark.parametrize("value", (float("inf"),))
+def test_non_finite_entry_risk_numbers_are_rejected(field: str, value: float) -> None:
+    """N1: a non-finite entry intent number is typed NUMBER_INVALID."""
+    document = _entry_payload("entry_recheck_enter_long.json")
+    document["entry_recheck"]["order_intent"][field] = value
+
+    output = DecisionOutput.model_validate(document)
+    errors = semantic_errors(output, role="ENTRY_RECHECK")
+
+    assert "NUMBER_INVALID" in {error.code for error in errors}
+    assert f"entry_recheck.order_intent.{field}" in {
+        error.field for error in errors if error.code == "NUMBER_INVALID"
+    }
+
+
+@pytest.mark.parametrize("field", ("risk_pct", "leverage"))
+@pytest.mark.parametrize("value", (float("nan"), float("-inf")))
+def test_non_finite_entry_risk_numbers_are_rejected_at_parse(field: str, value: float) -> None:
+    """N1: NaN/-Infinity is rejected by the positive-number bound before semantics."""
+    from pydantic import ValidationError
+
+    document = _entry_payload("entry_recheck_enter_long.json")
+    document["entry_recheck"]["order_intent"][field] = value
+
+    with pytest.raises(ValidationError):
+        DecisionOutput.model_validate(document)
+
+
+@pytest.mark.parametrize("field", ("risk_pct", "leverage"))
+def test_mutated_non_finite_entry_numbers_are_rejected_by_semantics(field: str) -> None:
+    """N1 defense in depth: NaN rejected by semantics even if parse is bypassed."""
+    document = _entry_payload("entry_recheck_enter_long.json")
+    output = DecisionOutput.model_validate(document)
+    assert output.entry_recheck is not None and output.entry_recheck.order_intent is not None
+    setattr(output.entry_recheck.order_intent, field, float("nan"))
+
+    errors = semantic_errors(output, role="ENTRY_RECHECK")
+
+    assert "NUMBER_INVALID" in {error.code for error in errors}
+    assert f"entry_recheck.order_intent.{field}" in {
+        error.field for error in errors if error.code == "NUMBER_INVALID"
+    }

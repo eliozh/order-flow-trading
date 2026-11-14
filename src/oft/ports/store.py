@@ -611,6 +611,20 @@ class PositionAdjustmentRecord:
 
 
 @dataclass(frozen=True)
+class ManagementUpdateRecord:
+    """A management action that changes the OPEN position without an order.
+
+    Used by ``HOLD`` (which appends a management-history entry) and by a stop
+    or target update (which changes only those fields). The update and its audit
+    events commit in one transaction, so a recorded action can never exist
+    without its audit trail.
+    """
+
+    position: PositionRecord
+    audits: tuple[AuditEventDraft, ...]
+
+
+@dataclass(frozen=True)
 class FundingAccrualRecord:
     """One recorded funding settlement applied to a position.
 
@@ -1160,6 +1174,16 @@ class StorePort(Protocol):
         position update, the position event, and the audits in one
         ``BEGIN IMMEDIATE`` transaction. A zero-row position update aborts the
         whole unit; no trade log is written.
+        """
+        ...
+
+    def save_management_update(self, record: ManagementUpdateRecord) -> bool:
+        """Atomically replace an OPEN position payload and append its audits.
+
+        Used by ``HOLD`` and by a stop/target update, which write no order or
+        fill. The optimistic payload guard aborts the transaction when the
+        position changed concurrently (``OmsConflictError``); every audit draft
+        commits with the position update.
         """
         ...
 

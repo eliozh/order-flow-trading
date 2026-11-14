@@ -117,7 +117,7 @@ def role_models(settings: Settings) -> dict[str, str | None]:
 def timeout_for_role(role: LLMRole) -> float:
     return (
         ENTRY_RECHECK_TIMEOUT_SECONDS
-        if role is LLMRole.ENTRY_RECHECK
+        if role in {LLMRole.ENTRY_RECHECK, LLMRole.MANAGEMENT}
         else (ANALYSIS_TIMEOUT_SECONDS)
     )
 

@@ -22,7 +22,7 @@ from oft.ports.llm import (
 _DEFAULT_FIXTURES: dict[LLMRole, str] = {
     LLMRole.ANALYSIS: "opportunity_valid.json",
     LLMRole.ENTRY_RECHECK: "entry_recheck_enter_long.json",
-    LLMRole.MANAGEMENT: "analysis_valid.json",
+    LLMRole.MANAGEMENT: "management_hold.json",
     LLMRole.REVIEW: "analysis_valid.json",
 }
 

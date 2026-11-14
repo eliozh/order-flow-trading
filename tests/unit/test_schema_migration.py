@@ -88,7 +88,7 @@ def test_v1_database_upgrades_to_v2_with_effective_checks(tmp_path: Path) -> Non
     finally:
         connection.close()
 
-    assert versions == set(range(1, 24))
+    assert versions == set(range(1, 25))
 
 
 _V2_BACKFILL = """
@@ -146,7 +146,7 @@ def test_v2_database_gains_the_backfill_heartbeat_column(tmp_path: Path) -> None
 
     assert "updated_at" in columns
     assert updated_at == "2026-11-06T00:00:00.000Z"
-    assert versions == set(range(1, 24))
+    assert versions == set(range(1, 25))
 
 
 def test_v5_checks_indexes_and_foreign_keys(tmp_path: Path) -> None:
@@ -243,7 +243,7 @@ def test_v5_database_migrates_manifest_metrics_columns(tmp_path: Path) -> None:
 
     assert {"metric_version", "input_manifest_hash", "window_start", "window_end"} <= columns
     assert legacy == ("/tmp/legacy.parquet", None, None)
-    assert versions == set(range(1, 24))
+    assert versions == set(range(1, 25))
 
 
 def test_v6_database_migrates_starred_columns(tmp_path: Path) -> None:
@@ -302,7 +302,7 @@ def test_v6_database_migrates_starred_columns(tmp_path: Path) -> None:
 
     assert {"starred", "starred_at"} <= columns
     assert row == ("BTCUSDT", 0, None)
-    assert versions == set(range(1, 24))
+    assert versions == set(range(1, 25))
 
 
 def test_manifest_run_metadata_columns_are_added_idempotently(tmp_path: Path) -> None:
@@ -319,7 +319,7 @@ def test_manifest_run_metadata_columns_are_added_idempotently(tmp_path: Path) ->
         connection.close()
 
     assert {"run_id", "last_n", "recomputed_from", "parent_run_id"} <= columns
-    assert versions == set(range(1, 24))
+    assert versions == set(range(1, 25))
 
 
 _V12_JOB_RUNS = """
@@ -385,7 +385,7 @@ def test_v12_database_gains_the_job_run_scope_symbol_column(tmp_path: Path) -> N
 
     assert "symbol" in columns
     assert symbol is None  # pre-v13 batch rows keep a null (batch) scope
-    assert versions == set(range(1, 24))
+    assert versions == set(range(1, 25))
 
 
 _V13_JOB_RUNS = """
@@ -636,7 +636,7 @@ def test_v9_database_upgrades_to_v10_with_ledgers_and_indexes(tmp_path: Path) ->
     finally:
         connection.close()
 
-    assert versions == set(range(1, 24))
+    assert versions == set(range(1, 25))
     assert "llm_json" in report_columns
     assert {
         "llm_calls",
@@ -786,9 +786,11 @@ def test_v15_prompt_and_llm_rows_upgrade_to_v16_and_seed_only_missing_families(
         "analysis:system",
         "entry_recheck",
         "entry_recheck:system",
+        "management",
+        "management:system",
     }
     assert tuple(llm_defaults) == ("", 1, "")
-    assert versions == set(range(1, 24))
+    assert versions == set(range(1, 25))
 
 
 def test_prompt_versions_are_immutable_and_have_one_active_row_per_prompt(
@@ -950,7 +952,7 @@ def test_v16_database_gains_budget_periods_settings_and_provider_capabilities(
     assert {"budget_ledger_week", "budget_ledger_month"} <= indexes
     # 2026-11-04 is ISO week 2026-W45.
     assert tuple(backfilled) == ("2026-11-04", "2026-W45", "2026-11", "")
-    assert versions == set(range(1, 24))
+    assert versions == set(range(1, 25))
 
 
 def _v16_budget_connection(settings: Settings) -> sqlite3.Connection:
@@ -1133,7 +1135,7 @@ def test_v18_trigger_events_gain_snapshot_provenance_and_backfill(
     assert tuple(good) == ("HASH-V18", "2026-11-09T10:00:00.000Z", "PARTIAL", 2)
     # A malformed legacy payload is skipped with its defaults, never aborting boot.
     assert tuple(bad) == ("", "", "", 0)
-    assert versions == set(range(1, 24))
+    assert versions == set(range(1, 25))
     skipped = [
         record
         for record in caplog.records
@@ -1201,7 +1203,7 @@ def test_concurrent_initializes_upgrade_v19_idempotently(tmp_path: Path) -> None
     assert tuple(good) == ("HASH-V18", "2026-11-09T10:00:00.000Z", "PARTIAL", 2)
     # Exactly one recorded v19 upgrade; v20 and v21 are recorded on the same boot.
     assert versions == {19}
-    assert highest_version == 23
+    assert highest_version == 24
     assert immutable_triggers == 1
     assert journal_mode.lower() == "wal"
 
@@ -1689,7 +1691,7 @@ def test_populated_v20_database_upgrades_to_v21_preserving_every_row(
     finally:
         connection.close()
 
-    assert to_version == 23
+    assert to_version == 24
     assert {20, 21} <= versions
     # Every populated row survives the rebuild: one row in every table.
     assert counts == {
@@ -2150,7 +2152,7 @@ def test_v21_database_migrates_to_v22_with_the_journal_tables(tmp_path: Path) ->
     finally:
         connection.close()
 
-    assert version == 23
+    assert version == 24
     assert {"trade_logs", "position_events"} <= tables
     assert {
         "trade_logs_closed",
@@ -2391,7 +2393,7 @@ def test_v22_database_migrates_to_v23_preserving_events_and_funding_uniqueness(
     finally:
         connection.close()
 
-    assert version == 23
+    assert version == 24
     assert "funding_accruals" in tables
     assert "reports_symbol_generated" in report_indexes
     assert "position_events_position_at" not in event_indexes
@@ -2456,7 +2458,7 @@ def test_a_stamped_v23_funding_table_without_side_size_is_repaired(tmp_path: Pat
         columns = {str(row[1]) for row in connection.execute("PRAGMA table_info(funding_accruals)")}
         version = connection.execute("SELECT MAX(version) FROM schema_migrations").fetchone()[0]
     assert {"side", "size"} <= columns
-    assert version == 23
+    assert version == 24
 
 
 def test_ensure_funding_accruals_shape_rolls_back_a_failed_repair(
@@ -2495,3 +2497,77 @@ def test_ensure_funding_accruals_shape_rolls_back_a_failed_repair(
         assert "side" not in columns
     finally:
         connection.close()
+
+
+def test_v23_database_reseeds_the_management_family_on_upgrade_to_v24(
+    tmp_path: Path,
+) -> None:
+    """A v23-stamped DB re-seeds MANAGEMENT v1 without touching operator edits."""
+    settings = Settings(env="test", port=8765, data_dir=tmp_path / "data")
+    SqliteStore(settings).initialize()
+
+    connection = sqlite3.connect(database_path(settings))
+    try:
+        # An operator promoted a custom analysis v2 to active; it must survive.
+        connection.execute(
+            "UPDATE prompt_versions SET is_active = 0, status = 'SUPERSEDED' "
+            "WHERE prompt_id = 'analysis' AND version = 1"
+        )
+        connection.execute(
+            "INSERT INTO prompt_versions ("
+            "prompt_id, version, body, body_hash, is_active, created_at, "
+            "system_prompt_id, system_prompt_version, system_body, system_body_hash, "
+            "required_variables_json, knowledge_artifact_hash, status, author, reason, "
+            "is_default) VALUES ("
+            "'analysis', 2, 'CUSTOM V2', 'CUSTOMHASH', 1, 't', "
+            "'analysis:system', 1, '', '', '[]', NULL, 'ACTIVE', 'operator', 'custom', 0)"
+        )
+        connection.execute(
+            "UPDATE prompt_templates SET active_version = 2 WHERE prompt_id = 'analysis'"
+        )
+        # Downgrade to v23: drop the slice-25 family and the v24 stamp.
+        connection.execute(
+            "DELETE FROM prompt_versions WHERE prompt_id IN ('management', 'management:system')"
+        )
+        connection.execute(
+            "DELETE FROM prompt_templates WHERE prompt_id IN ('management', 'management:system')"
+        )
+        connection.execute("DELETE FROM schema_migrations WHERE version = 24")
+        connection.commit()
+    finally:
+        connection.close()
+
+    store = SqliteStore(settings)
+    store.initialize()
+    store.initialize()  # idempotent re-initialize
+
+    connection = sqlite3.connect(database_path(settings))
+    try:
+        templates = {
+            row[0]
+            for row in connection.execute("SELECT prompt_id FROM prompt_templates ORDER BY 1")
+        }
+        management_versions = connection.execute(
+            "SELECT version, is_active, status FROM prompt_versions "
+            "WHERE prompt_id = 'management' ORDER BY version"
+        ).fetchall()
+        management_active = connection.execute(
+            "SELECT active_version FROM prompt_templates WHERE prompt_id = 'management'"
+        ).fetchone()[0]
+        analysis_active = connection.execute(
+            "SELECT active_version FROM prompt_templates WHERE prompt_id = 'analysis'"
+        ).fetchone()[0]
+        analysis_v2 = connection.execute(
+            "SELECT body FROM prompt_versions WHERE prompt_id = 'analysis' AND version = 2"
+        ).fetchone()[0]
+        versions = {row[0] for row in connection.execute("SELECT version FROM schema_migrations")}
+    finally:
+        connection.close()
+
+    assert {"management", "management:system"} <= templates
+    assert management_active == 1
+    assert management_versions == [(1, 1, "ACTIVE")]
+    # The operator's active non-v1 version is preserved untouched.
+    assert analysis_active == 2
+    assert analysis_v2 == "CUSTOM V2"
+    assert versions == set(range(1, 25))

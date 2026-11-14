@@ -13,13 +13,18 @@ from decimal import Decimal
 
 from oft.application.kill_switch import KillSwitch, record_audit
 from oft.application.paper_account import compute_equity
-from oft.application.paper_broker import BrokerResult, OrderIntent, PaperBroker
+from oft.application.paper_broker import (
+    REDUCE_ONLY_PURPOSES,
+    BrokerResult,
+    OrderIntent,
+    PaperBroker,
+)
 from oft.domain.risk import RiskRequest, verdict_inputs_hash
 from oft.domain.time import utc_timestamp
 from oft.ports.clock import ClockPort
 from oft.ports.store import OmsConflictError, RiskVerdictRecord, StorePort
 
-_RISK_REDUCING_PURPOSES = frozenset({"EXIT"})
+_RISK_REDUCING_PURPOSES = REDUCE_ONLY_PURPOSES
 
 
 def _decimal_or_none(value: object) -> Decimal | None:
@@ -63,7 +68,7 @@ class IntentClassification:
 
 
 def classify_intent(intent: OrderIntent) -> IntentClassification:
-    """A reduce-only EXIT reduces risk; everything else increases it."""
+    """A reduce-only exit/partial/full close reduces risk; everything else increases it."""
     if intent.reduce_only and intent.purpose.upper() in _RISK_REDUCING_PURPOSES:
         return IntentClassification(True, "reduce-only exit")
     return IntentClassification(False, "risk-increasing intent")
@@ -185,8 +190,9 @@ class ExecutionGateway:
 
         An exit does not need the entry trigger/stop/equity-digest binding: the
         verdict only has to belong to the same decision, cover the exit
-        quantity, name the same symbol/side as the position, and the intent must
-        be reduce-only against an OPEN position that carries a source trigger.
+        quantity, name the same symbol/side as the position, and the verdict's
+        trigger must equal the position's own source trigger. The intent must be
+        reduce-only against an OPEN position that carries a source trigger.
         ADR-0006 also forbids trusting the caller: the submitted close mark must
         equal the position's recorded mark, so an exit cannot be priced from an
         invented or stale price that the position row does not carry.

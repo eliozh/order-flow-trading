@@ -1,0 +1,23 @@
+{
+  "decision_type": "POSITION_MANAGEMENT",
+  "subject": {
+    "symbol": "BTCUSDT",
+    "timeframe": "4h",
+    "as_of": "2026-10-08T00:01:00.000Z"
+  },
+  "confidence": 0.61,
+  "rationale": "Reduce half and extend the profit targets as the short trend continues.",
+  "caveats": [],
+  "analysis": null,
+  "opportunity": null,
+  "entry_recheck": null,
+  "position_management": {
+    "action": "PARTIAL_CLOSE",
+    "close_fraction": 0.5,
+    "add_risk_pct": null,
+    "new_stop_price": null,
+    "new_targets": ["69000.00", "68000.00"],
+    "rationale": "Take half off and extend the profit targets lower.",
+    "urgency": "MEDIUM"
+  }
+}

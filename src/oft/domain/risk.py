@@ -26,6 +26,8 @@ from decimal import ROUND_DOWN, Decimal
 from enum import StrEnum
 from typing import Any
 
+from oft.domain.oms import PositionSide
+
 RISK_VERDICT_TTL_SECONDS = 30
 RISK_CAPS_STATE_KEY = "risk_caps"
 MAX_LEVERAGE_CEILING = 125.0
@@ -52,6 +54,36 @@ class Verdict(StrEnum):
     ALLOW = "ALLOW"
     REDUCE = "REDUCE"
     BLOCK = "BLOCK"
+
+
+class ManagementAction(StrEnum):
+    """The closed position-management action vocabulary (slice 25)."""
+
+    HOLD = "HOLD"
+    PARTIAL_CLOSE = "PARTIAL_CLOSE"
+    FULL_CLOSE = "FULL_CLOSE"
+    ADD = "ADD"
+
+
+class ManagementStatus(StrEnum):
+    """The closed outcome vocabulary of one management request."""
+
+    NO_ACTION = "NO_ACTION"
+    EXECUTED = "EXECUTED"
+    BLOCKED = "BLOCKED"
+
+
+class StopChange(StrEnum):
+    """How a management recommendation changes the protective stop."""
+
+    NONE = "NONE"
+    TIGHTEN = "TIGHTEN"
+    LOOSEN = "LOOSEN"
+    REMOVE = "REMOVE"
+    SET = "SET"
+
+
+_RISK_REDUCING_MANAGEMENT = frozenset({ManagementAction.PARTIAL_CLOSE, ManagementAction.FULL_CLOSE})
 
 
 class BindingCap(StrEnum):
@@ -228,6 +260,136 @@ def apply_persisted_caps(base: RiskCaps, payload: Mapping[str, Any]) -> RiskCaps
     partial = RiskCaps.from_state(payload)
     values = {field: getattr(partial, field) for field in CAP_FIELDS if field in payload}
     return replace(base, **values)
+
+
+@dataclass(frozen=True)
+class ManagementClassification:
+    """Whether a management recommendation increases or reduces risk (ADR-0006).
+
+    The kill switch permits risk-reducing management (a reduce-only close or a
+    tighter stop) and blocks risk-increasing management (an add or a looser or
+    removed stop). ``HOLD`` with no change writes no order (it still records its
+    management-history entry and audit) and is never blocked.
+    """
+
+    risk_increasing: bool
+    stop_change: StopChange
+    reasons: tuple[str, ...]
+
+    def __post_init__(self) -> None:
+        # A loosened or removed stop is risk-increasing by definition; a
+        # classification that disagrees could bypass the kill switch and the
+        # management path's stop guard.
+        if not self.risk_increasing and self.stop_change in (StopChange.LOOSEN, StopChange.REMOVE):
+            raise ValueError("a loosened or removed stop must be risk-increasing")
+
+
+def _stop_change(
+    position_side: PositionSide,
+    current_stop: Decimal | None,
+    new_stop: Decimal | None,
+) -> StopChange:
+    # The provider schema cannot distinguish "no new stop" from "remove the
+    # stop", so a null ``new_stop_price`` means "leave the stop unchanged".
+    # Removal is an explicit caller decision (``remove_stop``).
+    if new_stop is None:
+        return StopChange.NONE
+    if current_stop is None:
+        return StopChange.SET
+    if new_stop == current_stop:
+        return StopChange.NONE
+    if position_side is PositionSide.LONG:
+        return StopChange.TIGHTEN if new_stop > current_stop else StopChange.LOOSEN
+    return StopChange.TIGHTEN if new_stop < current_stop else StopChange.LOOSEN
+
+
+def classify_management_intent(
+    *,
+    action: str,
+    position_side: PositionSide,
+    current_stop: Decimal | None,
+    new_stop_price: Decimal | None,
+    remove_stop: bool = False,
+) -> ManagementClassification:
+    """Classify a management recommendation for the kill-switch policy.
+
+    A full close ignores any stop move: the position is leaving, so the stop no
+    longer carries exposure. ``SET`` (a stop added to a stop-less position) and
+    ``TIGHTEN`` reduce risk; ``LOOSEN`` and an explicit ``remove_stop`` increase
+    it. A null ``new_stop_price`` is "no change", never a removal.
+    """
+    normalized = action.strip().upper()
+    if normalized not in ManagementAction.__members__:
+        raise ValueError(f"unknown management action {action!r}")
+    try:
+        side = PositionSide(position_side)
+    except ValueError as exc:
+        raise ValueError("position_side must be LONG or SHORT") from exc
+    resolved = ManagementAction(normalized)
+    if resolved is ManagementAction.FULL_CLOSE:
+        change = StopChange.NONE
+    elif remove_stop:
+        change = StopChange.REMOVE
+    else:
+        change = _stop_change(side, current_stop, new_stop_price)
+    reasons: list[str] = []
+    increasing = False
+    if resolved is ManagementAction.ADD:
+        increasing = True
+        reasons.append("an add increases exposure")
+    if change in (StopChange.LOOSEN, StopChange.REMOVE):
+        increasing = True
+        reasons.append("loosening or removing the stop increases risk")
+    elif change is StopChange.TIGHTEN:
+        reasons.append("a tighter stop reduces risk")
+    elif change is StopChange.SET:
+        reasons.append("setting a protective stop reduces risk")
+    if resolved in _RISK_REDUCING_MANAGEMENT:
+        reasons.append("a reduce-only close reduces risk")
+    return ManagementClassification(
+        risk_increasing=increasing,
+        stop_change=change,
+        reasons=tuple(reasons),
+    )
+
+
+def management_requires_risk_verdict(action: str) -> bool:
+    """Only an add increases exposure, so only an add needs a fresh verdict."""
+    return action.strip().upper() == ManagementAction.ADD.value
+
+
+def management_is_exit(action: str) -> bool:
+    """A partial or full close is a risk-reducing exit; HOLD and ADD are not."""
+    return action.strip().upper() in {
+        ManagementAction.PARTIAL_CLOSE.value,
+        ManagementAction.FULL_CLOSE.value,
+    }
+
+
+def add_risk_quantity(
+    *,
+    equity: Decimal,
+    add_risk_pct: float,
+    mark_price: Decimal,
+    stop_price: Decimal,
+) -> Decimal | None:
+    """The add size a risk percentage implies at the stop distance, or ``None``.
+
+    The result is the LLM's *requested* size. The deterministic gate still takes
+    the stricter of this size and every configured cap; this helper never
+    grants authority, it only turns the advisory percentage into a quantity.
+    """
+    if not math.isfinite(add_risk_pct) or add_risk_pct <= 0 or add_risk_pct > 100:
+        return None
+    if not equity.is_finite() or equity <= 0:
+        return None
+    if mark_price <= 0 or stop_price <= 0:
+        return None
+    distance = abs(mark_price - stop_price)
+    if distance <= 0:
+        return None
+    budget = equity * Decimal(str(add_risk_pct)) / Decimal("100")
+    return budget / distance
 
 
 @dataclass(frozen=True)

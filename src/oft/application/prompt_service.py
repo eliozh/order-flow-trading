@@ -536,10 +536,10 @@ class PromptService:
     def active_for(self, role: str | PromptRole) -> ActivePrompt:
         """The explicitly active version for a role.
 
-        Seeded roles (ANALYSIS/ENTRY_RECHECK) fail closed when their template
-        row or active version is unreadable: silently substituting the built-in
-        v1 would bypass an operator's activation and record false provenance.
-        Only never-seeded roles (MANAGEMENT/REVIEW) use the built-in default,
+        Seeded roles (ANALYSIS/ENTRY_RECHECK/MANAGEMENT) fail closed when their
+        template row or active version is unreadable: silently substituting the
+        built-in v1 would bypass an operator's activation and record false
+        provenance. Only never-seeded roles (REVIEW) use the built-in default,
         and that fallback is logged.
         """
         resolved_role = _resolve_role(role)
