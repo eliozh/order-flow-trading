@@ -287,7 +287,7 @@ def _render_decision_card(card: dict[str, Any]) -> str:
         f"TRIGGER {trigger.get('trigger_id', '-')} · {trigger.get('symbol', '-')}"
         f" · {trigger.get('side', '-')} · {trigger.get('status', '-')} · CALC",
         f"LLM {llm.get('decision', '-')} · {llm.get('validation_status', '-')}"
-        f" · confidence {llm.get('confidence', '-')} · LLM",
+        f" · confidence {llm.get('confidence', '-')}",
     ]
     provenance = llm.get("provenance")
     if isinstance(provenance, dict):
@@ -298,6 +298,8 @@ def _render_decision_card(card: dict[str, Any]) -> str:
             f" v{provenance.get('prompt_version', '-')}"
             f" · cost {cost.get('amount_usd', '-')} {cost.get('currency', 'USD')}"
         )
+    else:
+        lines.append("  provenance unavailable")
     lines.extend(
         [
             f"RISK {verdict or '-'} · binding {risk.get('binding_cap', '-')} · CALC",
@@ -305,7 +307,10 @@ def _render_decision_card(card: dict[str, Any]) -> str:
         ]
     )
     if card.get("refreshed"):
-        lines.append("refreshed · the persisted decision was replaced explicitly")
+        lines.append(
+            "refreshed · a new persisted decision now supersedes the previous one, "
+            "which is retained for the audit trail"
+        )
     reasons = risk.get("reasons") or []
     for reason in reasons:
         lines.append(f"  reason: {reason}")
@@ -340,7 +345,10 @@ def trigger_recheck(
         bool,
         typer.Option(
             "--refresh",
-            help="Explicitly re-run the provider; the default reuses the persisted decision.",
+            help=(
+                "Supersede the persisted decision with a new provider run; without it a "
+                "recorded decision is reused (a trigger with none bootstraps its first)."
+            ),
         ),
     ] = False,
     idempotency_key: Annotated[

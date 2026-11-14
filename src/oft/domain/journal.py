@@ -34,7 +34,7 @@ from collections.abc import Mapping, Sequence
 from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
 from decimal import ROUND_DOWN, Decimal
-from typing import Any
+from typing import Any, Literal
 
 EIGHT_DP = Decimal("0.00000001")
 ZERO = Decimal("0")
@@ -126,6 +126,22 @@ class PeriodWindow:
     end: str
     basis: str = "closed_at"
 
+    def __post_init__(self) -> None:
+        if not isinstance(self.label, str) or not self.label.strip():
+            raise JournalError("VALIDATION_FAILED", "the period label must be a non-empty string")
+        start = _parse_timestamp(self.start)
+        end = _parse_timestamp(self.end)
+        if start is None or end is None:
+            raise JournalError(
+                "VALIDATION_FAILED", "the period window bounds must be parseable timestamps"
+            )
+        if start > end:
+            raise JournalError(
+                "VALIDATION_FAILED", "the period window start must not be after its end"
+            )
+        if self.basis != "closed_at":
+            raise JournalError("VALIDATION_FAILED", f"unsupported period basis {self.basis!r}")
+
     def to_contract(self) -> dict[str, Any]:
         return {
             "label": self.label,
@@ -136,12 +152,136 @@ class PeriodWindow:
 
 
 @dataclass(frozen=True)
+class JournalAvgR:
+    """Average R with its sample and excluded-null counts."""
+
+    value: float | None
+    samples: int
+    excluded_null_r: int
+
+    def __post_init__(self) -> None:
+        if self.samples < 0 or self.excluded_null_r < 0:
+            raise ValueError("average-R counts must be non-negative")
+        if (self.value is not None) != (self.samples > 0):
+            raise ValueError("average-R value must be present iff samples > 0")
+
+    def to_contract(self) -> dict[str, Any]:
+        return {
+            "value": self.value,
+            "samples": self.samples,
+            "excluded_null_r": self.excluded_null_r,
+        }
+
+
+@dataclass(frozen=True)
+class JournalTotals:
+    """The rendered money sums; ``None`` means at least one term was unreadable."""
+
+    gross_pnl_usd: str | None
+    fees_usd: str | None
+    funding_usd: str | None
+    net_pnl_usd: str | None
+
+    def to_contract(self) -> dict[str, Any]:
+        return {
+            "gross_pnl_usd": self.gross_pnl_usd,
+            "fees_usd": self.fees_usd,
+            "funding_usd": self.funding_usd,
+            "net_pnl_usd": self.net_pnl_usd,
+        }
+
+
+@dataclass(frozen=True)
+class JournalStats:
+    """A discriminated, invariant-checked statistics result.
+
+    ``DEFINED`` requires a positive sample, buckets that sum to it, non-null
+    win-rate/expectancy, and an average-R split that accounts for every sample.
+    ``UNDEFINED`` requires every metric and total to be empty -- never a
+    fabricated zero.
+    """
+
+    status: Literal["DEFINED", "UNDEFINED"]
+    reason: str | None
+    period: PeriodWindow | None
+    sample_size: int
+    denominator: int
+    exclusions: dict[str, int]
+    definitions: dict[str, str]
+    wins: int
+    losses: int
+    ties: int
+    win_rate: float | None
+    expectancy_usd: str | None
+    avg_r: JournalAvgR
+    totals: JournalTotals
+    data_quality: Literal["COMPLETE", "PARTIAL", "MISSING"]
+
+    def __post_init__(self) -> None:
+        if self.status not in {"DEFINED", "UNDEFINED"}:
+            raise ValueError(f"invalid statistics status {self.status!r}")
+        if self.data_quality not in {"COMPLETE", "PARTIAL", "MISSING"}:
+            raise ValueError(f"invalid data quality {self.data_quality!r}")
+        if self.status == "DEFINED":
+            if self.sample_size <= 0:
+                raise ValueError("DEFINED statistics require a positive sample size")
+            if self.wins + self.losses + self.ties != self.sample_size:
+                raise ValueError("wins + losses + ties must equal sample_size")
+            if self.win_rate is None or self.expectancy_usd is None:
+                raise ValueError("DEFINED statistics require a win rate and expectancy")
+            if self.avg_r.samples + self.avg_r.excluded_null_r != self.sample_size:
+                raise ValueError("average-R samples must account for every eligible trade")
+            return
+        if self.sample_size != 0 or self.wins or self.losses or self.ties:
+            raise ValueError("UNDEFINED statistics require a zero sample and empty buckets")
+        if self.win_rate is not None or self.expectancy_usd is not None:
+            raise ValueError("UNDEFINED statistics must not fabricate a metric")
+        if (
+            self.avg_r.value is not None
+            or self.avg_r.samples != 0
+            or self.avg_r.excluded_null_r != 0
+        ):
+            raise ValueError("UNDEFINED statistics require an empty average-R result")
+        totals = self.totals
+        if any(
+            value is not None
+            for value in (
+                totals.gross_pnl_usd,
+                totals.fees_usd,
+                totals.funding_usd,
+                totals.net_pnl_usd,
+            )
+        ):
+            raise ValueError("UNDEFINED statistics require empty totals")
+
+    def to_contract(self) -> dict[str, Any]:
+        """The stable JSON shape shared by the API, the CLI, and the export."""
+        return {
+            "period": None if self.period is None else self.period.to_contract(),
+            "sample_size": self.sample_size,
+            "denominator": self.denominator,
+            "exclusions": dict(self.exclusions),
+            "definitions": dict(self.definitions),
+            "status": self.status,
+            "reason": self.reason,
+            "wins": self.wins,
+            "losses": self.losses,
+            "ties": self.ties,
+            "win_rate": self.win_rate,
+            "expectancy_usd": self.expectancy_usd,
+            "avg_r": self.avg_r.to_contract(),
+            "totals": self.totals.to_contract(),
+            "data_quality": self.data_quality,
+        }
+
+
+@dataclass(frozen=True)
 class CsvExport:
-    """A rendered CSV document plus its row and neutralization counts."""
+    """A rendered CSV document plus its row and neutralized-cell counts."""
 
     text: str
     rows: int
-    neutralized: int
+    neutralized_cells: int
 
 
 # -- parsing ---------------------------------------------------------------
@@ -252,7 +392,8 @@ def _money_text(value: Decimal) -> str | None:
     return format(quantized, "f")
 
 
-def _decimal_text(value: object) -> str | None:
+def decimal_text(value: object) -> str | None:
+    """Render an exact decimal string, or ``None`` when the value is unusable."""
     parsed = _decimal(value)
     return None if parsed is None else format(parsed, "f")
 
@@ -280,7 +421,7 @@ def compute_stats(
     *,
     open_positions: int = 0,
     window: PeriodWindow | None = None,
-) -> dict[str, Any]:
+) -> JournalStats:
     """Compute the documented statistics from persisted closed-trade payloads."""
     exclusions = {
         "open_positions": max(0, int(open_positions)),
@@ -288,8 +429,17 @@ def compute_stats(
         "unreadable_trades": 0,
         "outside_period": 0,
     }
-    start_dt = _parse_timestamp(window.start) if window is not None else None
-    end_dt = _parse_timestamp(window.end) if window is not None else None
+    bounds: tuple[datetime, datetime] | None = None
+    if window is not None:
+        start_dt = _parse_timestamp(window.start)
+        end_dt = _parse_timestamp(window.end)
+        if start_dt is None or end_dt is None:
+            # A window whose bounds do not parse must never silently classify
+            # every row as outside the period.
+            raise JournalError(
+                "VALIDATION_FAILED", "the period window bounds must be parseable timestamps"
+            )
+        bounds = (start_dt, end_dt)
     eligible: list[tuple[Mapping[str, Any], Decimal]] = []
     for payload in trades:
         if not isinstance(payload, Mapping):
@@ -304,40 +454,35 @@ def compute_stats(
         if quality != "COMPLETE" or _has_partial_tag(payload):
             exclusions["partial_trades"] += 1
             continue
-        if window is not None and (
-            start_dt is None or end_dt is None or not (start_dt <= closed_at <= end_dt)
-        ):
+        if bounds is not None and not (bounds[0] <= closed_at <= bounds[1]):
             exclusions["outside_period"] += 1
             continue
         eligible.append((payload, net))
 
     sample_size = len(eligible)
-    base: dict[str, Any] = {
-        "period": None if window is None else window.to_contract(),
-        "sample_size": sample_size,
-        "denominator": sample_size,
-        "exclusions": exclusions,
-        "definitions": dict(DEFINITIONS),
-    }
     if sample_size == 0:
-        return {
-            **base,
-            "status": "UNDEFINED",
-            "reason": _undefined_reason(exclusions, total_rows=len(trades)),
-            "wins": 0,
-            "losses": 0,
-            "ties": 0,
-            "win_rate": None,
-            "expectancy_usd": None,
-            "avg_r": {"value": None, "samples": 0, "excluded_null_r": 0},
-            "totals": {
-                "gross_pnl_usd": None,
-                "fees_usd": None,
-                "funding_usd": None,
-                "net_pnl_usd": None,
-            },
-            "data_quality": "MISSING",
-        }
+        return JournalStats(
+            status="UNDEFINED",
+            reason=_undefined_reason(exclusions, total_rows=len(trades)),
+            period=window,
+            sample_size=0,
+            denominator=0,
+            exclusions=exclusions,
+            definitions=dict(DEFINITIONS),
+            wins=0,
+            losses=0,
+            ties=0,
+            win_rate=None,
+            expectancy_usd=None,
+            avg_r=JournalAvgR(value=None, samples=0, excluded_null_r=0),
+            totals=JournalTotals(
+                gross_pnl_usd=None,
+                fees_usd=None,
+                funding_usd=None,
+                net_pnl_usd=None,
+            ),
+            data_quality="MISSING",
+        )
 
     wins = losses = ties = 0
     net_total = ZERO
@@ -375,33 +520,48 @@ def compute_stats(
     expectancy = (net_total / Decimal(sample_size)).quantize(EIGHT_DP, rounding=ROUND_DOWN)
     expectancy_text = _money_text(expectancy)
     net_total_text = _money_text(net_total)
+    gross_text = _money_text(gross_total) if gross_complete else None
+    fees_text = _money_text(fees_total) if fees_complete else None
+    funding_text = _money_text(funding_total) if funding_complete else None
+    # Quality is symmetric: a rendered component that cannot be quantized is a
+    # named degradation, not a silently COMPLETE total.
     if net_total_text is None:
         degraded = True
-    avg_r: float | None = None
+    if gross_complete and gross_text is None:
+        degraded = True
+    if fees_complete and fees_text is None:
+        degraded = True
+    if funding_complete and funding_text is None:
+        degraded = True
+    avg_r_value: float | None = None
     if r_values:
-        avg_r = sum(r_values) / len(r_values)
-    return {
-        **base,
-        "status": "DEFINED",
-        "reason": None,
-        "wins": wins,
-        "losses": losses,
-        "ties": ties,
-        "win_rate": wins / sample_size,
-        "expectancy_usd": expectancy_text,
-        "avg_r": {
-            "value": avg_r,
-            "samples": len(r_values),
-            "excluded_null_r": null_r,
-        },
-        "totals": {
-            "gross_pnl_usd": _money_text(gross_total) if gross_complete else None,
-            "fees_usd": _money_text(fees_total) if fees_complete else None,
-            "funding_usd": _money_text(funding_total) if funding_complete else None,
-            "net_pnl_usd": net_total_text,
-        },
-        "data_quality": "PARTIAL" if degraded else "COMPLETE",
-    }
+        avg_r_value = sum(r_values) / len(r_values)
+    return JournalStats(
+        status="DEFINED",
+        reason=None,
+        period=window,
+        sample_size=sample_size,
+        denominator=sample_size,
+        exclusions=exclusions,
+        definitions=dict(DEFINITIONS),
+        wins=wins,
+        losses=losses,
+        ties=ties,
+        win_rate=wins / sample_size,
+        expectancy_usd=expectancy_text,
+        avg_r=JournalAvgR(
+            value=avg_r_value,
+            samples=len(r_values),
+            excluded_null_r=null_r,
+        ),
+        totals=JournalTotals(
+            gross_pnl_usd=gross_text,
+            fees_usd=fees_text,
+            funding_usd=funding_text,
+            net_pnl_usd=net_total_text,
+        ),
+        data_quality="PARTIAL" if degraded else "COMPLETE",
+    )
 
 
 def _accumulate(total: Decimal, complete: bool, value: object) -> tuple[Decimal, bool]:
@@ -492,13 +652,15 @@ def csv_document(trades: Sequence[Mapping[str, Any]]) -> CsvExport:
     buffer = io.StringIO()
     writer = csv.writer(buffer, lineterminator="\n")
     writer.writerow(CSV_COLUMNS)
-    neutralized = 0
+    neutralized_cells = 0
     for payload in trades:
         raw = _csv_raw(payload)
         cells = tuple(neutralize_csv_cell(value) for value in raw)
-        neutralized += sum(1 for before, after in zip(raw, cells, strict=True) if before != after)
+        neutralized_cells += sum(
+            1 for before, after in zip(raw, cells, strict=True) if before != after
+        )
         writer.writerow(cells)
-    return CsvExport(text=buffer.getvalue(), rows=len(trades), neutralized=neutralized)
+    return CsvExport(text=buffer.getvalue(), rows=len(trades), neutralized_cells=neutralized_cells)
 
 
 # -- signal vs outcome -----------------------------------------------------
@@ -513,9 +675,9 @@ def zone_vs_fill(entry_price: object, zone_low: object, zone_high: object) -> di
     if entry is None or entry <= 0:
         return {
             "status": "N/A",
-            "entry": _decimal_text(entry_price),
-            "zone_low": _decimal_text(zone_low),
-            "zone_high": _decimal_text(zone_high),
+            "entry": decimal_text(entry_price),
+            "zone_low": decimal_text(zone_low),
+            "zone_high": decimal_text(zone_high),
             "inside": None,
             "distance_bps": None,
             "reasons": ["the trade has no parseable entry average price"],
@@ -523,9 +685,9 @@ def zone_vs_fill(entry_price: object, zone_low: object, zone_high: object) -> di
     if low is None or high is None or low <= 0 or high <= 0 or low > high:
         return {
             "status": "N/A",
-            "entry": _decimal_text(entry),
-            "zone_low": _decimal_text(zone_low),
-            "zone_high": _decimal_text(zone_high),
+            "entry": decimal_text(entry),
+            "zone_low": decimal_text(zone_low),
+            "zone_high": decimal_text(zone_high),
             "inside": None,
             "distance_bps": None,
             "reasons": ["the source opportunity zone is missing or invalid"],
@@ -544,9 +706,9 @@ def zone_vs_fill(entry_price: object, zone_low: object, zone_high: object) -> di
         inside = False
     return {
         "status": status,
-        "entry": _decimal_text(entry),
-        "zone_low": _decimal_text(low),
-        "zone_high": _decimal_text(high),
+        "entry": decimal_text(entry),
+        "zone_low": decimal_text(low),
+        "zone_high": decimal_text(high),
         "inside": inside,
         "distance_bps": distance,
         "reasons": reasons,
@@ -606,12 +768,16 @@ __all__ = [
     "DEFINITIONS",
     "MAX_PERIOD_DAYS",
     "CsvExport",
+    "JournalAvgR",
     "JournalError",
+    "JournalStats",
+    "JournalTotals",
     "Period",
     "PeriodWindow",
     "compute_stats",
     "csv_document",
     "csv_row",
+    "decimal_text",
     "decision_vs_outcome",
     "neutralize_csv_cell",
     "parse_period",

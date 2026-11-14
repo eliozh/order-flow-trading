@@ -3,9 +3,11 @@
 from __future__ import annotations
 
 import json
+import logging
 import sqlite3
 import stat
 from datetime import UTC, datetime, timedelta
+from decimal import Decimal
 from pathlib import Path
 from types import SimpleNamespace
 from typing import Any
@@ -267,7 +269,7 @@ def test_csv_export_neutralizes_formulas_and_never_exports_prompts(
     assert result["format"] == "csv"
     assert result["rows"] == 1
     assert result["bytes"] > 0
-    assert result["neutralized"] >= 1
+    assert result["neutralized_cells"] >= 1
     text = path.read_text(encoding="utf-8")
     assert text.splitlines()[0].startswith("trade_id,position_id")
     assert "'=BTCUSDT" in text
@@ -466,3 +468,306 @@ def _corrupt_trade(tmp_path: Path, trade_id: str) -> None:
             ("{not-json", trade_id),
         )
         connection.commit()
+
+
+def _patch_position(tmp_path: Path, position_id: str, **changes: Any) -> None:
+    database = (tmp_path / "data") / "oft.db"
+    with sqlite3.connect(database) as connection:
+        row = connection.execute(
+            "SELECT payload_json FROM positions WHERE position_id = ?", (position_id,)
+        ).fetchone()
+        assert row is not None
+        payload = json.loads(row[0])
+        payload.update(changes)
+        connection.execute(
+            "UPDATE positions SET payload_json = ? WHERE position_id = ?",
+            (json.dumps(payload, sort_keys=True), position_id),
+        )
+        connection.commit()
+
+
+def _complete_trade(tmp_path: Path, trade: dict[str, Any]) -> None:
+    _patch_trade(
+        tmp_path,
+        trade["trade_id"],
+        data_quality={
+            "status": "COMPLETE",
+            "reasons": [],
+            "gaps": [],
+            "last_event_at": trade["closed_at"],
+            "coverage_start": trade["opened_at"],
+        },
+        outcome_tags=["LOSS", "STOPPED"],
+    )
+
+
+def test_open_position_exclusions_follow_the_symbol_scope(tmp_path: Path) -> None:
+    _settings_value, container, _position, trade = _closed_trade(tmp_path)
+    with sqlite3.connect((tmp_path / "data") / "oft.db") as connection:
+        connection.execute(
+            "UPDATE positions SET state = 'OPEN' WHERE position_id = ?",
+            (trade["position_id"],),
+        )
+        connection.execute(
+            "INSERT INTO positions "
+            "(position_id, account_id, environment, symbol, state, opened_at, payload_json) "
+            "VALUES (?, ?, ?, ?, ?, ?, ?)",
+            (
+                "POS-ETH-OPEN",
+                "ACC-PAPER",
+                "PAPER",
+                "ETHUSDT",
+                "OPEN",
+                "2026-11-14T10:00:00.000Z",
+                json.dumps({}),
+            ),
+        )
+        connection.commit()
+    service = _service(container)
+
+    assert service.stats()["exclusions"]["open_positions"] == 2
+    assert service.stats(symbol="BTCUSDT")["exclusions"]["open_positions"] == 1
+    assert service.stats(symbol="ETHUSDT")["exclusions"]["open_positions"] == 1
+
+
+def test_all_resolved_sides_make_the_comparison_complete(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    _settings_value, container, position, trade = _closed_trade(tmp_path)
+    service = _service(container)
+    side = str(trade["side"])
+    stop = Decimal(str(position["stop_price"]))
+    target = Decimal(str(position["target_prices"][0]))
+    if side == "LONG":
+        low = stop + (target - stop) / 3
+        high = stop + 2 * (target - stop) / 3
+    else:
+        low = target + (stop - target) / 3
+        high = target + 2 * (stop - target) / 3
+    bar = {"bar_end": trade["closed_at"], "low": str(low), "high": str(high)}
+    monkeypatch.setattr(
+        service,
+        "_window_bars",
+        lambda *_args, **_kwargs: recorded_bars.WindowBars(rows=(bar,)),
+    )
+
+    comparison = service.compare(trade["trade_id"])
+
+    assert comparison["zone"]["status"] in {"INSIDE", "ABOVE_ZONE", "BELOW_ZONE"}
+    assert comparison["slippage"]["status"] == "OK"
+    assert comparison["first_touch"]["status"] == "OK"
+    assert comparison["first_touch"]["ambiguous"] is False
+    assert comparison["decision"]["status"] == "OK"
+    assert comparison["data_quality"] == "COMPLETE"
+    assert comparison["reasons"] == []
+
+
+def test_compare_degrades_each_unavailable_side_with_a_reason(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    _settings_value, container, _position, trade = _closed_trade(tmp_path)
+    service = _service(container)
+
+    monkeypatch.setattr(
+        container.store,
+        "get_opportunity",
+        lambda *_args: SimpleNamespace(payload_json=json.dumps({"zone": [], "source": {}})),
+    )
+    non_mapping_zone = service.compare(trade["trade_id"])
+    assert non_mapping_zone["zone"]["status"] == "N/A"
+    assert non_mapping_zone["zone"]["reasons"]
+
+
+def test_compare_degrades_an_unusable_reference_price(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    _settings_value, container, _position, trade = _closed_trade(tmp_path)
+    service = _service(container)
+    monkeypatch.setattr(
+        container.store,
+        "get_report",
+        lambda *_args: SimpleNamespace(
+            snapshot_json=json.dumps({"last_price": "oops", "as_of": "2026-11-14T11:00:00Z"})
+        ),
+    )
+
+    comparison = service.compare(trade["trade_id"])
+
+    assert comparison["slippage"]["status"] == "N/A"
+    assert any("reference price" in reason for reason in comparison["slippage"]["reasons"])
+    assert comparison["slippage"]["entry_avg_price"] is not None
+    assert comparison["slippage"]["reference_price"] is None
+
+
+def test_compare_degrades_a_missing_position_and_missing_stop_target(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    _settings_value, container, position, trade = _closed_trade(tmp_path)
+    service = _service(container)
+
+    monkeypatch.setattr(container.store, "get_position", lambda *_args: None)
+    missing = service.compare(trade["trade_id"])
+    assert missing["first_touch"]["status"] == "N/A"
+    assert missing["first_touch"]["reasons"] == ["the closed position payload is unavailable"]
+
+    monkeypatch.undo()
+    _patch_position(
+        tmp_path,
+        position["position_id"],
+        stop_price=None,
+        target_prices=[],
+    )
+    no_levels = _service(container).compare(trade["trade_id"])
+    assert no_levels["first_touch"]["status"] == "N/A"
+    assert no_levels["first_touch"]["reasons"] == [
+        "the position records neither a stop nor a target"
+    ]
+
+
+def test_compare_degrades_a_first_touch_value_error(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    _settings_value, container, _position, trade = _closed_trade(tmp_path)
+    service = _service(container)
+    bar = {"bar_end": trade["closed_at"], "low": "0.01", "high": "999999"}
+    monkeypatch.setattr(
+        service,
+        "_window_bars",
+        lambda *_args, **_kwargs: recorded_bars.WindowBars(rows=(bar,)),
+    )
+
+    def explode(*_args: object, **_kwargs: object) -> None:
+        raise ValueError("unusable bar range")
+
+    monkeypatch.setattr("oft.application.journal_service.first_touch", explode)
+    comparison = service.compare(trade["trade_id"])
+
+    assert comparison["first_touch"]["status"] == "N/A"
+    assert any(
+        "first-touch evaluation is unavailable" in reason
+        for reason in comparison["first_touch"]["reasons"]
+    )
+
+
+def test_a_corrupt_stop_with_a_valid_target_is_partial_and_uses_the_target(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    _settings_value, container, position, trade = _closed_trade(tmp_path)
+    _patch_position(tmp_path, position["position_id"], stop_price="not-a-number")
+    service = _service(container)
+    target = Decimal(str(position["target_prices"][0]))
+    if str(trade["side"]) == "LONG":
+        bar = {
+            "bar_end": trade["closed_at"],
+            "low": str(target - Decimal("1000")),
+            "high": str(target + Decimal("1000")),
+        }
+    else:
+        bar = {
+            "bar_end": trade["closed_at"],
+            "low": str(target - Decimal("1000")),
+            "high": str(target + Decimal("1000")),
+        }
+    monkeypatch.setattr(
+        service,
+        "_window_bars",
+        lambda *_args, **_kwargs: recorded_bars.WindowBars(rows=(bar,)),
+    )
+
+    comparison = service.compare(trade["trade_id"])
+
+    assert comparison["first_touch"]["status"] == "PARTIAL"
+    assert comparison["first_touch"]["kind"] == "TARGET"
+    assert "the position stop price is unreadable" in comparison["first_touch"]["reasons"]
+
+
+def test_a_corrupt_stop_without_a_target_is_na_with_a_named_reason(
+    tmp_path: Path,
+) -> None:
+    _settings_value, container, position, trade = _closed_trade(tmp_path)
+    _patch_position(
+        tmp_path,
+        position["position_id"],
+        stop_price="not-a-number",
+        target_prices=[],
+    )
+
+    comparison = _service(container).compare(trade["trade_id"])
+
+    assert comparison["first_touch"]["status"] == "N/A"
+    assert comparison["first_touch"]["reasons"] == ["the position stop price is unreadable"]
+
+
+def test_a_period_export_includes_only_in_window_trades(tmp_path: Path) -> None:
+    _settings_value, container, _position, trade = _closed_trade(tmp_path)
+    service = _service(container)
+
+    inside = service.export("csv", period="8w")
+    assert inside["rows"] == 1
+
+    _patch_trade(
+        tmp_path,
+        trade["trade_id"],
+        closed_at=(NOW - timedelta(days=10)).strftime("%Y-%m-%dT%H:%M:%S.000Z"),
+    )
+    outside = service.export("json", period="1d")
+    assert outside["rows"] == 0
+    document = json.loads(Path(outside["path"]).read_text(encoding="utf-8"))
+    assert document["trades"] == []
+
+
+def test_an_export_filters_by_symbol(tmp_path: Path) -> None:
+    _settings_value, container, _position, _trade = _closed_trade(tmp_path)
+    service = _service(container)
+
+    matching = service.export("csv", symbol="btcusdt")
+    assert matching["rows"] == 1
+
+    other = service.export("json", symbol="ETHUSDT")
+    assert other["rows"] == 0
+
+
+def test_an_unparseable_closed_at_is_counted_and_logged(
+    tmp_path: Path, caplog: pytest.LogCaptureFixture
+) -> None:
+    _settings_value, container, _position, trade = _closed_trade(tmp_path)
+    service = _service(container)
+    _patch_trade(tmp_path, trade["trade_id"], closed_at="not-a-timestamp")
+
+    with caplog.at_level(logging.WARNING, logger="oft.application.journal_service"):
+        result = service.export("csv", period="8w")
+
+    assert result["rows"] == 0
+    assert result["skipped_unreadable"] == 1
+    assert any(trade["trade_id"] in record.getMessage() for record in caplog.records)
+    # The stats counter agrees: the same row is unreadable, not silently dropped.
+    assert service.stats()["exclusions"]["unreadable_trades"] == 1
+
+
+def test_a_complete_export_neutralizes_zero_cells(tmp_path: Path) -> None:
+    _settings_value, container, _position, trade = _closed_trade(tmp_path)
+    _patch_trade(
+        tmp_path,
+        trade["trade_id"],
+        gross_pnl_usd="100.00000000",
+        fees_usd="0.00000000",
+        funding_usd="0.00000000",
+        net_pnl_usd="100.00000000",
+        r_multiple=1.0,
+        mae_usd="0.00000000",
+        mfe_usd="0.00000000",
+        return_pct=1.0,
+        outcome_tags=["WIN"],
+        data_quality={
+            "status": "COMPLETE",
+            "reasons": [],
+            "gaps": [],
+            "last_event_at": trade["closed_at"],
+            "coverage_start": trade["opened_at"],
+        },
+    )
+
+    result = _service(container).export("csv")
+
+    assert result["neutralized_cells"] == 0
+    assert result["data_quality"] == "COMPLETE"

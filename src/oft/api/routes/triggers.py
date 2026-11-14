@@ -348,7 +348,13 @@ def recheck_trigger(
     refresh: bool = Query(default=False),
     idempotency_key: str | None = Header(default=None, alias="Idempotency-Key"),
 ) -> Any:
-    """Read the persisted entry re-check, or refresh it explicitly (ADR-0003)."""
+    """Read the persisted entry re-check, or supersede it with ``?refresh=true`` (ADR-0003).
+
+    The default reuses a recorded decision. A trigger with no recorded decision
+    bootstraps its first one through the provider (audited as ``ENTRY_RECHECK``);
+    ``?refresh=true`` writes a new row only when superseding a previous one and
+    audits ``ENTRY_RECHECK_REFRESHED``.
+    """
     key = require_idempotency_key(idempotency_key)
     request_hash = hashlib.sha256(
         json.dumps({"trigger_id": trigger_id, "refresh": refresh}, sort_keys=True).encode("utf-8")

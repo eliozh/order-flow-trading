@@ -12,6 +12,8 @@ from __future__ import annotations
 
 import hashlib
 import json
+import uuid
+from collections.abc import Mapping
 from dataclasses import dataclass, replace
 from decimal import Decimal
 from typing import Any
@@ -84,6 +86,20 @@ ENTRY_PROMPT_VERSION = 1
 # accept/reject/recheck paths also consult the OMS ledger, so a crashed accept
 # (order committed, trigger update lost) is reconciled instead of overwritten.
 _PRE_ACCEPT_STATUSES = frozenset({"PENDING_RECHECK", "RECHECKED"})
+
+# The only entry decision values the contract defines. Anything else is treated
+# as unusable rather than displayed or allowed to make a persisted read COMPLETE.
+_ENTRY_DECISIONS = frozenset({"ENTER_LONG", "ENTER_SHORT", "NO_ENTRY"})
+
+
+def _entry_decision(entry_recheck: object) -> str | None:
+    """The decision value when it is a contract value, else ``None``."""
+    if not isinstance(entry_recheck, Mapping):
+        return None
+    value = entry_recheck.get("decision")
+    if isinstance(value, str) and value in _ENTRY_DECISIONS:
+        return value
+    return None
 
 
 class EntryRejected(Exception):
@@ -248,9 +264,13 @@ class EntryService:
             )
         previous_decision_id = payload.get("entry_decision_id")
         if not refresh:
-            # The default read path never calls the provider: a persisted entry
-            # decision is reused verbatim. Only an explicit refresh re-runs the
-            # LLM. An id whose row vanished or is unreadable fails closed.
+            # The default path reuses a recorded persisted entry decision
+            # verbatim and never refreshes it. A trigger with no
+            # ``entry_decision_id`` has nothing to reuse, so it bootstraps its
+            # first decision through the provider (the same path ``accept``
+            # uses) and audits ``ENTRY_RECHECK``; only ``?refresh=true``
+            # supersedes a previous row and audits ``ENTRY_RECHECK_REFRESHED``.
+            # An id whose row vanished or is unreadable fails closed.
             persisted = self.get_persisted_entry_decision(trigger_id)
             if persisted["status"] == "FOUND":
                 return self._persisted_card(trigger_id, payload, persisted)
@@ -285,6 +305,12 @@ class EntryService:
         system, user = rendered.system, rendered.user
         digest = hash_text(f"{system}\n{user}\n{schema_text()}")
         decision_id = f"DEC-ENTRY-{digest[:16].upper()}"
+        if refresh:
+            # An explicit refresh always produces a NEW persisted decision row,
+            # even when the inputs (and therefore the digest) are unchanged. The
+            # previous row is retained for the audit trail; the trigger's
+            # ``entry_decision_id`` moves to the new id.
+            decision_id = f"{decision_id}-R{uuid.uuid4().hex[:8].upper()}"
         request = LLMRequest(
             role=LLMRole.ENTRY_RECHECK,
             # Empty model: the orchestrator resolves ``llm_model_entry_recheck``
@@ -470,7 +496,10 @@ class EntryService:
         This is the deferred slice-20 read: trigger -> ``entry_decision_id`` ->
         the LLM ledger row. A missing/unreadable row is reported as ``MISSING``
         with named reasons; an unknown trigger still raises ``TriggerNotFound``.
-        No orchestrator, adapter, or prompt is touched.
+        No orchestrator, adapter, or prompt is touched here. The default
+        ``recheck`` path reuses a ``FOUND`` decision and never refreshes it; a
+        trigger with no recorded decision is read as ``MISSING`` and then
+        bootstraps its first decision through the provider.
         """
         trigger = self._trigger(trigger_id)
         payload = decode_payload_json(trigger.payload_json, subject=f"trigger {trigger_id}")
@@ -500,11 +529,15 @@ class EntryService:
             )
         provenance = envelope.get("provenance")
         resolved_provenance = provenance if isinstance(provenance, dict) else None
-        reasons = (
-            []
-            if resolved_provenance is not None
-            else ["the persisted entry decision carries no provenance"]
-        )
+        entry_recheck = envelope.get("entry_recheck")
+        has_entry_recheck = isinstance(entry_recheck, Mapping)
+        reasons: list[str] = []
+        if not has_entry_recheck:
+            reasons.append("the persisted entry decision has no entry_recheck payload")
+        elif _entry_decision(entry_recheck) is None:
+            reasons.append("the persisted entry decision has no usable entry_recheck.decision")
+        if resolved_provenance is None:
+            reasons.append("the persisted entry decision carries no provenance")
         return {
             "trigger_id": trigger_id,
             "entry_decision_id": record.decision_id,
@@ -541,7 +574,13 @@ class EntryService:
         trigger_payload: dict[str, Any],
         persisted: dict[str, Any],
     ) -> dict[str, Any]:
-        """Render the ordered decision card from persisted evidence only."""
+        """Render the ordered decision card from persisted evidence only.
+
+        The persisted read owns the decision-quality verdict: the card is
+        PARTIAL whenever that read is not COMPLETE, carries any named reason, or
+        the RISK stage itself is not COMPLETE (stale inputs, a gate error, or no
+        verdict). Its reasons are propagated verbatim.
+        """
         envelope = persisted.get("decision")
         if not isinstance(envelope, dict):
             raise EntryRejected("DATA_UNAVAILABLE", "the persisted entry decision is unreadable")
@@ -556,25 +595,51 @@ class EntryService:
                 "provenance": "CALC",
             }
         entry = envelope.get("entry_recheck")
-        decision_value = entry.get("decision") if isinstance(entry, dict) else None
+        decision_value = _entry_decision(entry)
         evaluated = (
             risk_stage.get("verdict") not in {None, "NOT_EVALUATED"}
             and decision_value != "NO_ENTRY"
         )
         provenance = persisted.get("provenance")
+        provenance_value = provenance if isinstance(provenance, dict) else None
+        persisted_reasons = [str(reason) for reason in persisted.get("reasons") or []]
+        # The persisted read already decided whether the decision evidence is
+        # COMPLETE and named any gaps; do not re-derive that here. The RISK stage
+        # is still part of the card, so it must itself be COMPLETE (a real
+        # verdict, no stale inputs, no gate error) for the card to over-claim
+        # nothing relative to the live re-check.
+        complete = (
+            persisted.get("data_quality") == "COMPLETE"
+            and not persisted_reasons
+            and self._data_quality(risk_stage, evaluated) == "COMPLETE"
+        )
         card = self._decision_card(
             trigger_id=trigger_id,
             trigger_payload=trigger_payload,
             envelope=envelope,
             risk_stage=risk_stage,
-            data_quality=self._data_quality(risk_stage, evaluated),
+            data_quality="COMPLETE" if complete else "PARTIAL",
             error_code=None,
-            decision_provenance=provenance if isinstance(provenance, dict) else None,
+            decision_provenance=provenance_value,
             refreshed=False,
         )
+        card["reasons"] = persisted_reasons
         card["human_action"] = trigger_payload.get("human_action")
         card["persisted"] = True
         return card
+
+    def _decision_provenance(self, decision_id: str | None) -> dict[str, Any] | None:
+        """The structured provenance of a persisted decision row, or ``None``."""
+        if not decision_id:
+            return None
+        record = self._store.get_decision(decision_id)
+        if record is None:
+            return None
+        envelope = decode_payload_json(record.payload_json, subject=f"entry decision {decision_id}")
+        if envelope is None:
+            return None
+        provenance = envelope.get("provenance")
+        return provenance if isinstance(provenance, dict) else None
 
     # -- human actions ---------------------------------------------------
 
@@ -1133,7 +1198,8 @@ class EntryService:
         decision_provenance: dict[str, Any] | None = None,
         refreshed: bool = False,
     ) -> dict[str, Any]:
-        entry = envelope.get("entry_recheck") or {}
+        entry = envelope.get("entry_recheck")
+        entry_reasons = entry.get("reasons", []) if isinstance(entry, Mapping) else []
         decision_id = envelope.get("decision_id")
         return {
             "decision_id": decision_id,
@@ -1157,15 +1223,16 @@ class EntryService:
             },
             "llm": {
                 "decision_id": decision_id,
-                "decision": entry.get("decision"),
+                # Never surface a value outside the contract's decision set.
+                "decision": _entry_decision(entry),
                 "validation_status": envelope.get("validation_status"),
                 "confidence": envelope.get("confidence"),
                 "rationale": envelope.get("rationale"),
-                "reasons": entry.get("reasons", []),
-                # The entry decision's own provenance (provider/model/prompt/
-                # cost/recorded_at), never a bare stage marker and never raw
-                # prompt text.
-                "provenance": decision_provenance if decision_provenance is not None else "LLM",
+                "reasons": entry_reasons,
+                # The entry decision's own structured provenance
+                # (provider/model/prompt/cost/recorded_at) or ``None``. Never a
+                # bare stage marker and never raw prompt text.
+                "provenance": decision_provenance,
             },
             "risk": risk_stage,
             "human_action": None,
@@ -1391,7 +1458,7 @@ class EntryService:
                 "decision": None,
                 "validation_status": None,
                 "confidence": None,
-                "provenance": "LLM",
+                "provenance": self._decision_provenance(result.decision_id),
             },
             "risk": risk_stage,
             "human_action": payload.get("human_action"),

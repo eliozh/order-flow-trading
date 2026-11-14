@@ -447,7 +447,7 @@ def test_log_export_neutralizes_a_formula_cell(live_daemon: Settings) -> None:
         assert path.is_file()
         text = path.read_text(encoding="utf-8")
         assert f"'{prefix}BTCUSDT" in text, prefix
-        assert export["data"]["neutralized"] >= 1
+        assert export["data"]["neutralized_cells"] >= 1
         assert "system_prompt" not in text
         assert "raw_output" not in text
 

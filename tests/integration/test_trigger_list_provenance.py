@@ -269,3 +269,16 @@ def test_the_decision_route_never_resolves_a_provider(
 
     assert response.status_code == 200, response.text
     assert response.json()["data"]["status"] == "FOUND"
+
+
+def test_an_unknown_trigger_decision_is_a_404_through_the_real_route(
+    tmp_path: Path,
+) -> None:
+    settings, _container, _trigger_id = _setup(tmp_path)
+    client, auth = _client(settings)
+
+    with client:
+        response = client.get("/api/v1/triggers/TRG-MISSING/decision", headers=auth)
+
+    assert response.status_code == 404, response.text
+    assert response.json()["error"]["code"] == "NOT_FOUND"

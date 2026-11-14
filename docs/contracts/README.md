@@ -41,6 +41,28 @@ The PRD's hard rule is enforced by four contracts plus the architecture:
 
 `GET /api/v1/opportunities?state=…` returns a read-only projection, not the full contract: each item carries `opportunity_id`, `symbol`, `side`, `state`, `confidence`, `zone {low, high}`, `entry_preference`, `trigger_conditions`, `expires_at`, `created_at`, `updated_at`, and `source`, plus the filtered `total`. A `counts` object gives the server-side COUNT per state (`OPEN`, `TRIGGERED`, `EXPIRED`, `INVALIDATED`) so the ledger's tab counts never depend on the fetched page. Rows render from this projection; they never fetch one full contract per row. The opportunity detail still reuses `opportunity.schema.json`; the ledger's stored provenance has no validation verdict, so the UI labels it "from ledger · not re-validated" rather than inventing one.
 
+### Trigger persisted entry decision and re-check
+
+`GET /api/v1/triggers/{id}/decision` returns the trigger's persisted entry decision
+(trigger → `entry_decision_id` → the LLM ledger row) with the decision's structured
+`provenance` (provider, model, prompt id/version/hash, knowledge artifact, input hash,
+usage, cost, `recorded_at`). It is **provider-free**: it never resolves a provider
+adapter and never calls an LLM, so a removed/rotated key cannot turn a pure read into an
+error. A missing/unreadable row is reported as `status = MISSING`; a present row without
+`entry_recheck` or provenance is `status = FOUND` with `data_quality = PARTIAL` and a
+named reason.
+
+`POST /api/v1/triggers/{id}/recheck` reuses the **persisted** decision when one is
+recorded and never refreshes it. A trigger with **no** recorded `entry_decision_id` has
+nothing to reuse, so the default path bootstraps its first decision through the provider
+(the same path `accept` uses) and audits `ENTRY_RECHECK`, not
+`ENTRY_RECHECK_REFRESHED`. `?refresh=true` explicitly re-runs the provider and persists a
+**new** decision row (even when the inputs are unchanged), retains the previous row, and
+writes an `ENTRY_RECHECK_REFRESHED` audit event carrying `previous_decision_id`. A
+first-ever refresh with no previous row is still the bootstrap path (`refreshed` false).
+The trigger's `entry_decision_id` moves to the new row; the card's `refreshed` flag and
+wording describe the supersede-and-retain semantics rather than a silent replacement.
+
 ### Journal statistics and comparison read models
 
 `GET /api/v1/journal/stats` returns a deterministic statistics read model, not a
@@ -55,14 +77,20 @@ metrics are `UNDEFINED` and every metric is `null` (never zero); the envelope
 
 `GET /api/v1/journal/compare/{trade_id}` is a composition of the trade log, the source
 opportunity zone, the trigger-time report snapshot, recorded bars, and the persisted
-entry decision. Each side is `OK`, `N/A`, or `PARTIAL` with named reasons; the overall
-data quality is `COMPLETE` only when every side resolved. `AMBIGUOUS_BAR` is explicit.
+entry decision. The zone side is `INSIDE`/`ABOVE_ZONE`/`BELOW_ZONE`/`N/A`; the slippage,
+first-touch, and decision sides are `OK`/`N/A`/`PARTIAL`, each with named reasons. The
+overall `data_quality` is `COMPLETE` only when every side resolved (a measured zone
+status counts as resolved), `MISSING` when every side is `N/A`, and `PARTIAL` otherwise.
+`AMBIGUOUS_BAR` is explicit.
 
 `GET /api/v1/journal/export?format=csv|json` writes under
 `<data_dir>/exports/journal-<UTC stamp>.<ext>`. CSV contains only trade-log read fields
 and neutralizes `=`, `+`, `-`, and `@` prefixes with a leading `'`; JSON is a versioned
-`{schema_version, generated_at, period, trades, stats}` document. Neither export
-includes raw prompts, decision payloads, or secrets.
+`{schema_version, generated_at, period, trades, stats}` document. The result's
+`neutralized_cells` counts neutralized **cells** (not rows). A readable row whose
+`closed_at` is unparseable is counted in `skipped_unreadable` (and logged with its trade
+id) rather than silently dropped, so it agrees with the statistics'
+`unreadable_trades`. Neither export includes raw prompts, decision payloads, or secrets.
 
 ## Validation pipeline
 
@@ -117,10 +145,10 @@ A rejected output never creates an opportunity, never reaches the risk gate, and
 | Scans | `POST /api/v1/scans`, `GET /api/v1/scans[/{scan_id}]` |
 | Reports | `GET /api/v1/reports[/{report_id}]`, `GET /api/v1/reports/{report_id}/export` |
 | Opportunities | `GET /api/v1/opportunities[/{id}][/timeline]` |
-| Triggers | `GET /api/v1/triggers[/{id}]`, `POST /api/v1/triggers/{id}/{recheck,accept,reject}` |
+| Triggers | `GET /api/v1/triggers[/{id}]`, `GET /api/v1/triggers/{id}/decision`, `POST /api/v1/triggers/{id}/{recheck,accept,reject}` |
 | Positions | `GET /api/v1/positions[/{id}]`, `POST /api/v1/positions/{id}/manage` |
 | Paper | `GET /api/v1/paper/{account,orders,fills,equity}`, `POST /api/v1/paper/reset` |
-| Journal | `GET /api/v1/journal[/{trade_id}]`, `/stats`, `/compare/{trade_id}` |
+| Journal | `GET /api/v1/journal[/{trade_id}]`, `/stats`, `/compare/{trade_id}`, `/export` |
 | Settings | `GET/PUT /api/v1/settings/{llm,prompts,risk,scan,budget,telegram,live}` |
 | Live/kill | `GET /api/v1/live/status`, `POST /api/v1/live/{enable,disable}`, `POST/DELETE /api/v1/kill-switch` |
 | Data | `POST /api/v1/backfill`, `GET /api/v1/backfill/{run_id}`, `GET /api/v1/data/quality` |

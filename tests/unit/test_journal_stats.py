@@ -10,7 +10,11 @@ import pytest
 
 from oft.domain.journal import (
     DEFINITIONS,
+    JournalAvgR,
     JournalError,
+    JournalStats,
+    JournalTotals,
+    PeriodWindow,
     compute_stats,
     parse_period,
     resolve_period,
@@ -43,6 +47,10 @@ def _trade(**overrides: Any) -> dict[str, Any]:
 
 def _expect(value: str) -> Decimal:
     return Decimal(value).quantize(EIGHT_DP, rounding=ROUND_DOWN)
+
+
+def _stats(trades: Any, **kwargs: Any) -> dict[str, Any]:
+    return compute_stats(trades, **kwargs).to_contract()
 
 
 # -- periods ---------------------------------------------------------------
@@ -98,7 +106,7 @@ def test_a_window_that_does_not_fit_the_calendar_is_a_typed_validation_error() -
 
 
 def test_no_closed_trades_are_undefined_never_zero() -> None:
-    stats = compute_stats([], open_positions=0)
+    stats = _stats([], open_positions=0)
 
     assert stats["status"] == "UNDEFINED"
     assert stats["data_quality"] == "MISSING"
@@ -120,7 +128,7 @@ def test_no_closed_trades_are_undefined_never_zero() -> None:
 
 
 def test_open_positions_are_excluded_and_counted_but_do_not_define_metrics() -> None:
-    stats = compute_stats([], open_positions=3)
+    stats = _stats([], open_positions=3)
 
     assert stats["status"] == "UNDEFINED"
     assert stats["exclusions"]["open_positions"] == 3
@@ -131,7 +139,7 @@ def test_open_positions_are_excluded_and_counted_but_do_not_define_metrics() -> 
 
 
 def test_win_rate_is_net_positive_over_eligible_and_ties_are_not_wins() -> None:
-    stats = compute_stats(
+    stats = _stats(
         [
             _trade(trade_id="TRD-W", net_pnl_usd="10.00000000"),
             _trade(trade_id="TRD-L", net_pnl_usd="-5.00000000", r_multiple=-0.5),
@@ -150,7 +158,7 @@ def test_win_rate_is_net_positive_over_eligible_and_ties_are_not_wins() -> None:
 
 
 def test_expectancy_is_the_mean_net_and_totals_sum_every_term() -> None:
-    stats = compute_stats(
+    stats = _stats(
         [
             _trade(
                 trade_id="TRD-A",
@@ -182,7 +190,7 @@ def test_expectancy_is_the_mean_net_and_totals_sum_every_term() -> None:
 
 
 def test_partial_quality_and_partial_tags_are_excluded_and_counted() -> None:
-    stats = compute_stats(
+    stats = _stats(
         [
             _trade(trade_id="TRD-OK"),
             _trade(
@@ -202,7 +210,7 @@ def test_partial_quality_and_partial_tags_are_excluded_and_counted() -> None:
 
 
 def test_null_r_trades_are_excluded_from_avg_r_and_counted() -> None:
-    stats = compute_stats(
+    stats = _stats(
         [
             _trade(trade_id="TRD-R1", r_multiple=1.0),
             _trade(trade_id="TRD-R2", r_multiple=3.0),
@@ -217,7 +225,7 @@ def test_null_r_trades_are_excluded_from_avg_r_and_counted() -> None:
 
 
 def test_no_r_samples_leaves_avg_r_null_but_the_metrics_defined() -> None:
-    stats = compute_stats([_trade(r_multiple=None)])
+    stats = _stats([_trade(r_multiple=None)])
 
     assert stats["status"] == "DEFINED"
     assert stats["avg_r"]["value"] is None
@@ -231,7 +239,7 @@ def test_a_period_excludes_out_of_window_trades_and_counts_them() -> None:
     inside = _trade(trade_id="TRD-IN", closed_at="2026-11-14T11:00:00.000Z")
     outside = _trade(trade_id="TRD-OUT", closed_at="2026-11-01T11:00:00.000Z")
 
-    stats = compute_stats([inside, outside], window=window)
+    stats = _stats([inside, outside], window=window)
 
     assert stats["sample_size"] == 1
     assert stats["exclusions"]["outside_period"] == 1
@@ -243,14 +251,14 @@ def test_period_start_boundary_is_inclusive() -> None:
     assert window is not None
     trade = _trade(closed_at=window.start)
 
-    stats = compute_stats([trade], window=window)
+    stats = _stats([trade], window=window)
 
     assert stats["sample_size"] == 1
     assert stats["exclusions"]["outside_period"] == 0
 
 
 def test_unreadable_rows_are_excluded_and_counted() -> None:
-    stats = compute_stats(
+    stats = _stats(
         [
             None,
             _trade(trade_id="TRD-BAD-NET", net_pnl_usd="not-money"),
@@ -289,7 +297,7 @@ def test_a_naive_clock_is_treated_as_utc() -> None:
 
 def test_datetime_and_missing_closed_at_are_classified_defensively() -> None:
     aware = datetime(2026, 11, 14, 11, 0, 0, tzinfo=UTC)
-    stats = compute_stats(
+    stats = _stats(
         [
             _trade(closed_at=aware),
             _trade(trade_id="TRD-NONE", closed_at=None),
@@ -301,7 +309,7 @@ def test_datetime_and_missing_closed_at_are_classified_defensively() -> None:
 
 
 def test_non_numeric_r_and_non_list_tags_are_handled() -> None:
-    stats = compute_stats(
+    stats = _stats(
         [
             _trade(
                 r_multiple="not-a-number",
@@ -317,7 +325,7 @@ def test_non_numeric_r_and_non_list_tags_are_handled() -> None:
 
 
 def test_missing_quality_non_decimal_net_rows_are_unreadable() -> None:
-    stats = compute_stats(
+    stats = _stats(
         [
             _trade(data_quality=None),
             _trade(trade_id="TRD-BOOL", net_pnl_usd=True),
@@ -330,7 +338,7 @@ def test_missing_quality_non_decimal_net_rows_are_unreadable() -> None:
 
 
 def test_an_unmeasurable_component_degrades_the_totals() -> None:
-    stats = compute_stats([_trade(gross_pnl_usd=None, fees_usd="1e20")])
+    stats = _stats([_trade(gross_pnl_usd=None, fees_usd="1e20")])
 
     assert stats["status"] == "DEFINED"
     assert stats["totals"]["gross_pnl_usd"] is None
@@ -339,7 +347,7 @@ def test_an_unmeasurable_component_degrades_the_totals() -> None:
 
 
 def test_an_out_of_range_net_total_leaves_the_total_empty_and_degraded() -> None:
-    stats = compute_stats(
+    stats = _stats(
         [
             _trade(trade_id="TRD-MAX-A", net_pnl_usd="1000000000000000"),
             _trade(trade_id="TRD-MAX-B", net_pnl_usd="1000000000000000"),
@@ -355,9 +363,199 @@ def test_an_out_of_range_net_total_leaves_the_total_empty_and_degraded() -> None
 
 
 def test_a_zero_net_tie_renders_a_plain_zero_money_string() -> None:
-    stats = compute_stats([_trade(net_pnl_usd="0")])
+    stats = _stats([_trade(net_pnl_usd="0")])
 
     assert stats["ties"] == 1
     assert stats["win_rate"] == 0.0
     assert stats["totals"]["net_pnl_usd"] == "0"
     assert stats["expectancy_usd"] == "0"
+
+
+def test_an_out_of_range_gross_total_degrades_quality_symmetrically() -> None:
+    stats = _stats(
+        [
+            _trade(trade_id="TRD-GROSS-A", gross_pnl_usd="1000000000000000"),
+            _trade(trade_id="TRD-GROSS-B", gross_pnl_usd="1000000000000000"),
+        ]
+    )
+
+    assert stats["status"] == "DEFINED"
+    # Two per-trade values at the plausible bound sum beyond it: the total is
+    # not fabricated and the quality degrades just like an unreadable term.
+    assert stats["totals"]["gross_pnl_usd"] is None
+    assert stats["data_quality"] == "PARTIAL"
+
+
+# -- typed invariants ------------------------------------------------------
+
+
+def _valid_defined() -> JournalStats:
+    return JournalStats(
+        status="DEFINED",
+        reason=None,
+        period=None,
+        sample_size=2,
+        denominator=2,
+        exclusions={
+            "open_positions": 0,
+            "partial_trades": 0,
+            "unreadable_trades": 0,
+            "outside_period": 0,
+        },
+        definitions=dict(DEFINITIONS),
+        wins=1,
+        losses=1,
+        ties=0,
+        win_rate=0.5,
+        expectancy_usd="1",
+        avg_r=JournalAvgR(value=1.0, samples=2, excluded_null_r=0),
+        totals=JournalTotals(gross_pnl_usd="1", fees_usd="0", funding_usd="0", net_pnl_usd="1"),
+        data_quality="COMPLETE",
+    )
+
+
+def test_a_valid_defined_stats_object_renders_the_contract_shape() -> None:
+    contract = _valid_defined().to_contract()
+
+    assert contract["status"] == "DEFINED"
+    assert contract["denominator"] == 2
+    assert contract["avg_r"] == {"value": 1.0, "samples": 2, "excluded_null_r": 0}
+    assert contract["definitions"] == DEFINITIONS
+
+
+def test_defined_stats_require_buckets_to_sum_to_the_sample() -> None:
+    with pytest.raises(ValueError, match="wins \\+ losses \\+ ties"):
+        replace_defined(wins=2)
+
+
+def test_defined_stats_require_a_positive_sample() -> None:
+    with pytest.raises(ValueError, match="positive sample size"):
+        replace_defined(sample_size=0)
+
+
+def test_defined_stats_require_the_avg_r_split_to_account_for_every_trade() -> None:
+    with pytest.raises(ValueError, match="average-R samples"):
+        replace_defined(avg_r=JournalAvgR(value=1.0, samples=1, excluded_null_r=0))
+
+
+def test_defined_stats_require_metrics() -> None:
+    with pytest.raises(ValueError, match="win rate and expectancy"):
+        replace_defined(win_rate=None)
+
+
+def test_undefined_stats_must_not_carry_metrics() -> None:
+    with pytest.raises(ValueError, match="must not fabricate"):
+        replace_defined(status="UNDEFINED", sample_size=0, wins=0, losses=0, win_rate=0.5)
+
+
+def test_undefined_stats_must_have_empty_buckets() -> None:
+    with pytest.raises(ValueError, match="zero sample and empty buckets"):
+        replace_defined(status="UNDEFINED", sample_size=0, wins=1, losses=0, win_rate=None)
+
+
+def test_undefined_stats_must_have_empty_totals() -> None:
+    with pytest.raises(ValueError, match="empty totals"):
+        replace_defined(
+            status="UNDEFINED",
+            sample_size=0,
+            wins=0,
+            losses=0,
+            win_rate=None,
+            expectancy_usd=None,
+            avg_r=JournalAvgR(value=None, samples=0, excluded_null_r=0),
+        )
+
+
+def test_avg_r_requires_a_value_iff_there_are_samples() -> None:
+    with pytest.raises(ValueError, match="present iff samples"):
+        JournalAvgR(value=None, samples=1, excluded_null_r=0)
+    with pytest.raises(ValueError, match="present iff samples"):
+        JournalAvgR(value=1.0, samples=0, excluded_null_r=0)
+
+
+def replace_defined(**overrides: Any) -> JournalStats:
+    from dataclasses import replace
+
+    return replace(_valid_defined(), **overrides)
+
+
+# -- period window validation ---------------------------------------------
+
+
+@pytest.mark.parametrize(
+    "start,end,basis",
+    [
+        ("not-a-timestamp", "2026-11-14T12:00:00Z", "closed_at"),
+        ("2026-11-13T12:00:00Z", "not-a-timestamp", "closed_at"),
+        ("2026-11-15T12:00:00Z", "2026-11-14T12:00:00Z", "closed_at"),
+        ("2026-11-13T12:00:00Z", "2026-11-14T12:00:00Z", "opened_at"),
+    ],
+)
+def test_an_invalid_period_window_is_a_typed_validation_error(
+    start: str, end: str, basis: str
+) -> None:
+    with pytest.raises(JournalError) as excinfo:
+        PeriodWindow(label="1d", start=start, end=end, basis=basis)
+    assert excinfo.value.code == "VALIDATION_FAILED"
+
+
+def test_an_empty_period_label_is_rejected() -> None:
+    with pytest.raises(JournalError) as excinfo:
+        PeriodWindow(label=" ", start="2026-11-13T12:00:00Z", end="2026-11-14T12:00:00Z")
+    assert excinfo.value.code == "VALIDATION_FAILED"
+
+
+def test_compute_stats_rejects_a_window_with_unparseable_bounds() -> None:
+    # Bypass the constructor guard (e.g. a future serialization path) to prove
+    # the computation itself fails closed instead of classifying every row as
+    # outside the period.
+    window = object.__new__(PeriodWindow)
+    object.__setattr__(window, "label", "1d")
+    object.__setattr__(window, "start", "not-a-timestamp")
+    object.__setattr__(window, "end", "2026-11-14T12:00:00Z")
+    object.__setattr__(window, "basis", "closed_at")
+
+    with pytest.raises(JournalError) as excinfo:
+        compute_stats([_trade()], window=window)
+
+    assert excinfo.value.code == "VALIDATION_FAILED"
+
+
+def test_an_unknown_status_or_quality_is_rejected() -> None:
+    with pytest.raises(ValueError, match="invalid statistics status"):
+        replace_defined(status="MAYBE")
+    with pytest.raises(ValueError, match="invalid data quality"):
+        replace_defined(data_quality="STALE")
+
+
+def test_undefined_stats_must_have_an_empty_avg_r_result() -> None:
+    with pytest.raises(ValueError, match="empty average-R"):
+        replace_defined(
+            status="UNDEFINED",
+            sample_size=0,
+            wins=0,
+            losses=0,
+            ties=0,
+            win_rate=None,
+            expectancy_usd=None,
+            avg_r=JournalAvgR(value=1.0, samples=1, excluded_null_r=0),
+        )
+
+
+@pytest.mark.parametrize("field", ["fees_usd", "funding_usd"])
+def test_an_out_of_range_fee_or_funding_total_degrades_quality(field: str) -> None:
+    stats = _stats(
+        [
+            _trade(trade_id="TRD-TOTAL-A", **{field: "1000000000000000"}),
+            _trade(trade_id="TRD-TOTAL-B", **{field: "1000000000000000"}),
+        ]
+    )
+
+    assert stats["status"] == "DEFINED"
+    assert stats["totals"][field] is None
+    assert stats["data_quality"] == "PARTIAL"
+
+
+def test_a_negative_average_r_count_is_rejected() -> None:
+    with pytest.raises(ValueError, match="non-negative"):
+        JournalAvgR(value=None, samples=0, excluded_null_r=-1)

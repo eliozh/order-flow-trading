@@ -133,7 +133,7 @@ def test_the_journal_stats_and_export_envelopes_validate(tmp_path: Path) -> None
         "path",
         "rows",
         "bytes",
-        "neutralized",
+        "neutralized_cells",
         "skipped_unreadable",
         "data_quality",
     }
@@ -141,7 +141,7 @@ def test_the_journal_stats_and_export_envelopes_validate(tmp_path: Path) -> None
     assert Path(result["path"]).is_file()
     assert result["rows"] == 0
     assert isinstance(result["bytes"], int) and result["bytes"] > 0
-    assert result["neutralized"] == 0
+    assert result["neutralized_cells"] == 0
     assert result["skipped_unreadable"] == 0
     assert result["data_quality"] == "MISSING"
     assert export_envelope["meta"]["data_quality"] == "MISSING"

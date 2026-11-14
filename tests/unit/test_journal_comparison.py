@@ -209,7 +209,7 @@ def test_csv_document_neutralizes_formula_cells_and_counts_them() -> None:
     assert "'@WIN" in export.text
     # Every rendered negative money/R/return cell also starts with "-" and is
     # neutralized, so the count covers the symbol, the tag, and those cells.
-    assert export.neutralized == 7
+    assert export.neutralized_cells == 7
 
 
 def test_csv_document_quotes_commas_safely() -> None:

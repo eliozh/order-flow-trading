@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from typing import Any
+from typing import Any, Literal
 
 from fastapi import APIRouter, Path, Query, Request
 
@@ -16,7 +16,6 @@ from oft.api.schemas.journal import (
     TradeLogListData,
 )
 from oft.application.journal_service import JournalError, JournalService
-from oft.application.payloads import decode_payload_json
 
 router = APIRouter()
 
@@ -98,7 +97,7 @@ def journal_stats(
 @router.get("/api/v1/journal/export", response_model=Envelope[JournalExportData])
 def export_journal(
     request: Request,
-    format: str = Query(default="csv", max_length=8),
+    format: Literal["csv", "json"] = Query(default="csv"),
     period: str | None = Query(default=None, max_length=16),
     symbol: str | None = Query(default=None, max_length=24),
 ) -> dict[str, Any]:
@@ -138,13 +137,10 @@ def read_journal_trade(
     request: Request,
     trade_id: str = Path(min_length=1, max_length=64, pattern=r"^[A-Za-z0-9._:-]+$"),
 ) -> dict[str, Any]:
-    store = request.app.state.container.store
-    record = store.get_trade_log(trade_id)
-    if record is None:
-        raise ApiError("NOT_FOUND", f"Trade {trade_id} does not exist.")
-    payload = decode_payload_json(record.payload_json, subject=f"trade log {trade_id}")
-    if payload is None:
-        raise ApiError("DATA_UNAVAILABLE", f"Trade {trade_id} payload is unreadable.")
+    try:
+        payload = _journal_service(request).show(trade_id)
+    except JournalError as exc:
+        raise ApiError(exc.code, exc.message) from exc
     return success_envelope(
         payload,
         request_id=new_request_id(),

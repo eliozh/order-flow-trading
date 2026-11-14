@@ -12,6 +12,7 @@ mutated here.
 from __future__ import annotations
 
 import json
+import logging
 import os
 from collections.abc import Mapping
 from datetime import UTC, datetime
@@ -23,9 +24,9 @@ from oft.application.payloads import decode_payload_json
 from oft.config import Settings
 from oft.domain.journal import (
     JournalError,
-    PeriodWindow,
     compute_stats,
     csv_document,
+    decimal_text,
     decision_vs_outcome,
     resolve_period,
     trigger_to_fill_bps,
@@ -40,6 +41,12 @@ _JSON_SCHEMA_VERSION = "1.0.0"
 _EXPORT_FORMATS = frozenset({"csv", "json"})
 _EXPORT_FILE_MODE = 0o600
 _QUALITY_RANK = {"COMPLETE": 0, "PARTIAL": 1, "MISSING": 2}
+_RESOLVED_STATUSES = frozenset({"OK", "INSIDE", "ABOVE_ZONE", "BELOW_ZONE"})
+_STOP_UNREADABLE = "the position stop price is unreadable"
+_TARGETS_UNREADABLE = "the position target prices are unreadable"
+_TARGETS_PARTIAL = "the position has unreadable target prices; the first parseable target was used"
+_LOGGER = logging.getLogger(__name__)
+_PayloadRows = list[tuple[Any, dict[str, Any] | None]]
 
 
 class JournalNotFound(JournalError):
@@ -48,21 +55,6 @@ class JournalNotFound(JournalError):
     def __init__(self, trade_id: str) -> None:
         super().__init__("NOT_FOUND", f"Trade {trade_id} does not exist.")
         self.trade_id = trade_id
-
-
-def _parse_timestamp(value: object) -> datetime | None:
-    if isinstance(value, datetime):
-        parsed = value
-    elif value is None:
-        return None
-    else:
-        try:
-            parsed = datetime.fromisoformat(str(value).replace("Z", "+00:00"))
-        except (TypeError, ValueError, OverflowError):
-            return None
-    if parsed.tzinfo is None:
-        parsed = parsed.replace(tzinfo=UTC)
-    return parsed.astimezone(UTC)
 
 
 def _snapshot_price(snapshot: Mapping[str, Any]) -> tuple[object, object]:
@@ -106,16 +98,12 @@ class JournalService:
         now = self._now()
         window = resolve_period(period, now)
         resolved = symbol.upper() if symbol else None
-        records = self._store.list_trade_logs(symbol=resolved, limit=None)
-        payloads: list[dict[str, Any] | None] = [
-            decode_payload_json(record.payload_json, subject=f"trade log {record.trade_id}")
-            for record in records
-        ]
+        payloads = [payload for _record, payload in self._all_payloads(resolved)]
         return compute_stats(
             payloads,
-            open_positions=self._store.count_positions(state="OPEN"),
+            open_positions=self._store.count_positions(state="OPEN", symbol=resolved),
             window=window,
-        )
+        ).to_contract()
 
     # -- signal vs outcome ----------------------------------------------
 
@@ -135,7 +123,7 @@ class JournalService:
         decision = self._decision(trigger, side, trade.get("net_pnl_usd"))
 
         sides = (zone, slippage, touch, decision)
-        if all(side_result["status"] == "OK" for side_result in sides):
+        if all(side_result["status"] in _RESOLVED_STATUSES for side_result in sides):
             data_quality = "COMPLETE"
         elif all(side_result["status"] == "N/A" for side_result in sides):
             data_quality = "MISSING"
@@ -224,7 +212,7 @@ class JournalService:
         if snapshot is None:
             return {
                 "status": "N/A",
-                "entry_avg_price": entry,
+                "entry_avg_price": decimal_text(entry),
                 "reference_price": None,
                 "reference_as_of": None,
                 "bps": None,
@@ -233,12 +221,13 @@ class JournalService:
             }
         reference, as_of = _snapshot_price(snapshot)
         bps = trigger_to_fill_bps(side, entry, reference)
+        rendered_as_of = _iso_or_none(as_of)
         if bps is None:
             return {
                 "status": "N/A",
-                "entry_avg_price": entry,
-                "reference_price": reference,
-                "reference_as_of": as_of,
+                "entry_avg_price": decimal_text(entry),
+                "reference_price": decimal_text(reference),
+                "reference_as_of": rendered_as_of,
                 "bps": None,
                 "formula": _SLIPPAGE_FORMULA,
                 "reasons": [
@@ -247,9 +236,9 @@ class JournalService:
             }
         return {
             "status": "OK",
-            "entry_avg_price": entry,
-            "reference_price": reference,
-            "reference_as_of": as_of,
+            "entry_avg_price": decimal_text(entry),
+            "reference_price": decimal_text(reference),
+            "reference_as_of": rendered_as_of,
             "bps": bps,
             "formula": _SLIPPAGE_FORMULA,
             "reasons": [],
@@ -263,13 +252,37 @@ class JournalService:
     ) -> dict[str, Any]:
         if position is None:
             return _touch_unavailable("the closed position payload is unavailable")
-        stop = json_decimal(position.get("stop_price"))
+        stop_raw = position.get("stop_price")
+        stop = json_decimal(stop_raw)
+        stop_unreadable = stop_raw is not None and stop is None
         targets = position.get("target_prices")
         target: Decimal | None = None
-        if isinstance(targets, list) and targets:
-            target = json_decimal(targets[0])
+        targets_unreadable = False
+        if isinstance(targets, list):
+            for value in targets:
+                parsed = json_decimal(value)
+                if parsed is not None:
+                    if target is None:
+                        target = parsed
+                elif value is not None:
+                    targets_unreadable = True
+        elif targets is not None:
+            targets_unreadable = True
+        reasons: list[str] = []
+        if stop_unreadable:
+            reasons.append(_STOP_UNREADABLE)
+        if targets_unreadable:
+            reasons.append(_TARGETS_UNREADABLE if target is None else _TARGETS_PARTIAL)
         if stop is None and target is None:
-            return _touch_unavailable("the position records neither a stop nor a target")
+            # Distinguish "absent" from "present but unreadable": a corrupt value
+            # must never be reported as a missing one.
+            return {
+                "kind": None,
+                "at": None,
+                "ambiguous": False,
+                "status": "N/A",
+                "reasons": reasons or ["the position records neither a stop nor a target"],
+            }
         bars = self._window_bars(
             str(trade.get("symbol") or ""),
             trade.get("opened_at"),
@@ -289,8 +302,7 @@ class JournalService:
                 "status": "N/A",
                 "reasons": [f"first-touch evaluation is unavailable: {exc}"],
             }
-        reasons: list[str] = []
-        status = "OK"
+        status = "PARTIAL" if reasons else "OK"
         if touch.ambiguous:
             status = "PARTIAL"
             reasons.append(
@@ -360,35 +372,49 @@ class JournalService:
         now = self._now()
         window = resolve_period(period, now)
         resolved_symbol = symbol.upper() if symbol else None
-        records = self._store.list_trade_logs(symbol=resolved_symbol, limit=None)
         all_payloads: list[dict[str, Any] | None] = []
         export_trades: list[dict[str, Any]] = []
         skipped = 0
-        for record in records:
-            payload = decode_payload_json(
-                record.payload_json, subject=f"trade log {record.trade_id}"
-            )
+        start_dt = recorded_bars.parse_timestamp(window.start) if window is not None else None
+        end_dt = recorded_bars.parse_timestamp(window.end) if window is not None else None
+        for record, payload in self._all_payloads(resolved_symbol):
             all_payloads.append(payload)
             if payload is None:
                 skipped += 1
                 continue
-            if not _inside_window(payload.get("closed_at"), window):
+            closed_at = recorded_bars.parse_timestamp(payload.get("closed_at"))
+            if closed_at is None:
+                # A readable row with an unparseable closed_at can never be
+                # placed in (or out of) the period; count and log it instead of
+                # silently dropping it. ``stats`` counts the same row as
+                # unreadable, so the two counters agree.
+                skipped += 1
+                _LOGGER.warning(
+                    "journal export skipped trade %s: closed_at is unreadable",
+                    record.trade_id,
+                )
                 continue
+            if window is not None:
+                if start_dt is None or end_dt is None:
+                    continue
+                if not (start_dt <= closed_at <= end_dt):
+                    continue
             export_trades.append(payload)
         stats = compute_stats(
             all_payloads,
-            open_positions=self._store.count_positions(state="OPEN"),
+            open_positions=self._store.count_positions(state="OPEN", symbol=resolved_symbol),
             window=window,
         )
+        stats_contract = stats.to_contract()
         exports_dir = self._settings.data_dir / "exports"
         exports_dir.mkdir(parents=True, exist_ok=True)
         stamp = now.strftime("%Y%m%dT%H%M%S%fZ")
         path = exports_dir / f"journal-{stamp}.{resolved_format}"
-        neutralized = 0
+        neutralized_cells = 0
         if resolved_format == "csv":
             rendered = csv_document(export_trades)
             text = rendered.text
-            neutralized = rendered.neutralized
+            neutralized_cells = rendered.neutralized_cells
         else:
             text = json.dumps(
                 {
@@ -396,7 +422,7 @@ class JournalService:
                     "generated_at": utc_timestamp(now),
                     "period": None if window is None else window.to_contract(),
                     "trades": export_trades,
-                    "stats": stats,
+                    "stats": stats_contract,
                 },
                 sort_keys=True,
             )
@@ -408,15 +434,26 @@ class JournalService:
             "path": str(path),
             "rows": len(export_trades),
             "bytes": len(text.encode("utf-8")),
-            "neutralized": neutralized,
+            "neutralized_cells": neutralized_cells,
             "skipped_unreadable": skipped,
             "data_quality": _worst_quality(
                 "PARTIAL" if skipped else "COMPLETE",
-                str(stats.get("data_quality") or "MISSING"),
+                str(stats.data_quality),
             ),
         }
 
     # -- helpers ---------------------------------------------------------
+
+    def _all_payloads(self, symbol: str | None) -> _PayloadRows:
+        """Every trade-log row with its decoded payload, or ``None`` if unreadable."""
+        records = self._store.list_trade_logs(symbol=symbol, limit=None)
+        return [
+            (
+                record,
+                decode_payload_json(record.payload_json, subject=f"trade log {record.trade_id}"),
+            )
+            for record in records
+        ]
 
     def _now(self) -> datetime:
         now = self._clock.now()
@@ -440,15 +477,12 @@ def _worst_quality(*values: str) -> str:
     return max(values, key=lambda value: _QUALITY_RANK.get(value, 2))
 
 
-def _inside_window(closed_at: object, window: PeriodWindow | None) -> bool:
-    if window is None:
-        return True
-    parsed = _parse_timestamp(closed_at)
-    start = _parse_timestamp(window.start)
-    end = _parse_timestamp(window.end)
-    if parsed is None or start is None or end is None:
-        return False
-    return start <= parsed <= end
+def _iso_or_none(value: object) -> str | None:
+    """Render a persisted timestamp as an ISO-8601 UTC string, or ``None``."""
+    parsed = recorded_bars.parse_timestamp(value)
+    if parsed is None:
+        return None
+    return parsed.strftime("%Y-%m-%dT%H:%M:%S.%fZ")
 
 
 _SLIPPAGE_FORMULA = (
