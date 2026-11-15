@@ -323,7 +323,7 @@ function fieldDetails(error: ApiError | null): SettingsFieldDetail[] {
   )
 }
 
-async function requestSettings<T>(
+export async function requestSettings<T>(
   path: string,
   init: RequestInit,
   validate: (data: unknown) => data is T,

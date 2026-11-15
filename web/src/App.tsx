@@ -17,6 +17,7 @@ import { ReportsPage } from './routes/reports'
 import { ScanDetailPage } from './routes/scan-detail'
 import { ScansPage } from './routes/scans'
 import { SettingsPage } from './routes/settings'
+import { SettingsBudgetPage } from './routes/settings-budget'
 import { SettingsLLMPage } from './routes/settings-llm'
 import { SettingsPromptDetailPage } from './routes/settings-prompt-detail'
 import { SettingsPromptHistoryPage } from './routes/settings-prompt-history'
@@ -89,6 +90,8 @@ export default function App() {
               <WatchlistPage />
             ) : route.isSettingsScan ? (
               <SettingsScanPage />
+            ) : route.isSettingsBudget ? (
+              <SettingsBudgetPage />
             ) : route.isSettingsLlm ? (
               <SettingsLLMPage />
             ) : route.isSettingsPromptHistory && route.promptId !== null ? (

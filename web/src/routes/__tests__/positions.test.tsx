@@ -63,7 +63,12 @@ async function renderList(
       }
     />,
   )
-  return screen.findByRole('heading', { name: /未平仓持仓/ })
+  await screen.findByRole('heading', { name: '未平仓持仓' })
+  // The heading also renders during the initial ``loading`` state, so it does
+  // not prove the load settled. Gate on the loading status disappearing, which
+  // happens in both the ready and error states.
+  await waitFor(() => expect(screen.queryByText(/加载未平仓持仓/)).not.toBeInTheDocument())
+  return screen.getByRole('heading', { name: '未平仓持仓' })
 }
 
 async function renderDetail(
@@ -112,7 +117,14 @@ async function renderDetail(
       }
     />,
   )
-  return screen.findByRole('heading', { name: 'POS-20261104-018' })
+  await screen.findByRole('heading', { name: 'POS-20261104-018' })
+  // The same heading renders while the initial load is in flight. Wait until
+  // the loading status is gone so the ready (or error) branch is committed
+  // before callers run synchronous queries against page content.
+  await waitFor(() =>
+    expect(screen.queryByText(/^加载持仓 POS-20261104-018/)).not.toBeInTheDocument(),
+  )
+  return screen.getByRole('heading', { name: 'POS-20261104-018' })
 }
 
 /** Open the management dialog and submit its confirmation once. */
@@ -630,7 +642,7 @@ describe('PositionDetailPage', () => {
       />,
     )
     await screen.findByRole('heading', { name: 'POS-20261104-018' })
-    expect(screen.getByRole('button', { name: /请求管理决策/ })).toHaveAttribute(
+    expect(await screen.findByRole('button', { name: /请求管理决策/ })).toHaveAttribute(
       'aria-disabled',
       'true',
     )
@@ -652,7 +664,7 @@ describe('PositionDetailPage', () => {
       />,
     )
     await screen.findAllByRole('heading', { name: 'POS-20261104-018' })
-    expect(screen.getByRole('button', { name: /请求管理决策/ })).toHaveAttribute(
+    expect(await screen.findByRole('button', { name: /请求管理决策/ })).toHaveAttribute(
       'aria-disabled',
       'true',
     )
@@ -691,7 +703,7 @@ describe('PositionDetailPage', () => {
     )
     await screen.findByRole('heading', { name: 'POS-20261104-018' })
 
-    expect(screen.getByText(/入场 risk verdict 不可用/)).toBeInTheDocument()
+    expect(await screen.findByText(/入场 risk verdict 不可用/)).toBeInTheDocument()
     expect(screen.getAllByText(/796\.80/).length).toBeGreaterThan(0)
   })
 
@@ -831,7 +843,7 @@ describe('PositionDetailPage', () => {
       </div>,
     )
     await screen.findByRole('heading', { name: 'POS-20261104-018' })
-    const trigger = screen.getByRole('button', { name: /请求管理决策/ })
+    const trigger = await screen.findByRole('button', { name: /请求管理决策/ })
     trigger.focus()
     fireEvent.click(trigger)
 
@@ -864,7 +876,7 @@ describe('PositionDetailPage', () => {
       </div>,
     )
     await screen.findByRole('heading', { name: 'POS-20261104-018' })
-    const trigger = screen.getByRole('button', { name: /请求管理决策/ })
+    const trigger = await screen.findByRole('button', { name: /请求管理决策/ })
     trigger.focus()
     fireEvent.click(trigger)
 
@@ -982,7 +994,7 @@ describe('PositionDetailPage', () => {
     )
     await screen.findByRole('heading', { name: 'POS-20261104-018' })
     await screen.findByRole('button', { name: /Kill switch 开启，可停止新订单/ })
-    const trigger = screen.getByRole('button', { name: /请求管理决策/ })
+    const trigger = await screen.findByRole('button', { name: /请求管理决策/ })
     trigger.focus()
     fireEvent.click(trigger)
     expect(screen.getByRole('dialog', { name: /请求管理决策/ })).toBeInTheDocument()
@@ -1051,7 +1063,7 @@ describe('PositionDetailPage', () => {
     const { rerender } = render(<PositionDetailPage {...props} />)
 
     await screen.findByRole('heading', { name: 'POS-20261104-018' })
-    expect(screen.getByTestId('position-detail-paused')).toHaveTextContent(/实时更新已暂停/)
+    expect(await screen.findByTestId('position-detail-paused')).toHaveTextContent(/实时更新已暂停/)
     expect(screen.getByTestId('position-detail-paused')).toHaveAttribute('role', 'note')
     expect(fetchPositionFn).toHaveBeenCalledTimes(1)
 
@@ -1413,7 +1425,7 @@ describe('PositionDetailPage', () => {
     await screen.findByRole('heading', { name: 'POS-20261104-018' })
     await screen.findByRole('button', { name: /Kill switch 开启，可停止新订单/ })
 
-    fireEvent.click(screen.getByRole('button', { name: /请求管理决策/ }))
+    fireEvent.click(await screen.findByRole('button', { name: /请求管理决策/ }))
     expect(screen.getByRole('dialog', { name: /请求管理决策/ })).toBeInTheDocument()
 
     const resume = document.querySelector<HTMLElement>('[data-kill-switch-action="resume"]')

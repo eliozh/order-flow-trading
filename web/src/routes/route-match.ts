@@ -30,6 +30,7 @@ export interface RouteMatch {
   isSettings: boolean
   isSettingsScan: boolean
   isSettingsRisk: boolean
+  isSettingsBudget: boolean
   isSettingsLlm: boolean
   isSettingsPrompts: boolean
   isSettingsPromptDetail: boolean
@@ -74,6 +75,7 @@ export function resolveRoute(pathname: string): RouteMatch {
   const isSettings = path === '/settings'
   const isSettingsScan = path === '/settings/scan'
   const isSettingsRisk = path === '/settings/risk'
+  const isSettingsBudget = path === '/settings/budget'
   const isSettingsLlm = path === '/settings/llm'
   const isSettingsPrompts = path === '/settings/prompts'
   // One detail segment, or exactly one detail segment plus `/history`. A
@@ -112,6 +114,7 @@ export function resolveRoute(pathname: string): RouteMatch {
     isWatchlist ||
     isSettingsScan ||
     isSettingsRisk ||
+    isSettingsBudget ||
     isSettingsLlm ||
     isSettingsPrompts ||
     isSettingsPromptDetail ||
@@ -143,6 +146,7 @@ export function resolveRoute(pathname: string): RouteMatch {
     isSettings,
     isSettingsScan,
     isSettingsRisk,
+    isSettingsBudget,
     isSettingsLlm,
     isSettingsPrompts,
     isSettingsPromptDetail,

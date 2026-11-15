@@ -20,6 +20,7 @@ from oft.adapters.sqlite_connections import SqliteConnectionMixin
 from oft.domain.budget_periods import budget_record_id
 from oft.ports.store import (
     AuditEventDraft,
+    AuditEventRecord,
     BudgetRecord,
     BudgetRecordConflictError,
     BudgetSettingsRecord,
@@ -425,40 +426,86 @@ class LLMStoreMixin(SqliteConnectionMixin, SqliteAuditMixin):
             ).fetchone()
         finally:
             connection.close()
-        if row is None:
-            return None
-        return BudgetSettingsRecord(
-            id=row["id"],
-            daily_usd=row["daily_usd"],
-            weekly_usd=row["weekly_usd"],
-            monthly_usd=row["monthly_usd"],
-            warn_pct=float(row["warn_pct"]),
-            updated_at=row["updated_at"],
-        )
+        return _row_to_budget_settings(row)
 
     def save_budget_settings(self, record: BudgetSettingsRecord) -> None:
         with closing(self._connect()) as connection, connection:
-            connection.execute(
-                """
-                INSERT INTO budget_settings
-                    (id, daily_usd, weekly_usd, monthly_usd, warn_pct, updated_at)
-                VALUES (?, ?, ?, ?, ?, ?)
-                ON CONFLICT(id) DO UPDATE SET
-                    daily_usd = excluded.daily_usd,
-                    weekly_usd = excluded.weekly_usd,
-                    monthly_usd = excluded.monthly_usd,
-                    warn_pct = excluded.warn_pct,
-                    updated_at = excluded.updated_at
-                """,
-                (
-                    "default",
-                    record.daily_usd,
-                    record.weekly_usd,
-                    record.monthly_usd,
-                    record.warn_pct,
-                    record.updated_at,
-                ),
-            )
+            self._upsert_budget_settings(connection, record)
+
+    def save_budget_settings_change(
+        self,
+        build: Callable[
+            [BudgetSettingsRecord | None],
+            tuple[BudgetSettingsRecord, AuditEventDraft] | None,
+        ],
+    ) -> tuple[BudgetSettingsRecord | None, AuditEventRecord | None]:
+        """Read, decide, and write the budget settings row inside one transaction.
+
+        The current row is read *inside* ``BEGIN IMMEDIATE`` so two processes
+        cannot interleave between the compare and the upsert. ``build`` is pure:
+        it returns either the complete row plus its audit draft, or ``None`` (a
+        no-op). A validation error raised by ``build`` rolls the whole unit back,
+        so invalid values write neither a row nor an audit.
+        """
+        connection = self._connect()
+        try:
+            connection.execute("BEGIN IMMEDIATE")
+            row = connection.execute(
+                "SELECT * FROM budget_settings WHERE id = 'default'"
+            ).fetchone()
+            current = _row_to_budget_settings(row)
+            outcome = build(current)
+            if outcome is None:
+                connection.commit()
+                return current, None
+            record, audit = outcome
+            self._upsert_budget_settings(connection, record)
+            audit_record = self._insert_audit_event(connection, audit)
+            connection.commit()
+            return record, audit_record
+        except BaseException:
+            connection.rollback()
+            raise
+        finally:
+            connection.close()
+
+    def _upsert_budget_settings(
+        self, connection: sqlite3.Connection, record: BudgetSettingsRecord
+    ) -> None:
+        connection.execute(
+            """
+            INSERT INTO budget_settings
+                (id, daily_usd, weekly_usd, monthly_usd, warn_pct, updated_at)
+            VALUES (?, ?, ?, ?, ?, ?)
+            ON CONFLICT(id) DO UPDATE SET
+                daily_usd = excluded.daily_usd,
+                weekly_usd = excluded.weekly_usd,
+                monthly_usd = excluded.monthly_usd,
+                warn_pct = excluded.warn_pct,
+                updated_at = excluded.updated_at
+            """,
+            (
+                "default",
+                record.daily_usd,
+                record.weekly_usd,
+                record.monthly_usd,
+                record.warn_pct,
+                record.updated_at,
+            ),
+        )
+
+
+def _row_to_budget_settings(row: sqlite3.Row | None) -> BudgetSettingsRecord | None:
+    if row is None:
+        return None
+    return BudgetSettingsRecord(
+        id=row["id"],
+        daily_usd=row["daily_usd"],
+        weekly_usd=row["weekly_usd"],
+        monthly_usd=row["monthly_usd"],
+        warn_pct=float(row["warn_pct"]),
+        updated_at=row["updated_at"],
+    )
 
 
 def _row_to_llm_call(row: sqlite3.Row) -> LLMCallRecord:

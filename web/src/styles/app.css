@@ -398,6 +398,10 @@ code {
   font-size: 10px;
 }
 
+.stat dd .stat-note {
+  display: block;
+}
+
 .panel {
   min-width: 0;
   border: 1px solid var(--oft-border-subtle);
@@ -1970,6 +1974,11 @@ code {
   .settings-page .btn {
     min-height: 44px;
   }
+
+  /* Touch targets meet the 44px contract at tablet/mobile (DESIGN A3/A12). */
+  .settings-input {
+    min-height: 44px;
+  }
 }
 
 /* Slice 34: risk-cap settings (F10c). */
@@ -2255,5 +2264,74 @@ code {
 
   .prompt-textarea {
     min-height: 200px;
+  }
+}
+
+/* Slice 37: budget thresholds and usage (F10e). */
+.budget-form {
+  padding: var(--oft-space-3) var(--oft-space-4) 0;
+}
+
+.budget-threshold-grid {
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(200px, 1fr));
+  gap: var(--oft-space-3);
+}
+
+.budget-meters {
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(220px, 1fr));
+  gap: var(--oft-space-3);
+  padding: var(--oft-space-3) var(--oft-space-4);
+}
+
+.budget-meter {
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+  min-width: 0;
+}
+
+.budget-meter-head {
+  display: flex;
+  justify-content: space-between;
+  gap: var(--oft-space-2);
+  color: var(--oft-text-secondary);
+  font-size: 12px;
+}
+
+.budget-meter-head .mono {
+  color: var(--oft-text-primary);
+}
+
+.budget-meter-track {
+  display: block;
+  height: 8px;
+  border: 1px solid var(--oft-border-subtle);
+  background: var(--oft-bg-panel);
+}
+
+.budget-meter-fill {
+  display: block;
+  height: 100%;
+  background: var(--oft-accent);
+}
+
+.budget-meter--warn .budget-meter-fill {
+  background: var(--oft-status-warn);
+}
+
+.budget-meter--exceeded .budget-meter-fill {
+  background: var(--oft-status-danger);
+}
+
+.status-message--warn {
+  border-color: var(--oft-status-warn);
+  color: var(--oft-status-warn);
+}
+
+@media (max-width: 768px) {
+  .budget-threshold-grid {
+    grid-template-columns: minmax(0, 1fr);
   }
 }

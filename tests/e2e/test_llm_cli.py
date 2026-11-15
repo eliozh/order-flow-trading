@@ -18,7 +18,7 @@ from oft.cli.main import app
 from oft.config import Settings
 from oft.domain.time import utc_timestamp
 from oft.ports.llm import LLMResult, LLMUsage, ProbeOutcome
-from oft.ports.store import LLMCallRecord
+from oft.ports.store import AuditEventDraft, LLMCallRecord
 
 SENTINEL = "sk-SENTINEL-DO-NOT-LEAK"
 
@@ -205,7 +205,7 @@ def test_llm_usage_reports_zero_spend_on_a_clean_dir(
 def test_budget_show_set_and_usage_round_trip(
     monkeypatch: pytest.MonkeyPatch, tmp_path: Path
 ) -> None:
-    _configure(monkeypatch, tmp_path)
+    settings = _configure(monkeypatch, tmp_path)
     runner = CliRunner()
 
     shown = runner.invoke(app, ["budget", "show", "--json"])
@@ -214,12 +214,49 @@ def test_budget_show_set_and_usage_round_trip(
     usage = runner.invoke(app, ["budget", "usage", "--period", "day", "--json"])
 
     assert shown.exit_code == 0, shown.output
-    assert shown.stdout and json.loads(shown.stdout)["data"]["thresholds"]["daily_usd"] == "10.00"
+    shown_data = json.loads(shown.stdout)["data"]
+    assert shown_data["thresholds"]["daily_usd"] == "10.00"
+    assert shown_data["projected_month_end_usd"] == "0.00000000"
+    assert shown_data["projection_basis"]["month_spend_usd"] == "0.00000000"
+    assert shown_data["last_alert"] is None
     assert updated.exit_code == 0, updated.output
     assert json.loads(updated.stdout)["data"]["thresholds"]["daily_usd"] == "5.00"
     assert json.loads(after.stdout)["data"]["thresholds"]["daily_usd"] == "5.00"
     assert usage.exit_code == 0, usage.output
     assert json.loads(usage.stdout)["data"]["period"] == "day"
+
+    # A crossing audit is surfaced by the next `show --json` and the human view.
+    store = SqliteStore(settings)
+    store.initialize()
+    store.append_audit_event(
+        AuditEventDraft(
+            event_type="BUDGET_THRESHOLD",
+            actor={"kind": "SYSTEM", "id": "budget_service"},
+            subject={"kind": "BUDGET", "id": "BUD-CLI"},
+            payload={
+                "period": "day",
+                "state": "WARN",
+                "spend_usd": "8.25000000",
+                "threshold_usd": "10.00",
+                "provider": "openai",
+                "model": "gpt-fixture",
+            },
+            created_at=utc_timestamp(datetime(2026, 11, 9, 10, tzinfo=UTC)),
+        )
+    )
+    alerted = runner.invoke(app, ["budget", "show", "--json"])
+    assert alerted.exit_code == 0, alerted.output
+    last_alert = json.loads(alerted.stdout)["data"]["last_alert"]
+    assert last_alert is not None
+    assert last_alert["state"] == "WARN"
+    assert last_alert["period"] == "day"
+    assert last_alert["provider"] == "openai"
+
+    human = runner.invoke(app, ["budget", "show"])
+    assert human.exit_code == 0, human.output
+    assert "Budget state" in human.stdout
+    assert "Projected month-end" in human.stdout
+    assert "Last alert" in human.stdout
 
 
 def test_budget_set_requires_at_least_one_value(

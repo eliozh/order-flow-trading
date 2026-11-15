@@ -1029,6 +1029,26 @@ class StorePort(Protocol):
 
     def save_budget_settings(self, record: BudgetSettingsRecord) -> None: ...
 
+    def save_budget_settings_change(
+        self,
+        build: Callable[
+            [BudgetSettingsRecord | None],
+            tuple[BudgetSettingsRecord, AuditEventDraft] | None,
+        ],
+    ) -> tuple[BudgetSettingsRecord | None, AuditEventRecord | None]:
+        """Read-modify-write the budget settings row atomically.
+
+        The store reads the current row inside one ``BEGIN IMMEDIATE``
+        transaction, calls the pure ``build`` callback with it, and upserts the
+        returned record plus its audit draft (or does nothing when ``build``
+        returns ``None``). ``before`` values derived inside the callback are
+        therefore accurate under concurrency, and a validation failure raised by
+        the callback rolls the transaction back with no partial write. Returns
+        the committed record (or the existing one when nothing was written) and
+        the committed audit record, if any.
+        """
+        ...
+
     # -- Provider capability probes --------------------------------------
 
     def save_provider_capability(self, record: ProviderCapabilityRecord) -> None: ...
