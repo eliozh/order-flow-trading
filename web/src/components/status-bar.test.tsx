@@ -81,4 +81,15 @@ describe('PauseControl', () => {
 
     expect(screen.getAllByRole('button')).toHaveLength(1)
   })
+
+  it('puts the pause control inside a labelled region landmark', () => {
+    render(
+      <LiveUpdatesProvider>
+        <PauseControl />
+      </LiveUpdatesProvider>,
+    )
+
+    const region = screen.getByRole('region', { name: '实时更新控制' })
+    expect(region).toContainElement(screen.getByRole('button', { name: '暂停实时更新' }))
+  })
 })

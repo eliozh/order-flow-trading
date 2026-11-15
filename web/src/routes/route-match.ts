@@ -1,4 +1,9 @@
 import { resolveActiveNav, type NavGroupId, type NavItemId } from './nav-items'
+import { normalizePath } from './path'
+
+// Re-exported so existing callers (App tests, consumers) keep importing the
+// single shared normalizer from the route module.
+export { normalizePath }
 
 export interface RouteMatch {
   path: string
@@ -32,14 +37,6 @@ function decodeSegment(segment: string): string {
   } catch {
     return segment
   }
-}
-
-/** Collapse trailing slashes so `/watchlist/search/` is the same route. */
-export function normalizePath(pathname: string): string {
-  if (!pathname || pathname === '/') {
-    return '/'
-  }
-  return pathname.replace(/\/+$/, '')
 }
 
 export function resolveRoute(pathname: string): RouteMatch {

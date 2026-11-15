@@ -5,6 +5,8 @@
  * reachable from one surface but missing from the other.
  */
 
+import { normalizePath } from './path'
+
 export type NavGroupId = 'monitor' | 'decide' | 'record' | 'config'
 
 export type NavItemId =
@@ -31,13 +33,23 @@ export type NavIconName =
   | 'settings'
   | 'system'
 
+/** A visible label fragment. `lang` marks an English token inside Chinese copy. */
+export interface NavLabelSegment {
+  text: string
+  lang?: string
+}
+
 export interface NavItem {
   id: NavItemId
   label: string
   href: string
   icon: NavIconName
-  /** Route prefix that makes this item current, including its detail routes. */
-  match: string
+  /**
+   * Optional labelled segments for mixed-language labels. When present the
+   * rendered link text is the concatenation of `text`, which must still equal
+   * `label` so the accessible name is unchanged.
+   */
+  segments?: readonly NavLabelSegment[]
 }
 
 export interface NavGroup {
@@ -51,46 +63,40 @@ export const NAV_GROUPS: readonly NavGroup[] = [
     id: 'monitor',
     label: '监控',
     items: [
-      {
-        id: 'watchlist',
-        label: '观察列表',
-        href: '/watchlist',
-        icon: 'watch',
-        match: '/watchlist',
-      },
-      { id: 'scans', label: '扫描', href: '/scans', icon: 'scan', match: '/scans' },
-      { id: 'reports', label: '报告', href: '/reports', icon: 'report', match: '/reports' },
+      { id: 'watchlist', label: '观察列表', href: '/watchlist', icon: 'watch' },
+      { id: 'scans', label: '扫描', href: '/scans', icon: 'scan' },
+      { id: 'reports', label: '报告', href: '/reports', icon: 'report' },
     ],
   },
   {
     id: 'decide',
     label: '决策',
     items: [
-      {
-        id: 'opportunities',
-        label: '机会台账',
-        href: '/opportunities',
-        icon: 'opp',
-        match: '/opportunities',
-      },
-      { id: 'triggers', label: '入场复核', href: '/triggers', icon: 'trigger', match: '/triggers' },
-      { id: 'positions', label: '持仓', href: '/positions', icon: 'pos', match: '/positions' },
+      { id: 'opportunities', label: '机会台账', href: '/opportunities', icon: 'opp' },
+      { id: 'triggers', label: '入场复核', href: '/triggers', icon: 'trigger' },
+      { id: 'positions', label: '持仓', href: '/positions', icon: 'pos' },
     ],
   },
   {
     id: 'record',
     label: '记录',
     items: [
-      { id: 'paper', label: 'Paper 账户', href: '/paper', icon: 'paper', match: '/paper' },
-      { id: 'journal', label: '交易复盘', href: '/journal', icon: 'journal', match: '/journal' },
+      {
+        id: 'paper',
+        label: 'Paper 账户',
+        href: '/paper',
+        icon: 'paper',
+        segments: [{ text: 'Paper', lang: 'en' }, { text: ' 账户' }],
+      },
+      { id: 'journal', label: '交易复盘', href: '/journal', icon: 'journal' },
     ],
   },
   {
     id: 'config',
     label: '配置',
     items: [
-      { id: 'settings', label: '设置', href: '/settings', icon: 'settings', match: '/settings' },
-      { id: 'system', label: '系统', href: '/system', icon: 'system', match: '/system' },
+      { id: 'settings', label: '设置', href: '/settings', icon: 'settings' },
+      { id: 'system', label: '系统', href: '/system', icon: 'system' },
     ],
   },
 ]
@@ -100,25 +106,22 @@ export interface ActiveNavMatch {
   item: NavItem
 }
 
-function normalizeNavPath(pathname: string): string {
-  if (!pathname) {
-    return '/'
-  }
-  const trimmed = pathname.replace(/\/+$/, '')
-  return trimmed === '' ? '/' : trimmed
-}
-
 function itemMatches(path: string, item: NavItem): boolean {
-  return path === item.match || path.startsWith(`${item.match}/`)
+  return path === item.href || path.startsWith(`${item.href}/`)
 }
 
 /**
- * The active group and item for a route. `/` belongs to the system surface, and
- * detail routes inherit the section they belong to (`/scans/abc` -> 扫描,
- * `/settings/scan` -> 设置).
+ * Pure section mapper: returns the nav group/item whose `href` owns a path.
+ *
+ * This helper does not know which route shapes actually render, so it must only
+ * be called with a path that `resolveRoute` has already resolved. `resolveRoute`
+ * owns `isResolved`, and calls this helper only then; a fabricated deeper path
+ * (for example `/triggers/a/b`) is not-found even though this bare mapper would
+ * still match the `/triggers` section. Do not broaden this mapper to compensate.
  */
 export function resolveActiveNav(pathname: string): ActiveNavMatch | null {
-  const normalized = normalizeNavPath(pathname)
+  // `/` is the system surface even though its canonical nav href is `/system`.
+  const normalized = normalizePath(pathname)
   const path = normalized === '/' ? '/system' : normalized
 
   for (const group of NAV_GROUPS) {

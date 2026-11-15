@@ -9,6 +9,14 @@ describe('resolveRoute', () => {
     expect(normalizePath('/watchlist/BTCUSDT///')).toBe('/watchlist/BTCUSDT')
   })
 
+  it('normalizes empty and slash-only paths to the root', () => {
+    expect(normalizePath('')).toBe('/')
+    expect(normalizePath('/')).toBe('/')
+    expect(normalizePath('///')).toBe('/')
+    expect(normalizePath('/watchlist/')).toBe('/watchlist')
+    expect(resolveRoute('///').isSystem).toBe(true)
+  })
+
   it('routes /watchlist/search/ to the watchlist search surface', () => {
     const route = resolveRoute('/watchlist/search/')
 

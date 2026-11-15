@@ -150,9 +150,61 @@ function NavLink({ item, active }: { item: NavItem; active: boolean }) {
         onClick={handleNavClick}
       >
         <NavIcon name={item.icon} />
-        <span className="nav-label">{item.label}</span>
+        <span className="nav-label">
+          {item.segments
+            ? item.segments.map((segment, index) =>
+                segment.lang ? (
+                  <span key={`${segment.lang}-${index}`} lang={segment.lang}>
+                    {segment.text}
+                  </span>
+                ) : (
+                  segment.text
+                ),
+              )
+            : item.label}
+        </span>
       </a>
     </li>
+  )
+}
+
+interface NavGroupsProps {
+  activeItemId: NavItemId | null
+  /**
+   * Appended to each group heading id. Compact and rail navs can coexist in the
+   * accessibility tree during breakpoint transitions, so the ids must be unique.
+   */
+  labelSuffix?: string
+  /** Compact groups render horizontal sections with the modifier class. */
+  compact?: boolean
+}
+
+/** One render tree for the desktop/rail/compact navigation groups. */
+function NavGroups({ activeItemId, labelSuffix = '', compact = false }: NavGroupsProps) {
+  return (
+    <>
+      {NAV_GROUPS.map((group) => {
+        const labelId = `nav-group-${group.id}${labelSuffix}`
+        return (
+          <section
+            className={compact ? 'nav-group nav-group--compact' : 'nav-group'}
+            key={group.id}
+          >
+            <h2 className="nav-group-label" id={labelId}>
+              {group.label}
+            </h2>
+            {/* Safari/VoiceOver drops list semantics for `list-style: none`, so
+                the explicit role is intentional (WCAG 1.3.1). */}
+            {/* eslint-disable-next-line jsx-a11y/no-redundant-roles */}
+            <ul className="nav-list" role="list" aria-labelledby={labelId}>
+              {group.items.map((item) => (
+                <NavLink key={item.id} item={item} active={activeItemId === item.id} />
+              ))}
+            </ul>
+          </section>
+        )
+      })}
+    </>
   )
 }
 
@@ -180,21 +232,7 @@ export function Nav({ activeItemId, compact = false }: NavProps) {
           <strong>{COMPACT_NOTE_ZH}</strong> <span lang="en">{COMPACT_NOTE_EN}</span>
         </p>
         <div className="nav-compact-groups">
-          {NAV_GROUPS.map((group) => {
-            const labelId = `nav-group-${group.id}-compact`
-            return (
-              <section className="nav-group nav-group--compact" key={group.id}>
-                <h2 className="nav-group-label" id={labelId}>
-                  {group.label}
-                </h2>
-                <ul className="nav-list" aria-labelledby={labelId}>
-                  {group.items.map((item) => (
-                    <NavLink key={item.id} item={item} active={activeItemId === item.id} />
-                  ))}
-                </ul>
-              </section>
-            )
-          })}
+          <NavGroups activeItemId={activeItemId} labelSuffix="-compact" compact />
         </div>
       </nav>
     )
@@ -202,28 +240,18 @@ export function Nav({ activeItemId, compact = false }: NavProps) {
 
   return (
     <nav id="app-nav" className="nav nav--rail" aria-label="主导航" tabIndex={-1}>
-      {NAV_GROUPS.map((group) => {
-        const labelId = `nav-group-${group.id}`
-        return (
-          <section className="nav-group" key={group.id}>
-            <h2 className="nav-group-label" id={labelId}>
-              {group.label}
-            </h2>
-            <ul className="nav-list" aria-labelledby={labelId}>
-              {group.items.map((item) => (
-                <NavLink key={item.id} item={item} active={activeItemId === item.id} />
-              ))}
-            </ul>
-          </section>
-        )
-      })}
+      <NavGroups activeItemId={activeItemId} />
     </nav>
   )
 }
 
 /**
- * Consumes the one-shot nav flag after a full-page navigation and focuses the
- * destination page's `h1` (preferred) or the dedicated shell live region.
+ * Consumes the one-shot nav flag after a full-page navigation and focuses a
+ * meaningful destination target. Precedence: the destination `h1`, then the
+ * always-present and programmatically focusable `#app-main`, and only as a last
+ * resort the dedicated shell live region. Taking `#app-main` when no h1 exists
+ * synchronously keeps `/` and `/system` (whose loading/error branches render no
+ * heading at mount) from focusing the permanently empty announcer.
  * Never installs a global key handler and never traps focus.
  */
 export function RouteFocus() {
@@ -234,8 +262,7 @@ export function RouteFocus() {
     const main = document.getElementById('app-main')
     const heading =
       main?.querySelector<HTMLElement>('h1') ?? document.querySelector<HTMLElement>('main h1')
-    const fallback = document.getElementById('route-announcer')
-    const target = heading ?? fallback
+    const target = heading ?? main ?? document.getElementById('route-announcer')
     if (!target) {
       return
     }

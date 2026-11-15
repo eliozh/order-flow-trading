@@ -2,6 +2,7 @@ import fs from 'node:fs'
 import path from 'node:path'
 
 import { expect, test, type Page } from '@playwright/test'
+import AxeBuilder from '@axe-core/playwright'
 
 /**
  * Critical read-only journey for slice 33: the persistent navigation shell.
@@ -38,19 +39,46 @@ const NAV_ITEMS = [
   { label: '系统', href: '/system' },
 ] as const
 
-/** Every existing route, with the nav item that must be current. */
+/** Every existing route, with the nav item that must be current and its h1. */
 const ROUTES = [
-  { path: '/system', current: '系统' },
-  { path: '/watchlist', current: '观察列表' },
-  { path: '/scans', current: '扫描' },
-  { path: '/reports', current: '报告' },
-  { path: '/opportunities', current: '机会台账' },
-  { path: '/triggers', current: '入场复核' },
-  { path: '/positions', current: '持仓' },
-  { path: '/paper', current: 'Paper 账户' },
-  { path: '/journal', current: '交易复盘' },
-  { path: '/settings', current: '设置' },
-  { path: '/settings/scan', current: '设置' },
+  { path: '/', current: '系统', heading: 'System status' },
+  { path: '/system', current: '系统', heading: 'System status' },
+  { path: '/watchlist', current: '观察列表', heading: 'Watchlist' },
+  { path: '/watchlist/search', current: '观察列表', heading: 'Watchlist' },
+  { path: '/scans', current: '扫描', heading: 'Scan history' },
+  { path: '/reports', current: '报告', heading: 'CALC reports' },
+  { path: '/opportunities', current: '机会台账', heading: 'Opportunities' },
+  { path: '/triggers', current: '入场复核', heading: '入场复核队列' },
+  { path: '/positions', current: '持仓', heading: '未平仓持仓' },
+  { path: '/paper', current: 'Paper 账户', heading: 'Paper 交易账户' },
+  { path: '/journal', current: '交易复盘', heading: '交易日志与复盘' },
+  { path: '/settings', current: '设置', heading: '设置 / Settings' },
+  { path: '/settings/scan', current: '设置', heading: '扫描周期与排程' },
+] as const
+
+/**
+ * Runtime axe baseline, per audited route. Every list is empty except for the
+ * known, pre-existing `/system` `definition-list` violation: the `.stat-note`
+ * `<p>` elements sit inside the `<dl><div>` wrappers, which the rule rejects.
+ * That is tracked outside slice 33; every other rule and route must be clean.
+ * Do not extend this list without a review.
+ */
+const AXE_BASELINE: Record<string, readonly string[]> = {
+  '/system': ['definition-list'],
+  '/watchlist': [],
+  '/reports': [],
+  '/positions': [],
+  '/journal': [],
+  '/settings': [],
+}
+
+const AXE_AUDIT_ROUTES = [
+  { path: '/system', heading: 'System status' },
+  { path: '/watchlist', heading: 'Watchlist' },
+  { path: '/reports', heading: 'CALC reports' },
+  { path: '/positions', heading: '未平仓持仓' },
+  { path: '/journal', heading: '交易日志与复盘' },
+  { path: '/settings', heading: '设置 / Settings' },
 ] as const
 
 const VIEWPORTS = [
@@ -117,11 +145,26 @@ async function activeFocus(page: Page): Promise<FocusStop> {
 }
 
 /** The shell guarantees that hold on every route at every width. */
-async function expectShell(page: Page, route: { path: string; current: string }): Promise<void> {
+async function expectShell(
+  page: Page,
+  route: { path: string; current: string; heading: string },
+): Promise<void> {
   await page.goto(route.path)
   const nav = navLandmark(page)
+  const main = page.locator('#app-main')
   await expect(nav, `nav landmark on ${route.path}`).toBeVisible()
-  await expect(page.locator('#app-main'), `main on ${route.path}`).toBeVisible()
+  await expect(main, `main on ${route.path}`).toBeVisible()
+
+  // The route renders its own page identity, not the not-found panel, inside
+  // the main landmark: a mis-wired branch cannot pass on shell presence alone.
+  await expect(
+    main.getByRole('heading', { level: 1, name: route.heading, exact: true }),
+    `h1 "${route.heading}" on ${route.path}`,
+  ).toBeVisible()
+  await expect(
+    page.getByRole('heading', { level: 1, name: 'Not found', exact: true }),
+    `no not-found heading on ${route.path}`,
+  ).toHaveCount(0)
 
   // Every existing route is reachable from the same grouped source.
   await expect(nav.getByRole('link'), `link count on ${route.path}`).toHaveCount(NAV_ITEMS.length)
@@ -190,6 +233,36 @@ test.describe('navigation shell reachability', () => {
   }
 })
 
+test('reports no new axe violations on the six audited routes at 1440', async ({ page }) => {
+  test.setTimeout(120_000)
+  await page.setViewportSize({ width: 1440, height: 900 })
+  await authenticate(page)
+
+  for (const route of AXE_AUDIT_ROUTES) {
+    await page.goto(route.path)
+    await page.waitForLoadState('networkidle')
+    await expect(
+      page
+        .locator('#app-main')
+        .getByRole('heading', { level: 1, name: route.heading, exact: true }),
+      `page identity on ${route.path}`,
+    ).toBeVisible()
+
+    const results = await new AxeBuilder({ page })
+      .withTags(['wcag2a', 'wcag2aa', 'wcag21a', 'wcag21aa'])
+      .analyze()
+    const allowed = AXE_BASELINE[route.path] ?? []
+    const violations = results.violations.filter((violation) => !allowed.includes(violation.id))
+    const summary = violations.map(
+      (violation) =>
+        `${violation.id} (${violation.impact ?? 'unknown'}): ${violation.nodes
+          .map((node) => node.target.join(' '))
+          .join(' | ')}`,
+    )
+    expect(violations, `${route.path} axe violations:\n${summary.join('\n')}`).toEqual([])
+  }
+})
+
 test('keeps the skip links first, reaches the kill switch before nav links, and moves focus on activation', async ({
   page,
 }) => {
@@ -221,11 +294,56 @@ test('keeps the skip links first, reaches the kill switch before nav links, and 
     /暂停实时更新|继续实时更新/,
   )
 
-  // 跳到主内容 moves focus to the main landmark.
+  // 跳到主内容 moves focus to the main landmark. It is visibly offscreen until
+  // it receives focus (WCAG 2.4.1): assert the geometry, not just focus.
   await page.reload()
   await expect(page.getByRole('heading', { name: 'System status', level: 1 })).toBeVisible()
+  const skipMain = page.getByRole('link', { name: '跳到主内容' })
+  const hiddenBox = await skipMain.boundingBox()
+  expect(hiddenBox, 'skip link has a box before focus').not.toBeNull()
+  expect(
+    hiddenBox!.y + hiddenBox!.height,
+    'skip link bottom is offscreen before focus',
+  ).toBeLessThanOrEqual(0)
+
   await page.keyboard.press('Tab')
-  await expect(page.getByRole('link', { name: '跳到主内容' })).toBeFocused()
+  await expect(skipMain).toBeFocused()
+
+  const viewport = page.viewportSize()
+  expect(viewport, 'viewport is known').not.toBeNull()
+  // The skip link slides in over 120ms; poll until it settles, then assert the
+  // final geometry is fully inside the viewport.
+  await expect
+    .poll(
+      async () => {
+        const box = await skipMain.boundingBox()
+        if (!box || !viewport) {
+          return false
+        }
+        return (
+          box.y >= 0 &&
+          box.x >= 0 &&
+          box.x + box.width <= viewport.width &&
+          box.y + box.height <= viewport.height
+        )
+      },
+      { message: 'focused skip link settles fully inside the viewport' },
+    )
+    .toBe(true)
+
+  const focusedBox = await skipMain.boundingBox()
+  expect(focusedBox, 'focused skip link has a box').not.toBeNull()
+  expect(focusedBox!.y, 'focused skip link top is inside the viewport').toBeGreaterThanOrEqual(0)
+  expect(focusedBox!.x, 'focused skip link left is inside the viewport').toBeGreaterThanOrEqual(0)
+  expect(
+    focusedBox!.x + focusedBox!.width,
+    'focused skip link right is inside the viewport',
+  ).toBeLessThanOrEqual(viewport!.width)
+  expect(
+    focusedBox!.y + focusedBox!.height,
+    'focused skip link bottom is inside the viewport',
+  ).toBeLessThanOrEqual(viewport!.height)
+
   await page.keyboard.press('Enter')
   await expect(page.locator('#app-main')).toBeFocused()
 
@@ -268,6 +386,16 @@ test('moves focus to the destination h1 after a nav-link route change', async ({
   await navLandmark(page).getByRole('link', { name: '扫描' }).click()
   await expect(page).toHaveURL(/\/scans$/)
   await expect(page.getByRole('heading', { name: 'Scan history', level: 1 })).toBeFocused()
+
+  // H1: /system's loading branch has no h1 at mount, so focus lands on the
+  // always-present #app-main instead of the permanently empty announcer.
+  await navLandmark(page).getByRole('link', { name: '系统' }).click()
+  await expect(page).toHaveURL(/\/system$/)
+  await expect(page.getByRole('heading', { name: 'System status', level: 1 })).toBeVisible()
+  await expect(page.locator('#app-main')).toBeFocused()
+  const systemFocus = await activeFocus(page)
+  expect(systemFocus.tag).not.toBe('BODY')
+  expect(systemFocus.id).not.toBe('route-announcer')
 
   // Focus never lands on body after a nav-driven route change.
   const focused = await activeFocus(page)

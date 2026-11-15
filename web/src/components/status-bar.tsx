@@ -72,7 +72,7 @@ export function PauseControl() {
   }, [paused])
 
   return (
-    <div className="pause-bar">
+    <section className="pause-bar" aria-label="实时更新控制">
       {paused && (
         <span className="stamp stamp--stale" data-testid="statusbar-paused" lang="en">
           PAUSED
@@ -84,6 +84,6 @@ export function PauseControl() {
       <span className="visually-hidden" role="status" aria-live="polite">
         {announcement}
       </span>
-    </div>
+    </section>
   )
 }

@@ -121,6 +121,23 @@ describe('navigation shell', () => {
     }
   })
 
+  it('keeps resolveActiveNav a pure section mapper contained by resolveRoute', () => {
+    // On every resolved route the mapper and the route authority agree.
+    for (const route of ROUTES) {
+      expect(resolveRoute(route.path).activeNavItem, route.path).toBe(
+        resolveActiveNav(route.path)?.item.id ?? null,
+      )
+    }
+
+    // The documented divergence is contained: the bare mapper would still claim
+    // the 入场复核 section for a deeper fabricated path, but resolveRoute's
+    // isResolved gate keeps that path in not-found.
+    expect(resolveActiveNav('/triggers/a/b')?.item.id).toBe('triggers')
+    const deeper = resolveRoute('/triggers/a/b')
+    expect(deeper.isTriggers).toBe(false)
+    expect(deeper.activeNavItem).toBeNull()
+  })
+
   it('renders every existing route inside the shell with exactly one aria-current item', async () => {
     for (const route of ROUTES) {
       const view = await renderAppAt(route.path)
@@ -176,8 +193,23 @@ describe('navigation shell', () => {
 
     for (const group of NAV_GROUPS) {
       expect(within(nav).getByRole('heading', { level: 2, name: group.label })).toBeInTheDocument()
-      expect(within(nav).getByRole('list', { name: group.label })).toBeInTheDocument()
+      const list = within(nav).getByRole('list', { name: group.label })
+      expect(list).toBeInTheDocument()
+      // Safari/VoiceOver drop list semantics under `list-style: none`; the
+      // explicit role keeps the list announced (WCAG 1.3.1).
+      expect(list).toHaveAttribute('role', 'list')
     }
+  })
+
+  it('marks the English Paper token with lang="en" without changing the accessible name', () => {
+    render(<Nav activeItemId="paper" />)
+    const nav = screen.getByRole('navigation', { name: '主导航' })
+    const link = within(nav).getByRole('link', { name: 'Paper 账户' })
+
+    const paper = within(link).getByText('Paper')
+    expect(paper).toHaveAttribute('lang', 'en')
+    expect(link).toHaveAccessibleName('Paper 账户')
+    expect(link).toHaveAttribute('aria-current', 'page')
   })
 
   it('uses same-origin relative hrefs and gives every link an accessible name', () => {
@@ -200,6 +232,15 @@ describe('navigation shell', () => {
     const links = screen.getAllByRole('link')
     expect(links[0]).toHaveAccessibleName('跳到主内容')
     expect(links[1]).toHaveAccessibleName('跳到导航')
+
+    // jsdom has no layout, so skip-link geometry (offscreen before focus and
+    // fully on-screen when focused) is asserted in web/e2e/navigation.spec.ts.
+    // Here we assert each href targets an existing in-page landmark and that
+    // activation actually moves focus.
+    expect(links[0]).toHaveAttribute('href', '#app-main')
+    expect(document.getElementById('app-main')).not.toBeNull()
+    expect(links[1]).toHaveAttribute('href', '#app-nav')
+    expect(document.getElementById('app-nav')).not.toBeNull()
 
     fireEvent.click(links[0])
     expect(document.activeElement).toBe(document.getElementById('app-main'))
@@ -234,7 +275,9 @@ describe('navigation shell', () => {
     expect(current[0]).toHaveAccessibleName('扫描')
 
     for (const group of NAV_GROUPS) {
-      expect(within(nav).getByRole('list', { name: group.label })).toBeInTheDocument()
+      const list = within(nav).getByRole('list', { name: group.label })
+      expect(list).toBeInTheDocument()
+      expect(list).toHaveAttribute('role', 'list')
     }
   })
 
@@ -290,7 +333,7 @@ describe('navigation shell', () => {
     expect(sessionStorage.getItem(NAV_FOCUS_KEY)).toBeNull()
   })
 
-  it('falls back to one shell live region when the destination has no h1', async () => {
+  it('falls back to the always-present main landmark when the destination has no h1', async () => {
     sessionStorage.setItem(NAV_FOCUS_KEY, '1')
     render(
       <div>
@@ -302,8 +345,21 @@ describe('navigation shell', () => {
     )
 
     await waitFor(() => {
+      expect(document.activeElement).toBe(document.getElementById('app-main'))
+    })
+    // The empty announcer is never focused while #app-main exists.
+    expect(document.activeElement).not.toBe(document.getElementById('route-announcer'))
+    expect(sessionStorage.getItem(NAV_FOCUS_KEY)).toBeNull()
+  })
+
+  it('uses the shell live region only when the destination has neither h1 nor main', async () => {
+    sessionStorage.setItem(NAV_FOCUS_KEY, '1')
+    render(<RouteFocus />)
+
+    await waitFor(() => {
       expect(document.activeElement).toBe(document.getElementById('route-announcer'))
     })
+    expect(sessionStorage.getItem(NAV_FOCUS_KEY)).toBeNull()
     expect(document.getElementById('route-announcer')).toHaveAttribute('role', 'status')
   })
 
