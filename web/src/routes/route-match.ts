@@ -29,6 +29,7 @@ export interface RouteMatch {
   journalTradeId: string | null
   isSettings: boolean
   isSettingsScan: boolean
+  isSettingsRisk: boolean
 }
 
 function decodeSegment(segment: string): string {
@@ -63,10 +64,11 @@ export function resolveRoute(pathname: string): RouteMatch {
   // Only `/journal` or exactly one detail segment is a journal route; a
   // deeper path falls through to not-found.
   const isJournal = path === '/journal' || journalMatch !== null
-  // Only the shell and the scan section exist in this slice; any deeper
-  // settings path falls through to not-found until its slice lands.
+  // The shell, scan, and risk sections exist; any deeper settings path falls
+  // through to not-found until its slice lands.
   const isSettings = path === '/settings'
   const isSettingsScan = path === '/settings/scan'
+  const isSettingsRisk = path === '/settings/risk'
   const isWatchlist = path === '/watchlist' || path.startsWith('/watchlist/')
   const isSystem = path === '/' || path === '/system' || path.startsWith('/system/')
 
@@ -90,6 +92,7 @@ export function resolveRoute(pathname: string): RouteMatch {
     isPaper ||
     isWatchlist ||
     isSettingsScan ||
+    isSettingsRisk ||
     isSettings ||
     isSystem
   const activeNav = isResolved ? resolveActiveNav(path) : null
@@ -116,5 +119,6 @@ export function resolveRoute(pathname: string): RouteMatch {
     journalTradeId: journalMatch !== null ? decodeSegment(journalMatch[1]) : null,
     isSettings,
     isSettingsScan,
+    isSettingsRisk,
   }
 }

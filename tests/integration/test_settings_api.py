@@ -16,6 +16,7 @@ from oft.api.app import create_app
 from oft.cli.main import app as cli_app
 from oft.clock import FixedClock
 from oft.config import Settings, load_settings
+from oft.domain.risk import RISK_CAPS_STATE_KEY
 from oft.ports.store import ConfigRecord
 
 NOW = datetime(2026, 11, 6, 10, 0, tzinfo=UTC)
@@ -429,12 +430,27 @@ def test_settings_sections_expose_source_and_keys_without_values(tmp_path: Path)
         before = client.get("/api/v1/settings", headers=auth)
         assert before.status_code == 200, before.text
         section = before.json()["data"]["sections"]
-        assert len(section) == 1
+        assert len(section) == 2
         assert section[0] == {
             "section": "scan",
             "source": "default",
             "last_changed": None,
             "keys": ["scan.period"],
+        }
+        assert section[1] == {
+            "section": "risk",
+            "source": "default",
+            "last_changed": None,
+            "keys": [
+                "per_trade_risk_pct",
+                "max_concurrent_positions",
+                "daily_loss_pct",
+                "max_leverage",
+                "max_notional_pct",
+                "max_slippage_bps",
+                "max_spread_bps",
+                "stale_mark_seconds",
+            ],
         }
         assert "value" not in json.dumps(section)
 
@@ -442,6 +458,46 @@ def test_settings_sections_expose_source_and_keys_without_values(tmp_path: Path)
         after = client.get("/api/v1/settings", headers=auth).json()["data"]["sections"][0]
         assert after["source"] == "user"
         assert after["last_changed"] == "2026-11-06T10:00:00.000Z"
+
+
+def test_settings_sections_are_metadata_only_for_risk(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The overview must not build the utilization snapshot."""
+    from oft.application.settings_service import SettingsService
+
+    def _boom(self: Any, caps: Any) -> Any:
+        raise AssertionError("read_sections must not compute utilization")
+
+    monkeypatch.setattr(SettingsService, "_utilization", _boom)
+    app = create_app(_settings(tmp_path), clock=FixedClock(NOW))
+
+    with TestClient(app) as client:
+        response = client.get("/api/v1/settings", headers=_auth(app))
+
+    assert response.status_code == 200, response.text
+    assert [section["section"] for section in response.json()["data"]["sections"]] == [
+        "scan",
+        "risk",
+    ]
+    # The detail route still owns the snapshot and is expected to fail here.
+    with TestClient(app) as client, pytest.raises(AssertionError):
+        client.get("/api/v1/settings/risk", headers=_auth(app))
+
+
+def test_corrupt_persisted_risk_caps_on_the_overview_map_to_config_invalid(
+    tmp_path: Path,
+) -> None:
+    app = create_app(_settings(tmp_path), clock=FixedClock(NOW))
+    app.state.container.store.set_system_state(
+        RISK_CAPS_STATE_KEY, "not-json", updated_at="2026-11-06T10:00:00.000Z"
+    )
+
+    with TestClient(app) as client:
+        response = client.get("/api/v1/settings", headers=_auth(app))
+
+    assert response.status_code == 500, response.text
+    assert response.json()["error"]["code"] == "CONFIG_INVALID"
 
 
 def test_settings_spa_entries_establish_a_browser_session(tmp_path: Path) -> None:

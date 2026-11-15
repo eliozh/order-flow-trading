@@ -26,6 +26,10 @@ const SECTION_COPY: Record<string, { title: string; description: string }> = {
     title: '扫描与排程',
     description: '扫描周期（4h/8h）、来源、下一个 UTC 边界。',
   },
+  risk: {
+    title: '风险上限',
+    description: '单笔风险、持仓数、日亏损、杠杆与名义上限；收紧直存，放宽需确认。',
+  },
 }
 
 /** `/settings`: the section index. Values are not shown here, only provenance. */
@@ -76,7 +80,7 @@ export function SettingsPage({
           <p className="kicker">Settings / overview</p>
           <h1 id="settings-heading">设置 / Settings</h1>
           <p className="page-sub">
-            高后果变更需显式保存、审计并确认。本切片只包含扫描周期；其他设置分区随后续切片提供。
+            高后果变更需显式保存、审计并确认。当前包含扫描周期与风险上限；其他设置分区随后续切片提供。
           </p>
         </div>
       </div>

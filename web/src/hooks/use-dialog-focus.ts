@@ -53,8 +53,13 @@ export function useDialogFocus(
     if (!open || typeof document === 'undefined') {
       return
     }
-    restoreRef.current =
-      document.activeElement instanceof HTMLElement ? document.activeElement : null
+    const activeElement =
+      document.activeElement instanceof HTMLElement &&
+      document.activeElement !== document.body &&
+      document.activeElement !== document.documentElement
+        ? document.activeElement
+        : null
+    restoreRef.current = activeElement
     const panel = panelRef.current
     const initial =
       panel?.querySelector<HTMLElement>('[data-autofocus]') ?? focusables(panel)[0] ?? panel
