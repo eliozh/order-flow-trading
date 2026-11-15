@@ -120,6 +120,9 @@ export type PromptApiErrorKind = 'refusal' | 'unknown'
  */
 export const DEFINITIVE_PROMPT_REFUSAL_CODES: ReadonlySet<string> = new Set([
   'PROMPT_VALIDATION_FAILED',
+  // FastAPI emits this generic code for a 422 validation error; the prompt
+  // service's own code is PROMPT_VALIDATION_FAILED. Both reject before a write.
+  'VALIDATION_FAILED',
   'PROMPT_VERSION_MISSING',
   'CONFLICT',
   'NOT_FOUND',
@@ -131,6 +134,9 @@ export const DEFINITIVE_PROMPT_REFUSAL_CODES: ReadonlySet<string> = new Set([
   'IDEMPOTENCY_KEY_REQUIRED',
   'IDEMPOTENCY_CONFLICT',
 ])
+
+/** Client-side upper bound on one template body, in UTF-8 bytes. */
+export const MAX_PROMPT_BODY_BYTES = 64 * 1024
 
 export class PromptApiError extends Error {
   readonly code: string | undefined

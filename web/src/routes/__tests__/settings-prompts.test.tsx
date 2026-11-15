@@ -15,7 +15,13 @@ import {
   PromptApiError,
 } from '../../api/prompts'
 import { diffLineTone } from '../../components/prompt-diff'
-import { renderRedactedPreview, validatePromptText } from '../../components/prompt-editor'
+import {
+  firstUnmatchedOffset,
+  lineColumnAt,
+  renderRedactedPreview,
+  validatePromptText,
+  variableLineNumbers,
+} from '../../components/prompt-editor'
 import { SettingsPromptDetailPage } from '../settings-prompt-detail'
 import { SettingsPromptHistoryPage } from '../settings-prompt-history'
 import { SettingsPromptsPage } from '../settings-prompts'
@@ -91,8 +97,11 @@ function settingsData(overrides: Partial<PromptSettingsData> = {}): PromptSettin
   }
 }
 
-function settingsEnvelope(data: PromptSettingsData): PromptSettingsEnvelope {
-  return { ok: true, data, error: null, meta }
+function settingsEnvelope(
+  data: PromptSettingsData,
+  metaOverrides: Partial<ApiMeta> = {},
+): PromptSettingsEnvelope {
+  return { ok: true, data, error: null, meta: { ...meta, ...metaOverrides } }
 }
 
 function promptVersion(overrides: Partial<PromptVersionData> = {}): PromptVersionData {
@@ -216,6 +225,71 @@ describe('prompt editor helpers', () => {
     expect(diffLineTone('--- a')).toBe('context')
     expect(diffLineTone('+++ b')).toBe('context')
   })
+
+  it('computes 1-based line/column positions across newlines', () => {
+    expect(lineColumnAt('abc', 0)).toEqual({ line: 1, column: 1 })
+    expect(lineColumnAt('abc', 2)).toEqual({ line: 1, column: 3 })
+    expect(lineColumnAt('ab\ncd', 3)).toEqual({ line: 2, column: 1 })
+    expect(lineColumnAt('ab\ncd', 5)).toEqual({ line: 2, column: 3 })
+    // An out-of-range offset clamps to the end of the body.
+    expect(lineColumnAt('ab\ncd', 99)).toEqual({ line: 2, column: 3 })
+  })
+
+  it('locates the first unmatched placeholder and reports its line and column', () => {
+    expect(firstUnmatchedOffset('{{symbol}}')).toBeNull()
+    expect(firstUnmatchedOffset('{{a}}{{b}}')).toBeNull()
+
+    const trailing = 'line one\n{{oops'
+    const offset = firstUnmatchedOffset(trailing)
+    expect(offset).toBe(trailing.indexOf('{{'))
+    expect(lineColumnAt(trailing, offset as number)).toEqual({ line: 2, column: 1 })
+
+    const strayClose = 'tail }}'
+    expect(firstUnmatchedOffset(strayClose)).toBe(strayClose.indexOf('}}'))
+
+    const issue = validatePromptText('line one\n{{oops', REQUIRED.ANALYSIS, 'ANALYSIS')
+    expect(issue.malformed).toBe(true)
+    expect(issue.malformedLine).toBe(2)
+    expect(issue.malformedColumn).toBe(1)
+  })
+
+  it('keeps malformed parity with the server for an empty placeholder', () => {
+    // Balanced braces but not a valid placeholder: the server rejects it, so
+    // the client must too.
+    expect(validatePromptText('Symbol {{ }}', REQUIRED.ANALYSIS, 'ANALYSIS').malformed).toBe(true)
+  })
+
+  it('maps each variable to its first-occurrence line', () => {    const lines = variableLineNumbers('{{symbol}}\nsecond\n{{timeframe}} {{symbol}}')
+    expect(lines.symbol).toBe(1)
+    expect(lines.timeframe).toBe(3)
+  })
+
+  it('allows exactly 65536 bytes and rejects 65537', () => {
+    const base = VALID_ANALYSIS_BODY
+    const atLimit = `${base}${'x'.repeat(65536 - base.length)}`
+    expect(new TextEncoder().encode(atLimit).length).toBe(65536)
+    const allowed = validatePromptText(atLimit, REQUIRED.ANALYSIS, 'ANALYSIS')
+    expect(allowed.byteLength).toBe(65536)
+    expect(allowed.tooLarge).toBe(false)
+    expect(allowed.valid).toBe(true)
+
+    const over = `${base}${'x'.repeat(65537 - base.length)}`
+    expect(validatePromptText(over, REQUIRED.ANALYSIS, 'ANALYSIS').tooLarge).toBe(true)
+  })
+
+  it('enforces the 64 KiB UTF-8 budget at the multibyte boundary', () => {
+    // Three bytes per CJK character: 21845 chars = 65535 bytes (under),
+    // 21846 chars = 65538 bytes (over).
+    const under = '汉'.repeat(21845)
+    const over = '汉'.repeat(21846)
+    const underIssue = validatePromptText(under, REQUIRED.ANALYSIS, 'ANALYSIS')
+    expect(underIssue.byteLength).toBe(65535)
+    expect(underIssue.tooLarge).toBe(false)
+    const overIssue = validatePromptText(over, REQUIRED.ANALYSIS, 'ANALYSIS')
+    expect(overIssue.byteLength).toBe(65538)
+    expect(overIssue.tooLarge).toBe(true)
+    expect(overIssue.valid).toBe(false)
+  })
 })
 
 // -- list -------------------------------------------------------------------
@@ -257,7 +331,11 @@ describe('SettingsPromptsPage', () => {
       'href',
       '/settings/prompts/analysis',
     )
-    expect(screen.getAllByRole('link', { name: '历史' })[0]).toHaveAttribute(
+    expect(screen.getByRole('link', { name: '编辑 analysis' })).toHaveAttribute(
+      'href',
+      '/settings/prompts/analysis',
+    )
+    expect(screen.getByRole('link', { name: 'analysis 历史' })).toHaveAttribute(
       'href',
       '/settings/prompts/analysis/history',
     )
@@ -286,14 +364,57 @@ describe('SettingsPromptsPage', () => {
     expect(screen.queryByTestId('prompts-builtin-banner')).toBeNull()
   })
 
-  it('shows the empty state when no template rows exist', async () => {
+  it('reports a MISSING aggregate without claiming built-in defaults', async () => {
     render(
       <SettingsPromptsPage
-        fetchPromptSettingsFn={async () => settingsEnvelope({ items: [], total: 0 })}
+        fetchPromptSettingsFn={async () =>
+          settingsEnvelope({ items: [], total: 0 }, { data_quality: 'MISSING' })
+        }
       />,
     )
 
-    expect(await screen.findByText('尚未创建自定义模板')).toBeInTheDocument()
+    expect(await screen.findByTestId('prompts-data-quality')).toBeInTheDocument()
+    expect(screen.getByTestId('prompts-data-quality-warning')).toHaveTextContent(
+      '未读取到任何模板角色',
+    )
+    expect(screen.getByText('模板数据缺失')).toBeInTheDocument()
+    // MISSING must never claim that the built-in default v1 is in use.
+    expect(screen.queryByTestId('prompts-builtin-banner')).toBeNull()
+    expect(screen.queryByText(/使用内置默认 v1/)).toBeNull()
+  })
+
+  it('warns on a PARTIAL aggregate and renders only the roles it received', async () => {
+    const items = settingsData().items.slice(0, 3)
+    await renderList({
+      fetch: async () =>
+        settingsEnvelope({ items, total: 3 }, { data_quality: 'PARTIAL' }),
+    })
+
+    expect(screen.getByTestId('prompts-data-quality')).toBeInTheDocument()
+    expect(screen.getByTestId('prompts-data-quality-warning')).toHaveTextContent(
+      '仅 3 / 4 个角色可用',
+    )
+    expect(screen.queryByTestId('prompts-builtin-banner')).toBeNull()
+    // The heading hint must not claim four roles when only three are present.
+    expect(screen.getByTestId('prompts-roles-hint')).toHaveTextContent('3 / 4')
+    expect(screen.getByTestId('prompt-row-analysis')).toBeInTheDocument()
+    expect(screen.queryByTestId('prompt-row-review')).toBeNull()
+  })
+
+  it('treats items.length !== total as an incomplete aggregate', async () => {
+    await renderList({
+      fetch: async () =>
+        settingsEnvelope(
+          { items: settingsData().items, total: 5 },
+          { data_quality: 'COMPLETE' },
+        ),
+    })
+
+    expect(screen.getByTestId('prompts-data-quality')).toBeInTheDocument()
+    expect(screen.getByTestId('prompts-data-quality-warning')).toHaveTextContent(
+      '与 total=5 不一致',
+    )
+    expect(screen.queryByTestId('prompts-builtin-banner')).toBeNull()
   })
 
   it('shows a load error and recovers on retry', async () => {
@@ -385,6 +506,8 @@ describe('SettingsPromptDetailPage', () => {
       expect(item).toHaveTextContent('已存在')
       expect(within(item).queryByRole('checkbox')).toBeNull()
     }
+    // Present variables carry their first-occurrence line; symbol is line 1.
+    expect(screen.getByTestId('prompt-variable-symbol')).toHaveTextContent('第 1 行')
     expect(screen.getByRole('region', { name: '必需变量检查' })).toHaveAttribute('tabindex', '0')
     expect(create).not.toHaveBeenCalled()
   })
@@ -411,6 +534,8 @@ describe('SettingsPromptDetailPage', () => {
     })
 
     expect(screen.getByText('缺少必需变量 {{metrics}}')).toBeInTheDocument()
+    // A missing required variable must not claim a line that does not exist.
+    expect(screen.getByTestId('prompt-variable-metrics')).toHaveTextContent('尚未出现')
     fireEvent.click(screen.getByRole('button', { name: '保存为新版本' }))
 
     const alert = await screen.findByRole('alert')
@@ -603,6 +728,125 @@ describe('SettingsPromptDetailPage', () => {
     expect(clear).toHaveBeenCalledWith('analysis')
   })
 
+  it('retires the key for a FastAPI VALIDATION_FAILED refusal and surfaces the detail message', async () => {
+    const create = vi.fn(async () => {
+      throw new PromptApiError('refused by server', 'VALIDATION_FAILED', {
+        httpStatus: 422,
+        details: [{ field: 'author', code: 'author_invalid', message: 'author is too long' }],
+      })
+    })
+    const clear = vi.fn()
+    await renderEditor({ create, clear })
+
+    fireEvent.click(screen.getByRole('button', { name: '编辑' }))
+    fireEvent.click(screen.getByRole('button', { name: '保存为新版本' }))
+
+    const alert = await screen.findByRole('alert')
+    expect(alert).toHaveTextContent('refused by server')
+    expect(alert).toHaveTextContent('author is too long')
+    expect(within(alert).getByRole('link', { name: '转到作者' })).toHaveAttribute(
+      'href',
+      '#prompt-author',
+    )
+    // A definitive 422 refusal wrote nothing, so the pending key is retired.
+    expect(clear).toHaveBeenCalledWith('analysis')
+  })
+
+  it('links a body-field refusal to the template body', async () => {
+    const create = vi.fn(async () => {
+      throw new PromptApiError('bad body', 'PROMPT_VALIDATION_FAILED', {
+        httpStatus: 422,
+        details: [{ field: 'body', message: 'body invalid' }],
+      })
+    })
+    await renderEditor({ create })
+
+    fireEvent.click(screen.getByRole('button', { name: '编辑' }))
+    fireEvent.click(screen.getByRole('button', { name: '保存为新版本' }))
+
+    const alert = await screen.findByRole('alert')
+    expect(alert).toHaveTextContent('body invalid')
+    expect(within(alert).getByRole('link', { name: '转到模板正文' })).toHaveAttribute(
+      'href',
+      '#prompt-body',
+    )
+  })
+
+  it('never creates a version on Enter; only the explicit save button writes', async () => {
+    const create = vi.fn(async () =>
+      versionEnvelope(
+        promptVersion({ version: 2, status: 'DRAFT', is_active: false, is_default: false }),
+      ),
+    )
+    await renderEditor({ create })
+
+    fireEvent.click(screen.getByRole('button', { name: '编辑' }))
+    const save = screen.getByRole('button', { name: '保存为新版本' })
+    expect(save).toHaveAttribute('type', 'button')
+
+    const author = screen.getByRole('textbox', { name: '作者' })
+    fireEvent.change(author, { target: { value: 'operator' } })
+    fireEvent.keyDown(author, { key: 'Enter' })
+    // Even an explicit submit event must not write without the button click.
+    fireEvent.submit(screen.getByRole('form', { name: '编辑 Prompt 模板' }))
+    expect(create).not.toHaveBeenCalled()
+
+    fireEvent.click(save)
+    await waitFor(() => expect(create).toHaveBeenCalledTimes(1))
+  })
+
+  it('blocks a body over the 64 KiB UTF-8 budget with zero writes', async () => {
+    const { create } = await renderEditor()
+
+    fireEvent.click(screen.getByRole('button', { name: '编辑' }))
+    fireEvent.change(editorTextarea(), {
+      target: { value: `${VALID_ANALYSIS_BODY}${'汉'.repeat(22000)}` },
+    })
+    fireEvent.click(screen.getByRole('button', { name: '保存为新版本' }))
+
+    const alert = await screen.findByRole('alert')
+    expect(alert).toHaveTextContent('64 KiB')
+    expect(create).not.toHaveBeenCalled()
+  })
+
+  it('keeps the editor and success message mounted when the post-save refetch fails', async () => {
+    let calls = 0
+    const fetch = vi.fn(() => {
+      calls += 1
+      return calls === 1
+        ? Promise.resolve(detailEnvelope(detailData()))
+        : Promise.reject(new Error('refetch down'))
+    })
+    const create = vi.fn(async () =>
+      versionEnvelope(
+        promptVersion({ version: 2, status: 'DRAFT', is_active: false, is_default: false }),
+      ),
+    )
+    await renderEditor({ fetch, create })
+
+    fireEvent.click(screen.getByRole('button', { name: '编辑' }))
+    fireEvent.change(editorTextarea(), {
+      target: { value: `${VALID_ANALYSIS_BODY}POST-SAVE REFETCH FAILS\n` },
+    })
+    fireEvent.click(screen.getByRole('button', { name: '保存为新版本' }))
+
+    const refreshError = await screen.findByTestId('prompt-editor-refresh-error')
+    expect(refreshError).toHaveTextContent('刷新失败；仍显示上次加载的内容')
+    expect(refreshError).toHaveTextContent('refetch down')
+    expect(screen.getByTestId('prompt-editor-visible')).toHaveTextContent('已创建 v2')
+    expect(screen.getByRole('form', { name: '编辑 Prompt 模板' })).toBeInTheDocument()
+    await waitFor(() => expect(screen.getByRole('button', { name: '编辑' })).toHaveFocus())
+
+    // The retained snapshot is the PRE-SAVE active detail: the read-only body
+    // and heading stay on v1 instead of showing the just-saved draft.
+    const textarea = editorTextarea()
+    expect(textarea).toHaveAttribute('readonly')
+    expect(textarea.value).toBe(VALID_ANALYSIS_BODY)
+    expect(screen.getByRole('heading', { level: 2, name: /v1/ })).toBeInTheDocument()
+    expect(screen.getByTestId('prompt-preview')).toHaveTextContent('[redacted: symbol]')
+    expect(screen.getByTestId('prompt-preview')).not.toHaveTextContent('POST-SAVE REFETCH FAILS')
+  })
+
   it('keeps the key and reports an unknown outcome for a transport failure', async () => {
     const create = vi.fn(async () => {
       throw new Error('socket closed')
@@ -619,11 +863,29 @@ describe('SettingsPromptDetailPage', () => {
     expect(clear).not.toHaveBeenCalled()
   })
 
-  it('is read-only at 375 with a desktop/CLI instruction', async () => {
+  it('keeps the 375 read-only body focusable and copyable while only actions are disabled', async () => {
     await renderEditor({ isCompact: true })
 
     expect(screen.getByRole('note')).toHaveTextContent(/桌面端或 CLI/)
-    expect(editorTextarea()).toBeDisabled()
+    const textarea = editorTextarea()
+    // SC 2.1.1: a read-only body must remain reachable and copyable. Only the
+    // edit/save actions are natively disabled.
+    expect(textarea).toHaveAttribute('readonly')
+    expect(textarea).not.toBeDisabled()
+    textarea.focus()
+    expect(textarea).toHaveFocus()
+    expect(textarea.value).toBe(VALID_ANALYSIS_BODY)
+    textarea.select()
+    expect(textarea.selectionStart).toBe(0)
+    expect(textarea.selectionEnd).toBe(textarea.value.length)
+
+    const author = screen.getByRole('textbox', { name: '作者' })
+    const reason = screen.getByRole('textbox', { name: '变更原因' })
+    expect(author).toHaveAttribute('readonly')
+    expect(reason).toHaveAttribute('readonly')
+    expect(author).not.toBeDisabled()
+    expect(reason).not.toBeDisabled()
+
     expect(screen.getByRole('button', { name: '编辑' })).toBeDisabled()
     expect(screen.getByRole('button', { name: '保存为新版本' })).toBeDisabled()
     expect(screen.getByRole('button', { name: '保存并激活' })).toBeDisabled()
@@ -801,6 +1063,102 @@ describe('SettingsPromptHistoryPage', () => {
     expect(body.querySelector('a')).toBeNull()
   })
 
+  it('announces diff loading and ready and exposes selected/pressed state', async () => {
+    const detail = detailData({
+      active_version: 2,
+      versions: [
+        promptVersion({ version: 1, is_active: false, status: 'SUPERSEDED', is_default: true }),
+        promptVersion({ version: 2, is_active: true, status: 'ACTIVE', is_default: false }),
+        promptVersion({ version: 3, is_active: false, status: 'DRAFT', is_default: false }),
+      ],
+    })
+    const pending = deferred<PromptDiffEnvelope>()
+    let calls = 0
+    const fetchDiff = vi.fn(() => {
+      calls += 1
+      return calls === 1
+        ? Promise.resolve(diffEnvelope(diffData(1, 2, DIFF_TEXT)))
+        : pending.promise
+    })
+    await renderHistory({ detail, fetchDiff })
+
+    await screen.findByTestId('prompt-diff-body')
+    expect(screen.getByTestId('prompt-diff-status')).toHaveTextContent('差异已就绪：v1 → v2')
+    expect(document.getElementById('prompt-diff-panel')).not.toBeNull()
+
+    const diffButton = screen.getByRole('button', { name: '查看 diff：v3 与 active v2 的差异' })
+    expect(diffButton).toHaveAttribute('aria-controls', 'prompt-diff-panel')
+    expect(diffButton).toHaveAttribute('aria-pressed', 'false')
+
+    fireEvent.click(diffButton)
+    await waitFor(() =>
+      expect(screen.getByTestId('prompt-diff-status')).toHaveTextContent(
+        '正在加载 v3 与 active v2 的差异',
+      ),
+    )
+    expect(screen.getByRole('button', { name: '查看 diff：v3 与 active v2 的差异' })).toHaveAttribute(
+      'aria-pressed',
+      'true',
+    )
+    // The visible loading paragraph is not a second live region; the stable
+    // hidden status is the single announcer for the loading transition.
+    expect(screen.getByTestId('prompt-diff-loading')).not.toHaveAttribute('role')
+
+    pending.resolve(diffEnvelope(diffData(2, 3, DIFF_TEXT)))
+    await waitFor(() =>
+      expect(screen.getByTestId('prompt-diff-status')).toHaveTextContent(
+        '差异已就绪：v2 → v3',
+      ),
+    )
+  })
+
+  it('announces a diff error once through the visible alert, not the hidden status', async () => {
+    await renderHistory({
+      fetchDiff: async () => {
+        throw new Error('diff down')
+      },
+    })
+
+    const alert = await screen.findByRole('alert')
+    expect(alert).toHaveTextContent('Diff 不可用')
+    expect(alert).toHaveTextContent('diff down')
+    // The stable status stays empty for an error so the alert is the only
+    // announcement of that transition.
+    expect(screen.getByTestId('prompt-diff-status').textContent).toBe('')
+  })
+
+  it('keeps the history and success message mounted when the post-activate refetch fails', async () => {
+    let calls = 0
+    const fetchDetail = vi.fn(() => {
+      calls += 1
+      return calls === 1
+        ? Promise.resolve(detailEnvelope(historyDetail()))
+        : Promise.reject(new Error('refetch down'))
+    })
+    const activate = vi.fn(async () =>
+      versionEnvelope(promptVersion({ version: 1, status: 'ACTIVE', is_active: true })),
+    )
+    await renderHistory({ fetchDetail, activate })
+
+    fireEvent.click(screen.getByRole('button', { name: '激活 v1' }))
+    fireEvent.click(
+      within(await screen.findByRole('dialog', { name: '激活 Prompt 版本' })).getByRole('button', {
+        name: '激活',
+      }),
+    )
+
+    const refreshError = await screen.findByTestId('prompt-history-refresh-error')
+    expect(refreshError).toHaveTextContent('刷新失败；仍显示上次加载的内容')
+    expect(refreshError).toHaveTextContent('refetch down')
+    expect(screen.getByTestId('prompt-history-visible')).toHaveTextContent('已激活 v1')
+    // The retained history table (and its rows) stays mounted after the
+    // refetch failure; only a non-destructive banner is added above it.
+    expect(screen.getByTestId('prompt-version-1')).toBeInTheDocument()
+    await waitFor(() =>
+      expect(screen.getByRole('heading', { level: 2, name: /版本历史/ })).toHaveFocus(),
+    )
+  })
+
   it('activates an old version only after explicit confirmation', async () => {
     const activate = vi.fn(async () =>
       versionEnvelope(promptVersion({ version: 1, status: 'ACTIVE', is_active: true })),
@@ -835,7 +1193,7 @@ describe('SettingsPromptHistoryPage', () => {
     )
   })
 
-  it('restore shows the replaced active version and creates a new version on confirm', async () => {
+  it('restore shows the active version staying in place and creates a DRAFT on confirm', async () => {
     const restore = vi.fn(async () =>
       versionEnvelope(
         promptVersion({ version: 3, status: 'DRAFT', is_active: false, is_default: true }),
@@ -845,7 +1203,7 @@ describe('SettingsPromptHistoryPage', () => {
 
     fireEvent.click(screen.getByRole('button', { name: '恢复内置默认' }))
     const dialog = await screen.findByRole('dialog', { name: '恢复 Prompt 默认版本' })
-    expect(dialog).toHaveTextContent('当前 active 版本（被替换）')
+    expect(dialog).toHaveTextContent('当前 active 版本（保持不变）')
     expect(dialog).toHaveTextContent('v2')
     expect(dialog).toHaveTextContent('新的 built-in default 版本（新建，DRAFT）')
     expect(restore).not.toHaveBeenCalled()
@@ -860,8 +1218,11 @@ describe('SettingsPromptHistoryPage', () => {
       reason: 'restore default',
     })
     const visible = screen.getByTestId('prompt-history-visible')
-    expect(visible).toHaveTextContent('将替换 active v2')
-    expect(visible).toHaveTextContent('激活 v3 前 active 仍为 v2')
+    // Restore creates a DRAFT; the active version stays until activation.
+    expect(visible).toHaveTextContent('（DRAFT）')
+    expect(visible).toHaveTextContent('active v2 保持不变')
+    expect(visible).toHaveTextContent('激活 v3 后才会切换')
+    expect(visible).not.toHaveTextContent('将替换')
     expect(screen.queryByRole('dialog')).toBeNull()
   })
 

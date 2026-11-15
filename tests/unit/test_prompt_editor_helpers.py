@@ -195,12 +195,14 @@ def test_prompt_settings_rows_track_the_active_version_not_a_draft(
     assert activated.is_builtin_default is False
 
 
-def test_prompt_settings_rows_survive_a_missing_active_version_row(
+def test_prompt_settings_rows_omit_a_role_whose_only_version_row_is_gone(
     tmp_path: Path,
 ) -> None:
     service, store = _service(tmp_path)
     connection = sqlite3.connect(store.path)
     try:
+        # Deleting the only version takes the ``not versions`` branch: there is
+        # no history left at all for the role.
         connection.execute(
             "DELETE FROM prompt_versions WHERE prompt_id = 'analysis' AND version = 1"
         )
@@ -208,14 +210,63 @@ def test_prompt_settings_rows_survive_a_missing_active_version_row(
     finally:
         connection.close()
 
-    analysis = next(row for row in service.prompt_settings_rows() if row.prompt_id == "analysis")
+    rows = service.prompt_settings_rows()
 
-    # The aggregate is a read surface: a damaged row must not crash it and must
-    # not invent an author or a default marker.
-    assert analysis.active_version == 1
-    assert analysis.author == ""
-    assert analysis.required_variables == REQUIRED_VARIABLES[PromptRole.ANALYSIS]
-    assert analysis.is_builtin_default is False
+    # The aggregate is a read surface: a damaged role is omitted, never
+    # fabricated with an empty author, role-default variables, and an active
+    # version that has no backing row.
+    assert [row.prompt_id for row in rows] == [
+        "entry_recheck",
+        "management",
+        "review",
+    ]
+    assert all(row.prompt_id != "analysis" for row in rows)
+    assert all(row.author != "" for row in rows)
+
+
+def test_prompt_settings_rows_omit_a_role_whose_active_record_is_missing(
+    tmp_path: Path,
+) -> None:
+    service, store = _service(tmp_path)
+    # Activate a second version, then delete only that ACTIVE row. History is
+    # still non-empty (v1 remains), so this exercises the ``active_record is
+    # None`` branch rather than the zero-version branch.
+    created = service.edit("analysis", _CUSTOM_ANALYSIS_BODY, author="tester")
+    service.activate("analysis", created.version, actor="tester")
+    connection = sqlite3.connect(store.path)
+    try:
+        connection.execute(
+            "DELETE FROM prompt_versions WHERE prompt_id = 'analysis' AND version = ?",
+            (created.version,),
+        )
+        connection.commit()
+    finally:
+        connection.close()
+
+    rows = service.prompt_settings_rows()
+
+    assert [row.prompt_id for row in rows] == ["entry_recheck", "management", "review"]
+    assert all(row.prompt_id != "analysis" for row in rows)
+    assert all(row.author != "" for row in rows)
+
+
+def test_prompt_settings_rows_omit_a_template_with_no_versions_at_all(
+    tmp_path: Path,
+) -> None:
+    service, store = _service(tmp_path)
+    connection = sqlite3.connect(store.path)
+    try:
+        # Keep the template row (so the role still exists) but remove every
+        # version. There is nothing to describe, so the role is omitted.
+        connection.execute("DELETE FROM prompt_versions WHERE prompt_id = 'management'")
+        connection.commit()
+    finally:
+        connection.close()
+
+    rows = service.prompt_settings_rows()
+
+    assert [row.prompt_id for row in rows] == ["analysis", "entry_recheck", "review"]
+    assert all(row.version_count >= 1 for row in rows)
 
 
 def test_prompt_settings_rows_never_include_the_persisted_body(tmp_path: Path) -> None:

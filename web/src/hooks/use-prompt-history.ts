@@ -147,7 +147,11 @@ export function usePromptHistory({
         }
         const data = envelope.data
         if (!data) {
-          setLoad({ state: 'error', detail: null, message: 'Prompt 响应为空。' })
+          setLoad((previous) => ({
+            state: 'error',
+            detail: previous.detail,
+            message: 'Prompt 响应为空。',
+          }))
           return
         }
         setLoad({ state: 'ready', detail: data })
@@ -158,7 +162,13 @@ export function usePromptHistory({
         if (!active || isAbortError(error)) {
           return
         }
-        setLoad({ state: 'error', detail: null, message: errorMessage(error) })
+        // A refetch after a confirmed mutation may fail; keep the previous
+        // detail so the history panel, heading, and success message survive.
+        setLoad((previous) => ({
+          state: 'error',
+          detail: previous.detail,
+          message: errorMessage(error),
+        }))
       })
     return () => {
       active = false
@@ -248,7 +258,9 @@ export function usePromptHistory({
     }
     setErrorText('')
     setDialog({ kind: 'restore', activeVersion })
-    setLiveMessage(`恢复默认会创建新版本并替换 active v${activeVersion}；需要确认。`)
+    setLiveMessage(
+      `恢复默认会创建一个新的 DRAFT 版本；激活前 active v${activeVersion} 保持不变；需要确认。`,
+    )
   }
 
   function cancelDialog(): void {
@@ -328,7 +340,7 @@ export function usePromptHistory({
           return
         }
         const created = envelope.data
-        const message = `已创建 v${created.version}（${created.status}），将替换 active v${replaced}；历史保留；激活 v${created.version} 前 active 仍为 v${replaced}。`
+        const message = `已创建 v${created.version}（DRAFT）；active v${replaced} 保持不变；激活 v${created.version} 后才会切换；历史保留；audit 已写入。`
         setStatusMessage(message)
         setLiveMessage(message)
       }

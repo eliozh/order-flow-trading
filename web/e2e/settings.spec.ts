@@ -279,8 +279,39 @@ function riskAuditEvents(): RiskAuditEvent[] {
   return JSON.parse(output.trim()) as RiskAuditEvent[]
 }
 
-function isPeriodRadioFocused(): boolean {
-  const active = document.activeElement
+interface PromptAuditEvent {
+  event_type: string
+  subjectId: string | null
+  version: number | null
+}
+
+/** Read the prompt lifecycle audit chain (oldest first) from SQLite. */
+function promptAuditEvents(): PromptAuditEvent[] {
+  if (!DATA_DIR) {
+    throw new Error('OFT_E2E_SETTINGS_DATA_DIR is required for the settings journey')
+  }
+  const script = [
+    'import json, os, sqlite3',
+    'database = os.path.join(os.environ["OFT_DATA_DIR"], "oft.db")',
+    'connection = sqlite3.connect(database)',
+    'rows = connection.execute("SELECT event_type, payload_json FROM audit_events WHERE event_type LIKE \'PROMPT_%\' ORDER BY seq ASC").fetchall()',
+    'connection.close()',
+    'events = []',
+    'for event_type, raw in rows:',
+    '    body = json.loads(raw)',
+    '    payload = body.get("payload", {})',
+    '    events.append({"event_type": event_type, "subjectId": (body.get("subject") or {}).get("id"), "version": payload.get("version")})',
+    'print(json.dumps(events))',
+  ].join('\n')
+  const output = execFileSync('python3', ['-c', script], {
+    cwd: ROOT,
+    env: { ...process.env, OFT_DATA_DIR: DATA_DIR },
+    encoding: 'utf8',
+  })
+  return JSON.parse(output.trim()) as PromptAuditEvent[]
+}
+
+function isPeriodRadioFocused(): boolean {  const active = document.activeElement
   return (
     active instanceof HTMLInputElement && active.type === 'radio' && active.name === 'scan-period'
   )
@@ -2270,23 +2301,28 @@ test('prompt history renders text-only diffs, activates explicitly, and restores
   await expect(page.getByTestId('prompt-history-visible')).toContainText('已激活 v1')
   expect((await readPromptDetail(page)).active_version).toBe(1)
 
-  // Restore requires confirmation, shows the replaced active version, and a
-  // cancelled restore writes nothing.
+  // Restore requires confirmation, shows the current active version as
+  // unchanged and the new DRAFT, and a cancelled restore writes nothing.
   const versionsBefore = (await readPromptDetail(page)).versions.length
   await page.getByRole('button', { name: '恢复内置默认' }).click()
   const restoreDialog = page.getByRole('dialog', { name: '恢复 Prompt 默认版本' })
-  await expect(restoreDialog).toContainText('当前 active 版本（被替换）')
+  await expect(restoreDialog).toContainText('当前 active 版本（保持不变）')
   await expect(restoreDialog).toContainText('v1')
   await expect(restoreDialog).toContainText('新的 built-in default 版本（新建，DRAFT）')
   await page.keyboard.press('Escape')
   await expect(restoreDialog).toBeHidden()
   expect((await readPromptDetail(page)).versions.length).toBe(versionsBefore)
 
+  const restoresBefore = promptAuditEvents().filter(
+    (event) => event.event_type === 'PROMPT_DEFAULT_RESTORED',
+  ).length
   await page.getByRole('button', { name: '恢复内置默认' }).click()
   await restoreDialog.getByRole('button', { name: '恢复默认' }).click()
   const restoreVisible = page.getByTestId('prompt-history-visible')
   await expect(restoreVisible).toContainText('已创建 v')
-  await expect(restoreVisible).toContainText('将替换 active v1')
+  await expect(restoreVisible).toContainText('（DRAFT）')
+  await expect(restoreVisible).toContainText('active v1 保持不变')
+  await expect(restoreVisible).toContainText('后才会切换')
 
   const afterRestore = await readPromptDetail(page)
   expect(afterRestore.active_version).toBe(1)
@@ -2294,6 +2330,16 @@ test('prompt history renders text-only diffs, activates explicitly, and restores
   expect(restored.status).toBe('DRAFT')
   expect(restored.is_default).toBe(true)
   expect(afterRestore.versions.length).toBe(versionsBefore + 1)
+
+  // The restore is audited under its own event type (not a plain create) and
+  // carries the created draft's version.
+  const restoreEvents = promptAuditEvents().filter(
+    (event) => event.event_type === 'PROMPT_DEFAULT_RESTORED',
+  )
+  expect(restoreEvents.length).toBe(restoresBefore + 1)
+  const restoreEvent = restoreEvents[restoreEvents.length - 1]
+  expect(restoreEvent?.subjectId).toBe('analysis')
+  expect(restoreEvent?.version).toBe(restored.version)
 
   // The restored default only takes effect after an explicit activation.
   const activateRestored = page.getByRole('button', { name: `激活 v${restored.version}` })
@@ -2406,7 +2452,29 @@ test('prompt screens are read-only at 375 and the editor is keyboard savable at 
     await expect(touchPage.locator('section.system-page').getByRole('note')).toContainText(
       '在桌面端或 CLI 修改',
     )
-    await expect(touchPage.locator('#prompt-body')).not.toBeEditable()
+    const touchBody = touchPage.locator('#prompt-body')
+    await expect(touchBody).not.toBeEditable()
+    // SC 2.1.1: the read-only body stays focusable, scrollable, and copyable;
+    // only the edit/save actions are disabled.
+    await touchBody.focus()
+    await expect(touchBody).toBeFocused()
+    await touchPage.keyboard.press('Control+A')
+    const bodySelection = await touchBody.evaluate((element) => {
+      const textarea = element as HTMLTextAreaElement
+      textarea.scrollTop = textarea.scrollHeight
+      return {
+        start: textarea.selectionStart,
+        end: textarea.selectionEnd,
+        length: textarea.value.length,
+        scrollable: textarea.scrollHeight > 0,
+        copyEnabled: document.queryCommandEnabled('copy'),
+      }
+    })
+    expect(bodySelection.start).toBe(0)
+    expect(bodySelection.end).toBe(bodySelection.length)
+    expect(bodySelection.length).toBeGreaterThan(0)
+    expect(bodySelection.scrollable).toBe(true)
+    expect(bodySelection.copyEnabled).toBe(true)
     await expect(touchPage.getByRole('button', { name: '编辑' })).toBeDisabled()
     await expect(touchPage.getByRole('button', { name: '保存为新版本' })).toBeDisabled()
     await expect(touchPage.getByTestId('prompt-preview')).toBeVisible()

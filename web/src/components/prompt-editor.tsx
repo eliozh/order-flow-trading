@@ -10,7 +10,12 @@
 import { useEffect, useRef } from 'react'
 import type { RefObject } from 'react'
 
-import { PROMPT_ROLE_LABELS, type PromptRole, type PromptVersionData } from '../api/prompts'
+import {
+  MAX_PROMPT_BODY_BYTES,
+  PROMPT_ROLE_LABELS,
+  type PromptRole,
+  type PromptVersionData,
+} from '../api/prompts'
 
 /** Optional variables accepted by the server for each role. */
 export const OPTIONAL_PROMPT_VARIABLES: Record<PromptRole, readonly string[]> = {
@@ -22,18 +27,94 @@ export const OPTIONAL_PROMPT_VARIABLES: Record<PromptRole, readonly string[]> = 
 
 export const PREVIEW_NOTICE = (
   <>
-    <span lang="en">secrets are never included; market text is untrusted data</span>
-    {' · 预览已脱敏，密钥永不包含'}
+    <span lang="en">
+      placeholders become [redacted: name]; no runtime value or configured secret is injected;
+      template text renders literally
+    </span>
+    {' · 占位符替换为 [redacted: name]；不注入运行时值或已配置密钥；模板文本按字面显示'}
   </>
 )
 
 export interface PromptTextIssue {
   empty: boolean
   malformed: boolean
+  /** 1-based line of the first unmatched ``{{``/``}}``; null when balanced. */
+  malformedLine: number | null
+  /** 1-based column of the first unmatched ``{{``/``}}``; null when balanced. */
+  malformedColumn: number | null
   missing: string[]
   unknown: string[]
   knowledgeOutsideTags: boolean
+  tooLarge: boolean
+  byteLength: number
   valid: boolean
+}
+
+export interface LineColumn {
+  line: number
+  column: number
+}
+
+/** First-occurrence line number for every placeholder in a body. */
+export function variableLineNumbers(body: string): Record<string, number> {
+  const lines: Record<string, number> = {}
+  for (const match of placeholders(body)) {
+    const name = match[1]
+    if (!(name in lines)) {
+      lines[name] = lineColumnAt(body, match.index ?? 0).line
+    }
+  }
+  return lines
+}
+
+/**
+ * Pure 1-based line/column math for a character offset.
+ *
+ * A newline advances the line and resets the column to 1, so an offset that
+ * points at the first character after ``\n`` reads as the next line's column 1.
+ */
+export function lineColumnAt(body: string, offset: number): LineColumn {
+  const end = Math.max(0, Math.min(offset, body.length))
+  let line = 1
+  let column = 1
+  for (let index = 0; index < end; index += 1) {
+    if (body[index] === '\n') {
+      line += 1
+      column = 1
+    } else {
+      column += 1
+    }
+  }
+  return { line, column }
+}
+
+/**
+ * Offset of the first unmatched ``{{`` or ``}}`` (string index), or null.
+ *
+ * Non-overlapping token pairs are pushed/popped; an unmatched close is
+ * returned immediately and a leftover open reports the earliest one.
+ */
+export function firstUnmatchedOffset(body: string): number | null {
+  const open: number[] = []
+  let index = 0
+  while (index < body.length - 1) {
+    const pair = body.slice(index, index + 2)
+    if (pair === '{{') {
+      open.push(index)
+      index += 2
+      continue
+    }
+    if (pair === '}}') {
+      if (open.length === 0) {
+        return index
+      }
+      open.pop()
+      index += 2
+      continue
+    }
+    index += 1
+  }
+  return open.length > 0 ? open[0] : null
 }
 
 const PLACEHOLDER_SOURCE = String.raw`\{\{\s*([a-z][a-z0-9_]*)\s*\}\}`
@@ -73,8 +154,9 @@ function knowledgeTagIntervals(body: string): Array<[number, number]> {
  * Validate a draft against the active version's required variables.
  *
  * Mirrors the server's rules so an invalid template is blocked inline with no
- * write: empty body, malformed braces, unknown placeholders, a missing
- * required variable, or `{{knowledge}}` outside `<knowledge>` delimiters.
+ * write: empty body, malformed braces, a body over the 64 KiB UTF-8 budget,
+ * unknown placeholders, a missing required variable, or `{{knowledge}}`
+ * outside `<knowledge>` delimiters.
  */
 export function validatePromptText(
   body: string,
@@ -83,8 +165,15 @@ export function validatePromptText(
 ): PromptTextIssue {
   const matches = placeholders(body)
   const variables = variablesInPromptText(body)
+  // Keep parity with the server: every ``{{`` and ``}}`` must belong to one
+  // valid placeholder, so a balanced-but-empty ``{{ }}`` is still malformed.
   const malformed =
     body.split('{{').length - 1 !== matches.length || body.split('}}').length - 1 !== matches.length
+  const malformedOffset = firstUnmatchedOffset(body)
+  const position =
+    malformed && malformedOffset !== null ? lineColumnAt(body, malformedOffset) : null
+  const byteLength = new TextEncoder().encode(body).length
+  const tooLarge = byteLength > MAX_PROMPT_BODY_BYTES
   const allowed = new Set<string>([...requiredVariables, ...OPTIONAL_PROMPT_VARIABLES[role]])
   const unknown = variables.filter((name) => !allowed.has(name))
   const missing = requiredVariables.filter((name) => !variables.includes(name))
@@ -103,11 +192,20 @@ export function validatePromptText(
   return {
     empty,
     malformed,
+    malformedLine: position?.line ?? null,
+    malformedColumn: position?.column ?? null,
     missing,
     unknown,
     knowledgeOutsideTags,
+    tooLarge,
+    byteLength,
     valid:
-      !empty && !malformed && missing.length === 0 && unknown.length === 0 && !knowledgeOutsideTags,
+      !empty &&
+      !malformed &&
+      !tooLarge &&
+      missing.length === 0 &&
+      unknown.length === 0 &&
+      !knowledgeOutsideTags,
   }
 }
 
@@ -139,6 +237,8 @@ export interface PromptEditorProps {
   statusMessage: string
   liveMessage: string
   errorText: string
+  /** Field named by a server refusal's details; scopes the summary deep link. */
+  errorField: 'author' | 'reason' | 'body' | null
   errorSummaryRef: RefObject<HTMLDivElement | null>
   onChangeBody: (value: string) => void
   onChangeAuthor: (value: string) => void
@@ -154,7 +254,14 @@ function issueMessages(issue: PromptTextIssue): string[] {
     messages.push('模板正文不能为空')
   }
   if (issue.malformed) {
-    messages.push('占位符语法错误：请成对使用 {{ 与 }}')
+    messages.push(
+      issue.malformedLine !== null && issue.malformedColumn !== null
+        ? `占位符语法错误：第 ${issue.malformedLine} 行第 ${issue.malformedColumn} 列；请成对使用 {{ 与 }}`
+        : '占位符语法错误：请成对使用 {{ 与 }}',
+    )
+  }
+  if (issue.tooLarge) {
+    messages.push('模板正文超过 64 KiB（UTF-8）限制')
   }
   for (const name of issue.missing) {
     messages.push(`缺少必需变量 {{${name}}}`)
@@ -166,6 +273,19 @@ function issueMessages(issue: PromptTextIssue): string[] {
     messages.push('{{knowledge}} 必须位于 <knowledge>...</knowledge> 内')
   }
   return messages
+}
+
+function errorLinkTarget(errorField: PromptEditorProps['errorField']): {
+  href: string
+  label: string
+} {
+  if (errorField === 'author') {
+    return { href: '#prompt-author', label: '转到作者' }
+  }
+  if (errorField === 'reason') {
+    return { href: '#prompt-reason', label: '转到变更原因' }
+  }
+  return { href: '#prompt-body', label: '转到模板正文' }
 }
 
 /** F10b.1: read-only until "编辑"; saving always creates a new version. */
@@ -183,6 +303,7 @@ export function PromptEditor({
   statusMessage,
   liveMessage,
   errorText,
+  errorField,
   errorSummaryRef,
   onChangeBody,
   onChangeAuthor,
@@ -197,6 +318,7 @@ export function PromptEditor({
   const messages = issue === null ? [] : issueMessages(issue)
   const invalid = issue !== null && !issue.valid
   const saveLocked = readOnly || !editing
+  const errorLink = errorLinkTarget(errorField)
 
   // The "编辑" control unmounts when editing begins; move focus into the body
   // so the keyboard flow (editor -> variables -> save) never drops to <body>.
@@ -266,7 +388,7 @@ export function PromptEditor({
           data-testid="prompt-editor-error"
         >
           <span aria-hidden="true">⚠</span> 错误：{errorText}{' '}
-          <a href="#prompt-body">转到模板正文</a>
+          <a href={errorLink.href}>{errorLink.label}</a>
         </div>
       )}
 
@@ -275,8 +397,8 @@ export function PromptEditor({
         aria-label="编辑 Prompt 模板"
         noValidate
         onSubmit={(event) => {
+          // The save controls are explicit buttons; Enter never writes.
           event.preventDefault()
-          onSave(false)
         }}
       >
         <div className="field">
@@ -289,8 +411,9 @@ export function PromptEditor({
             id="prompt-body"
             className="prompt-textarea"
             spellCheck={false}
-            readOnly={!editing}
-            disabled={readOnly}
+            // Remaining focusable/scrollable/copyable at 375 is required: a
+            // read-only body must be reachable by keyboard, switch, and voice.
+            readOnly={readOnly || !editing}
             value={draft}
             aria-invalid={invalid || undefined}
             aria-describedby="prompt-body-hint prompt-body-issues"
@@ -318,7 +441,13 @@ export function PromptEditor({
               className="num-input"
               value={author}
               maxLength={64}
-              disabled={readOnly || !editing || saving}
+              readOnly={readOnly || !editing || saving}
+              onKeyDown={(event) => {
+                if (event.key === 'Enter') {
+                  // Enter must never trigger an implicit form submit here.
+                  event.preventDefault()
+                }
+              }}
               onChange={(event) => onChangeAuthor(event.target.value)}
             />
           </div>
@@ -331,7 +460,13 @@ export function PromptEditor({
               className="num-input"
               value={reason}
               maxLength={500}
-              disabled={readOnly || !editing || saving}
+              readOnly={readOnly || !editing || saving}
+              onKeyDown={(event) => {
+                if (event.key === 'Enter') {
+                  // Enter must never trigger an implicit form submit here.
+                  event.preventDefault()
+                }
+              }}
               onChange={(event) => onChangeReason(event.target.value)}
             />
           </div>
@@ -353,13 +488,13 @@ export function PromptEditor({
             </button>
           )}
           <button
-            type="submit"
+            type="button"
             className="control-btn"
             disabled={saveLocked}
             aria-disabled={saving || undefined}
-            onClick={(event) => {
-              if (saveLocked || saving) {
-                event.preventDefault()
+            onClick={() => {
+              if (!saveLocked && !saving) {
+                onSave(false)
               }
             }}
           >

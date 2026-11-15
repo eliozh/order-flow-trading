@@ -11,7 +11,11 @@ export interface PromptVariablePanelProps {
   requiredVariables: readonly string[]
   presentVariables: readonly string[]
   unknownVariables: readonly string[]
+  /** First-occurrence line (1-based) of each present placeholder in the draft. */
+  variableLines: Record<string, number>
   malformed: boolean
+  malformedLine: number | null
+  malformedColumn: number | null
   knowledgeOutsideTags: boolean
   readOnly: boolean
 }
@@ -20,10 +24,17 @@ export function PromptVariablePanel({
   requiredVariables,
   presentVariables,
   unknownVariables,
+  variableLines,
   malformed,
+  malformedLine,
+  malformedColumn,
   knowledgeOutsideTags,
   readOnly,
 }: PromptVariablePanelProps) {
+  const malformedPosition =
+    malformedLine !== null && malformedColumn !== null
+      ? `第 ${malformedLine} 行第 ${malformedColumn} 列`
+      : null
   return (
     <section className="panel" aria-labelledby="prompt-variables-heading">
       <div className="panel-head">
@@ -40,6 +51,8 @@ export function PromptVariablePanel({
         <ul className="prompt-variable-list">
           {requiredVariables.map((name) => {
             const present = presentVariables.includes(name)
+            const line = variableLines[name]
+            const locationHint = line === undefined ? '' : `第 ${line} 行 · `
             return (
               <li
                 key={name}
@@ -53,7 +66,11 @@ export function PromptVariablePanel({
                   {present ? '✓' : '✕'}
                 </span>
                 <span className="mono">{`{{${name}}}`}</span>
-                <small>{present ? '已存在 · 由代码注入；模板不得自行构造' : '缺少必需变量'}</small>
+                <small>
+                  {present
+                    ? `${locationHint}已存在 · 由代码注入；模板不得自行构造`
+                    : '缺少必需变量 · 尚未出现'}
+                </small>
               </li>
             )
           })}
@@ -66,7 +83,9 @@ export function PromptVariablePanel({
       )}
       {malformed && (
         <p className="field-error" data-testid="prompt-variable-malformed">
-          占位符语法错误：请成对使用 {'{{'} 与 {'}}'}
+          占位符语法错误
+          {malformedPosition === null ? '' : `：${malformedPosition}`}
+          ：请成对使用 {'{{'} 与 {'}}'}
         </p>
       )}
       {knowledgeOutsideTags && (
@@ -75,7 +94,8 @@ export function PromptVariablePanel({
         </p>
       )}
       <p className="hint">
-        变量在渲染时由代码填充；预览已脱敏，不显示原始 <span lang="en">prompt secrets</span>。
+        变量在渲染时由代码填充；预览将占位符替换为{' '}
+        <span className="mono">[redacted: name]</span>，不注入运行时值或已配置密钥。
         {readOnly ? ' 375px 下模板只读，请使用桌面端或 CLI。' : ''}
       </p>
     </section>

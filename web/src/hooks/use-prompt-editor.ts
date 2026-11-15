@@ -63,6 +63,7 @@ export interface PromptEditorState {
   statusMessage: string
   liveMessage: string
   errorText: string
+  errorField: 'author' | 'reason' | 'body' | null
   errorSummaryRef: RefObject<HTMLDivElement | null>
   retry: () => void
   startEdit: () => void
@@ -86,7 +87,14 @@ function issueSummary(issue: PromptTextIssue): string {
     parts.push('模板正文不能为空')
   }
   if (issue.malformed) {
-    parts.push('占位符语法错误')
+    parts.push(
+      issue.malformedLine !== null && issue.malformedColumn !== null
+        ? `占位符语法错误（第 ${issue.malformedLine} 行第 ${issue.malformedColumn} 列）`
+        : '占位符语法错误',
+    )
+  }
+  if (issue.tooLarge) {
+    parts.push('模板正文超过 64 KiB（UTF-8）限制')
   }
   for (const name of issue.missing) {
     parts.push(`缺少必需变量 {{${name}}}`)
@@ -98,6 +106,23 @@ function issueSummary(issue: PromptTextIssue): string {
     parts.push('{{knowledge}} 必须位于 <knowledge> 标签内')
   }
   return `无法保存：${parts.join('；')}。未写入任何内容。`
+}
+
+/** The first server-named field, scoped to the editor's deep-link targets. */
+function refusalField(details: readonly { field?: string | null }[]): 'author' | 'reason' | 'body' {
+  const field = details.find((detail) => typeof detail.field === 'string')?.field
+  if (field === 'author' || field === 'reason') {
+    return field
+  }
+  return 'body'
+}
+
+/** Combine the envelope message with any distinct ``details[].message`` values. */
+function refusalText(message: string, details: readonly { message?: string }[]): string {
+  const parts = [message, ...details.map((detail) => detail.message ?? '')].filter(
+    (part) => part.trim() !== '',
+  )
+  return Array.from(new Set(parts)).join('；')
 }
 
 export function usePromptEditor({
@@ -120,6 +145,7 @@ export function usePromptEditor({
   const [statusMessage, setStatusMessage] = useState('')
   const [liveMessage, setLiveMessage] = useState('')
   const [errorText, setErrorText] = useState('')
+  const [errorField, setErrorField] = useState<'author' | 'reason' | 'body' | null>(null)
   const [focusTick, setFocusTick] = useState(0)
   const mounted = useRef(true)
   const inFlight = useRef(false)
@@ -144,7 +170,11 @@ export function usePromptEditor({
         }
         const data = envelope.data
         if (!data) {
-          setLoad({ state: 'error', detail: null, message: 'Prompt 响应为空。' })
+          setLoad((previous) => ({
+            state: 'error',
+            detail: previous.detail,
+            message: 'Prompt 响应为空。',
+          }))
           return
         }
         setLoad({ state: 'ready', detail: data })
@@ -157,7 +187,13 @@ export function usePromptEditor({
         if (!active || isAbortError(error)) {
           return
         }
-        setLoad({ state: 'error', detail: null, message: errorMessage(error) })
+        // A refetch after a confirmed write may fail; keep the previous detail
+        // so the editor and its success message are not torn down.
+        setLoad((previous) => ({
+          state: 'error',
+          detail: previous.detail,
+          message: errorMessage(error),
+        }))
       })
     return () => {
       active = false
@@ -201,6 +237,7 @@ export function usePromptEditor({
     setStatusMessage('')
     setLiveMessage('编辑中：保存将创建新版本，永不原地编辑。')
     setErrorText('')
+    setErrorField(null)
   }
 
   function discard(): void {
@@ -210,6 +247,7 @@ export function usePromptEditor({
     setDraft(active?.body ?? '')
     setEditing(false)
     setErrorText('')
+    setErrorField(null)
     const message = '已丢弃未保存的更改；未写入任何内容。'
     setStatusMessage(message)
     setLiveMessage(message)
@@ -221,6 +259,7 @@ export function usePromptEditor({
     }
     setDraft(value)
     setErrorText('')
+    setErrorField(null)
   }
 
   function changeAuthor(value: string): void {
@@ -229,6 +268,7 @@ export function usePromptEditor({
     }
     setAuthor(value)
     setErrorText('')
+    setErrorField(null)
   }
 
   function changeReason(value: string): void {
@@ -237,6 +277,7 @@ export function usePromptEditor({
     }
     setReason(value)
     setErrorText('')
+    setErrorField(null)
   }
 
   function handleSaveError(error: unknown): void {
@@ -246,19 +287,21 @@ export function usePromptEditor({
     const message = errorMessage(error)
     setLiveMessage('')
     if (error instanceof PromptApiError && error.kind === 'refusal') {
+      const text = refusalText(message, error.details)
+      const field = refusalField(error.details)
       if (error.code === 'IDEMPOTENCY_CONFLICT') {
         rotatePromptVersionKeyFn(promptId)
-        setErrorText(
-          `请求冲突；已生成新的 Idempotency-Key，可直接重试。${message ? ` ${message}` : ''}`,
-        )
+        setErrorText(`请求冲突；已生成新的 Idempotency-Key，可直接重试。${text ? ` ${text}` : ''}`)
       } else {
         clearPromptVersionKeyFn(promptId)
-        setErrorText(message)
+        setErrorText(text)
       }
+      setErrorField(field)
       requestFocus('summary')
       return
     }
     // The POST may have committed; keep the key so a retry replays it.
+    setErrorField('body')
     setErrorText(`结果未知，重试会使用同一 Idempotency-Key 重放。${message ? ` ${message}` : ''}`)
     requestFocus('summary')
   }
@@ -270,6 +313,7 @@ export function usePromptEditor({
     const currentIssue = validatePromptText(draft, active.required_variables, role)
     if (!currentIssue.valid) {
       setErrorText(issueSummary(currentIssue))
+      setErrorField('body')
       setLiveMessage('')
       setStatusMessage('')
       requestFocus('summary')
@@ -279,6 +323,7 @@ export function usePromptEditor({
     setSaving(true)
     setStatusMessage('')
     setErrorText('')
+    setErrorField(null)
     setLiveMessage('保存中…')
     try {
       const envelope = await createPromptVersionFn(
@@ -303,6 +348,10 @@ export function usePromptEditor({
           : `已创建 v${created.version}（${stateLabel}）；激活前下一次分析继续使用 active v${active.version}；既有决策仍绑定其原始版本。`
       setStatusMessage(message)
       setLiveMessage(message)
+      // Leave edit mode showing the still-active body. Until a successful
+      // refetch replaces the detail snapshot, the read-only body must match
+      // the heading/preview (the saved draft is described by the message).
+      setDraft(active.body)
       setEditing(false)
       setAttempt((value) => value + 1)
     } catch (error: unknown) {
@@ -329,6 +378,7 @@ export function usePromptEditor({
     statusMessage,
     liveMessage,
     errorText,
+    errorField,
     errorSummaryRef,
     retry,
     startEdit,

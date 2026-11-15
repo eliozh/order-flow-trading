@@ -349,9 +349,17 @@ class PromptService:
         catalog/CLI contract stays byte-for-byte stable. Reads the active
         version record directly (author, default flag, required variables).
 
-        A missing role is omitted rather than invented: the aggregate is a read
-        surface and must not fabricate a template. Seeded installs always have
-        all four.
+        A role is omitted rather than invented whenever its data is damaged:
+        no template row, no version rows at all, or no row for the template's
+        recorded active version. For those enumerated missing-record cases the
+        aggregate never manufactures an author, required variables, or an
+        active version with no backing row. (A version row whose stored
+        ``required_variables_json`` is malformed or not a list is a separate,
+        pre-existing case: ``_parse_required`` logs and falls back to
+        ``REQUIRED_VARIABLES[role]``, so the returned ``required_variables``
+        may be the role defaults there.) Seeded installs always have all four
+        complete roles, so an omission downgrades the route's count-derived
+        quality to PARTIAL (or MISSING when nothing remains).
         """
         templates = {
             template.prompt_id: template for template in self._store.list_prompt_templates()
@@ -363,30 +371,29 @@ class PromptService:
             if template is None:
                 continue
             versions = self._store.list_prompt_versions(prompt_id)
+            if not versions:
+                continue
             active_record = next(
                 (record for record in versions if record.version == template.active_version),
                 None,
             )
-            version_count = len(versions)
+            if active_record is None:
+                # The template points at a version row that no longer exists.
+                # Omit the damaged role instead of manufacturing an active row.
+                continue
             rows.append(
                 PromptSettingsRow(
                     prompt_id=prompt_id,
                     role=role,
                     active_version=template.active_version,
-                    author=active_record.author if active_record is not None else "",
+                    author=active_record.author,
                     updated_at=template.updated_at,
-                    version_count=version_count,
-                    latest_version=versions[-1].version if versions else 0,
-                    required_variables=(
-                        _parse_required(active_record.required_variables_json, role)
-                        if active_record is not None
-                        else REQUIRED_VARIABLES[role]
-                    ),
+                    version_count=len(versions),
+                    latest_version=versions[-1].version,
+                    required_variables=_parse_required(active_record.required_variables_json, role),
                     is_builtin_default=is_builtin_default(
-                        active_is_default=(
-                            active_record.is_default if active_record is not None else False
-                        ),
-                        version_count=version_count,
+                        active_is_default=active_record.is_default,
+                        version_count=len(versions),
                     ),
                 )
             )

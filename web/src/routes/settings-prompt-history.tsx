@@ -61,7 +61,7 @@ export function SettingsPromptHistoryPage(props: SettingsPromptHistoryPageProps)
               field: 'version',
               label: (
                 <>
-                  当前 <span lang="en">active</span> 版本（被替换）
+                  当前 <span lang="en">active</span> 版本（保持不变）
                 </>
               ),
               before: `v${dialog.activeVersion}`,
@@ -73,6 +73,13 @@ export function SettingsPromptHistoryPage(props: SettingsPromptHistoryPageProps)
               ),
             },
           ]
+
+  const diffStatus =
+    diff.state === 'loading' && history.selectedVersion !== null && activeVersion !== null
+      ? `正在加载 v${history.selectedVersion} 与 active v${activeVersion} 的差异…`
+      : diff.state === 'ready' && diff.data !== null
+        ? `差异已就绪：v${diff.data.from_version} → v${diff.data.to_version}`
+        : ''
 
   return (
     <section
@@ -89,7 +96,9 @@ export function SettingsPromptHistoryPage(props: SettingsPromptHistoryPageProps)
             <span lang="en">Prompt</span> 版本历史
           </h1>
           <p className="page-sub">
-            作者、时间、原因与激活状态。可显式激活旧版本；缺失版本禁用回放。恢复默认创建新版本并显示被替换的版本，历史保持完整。
+            作者、时间、原因与激活状态。可显式激活旧版本；缺失版本禁用回放。恢复默认创建新的{' '}
+            <span lang="en">DRAFT</span> 版本并显示当前 <span lang="en">active</span> 版本；激活前{' '}
+            <span lang="en">active</span> 保持不变，历史保持完整。
           </p>
         </div>
       </div>
@@ -117,7 +126,7 @@ export function SettingsPromptHistoryPage(props: SettingsPromptHistoryPageProps)
             <p className="status-message">加载版本历史…</p>
           )}
 
-          {load.state === 'error' && (
+          {load.state === 'error' && detail === null && (
             <div className="panel" role="alert">
               <div className="panel-head">
                 <h2>版本历史不可用</h2>
@@ -155,6 +164,23 @@ export function SettingsPromptHistoryPage(props: SettingsPromptHistoryPageProps)
               >
                 {history.liveMessage}
               </p>
+
+              {/* A failed refetch after a confirmed mutation keeps the previous
+                  detail mounted. Non-destructive: the success message and the
+                  focused heading stay reachable. */}
+              {load.state === 'error' && (
+                <div
+                  className="status-message status-message--error"
+                  role="alert"
+                  data-testid="prompt-history-refresh-error"
+                >
+                  <span aria-hidden="true">⚠</span> 刷新失败；仍显示上次加载的内容：
+                  {load.message ?? '未知错误'}
+                  <button type="button" className="control-btn" onClick={history.retry}>
+                    重试
+                  </button>
+                </div>
+              )}
 
               {history.errorText !== '' && (
                 <div
@@ -278,6 +304,11 @@ export function SettingsPromptHistoryPage(props: SettingsPromptHistoryPageProps)
                                   type="button"
                                   className="btn sm"
                                   onClick={() => history.selectVersion(version.version)}
+                                  aria-pressed={history.selectedVersion === version.version}
+                                  aria-controls="prompt-diff-panel"
+                                  aria-label={`查看 diff：v${version.version} 与 active v${
+                                    activeVersion ?? detail.active_version
+                                  } 的差异`}
                                 >
                                   查看 <span lang="en">diff</span>
                                 </button>
@@ -290,57 +321,71 @@ export function SettingsPromptHistoryPage(props: SettingsPromptHistoryPageProps)
                   </table>
                 </div>
                 <p className="hint">
-                  激活旧版本不会删除新版本；每次决策记录其使用的版本。恢复默认需确认并显示被替换的版本。
+                  激活旧版本不会删除新版本；每次决策记录其使用的版本。恢复默认需确认；激活前{' '}
+                  <span lang="en">active</span> 保持不变。
                 </p>
               </section>
 
-              {detail.versions.length <= 1 ? (
-                <p className="status-message">只有一个内置版本；创建自定义版本后可在此比较差异。</p>
-              ) : diff.state === 'loading' ? (
-                <p className="status-message">
-                  加载 <span lang="en">diff</span>…
-                </p>
-              ) : diff.state === 'error' ? (
-                <div className="status-message status-message--error" role="alert">
-                  <span lang="en">Diff</span> 不可用：{diff.message ?? '未知错误'}
-                </div>
-              ) : diff.state === 'ready' && diff.data !== null ? (
-                <PromptDiff
-                  diff={diff.data.diff}
-                  fromLabel={
-                    <>
-                      v{diff.data.from_version}
-                      {diff.data.from_version === detail.active_version && (
-                        <>
-                          {' '}
-                          <span lang="en">active</span>
-                        </>
-                      )}
-                    </>
-                  }
-                  toLabel={
-                    <>
-                      v{diff.data.to_version}
-                      {diff.data.to_version === detail.active_version && (
-                        <>
-                          {' '}
-                          <span lang="en">active</span>
-                        </>
-                      )}
-                    </>
-                  }
-                  fromText={`v${diff.data.from_version}${
-                    diff.data.from_version === detail.active_version ? ' active' : ''
-                  }`}
-                  toText={`v${diff.data.to_version}${
-                    diff.data.to_version === detail.active_version ? ' active' : ''
-                  }`}
-                />
-              ) : (
-                <p className="status-message">
-                  选择一个版本查看与 <span lang="en">active</span> 的差异。
-                </p>
-              )}
+              <p
+                role="status"
+                aria-live="polite"
+                className="visually-hidden"
+                data-testid="prompt-diff-status"
+              >
+                {diffStatus}
+              </p>
+
+              <div id="prompt-diff-panel">
+                {detail.versions.length <= 1 ? (
+                  <p className="status-message">
+                    只有一个内置版本；创建自定义版本后可在此比较差异。
+                  </p>
+                ) : diff.state === 'loading' ? (
+                  <p className="status-message" data-testid="prompt-diff-loading">
+                    加载 <span lang="en">diff</span>…
+                  </p>
+                ) : diff.state === 'error' ? (
+                  <div className="status-message status-message--error" role="alert">
+                    <span lang="en">Diff</span> 不可用：{diff.message ?? '未知错误'}
+                  </div>
+                ) : diff.state === 'ready' && diff.data !== null ? (
+                  <PromptDiff
+                    diff={diff.data.diff}
+                    fromLabel={
+                      <>
+                        v{diff.data.from_version}
+                        {diff.data.from_version === detail.active_version && (
+                          <>
+                            {' '}
+                            <span lang="en">active</span>
+                          </>
+                        )}
+                      </>
+                    }
+                    toLabel={
+                      <>
+                        v{diff.data.to_version}
+                        {diff.data.to_version === detail.active_version && (
+                          <>
+                            {' '}
+                            <span lang="en">active</span>
+                          </>
+                        )}
+                      </>
+                    }
+                    fromText={`v${diff.data.from_version}${
+                      diff.data.from_version === detail.active_version ? ' active' : ''
+                    }`}
+                    toText={`v${diff.data.to_version}${
+                      diff.data.to_version === detail.active_version ? ' active' : ''
+                    }`}
+                  />
+                ) : (
+                  <p className="status-message">
+                    选择一个版本查看与 <span lang="en">active</span> 的差异。
+                  </p>
+                )}
+              </div>
 
               <p className="status-message" data-testid="prompt-history-visible">
                 {history.statusMessage}
@@ -366,8 +411,9 @@ export function SettingsPromptHistoryPage(props: SettingsPromptHistoryPageProps)
         description={
           dialog?.kind === 'restore' ? (
             <>
-              恢复默认会创建一个新的内置默认版本并显示被替换的 <span lang="en">active</span>{' '}
-              版本；历史版本全部保留。激活前 <span lang="en">active</span> 不变。
+              恢复默认会创建一个新的内置默认 <span lang="en">DRAFT</span> 版本并显示当前{' '}
+              <span lang="en">active</span> 版本；历史版本全部保留。激活前{' '}
+              <span lang="en">active</span> 保持不变。
             </>
           ) : (
             <>

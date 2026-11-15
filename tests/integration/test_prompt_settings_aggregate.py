@@ -314,6 +314,104 @@ def test_a_missing_user_role_is_omitted_and_reported_partial(tmp_path: Path) -> 
     assert body["meta"]["data_quality"] == "PARTIAL"
 
 
+def test_a_template_with_zero_versions_is_omitted_not_fabricated(
+    tmp_path: Path,
+) -> None:
+    app = create_app(_settings(tmp_path), clock=FixedClock(NOW))
+    store_path = app.state.container.store.path
+    # Keep the analysis TEMPLATE row but remove its only version: the role now
+    # has no version history at all, so it takes the zero-version branch.
+    connection = sqlite3.connect(store_path)
+    try:
+        connection.execute(
+            "DELETE FROM prompt_versions WHERE prompt_id = 'analysis' AND version = 1"
+        )
+        connection.commit()
+    finally:
+        connection.close()
+
+    with TestClient(app) as client:
+        body = _aggregate(client, _auth(app))
+
+    data = body["data"]
+    assert data["total"] == 3
+    assert body["meta"]["data_quality"] == "PARTIAL"
+    assert [item["prompt_id"] for item in data["items"]] == [
+        "entry_recheck",
+        "management",
+        "review",
+    ]
+    assert all(item["prompt_id"] != "analysis" for item in data["items"])
+    # No fabricated row and no empty author anywhere in the damaged aggregate.
+    assert all(item["author"] != "" for item in data["items"])
+
+
+def test_a_missing_active_record_with_history_present_is_omitted_and_partial(
+    tmp_path: Path,
+) -> None:
+    app = create_app(_settings(tmp_path), clock=FixedClock(NOW))
+    auth = _auth(app)
+
+    with TestClient(app) as client:
+        created = _create_analysis_version(client, auth, key="aggregate-active-gone")
+        activated = client.post(
+            "/api/v1/prompts/analysis/activate",
+            json={"version": created["version"], "actor": "tester"},
+            headers={**auth, "Idempotency-Key": "aggregate-active-gone-activate"},
+        )
+        assert activated.status_code == 200, activated.text
+
+        # Delete only the ACTIVE version row; v1 remains, so this exercises the
+        # ``active_record is None`` branch (history is non-empty) instead of the
+        # zero-version branch.
+        connection = sqlite3.connect(app.state.container.store.path)
+        try:
+            connection.execute(
+                "DELETE FROM prompt_versions WHERE prompt_id = 'analysis' AND version = ?",
+                (created["version"],),
+            )
+            connection.commit()
+        finally:
+            connection.close()
+
+        body = _aggregate(client, auth)
+
+    data = body["data"]
+    assert data["total"] == 3
+    assert body["meta"]["data_quality"] == "PARTIAL"
+    assert [item["prompt_id"] for item in data["items"]] == [
+        "entry_recheck",
+        "management",
+        "review",
+    ]
+    assert all(item["prompt_id"] != "analysis" for item in data["items"])
+    assert all(item["author"] != "" for item in data["items"])
+
+
+def test_a_template_with_zero_versions_is_omitted_and_reported_partial(
+    tmp_path: Path,
+) -> None:
+    app = create_app(_settings(tmp_path), clock=FixedClock(NOW))
+    store_path = app.state.container.store.path
+    # The management template row survives but every version is gone. There is
+    # no active record to describe, so the role is omitted.
+    connection = sqlite3.connect(store_path)
+    try:
+        connection.execute("DELETE FROM prompt_versions WHERE prompt_id = 'management'")
+        connection.commit()
+    finally:
+        connection.close()
+
+    with TestClient(app) as client:
+        body = _aggregate(client, _auth(app))
+
+    data = body["data"]
+    assert data["total"] == 3
+    assert body["meta"]["data_quality"] == "PARTIAL"
+    assert all(item["prompt_id"] != "management" for item in data["items"])
+    assert all(item["version_count"] >= 1 for item in data["items"])
+
+
 def test_the_aggregate_never_includes_a_persisted_template_secret(
     tmp_path: Path,
 ) -> None:

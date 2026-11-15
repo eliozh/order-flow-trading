@@ -9,6 +9,7 @@ import {
   type PromptSettingsEnvelope,
   type PromptSettingsRow,
 } from '../api/prompts'
+import { DataQualityBadge } from '../components/data-quality'
 import { SettingsSectionNav } from '../components/settings-section-nav'
 import { useSettingsReadonly } from '../components/settings-field'
 
@@ -20,6 +21,7 @@ export interface SettingsPromptsPageProps {
 interface PromptListLoad {
   state: 'loading' | 'ready' | 'error'
   data: PromptSettingsData | null
+  dataQuality: string | null
   message?: string
 }
 
@@ -69,10 +71,18 @@ function PromptRow({ row }: { row: PromptSettingsRow }) {
       </td>
       <td>
         <span className="action-row">
-          <a className="btn sm" href={editorHref(row.prompt_id)}>
+          <a
+            className="btn sm"
+            href={editorHref(row.prompt_id)}
+            aria-label={`编辑 ${row.prompt_id}`}
+          >
             编辑
           </a>
-          <a className="btn sm" href={historyHref(row.prompt_id)}>
+          <a
+            className="btn sm"
+            href={historyHref(row.prompt_id)}
+            aria-label={`${row.prompt_id} 历史`}
+          >
             历史
           </a>
         </span>
@@ -87,7 +97,11 @@ export function SettingsPromptsPage({
   isCompact,
 }: SettingsPromptsPageProps) {
   const readonly = useSettingsReadonly(isCompact)
-  const [load, setLoad] = useState<PromptListLoad>({ state: 'loading', data: null })
+  const [load, setLoad] = useState<PromptListLoad>({
+    state: 'loading',
+    data: null,
+    dataQuality: null,
+  })
   const [attempt, setAttempt] = useState(0)
 
   useEffect(() => {
@@ -100,16 +114,25 @@ export function SettingsPromptsPage({
           return
         }
         if (!envelope.data) {
-          setLoad({ state: 'error', data: null, message: 'Prompt 响应为空。' })
+          setLoad({
+            state: 'error',
+            data: null,
+            dataQuality: envelope.meta.data_quality,
+            message: 'Prompt 响应为空。',
+          })
           return
         }
-        setLoad({ state: 'ready', data: envelope.data })
+        setLoad({
+          state: 'ready',
+          data: envelope.data,
+          dataQuality: envelope.meta.data_quality,
+        })
       })
       .catch((error: unknown) => {
         if (!active || isAbortError(error)) {
           return
         }
-        setLoad({ state: 'error', data: null, message: errorMessage(error) })
+        setLoad({ state: 'error', data: null, dataQuality: null, message: errorMessage(error) })
       })
     return () => {
       active = false
@@ -118,7 +141,19 @@ export function SettingsPromptsPage({
   }, [fetchPromptSettingsFn, attempt])
 
   const items = load.data?.items ?? []
-  const allBuiltin = items.length > 0 && items.every((item) => item.is_builtin_default)
+  const total = load.data?.total ?? 0
+  const dataQuality = load.dataQuality ?? 'MISSING'
+  const incomplete =
+    load.state === 'ready' && (dataQuality !== 'COMPLETE' || items.length !== total)
+  const missing =
+    load.state === 'ready' && (dataQuality === 'MISSING' || (items.length === 0 && total === 0))
+  // The aggregate-level "everything is the built-in default v1" claim is only
+  // true for a COMPLETE four-role aggregate where every row says so.
+  const allBuiltin =
+    dataQuality === 'COMPLETE' &&
+    items.length === 4 &&
+    total === 4 &&
+    items.every((item) => item.is_builtin_default)
 
   return (
     <section
@@ -190,13 +225,28 @@ export function SettingsPromptsPage({
             </div>
           )}
 
+          {load.state === 'ready' && incomplete && (
+            <div className="status-message" role="status" data-testid="prompts-data-quality">
+              <DataQualityBadge status={dataQuality} />{' '}
+              <span data-testid="prompts-data-quality-warning">
+                {missing
+                  ? '未读取到任何模板角色；不会显示伪造的内置默认模板。请重试或检查种子数据。'
+                  : items.length !== total
+                    ? `聚合不完整：返回 ${items.length} 行与 total=${total} 不一致；缺少的角色不会以伪造数据补充。`
+                    : `聚合不完整（${dataQuality}）：仅 ${items.length} / 4 个角色可用；缺少的角色不会以伪造数据补充。`}
+              </span>
+            </div>
+          )}
+
           {load.state === 'ready' && items.length === 0 && (
             <section className="panel" aria-labelledby="prompt-empty-heading">
               <div className="panel-head">
-                <h2 id="prompt-empty-heading">尚未创建自定义模板</h2>
+                <h2 id="prompt-empty-heading">{missing ? '模板数据缺失' : '尚未创建自定义模板'}</h2>
               </div>
               <p className="panel-foot">
-                当前使用内置默认 v1。可以打开编辑器创建新版本；恢复默认随时可用。
+                {missing
+                  ? '未读取到任何模板角色；不会显示伪造的内置默认模板。请重试或检查种子数据。'
+                  : '可以打开编辑器创建新版本；恢复默认随时可用。'}
               </p>
             </section>
           )}
@@ -211,8 +261,8 @@ export function SettingsPromptsPage({
               <section className="panel" aria-labelledby="prompt-list-heading">
                 <div className="panel-head">
                   <h2 id="prompt-list-heading">模板列表</h2>
-                  <span className="hint">
-                    4 <span lang="en">roles</span> · 历史版本永久保留
+                  <span className="hint" data-testid="prompts-roles-hint">
+                    {items.length} / 4 <span lang="en">roles</span> · 历史版本永久保留
                   </span>
                 </div>
                 <div
