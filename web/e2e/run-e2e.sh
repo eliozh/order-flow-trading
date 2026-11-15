@@ -646,3 +646,10 @@ echo "report e2e daemon: $REPORTS_BASE_URL · data: $REPORTS_DATA_DIR · report:
 
 cd "$WEB_DIR"
 ./node_modules/.bin/playwright test "$@"
+
+# Slice 32: the `/settings/scan` journey owns its own daemon and port, so it is
+# not a project in `playwright.config.ts` (that config targets the three daemons
+# above). Running its own runner here keeps `make e2e` / `npm --prefix web run
+# test:e2e` gating the browser-level settings guarantees; its exit code
+# propagates through `set -e`.
+bash "$SCRIPT_DIR/run-settings-e2e.sh"

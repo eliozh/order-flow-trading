@@ -300,6 +300,36 @@ test('reloads the persisted user value and the API agrees', async ({ page }) => 
   expectClean(diagnostics)
 })
 
+test('saves the already-effective value and writes no row or audit', async ({ page }) => {
+  const diagnostics = collectDiagnostics(page)
+  await page.setViewportSize({ width: 1440, height: 900 })
+  await authenticate(page)
+  await page.goto('/settings/scan')
+  await expect(page.getByRole('heading', HEADING)).toBeVisible()
+
+  const form = page.getByRole('form', { name: FORM_NAME })
+  await expect(form.getByRole('radio', { name: '8h' })).toBeChecked()
+  const before = await readScan(page)
+  const beforeCounts = databaseCounts()
+  expect(before.value).toBe('8h')
+
+  // Saving without changing the value is a deterministic no-op: the copy says
+  // so explicitly and no new config/audit row is written.
+  await form.getByRole('button', { name: '保存排程' }).click()
+  const status = form.getByRole('status')
+  await expect(status).toContainText('未变更，未写入新 audit')
+  await expect(status).not.toContainText('audit 已写入')
+  await expect(page.getByTestId('scan-current-value').locator('strong')).toHaveText('8h')
+
+  const after = await readScan(page)
+  expect(after.value).toBe(before.value)
+  expect(after.source).toBe(before.source)
+  expect(after.updated_at).toBe(before.updated_at)
+  expect(databaseCounts()).toEqual(beforeCounts)
+
+  expectClean(diagnostics)
+})
+
 test('replays an identical idempotent save and rejects a different payload under the same key', async ({
   page,
 }) => {
@@ -413,6 +443,65 @@ async function expectScanViewport(page: Page, viewport: ScanViewport): Promise<v
   await page.screenshot({ path: path.join(SCREENS_DIR, viewport.name), fullPage: true })
   expectClean(diagnostics)
 }
+
+test('focuses the scan-period group when the error summary link is followed', async ({ page }) => {
+  const diagnostics = collectDiagnostics(page)
+  await page.setViewportSize({ width: 1440, height: 900 })
+  await authenticate(page)
+
+  // Force one definitive refusal so the field-error summary renders. The PUT is
+  // intercepted before it reaches the daemon, so nothing is written.
+  await page.route('**/api/v1/settings/scan', async (route, request) => {
+    if (request.method() !== 'PUT') {
+      await route.continue()
+      return
+    }
+    await route.fulfill({
+      status: 422,
+      contentType: 'application/json',
+      body: JSON.stringify({
+        ok: false,
+        data: null,
+        error: {
+          code: 'VALIDATION_FAILED',
+          message: 'scan.period must be one of: 4h, 8h',
+          category: 'VALIDATION',
+          http_status: 422,
+          retryable: false,
+          reference_id: 'REQ-E2E-FOCUS',
+          details: [{ field: 'period', code: 'unsupported', message: 'invalid period' }],
+        },
+        meta: {},
+      }),
+    })
+  })
+
+  await page.goto('/settings/scan')
+  await expect(page.getByRole('heading', HEADING)).toBeVisible()
+  const form = page.getByRole('form', { name: FORM_NAME })
+  const radio4h = form.getByRole('radio', { name: '4h' })
+  const radio8h = form.getByRole('radio', { name: '8h' })
+  if (await radio8h.isChecked()) {
+    await radio4h.check()
+  } else {
+    await radio8h.check()
+  }
+  await form.getByRole('button', { name: '保存排程' }).click()
+
+  const summary = page.getByRole('alert')
+  await expect(summary).toContainText('错误：')
+  await summary.getByRole('link', { name: '转到扫描周期' }).click()
+
+  // The native in-page link moves focus to the focusable radio fieldset.
+  await expect(page.getByRole('group', { name: '扫描周期' })).toBeFocused()
+  // The intercepted 422 is the intended outcome; Chromium logs it as a failed
+  // resource. Any other page/console error is still a failure.
+  expect(diagnostics.pageErrors, 'uncaught page errors').toEqual([])
+  expect(
+    diagnostics.consoleErrors.filter((message) => !message.includes('status of 422')),
+    'unexpected console errors',
+  ).toEqual([])
+})
 
 test('is read-only only on phone-width touch and keeps fine-pointer zoom editable', async ({
   page,

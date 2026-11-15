@@ -66,7 +66,7 @@ interface ReadOnlyFieldProps {
  */
 export function ReadOnlyField({ id, label, value, note, testId }: ReadOnlyFieldProps) {
   return (
-    <div className="field">
+    <div className="field" role="group" aria-labelledby={`${id}-label`}>
       <span className="field-label" id={`${id}-label`}>
         {label} <span className="chip chip--muted">read-only</span>
       </span>

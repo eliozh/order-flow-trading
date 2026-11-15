@@ -147,7 +147,7 @@ describe('updateScanPeriod', () => {
     expect(envelope.meta.idempotent_replay).toBe(true)
   })
 
-  it('keeps an unknown outcome distinct from a definitive refusal', async () => {
+  it('classifies a 409 conflict as a definitive refusal for this payload', async () => {
     vi.stubGlobal(
       'fetch',
       fetchMockReturning(
@@ -174,7 +174,39 @@ describe('updateScanPeriod', () => {
     const error = await updateScanPeriod('8h', 'idem-key-3').catch((thrown: unknown) => thrown)
 
     expect(error).toBeInstanceOf(SettingsApiError)
+    expect((error as SettingsApiError).kind).toBe('refusal')
+    expect((error as SettingsApiError).code).toBe('IDEMPOTENCY_CONFLICT')
+  })
+
+  it('treats an unlisted error code as an unknown outcome (safe default)', async () => {
+    vi.stubGlobal(
+      'fetch',
+      fetchMockReturning(
+        jsonResponse(
+          {
+            ok: false,
+            data: null,
+            error: {
+              code: 'SOMETHING_NEW',
+              message: 'a code this client does not know',
+              category: 'INTERNAL',
+              http_status: 500,
+              retryable: false,
+              reference_id: 'REQ-3',
+              details: [],
+            },
+            meta,
+          },
+          500,
+        ),
+      ),
+    )
+
+    const error = await updateScanPeriod('8h', 'idem-key-4').catch((thrown: unknown) => thrown)
+
+    expect(error).toBeInstanceOf(SettingsApiError)
     expect((error as SettingsApiError).kind).toBe('unknown')
+    expect((error as SettingsApiError).code).toBe('SOMETHING_NEW')
   })
 })
 

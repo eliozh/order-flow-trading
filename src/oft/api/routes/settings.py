@@ -78,7 +78,15 @@ def update_scan_settings(
     request: Request,
     idempotency_key: str | None = Header(default=None, alias="Idempotency-Key"),
 ) -> Any:
-    """Validate, persist one row, and audit exactly one ``CONFIG_UPDATED`` event."""
+    """Validate and persist the scan period, auditing only a real change.
+
+    A save that changes the effective value writes exactly one ``config`` row
+    and one ``CONFIG_UPDATED`` audit event in one transaction. A save that
+    repeats the already-effective value returns 200 with no new row and no
+    audit event. An identical replay (same ``Idempotency-Key``, same payload)
+    returns the stored envelope with ``meta.idempotent_replay=true`` and writes
+    nothing; the same key with a different payload is a 409.
+    """
     try:
         return idempotent_mutation(
             request,

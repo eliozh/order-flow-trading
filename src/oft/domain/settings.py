@@ -8,11 +8,16 @@ them.
 
 from __future__ import annotations
 
+from collections.abc import Mapping
 from enum import StrEnum
 from typing import Any
 
 SCAN_PERIOD_KEY = "scan.period"
-SUPPORTED_SCAN_PERIODS: tuple[str, ...] = ("4h", "8h")
+# One source of truth for every scan cadence: the supported label and its hour
+# length. ``SUPPORTED_SCAN_PERIODS`` and the scheduler's period/boundary maps are
+# derived from it, so adding a cadence is a one-line domain change.
+SCAN_PERIOD_HOURS: Mapping[str, int] = {"4h": 4, "8h": 8}
+SUPPORTED_SCAN_PERIODS: tuple[str, ...] = tuple(SCAN_PERIOD_HOURS)
 
 # One audit event type and subject kind are enough for the config path; other
 # settings slices reuse ``CONFIG_UPDATED`` with their own key.
@@ -80,6 +85,7 @@ def scoped_diff(*, key: str, before: Any, after: Any) -> dict[str, Any]:
 __all__ = [
     "CONFIG_SUBJECT_KIND",
     "CONFIG_UPDATED_EVENT",
+    "SCAN_PERIOD_HOURS",
     "SCAN_PERIOD_KEY",
     "SUPPORTED_SCAN_PERIODS",
     "SettingSource",

@@ -53,9 +53,10 @@ export type ScanSettingsEnvelope = ApiEnvelope<ScanSettingsData>
 export type SettingsSectionsEnvelope = ApiEnvelope<SettingsSectionsData>
 
 /**
- * Envelope codes that prove the server rejected the save before writing. Only
- * these clear the pending idempotency key; anything else (a transport failure,
- * a timeout, or ``IDEMPOTENCY_CONFLICT``) may have written and must keep it.
+ * Envelope codes that prove the server rejected the save before writing (or,
+ * for ``IDEMPOTENCY_CONFLICT``, that this payload is definitively dead for the
+ * presented key). Only these clear/rotate the pending idempotency key; anything
+ * else (a transport failure or a timeout) may have written and must keep it.
  */
 export const DEFINITIVE_SETTINGS_REFUSAL_CODES: ReadonlySet<string> = new Set([
   'VALIDATION_FAILED',
@@ -65,6 +66,7 @@ export const DEFINITIVE_SETTINGS_REFUSAL_CODES: ReadonlySet<string> = new Set([
   'ORIGIN_FORBIDDEN',
   'HOST_FORBIDDEN',
   'IDEMPOTENCY_KEY_REQUIRED',
+  'IDEMPOTENCY_CONFLICT',
   'CONFIG_INVALID',
 ])
 

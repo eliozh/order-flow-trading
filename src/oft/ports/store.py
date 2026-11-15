@@ -1298,3 +1298,19 @@ class StorePort(Protocol):
     ) -> AuditEventRecord:
         """Upsert one setting row and append its audit event in one transaction."""
         ...
+
+    def save_config_change(
+        self,
+        key: str,
+        build: Callable[[ConfigRecord | None], tuple[ConfigRecord, AuditEventDraft] | None],
+    ) -> tuple[ConfigRecord | None, AuditEventRecord | None]:
+        """Read-modify-write one setting atomically.
+
+        The store reads the row inside one ``BEGIN IMMEDIATE`` transaction,
+        calls the pure ``build`` callback with it, and upserts the returned
+        record plus its audit draft (or does nothing when ``build`` returns
+        ``None``). ``before`` values derived inside the callback are therefore
+        accurate under concurrency. Returns the committed row (or the existing
+        row when nothing was written) and the committed audit record, if any.
+        """
+        ...

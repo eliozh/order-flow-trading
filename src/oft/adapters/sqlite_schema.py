@@ -564,6 +564,21 @@ _OPPORTUNITY_CONDITIONS_INDEXES = (
 _OPPORTUNITY_CONDITIONS_DDL = _OPPORTUNITY_CONDITIONS_TABLE + "\n".join(
     _OPPORTUNITY_CONDITIONS_INDEXES
 )
+
+# v26: one row per persisted runtime setting. ``value_json`` keeps the typed
+# value (a JSON string, number, boolean, or object) so later settings slices
+# reuse the same table. The table and index live in one constant shared by the
+# fresh schema and the v25 -> v26 migration so their shapes cannot drift.
+_CONFIG_DEFINITION = """
+    key TEXT PRIMARY KEY,
+    value_json TEXT NOT NULL,
+    updated_at TEXT NOT NULL,
+    updated_by TEXT NOT NULL
+"""
+_V26_DDL: tuple[str, ...] = (
+    f"CREATE TABLE IF NOT EXISTS config ({_CONFIG_DEFINITION});",
+    "CREATE INDEX IF NOT EXISTS config_updated_at ON config(updated_at);",
+)
 _OPPORTUNITY_CONDITION_INDEX_NAMES = (
     "opportunity_conditions_opportunity",
     "opportunity_conditions_type",
@@ -864,16 +879,8 @@ _SCHEMA_SQL = f"""
         value TEXT NOT NULL,
         updated_at TEXT NOT NULL
     );
-    -- Slice 32: one row per persisted runtime setting. ``value_json`` keeps the
-    -- typed value (a JSON string, number, boolean, or object) so later settings
-    -- slices reuse the same table.
-    CREATE TABLE IF NOT EXISTS config (
-        key TEXT PRIMARY KEY,
-        value_json TEXT NOT NULL,
-        updated_at TEXT NOT NULL,
-        updated_by TEXT NOT NULL
-    );
-    CREATE INDEX IF NOT EXISTS config_updated_at ON config(updated_at);
+    {_V26_DDL[0]}
+    {_V26_DDL[1]}
 {_OPPORTUNITY_CONDITIONS_DDL}
 {_V22_DDL}
 {_V23_DDL}
@@ -2301,17 +2308,8 @@ def _migrate_v26(connection: sqlite3.Connection) -> None:
         connection.commit()
     connection.execute("BEGIN IMMEDIATE")
     try:
-        connection.execute(
-            """
-            CREATE TABLE IF NOT EXISTS config (
-                key TEXT PRIMARY KEY,
-                value_json TEXT NOT NULL,
-                updated_at TEXT NOT NULL,
-                updated_by TEXT NOT NULL
-            )
-            """
-        )
-        connection.execute("CREATE INDEX IF NOT EXISTS config_updated_at ON config(updated_at)")
+        for statement in _V26_DDL:
+            connection.execute(statement)
         connection.execute("COMMIT")
     except Exception:
         if connection.in_transaction:

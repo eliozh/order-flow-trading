@@ -7,6 +7,7 @@ from typing import Any, Literal
 from pydantic import BaseModel, ConfigDict, Field
 
 from oft.api.schemas.envelope import Envelope
+from oft.api.schemas.errors import ErrorBody, ErrorEnvelope, catalog_responses
 
 
 class ScanSettingsUpdate(BaseModel):
@@ -45,23 +46,6 @@ class SettingsSectionsData(BaseModel):
     sections: list[SettingsSectionData]
 
 
-class ErrorBody(BaseModel):
-    code: str
-    message: str
-    category: str
-    http_status: int
-    retryable: bool
-    reference_id: str
-    details: list[dict[str, Any]] | None = None
-
-
-class ErrorEnvelope(BaseModel):
-    ok: bool
-    data: None
-    error: ErrorBody
-    meta: dict[str, Any]
-
-
 _CATALOG_ERRORS = {
     400: ("IDEMPOTENCY_KEY_REQUIRED", "A state-changing settings request omitted Idempotency-Key."),
     401: ("AUTH_REQUIRED", "The local API credential is missing or invalid."),
@@ -71,21 +55,29 @@ _CATALOG_ERRORS = {
     500: ("CONFIG_INVALID", "The configuration is missing, unreadable, or inconsistent."),
 }
 
-ERROR_RESPONSES: dict[int | str, dict[str, Any]] = {
-    status: {"model": ErrorEnvelope, "description": description}
-    for status, (_code, description) in _CATALOG_ERRORS.items()
-}
+ERROR_RESPONSES: dict[int | str, dict[str, Any]] = catalog_responses(_CATALOG_ERRORS)
 
 
 def mutation_openapi() -> dict[str, Any]:
-    """Document only the mandatory ``Idempotency-Key`` header for settings PUTs."""
+    """Document the mandatory ``Idempotency-Key`` header for settings PUTs.
+
+    A save that changes the value writes one ``config`` row and one
+    ``CONFIG_UPDATED`` audit event. A save that repeats the already-effective
+    value returns 200 with no new row and no audit event. An identical replay
+    (same key, same payload) returns the stored envelope with
+    ``meta.idempotent_replay=true`` and writes nothing.
+    """
     return {
         "parameters": [
             {
                 "name": "Idempotency-Key",
                 "in": "header",
                 "required": True,
-                "description": "Mandatory; a replay with a different payload is a 409.",
+                "description": (
+                    "Mandatory; a replay with a different payload is a 409. "
+                    "An identical replay returns the stored envelope "
+                    "(meta.idempotent_replay=true) and writes nothing."
+                ),
                 "schema": {"type": "string", "maxLength": 200},
             }
         ]
@@ -95,6 +87,7 @@ def mutation_openapi() -> dict[str, Any]:
 __all__ = [
     "ERROR_RESPONSES",
     "Envelope",
+    "ErrorBody",
     "ErrorEnvelope",
     "ScanSettingsData",
     "ScanSettingsUpdate",

@@ -13,7 +13,7 @@ const ITEMS: { id: 'overview' | SettingsSectionId; href: string; label: string }
 
 export function SettingsSectionNav({ active }: SettingsSectionNavProps) {
   return (
-    <nav className="settings-nav" aria-label="Settings sections">
+    <nav className="settings-nav" aria-label="设置分区导航">
       <ul>
         {ITEMS.map((item) => (
           <li key={item.id}>

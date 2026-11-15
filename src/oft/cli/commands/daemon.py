@@ -34,7 +34,6 @@ from oft.application.scheduler import (
     SettingsSyncDaemonScheduler,
     TriggerDaemonScheduler,
     align_to_boundary,
-    resolve_schedule_settings,
 )
 from oft.cli.commands.doctor import emit_error
 from oft.config import ConfigError, Settings, load_settings
@@ -144,42 +143,39 @@ def _schedule_state(
 ) -> ScheduleState:
     """The persisted ``schedule.json`` state with the saved period overlaid.
 
-    A persisted ``scan.period`` that differs from the active *and* pending
-    period is requested as a pending change, so the daemon applies it at the
-    next UTC boundary without rewriting the current window. A persisted value
-    equal to the active period collapses a stale pending change.
+    The persisted row is resolved before the environment period is validated
+    (M3) and a due pending change is promoted before the value is used (M1), so
+    ``daemon status`` / ``scan status`` never show a change that already applied
+    or fail because ``OFT_SCAN_PERIOD`` is stale. A corrupt persisted row, an
+    invalid environment period, or an invalid jitter is surfaced as
+    ``CONFIG_INVALID`` (exit 5) instead of a traceback.
 
     ``json_output`` keeps a config error in the standard JSON envelope for
     ``daemon status --json`` / ``scan status --json``.
     """
     try:
-        config = resolve_schedule_settings()
-    except ValueError as exc:
-        emit_error("CONFIG_INVALID", str(exc), json_output=json_output)
+        if settings is None:
+            from oft.application.scheduler import resolve_schedule_settings
+
+            config = resolve_schedule_settings()
+            return ScheduleState(period=config.period, jitter_seconds_max=config.jitter_seconds)
+        resolved = container
+        if resolved is None:
+            from oft.bootstrap import build_container
+
+            resolved = build_container(settings)
+        from oft.application.settings_service import resolve_schedule_state_overlay
+
+        return resolve_schedule_state_overlay(
+            settings=settings,
+            store=resolved.store,
+            clock=resolved.clock,
+            now=now,
+        )
+    except (ConfigError, ValueError) as exc:
+        message = exc.message if isinstance(exc, ConfigError) else str(exc)
+        emit_error("CONFIG_INVALID", message, json_output=json_output)
         raise typer.Exit(code=5) from exc
-    default = ScheduleState(period=config.period, jitter_seconds_max=config.jitter_seconds)
-    if settings is None:
-        return default
-    from oft.application.scheduler import load_schedule_state
-
-    state = load_schedule_state(schedule_state_path(settings), default=default)
-    resolved = container
-    if resolved is None:
-        from oft.bootstrap import build_container
-
-        resolved = build_container(settings)
-    from oft.application.settings_service import SettingsService
-
-    service = SettingsService(store=resolved.store, clock=resolved.clock)
-    try:
-        persisted = service.persisted_scan_period()
-    except ConfigError as exc:
-        # A corrupt persisted row must be reported, never silently defaulted.
-        emit_error(exc.code, exc.message, json_output=json_output)
-        raise typer.Exit(code=5) from exc
-    resolved_now = now or resolved.clock.now()
-    state, _changed = state.apply_persisted(persisted, now=resolved_now)
-    return state
 
 
 def _last_scheduled_run(settings: Settings, *, container: Any | None = None) -> Any:
@@ -334,6 +330,20 @@ def _start_scheduler(
     return scheduler
 
 
+def _run_settings_sync(sync: Any) -> bool:
+    """Run one settings sync tick without letting a config error kill it.
+
+    A corrupt persisted row (``ConfigError``) or an incompatible jitter/period
+    (``ValueError``) must never stop the interval scheduler; the API and CLI
+    surface ``CONFIG_INVALID`` directly. Returns whether the schedule changed.
+    """
+    try:
+        return bool(sync.sync())
+    except (ConfigError, ValueError) as exc:
+        _LOGGER.warning("scan_period_sync_failed", error=str(exc))
+        return False
+
+
 def _start_settings_sync_scheduler(
     *,
     container: Any,
@@ -353,15 +363,7 @@ def _start_settings_sync_scheduler(
         period_provider=service.persisted_scan_period,
     )
 
-    def _run_sync() -> None:
-        try:
-            sync.sync()
-        except ConfigError as exc:
-            # A corrupt persisted row must not kill the scheduler; the API and
-            # CLI surface CONFIG_INVALID directly.
-            _LOGGER.warning("scan_period_sync_failed", error=exc.message)
-
-    scheduler = SettingsSyncDaemonScheduler(job=_run_sync)
+    scheduler = SettingsSyncDaemonScheduler(job=lambda: _run_settings_sync(sync))
     scheduler.start()
     return scheduler
 
@@ -720,4 +722,5 @@ __all__ = [
     "pid_path",
     "process_alive",
     "read_pid",
+    "_run_settings_sync",
 ]

@@ -4,16 +4,19 @@ from __future__ import annotations
 
 from typing import Literal
 
+import structlog
 from pydantic import BaseModel, ConfigDict, Field
 
 from oft import __version__
 from oft.application.health import DaemonProbe
-from oft.config import Settings
+from oft.config import ConfigError, Settings
 from oft.domain.symbols import SymbolUniverseSummary, summarize_universe
 from oft.domain.time import utc_timestamp
 from oft.ports.clock import ClockPort
 from oft.ports.market_data import MarketDataPort
 from oft.ports.store import StorePort
+
+_LOGGER = structlog.get_logger(__name__)
 
 
 class DaemonStatus(BaseModel):
@@ -153,13 +156,22 @@ def _market_data_status(settings: Settings) -> MarketDataStatus | None:
     )
 
 
-def _schedule_status(settings: Settings, clock: ClockPort) -> ScheduleStatus | None:
-    """Read the persisted scheduler cadence (never guess from the last scan)."""
-    from oft.application.scheduler import resolve_schedule_state
+def _schedule_status(
+    settings: Settings, clock: ClockPort, store: StorePort | None
+) -> ScheduleStatus | None:
+    """Read the persisted cadence, overlaying the saved period (M14)."""
+    from oft.application.settings_service import resolve_schedule_state_overlay
 
     try:
-        state = resolve_schedule_state(settings)
-    except ValueError:
+        state = resolve_schedule_state_overlay(
+            settings=settings,
+            store=store,
+            clock=clock,
+        )
+    except (ConfigError, ValueError) as exc:
+        # A corrupt persisted row (or an incompatible env jitter) still returns
+        # HTTP 200, but the dropped schedule must be diagnosable, not silent.
+        _LOGGER.warning("schedule_status_unavailable", error=str(exc))
         return None
     payload = state.next_run_payload(clock.now())
     return ScheduleStatus(
@@ -194,5 +206,5 @@ def build_status(
         daemon=DaemonStatus(state=probe.state, detail=probe.detail),
         last_scan=_last_scan(store),
         market_data=market_data_status or _market_data_status(settings),
-        schedule=_schedule_status(settings, clock),
+        schedule=_schedule_status(settings, clock, store),
     )

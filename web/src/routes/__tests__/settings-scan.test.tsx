@@ -83,7 +83,7 @@ async function renderLoaded(options: RenderLoadedOptions = {}) {
   const fetch = options.fetch ?? (async () => scanEnvelope(scanData()))
   const clear = options.clear ?? vi.fn()
   const rotate = options.rotate ?? vi.fn(() => 'rotated-key')
-  render(
+  const { unmount } = render(
     <SettingsScanPage
       fetchScanSettingsFn={fetch}
       updateScanPeriodFn={update}
@@ -94,7 +94,7 @@ async function renderLoaded(options: RenderLoadedOptions = {}) {
     />,
   )
   await screen.findByTestId('scan-current-value')
-  return { update, fetch, clear, rotate }
+  return { update, fetch, clear, rotate, unmount }
 }
 
 describe('SettingsScanPage', () => {
@@ -108,6 +108,10 @@ describe('SettingsScanPage', () => {
     expect(screen.getByTestId('scan-lookback')).toHaveTextContent('7 天')
     expect(screen.getByTestId('scan-timezone')).toHaveTextContent('UTC')
     expect(screen.getAllByText('read-only', { selector: '.chip' })).toHaveLength(3)
+    // Each read-only field is a named group, so its label associates with it.
+    expect(screen.getByRole('group', { name: /分析回看/ })).toBeInTheDocument()
+    expect(screen.getByRole('group', { name: /时区显示/ })).toBeInTheDocument()
+    expect(screen.getByRole('group', { name: /下一个 UTC 边界/ })).toBeInTheDocument()
     expect(screen.getByRole('radio', { name: '4h' })).toBeChecked()
     expect(screen.getByRole('radio', { name: '8h' })).not.toBeChecked()
     // The permanent live region exists before any text is written.
@@ -189,7 +193,7 @@ describe('SettingsScanPage', () => {
     const summary = await screen.findByRole('alert')
     expect(summary).toHaveTextContent('错误：')
     expect(summary).toHaveTextContent('scan.period must be one of: 4h, 8h')
-    expect(summary.querySelector('a')).toHaveAttribute('href', '#scan-period-error')
+    expect(summary.querySelector('a')).toHaveAttribute('href', '#scan-period-group')
     await waitFor(() => expect(summary).toHaveFocus())
 
     const inline = document.getElementById('scan-period-error')
@@ -197,6 +201,15 @@ describe('SettingsScanPage', () => {
     const group = screen.getByRole('group', { name: '扫描周期' })
     expect(group).toHaveAttribute('aria-invalid', 'true')
     expect(group.getAttribute('aria-describedby')).toContain('scan-period-error')
+    // The summary link targets a focusable target, and each radio mirrors the
+    // fieldset's invalid state for assistive technology that does not cascade.
+    expect(group).toHaveAttribute('id', 'scan-period-group')
+    expect(group).toHaveAttribute('tabindex', '-1')
+    for (const period of ['4h', '8h']) {
+      const radio = screen.getByRole('radio', { name: period })
+      expect(radio).toHaveAttribute('aria-invalid', 'true')
+      expect(radio.getAttribute('aria-describedby')).toContain('scan-period-error')
+    }
     expect(screen.getByTestId('scan-current-value')).toHaveTextContent('4h')
     expect(clear).toHaveBeenCalled()
   })
@@ -284,22 +297,128 @@ describe('SettingsScanPage', () => {
     )
   })
 
-  it('treats a 409 conflict as an unknown outcome and keeps the key', async () => {
+  it('treats a 409 conflict as definitive, rotates the key, and never reconciles', async () => {
+    const fetch = vi.fn(async () => scanEnvelope(scanData()))
     const update = vi.fn(async () => {
       throw new SettingsApiError('still running', 'IDEMPOTENCY_CONFLICT', {
         httpStatus: 409,
-        kind: 'unknown',
       })
     })
     const clear = vi.fn()
-    await renderLoaded({ update, clear })
+    const rotate = vi.fn(() => 'rotated-key')
+    await renderLoaded({ update, fetch, clear, rotate })
 
     fireEvent.click(screen.getByRole('radio', { name: '8h' }))
     fireEvent.click(screen.getByRole('button', { name: '保存排程' }))
 
     const summary = await screen.findByRole('alert')
-    expect(summary).toHaveTextContent('结果未知')
+    expect(summary).toHaveTextContent('新的 Idempotency-Key')
+    expect(summary).toHaveTextContent('可直接重试')
+    expect(summary).not.toHaveTextContent('结果未知')
+    expect(rotate).toHaveBeenCalledTimes(1)
     expect(clear).not.toHaveBeenCalled()
+    // Definitive for this payload: no unknown-outcome reconcile fetch.
+    expect(fetch).toHaveBeenCalledTimes(1)
+  })
+
+  it('states that an unchanged save wrote no audit and keeps the old value', async () => {
+    const update = vi.fn(async () =>
+      scanEnvelope(
+        scanData({
+          value: '4h',
+          source: 'user',
+          updated_at: '2026-11-06T10:00:00.000Z',
+          updated_by: 'web',
+        }),
+      ),
+    )
+    await renderLoaded({ update })
+
+    fireEvent.click(screen.getByRole('button', { name: '保存排程' }))
+
+    const visible = await screen.findByTestId('settings-save-visible')
+    expect(visible).toHaveTextContent('未变更')
+    expect(visible).toHaveTextContent('未写入新 audit')
+    expect(visible).not.toHaveTextContent('audit 已写入')
+    expect(screen.getByTestId('scan-current-value')).toHaveTextContent('4h')
+  })
+
+  it('clears the idempotency key even when the PUT resolves after unmount', async () => {
+    let resolveUpdate: ((envelope: ScanSettingsEnvelope) => void) | undefined
+    const update = vi.fn(
+      () =>
+        new Promise<ScanSettingsEnvelope>((resolve) => {
+          resolveUpdate = resolve
+        }),
+    )
+    const clear = vi.fn()
+    const { unmount } = await renderLoaded({ update, clear })
+
+    fireEvent.click(screen.getByRole('radio', { name: '8h' }))
+    fireEvent.click(screen.getByRole('button', { name: '保存排程' }))
+    await waitFor(() => expect(update).toHaveBeenCalled())
+
+    unmount()
+    resolveUpdate?.(
+      scanEnvelope(
+        scanData({ value: '8h', source: 'user', updated_at: '2026-11-06T10:00:00.000Z' }),
+      ),
+    )
+
+    await waitFor(() => expect(clear).toHaveBeenCalled())
+  })
+
+  it('clears the field error and aria-invalid once a valid radio is selected', async () => {
+    const update = vi.fn(async () => {
+      throw new SettingsApiError('scan.period must be one of: 4h, 8h', 'VALIDATION_FAILED', {
+        httpStatus: 422,
+      })
+    })
+    await renderLoaded({ update })
+
+    fireEvent.click(screen.getByRole('radio', { name: '8h' }))
+    fireEvent.click(screen.getByRole('button', { name: '保存排程' }))
+    await screen.findByRole('alert')
+
+    const group = screen.getByRole('group', { name: '扫描周期' })
+    expect(group).toHaveAttribute('aria-invalid', 'true')
+    expect(screen.getByRole('radio', { name: '8h' })).toHaveAttribute('aria-invalid', 'true')
+
+    fireEvent.click(screen.getByRole('radio', { name: '4h' }))
+
+    await waitFor(() => expect(screen.queryByRole('alert')).toBeNull())
+    expect(group).not.toHaveAttribute('aria-invalid')
+    expect(screen.getByRole('radio', { name: '4h' })).not.toHaveAttribute('aria-invalid')
+    expect(document.getElementById('scan-period-error')).toBeNull()
+  })
+
+  it('shows a load error and recovers when the operator retries', async () => {
+    const fetch = vi
+      .fn<(signal?: AbortSignal) => Promise<ScanSettingsEnvelope>>()
+      .mockRejectedValueOnce(new Error('network down'))
+      .mockResolvedValueOnce(scanEnvelope(scanData()))
+    render(<SettingsScanPage fetchScanSettingsFn={fetch} />)
+
+    const alert = await screen.findByRole('alert')
+    expect(alert).toHaveTextContent('扫描设置不可用')
+    expect(alert).toHaveTextContent('network down')
+
+    fireEvent.click(screen.getByRole('button', { name: '重试' }))
+
+    await screen.findByTestId('scan-current-value')
+    expect(fetch).toHaveBeenCalledTimes(2)
+  })
+
+  it('renders a permanent load live region and keeps the visible text non-live', () => {
+    const fetch = () => new Promise<ScanSettingsEnvelope>(() => {})
+    render(<SettingsScanPage fetchScanSettingsFn={fetch} />)
+
+    const region = document.getElementById('settings-load-status')
+    expect(region).toHaveAttribute('role', 'status')
+    expect(region).toHaveTextContent('加载扫描设置…')
+    expect(screen.getByText('加载扫描设置…', { selector: 'p.status-message' })).not.toHaveAttribute(
+      'role',
+    )
   })
 
   it('is read-only at the compact override with the desktop/CLI note', async () => {
@@ -322,7 +441,7 @@ describe('SettingsPage', () => {
 
     const link = await screen.findByRole('link', { name: /扫描与排程/ })
     expect(link).toHaveAttribute('href', '/settings/scan')
-    const nav = screen.getByRole('navigation', { name: 'Settings sections' })
+    const nav = screen.getByRole('navigation', { name: '设置分区导航' })
     expect(nav).toBeInTheDocument()
     expect(screen.getByRole('link', { name: /概览/ })).toHaveAttribute('aria-current', 'page')
   })

@@ -1838,7 +1838,7 @@ code {
   color: var(--oft-text-primary);
 }
 
-.segbtn:focus-within {
+.segbtn:has(:focus-visible) {
   outline: 2px solid var(--oft-accent);
   outline-offset: 1px;
 }
@@ -1889,7 +1889,7 @@ code {
 
 .chip--muted {
   border-color: var(--oft-border-subtle);
-  color: var(--oft-text-muted);
+  color: var(--oft-text-secondary);
 }
 
 .settings-readonly-grid {

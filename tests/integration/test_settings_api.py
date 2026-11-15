@@ -219,6 +219,128 @@ def test_repeated_identical_put_replays_the_original_envelope(tmp_path: Path) ->
         assert second.json()["meta"]["idempotent_replay"] is True
         assert second.json()["data"] == first.json()["data"]
         assert len(app.state.container.store.list_config()) == 1
+        # M16/F5: an identical replay never writes a second audit event.
+        audits = app.state.container.store.list_audit_events()
+        assert len(audits) == 1
+        assert audits[0].event_type == "CONFIG_UPDATED"
+
+
+def test_a_fresh_key_saving_the_effective_value_writes_nothing(tmp_path: Path) -> None:
+    app = create_app(_settings(tmp_path), clock=FixedClock(NOW))
+    auth = _auth(app)
+
+    with TestClient(app) as client:
+        first = _put(client, auth, {"period": "8h"}, key="noop-first")
+        assert first.status_code == 200, first.text
+        before_audits = app.state.container.store.list_audit_events()
+
+        # The effective value is already 8h; a different key is a new logical
+        # save and must be a deterministic no-op: no row, no audit, 200.
+        second = _put(client, auth, {"period": "8h"}, key="noop-second")
+        assert second.status_code == 200, second.text
+        assert second.json()["data"]["value"] == "8h"
+        assert second.json()["data"]["source"] == "user"
+        assert second.json()["meta"]["idempotent_replay"] is False
+
+        assert len(app.state.container.store.list_config()) == 1
+        assert app.state.container.store.list_audit_events() == before_audits
+
+
+def test_get_scan_settings_with_an_invalid_environment_period_is_config_invalid(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setenv("OFT_SCAN_PERIOD", "1h")
+    app = create_app(_settings(tmp_path), clock=FixedClock(NOW))
+
+    with TestClient(app) as client:
+        response = client.get("/api/v1/settings/scan", headers=_auth(app))
+
+    assert response.status_code == 500
+    assert response.json()["error"]["code"] == "CONFIG_INVALID"
+
+
+def test_status_schedule_overlays_the_persisted_user_period(tmp_path: Path) -> None:
+    app = create_app(_settings(tmp_path), clock=FixedClock(NOW))
+    app.state.container.store.set_config(
+        ConfigRecord(
+            key="scan.period",
+            value_json=json.dumps("8h"),
+            updated_at="2026-11-06T09:00:00.000Z",
+            updated_by="web",
+        )
+    )
+
+    with TestClient(app) as client:
+        response = client.get("/api/v1/status", headers=_auth(app))
+
+    assert response.status_code == 200, response.text
+    schedule = response.json()["data"]["schedule"]
+    assert schedule["period"] == "8h"
+    assert schedule["pending_period"] is None
+    # The 8h window's fire time carries the deterministic 30 s jitter.
+    assert schedule["next_run_at"].startswith("2026-11-06T16:00:")
+
+
+def test_status_drops_the_schedule_and_logs_when_the_row_is_corrupt(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from oft.application import status as status_module
+
+    warnings: list[tuple[str, dict[str, Any]]] = []
+
+    class _Recorder:
+        def warning(self, event: str, **fields: Any) -> None:
+            warnings.append((event, fields))
+
+    # A module-level recorder is order-independent: structlog's
+    # ``cache_logger_on_first_use`` can otherwise hide the event after another
+    # test has run ``configure_logging``.
+    monkeypatch.setattr(status_module, "_LOGGER", _Recorder())
+
+    app = create_app(_settings(tmp_path), clock=FixedClock(NOW))
+    app.state.container.store.set_config(
+        ConfigRecord(
+            key="scan.period",
+            value_json="not-json",
+            updated_at="2026-11-06T09:00:00.000Z",
+            updated_by="web",
+        )
+    )
+
+    with TestClient(app) as client:
+        response = client.get("/api/v1/status", headers=_auth(app))
+
+    assert response.status_code == 200, response.text
+    assert response.json()["data"]["schedule"] is None
+    assert len(warnings) == 1
+    event, fields = warnings[0]
+    assert event == "schedule_status_unavailable"
+    assert "persisted scan.period" in str(fields.get("error", ""))
+
+
+def test_a_different_value_put_over_a_corrupt_row_is_config_invalid_with_no_write(
+    tmp_path: Path,
+) -> None:
+    app = create_app(_settings(tmp_path), clock=FixedClock(NOW))
+    store = app.state.container.store
+    corrupt = ConfigRecord(
+        key="scan.period",
+        value_json="not-json",
+        updated_at="2026-11-06T09:00:00.000Z",
+        updated_by="web",
+    )
+    store.set_config(corrupt)
+
+    with TestClient(app) as client:
+        response = _put(client, _auth(app), {"period": "8h"}, key="corrupt-save")
+
+    assert response.status_code == 500, response.text
+    assert response.json()["error"]["code"] == "CONFIG_INVALID"
+    row = store.get_config("scan.period")
+    assert row is not None
+    assert row.value_json == "not-json"
+    assert row.updated_at == corrupt.updated_at
+    assert store.list_audit_events() == ()
 
 
 def test_same_key_with_a_different_payload_is_an_idempotency_conflict(tmp_path: Path) -> None:
@@ -295,6 +417,8 @@ def test_malformed_json_is_a_validation_failure(tmp_path: Path) -> None:
     assert response.status_code == 422
     assert response.json()["error"]["code"] == "VALIDATION_FAILED"
     assert app.state.container.store.list_config() == ()
+    # A malformed request body writes no audit event either.
+    assert app.state.container.store.list_audit_events() == ()
 
 
 def test_settings_sections_expose_source_and_keys_without_values(tmp_path: Path) -> None:
@@ -347,6 +471,22 @@ def _cli_env(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
     monkeypatch.setenv("OFT_PORT", "8765")
     monkeypatch.setenv("OFT_DATA", str(tmp_path / "data"))
     monkeypatch.delenv("OFT_SCAN_PERIOD", raising=False)
+    monkeypatch.delenv("OFT_SCAN_JITTER_SECONDS", raising=False)
+
+
+def _seed_persisted_period(monkeypatch: pytest.MonkeyPatch, tmp_path: Path, value: str) -> None:
+    """A valid saved ``scan.period`` in the CLI data dir (no schedule.json)."""
+    _cli_env(monkeypatch, tmp_path)
+    store = SqliteStore(load_settings())
+    store.initialize()
+    store.set_config(
+        ConfigRecord(
+            key="scan.period",
+            value_json=json.dumps(value),
+            updated_at="2026-11-06T09:00:00.000Z",
+            updated_by="web",
+        )
+    )
 
 
 def test_cli_get_set_show_and_validate_match_the_api(
@@ -373,10 +513,58 @@ def test_cli_get_set_show_and_validate_match_the_api(
     assert data["value"] == "8h"
     assert data["source"] == "user"
     assert data["supported"] == ["4h", "8h"]
+    # CLI/API parity includes the next UTC boundary for the effective period.
+    assert data["next_run"].endswith("Z")
+    next_run = datetime.fromisoformat(data["next_run"].replace("Z", "+00:00"))
+    assert next_run.hour in (0, 8, 16)
+    assert next_run.minute == 0 and next_run.second == 0
 
     validated = runner.invoke(cli_app, ["config", "validate", "--json"])
     assert validated.exit_code == 0, validated.output
     assert json.loads(validated.output)["data"]["status"] == "PASS"
+
+
+def test_cli_and_api_agree_on_value_source_and_next_run(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """F8 parity: the same data dir and clock through both real entry points."""
+    _cli_env(monkeypatch, tmp_path)
+    from oft.bootstrap import build_container
+    from oft.cli.commands import config as config_module
+
+    def _fixed_container(settings: Any, *, initialize: bool = False) -> Any:
+        return build_container(settings, initialize=initialize, clock=FixedClock(NOW))
+
+    monkeypatch.setattr(config_module, "build_container", _fixed_container)
+    runner = CliRunner()
+
+    saved = runner.invoke(cli_app, ["config", "set", "scan.period", "8h"])
+    assert saved.exit_code == 0, saved.output
+    shown = runner.invoke(cli_app, ["config", "show", "--json"])
+    assert shown.exit_code == 0, shown.output
+    cli_data = json.loads(shown.output)["data"]
+    cli_get = runner.invoke(cli_app, ["config", "get", "scan.period"])
+    assert cli_get.exit_code == 0, cli_get.output
+
+    app = create_app(_settings(tmp_path), clock=FixedClock(NOW))
+    with TestClient(app) as client:
+        response = client.get("/api/v1/settings/scan", headers=_auth(app))
+    assert response.status_code == 200, response.text
+    api_data = response.json()["data"]
+
+    assert cli_get.output.strip() == api_data["value"] == "8h"
+    for field in (
+        "key",
+        "value",
+        "source",
+        "supported",
+        "next_run",
+        "timezone",
+        "updated_at",
+        "updated_by",
+    ):
+        assert cli_data[field] == api_data[field], field
+    assert api_data["next_run"] == "2026-11-06T16:00:00.000Z"
 
 
 def test_cli_set_rejects_an_invalid_period_with_exit_1(
@@ -515,3 +703,55 @@ def test_scan_status_json_keeps_the_error_envelope_for_a_corrupt_row(
     body = json.loads(result.output)
     assert body["ok"] is False
     assert body["error"]["code"] == "CONFIG_INVALID"
+
+
+# -- M3/M4/M14 daemon seams ---------------------------------------------------
+
+
+def test_daemon_and_scan_status_show_the_persisted_period_over_an_invalid_env(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    _seed_persisted_period(monkeypatch, tmp_path, "8h")
+    # A stale environment value must not override a valid saved period.
+    monkeypatch.setenv("OFT_SCAN_PERIOD", "1h")
+    runner = CliRunner()
+
+    daemon = runner.invoke(cli_app, ["daemon", "status", "--json"])
+    assert daemon.exit_code == 0, daemon.output
+    assert json.loads(daemon.output)["data"]["period"] == "8h"
+
+    scan = runner.invoke(cli_app, ["scan", "status", "--json"])
+    assert scan.exit_code == 0, scan.output
+    assert json.loads(scan.output)["data"]["period"] == "8h"
+
+    show = runner.invoke(cli_app, ["config", "show", "--json"])
+    assert show.exit_code == 0, show.output
+    assert json.loads(show.output)["data"]["source"] == "user"
+
+
+def test_an_out_of_range_jitter_is_clamped_for_a_smaller_persisted_period(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    _seed_persisted_period(monkeypatch, tmp_path, "4h")
+    # 20000s exceeds the 4h period (14400s); the overlay clamps instead of
+    # raising from ScheduleState.
+    monkeypatch.setenv("OFT_SCAN_JITTER_SECONDS", "20000")
+    runner = CliRunner()
+
+    result = runner.invoke(cli_app, ["daemon", "status", "--json"])
+
+    assert result.exit_code == 0, result.output
+    assert json.loads(result.output)["data"]["period"] == "4h"
+
+
+def test_a_non_integer_jitter_is_config_invalid_even_with_a_persisted_period(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    _seed_persisted_period(monkeypatch, tmp_path, "8h")
+    monkeypatch.setenv("OFT_SCAN_JITTER_SECONDS", "soon")
+    runner = CliRunner()
+
+    result = runner.invoke(cli_app, ["daemon", "status", "--json"])
+
+    assert result.exit_code == 5, result.output
+    assert json.loads(result.output)["error"]["code"] == "CONFIG_INVALID"

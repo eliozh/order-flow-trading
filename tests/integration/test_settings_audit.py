@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import json
 import sqlite3
+import threading
 from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any
@@ -199,3 +200,90 @@ def test_fresh_database_matches_a_migrated_v25_database(tmp_path: Path) -> None:
     # Re-running the migration is idempotent and preserves the table.
     migrated_store.initialize()
     assert _config_shape(migrated_settings) == migrated
+
+
+def test_concurrent_saves_commit_one_row_and_exactly_one_audit(tmp_path: Path) -> None:
+    """H2: compare+write+audit are serialized by one BEGIN IMMEDIATE transaction."""
+    settings = _settings(tmp_path)
+    SqliteStore(settings).initialize()
+    barrier = threading.Barrier(2)
+    results: list[Any] = []
+    errors: list[BaseException] = []
+
+    def _save(actor: str) -> None:
+        # Two independent store/service instances over the same database.
+        store = SqliteStore(settings)
+        service = SettingsService(store=store, clock=FixedClock(NOW))
+        try:
+            barrier.wait(timeout=10)
+            results.append(service.update_scan_period("8h", actor=actor))
+        except BaseException as exc:  # surfaced by the errors assertion below
+            errors.append(exc)
+
+    threads = [
+        threading.Thread(target=_save, args=("web",)),
+        threading.Thread(target=_save, args=("cli",)),
+    ]
+    for thread in threads:
+        thread.start()
+    for thread in threads:
+        thread.join(timeout=30)
+
+    assert errors == []
+    assert len(results) == 2
+    assert [result.value for result in results] == ["8h", "8h"]
+
+    fresh = SqliteStore(settings)
+    rows = fresh.list_config()
+    assert len(rows) == 1
+    assert json.loads(rows[0].value_json) == "8h"
+    audits = fresh.list_audit_events()
+    assert len(audits) == 1
+    assert audits[0].event_type == "CONFIG_UPDATED"
+
+
+def test_concurrent_different_values_keep_an_accurate_before_chain(tmp_path: Path) -> None:
+    """H2: the ``before`` value comes from the row read under the write lock."""
+    settings = _settings(tmp_path)
+    SqliteStore(settings).initialize()
+    barrier = threading.Barrier(2)
+    errors: list[BaseException] = []
+
+    def _save(actor: str, value: str) -> None:
+        store = SqliteStore(settings)
+        service = SettingsService(store=store, clock=FixedClock(NOW))
+        try:
+            barrier.wait(timeout=10)
+            service.update_scan_period(value, actor=actor)
+        except BaseException as exc:  # surfaced by the errors assertion below
+            errors.append(exc)
+
+    threads = [
+        threading.Thread(target=_save, args=("web", "8h")),
+        threading.Thread(target=_save, args=("cli", "4h")),
+    ]
+    for thread in threads:
+        thread.start()
+    for thread in threads:
+        thread.join(timeout=30)
+
+    assert errors == []
+
+    fresh = SqliteStore(settings)
+    rows = fresh.list_config()
+    assert len(rows) == 1
+    final_value = json.loads(rows[0].value_json)
+
+    audits = sorted(fresh.list_audit_events(), key=lambda record: record.seq)
+    assert 1 <= len(audits) <= 2
+    assert all(audit.event_type == "CONFIG_UPDATED" for audit in audits)
+
+    bodies = [_audit_body(audit) for audit in audits]
+    assert all(body["subject"] == {"kind": "CONFIG", "id": SCAN_PERIOD_KEY} for body in bodies)
+    chain = [body["payload"] for body in bodies]
+    # Starting from the default 4h, every recorded step begins where the
+    # previous one ended, and the last one ends at the committed row.
+    assert chain[0]["before"] == "4h"
+    for current, following in zip(chain, chain[1:], strict=False):
+        assert current["after"] == following["before"]
+    assert chain[-1]["after"] == final_value

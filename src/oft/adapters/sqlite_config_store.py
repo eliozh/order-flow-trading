@@ -1,8 +1,12 @@
 """Persisted runtime settings (``config`` table) with atomic audit writes.
 
-The settings service is the only writer. A save upserts exactly one row and
-appends exactly one audit event inside one ``BEGIN IMMEDIATE`` transaction, so a
-recorded change can never exist without its audit trail (and vice versa).
+A save that *changes* the effective value upserts exactly one row and appends
+exactly one audit event inside one ``BEGIN IMMEDIATE`` transaction, so a
+recorded change can never exist without its audit trail (and vice versa). A save
+that repeats the effective value writes nothing. ``set_config`` and
+``save_config_with_audit`` are low-level seams (tests, migrations, one-shot
+writes), not the settings path: ``SettingsService`` goes through
+``save_config_change`` so the compare, write, and audit are one transaction.
 """
 
 from __future__ import annotations
@@ -15,7 +19,12 @@ from oft.ports.store import AuditEventDraft, AuditEventRecord, ConfigRecord
 
 
 class ConfigStoreMixin:
-    """Read and write ``config`` rows; the schema DDL lives in ``sqlite_schema``."""
+    """Read and write ``config`` rows; the schema DDL lives in ``sqlite_schema``.
+
+    ``save_config_change`` is the compare-then-write path the settings service
+    uses. ``set_config``/``save_config_with_audit`` are lower-level seams and
+    bypass the value comparison.
+    """
 
     # Supplied by ``SqliteConnectionMixin``/``SqliteAuditMixin`` in the concrete
     # composition.
@@ -72,6 +81,58 @@ class ConfigStoreMixin:
             audit_record = self._insert_audit_event(connection, audit)
             connection.commit()
             return audit_record
+        except BaseException:
+            connection.rollback()
+            raise
+        finally:
+            connection.close()
+
+    def save_config_change(
+        self,
+        key: str,
+        build: Callable[[ConfigRecord | None], tuple[ConfigRecord, AuditEventDraft] | None],
+    ) -> tuple[ConfigRecord | None, AuditEventRecord | None]:
+        """Read, decide, and write one settings change inside one transaction.
+
+        The current row is read *inside* the ``BEGIN IMMEDIATE`` transaction, so
+        a concurrent writer cannot interleave between the compare and the
+        upsert: the loser observes the committed row and its ``build`` callback
+        returns ``None`` (a no-op) instead of writing a duplicate audit or an
+        inaccurate ``before``. ``build`` is pure and returns either
+        ``(record_to_write, audit_draft)`` or ``None``. The committed row is
+        returned, or the existing row plus ``None`` when nothing was written.
+        """
+        connection = self._connect()
+        try:
+            connection.execute("BEGIN IMMEDIATE")
+            try:
+                row = connection.execute(
+                    "SELECT key, value_json, updated_at, updated_by FROM config WHERE key = ?",
+                    (key,),
+                ).fetchone()
+            except sqlite3.OperationalError as exc:
+                # A pre-v26 data directory has no ``config`` table yet; treat it
+                # as "no persisted row" so the callback can still decide.
+                if not _missing_config_table(exc):
+                    raise
+                row = None
+            current = _row_to_config(row) if row is not None else None
+            outcome = build(current)
+            if outcome is None:
+                connection.commit()
+                return current, None
+            record, audit = outcome
+            self._upsert_config(connection, record)
+            audit_record = self._insert_audit_event(connection, audit)
+            connection.commit()
+            committed = connection.execute(
+                "SELECT key, value_json, updated_at, updated_by FROM config WHERE key = ?",
+                (key,),
+            ).fetchone()
+            return (
+                (_row_to_config(committed) if committed is not None else record),
+                audit_record,
+            )
         except BaseException:
             connection.rollback()
             raise

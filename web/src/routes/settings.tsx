@@ -90,11 +90,17 @@ export function SettingsPage({
       <div className="settings-cols">
         <SettingsSectionNav active="overview" />
         <div className="stack">
-          {load.state === 'loading' && (
-            <p className="status-message" role="status">
-              加载设置分区…
-            </p>
-          )}
+          {/* Permanent live region: text is written on a load-state change. */}
+          <p
+            role="status"
+            className="visually-hidden"
+            id="settings-sections-status"
+            data-testid="settings-sections-status"
+          >
+            {load.state === 'loading' ? '加载设置分区…' : ''}
+          </p>
+
+          {load.state === 'loading' && <p className="status-message">加载设置分区…</p>}
 
           {load.state === 'error' && (
             <>

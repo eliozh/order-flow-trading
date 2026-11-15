@@ -63,6 +63,8 @@ def test_a_persisted_save_is_pending_until_the_next_boundary_and_keeps_the_windo
 ) -> None:
     settings = _settings(tmp_path)
     container = build_container(settings, initialize=True, clock=MutableClock(NOW))
+    # The running daemon has an active 4h window recorded before the save.
+    save_schedule_state(schedule_state_path(settings), ScheduleState(period="4h"))
     SettingsService(
         store=container.store,
         clock=container.clock,
@@ -241,3 +243,145 @@ def test_next_run_is_for_the_effective_period_while_the_daemon_applies_later(
     assert state.period_at(NOW) == "8h"
     assert state.effective_from == datetime(2026, 11, 6, 16, 0, tzinfo=UTC)
     assert state.period_at(state.effective_from) == "4h"
+
+
+# -- H1 / M1: a due pending change is promoted, never shown as still pending ----
+
+
+def _pending_8h() -> ScheduleState:
+    return ScheduleState(period="4h", pending_period="8h", effective_from=TRANSITION)
+
+
+def test_a_due_pending_change_is_promoted_after_the_boundary() -> None:
+    state = _pending_8h()
+    assert state.period_at(NOW) == "4h"
+
+    promoted = state.promote(TRANSITION.replace(minute=1))
+
+    assert promoted is not state
+    assert promoted.period == "8h"
+    assert promoted.pending_period is None
+    assert promoted.effective_from is None
+    assert promoted.period_at(TRANSITION.replace(minute=1)) == "8h"
+
+
+def test_revert_after_apply_requests_a_new_pending_change_at_the_new_boundary() -> None:
+    state = _pending_8h()
+    applied = TRANSITION.replace(minute=1)
+
+    promoted, changed = state.apply_persisted("4h", now=applied)
+
+    assert changed is True
+    assert promoted.period_at(applied) == "8h"
+    assert promoted.period_at(TRANSITION.replace(hour=15)) == "8h"
+    assert promoted.pending_period == "4h"
+    assert promoted.effective_from == datetime(2026, 11, 6, 16, 0, tzinfo=UTC)
+    assert promoted.period_at(datetime(2026, 11, 6, 16, 0, tzinfo=UTC)) == "4h"
+    # A revert is not treated as an immediate no-op against the stale pending.
+
+
+def test_reapplying_the_now_active_period_after_the_boundary_is_a_clean_no_op() -> None:
+    state = _pending_8h()
+    applied = TRANSITION.replace(minute=1)
+
+    promoted, changed = state.apply_persisted("8h", now=applied)
+
+    assert changed is True
+    assert promoted.period == "8h"
+    assert promoted.pending_period is None
+    assert promoted.effective_from is None
+
+
+def test_status_payload_after_the_boundary_shows_the_applied_period_and_no_pending() -> None:
+    state = _pending_8h()
+
+    payload = state.next_run_payload(TRANSITION.replace(minute=1))
+
+    assert payload["period"] == "8h"
+    assert payload["pending_period"] == ""
+    assert payload["next_run_at"].startswith("2026-11-06T16:00:")
+
+
+def test_schedule_state_clears_a_stale_pending_value_once_the_boundary_passed(
+    tmp_path: Path,
+) -> None:
+    settings = _settings(tmp_path)
+    container = build_container(settings, initialize=True, clock=MutableClock(NOW))
+    container.store.set_config(
+        ConfigRecord(
+            key=SCAN_PERIOD_KEY,
+            value_json=json.dumps("8h"),
+            updated_at="2026-11-06T10:00:00.000Z",
+            updated_by="web",
+        )
+    )
+    save_schedule_state(schedule_state_path(settings), _pending_8h())
+    applied = MutableClock(TRANSITION.replace(minute=1))
+
+    state = _schedule_state(settings, container=container, now=applied.now())
+
+    assert state.period_at(applied.now()) == "8h"
+    assert state.pending_period is None
+    assert state.effective_from is None
+
+
+def test_the_scheduler_and_domain_agree_on_periods_and_boundaries() -> None:
+    from oft.application.scheduler import BOUNDARY_HOURS, PERIOD_HOURS
+    from oft.domain.settings import SCAN_PERIOD_HOURS, SUPPORTED_SCAN_PERIODS
+
+    assert tuple(SCAN_PERIOD_HOURS) == SUPPORTED_SCAN_PERIODS
+    assert dict(SCAN_PERIOD_HOURS) == PERIOD_HOURS
+    for period, hours in SCAN_PERIOD_HOURS.items():
+        assert BOUNDARY_HOURS[period] == tuple(range(0, 24, hours))
+
+
+# -- M4/M8: the daemon sync seam never raises out of the interval job ----------
+
+
+def test_run_settings_sync_swallows_value_and_config_errors_and_logs(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from oft.cli.commands import daemon as daemon_module
+    from oft.config import ConfigError
+
+    warnings: list[tuple[str, dict[str, object]]] = []
+
+    class _Recorder:
+        def warning(self, event: str, **fields: object) -> None:
+            warnings.append((event, fields))
+
+    # Order-independent: structlog's ``cache_logger_on_first_use`` may already
+    # have cached a stdlib logger after another test ran ``configure_logging``.
+    monkeypatch.setattr(daemon_module, "_LOGGER", _Recorder())
+
+    class _Raising:
+        def __init__(self, error: BaseException) -> None:
+            self._error = error
+
+        def sync(self) -> bool:
+            raise self._error
+
+    assert daemon_module._run_settings_sync(_Raising(ValueError("bad jitter"))) is False
+    assert len(warnings) == 1
+    assert warnings[0][0] == "scan_period_sync_failed"
+    assert "bad jitter" in str(warnings[0][1].get("error", ""))
+
+    warnings.clear()
+    assert daemon_module._run_settings_sync(_Raising(ConfigError("corrupt row"))) is False
+    assert len(warnings) == 1
+    assert warnings[0][0] == "scan_period_sync_failed"
+    assert "corrupt row" in str(warnings[0][1].get("error", ""))
+
+
+def test_run_settings_sync_returns_the_scheduler_change_flag() -> None:
+    from oft.cli.commands.daemon import _run_settings_sync
+
+    class _Sync:
+        def __init__(self, changed: bool) -> None:
+            self._changed = changed
+
+        def sync(self) -> bool:
+            return self._changed
+
+    assert _run_settings_sync(_Sync(True)) is True
+    assert _run_settings_sync(_Sync(False)) is False
