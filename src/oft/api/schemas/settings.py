@@ -1,4 +1,4 @@
-"""Settings request and response schemas (slice 32: ``scan.period`` only)."""
+"""Settings request and response schemas (slices 32/34)."""
 
 from __future__ import annotations
 
@@ -11,7 +11,7 @@ from oft.api.schemas.errors import ErrorBody, ErrorEnvelope, catalog_responses
 
 
 class ScanSettingsUpdate(BaseModel):
-    """The one supported setting in this slice; extra fields are rejected."""
+    """The one supported scan setting; extra fields are rejected."""
 
     model_config = ConfigDict(extra="forbid")
 
@@ -46,12 +46,56 @@ class SettingsSectionsData(BaseModel):
     sections: list[SettingsSectionData]
 
 
+RiskSource = Literal["paper_account", "none"]
+RiskQuality = Literal["COMPLETE", "PARTIAL", "UNAVAILABLE"]
+
+
+class RiskUtilizationMetricData(BaseModel):
+    used: float | None
+    cap: float
+    unit: str
+    source: RiskSource
+    quality: RiskQuality
+    note: str | None = None
+
+
+class RiskUtilizationData(BaseModel):
+    source: RiskSource
+    quality: RiskQuality
+    stale_inputs: list[str]
+    metrics: dict[str, RiskUtilizationMetricData]
+
+
+class RiskSettingsUpdate(BaseModel):
+    """A partial cap patch; ``confirm`` authorizes loosening.
+
+    The cap keys/values are validated by the shared service (which reuses the
+    domain's typed parser), so a bool, NaN, unknown field, or range violation
+    produces the same field-scoped details the CLI reports.
+    """
+
+    model_config = ConfigDict(extra="forbid")
+
+    caps: dict[str, Any]
+    confirm: bool = False
+    reason: str = Field(default="", max_length=500)
+
+
+class RiskSettingsData(BaseModel):
+    caps: dict[str, float | int]
+    source: Literal["default", "user"]
+    defaults: dict[str, float | int]
+    utilization: RiskUtilizationData
+    updated_at: str | None = None
+    updated_by: str | None = None
+
+
 _CATALOG_ERRORS = {
     400: ("IDEMPOTENCY_KEY_REQUIRED", "A state-changing settings request omitted Idempotency-Key."),
     401: ("AUTH_REQUIRED", "The local API credential is missing or invalid."),
     403: ("CSRF_INVALID", "The CSRF token or Origin check failed."),
     409: ("IDEMPOTENCY_CONFLICT", "The same key was used with a different payload."),
-    422: ("VALIDATION_FAILED", "The scan period failed typed validation."),
+    422: ("VALIDATION_FAILED", "The setting failed typed validation."),
     500: ("CONFIG_INVALID", "The configuration is missing, unreadable, or inconsistent."),
 }
 
@@ -89,6 +133,10 @@ __all__ = [
     "Envelope",
     "ErrorBody",
     "ErrorEnvelope",
+    "RiskSettingsData",
+    "RiskSettingsUpdate",
+    "RiskUtilizationData",
+    "RiskUtilizationMetricData",
     "ScanSettingsData",
     "ScanSettingsUpdate",
     "SettingsSectionData",

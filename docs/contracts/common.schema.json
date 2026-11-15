@@ -460,7 +460,15 @@
       "properties": {
         "field": { "type": ["string", "null"] },
         "code": { "type": ["string", "null"] },
-        "message": { "type": "string" }
+        "message": { "type": "string" },
+        "before": {
+          "type": ["number", "null"],
+          "description": "Server-computed value before the change (confirmation_required details only)."
+        },
+        "after": {
+          "type": ["number", "null"],
+          "description": "Server-computed value after the change (confirmation_required details only)."
+        }
       }
     },
     "pagination": {

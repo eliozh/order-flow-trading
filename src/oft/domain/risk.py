@@ -33,6 +33,10 @@ RISK_CAPS_STATE_KEY = "risk_caps"
 MAX_LEVERAGE_CEILING = 125.0
 MAX_BPS_CEILING = 10000.0
 _INT_CAP_FIELDS = frozenset({"max_concurrent_positions", "stale_mark_seconds"})
+# The one cross-field policy rule. It is checked on a *proposed* document (and
+# reported by ``oft risk validate``), never on a legacy row being read, so an
+# operator can repair a persisted document that predates the rule.
+DAILY_LOSS_BELOW_PER_TRADE = "daily_loss_pct must be greater than or equal to per_trade_risk_pct"
 
 # The complete cap set, in the order the contract and the persistence document
 # expose it. Adding a cap here is the one edit point (D1).
@@ -185,8 +189,15 @@ def _finite_number(name: str, value: object) -> bool:
     return math.isfinite(value)
 
 
-def validate_caps(caps: RiskCaps) -> tuple[str, ...]:
-    """Return invariant violations; an empty tuple means the caps are usable."""
+def validate_caps(caps: RiskCaps, *, cross_field: bool = True) -> tuple[str, ...]:
+    """Return invariant violations; an empty tuple means the caps are usable.
+
+    ``cross_field=False`` keeps only the per-field type and range checks. The
+    read path uses it to decode the *current* persisted document so a legacy row
+    that predates the cross-field policy stays readable and repairable; every
+    *proposed* document (the save path and ``oft risk validate``) is checked
+    with the default full rule.
+    """
     errors: list[str] = []
 
     def _pct(name: str, value: object) -> None:
@@ -224,6 +235,16 @@ def validate_caps(caps: RiskCaps) -> tuple[str, ...]:
         errors.append("stale_mark_seconds must be a finite integer")
     elif caps.stale_mark_seconds < 1:
         errors.append("stale_mark_seconds must be at least 1")
+    # The cross-field policy lives here so the save path, the read path, and
+    # ``oft risk validate`` cannot drift. Only finite numbers are compared; a
+    # NaN/bool already reported above would make the comparison meaningless.
+    if (
+        cross_field
+        and _finite_number("per_trade_risk_pct", caps.per_trade_risk_pct)
+        and _finite_number("daily_loss_pct", caps.daily_loss_pct)
+        and caps.daily_loss_pct < caps.per_trade_risk_pct
+    ):
+        errors.append(DAILY_LOSS_BELOW_PER_TRADE)
     return tuple(errors)
 
 

@@ -15,8 +15,8 @@ set -euo pipefail
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 WEB_DIR="$(cd "$SCRIPT_DIR/.." && pwd)"
 ROOT="$(cd "$WEB_DIR/.." && pwd)"
-SCREENS_DIR="$ROOT/.claude/ecc-workflow/screens/slice-32-e2e"
-REPORT_DIR="$SCREENS_DIR/report"
+SCREENS_DIR="${OFT_E2E_SETTINGS_SCREENS_DIR:-$ROOT/.claude/ecc-workflow/screens/slice-32-e2e}"
+REPORT_DIR="${OFT_E2E_SETTINGS_REPORT_DIR:-$SCREENS_DIR/report}"
 
 RESERVED_PORTS="7622 7632 7642 7662"
 

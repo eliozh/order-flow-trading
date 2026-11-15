@@ -10,6 +10,7 @@ block or create files.
 from __future__ import annotations
 
 import sqlite3
+from collections.abc import Callable
 from contextlib import closing
 from pathlib import Path
 
@@ -82,6 +83,18 @@ class SqliteStore(
             connection.close()
         return str(row["value"]) if row is not None else None
 
+    def get_system_state_updated_at(self, key: str) -> str | None:
+        connection = self._connect_read_only()
+        if connection is None:
+            return None
+        try:
+            row = connection.execute(
+                "SELECT updated_at FROM system_state WHERE key = ?", (key,)
+            ).fetchone()
+        finally:
+            connection.close()
+        return str(row["updated_at"]) if row is not None else None
+
     def set_system_state(self, key: str, value: str, *, updated_at: str) -> None:
         with closing(self._connect()) as connection, connection:
             connection.execute(
@@ -113,6 +126,49 @@ class SqliteStore(
             record = self._insert_audit_event(connection, audit)
             connection.commit()
             return record
+        except BaseException:
+            connection.rollback()
+            raise
+        finally:
+            connection.close()
+
+    def save_risk_caps_change(
+        self,
+        build: Callable[[str | None], tuple[str, AuditEventDraft] | None],
+    ) -> tuple[str | None, AuditEventRecord | None]:
+        """Read, decide, and write the risk caps inside one transaction.
+
+        The current ``system_state.risk_caps`` value is read *inside*
+        ``BEGIN IMMEDIATE`` so two processes cannot interleave between the
+        compare and the upsert. ``build`` is pure: it returns either the complete
+        caps document plus its audit draft, or ``None`` (a no-op). A validation
+        error raised by ``build`` rolls the whole unit back, so invalid values
+        write neither a row nor an audit.
+        """
+        connection = self._connect()
+        try:
+            connection.execute("BEGIN IMMEDIATE")
+            row = connection.execute(
+                "SELECT value FROM system_state WHERE key = ?", ("risk_caps",)
+            ).fetchone()
+            current = None if row is None else str(row["value"])
+            outcome = build(current)
+            if outcome is None:
+                connection.commit()
+                return current, None
+            value, audit = outcome
+            connection.execute(
+                """
+                INSERT INTO system_state (key, value, updated_at) VALUES (?, ?, ?)
+                ON CONFLICT(key) DO UPDATE SET
+                    value = excluded.value,
+                    updated_at = excluded.updated_at
+                """,
+                ("risk_caps", value, audit.created_at),
+            )
+            record = self._insert_audit_event(connection, audit)
+            connection.commit()
+            return value, record
         except BaseException:
             connection.rollback()
             raise

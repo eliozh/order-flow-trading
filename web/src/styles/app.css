@@ -1965,3 +1965,112 @@ code {
     min-height: 44px;
   }
 }
+
+/* Slice 34: risk-cap settings (F10c). */
+.risk-grid {
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(220px, 1fr));
+  gap: var(--oft-space-3);
+  padding: var(--oft-space-3) var(--oft-space-4);
+}
+
+.risk-grid .field-label {
+  justify-content: space-between;
+  gap: var(--oft-space-2);
+}
+
+.num-input {
+  width: 100%;
+  min-height: 36px;
+  padding: 4px 8px;
+  border: 1px solid var(--oft-border-control);
+  border-radius: var(--oft-radius-sm);
+  background: var(--oft-bg-panel);
+  color: var(--oft-text-primary);
+  font: 13px var(--oft-font-mono);
+}
+
+.num-input:focus-visible {
+  outline: 2px solid var(--oft-accent);
+  outline-offset: 1px;
+}
+
+.num-input[aria-invalid='true'] {
+  border-color: var(--oft-status-danger);
+}
+
+.num-input:disabled {
+  opacity: 0.65;
+  cursor: not-allowed;
+}
+
+.risk-meters {
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(240px, 1fr));
+  gap: var(--oft-space-3);
+  padding: var(--oft-space-3) var(--oft-space-4);
+}
+
+.risk-meter {
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+  min-width: 0;
+}
+
+.risk-meter-head {
+  display: flex;
+  justify-content: space-between;
+  gap: var(--oft-space-2);
+  color: var(--oft-text-secondary);
+  font-size: 12px;
+}
+
+.risk-meter-head .mono {
+  color: var(--oft-text-primary);
+}
+
+.risk-meter-track {
+  display: block;
+  height: 8px;
+  border: 1px solid var(--oft-border-subtle);
+  background: var(--oft-bg-panel);
+}
+
+.risk-meter-fill {
+  display: block;
+  height: 100%;
+  background: var(--oft-accent);
+}
+
+.risk-defaults {
+  padding: 0 var(--oft-space-4) var(--oft-space-3);
+}
+
+.risk-defaults dd {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 4px var(--oft-space-2);
+}
+
+.risk-diff-wrap {
+  margin-top: var(--oft-space-3);
+}
+
+.risk-diff {
+  min-width: 320px;
+}
+
+.risk-diff th[scope='row'] {
+  text-align: left;
+}
+
+@media (max-width: 768px) {
+  .risk-grid {
+    grid-template-columns: minmax(0, 1fr);
+  }
+
+  .num-input {
+    min-height: 44px;
+  }
+}

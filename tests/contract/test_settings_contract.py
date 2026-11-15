@@ -61,6 +61,7 @@ def test_every_settings_response_validates_the_envelope(
         responses = [
             client.get("/api/v1/settings/scan", headers=auth),
             client.get("/api/v1/settings", headers=auth),
+            client.get("/api/v1/settings/risk", headers=auth),
             client.put(
                 "/api/v1/settings/scan",
                 json={"period": "8h"},
@@ -76,6 +77,26 @@ def test_every_settings_response_validates_the_envelope(
                 "/api/v1/settings/scan",
                 json={"period": "8h"},
                 headers=auth,
+            ),
+            client.put(
+                "/api/v1/settings/risk",
+                json={"caps": {"per_trade_risk_pct": 0.5}},
+                headers={**auth, "Idempotency-Key": "contract-risk-1"},
+            ),
+            client.put(
+                "/api/v1/settings/risk",
+                json={"caps": {"max_leverage": 6.0}},
+                headers={**auth, "Idempotency-Key": "contract-risk-2"},
+            ),
+            client.put(
+                "/api/v1/settings/risk",
+                json={"caps": {"per_trade_risk_pct": -1}},
+                headers={**auth, "Idempotency-Key": "contract-risk-3"},
+            ),
+            client.put(
+                "/api/v1/settings/risk",
+                json={"caps": {"per_trade_risk_pct": 3.0}, "confirm": True},
+                headers={**auth, "Idempotency-Key": "contract-risk-4"},
             ),
         ]
 
@@ -142,3 +163,111 @@ def test_scan_settings_payload_has_no_secret_or_extra_fields(
     serialized = json.dumps(data).lower()
     for marker in ("secret", "api_key", "token", "password"):
         assert marker not in serialized
+
+
+def test_risk_settings_payload_has_exact_keys_and_no_secrets(
+    tmp_path: Path, validator: Draft202012Validator
+) -> None:
+    settings = Settings(env="test", port=8765, data_dir=tmp_path / "data")
+    app = create_app(settings, clock=FixedClock(NOW))
+    auth = _auth(app)
+
+    with TestClient(app) as client:
+        get_response = client.get("/api/v1/settings/risk", headers=auth)
+        put_response = client.put(
+            "/api/v1/settings/risk",
+            json={"caps": {"per_trade_risk_pct": 0.5}, "reason": "contract"},
+            headers={**auth, "Idempotency-Key": "contract-risk-keys"},
+        )
+
+    for response in (get_response, put_response):
+        _validate(validator, response.json())
+        data = response.json()["data"]
+        assert set(data) == {
+            "caps",
+            "source",
+            "defaults",
+            "utilization",
+            "updated_at",
+            "updated_by",
+        }
+        assert set(data["caps"]) == {
+            "per_trade_risk_pct",
+            "max_concurrent_positions",
+            "daily_loss_pct",
+            "max_leverage",
+            "max_notional_pct",
+            "max_slippage_bps",
+            "max_spread_bps",
+            "stale_mark_seconds",
+        }
+        assert set(data["defaults"]) == set(data["caps"])
+        utilization = data["utilization"]
+        assert set(utilization) == {"source", "quality", "stale_inputs", "metrics"}
+        assert set(utilization["metrics"]) == set(data["caps"])
+        for metric in utilization["metrics"].values():
+            assert set(metric) == {"used", "cap", "unit", "source", "quality", "note"}
+        serialized = json.dumps(data).lower()
+        for marker in ("secret", "api_key", "token", "password"):
+            assert marker not in serialized
+
+
+def test_risk_settings_errors_use_catalogued_codes_and_the_envelope(
+    tmp_path: Path, validator: Draft202012Validator
+) -> None:
+    catalog_codes = {entry["code"] for entry in _load("error-catalog.json")["codes"]}
+    settings = Settings(env="test", port=8765, data_dir=tmp_path / "data")
+    app = create_app(settings, clock=FixedClock(NOW))
+    auth = _auth(app)
+
+    with TestClient(app) as client:
+        no_key = client.put(
+            "/api/v1/settings/risk",
+            json={"caps": {"per_trade_risk_pct": 0.5}},
+            headers=auth,
+        )
+        loosening = client.put(
+            "/api/v1/settings/risk",
+            json={"caps": {"max_leverage": 6.0}},
+            headers={**auth, "Idempotency-Key": "contract-risk-loosen"},
+        )
+        extra = client.put(
+            "/api/v1/settings/risk",
+            json={"caps": {"per_trade_risk_pct": 0.5}, "unknown": True},
+            headers={**auth, "Idempotency-Key": "contract-risk-extra"},
+        )
+
+    for response in (no_key, loosening, extra):
+        _validate(validator, response.json())
+
+    assert no_key.json()["error"]["code"] == "IDEMPOTENCY_KEY_REQUIRED"
+    assert loosening.json()["error"]["code"] == "VALIDATION_FAILED"
+    assert extra.json()["error"]["code"] == "VALIDATION_FAILED"
+    for response in (no_key, loosening, extra):
+        assert response.json()["error"]["code"] in catalog_codes
+
+
+def test_settings_sections_include_the_risk_section(
+    tmp_path: Path, validator: Draft202012Validator
+) -> None:
+    settings = Settings(env="test", port=8765, data_dir=tmp_path / "data")
+    app = create_app(settings, clock=FixedClock(NOW))
+
+    with TestClient(app) as client:
+        response = client.get("/api/v1/settings", headers=_auth(app))
+
+    _validate(validator, response.json())
+    sections = {item["section"]: item for item in response.json()["data"]["sections"]}
+    assert set(sections) == {"scan", "risk"}
+    assert sections["risk"]["source"] == "default"
+    assert sections["risk"]["last_changed"] is None
+    assert sections["risk"]["keys"] == [
+        "per_trade_risk_pct",
+        "max_concurrent_positions",
+        "daily_loss_pct",
+        "max_leverage",
+        "max_notional_pct",
+        "max_slippage_bps",
+        "max_spread_bps",
+        "stale_mark_seconds",
+    ]

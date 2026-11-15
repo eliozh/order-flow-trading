@@ -161,27 +161,43 @@ def caps_from_settings(settings: Settings | None) -> RiskCaps:
     )
 
 
-def effective_caps(settings: Settings | None, store: StorePort) -> tuple[RiskCaps, str]:
-    """Return ``(caps, source)``; persisted fields override the config base (D1).
+def decode_persisted_caps(base: RiskCaps, raw: str, *, cross_field: bool = True) -> RiskCaps:
+    """Decode and validate one persisted ``risk_caps`` document over ``base``.
 
-    The merge is field by field: a partial operator row may tighten one cap and
-    must not silently reset the others to the hardcoded dataclass defaults.
+    This is the one fail-closed decode used by both the read path
+    (:func:`effective_caps`) and the settings write transaction, so the merge,
+    typing, and range rules cannot drift. ``cross_field=False`` keeps a legacy
+    document whose ``daily_loss_pct < per_trade_risk_pct`` readable so the
+    operator can repair it; the save path validates the proposed document with
+    the full cross-field rule. An unreadable, structurally invalid, or
+    range-invalid document raises :class:`RiskCapsError` and nothing is written.
     """
-    base = caps_from_settings(settings)
-    raw = store.get_system_state(RISK_CAPS_STATE_KEY)
-    if raw is None:
-        return base, "config"
     try:
         payload = json.loads(raw)
         if not isinstance(payload, dict):
             raise ValueError("persisted risk caps must be a JSON object")
         merged = apply_persisted_caps(base, payload)
-        errors = validate_caps(merged)
+        errors = validate_caps(merged, cross_field=cross_field)
         if errors:
             raise ValueError("persisted risk caps are invalid: " + "; ".join(errors))
     except (json.JSONDecodeError, TypeError, ValueError) as exc:
         raise RiskCapsError(str(exc)) from exc
-    return merged, "persisted"
+    return merged
+
+
+def effective_caps(settings: Settings | None, store: StorePort) -> tuple[RiskCaps, str]:
+    """Return ``(caps, source)``; persisted fields override the config base (D1).
+
+    The merge is field by field: a partial operator row may tighten one cap and
+    must not silently reset the others to the hardcoded dataclass defaults. The
+    cross-field rule is a write-time policy, so a legacy persisted document
+    that violates it still reads (and can be repaired).
+    """
+    base = caps_from_settings(settings)
+    raw = store.get_system_state(RISK_CAPS_STATE_KEY)
+    if raw is None:
+        return base, "config"
+    return decode_persisted_caps(base, raw, cross_field=False), "persisted"
 
 
 @dataclass(frozen=True)

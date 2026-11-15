@@ -1,38 +1,39 @@
 """``oft risk show|set|validate``: read and persist the percentage-based caps (D4).
 
-The caps are read from ``OFT_RISK_*`` defaults and overridden by the operator
-row in ``system_state.risk_caps``. Loosening any cap requires ``--confirm`` and
-always writes one hash-chained ``RISK_CAPS_UPDATED`` audit event.
+The caps, validation, loosening policy, and audit write all live in
+:class:`oft.application.settings_service.SettingsService`, the same service the
+Web/API path uses. Loosening any cap requires ``--confirm`` and always writes one
+hash-chained ``RISK_CAPS_UPDATED`` audit event.
 """
 
 from __future__ import annotations
 
 import json
-from dataclasses import replace
 from typing import Annotated, Any
 
 import typer
 
 from oft.api.envelope import new_request_id, success_envelope
-from oft.application.entry_service import RiskCapsError, effective_caps
+from oft.application.entry_service import RiskCapsError
+from oft.application.settings_service import SettingsService
 from oft.bootstrap import build_container
 from oft.cli.commands.doctor import emit_error, exit_code_for
 from oft.config import ConfigError, Settings, load_settings
-from oft.domain.risk import (
-    DEFAULT_CAPS,
-    RISK_CAPS_STATE_KEY,
-    RiskCaps,
-    caps_loosened,
-    validate_caps,
-)
-from oft.domain.time import utc_timestamp
-from oft.ports.store import AuditEventDraft
+from oft.domain.risk import validate_caps
+from oft.domain.settings import SettingSource, SettingValidationError
 
 risk_app = typer.Typer(
     help="Risk caps: show, tighten, or (with --confirm) loosen the paper limits.",
     no_args_is_help=True,
     add_completion=False,
 )
+
+# The service reports ``default``/``user``; the CLI's established vocabulary is
+# ``config``/``persisted``. The mapping keeps existing output and tests intact.
+_SOURCE_LABELS = {
+    SettingSource.DEFAULT: "config",
+    SettingSource.USER: "persisted",
+}
 
 
 def _load() -> tuple[Settings, Any]:
@@ -42,6 +43,14 @@ def _load() -> tuple[Settings, Any]:
         emit_error("CONFIG_INVALID", exc.message, json_output=False)
         raise typer.Exit(code=5) from exc
     return settings, build_container(settings, initialize=True)
+
+
+def _service(settings: Settings, container: Any) -> SettingsService:
+    return SettingsService(
+        store=container.store,
+        clock=container.clock,
+        settings=settings,
+    )
 
 
 def _emit(json_output: bool, data: dict[str, Any]) -> None:
@@ -71,18 +80,18 @@ def risk_show(
     """Show the effective caps, their source, and the documented defaults."""
     settings, container = _load()
     try:
-        caps, source = effective_caps(settings, container.store)
+        risk = _service(settings, container).read_risk_summary()
     except RiskCapsError as exc:
         emit_error(exc.code, exc.message, json_output=json_output)
         raise typer.Exit(code=exit_code_for(exc.code)) from exc
     _emit(
         json_output,
-        {"caps": caps.to_state(), "source": source, "defaults": DEFAULT_CAPS.to_state()},
+        {
+            "caps": risk.caps.to_state(),
+            "source": _SOURCE_LABELS[risk.source],
+            "defaults": risk.defaults.to_state(),
+        },
     )
-
-
-def _proposed_caps(current: RiskCaps, changes: dict[str, Any]) -> RiskCaps:
-    return replace(current, **{name: value for name, value in changes.items() if value is not None})
 
 
 @risk_app.command("set")
@@ -108,11 +117,6 @@ def risk_set(
 ) -> None:
     """Persist new caps in one transaction, with a ``RISK_CAPS_UPDATED`` audit."""
     settings, container = _load()
-    try:
-        current, _source = effective_caps(settings, container.store)
-    except RiskCapsError as exc:
-        emit_error(exc.code, exc.message, json_output=json_output)
-        raise typer.Exit(code=exit_code_for(exc.code)) from exc
     changes = {
         "per_trade_risk_pct": per_trade_pct,
         "max_concurrent_positions": max_concurrent_positions,
@@ -123,55 +127,39 @@ def risk_set(
         "max_spread_bps": max_spread_bps,
         "stale_mark_seconds": stale_mark_seconds,
     }
-    if all(value is None for value in changes.values()):
+    patch = {name: value for name, value in changes.items() if value is not None}
+    if not patch:
         emit_error(
             "VALIDATION_FAILED",
             "no risk cap was provided to set",
             json_output=json_output,
         )
         raise typer.Exit(code=exit_code_for("VALIDATION_FAILED"))
-    proposed = _proposed_caps(current, changes)
-    errors = validate_caps(proposed)
-    if errors:
+    try:
+        result = _service(settings, container).update_risk_caps(
+            patch,
+            actor="cli",
+            reason=reason or "",
+            confirm=confirm,
+        )
+    except SettingValidationError as exc:
         emit_error(
             "VALIDATION_FAILED",
-            "invalid risk caps: " + "; ".join(errors),
+            exc.message,
             json_output=json_output,
+            details=exc.details,
         )
-        raise typer.Exit(code=exit_code_for("VALIDATION_FAILED"))
-    loosened = caps_loosened(current, proposed)
-    if loosened and not confirm:
-        emit_error(
-            "VALIDATION_FAILED",
-            f"loosening {', '.join(loosened)} requires --confirm",
-            json_output=json_output,
-        )
-        raise typer.Exit(code=exit_code_for("VALIDATION_FAILED"))
-    now = utc_timestamp(container.clock.now())
-    audit = AuditEventDraft(
-        event_type="RISK_CAPS_UPDATED",
-        actor={"kind": "USER", "id": "cli"},
-        subject={"kind": "SYSTEM", "id": RISK_CAPS_STATE_KEY},
-        payload={
-            "before": current.to_state(),
-            "after": proposed.to_state(),
-            "loosened": list(loosened),
-            "reason": reason or ("loosening confirmed by operator" if loosened else ""),
-        },
-        created_at=now,
-    )
-    container.store.save_risk_caps(
-        value=json.dumps(proposed.to_state(), sort_keys=True),
-        updated_at=now,
-        audit=audit,
-    )
+        raise typer.Exit(code=exit_code_for("VALIDATION_FAILED")) from exc
+    except RiskCapsError as exc:
+        emit_error(exc.code, exc.message, json_output=json_output)
+        raise typer.Exit(code=exit_code_for(exc.code)) from exc
     _emit(
         json_output,
         {
-            "caps": proposed.to_state(),
-            "source": "persisted",
-            "defaults": DEFAULT_CAPS.to_state(),
-            "loosened": list(loosened),
+            "caps": result.after.to_state(),
+            "source": _SOURCE_LABELS[result.settings.source],
+            "defaults": result.settings.defaults.to_state(),
+            "loosened": list(result.loosened),
         },
     )
 
@@ -183,13 +171,16 @@ def risk_validate(
     """Check the effective caps' invariants; never places an order."""
     settings, container = _load()
     try:
-        caps, source = effective_caps(settings, container.store)
+        risk = _service(settings, container).read_risk_summary()
     except RiskCapsError as exc:
         emit_error(exc.code, exc.message, json_output=json_output)
         raise typer.Exit(code=exit_code_for(exc.code)) from exc
-    errors = list(validate_caps(caps))
+    source = _SOURCE_LABELS[risk.source]
+    # ``validate_caps`` owns every invariant, including the cross-field
+    # ``daily_loss_pct >= per_trade_risk_pct`` rule; there is no second copy.
+    errors = list(validate_caps(risk.caps))
     status = "PASS" if not errors else "FAIL"
-    data = {"status": status, "source": source, "caps": caps.to_state(), "errors": errors}
+    data = {"status": status, "source": source, "caps": risk.caps.to_state(), "errors": errors}
     if json_output:
         typer.echo(
             json.dumps(

@@ -137,6 +137,27 @@ class SqliteAuditMixin:
             connection.close()
         return _row_to_audit(row) if row is not None else None
 
+    def last_audit_event_of_type(self, event_type: str) -> AuditEventRecord | None:
+        """The newest event of one type via the v27 lookup index.
+
+        Schema v27 indexes ``audit_events(event_type, seq DESC)``, so SQLite
+        seeks straight to the newest matching row instead of walking the whole
+        ``seq`` chain backwards. With no matching event the seek still visits
+        only that type's index range. Metadata-only callers can use the
+        ``system_state`` row instead.
+        """
+        connection = self._connect_read_only()
+        if connection is None:
+            return None
+        try:
+            row = connection.execute(
+                "SELECT * FROM audit_events WHERE event_type = ? ORDER BY seq DESC LIMIT 1",
+                (event_type,),
+            ).fetchone()
+        finally:
+            connection.close()
+        return _row_to_audit(row) if row is not None else None
+
     def audit_store_initialized(self) -> bool:
         """Whether the DB exists and carries the append-only audit table (D7)."""
         connection = self._connect_read_only()

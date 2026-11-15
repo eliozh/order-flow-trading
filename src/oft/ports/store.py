@@ -1271,11 +1271,29 @@ class StorePort(Protocol):
 
     def last_audit_event(self) -> AuditEventRecord | None: ...
 
+    def last_audit_event_of_type(self, event_type: str) -> AuditEventRecord | None:
+        """The newest chained event of one type, or ``None``.
+
+        Schema v27 indexes ``audit_events(event_type, seq DESC)``, so this is a
+        bounded index seek even when no event of that type has ever been
+        written. Callers on hot metadata paths may still prefer
+        ``get_system_state_updated_at`` (which reads the ``system_state`` row).
+        """
+        ...
+
     def audit_store_initialized(self) -> bool:
         """Whether the database exists and carries the ``audit_events`` table (D7)."""
         ...
 
     def get_system_state(self, key: str) -> str | None: ...
+
+    def get_system_state_updated_at(self, key: str) -> str | None:
+        """The ``updated_at`` of one ``system_state`` row, or ``None``.
+
+        A single indexed primary-key lookup, used by metadata-only reads that
+        need a last-change timestamp without scanning the audit chain.
+        """
+        ...
 
     def set_system_state(self, key: str, value: str, *, updated_at: str) -> None: ...
 
@@ -1283,6 +1301,23 @@ class StorePort(Protocol):
         self, *, value: str, updated_at: str, audit: AuditEventDraft
     ) -> AuditEventRecord:
         """Persist the caps document and its ``RISK_CAPS_UPDATED`` audit atomically."""
+        ...
+
+    def save_risk_caps_change(
+        self,
+        build: Callable[[str | None], tuple[str, AuditEventDraft] | None],
+    ) -> tuple[str | None, AuditEventRecord | None]:
+        """Read-modify-write the ``system_state.risk_caps`` document atomically.
+
+        The store reads the current value inside one ``BEGIN IMMEDIATE``
+        transaction, calls the pure ``build`` callback with it, and upserts the
+        returned document plus its audit draft (or does nothing when ``build``
+        returns ``None``). ``before`` values derived inside the callback are
+        therefore accurate under concurrency, and a validation failure raised by
+        the callback rolls the transaction back with no partial write. Returns
+        the committed value (or the existing value when nothing was written) and
+        the committed audit record, if any.
+        """
         ...
 
     # -- Persisted runtime settings --------------------------------------

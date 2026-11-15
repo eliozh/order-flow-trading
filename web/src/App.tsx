@@ -17,6 +17,7 @@ import { ReportsPage } from './routes/reports'
 import { ScanDetailPage } from './routes/scan-detail'
 import { ScansPage } from './routes/scans'
 import { SettingsPage } from './routes/settings'
+import { SettingsRiskPage } from './routes/settings-risk'
 import { SettingsScanPage } from './routes/settings-scan'
 import { SymbolInspectorPage } from './routes/symbol-inspector'
 import { SystemPage } from './routes/system'
@@ -84,6 +85,8 @@ export default function App() {
               <WatchlistPage />
             ) : route.isSettingsScan ? (
               <SettingsScanPage />
+            ) : route.isSettingsRisk ? (
+              <SettingsRiskPage />
             ) : route.isSettings ? (
               <SettingsPage />
             ) : route.isSystem ? (
