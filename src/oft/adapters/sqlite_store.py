@@ -15,6 +15,7 @@ from pathlib import Path
 
 from oft.adapters.sqlite_audit import SqliteAuditMixin
 from oft.adapters.sqlite_backfill_store import BackfillStoreMixin
+from oft.adapters.sqlite_config_store import ConfigStoreMixin
 from oft.adapters.sqlite_connections import SqliteConnectionMixin
 from oft.adapters.sqlite_job_store import JobStoreMixin
 from oft.adapters.sqlite_llm_ledger import LLMStoreMixin
@@ -40,6 +41,7 @@ class SqliteStore(
     BackfillStoreMixin,
     JobStoreMixin,
     PromptStoreMixin,
+    ConfigStoreMixin,
     SqliteConnectionMixin,
     SqliteAuditMixin,
 ):

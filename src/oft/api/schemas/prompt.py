@@ -7,6 +7,7 @@ from typing import Any
 from pydantic import BaseModel, ConfigDict, Field, field_validator
 
 from oft.api.schemas.envelope import Envelope
+from oft.api.schemas.errors import ErrorEnvelope, catalog_responses
 from oft.domain.prompts import PromptKind, PromptRole, PromptStatus
 
 MAX_PROMPT_BODY_BYTES = 64 * 1024
@@ -109,23 +110,6 @@ class PromptDiffData(BaseModel):
     diff: str
 
 
-class ErrorBody(BaseModel):
-    code: str
-    message: str
-    category: str
-    http_status: int
-    retryable: bool
-    reference_id: str
-    details: list[dict[str, Any]] | None = None
-
-
-class ErrorEnvelope(BaseModel):
-    ok: bool
-    data: None
-    error: ErrorBody
-    meta: dict[str, Any]
-
-
 _CATALOG_ERRORS = {
     400: ("IDEMPOTENCY_KEY_REQUIRED", "A state-changing request omitted Idempotency-Key."),
     401: ("AUTH_REQUIRED", "The local API credential is missing or invalid."),
@@ -139,10 +123,7 @@ _CATALOG_ERRORS = {
     422: ("PROMPT_VALIDATION_FAILED", "The template body failed validation."),
 }
 
-ERROR_RESPONSES: dict[int | str, dict[str, Any]] = {
-    status: {"model": ErrorEnvelope, "description": description}
-    for status, (_code, description) in _CATALOG_ERRORS.items()
-}
+ERROR_RESPONSES: dict[int | str, dict[str, Any]] = catalog_responses(_CATALOG_ERRORS)
 
 
 def mutation_openapi() -> dict[str, Any]:

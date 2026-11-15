@@ -14,6 +14,8 @@ import { ReportDetailPage } from './routes/report-detail'
 import { ReportsPage } from './routes/reports'
 import { ScanDetailPage } from './routes/scan-detail'
 import { ScansPage } from './routes/scans'
+import { SettingsPage } from './routes/settings'
+import { SettingsScanPage } from './routes/settings-scan'
 import { SymbolInspectorPage } from './routes/symbol-inspector'
 import { SystemPage } from './routes/system'
 import { TriggerDetailPage } from './routes/trigger-detail'
@@ -69,6 +71,10 @@ export default function App() {
             <PaperPage />
           ) : route.isWatchlist ? (
             <WatchlistPage />
+          ) : route.isSettingsScan ? (
+            <SettingsScanPage />
+          ) : route.isSettings ? (
+            <SettingsPage />
           ) : route.isSystem ? (
             <SystemPage />
           ) : (

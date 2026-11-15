@@ -282,21 +282,17 @@ def scan_show(
 
 def _emit_schedule(settings: Any, json_output: bool) -> None:
     """Show the UTC next/last run state without requiring a daemon."""
-    from oft.application.scheduler import resolve_schedule_settings
     from oft.bootstrap import build_container
     from oft.domain.time import utc_timestamp
 
-    try:
-        resolve_schedule_settings()
-    except ValueError as exc:
-        emit_error("CONFIG_INVALID", str(exc), json_output=json_output)
-        raise typer.Exit(code=5) from exc
-
+    # The persisted period is resolved before any environment validation is
+    # attempted, so a stale ``OFT_SCAN_PERIOD`` cannot fail a valid saved value.
     container = build_container(settings)
     from oft.cli.commands.daemon import _schedule_state
 
-    state = _schedule_state(settings)
+    state = _schedule_state(settings, container=container, json_output=json_output)
     now = container.clock.now()
+    state = state.promote(now)
     last = next(
         (run for run in container.store.list_job_runs("scan") if run.trigger_source == "SCHEDULED"),
         None,

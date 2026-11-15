@@ -30,9 +30,10 @@ from oft.application.scheduler import (
     PositionMonitorDaemonScheduler,
     ScanDaemonScheduler,
     ScheduleState,
+    SettingsPeriodSync,
+    SettingsSyncDaemonScheduler,
     TriggerDaemonScheduler,
     align_to_boundary,
-    resolve_schedule_settings,
 )
 from oft.cli.commands.doctor import emit_error
 from oft.config import ConfigError, Settings, load_settings
@@ -133,46 +134,79 @@ def schedule_state_path(settings: Settings) -> Path:
     return settings.data_dir / "run" / "schedule.json"
 
 
-def _schedule_state(settings: Settings | None = None) -> ScheduleState:
+def _schedule_state(
+    settings: Settings | None = None,
+    *,
+    container: Any | None = None,
+    now: datetime | None = None,
+    json_output: bool = False,
+) -> ScheduleState:
+    """The persisted ``schedule.json`` state with the saved period overlaid.
+
+    The persisted row is resolved before the environment period is validated
+    (M3) and a due pending change is promoted before the value is used (M1), so
+    ``daemon status`` / ``scan status`` never show a change that already applied
+    or fail because ``OFT_SCAN_PERIOD`` is stale. A corrupt persisted row, an
+    invalid environment period, or an invalid jitter is surfaced as
+    ``CONFIG_INVALID`` (exit 5) instead of a traceback.
+
+    ``json_output`` keeps a config error in the standard JSON envelope for
+    ``daemon status --json`` / ``scan status --json``.
+    """
     try:
-        config = resolve_schedule_settings()
-    except ValueError as exc:
-        emit_error("CONFIG_INVALID", str(exc), json_output=False)
+        if settings is None:
+            from oft.application.scheduler import resolve_schedule_settings
+
+            config = resolve_schedule_settings()
+            return ScheduleState(period=config.period, jitter_seconds_max=config.jitter_seconds)
+        resolved = container
+        if resolved is None:
+            from oft.bootstrap import build_container
+
+            resolved = build_container(settings)
+        from oft.application.settings_service import resolve_schedule_state_overlay
+
+        return resolve_schedule_state_overlay(
+            settings=settings,
+            store=resolved.store,
+            clock=resolved.clock,
+            now=now,
+        )
+    except (ConfigError, ValueError) as exc:
+        message = exc.message if isinstance(exc, ConfigError) else str(exc)
+        emit_error("CONFIG_INVALID", message, json_output=json_output)
         raise typer.Exit(code=5) from exc
-    default = ScheduleState(period=config.period, jitter_seconds_max=config.jitter_seconds)
-    if settings is None:
-        return default
-    from oft.application.scheduler import load_schedule_state
-
-    return load_schedule_state(schedule_state_path(settings), default=default)
 
 
-def _last_scheduled_run(settings: Settings) -> Any:
+def _last_scheduled_run(settings: Settings, *, container: Any | None = None) -> Any:
     from oft.bootstrap import build_container
 
-    container = build_container(settings)
-    for run in container.store.list_job_runs("scan"):
+    resolved = container or build_container(settings)
+    for run in resolved.store.list_job_runs("scan"):
         if run.trigger_source == "SCHEDULED":
             return run
     return None
 
 
-def _latest_job_payloads(settings: Settings) -> dict[str, Any]:
+def _latest_job_payloads(settings: Settings, *, container: Any | None = None) -> dict[str, Any]:
     """The aggregated latest-window status of the slice-26 jobs."""
     from oft.bootstrap import build_container
 
-    return latest_jobs_payload(build_container(settings).store)
+    resolved = container or build_container(settings)
+    return latest_jobs_payload(resolved.store)
 
 
-def _status_payload(settings: Settings, state: ScheduleState) -> dict[str, Any]:
+def _status_payload(
+    settings: Settings, state: ScheduleState, *, container: Any | None = None
+) -> dict[str, Any]:
     from oft.clock import SystemClock
 
     pid = read_pid(settings)
     running = pid is not None and process_alive(pid)
     now = SystemClock().now()
-    last = _last_scheduled_run(settings)
+    last = _last_scheduled_run(settings, container=container)
     schedule = state.next_run_payload(now)
-    latest_jobs = _latest_job_payloads(settings)
+    latest_jobs = _latest_job_payloads(settings, container=container)
     return {
         "state": "RUNNING" if running else "OFFLINE",
         "pid": pid if running else None,
@@ -231,12 +265,14 @@ def daemon_start(
             json_output=False,
         )
         raise typer.Exit(code=1)
-    state = _schedule_state(settings)
     from oft.bootstrap import build_container
 
     container = build_container(settings, initialize=True)
+    # Positional call only: tests replace this seam with a one-argument lambda.
+    state = _schedule_state(settings)
     _run_live_ingestion(settings, replay_file, symbols, container=container)
     scheduler = _start_scheduler(settings, state, container=container)
+    settings_sync = _start_settings_sync_scheduler(container=container, scan_scheduler=scheduler)
     trigger_scheduler = _start_trigger_scheduler(settings, container=container)
     monitor_scheduler = _start_position_monitor_scheduler(settings, container=container)
     management_scheduler = _start_management_scheduler(
@@ -248,6 +284,7 @@ def daemon_start(
         management_scheduler.shutdown()
         monitor_scheduler.shutdown()
         trigger_scheduler.shutdown()
+        settings_sync.shutdown()
         scheduler.shutdown()
         pid_path(settings).unlink(missing_ok=True)
 
@@ -289,6 +326,44 @@ def _start_scheduler(
     write_pid(settings)
     if settings.env != "test":
         _catch_up_on_start(resolved, state)
+    scheduler.start()
+    return scheduler
+
+
+def _run_settings_sync(sync: Any) -> bool:
+    """Run one settings sync tick without letting a config error kill it.
+
+    A corrupt persisted row (``ConfigError``) or an incompatible jitter/period
+    (``ValueError``) must never stop the interval scheduler; the API and CLI
+    surface ``CONFIG_INVALID`` directly. Returns whether the schedule changed.
+    """
+    try:
+        return bool(sync.sync())
+    except (ConfigError, ValueError) as exc:
+        _LOGGER.warning("scan_period_sync_failed", error=str(exc))
+        return False
+
+
+def _start_settings_sync_scheduler(
+    *,
+    container: Any,
+    scan_scheduler: ScanDaemonScheduler,
+) -> SettingsSyncDaemonScheduler:
+    """Apply a saved ``scan.period`` at the next boundary without a restart.
+
+    Every ~15 s the persisted value is compared with the active/pending period;
+    only a real difference requests a change, so the running window is never
+    rewritten by the sync itself.
+    """
+    from oft.application.settings_service import SettingsService
+
+    service = SettingsService(store=container.store, clock=container.clock)
+    sync = SettingsPeriodSync(
+        scheduler=scan_scheduler,
+        period_provider=service.persisted_scan_period,
+    )
+
+    scheduler = SettingsSyncDaemonScheduler(job=lambda: _run_settings_sync(sync))
     scheduler.start()
     return scheduler
 
@@ -579,8 +654,11 @@ def daemon_status(
 ) -> None:
     """Show PID state plus the next and last UTC scan windows."""
     settings = _settings_or_exit(json_output)
-    state = _schedule_state(settings)
-    payload = _status_payload(settings, state)
+    from oft.bootstrap import build_container
+
+    container = build_container(settings)
+    state = _schedule_state(settings, container=container, json_output=json_output)
+    payload = _status_payload(settings, state, container=container)
     if json_output:
         typer.echo(
             json.dumps(
@@ -644,4 +722,5 @@ __all__ = [
     "pid_path",
     "process_alive",
     "read_pid",
+    "_run_settings_sync",
 ]

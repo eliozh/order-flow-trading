@@ -17,6 +17,8 @@ export interface RouteMatch {
   isPaper: boolean
   isJournal: boolean
   journalTradeId: string | null
+  isSettings: boolean
+  isSettingsScan: boolean
 }
 
 function decodeSegment(segment: string): string {
@@ -71,5 +73,9 @@ export function resolveRoute(pathname: string): RouteMatch {
     // deeper path falls through to not-found.
     isJournal: path === '/journal' || journalMatch !== null,
     journalTradeId: journalMatch !== null ? decodeSegment(journalMatch[1]) : null,
+    // Only the shell and the scan section exist in this slice; any deeper
+    // settings path falls through to not-found until its slice lands.
+    isSettings: path === '/settings',
+    isSettingsScan: path === '/settings/scan',
   }
 }
