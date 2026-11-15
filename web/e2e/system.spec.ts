@@ -204,7 +204,7 @@ test('at 375px the shell is read-only and has no page-level horizontal scroll', 
 
   const systemPage = page.locator('section.system-page')
   await expect(systemPage).toHaveAttribute('data-readonly', 'true')
-  await expect(page.getByRole('note')).toContainText('Read-only at this width')
+  await expect(systemPage.getByRole('note')).toContainText('Read-only at this width')
 
   // The environment chip stays visible and in the accessibility tree at 375px.
   const readiness = await fetchReadiness(page)

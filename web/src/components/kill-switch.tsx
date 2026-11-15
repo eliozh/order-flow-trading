@@ -183,7 +183,7 @@ export function KillSwitchBar({
       }}
     >
       <span id="kill-switch-heading" className="visually-hidden" tabIndex={-1}>
-        Kill switch
+        <span lang="en">Kill switch</span>
       </span>
       <span className={chipClass} aria-live="assertive" aria-atomic="true">
         {unknown ? (
@@ -200,7 +200,7 @@ export function KillSwitchBar({
 
       {probeError !== null && (
         <span role="alert" className="value-down">
-          Kill switch 状态不可用：{probeError}
+          <span lang="en">Kill switch</span> 状态不可用：{probeError}
         </span>
       )}
       {actionError !== null && !open && (
@@ -218,7 +218,7 @@ export function KillSwitchBar({
           disabled={acting}
           onClick={openResumeDialog}
         >
-          Kill switch 开启，可停止新订单
+          <span lang="en">Kill switch</span> 开启，可停止新订单
         </button>
       ) : (
         <button
@@ -231,7 +231,7 @@ export function KillSwitchBar({
             void activate()
           }}
         >
-          启用 Kill switch（立即停止新订单）
+          启用 <span lang="en">Kill switch</span>（立即停止新订单）
         </button>
       )}
 

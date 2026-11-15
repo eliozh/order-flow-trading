@@ -289,6 +289,21 @@ code {
   min-height: 28px;
 }
 
+/* Global pause control. It is rendered after the kill switch in the shell
+   chrome, so the first three tab stops are the skip links and the kill switch
+   (DESIGN A2.2 / A12 #7). */
+.pause-bar {
+  display: flex;
+  align-items: center;
+  justify-content: flex-end;
+  gap: var(--oft-space-3);
+  flex: none;
+  min-height: 40px;
+  padding: 4px var(--oft-space-4);
+  border-bottom: 1px solid var(--oft-border-default);
+  background: var(--oft-bg-panel);
+}
+
 /* The kill-switch bar stays above an open dialog overlay so the focused stop
    control and its focus ring remain visible (DESIGN A2.4/A6). The dialog still
    paints above all page content. */
@@ -602,6 +617,14 @@ code {
   .statusbar .sb-sep,
   .statusbar .sb-brand {
     display: none;
+  }
+
+  .pause-bar {
+    padding: 4px 8px;
+  }
+
+  .pause-bar .sb-pause {
+    min-height: 44px;
   }
 
   .app-main {
