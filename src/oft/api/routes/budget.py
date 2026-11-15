@@ -1,21 +1,32 @@
-"""Budget threshold and usage routes (D9; no Web settings screen this slice)."""
+"""Budget threshold and usage routes (D9; F10e usage over the same service)."""
 
 from __future__ import annotations
 
-from typing import Any
+from typing import Any, cast
 
-from fastapi import APIRouter, Query, Request
+import structlog
+from fastapi import APIRouter, Header, Query, Request
+from fastapi.responses import JSONResponse
 from pydantic import BaseModel, ConfigDict
 
 from oft.api.envelope import new_request_id, success_envelope
 from oft.api.errors import ApiError
+from oft.api.idempotency import idempotent_mutation
+from oft.api.schemas.settings import ERROR_RESPONSES
+from oft.application.budget_read_model import BUDGET_READ_ERRORS, BudgetThresholds
 from oft.application.budget_service import BudgetConfigError, BudgetService
 from oft.domain.time import utc_timestamp
+
+LOGGER = structlog.get_logger(__name__)
 
 router = APIRouter()
 
 _PERIODS = ("day", "week", "month")
-_RANK = {"OK": 0, "WARN": 1, "EXCEEDED": 2}
+
+# A ledger/config read that fails in one of these ways degrades the usage
+# display (N/A) instead of failing the whole budget read: the thresholds stay
+# visible and editable while the operator recovers the ledger.
+_USAGE_READ_ERRORS = BUDGET_READ_ERRORS
 
 
 class BudgetUpdateRequest(BaseModel):
@@ -32,41 +43,86 @@ def _service(request: Request) -> BudgetService:
     return BudgetService(store=container.store, settings=container.settings)
 
 
-@router.get("/api/v1/budget")
+def _degraded_snapshot(thresholds: BudgetThresholds) -> dict[str, object]:
+    """Thresholds stay readable; usage is explicitly unavailable, never zero."""
+    return {
+        "thresholds": thresholds.to_contract(),
+        "usage_quality": "UNAVAILABLE",
+        "budget_state": None,
+        "periods": None,
+        "projected_month_end_usd": None,
+        "projection_basis": None,
+        "last_alert": None,
+    }
+
+
+def _snapshot(service: BudgetService, at: str, thresholds: BudgetThresholds) -> dict[str, Any]:
+    try:
+        return service.snapshot(at, thresholds=thresholds)
+    except _USAGE_READ_ERRORS as exc:
+        LOGGER.warning("budget_usage_unavailable", error=str(exc))
+        return _degraded_snapshot(thresholds)
+
+
+def _envelope_quality(data: dict[str, Any]) -> str:
+    """Map the payload's usage quality onto the shared envelope enum.
+
+    ``UNAVAILABLE`` usage is a missing required input, which the envelope
+    contract spells ``MISSING`` (the payload keeps its own ``usage_quality``).
+    """
+    return "COMPLETE" if data.get("usage_quality") == "COMPLETE" else "MISSING"
+
+
+@router.get("/api/v1/budget", responses=ERROR_RESPONSES)
 def show_budget(request: Request) -> dict[str, Any]:
-    """Thresholds plus the current day/week/month state (never a hard stop)."""
+    """Thresholds plus the current day/week/month usage (never a hard stop).
+
+    A ledger read failure degrades only the usage block: ``thresholds`` is
+    always returned, ``usage_quality`` becomes ``UNAVAILABLE``, and the usage
+    fields are ``null``. If the thresholds themselves cannot be read, the whole
+    read fails with 503 so the client can offer a retry.
+    """
     container = request.app.state.container
     service = _service(request)
     at = utc_timestamp(container.clock.now())
-    windows = {period: service.usage(period, at=at) for period in _PERIODS}
-    state = max(
-        (window["budget_state"] for window in windows.values()),
-        key=lambda value: _RANK[str(value)],
-    )
+    try:
+        thresholds = service.thresholds()
+    except _USAGE_READ_ERRORS as exc:
+        LOGGER.warning("budget_thresholds_unavailable", error=str(exc))
+        raise ApiError("STORAGE_UNAVAILABLE") from exc
+    data = _snapshot(service, at, thresholds)
     return success_envelope(
-        {
-            "thresholds": service.thresholds().to_contract(),
-            "budget_state": state,
-            "periods": {
-                period: {
-                    "period_key": window["period_key"],
-                    "spend_usd": window["spend_usd"],
-                    "call_count": window["call_count"],
-                    "unpriced_count": window["unpriced_count"],
-                    "budget_state": window["budget_state"],
-                }
-                for period, window in windows.items()
-            },
-        },
+        data,
         request_id=new_request_id(),
         provenance="CALC",
-        data_quality="COMPLETE",
+        data_quality=_envelope_quality(data),
     )
 
 
-@router.put("/api/v1/budget")
-def update_budget(payload: BudgetUpdateRequest, request: Request) -> dict[str, Any]:
-    """Persist operator thresholds and record the before/after audit event."""
+@router.put(
+    "/api/v1/budget",
+    response_model=None,
+    responses=ERROR_RESPONSES,
+)
+def update_budget(
+    payload: BudgetUpdateRequest,
+    request: Request,
+    idempotency_key: str | None = Header(
+        default=None,
+        alias="Idempotency-Key",
+        description=(
+            "Optional; when present the mutation is replayed for the same key "
+            "and a different payload with that key is a 409."
+        ),
+        max_length=200,
+    ),
+) -> dict[str, Any] | JSONResponse:
+    """Persist operator thresholds, auditing only a real change (alert-only).
+
+    ``Idempotency-Key`` is optional: without one the mutation runs once and
+    returns the same envelope; with one, a replay returns the stored response
+    and a different payload for the same key is a 409.
+    """
     if (
         payload.daily_usd is None
         and payload.weekly_usd is None
@@ -74,22 +130,43 @@ def update_budget(payload: BudgetUpdateRequest, request: Request) -> dict[str, A
         and payload.warn_pct is None
     ):
         raise ApiError("VALIDATION_FAILED", "provide at least one budget threshold")
-    container = request.app.state.container
-    try:
-        thresholds = _service(request).set_thresholds(
-            daily_usd=payload.daily_usd,
-            weekly_usd=payload.weekly_usd,
-            monthly_usd=payload.monthly_usd,
-            warn_pct=payload.warn_pct,
-            updated_at=utc_timestamp(container.clock.now()),
+
+    def mutate() -> dict[str, Any]:
+        container = request.app.state.container
+        service = _service(request)
+        at = utc_timestamp(container.clock.now())
+        try:
+            thresholds, changed = service.update_thresholds(
+                daily_usd=payload.daily_usd,
+                weekly_usd=payload.weekly_usd,
+                monthly_usd=payload.monthly_usd,
+                warn_pct=payload.warn_pct,
+                updated_at=at,
+                actor="web",
+            )
+        except BudgetConfigError as exc:
+            raise ApiError("VALIDATION_FAILED", exc.message, details=exc.details) from exc
+        return {**_snapshot(service, at, thresholds), "changed": changed}
+
+    presented = (idempotency_key or "").strip()
+    if not presented:
+        data = mutate()
+        return success_envelope(
+            data,
+            request_id=new_request_id(),
+            provenance="CALC",
+            data_quality=_envelope_quality(data),
         )
-    except BudgetConfigError as exc:
-        raise ApiError("VALIDATION_FAILED", exc.message) from exc
-    return success_envelope(
-        {"thresholds": thresholds.to_contract()},
-        request_id=new_request_id(),
-        provenance="CALC",
-        data_quality="COMPLETE",
+    return cast(
+        dict[str, Any] | JSONResponse,
+        idempotent_mutation(
+            request,
+            presented_key=presented,
+            payload=payload,
+            status=200,
+            mutate=mutate,
+            data_quality=_envelope_quality,
+        ),
     )
 
 

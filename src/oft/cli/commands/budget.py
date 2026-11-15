@@ -20,9 +20,6 @@ budget_app = typer.Typer(
     add_completion=False,
 )
 
-_PERIODS = ("day", "week", "month")
-_RANK = {"OK": 0, "WARN": 1, "EXCEEDED": 2}
-
 
 def _settings_or_exit(json_output: bool) -> Any:
     try:
@@ -47,37 +44,32 @@ def _emit_json(data: dict[str, Any]) -> None:
 
 
 def _show_payload(service: BudgetService, at: str) -> dict[str, Any]:
-    windows = {period: service.usage(period, at=at) for period in _PERIODS}
-    state = max(
-        (window["budget_state"] for window in windows.values()),
-        key=lambda value: _RANK[str(value)],
-    )
-    return {
-        "thresholds": service.thresholds().to_contract(),
-        "budget_state": state,
-        "periods": {
-            period: {
-                "period_key": window["period_key"],
-                "spend_usd": window["spend_usd"],
-                "call_count": window["call_count"],
-                "unpriced_count": window["unpriced_count"],
-                "budget_state": window["budget_state"],
-            }
-            for period, window in windows.items()
-        },
-    }
+    return service.snapshot(at)
 
 
 def _render_show(payload: dict[str, Any]) -> str:
     thresholds = payload["thresholds"]
+    projection = payload["projection_basis"]
     lines = [
         f"Budget state      {payload['budget_state']}",
         f"Daily threshold   {thresholds['daily_usd']} USD (warn {thresholds['warn_pct']}%)",
         f"Weekly threshold  {thresholds['weekly_usd']} USD",
         f"Monthly threshold {thresholds['monthly_usd']} USD",
-        "",
-        f"{'PERIOD':<10}{'KEY':<14}{'SPEND USD':<16}{'CALLS':<8}{'UNPRICED':<10}STATE",
+        f"Projected month-end {payload['projected_month_end_usd']} USD "
+        f"(spend {projection['month_spend_usd']} USD, elapsed fraction "
+        f"{projection['elapsed_fraction']:.6f} as of {projection['as_of']})",
     ]
+    last_alert = payload["last_alert"]
+    if last_alert is None:
+        lines.append("Last alert        none")
+    else:
+        lines.append(
+            f"Last alert        {last_alert['occurred_at']} {last_alert['period']} "
+            f"{last_alert['state']} {last_alert['spend_usd']}/{last_alert['threshold_usd']} "
+            f"USD ({last_alert['provider']} {last_alert['model']})"
+        )
+    lines.append("")
+    lines.append(f"{'PERIOD':<10}{'KEY':<14}{'SPEND USD':<16}{'CALLS':<8}{'UNPRICED':<10}STATE")
     for period, window in payload["periods"].items():
         lines.append(
             f"{period:<10}{window['period_key']:<14}{window['spend_usd']:<16}"

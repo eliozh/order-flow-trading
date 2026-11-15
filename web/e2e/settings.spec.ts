@@ -1369,6 +1369,15 @@ function activeTestIdIs(page: Page, testId: string): Promise<boolean> {
   )
 }
 
+function activeTextIs(page: Page, text: string): Promise<boolean> {
+  return page.evaluate(
+    (target) =>
+      document.activeElement instanceof HTMLElement &&
+      (document.activeElement.textContent ?? '').trim() === target,
+    text,
+  )
+}
+
 test('LLM key add, reload, rotate, and delete stay write-only through the UI', async ({ page }) => {
   test.setTimeout(90_000)
   const diagnostics = collectDiagnostics(page)
@@ -2511,6 +2520,716 @@ test('prompt screens are read-only at 375 and the editor is keyboard savable at 
     await touchContext.close()
   }
 
+  expectClean(diagnostics)
+  expectClean(touchDiagnostics)
+})
+
+// -- Slice 37: budget thresholds and usage (F10e) ---------------------------
+
+const BUDGET_HEADING = { name: 'LLM 预算阈值', level: 1 } as const
+
+interface BudgetRowPayload {
+  period_key: string
+  spend_usd: string
+  call_count: number
+  unpriced_count: number
+  budget_state: string
+}
+
+interface BudgetDataPayload {
+  thresholds: Record<string, string | number>
+  budget_state: string
+  periods: Record<'day' | 'week' | 'month', BudgetRowPayload>
+  projected_month_end_usd: string
+  projection_basis: { month_spend_usd: string; elapsed_fraction: number; as_of: string }
+  last_alert: Record<string, string> | null
+}
+
+interface BudgetAuditEvent {
+  actorId: string | null
+  before: Record<string, unknown>
+  after: Record<string, unknown>
+}
+
+/** Delete the persisted budget row so the journey starts from env defaults. */
+function resetBudgetSettings(): void {
+  if (!DATA_DIR) {
+    throw new Error('OFT_E2E_SETTINGS_DATA_DIR is required for the settings journey')
+  }
+  const script = [
+    'import os, sqlite3',
+    'database = os.path.join(os.environ["OFT_DATA_DIR"], "oft.db")',
+    'connection = sqlite3.connect(database)',
+    'connection.execute("DELETE FROM budget_settings WHERE id = \'default\'")',
+    'connection.commit()',
+    'connection.close()',
+    'print("reset")',
+  ].join('\n')
+  execFileSync('python3', ['-c', script], {
+    cwd: ROOT,
+    env: { ...process.env, OFT_DATA_DIR: DATA_DIR },
+    encoding: 'utf8',
+  })
+}
+
+/** Read the persisted BUDGET_THRESHOLDS_UPDATED chain (oldest first). */
+function budgetAuditEvents(): BudgetAuditEvent[] {
+  if (!DATA_DIR) {
+    throw new Error('OFT_E2E_SETTINGS_DATA_DIR is required for the settings journey')
+  }
+  const script = [
+    'import json, os, sqlite3',
+    'database = os.path.join(os.environ["OFT_DATA_DIR"], "oft.db")',
+    'connection = sqlite3.connect(database)',
+    'rows = connection.execute("SELECT payload_json FROM audit_events WHERE event_type = \'BUDGET_THRESHOLDS_UPDATED\' ORDER BY seq ASC").fetchall()',
+    'connection.close()',
+    'events = []',
+    'for (raw,) in rows:',
+    '    body = json.loads(raw)',
+    '    payload = body.get("payload", {})',
+    '    events.append({"actorId": (body.get("actor") or {}).get("id"), "before": payload.get("before", {}), "after": payload.get("after", {})})',
+    'print(json.dumps(events))',
+  ].join('\n')
+  const output = execFileSync('python3', ['-c', script], {
+    cwd: ROOT,
+    env: { ...process.env, OFT_DATA_DIR: DATA_DIR },
+    encoding: 'utf8',
+  })
+  return JSON.parse(output.trim()) as BudgetAuditEvent[]
+}
+
+async function readBudget(page: Page): Promise<BudgetDataPayload> {
+  const response = await page.request.get('/api/v1/budget', {
+    headers: { Accept: 'application/json' },
+  })
+  expect(response.status(), 'GET /api/v1/budget').toBe(200)
+  const body = (await response.json()) as Envelope<BudgetDataPayload>
+  expect(body.ok).toBe(true)
+  expect(body.data).not.toBeNull()
+  return body.data as BudgetDataPayload
+}
+
+/** One authenticated, same-origin, CSRF-bearing budget mutation. */
+async function putBudget(page: Page, payload: Record<string, unknown>, idempotencyKey: string) {
+  const csrf = await csrfToken(page)
+  return page.request.put('/api/v1/budget', {
+    headers: {
+      Accept: 'application/json',
+      'Content-Type': 'application/json',
+      'Idempotency-Key': idempotencyKey,
+      'X-CSRF-Token': csrf,
+      Origin: ORIGIN,
+    },
+    data: payload,
+  })
+}
+
+/** The CLI view of the same SQLite data, from the repository root. */
+function cliBudgetShow(): BudgetDataPayload {
+  if (!DATA_DIR) {
+    throw new Error('OFT_E2E_SETTINGS_DATA_DIR is required for the settings journey')
+  }
+  const output = execFileSync('uv', ['run', 'oft', 'budget', 'show', '--json'], {
+    cwd: ROOT,
+    env: { ...process.env, OFT_DATA_DIR: DATA_DIR, OFT_ENV: 'test' },
+    encoding: 'utf8',
+  })
+  return (JSON.parse(output) as { data: BudgetDataPayload }).data
+}
+
+test('budget thresholds save once with a web audit, reject ordering, and agree with the CLI', async ({
+  page,
+}) => {
+  test.setTimeout(120_000)
+  const diagnostics = collectDiagnostics(page)
+  await page.setViewportSize({ width: 1440, height: 900 })
+  resetBudgetSettings()
+  await authenticate(page)
+  await page.goto('/settings/budget')
+  await expect(page.getByRole('heading', BUDGET_HEADING)).toBeVisible()
+  await expect(page.getByRole('textbox', { name: 'Daily USD' })).toHaveValue('10.00')
+  await expect(page.getByRole('textbox', { name: 'Weekly USD' })).toHaveValue('50.00')
+  await expect(page.getByRole('textbox', { name: 'Monthly USD' })).toHaveValue('150.00')
+  await expect(page.getByRole('textbox', { name: '警告阈值 %' })).toHaveValue('80')
+
+  // Three spend meters with an explicit value text, plus projection/unpriced/alert.
+  await expect(page.locator('[role="meter"]')).toHaveCount(3)
+  for (const period of ['day', 'week', 'month'] as const) {
+    const meter = page.getByTestId(`budget-meter-${period}`)
+    await expect(meter).toHaveAttribute('role', 'meter')
+    await expect(meter).toHaveAttribute(
+      'aria-valuetext',
+      /状态 (OK|WARN|EXCEEDED)；调用 \d+ 次；unpriced \d+ 次/,
+    )
+  }
+  await expect(page.getByTestId('budget-projection')).toHaveText(/^\$\d+\.\d+$/)
+  await expect(page.getByTestId('budget-unpriced-count')).toHaveText(/^\d+$/)
+  await expect(page.getByTestId('budget-last-alert')).toBeVisible()
+  await expect(page.getByTestId('budget-last-alert')).toContainText('尚无阈值告警')
+
+  // Alert-only contract: thresholds never stop calls and do not promise Telegram.
+  const usagePanel = page.getByTestId('budget-usage')
+  await expect(usagePanel).toContainText('绝不停止或阻断调用')
+  await expect(usagePanel).toContainText('不会通过 Telegram 投递')
+
+  const beforeAudits = budgetAuditEvents().length
+  await page.getByRole('textbox', { name: 'Daily USD' }).fill('12.00')
+  await page.getByRole('textbox', { name: 'Weekly USD' }).fill('60.00')
+  await page.getByRole('textbox', { name: 'Monthly USD' }).fill('180.00')
+  await page.getByRole('textbox', { name: '警告阈值 %' }).fill('75')
+  await page.getByRole('button', { name: '保存阈值' }).click()
+
+  await expect(page.getByTestId('settings-budget-save-visible')).toContainText('audit 已写入')
+  await expect(page.getByTestId('settings-budget-save-visible')).toContainText(
+    '绝不停止或阻断调用',
+  )
+  await expect(page.getByTestId('settings-budget-save-visible')).toContainText(
+    '不会通过 Telegram 投递',
+  )
+  // A successful save settles focus back on the save button.
+  await expect(page.getByRole('button', { name: '保存阈值' })).toBeFocused()
+  const events = budgetAuditEvents()
+  expect(events.length, 'exactly one new budget audit').toBe(beforeAudits + 1)
+  const saved = events[events.length - 1]
+  expect(saved.actorId).toBe('web')
+  expect(saved.before.daily_usd).toBe('10.00')
+  expect(saved.after.daily_usd).toBe('12.00')
+  expect(saved.after.warn_pct).toBe(75)
+
+  await page.reload()
+  await expect(page.getByRole('textbox', { name: 'Daily USD' })).toHaveValue('12.00')
+  await expect(page.getByRole('textbox', { name: '警告阈值 %' })).toHaveValue('75')
+
+  const beforeInvalid = budgetAuditEvents().length
+  const daily = page.getByRole('textbox', { name: 'Daily USD' })
+  const weekly = page.getByRole('textbox', { name: 'Weekly USD' })
+  const monthly = page.getByRole('textbox', { name: 'Monthly USD' })
+  const warn = page.getByRole('textbox', { name: '警告阈值 %' })
+  const save = page.getByRole('button', { name: '保存阈值' })
+  const summary = page.getByTestId('settings-budget-error')
+
+  // daily > weekly: focused summary, field links, aria wiring, and no audit.
+  await weekly.fill('5.00')
+  await save.click()
+  await expect(summary).toHaveAttribute('role', 'alert')
+  await expect(summary).toBeFocused()
+  await expect(summary).toContainText('无法保存')
+  await expect(weekly).toHaveAttribute('aria-invalid', 'true')
+  await expect(weekly).toHaveAttribute('aria-describedby', /budget-weekly-error/)
+  await expect(page.getByText('Weekly 必须 ≥ Daily')).toBeVisible()
+  await summary.getByRole('link', { name: '转到Weekly USD' }).click()
+  await expect(weekly).toBeFocused()
+  await weekly.fill('60.00')
+
+  // blank and non-positive values are blocked inline, focused summary included.
+  await daily.fill('')
+  await save.click()
+  await expect(summary).toBeFocused()
+  await expect(daily).toHaveAttribute('aria-invalid', 'true')
+  await expect(daily).toHaveAttribute('aria-describedby', /budget-daily-error/)
+  await expect(page.getByText('Daily USD 必填')).toBeVisible()
+  await summary.getByRole('link', { name: '转到Daily USD' }).click()
+  await expect(daily).toBeFocused()
+
+  await daily.fill('12.00')
+  await weekly.fill('0')
+  await save.click()
+  await expect(summary).toBeFocused()
+  await expect(weekly).toHaveAttribute('aria-invalid', 'true')
+  await expect(page.getByText('Weekly USD 必须大于 0')).toBeVisible()
+  await weekly.fill('60.00')
+
+  // warn outside 1–100 is blocked inline.
+  for (const invalidWarn of ['0', '101']) {
+    await warn.fill(invalidWarn)
+    await save.click()
+    await expect(summary).toBeFocused()
+    await expect(warn).toHaveAttribute('aria-invalid', 'true')
+    await expect(warn).toHaveAttribute('aria-describedby', /budget-warn-error/)
+    await expect(page.getByText('警告阈值必须在 1–100 之间')).toBeVisible()
+  }
+  await warn.fill('75')
+
+  // weekly > monthly is also rejected as an ordering violation.
+  await weekly.fill('200.00')
+  await save.click()
+  await expect(summary).toBeFocused()
+  await expect(monthly).toHaveAttribute('aria-invalid', 'true')
+  await expect(monthly).toHaveAttribute('aria-describedby', /budget-monthly-error/)
+  await expect(page.getByText('Monthly 必须 ≥ Weekly')).toBeVisible()
+  await weekly.fill('60.00')
+
+  await daily.fill('12.00')
+  await monthly.fill('180.00')
+  expect(budgetAuditEvents().length, 'refusals and invalid values write no audit').toBe(
+    beforeInvalid,
+  )
+
+  const replayPayload = {
+    daily_usd: '13.00',
+    weekly_usd: '60.00',
+    monthly_usd: '180.00',
+    warn_pct: 75,
+  }
+  const beforeReplay = budgetAuditEvents().length
+  const first = await putBudget(page, replayPayload, 'e2e-budget-replay')
+  expect(first.status(), 'first budget PUT').toBe(200)
+  expect((await first.json()).data.changed).toBe(true)
+  const replay = await putBudget(page, replayPayload, 'e2e-budget-replay')
+  expect(replay.status(), 'replayed budget PUT').toBe(200)
+  expect((await replay.json()).meta.idempotent_replay).toBe(true)
+  expect(budgetAuditEvents().length, 'the replay writes nothing').toBe(beforeReplay + 1)
+
+  await page.reload()
+  await expect(page.getByRole('textbox', { name: 'Daily USD' })).toHaveValue('13.00')
+
+  // Web and CLI must report identical thresholds, spend, state, and unpriced counts.
+  const api = await readBudget(page)
+  const cli = cliBudgetShow()
+  expect(cli.thresholds).toEqual(api.thresholds)
+  expect(cli.budget_state).toBe(api.budget_state)
+  expect(cli.projected_month_end_usd).toBe(api.projected_month_end_usd)
+  expect(cli.projection_basis.month_spend_usd).toBe(api.projection_basis.month_spend_usd)
+  expect(cli.last_alert).toEqual(api.last_alert)
+  for (const period of ['day', 'week', 'month'] as const) {
+    expect(cli.periods[period].spend_usd).toBe(api.periods[period].spend_usd)
+    expect(cli.periods[period].budget_state).toBe(api.periods[period].budget_state)
+    expect(cli.periods[period].unpriced_count).toBe(api.periods[period].unpriced_count)
+  }
+  await expect(page.getByTestId('budget-today-spend')).toHaveText(`$${api.periods.day.spend_usd}`)
+  await expect(page.getByTestId('budget-weekly-spend')).toHaveText(
+    `$${api.periods.week.spend_usd}`,
+  )
+  await expect(page.getByTestId('budget-monthly-spend')).toHaveText(
+    `$${api.periods.month.spend_usd}`,
+  )
+  await expect(page.getByTestId('budget-projection')).toHaveText(
+    `$${api.projected_month_end_usd}`,
+  )
+  await expect(page.getByTestId('budget-unpriced-count')).toHaveText(
+    String(api.periods.month.unpriced_count),
+  )
+  await expect(page.getByTestId('budget-meter-day')).toHaveAttribute(
+    'aria-valuetext',
+    new RegExp(`状态 ${api.periods.day.budget_state}`),
+  )
+
+  expectClean(diagnostics)
+})
+
+interface BudgetViewport {
+  width: number
+  height: number
+  readonly: boolean
+  name: string
+}
+
+async function expectBudgetViewport(page: Page, viewport: BudgetViewport): Promise<void> {
+  await page.setViewportSize({ width: viewport.width, height: viewport.height })
+  await page.goto('/settings/budget')
+  await expect(page.getByRole('heading', BUDGET_HEADING)).toBeVisible()
+  await expect(page.locator('section.system-page')).toHaveAttribute(
+    'data-readonly',
+    viewport.readonly ? 'true' : 'false',
+  )
+
+  const daily = page.getByRole('textbox', { name: 'Daily USD' })
+  const save = page.getByRole('button', { name: '保存阈值' })
+  if (viewport.readonly) {
+    await expect(page.locator('section.system-page').getByRole('note').first()).toContainText(
+      '在桌面端或 CLI 修改',
+    )
+    await expect(daily).toBeDisabled()
+    await expect(save).toBeDisabled()
+  } else {
+    await expect(daily).toBeEnabled()
+    await expect(save).toBeEnabled()
+  }
+
+  const widths = await page.evaluate(() => ({
+    document: document.documentElement.scrollWidth,
+    viewport: window.innerWidth,
+  }))
+  expect(widths.document, `no horizontal overflow at ${viewport.width}`).toBeLessThanOrEqual(
+    widths.viewport,
+  )
+  await page.screenshot({ path: path.join(SCREENS_DIR, viewport.name), fullPage: true })
+}
+
+test('budget degraded usage keeps thresholds editable with N/A and a marker', async ({
+  page,
+}) => {
+  test.setTimeout(120_000)
+  const diagnostics = collectDiagnostics(page)
+  await page.setViewportSize({ width: 1440, height: 900 })
+  await authenticate(page)
+
+  const budgetRoute = '**/api/v1/budget'
+  await page.route(budgetRoute, async (route, request) => {
+    if (request.method() !== 'GET') {
+      await route.continue()
+      return
+    }
+    await route.fulfill({
+      status: 200,
+      contentType: 'application/json',
+      body: JSON.stringify({
+        ok: true,
+        data: {
+          thresholds: {
+            daily_usd: '10.00',
+            weekly_usd: '50.00',
+            monthly_usd: '150.00',
+            warn_pct: 80,
+          },
+          usage_quality: 'UNAVAILABLE',
+          budget_state: null,
+          periods: null,
+          projected_month_end_usd: null,
+          projection_basis: null,
+          last_alert: null,
+        },
+        error: null,
+        meta: {},
+      }),
+    })
+  })
+
+  try {
+    await page.goto('/settings/budget')
+    await expect(page.getByRole('heading', BUDGET_HEADING)).toBeVisible()
+    const missing = page.getByTestId('budget-usage-missing')
+    await expect(missing).toBeVisible()
+    for (const testId of [
+      'budget-usage-spend',
+      'budget-usage-state',
+      'budget-usage-projection',
+      'budget-usage-unpriced',
+    ]) {
+      await expect(page.getByTestId(testId)).toHaveText('N/A')
+    }
+    await expect(missing).not.toContainText('$0')
+    await expect(page.getByTestId('budget-usage-degraded')).toBeVisible()
+    await expect(page.getByTestId('budget-last-alert')).toContainText('degraded')
+    await expect(missing).toContainText('用量不可用：成本账本读取失败')
+    await expect(page.getByTestId('budget-usage')).toContainText('阈值仍可编辑')
+    // The thresholds stay readable and editable during a ledger outage.
+    await expect(page.getByRole('textbox', { name: 'Daily USD' })).toHaveValue('10.00')
+    await expect(page.getByRole('textbox', { name: 'Daily USD' })).toBeEnabled()
+    await expect(page.getByRole('button', { name: '保存阈值' })).toBeEnabled()
+    await expect(page.getByRole('alert').filter({ hasText: '预算设置不可用' })).toHaveCount(0)
+
+    // The degraded retry re-reads usage and announces the degraded result.
+    await page.getByRole('button', { name: '重试用量' }).click()
+    await expect(page.getByTestId('budget-usage-status')).toHaveText(
+      '用量刷新后仍不可用（N/A）；阈值可编辑。',
+    )
+    await expect(page.getByTestId('budget-usage-degraded')).toBeVisible()
+    await expect(page.getByRole('textbox', { name: 'Daily USD' })).toBeEnabled()
+    await expect(page.getByRole('button', { name: '保存阈值' })).toBeEnabled()
+  } finally {
+    await page.unroute(budgetRoute)
+  }
+
+  expect(diagnostics.pageErrors, 'uncaught page errors').toEqual([])
+})
+
+test('budget missing usage renders N/A everywhere and never zero', async ({ page }) => {
+  test.setTimeout(120_000)
+  const diagnostics = collectDiagnostics(page)
+  await page.setViewportSize({ width: 1440, height: 900 })
+  await authenticate(page)
+
+  const budgetRoute = '**/api/v1/budget'
+  await page.route(budgetRoute, async (route, request) => {
+    if (request.method() !== 'GET') {
+      await route.continue()
+      return
+    }
+    await route.fulfill({
+      status: 503,
+      contentType: 'application/json',
+      body: JSON.stringify({
+        ok: false,
+        data: null,
+        error: {
+          code: 'BUDGET_UNAVAILABLE',
+          message: '成本账本不可用',
+          category: 'UPSTREAM',
+          http_status: 503,
+          retryable: true,
+          reference_id: 'REQ-E2E-BUDGET-NA',
+          details: [],
+        },
+        meta: {},
+      }),
+    })
+  })
+
+  try {
+    await page.goto('/settings/budget')
+    await expect(page.getByRole('heading', BUDGET_HEADING)).toBeVisible()
+    const missing = page.getByTestId('budget-usage-missing')
+    await expect(missing).toBeVisible()
+    for (const testId of [
+      'budget-usage-spend',
+      'budget-usage-state',
+      'budget-usage-projection',
+      'budget-usage-unpriced',
+    ]) {
+      await expect(page.getByTestId(testId)).toHaveText('N/A')
+    }
+    // A missing usage read must never be rendered as a zero.
+    await expect(missing).not.toContainText('$0')
+    await expect(missing).toContainText('成本账本不可用')
+    await expect(page.getByTestId('budget-usage')).toContainText('unpriced 调用绝不静默归零')
+    // A hard load error must not claim the thresholds are editable, and it
+    // offers recovery through the load-error panel rather than a panel retry.
+    await expect(page.getByTestId('budget-usage')).toContainText(
+      '阈值不可编辑，直到重新加载成功',
+    )
+    await expect(page.getByTestId('budget-usage')).not.toContainText('阈值仍可编辑')
+    await expect(page.getByRole('button', { name: '重试用量' })).toHaveCount(0)
+    await expect(page.getByRole('button', { name: '重试' })).toBeVisible()
+    await expect(page.getByRole('alert').filter({ hasText: '预算设置不可用' })).toBeVisible()
+  } finally {
+    await page.unroute(budgetRoute)
+  }
+
+  // Recovery must fetch the real numbers again instead of leaving N/A on screen.
+  await page.getByRole('button', { name: '重试' }).click()
+  await expect(page.getByTestId('budget-today-spend')).toBeVisible()
+  expect(diagnostics.pageErrors, 'uncaught page errors').toEqual([])
+  expect(
+    diagnostics.consoleErrors.filter((message) => !message.includes('status of 503')),
+    'unexpected console errors',
+  ).toEqual([])
+})
+
+test('budget refresh keeps the last good values, marks them STALE, and clears on success', async ({
+  page,
+}) => {
+  test.setTimeout(120_000)
+  const diagnostics = collectDiagnostics(page)
+  await page.setViewportSize({ width: 1440, height: 900 })
+  await authenticate(page)
+  await page.goto('/settings/budget')
+  await expect(page.getByTestId('budget-today-spend')).toBeVisible()
+
+  const lastGood = ((await page.getByTestId('budget-today-spend').textContent()) ?? '').trim()
+  expect(lastGood, 'the initial read must show a spend value').not.toBe('')
+
+  let releaseRefresh: () => void = () => {}
+  const refreshGate = new Promise<void>((resolve) => {
+    releaseRefresh = resolve
+  })
+  await page.route('**/api/v1/budget', async (route, request) => {
+    if (request.method() !== 'GET') {
+      await route.continue()
+      return
+    }
+    await refreshGate
+    await route.continue()
+  })
+
+  try {
+    await page.getByRole('button', { name: '刷新用量' }).click()
+    const usage = page.getByTestId('budget-usage')
+    await expect(usage).toHaveAttribute('aria-busy', 'true')
+    await expect(page.locator('[data-quality="STALE"]')).toBeVisible()
+    await expect(page.getByTestId('budget-today-spend')).toHaveText(lastGood)
+    await expect(page.getByTestId('budget-projection')).toHaveText(/^\$\d+\.\d+$/)
+    await expect(page.getByRole('button', { name: '刷新中…' })).toBeDisabled()
+  } finally {
+    releaseRefresh()
+  }
+
+  // A successful refresh clears the stamp but keeps the same last good values.
+  await expect(page.getByTestId('budget-usage')).toHaveAttribute('aria-busy', 'false')
+  await expect(page.locator('[data-quality="STALE"]')).toHaveCount(0)
+  await expect(page.getByTestId('budget-today-spend')).toHaveText(lastGood)
+  await expect(page.getByRole('button', { name: '刷新用量' })).toBeEnabled()
+  expectClean(diagnostics)
+})
+
+test('budget refresh, fields, and save are keyboard operable with focused errors', async ({
+  page,
+}) => {
+  test.setTimeout(120_000)
+  const diagnostics = collectDiagnostics(page)
+  await page.setViewportSize({ width: 1440, height: 900 })
+  await authenticate(page)
+  // Seed this test's own value so the keyboard journey runs alone instead of
+  // depending on an earlier test's persisted thresholds.
+  const seeded = await putBudget(
+    page,
+    { daily_usd: '13.00', weekly_usd: '60.00', monthly_usd: '180.00', warn_pct: 75 },
+    'e2e-budget-keyboard-seed',
+  )
+  expect(seeded.status(), 'seed budget thresholds').toBe(200)
+  await page.goto('/settings/budget')
+  await expect(page.getByRole('heading', BUDGET_HEADING)).toBeVisible()
+  await page.waitForLoadState('networkidle')
+
+  const beforeAudits = budgetAuditEvents().length
+  const daily = page.locator('#budget-daily')
+  const summary = page.getByTestId('settings-budget-error')
+
+  // Tab from the page start through refresh, every input, and save.
+  await page.evaluate(() => (document.activeElement as HTMLElement | null)?.blur())
+  await tabUntil(page, () => activeTextIs(page, '刷新用量'), 'refresh')
+  await tabUntil(page, () => activeIdIs(page, 'budget-daily'), 'daily')
+  await tabUntil(page, () => activeIdIs(page, 'budget-weekly'), 'weekly')
+  await tabUntil(page, () => activeIdIs(page, 'budget-monthly'), 'monthly')
+  await tabUntil(page, () => activeIdIs(page, 'budget-warn'), 'warn')
+  await tabUntil(page, () => activeTextIs(page, '保存阈值'), 'save')
+
+  // A keyboard submit of a blank daily must focus the error summary.
+  await daily.focus()
+  await page.keyboard.press('Control+A')
+  await page.keyboard.press('Backspace')
+  await tabUntil(page, () => activeTextIs(page, '保存阈值'), 'save')
+  await page.keyboard.press('Enter')
+  await expect(summary).toBeFocused()
+  await expect(daily).toHaveAttribute('aria-invalid', 'true')
+  await expect(daily).toHaveAttribute('aria-describedby', /budget-daily-error/)
+  await expect(page.getByText('Daily USD 必填')).toBeVisible()
+
+  // Restoring the persisted value and saving writes nothing; focus returns to save.
+  await daily.focus()
+  await page.keyboard.press('Control+A')
+  await page.keyboard.type('13.00')
+  await tabUntil(page, () => activeTextIs(page, '保存阈值'), 'save')
+  await page.keyboard.press('Enter')
+  await expect(page.getByRole('button', { name: '保存阈值' })).toBeFocused()
+  await expect(page.getByTestId('settings-budget-save-visible')).toContainText('未变更')
+  expect(
+    budgetAuditEvents().length,
+    'a keyboard refusal and an unchanged save write no audit',
+  ).toBe(beforeAudits)
+  expectClean(diagnostics)
+})
+
+test('budget screen renders at 375/768/1440, is read-only at 375, and has no axe violations', async ({
+  page,
+  browser,
+}) => {
+  test.setTimeout(120_000)
+  const diagnostics = collectDiagnostics(page)
+  fs.mkdirSync(SCREENS_DIR, { recursive: true })
+  await authenticate(page)
+
+  await expectBudgetViewport(page, {
+    width: 1440,
+    height: 900,
+    readonly: false,
+    name: 'settings-budget-1440.png',
+  })
+
+  const tags = ['wcag2a', 'wcag2aa', 'wcag21a', 'wcag21aa']
+  const results = await new AxeBuilder({ page }).withTags(tags).analyze()
+  const desktopSummary = results.violations.map(
+    (violation) =>
+      `1440 ${violation.id} (${violation.impact ?? 'unknown'}): ${violation.nodes
+        .map((node) => node.target.join(' '))
+        .join(' | ')}`,
+  )
+  fs.writeFileSync(
+    path.join(SCREENS_DIR, 'settings-budget-axe.json'),
+    JSON.stringify(
+      {
+        url: '/settings/budget (1440)',
+        tags,
+        violationCount: results.violations.length,
+        violations: results.violations.map((violation) => ({
+          id: violation.id,
+          impact: violation.impact ?? null,
+          targets: violation.nodes.map((node) => node.target.join(' ')),
+        })),
+      },
+      null,
+      2,
+    ),
+  )
+
+  const touchContext = await browser.newContext({
+    baseURL: BASE_URL,
+    hasTouch: true,
+    isMobile: true,
+    viewport: { width: 375, height: 812 },
+  })
+  const touchPage = await touchContext.newPage()
+  const touchDiagnostics = collectDiagnostics(touchPage)
+  let mobileSummary: string[] = []
+  let tabletSummary: string[] = []
+  try {
+    await authenticate(touchPage)
+    await expectBudgetViewport(touchPage, {
+      width: 375,
+      height: 812,
+      readonly: true,
+      name: 'settings-budget-375.png',
+    })
+    const mobileResults = await new AxeBuilder({ page: touchPage }).withTags(tags).analyze()
+    mobileSummary = mobileResults.violations.map(
+      (violation) =>
+        `375 ${violation.id} (${violation.impact ?? 'unknown'}): ${violation.nodes
+          .map((node) => node.target.join(' '))
+          .join(' | ')}`,
+    )
+    fs.writeFileSync(
+      path.join(SCREENS_DIR, 'settings-budget-axe-375.json'),
+      JSON.stringify(
+        {
+          url: '/settings/budget (375 coarse pointer)',
+          tags,
+          violationCount: mobileResults.violations.length,
+          violations: mobileResults.violations.map((violation) => ({
+            id: violation.id,
+            impact: violation.impact ?? null,
+            targets: violation.nodes.map((node) => node.target.join(' ')),
+          })),
+        },
+        null,
+        2,
+      ),
+    )
+    await expectBudgetViewport(touchPage, {
+      width: 768,
+      height: 1024,
+      readonly: false,
+      name: 'settings-budget-768.png',
+    })
+    const tabletResults = await new AxeBuilder({ page: touchPage }).withTags(tags).analyze()
+    tabletSummary = tabletResults.violations.map(
+      (violation) =>
+        `768 ${violation.id} (${violation.impact ?? 'unknown'}): ${violation.nodes
+          .map((node) => node.target.join(' '))
+          .join(' | ')}`,
+    )
+    fs.writeFileSync(
+      path.join(SCREENS_DIR, 'settings-budget-axe-768.json'),
+      JSON.stringify(
+        {
+          url: '/settings/budget (768 editable)',
+          tags,
+          violationCount: tabletResults.violations.length,
+          violations: tabletResults.violations.map((violation) => ({
+            id: violation.id,
+            impact: violation.impact ?? null,
+            targets: violation.nodes.map((node) => node.target.join(' ')),
+          })),
+        },
+        null,
+        2,
+      ),
+    )
+  } finally {
+    await touchContext.close()
+  }
+
+  const summary = [...desktopSummary, ...mobileSummary, ...tabletSummary]
+  expect(summary, `settings/budget axe violations (1440 + 375 + 768):\n${summary.join('\n')}`).toEqual([])
   expectClean(diagnostics)
   expectClean(touchDiagnostics)
 })

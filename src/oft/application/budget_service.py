@@ -11,11 +11,27 @@ import json
 import threading
 from collections.abc import Mapping
 from dataclasses import dataclass
-from decimal import ROUND_HALF_UP, Decimal, InvalidOperation
+from decimal import Decimal
 from typing import Any
 
 import structlog
 
+from oft.application.budget_read_model import (
+    DEFAULT_THRESHOLDS,
+    PERIODS,
+    STATE_RANK,
+    BudgetConfigError,
+    BudgetThresholds,
+    candidate_thresholds,
+    format_money,
+    format_text,
+    max_state,
+    parse_decimal,
+    parse_last_alert,
+    projection_for,
+    state_for,
+    thresholds_from_record,
+)
 from oft.config import Settings
 from oft.domain.budget_periods import budget_record_id, period_parts
 from oft.domain.pricing import (
@@ -42,15 +58,7 @@ LOGGER = structlog.get_logger(__name__)
 # transaction instead, so it is also safe across processes (M2/F4).
 _LEDGER_LOCK = threading.Lock()
 
-DEFAULT_THRESHOLDS: dict[str, Any] = {
-    "daily_usd": "10.00",
-    "weekly_usd": "50.00",
-    "monthly_usd": "150.00",
-    "warn_pct": 80.0,
-}
-_STATE_RANK = {"OK": 0, "WARN": 1, "EXCEEDED": 2}
-_QUANTUM = Decimal("0.00000001")
-_PERIODS = ("day", "week", "month")
+_PERIODS = PERIODS
 _SECRET_FIELDS = (
     "openai_api_key",
     "anthropic_api_key",
@@ -68,72 +76,6 @@ def budget_period(instant: str) -> dict[str, str]:
 class BudgetEntry:
     record: BudgetRecord
     payload: dict[str, Any]
-
-
-class BudgetConfigError(Exception):
-    """An operator threshold/period is invalid or pricing overrides are inconsistent."""
-
-    code = "VALIDATION_FAILED"
-
-    def __init__(self, message: str) -> None:
-        super().__init__(message)
-        self.message = message
-
-
-def _decimal(value: str, *, field: str) -> Decimal:
-    try:
-        parsed = Decimal(str(value))
-    except (InvalidOperation, TypeError, ValueError) as exc:
-        raise BudgetConfigError(f"{field} must be a decimal string") from exc
-    if not parsed.is_finite():
-        raise BudgetConfigError(f"{field} must be a finite decimal")
-    return parsed
-
-
-def _positive_decimal(value: str, *, field: str) -> Decimal:
-    parsed = _decimal(value, field=field)
-    if parsed <= 0:
-        raise BudgetConfigError(f"{field} must be positive")
-    return parsed
-
-
-def _text(value: Decimal) -> str:
-    return format(value, "f")
-
-
-def _money(value: Decimal) -> str:
-    return format(value.quantize(_QUANTUM, rounding=ROUND_HALF_UP), "f")
-
-
-@dataclass(frozen=True)
-class BudgetThresholds:
-    daily_usd: Decimal
-    weekly_usd: Decimal
-    monthly_usd: Decimal
-    warn_pct: float
-
-    def threshold_for(self, period: str) -> Decimal:
-        return {
-            "day": self.daily_usd,
-            "week": self.weekly_usd,
-            "month": self.monthly_usd,
-        }[period]
-
-    def to_contract(self) -> dict[str, object]:
-        return {
-            "daily_usd": _text(self.daily_usd),
-            "weekly_usd": _text(self.weekly_usd),
-            "monthly_usd": _text(self.monthly_usd),
-            "warn_pct": self.warn_pct,
-        }
-
-
-def _state_for(spend: Decimal, threshold: Decimal, warn_pct: float) -> str:
-    if spend >= threshold:
-        return "EXCEEDED"
-    if spend >= threshold * Decimal(str(warn_pct)) / Decimal("100"):
-        return "WARN"
-    return "OK"
 
 
 def _usage_tokens(usage: LLMUsage) -> TokenUsage:
@@ -188,15 +130,40 @@ class BudgetService:
         )
 
     def thresholds(self) -> BudgetThresholds:
-        defaults = self._default_thresholds()
-        stored = self._store.get_budget_settings()
-        if stored is None:
-            return defaults
-        return BudgetThresholds(
-            daily_usd=Decimal(stored.daily_usd),
-            weekly_usd=Decimal(stored.weekly_usd),
-            monthly_usd=Decimal(stored.monthly_usd),
-            warn_pct=stored.warn_pct,
+        return thresholds_from_record(self._store.get_budget_settings(), self._default_thresholds())
+
+    def _settings_record(
+        self, candidate: BudgetThresholds, *, updated_at: str
+    ) -> BudgetSettingsRecord:
+        return BudgetSettingsRecord(
+            daily_usd=format_text(candidate.daily_usd),
+            weekly_usd=format_text(candidate.weekly_usd),
+            monthly_usd=format_text(candidate.monthly_usd),
+            warn_pct=candidate.warn_pct,
+            updated_at=updated_at,
+        )
+
+    def _thresholds_audit(
+        self,
+        *,
+        current: BudgetThresholds,
+        candidate: BudgetThresholds,
+        updated_at: str,
+        actor: str,
+        reason: str,
+    ) -> AuditEventDraft:
+        payload: dict[str, Any] = {
+            "before": current.to_contract(),
+            "after": candidate.to_contract(),
+        }
+        if reason:
+            payload["reason"] = reason
+        return AuditEventDraft(
+            event_type="BUDGET_THRESHOLDS_UPDATED",
+            actor={"kind": "USER", "id": actor},
+            subject={"kind": "BUDGET_SETTINGS", "id": "default"},
+            payload=payload,
+            created_at=updated_at,
         )
 
     def set_thresholds(
@@ -207,47 +174,86 @@ class BudgetService:
         monthly_usd: str | None = None,
         warn_pct: float | None = None,
         updated_at: str,
+        actor: str = "cli",
+        reason: str = "",
     ) -> BudgetThresholds:
-        current = self.thresholds()
-        candidate = BudgetThresholds(
-            daily_usd=(
-                _positive_decimal(daily_usd, field="daily_usd")
-                if daily_usd is not None
-                else current.daily_usd
-            ),
-            weekly_usd=(
-                _positive_decimal(weekly_usd, field="weekly_usd")
-                if weekly_usd is not None
-                else current.weekly_usd
-            ),
-            monthly_usd=(
-                _positive_decimal(monthly_usd, field="monthly_usd")
-                if monthly_usd is not None
-                else current.monthly_usd
-            ),
-            warn_pct=current.warn_pct if warn_pct is None else float(warn_pct),
-        )
-        if not 0 < candidate.warn_pct <= 100:
-            raise BudgetConfigError("warn_pct must be greater than 0 and at most 100")
-        self._store.save_budget_settings(
-            BudgetSettingsRecord(
-                daily_usd=_text(candidate.daily_usd),
-                weekly_usd=_text(candidate.weekly_usd),
-                monthly_usd=_text(candidate.monthly_usd),
-                warn_pct=candidate.warn_pct,
-                updated_at=updated_at,
+        captured: dict[str, BudgetThresholds] = {}
+
+        def build(
+            stored: BudgetSettingsRecord | None,
+        ) -> tuple[BudgetSettingsRecord, AuditEventDraft]:
+            current = thresholds_from_record(stored, self._default_thresholds())
+            candidate = candidate_thresholds(
+                current,
+                daily_usd=daily_usd,
+                weekly_usd=weekly_usd,
+                monthly_usd=monthly_usd,
+                warn_pct=warn_pct,
+                enforce_ordering=False,
             )
-        )
-        self._store.append_audit_event(
-            AuditEventDraft(
-                event_type="BUDGET_THRESHOLDS_UPDATED",
-                actor={"kind": "USER", "id": "cli"},
-                subject={"kind": "BUDGET_SETTINGS", "id": "default"},
-                payload={"before": current.to_contract(), "after": candidate.to_contract()},
-                created_at=updated_at,
+            captured["thresholds"] = candidate
+            return (
+                self._settings_record(candidate, updated_at=updated_at),
+                self._thresholds_audit(
+                    current=current,
+                    candidate=candidate,
+                    updated_at=updated_at,
+                    actor=actor,
+                    reason=reason,
+                ),
             )
-        )
-        return candidate
+
+        self._store.save_budget_settings_change(build)
+        return captured["thresholds"]
+
+    def update_thresholds(
+        self,
+        *,
+        daily_usd: str | None = None,
+        weekly_usd: str | None = None,
+        monthly_usd: str | None = None,
+        warn_pct: float | None = None,
+        updated_at: str,
+        actor: str = "web",
+        reason: str = "",
+    ) -> tuple[BudgetThresholds, bool]:
+        """Compare-and-write atomically: an unchanged candidate stores nothing.
+
+        The current row is read inside the store's ``BEGIN IMMEDIATE``
+        transaction, and the typed :class:`BudgetThresholds` values are compared
+        (``Decimal`` equality), so ``"10"`` against a stored ``"10.00"`` is a
+        no-op rather than a spurious audit.
+        """
+        captured: dict[str, Any] = {}
+
+        def build(
+            stored: BudgetSettingsRecord | None,
+        ) -> tuple[BudgetSettingsRecord, AuditEventDraft] | None:
+            current = thresholds_from_record(stored, self._default_thresholds())
+            candidate = candidate_thresholds(
+                current,
+                daily_usd=daily_usd,
+                weekly_usd=weekly_usd,
+                monthly_usd=monthly_usd,
+                warn_pct=warn_pct,
+            )
+            if candidate == current:
+                captured.update(thresholds=current, changed=False)
+                return None
+            captured.update(thresholds=candidate, changed=True)
+            return (
+                self._settings_record(candidate, updated_at=updated_at),
+                self._thresholds_audit(
+                    current=current,
+                    candidate=candidate,
+                    updated_at=updated_at,
+                    actor=actor,
+                    reason=reason,
+                ),
+            )
+
+        self._store.save_budget_settings_change(build)
+        return captured["thresholds"], captured["changed"]
 
     # -- per-call ledger -------------------------------------------------
 
@@ -280,7 +286,7 @@ class BudgetService:
                 return _empty_unpriced(), True
             return table.price_call(result.provider, result.model, _usage_tokens(usage)), False
         assert cost_usd is not None and price_version is not None
-        cost = _decimal(cost_usd, field="cost_usd")
+        cost = parse_decimal(cost_usd, field="cost_usd")
         if unpriced is True:
             if cost != 0:
                 raise BudgetConfigError("an unpriced call must record a zero cost")
@@ -290,7 +296,7 @@ class BudgetService:
         return (
             PricedCall(
                 unpriced=bool(unpriced),
-                cost_usd=_money(cost) if not unpriced else "0",
+                cost_usd=format_money(cost) if not unpriced else "0",
                 price_version=price_version,
                 input_per_mtok="0",
                 output_per_mtok="0",
@@ -314,19 +320,17 @@ class BudgetService:
         prior_spends = {name: Decimal(str(prior[name]["spend_usd"])) for name in _PERIODS}
         spends = {name: prior_spends[name] + current_cost for name in _PERIODS}
         prior_states = {
-            name: _state_for(
-                prior_spends[name], thresholds.threshold_for(name), thresholds.warn_pct
-            )
+            name: state_for(prior_spends[name], thresholds.threshold_for(name), thresholds.warn_pct)
             for name in _PERIODS
         }
         states = {
-            name: _state_for(spends[name], thresholds.threshold_for(name), thresholds.warn_pct)
+            name: state_for(spends[name], thresholds.threshold_for(name), thresholds.warn_pct)
             for name in _PERIODS
         }
         crossing = [
-            name for name in _PERIODS if _STATE_RANK[states[name]] > _STATE_RANK[prior_states[name]]
+            name for name in _PERIODS if STATE_RANK[states[name]] > STATE_RANK[prior_states[name]]
         ]
-        state = max(states.values(), key=lambda value: _STATE_RANK[value])
+        state = max(states.values(), key=lambda value: STATE_RANK[value])
         return states, spends, crossing, state
 
     def _payload(
@@ -591,8 +595,8 @@ class BudgetService:
         payload = {
             "period": period,
             "period_key": budget_period(record.occurred_at)[period],
-            "spend_usd": _money(spends[period]),
-            "threshold_usd": _text(thresholds.threshold_for(period)),
+            "spend_usd": format_money(spends[period]),
+            "threshold_usd": format_text(thresholds.threshold_for(period)),
             "state": states[period],
             "provider": record.provider,
             "model": record.model,
@@ -651,18 +655,24 @@ class BudgetService:
 
     # -- rollups ---------------------------------------------------------
 
-    def usage(self, period: str, *, at: str) -> dict[str, object]:
+    def usage(
+        self,
+        period: str,
+        *,
+        at: str,
+        thresholds: BudgetThresholds | None = None,
+    ) -> dict[str, object]:
         if period not in _PERIODS:
             raise BudgetConfigError("period must be day, week, or month")
         period_key = budget_period(at)[period]
         records = list(self._store.list_budget_records_for_period(period, period_key))
-        threshold = self.thresholds()
+        threshold = self.thresholds() if thresholds is None else thresholds
         spend = sum((Decimal(record.cost_usd) for record in records), Decimal("0"))
-        state = _state_for(spend, threshold.threshold_for(period), threshold.warn_pct)
+        state = state_for(spend, threshold.threshold_for(period), threshold.warn_pct)
         return {
             "period": period,
             "period_key": period_key,
-            "spend_usd": _money(spend),
+            "spend_usd": format_money(spend),
             "call_count": len(records),
             "unpriced_count": sum(1 for record in records if record.unpriced),
             "thresholds": threshold.to_contract(),
@@ -670,6 +680,43 @@ class BudgetService:
             "by_provider": _breakdown(records, "provider"),
             "by_model": _breakdown(records, "model"),
         }
+
+    def projection(self, at: str) -> dict[str, object]:
+        """Project month-end spend; see :func:`projection_for` for the math."""
+        month = self.usage("month", at=at)
+        return projection_for(at, Decimal(str(month["spend_usd"])))
+
+    def snapshot(self, at: str, *, thresholds: BudgetThresholds | None = None) -> dict[str, object]:
+        """The single authoritative read model used by GET, PUT, and the CLI.
+
+        The three usage windows are computed once and the month window feeds the
+        projection, so one snapshot scans the ledger once per period and reads
+        the thresholds once.
+        """
+        current = self.thresholds() if thresholds is None else thresholds
+        windows = {period: self.usage(period, at=at, thresholds=current) for period in _PERIODS}
+        month_spend = Decimal(str(windows["month"]["spend_usd"]))
+        return {
+            "thresholds": current.to_contract(),
+            "usage_quality": "COMPLETE",
+            "budget_state": max_state(window["budget_state"] for window in windows.values()),
+            "periods": {
+                period: {
+                    "period_key": window["period_key"],
+                    "spend_usd": window["spend_usd"],
+                    "call_count": window["call_count"],
+                    "unpriced_count": window["unpriced_count"],
+                    "budget_state": window["budget_state"],
+                }
+                for period, window in windows.items()
+            },
+            **projection_for(at, month_spend),
+            "last_alert": self.last_alert(),
+        }
+
+    def last_alert(self) -> dict[str, object] | None:
+        """The newest well-formed ``BUDGET_THRESHOLD`` crossing, or ``None``."""
+        return parse_last_alert(self._store.last_audit_event_of_type("BUDGET_THRESHOLD"))
 
 
 def _breakdown(records: list[BudgetRecord], attribute: str) -> list[dict[str, object]]:
@@ -682,7 +729,7 @@ def _breakdown(records: list[BudgetRecord], attribute: str) -> list[dict[str, ob
         spend = sum((Decimal(record.cost_usd) for record in items), Decimal("0"))
         row: dict[str, object] = {
             attribute: key,
-            "spend_usd": _money(spend),
+            "spend_usd": format_money(spend),
             "call_count": len(items),
             "unpriced_count": sum(1 for record in items if record.unpriced),
         }

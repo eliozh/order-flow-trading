@@ -102,12 +102,15 @@ def idempotent_mutation(
     payload: Any,
     status: int,
     mutate: Callable[[], dict[str, Any]],
+    data_quality: str | Callable[[dict[str, Any]], str] = "COMPLETE",
 ) -> Any:
     """Run one state-changing request exactly once per ``Idempotency-Key``.
 
     Reserves the key, returns a stored replay when present, executes ``mutate``
     (which returns the contract data payload), records the success envelope, and
-    releases the reservation if the mutation raises.
+    releases the reservation if the mutation raises. ``data_quality`` may be a
+    callable so a mutation whose result is degraded (for example an unavailable
+    usage block) reports its own quality rather than a hard-coded ``COMPLETE``.
     """
     key = idempotency_key(presented_key)
     payload_hash = request_hash(payload)
@@ -119,11 +122,12 @@ def idempotent_mutation(
     except BaseException:
         release(request, key=key)
         raise
+    quality = data_quality(data) if callable(data_quality) else data_quality
     envelope = success_envelope(
         data,
         request_id=new_request_id(),
         provenance="CALC",
-        data_quality="COMPLETE",
+        data_quality=quality,
     )
     complete(request, key=key, request_hash=payload_hash, envelope=envelope, status=status)
     return envelope
