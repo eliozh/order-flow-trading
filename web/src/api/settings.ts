@@ -97,6 +97,10 @@ export interface SettingsFieldDetail {
   field?: string | null
   code?: string
   message?: string
+  /** For ``confirmation_required``: the server's committed value. */
+  before?: number | null
+  /** For ``confirmation_required``: the looser value the server refused. */
+  after?: number | null
 }
 
 export interface ScanSettingsData {

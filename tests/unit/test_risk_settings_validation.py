@@ -86,6 +86,23 @@ def _seed_open_position(
         )
 
 
+def _insert_raw_position(store: SqliteStore, position_id: str, payload_json: str) -> None:
+    """Insert one OPEN position row with the exact raw payload (corruption included)."""
+    with closing(store._connect()) as connection, connection:
+        connection.execute(
+            """
+            INSERT INTO positions (
+                position_id, account_id, environment, symbol, state, opened_at, payload_json
+            ) VALUES (?, ?, ?, ?, ?, ?, ?)
+            """,
+            (position_id, "ACC-PAPER", "PAPER", "BTCUSDT", "OPEN", NOW_TEXT, payload_json),
+        )
+
+
+def _seed_account(store: SqliteStore, settings: Settings) -> None:
+    PaperAccountService(settings=settings, store=store, clock=FixedClock(NOW)).summary()
+
+
 @pytest.fixture(autouse=True)
 def _clear_risk_env(monkeypatch: pytest.MonkeyPatch) -> None:
     for name in (
@@ -474,6 +491,200 @@ def test_utilization_reports_partial_quality_for_stale_marks(tmp_path: Path) -> 
     assert metrics["max_notional_pct"]["quality"] == "UNAVAILABLE"
 
 
+def test_utilization_reports_zero_and_complete_for_no_open_positions(tmp_path: Path) -> None:
+    service, store, settings = _service(tmp_path)
+    _seed_account(store, settings)
+
+    utilization = service.read_risk_settings().to_contract()["utilization"]
+
+    assert utilization["quality"] == "COMPLETE"
+    assert utilization["stale_inputs"] == []
+    metrics = utilization["metrics"]
+    assert metrics["per_trade_risk_pct"]["used"] == 0.0
+    assert metrics["per_trade_risk_pct"]["quality"] == "COMPLETE"
+    assert metrics["max_leverage"]["used"] == 0.0
+    assert metrics["max_leverage"]["quality"] == "COMPLETE"
+    assert metrics["max_notional_pct"]["used"] == 0.0
+    assert metrics["max_notional_pct"]["quality"] == "COMPLETE"
+    assert metrics["max_concurrent_positions"]["used"] == 0
+    assert metrics["max_concurrent_positions"]["quality"] == "COMPLETE"
+
+
+def test_utilization_never_seeds_a_missing_paper_account(tmp_path: Path) -> None:
+    service, store, _settings_obj = _service(tmp_path)
+
+    service.read_risk_settings()
+    service.read_risk_settings()
+
+    assert store.get_paper_account("ACC-PAPER") is None
+    assert store.list_positions(state="OPEN", limit=None) == ()
+    assert store.list_audit_events() == ()
+
+
+def test_utilization_survives_a_corrupt_open_position_payload(tmp_path: Path) -> None:
+    service, store, settings = _service(tmp_path)
+    _seed_account(store, settings)
+    _insert_raw_position(store, "POS-BAD", "{not-json")
+
+    utilization = service.read_risk_settings().to_contract()["utilization"]
+
+    assert utilization["quality"] == "UNAVAILABLE"
+    assert "position_payload" in utilization["stale_inputs"]
+    metrics = utilization["metrics"]
+    for field in ("per_trade_risk_pct", "max_leverage", "max_notional_pct"):
+        assert metrics[field]["used"] is None
+        assert metrics[field]["quality"] == "UNAVAILABLE"
+        assert "payload" in (metrics[field]["note"] or "")
+    # The OPEN row count stays knowable even when its payload is not.
+    assert metrics["max_concurrent_positions"]["used"] == 1
+    assert metrics["max_concurrent_positions"]["quality"] == "PARTIAL"
+    assert store.list_audit_events() == ()
+
+
+def test_update_over_a_corrupt_position_commits_and_returns_the_caps(tmp_path: Path) -> None:
+    service, store, settings = _service(tmp_path)
+    _seed_account(store, settings)
+    _insert_raw_position(store, "POS-BAD", "{not-json")
+
+    result = service.update_risk_caps({"max_leverage": 4.0}, actor="web")
+
+    assert result.changed is True
+    assert result.after.max_leverage == 4.0
+    assert result.settings.caps.max_leverage == 4.0
+    assert result.settings.source.value == "user"
+    assert result.settings.updated_at == NOW_TEXT
+    assert result.settings.updated_by == "web"
+    assert result.settings.utilization.metrics["per_trade_risk_pct"].used is None
+    row = store.get_system_state(RISK_CAPS_STATE_KEY)
+    assert row is not None
+    assert json.loads(row)["max_leverage"] == 4.0
+    assert len(store.list_audit_events()) == 1
+
+
+def test_utilization_reports_unavailable_for_an_unreadable_account_balance(tmp_path: Path) -> None:
+    service, store, settings = _service(tmp_path)
+    _seed_account(store, settings)
+    with closing(store._connect()) as connection, connection:
+        connection.execute(
+            "UPDATE paper_accounts SET balance = 'not-a-number' WHERE account_id = ?",
+            ("ACC-PAPER",),
+        )
+
+    utilization = service.read_risk_settings().to_contract()["utilization"]
+
+    assert utilization["quality"] == "UNAVAILABLE"
+    assert any("unreadable" in item for item in utilization["stale_inputs"])
+    assert all(metric["used"] is None for metric in utilization["metrics"].values())
+    assert store.list_audit_events() == ()
+
+    result = service.update_risk_caps({"max_leverage": 4.0}, actor="web")
+
+    assert result.changed is True
+    assert result.after.max_leverage == 4.0
+    assert result.settings.utilization.quality == "UNAVAILABLE"
+    assert len(store.list_audit_events()) == 1
+
+
+def test_utilization_marks_per_trade_unavailable_when_a_position_omits_risk_pct(
+    tmp_path: Path,
+) -> None:
+    service, store, settings = _service(tmp_path)
+    _seed_account(store, settings)
+    _insert_raw_position(
+        store,
+        "POS-1",
+        json.dumps({"size": "2", "mark_price": "100", "leverage": 2.0}),
+    )
+    _insert_raw_position(
+        store,
+        "POS-2",
+        json.dumps({"size": "1", "mark_price": "100", "risk_pct": 0.5, "leverage": 3.0}),
+    )
+
+    utilization = service.read_risk_settings().to_contract()["utilization"]
+    metrics = utilization["metrics"]
+
+    assert metrics["per_trade_risk_pct"]["used"] is None
+    assert metrics["per_trade_risk_pct"]["quality"] == "UNAVAILABLE"
+    assert "risk_pct" in (metrics["per_trade_risk_pct"]["note"] or "")
+    # A missing per-trade value never hides the leverage that is measurable.
+    assert metrics["max_leverage"]["used"] == pytest.approx(3.0)
+    assert metrics["max_leverage"]["quality"] == "COMPLETE"
+    assert "position_payload" not in utilization["stale_inputs"]
+
+
+def test_utilization_marks_per_trade_unavailable_for_a_non_finite_risk_pct(
+    tmp_path: Path,
+) -> None:
+    service, store, settings = _service(tmp_path)
+    _seed_account(store, settings)
+    _insert_raw_position(
+        store,
+        "POS-NAN",
+        json.dumps({"size": "2", "mark_price": "100", "risk_pct": "nan", "leverage": 2.0}),
+    )
+
+    metrics = service.read_risk_settings().to_contract()["utilization"]["metrics"]
+
+    assert metrics["per_trade_risk_pct"]["used"] is None
+    assert metrics["per_trade_risk_pct"]["quality"] == "UNAVAILABLE"
+    assert "risk_pct" in (metrics["per_trade_risk_pct"]["note"] or "")
+    assert metrics["max_leverage"]["used"] == pytest.approx(2.0)
+
+
+def test_confirmation_details_carry_the_server_before_and_after(tmp_path: Path) -> None:
+    service, store, _settings_obj = _service(tmp_path)
+
+    with pytest.raises(SettingValidationError) as excinfo:
+        service.update_risk_caps(
+            {"per_trade_risk_pct": 1.0, "max_leverage": 6.0},
+            actor="web",
+        )
+
+    details = {detail["field"]: detail for detail in excinfo.value.details}
+    assert set(details) == {"per_trade_risk_pct", "max_leverage"}
+    assert all(detail["code"] == "confirmation_required" for detail in details.values())
+    assert details["per_trade_risk_pct"]["before"] == pytest.approx(0.8)
+    assert details["per_trade_risk_pct"]["after"] == pytest.approx(1.0)
+    assert details["max_leverage"]["before"] == pytest.approx(5.0)
+    assert details["max_leverage"]["after"] == pytest.approx(6.0)
+    assert store.get_system_state(RISK_CAPS_STATE_KEY) is None
+    assert store.list_audit_events() == ()
+
+
+def test_a_noop_after_a_save_returns_the_committed_summary(tmp_path: Path) -> None:
+    service, store, _settings_obj = _service(tmp_path)
+    service.update_risk_caps({"per_trade_risk_pct": 0.5}, actor="web")
+    before_audits = store.list_audit_events()
+
+    result = service.update_risk_caps({"per_trade_risk_pct": 0.5}, actor="cli")
+
+    assert result.changed is False
+    assert result.settings.source.value == "user"
+    assert result.settings.updated_at == NOW_TEXT
+    assert result.settings.updated_by == "web"
+    assert result.settings.caps.per_trade_risk_pct == 0.5
+    assert store.list_audit_events() == before_audits
+
+
+def test_confirmed_loosening_without_a_reason_records_the_default_reason(tmp_path: Path) -> None:
+    service, store, _settings_obj = _service(tmp_path)
+
+    service.update_risk_caps({"per_trade_risk_pct": 1.0}, actor="web", confirm=True)
+
+    payload = json.loads(store.list_audit_events()[0].payload_json)["payload"]
+    assert payload["reason"] == "loosening confirmed by operator"
+
+
+def test_tightening_without_a_reason_records_an_empty_reason(tmp_path: Path) -> None:
+    service, store, _settings_obj = _service(tmp_path)
+
+    service.update_risk_caps({"per_trade_risk_pct": 0.5}, actor="web")
+
+    payload = json.loads(store.list_audit_events()[0].payload_json)["payload"]
+    assert payload["reason"] == ""
+
+
 def test_read_sections_never_computes_utilization(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
@@ -487,3 +698,147 @@ def test_read_sections_never_computes_utilization(
     sections = service.read_sections()
 
     assert [section["section"] for section in sections] == ["scan", "risk"]
+
+
+def test_utilization_survives_a_position_number_beyond_the_float_range(
+    tmp_path: Path,
+) -> None:
+    service, store, settings = _service(tmp_path)
+    _seed_account(store, settings)
+    huge = 10**400
+    _insert_raw_position(
+        store,
+        "POS-HUGE",
+        json.dumps({"size": "2", "mark_price": "100", "risk_pct": huge, "leverage": huge}),
+    )
+
+    metrics = service.read_risk_settings().to_contract()["utilization"]["metrics"]
+
+    assert metrics["per_trade_risk_pct"]["used"] is None
+    assert metrics["per_trade_risk_pct"]["quality"] == "UNAVAILABLE"
+    assert "risk_pct" in (metrics["per_trade_risk_pct"]["note"] or "")
+    assert metrics["max_leverage"]["used"] is None
+    assert metrics["max_leverage"]["quality"] == "UNAVAILABLE"
+    assert "leverage" in (metrics["max_leverage"]["note"] or "")
+
+
+def test_utilization_survives_an_unrepresentable_equity_total(tmp_path: Path) -> None:
+    service, store, settings = _service(tmp_path)
+    _seed_account(store, settings)
+    _insert_raw_position(
+        store,
+        "POS-BIG",
+        json.dumps({"size": "1e15", "mark_price": "1e5", "risk_pct": 1.0, "leverage": 2.0}),
+    )
+
+    utilization = service.read_risk_settings().to_contract()["utilization"]
+    metrics = utilization["metrics"]
+
+    assert utilization["quality"] == "PARTIAL"
+    assert "equity" in utilization["stale_inputs"]
+    assert metrics["max_notional_pct"]["used"] is None
+    assert metrics["max_notional_pct"]["quality"] == "UNAVAILABLE"
+    assert metrics["max_notional_pct"]["note"] == "equity could not be computed"
+    # The readable per-position metrics and the exact row count keep reporting.
+    assert metrics["per_trade_risk_pct"]["used"] == pytest.approx(1.0)
+    assert metrics["max_leverage"]["used"] == pytest.approx(2.0)
+    assert metrics["max_concurrent_positions"]["used"] == 1
+
+
+def test_utilization_survives_an_unrepresentable_notional_total(tmp_path: Path) -> None:
+    service, store, settings = _service(tmp_path)
+    _seed_account(store, settings)
+    _insert_raw_position(
+        store,
+        "POS-ASTRONOMICAL",
+        json.dumps(
+            {"size": "1e600000", "mark_price": "1e600000", "risk_pct": 1.0, "leverage": 2.0}
+        ),
+    )
+
+    metrics = service.read_risk_settings().to_contract()["utilization"]["metrics"]
+
+    assert metrics["max_notional_pct"]["used"] is None
+    assert metrics["max_notional_pct"]["quality"] == "UNAVAILABLE"
+    assert metrics["max_notional_pct"]["note"] == "position notional could not be computed"
+    assert metrics["per_trade_risk_pct"]["used"] == pytest.approx(1.0)
+
+
+def test_utilization_marks_leverage_unavailable_when_a_position_omits_it(
+    tmp_path: Path,
+) -> None:
+    service, store, settings = _service(tmp_path)
+    _seed_account(store, settings)
+    _insert_raw_position(
+        store,
+        "POS-1",
+        json.dumps({"size": "2", "mark_price": "100", "risk_pct": 1.5}),
+    )
+    _insert_raw_position(
+        store,
+        "POS-2",
+        json.dumps({"size": "1", "mark_price": "100", "risk_pct": 0.5, "leverage": 2.0}),
+    )
+
+    metrics = service.read_risk_settings().to_contract()["utilization"]["metrics"]
+
+    assert metrics["max_leverage"]["used"] is None
+    assert metrics["max_leverage"]["quality"] == "UNAVAILABLE"
+    assert "leverage" in (metrics["max_leverage"]["note"] or "")
+    assert metrics["per_trade_risk_pct"]["used"] == pytest.approx(1.5)
+    assert metrics["per_trade_risk_pct"]["quality"] == "COMPLETE"
+
+
+def test_utilization_marks_leverage_unavailable_for_non_finite_or_bool_leverage(
+    tmp_path: Path,
+) -> None:
+    service, store, settings = _service(tmp_path)
+    _seed_account(store, settings)
+    _insert_raw_position(
+        store,
+        "POS-NAN",
+        json.dumps({"size": "2", "mark_price": "100", "risk_pct": 1.5, "leverage": "NaN"}),
+    )
+    _insert_raw_position(
+        store,
+        "POS-BOOL",
+        json.dumps({"size": "1", "mark_price": "100", "risk_pct": 0.5, "leverage": True}),
+    )
+
+    metrics = service.read_risk_settings().to_contract()["utilization"]["metrics"]
+
+    assert metrics["max_leverage"]["used"] is None
+    assert metrics["max_leverage"]["quality"] == "UNAVAILABLE"
+    assert "leverage" in (metrics["max_leverage"]["note"] or "")
+    assert metrics["per_trade_risk_pct"]["used"] == pytest.approx(1.5)
+    assert metrics["per_trade_risk_pct"]["quality"] == "COMPLETE"
+
+
+def test_notional_note_names_the_missing_mark(tmp_path: Path) -> None:
+    service, store, settings = _service(tmp_path)
+    _seed_account(store, settings)
+    _insert_raw_position(
+        store, "POS-NO-MARK", json.dumps({"size": "2", "risk_pct": 1.0, "leverage": 2.0})
+    )
+
+    metrics = service.read_risk_settings().to_contract()["utilization"]["metrics"]
+
+    assert metrics["max_notional_pct"]["used"] is None
+    assert metrics["max_notional_pct"]["note"] == (
+        "mark_price is missing or not finite on an open position"
+    )
+    assert metrics["per_trade_risk_pct"]["used"] == pytest.approx(1.0)
+
+
+def test_notional_note_reports_non_positive_equity(tmp_path: Path) -> None:
+    service, store, settings = _service(tmp_path)
+    _seed_account(store, settings)
+    with closing(store._connect()) as connection, connection:
+        connection.execute(
+            "UPDATE paper_accounts SET balance = '0' WHERE account_id = ?", ("ACC-PAPER",)
+        )
+
+    metrics = service.read_risk_settings().to_contract()["utilization"]["metrics"]
+
+    assert metrics["max_notional_pct"]["used"] is None
+    assert metrics["max_notional_pct"]["note"] == "equity is not positive"

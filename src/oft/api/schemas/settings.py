@@ -78,7 +78,7 @@ class RiskSettingsUpdate(BaseModel):
 
     caps: dict[str, Any]
     confirm: bool = False
-    reason: str = ""
+    reason: str = Field(default="", max_length=500)
 
 
 class RiskSettingsData(BaseModel):

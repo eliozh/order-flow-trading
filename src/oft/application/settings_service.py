@@ -11,11 +11,10 @@ no-op. Risk-cap loosening additionally requires an explicit confirmation.
 from __future__ import annotations
 
 import json
-import math
+import logging
 from collections.abc import Mapping
 from dataclasses import dataclass, replace
 from datetime import datetime
-from decimal import Decimal
 from typing import TYPE_CHECKING, Any
 
 from oft.application.entry_service import (
@@ -23,10 +22,11 @@ from oft.application.entry_service import (
     decode_persisted_caps,
     effective_caps,
 )
-from oft.application.paper_account import (
-    DEFAULT_ACCOUNT_ID,
-    PaperAccountService,
-    compute_equity,
+from oft.application.risk_utilization import (
+    RiskUtilization,
+    RiskUtilizationMetric,
+    build_risk_utilization,
+    unavailable_utilization,
 )
 from oft.application.scheduler import (
     ScheduleState,
@@ -71,23 +71,7 @@ OVERLAY_MAX_JITTER_SECONDS = min(SCAN_PERIOD_HOURS.values()) * 3600 - 1
 
 RISK_CAPS_UPDATED_EVENT = "RISK_CAPS_UPDATED"
 RISK_SECTION = "risk"
-# The caps with no live measurement in this slice; they are reported with
-# ``used: null`` and an explicit reason, never a fabricated zero.
-_UNMEASURED_RISK_CAPS = frozenset({"max_slippage_bps", "max_spread_bps", "stale_mark_seconds"})
-_RISK_CAP_UNITS: Mapping[str, str] = {
-    "per_trade_risk_pct": "%",
-    "max_concurrent_positions": "positions",
-    "daily_loss_pct": "%",
-    "max_leverage": "x",
-    "max_notional_pct": "%",
-    "max_slippage_bps": "bps",
-    "max_spread_bps": "bps",
-    "stale_mark_seconds": "s",
-}
-_UNMEASURED_NOTE = "no live measurement exists for this cap"
-_DAILY_LOSS_NOTE = (
-    "no per-UTC-day realized-PnL source exists in this slice; daily loss is not measured"
-)
+_LOGGER = logging.getLogger(__name__)
 
 
 @dataclass(frozen=True)
@@ -113,46 +97,6 @@ class ScanSettings:
             "timezone": self.timezone,
             "updated_at": self.updated_at,
             "updated_by": self.updated_by,
-        }
-
-
-@dataclass(frozen=True)
-class RiskUtilizationMetric:
-    """One cap's read-only utilization and its provenance."""
-
-    used: float | None
-    cap: float
-    unit: str
-    source: str
-    quality: str
-    note: str | None = None
-
-    def to_contract(self) -> dict[str, Any]:
-        return {
-            "used": self.used,
-            "cap": self.cap,
-            "unit": self.unit,
-            "source": self.source,
-            "quality": self.quality,
-            "note": self.note,
-        }
-
-
-@dataclass(frozen=True)
-class RiskUtilization:
-    """The read-only utilization snapshot; never mutates anything."""
-
-    source: str
-    quality: str
-    stale_inputs: tuple[str, ...]
-    metrics: dict[str, RiskUtilizationMetric]
-
-    def to_contract(self) -> dict[str, Any]:
-        return {
-            "source": self.source,
-            "quality": self.quality,
-            "stale_inputs": list(self.stale_inputs),
-            "metrics": {field: metric.to_contract() for field, metric in self.metrics.items()},
         }
 
 
@@ -387,6 +331,10 @@ class SettingsService:
                             "field": field,
                             "code": "confirmation_required",
                             "message": f"loosening {field} requires confirmation",
+                            # The server's own diff, so a client never has to
+                            # build a stale confirmation table from local state.
+                            "before": float(getattr(current, field)),
+                            "after": float(getattr(proposed, field)),
                         }
                         for field in loosened
                     ],
@@ -410,11 +358,43 @@ class SettingsService:
             return json.dumps(proposed.to_state(), sort_keys=True), audit
 
         self._store.save_risk_caps_change(_build)
-        # Read back after the commit so the response reflects the committed row.
+        # Build the response from the values captured inside the write
+        # transaction. A post-commit read could hit a corrupt position/account
+        # row and turn a committed, audited write into a 500 for the caller.
+        after: RiskCaps = captured["after"]
+        if captured["changed"]:
+            source = SettingSource.USER
+            updated_at: str | None = timestamp
+            updated_by: str | None = actor
+        else:
+            # A no-op commits nothing; the committed row (if any) and its newest
+            # audit event supply the provenance of the effective caps.
+            summary = self.read_risk_summary()
+            source = summary.source
+            updated_at = summary.updated_at
+            audit = self._store.last_audit_event_of_type(RISK_CAPS_UPDATED_EVENT)
+            updated_by = _audit_actor_id(audit.payload_json) if audit is not None else None
+        # The caps row and its audit event are committed by now, so the
+        # best-effort response snapshot must never turn a successful, audited
+        # write into a 500. A DB-level or arithmetic failure degrades to an
+        # explicitly unavailable utilization instead.
+        try:
+            utilization = self._utilization(after)
+        except Exception:
+            _LOGGER.exception("risk-cap utilization snapshot failed after a committed save")
+            utilization = unavailable_utilization(after, "utilization snapshot is unavailable")
+        settings = RiskSettings(
+            caps=after,
+            source=source,
+            defaults=caps_from_settings(self._settings),
+            utilization=utilization,
+            updated_at=updated_at,
+            updated_by=updated_by,
+        )
         return RiskCapsUpdateResult(
-            settings=self.read_risk_settings(),
+            settings=settings,
             before=captured["before"],
-            after=captured["after"],
+            after=after,
             loosened=captured["loosened"],
             changed=captured["changed"],
         )
@@ -437,71 +417,13 @@ class SettingsService:
     def _utilization(self, caps: RiskCaps) -> RiskUtilization:
         """Read-only utilization; never seeds or writes anything.
 
-        Only the account row, its open positions, and the equity computed from
-        them feed the snapshot. The lifetime trade-log totals are not a daily
-        loss measurement, so no utilization metric consumes them and this path
-        never performs the unbounded ``trade_logs`` scan that
-        ``PaperAccountService.closed_totals`` costs. ``summary`` is not used for
-        the same reason; an account that does not exist stays unavailable rather
-        than being seeded as a GET side effect.
+        The defensive read model (corrupt account/position payload policy)
+        lives in :mod:`oft.application.risk_utilization`; this method only
+        decides whether a snapshot is meaningful for this service.
         """
-        if self._settings is None or self._store.get_paper_account(DEFAULT_ACCOUNT_ID) is None:
-            return _unavailable_utilization(caps, "paper account is not initialized")
-        paper = PaperAccountService(settings=self._settings, store=self._store, clock=self._clock)
-        account = paper.account()
-        positions = list(paper.positions())
-        equity, view = compute_equity(Decimal(account.balance), positions)
-        stale = tuple(str(name) for name in view.stale_inputs)
-        quality = "PARTIAL" if stale else "COMPLETE"
-        measured: dict[str, RiskUtilizationMetric] = {}
-
-        per_trade = _max_position_number(positions, "risk_pct")
-        leverage = _max_position_number(positions, "leverage")
-        notional, notional_complete = _position_notional(positions)
-        notional_pct: float | None = None
-        if notional is not None and equity > 0 and notional_complete:
-            notional_pct = float(notional / equity * Decimal("100"))
-
-        measured["per_trade_risk_pct"] = _metric(caps, "per_trade_risk_pct", per_trade, quality)
-        measured["max_concurrent_positions"] = _metric(
-            caps,
-            "max_concurrent_positions",
-            float(len(positions)),
-            quality,
-        )
-        # Lifetime realized PnL is not a daily-loss measurement. Until a
-        # per-UTC-day source exists (the entry gate records the same gap), the
-        # metric is unavailable rather than a mislabelled lifetime figure.
-        measured["daily_loss_pct"] = RiskUtilizationMetric(
-            used=None,
-            cap=_cap_float(caps, "daily_loss_pct"),
-            unit=_RISK_CAP_UNITS["daily_loss_pct"],
-            source="none",
-            quality="UNAVAILABLE",
-            note=_DAILY_LOSS_NOTE,
-        )
-        measured["max_leverage"] = _metric(caps, "max_leverage", leverage, quality)
-        measured["max_notional_pct"] = _metric(
-            caps,
-            "max_notional_pct",
-            notional_pct,
-            quality if notional_pct is not None else "UNAVAILABLE",
-        )
-        for field in _UNMEASURED_RISK_CAPS:
-            measured[field] = RiskUtilizationMetric(
-                used=None,
-                cap=_cap_float(caps, field),
-                unit=_RISK_CAP_UNITS[field],
-                source="none",
-                quality="UNAVAILABLE",
-                note=_UNMEASURED_NOTE,
-            )
-        return RiskUtilization(
-            source="paper_account",
-            quality=quality,
-            stale_inputs=stale,
-            metrics={field: measured[field] for field in CAP_FIELDS},
-        )
+        if self._settings is None:
+            return unavailable_utilization(caps, "paper account is not initialized")
+        return build_risk_utilization(self._store, caps)
 
     def validate_settings(self) -> dict[str, Any]:
         """Validate the effective setting without writing anything."""
@@ -647,87 +569,6 @@ def _validation_details(errors: list[str]) -> list[dict[str, Any]]:
         )
         details.append({"field": field, "code": code, "message": message})
     return details
-
-
-def _cap_float(caps: RiskCaps, field: str) -> float:
-    return float(getattr(caps, field))
-
-
-def _decimal(value: object) -> Decimal | None:
-    if value is None or value == "":
-        return None
-    try:
-        parsed = Decimal(str(value))
-    except (ArithmeticError, TypeError, ValueError):
-        return None
-    return parsed if parsed.is_finite() else None
-
-
-def _max_position_number(positions: list[dict[str, Any]], key: str) -> float:
-    """The largest finite numeric ``key`` across open positions (0 when none)."""
-    values: list[float] = []
-    for position in positions:
-        raw = position.get(key)
-        if raw is None or isinstance(raw, bool):
-            continue
-        try:
-            number = float(raw)
-        except (TypeError, ValueError):
-            continue
-        if math.isfinite(number):
-            values.append(number)
-    return max(values, default=0.0)
-
-
-def _position_notional(positions: list[dict[str, Any]]) -> tuple[Decimal | None, bool]:
-    """Signed-agnostic position notional and whether every mark was readable."""
-    total = Decimal("0")
-    for position in positions:
-        size = _decimal(position.get("size"))
-        mark = _decimal(position.get("mark_price"))
-        if size is None or mark is None:
-            return None, False
-        total += abs(size * mark)
-    return total, True
-
-
-def _metric(caps: RiskCaps, field: str, used: float | None, quality: str) -> RiskUtilizationMetric:
-    if used is None:
-        return RiskUtilizationMetric(
-            used=None,
-            cap=_cap_float(caps, field),
-            unit=_RISK_CAP_UNITS[field],
-            source="none",
-            quality="UNAVAILABLE",
-            note="no usable measurement in the paper account",
-        )
-    return RiskUtilizationMetric(
-        used=used,
-        cap=_cap_float(caps, field),
-        unit=_RISK_CAP_UNITS[field],
-        source="paper_account",
-        quality=quality,
-        note=None,
-    )
-
-
-def _unavailable_utilization(caps: RiskCaps, reason: str) -> RiskUtilization:
-    metrics: dict[str, RiskUtilizationMetric] = {}
-    for field in CAP_FIELDS:
-        metrics[field] = RiskUtilizationMetric(
-            used=None,
-            cap=_cap_float(caps, field),
-            unit=_RISK_CAP_UNITS[field],
-            source="none",
-            quality="UNAVAILABLE",
-            note=_UNMEASURED_NOTE if field in _UNMEASURED_RISK_CAPS else reason,
-        )
-    return RiskUtilization(
-        source="none",
-        quality="UNAVAILABLE",
-        stale_inputs=(reason,),
-        metrics=metrics,
-    )
 
 
 def resolve_schedule_state_overlay(

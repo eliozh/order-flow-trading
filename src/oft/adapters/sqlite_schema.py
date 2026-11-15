@@ -33,7 +33,7 @@ from oft.domain.prompts import (
 _LOGGER = logging.getLogger(__name__)
 
 
-_SCHEMA_VERSION = 26
+_SCHEMA_VERSION = 27
 # ``PRAGMA journal_mode=WAL`` needs an exclusive lock and does not reliably
 # consult the busy handler, so a concurrent initializer can still see
 # SQLITE_BUSY with the timeout installed. Retry the switch briefly.
@@ -579,6 +579,12 @@ _V26_DDL: tuple[str, ...] = (
     f"CREATE TABLE IF NOT EXISTS config ({_CONFIG_DEFINITION});",
     "CREATE INDEX IF NOT EXISTS config_updated_at ON config(updated_at);",
 )
+# v27: the reverse-scan lookup used to resolve the newest audit event of one
+# type. Additive and idempotent; the fresh schema carries the same statement so
+# both paths cannot drift.
+_V27_DDL: tuple[str, ...] = (
+    "CREATE INDEX IF NOT EXISTS audit_events_event_type_seq ON audit_events(event_type, seq DESC);",
+)
 _OPPORTUNITY_CONDITION_INDEX_NAMES = (
     "opportunity_conditions_opportunity",
     "opportunity_conditions_type",
@@ -821,6 +827,7 @@ _SCHEMA_SQL = f"""
         event_hash TEXT NOT NULL,
         payload_json TEXT NOT NULL
     );
+    {_V27_DDL[0]}
     -- D7 hardening: the chain is append-only in the database itself; an
     -- application bug (or a casual writer) cannot rewrite or remove a row.
     DROP TRIGGER IF EXISTS audit_events_no_update;
@@ -2317,6 +2324,29 @@ def _migrate_v26(connection: sqlite3.Connection) -> None:
         raise
 
 
+def _migrate_v27(connection: sqlite3.Connection) -> None:
+    """Add the ``(event_type, seq DESC)`` audit lookup index (slice 34).
+
+    Additive and idempotent: a populated v26 database keeps every audit row and
+    gains the index used to resolve the newest event of one type in O(log n).
+    A database without the append-only ``audit_events`` table is left untouched;
+    the fresh schema creates the same index next to the table.
+    """
+    if not _table_exists(connection, "audit_events"):
+        return
+    if connection.in_transaction:
+        connection.commit()
+    connection.execute("BEGIN IMMEDIATE")
+    try:
+        for statement in _V27_DDL:
+            connection.execute(statement)
+        connection.execute("COMMIT")
+    except Exception:
+        if connection.in_transaction:
+            connection.execute("ROLLBACK")
+        raise
+
+
 def _opportunity_conditions_pk(
     connection: sqlite3.Connection,
 ) -> tuple[str, ...]:
@@ -2486,7 +2516,7 @@ def _enable_wal(connection: sqlite3.Connection) -> None:
 
 
 def initialize_database(settings: Settings) -> None:
-    """Create the data directory and the schema, currently v26.
+    """Create the data directory and the schema, currently v27.
 
     v19 adds the trigger snapshot provenance columns (``snapshot_hash``,
     ``as_of``, ``data_quality``, ``condition_count``) and backfills them from
@@ -2503,7 +2533,9 @@ def initialize_database(settings: Settings) -> None:
     ``trade_logs.review_decision_id`` link (indexed), preserving every existing
     trade-log row and payload. v26 adds the additive ``config`` key/value table
     (``key`` primary key plus an ``updated_at`` index) so runtime settings can
-    be persisted and audited in one transaction.
+    be persisted and audited in one transaction. v27 adds the additive
+    ``audit_events(event_type, seq DESC)`` index that makes the newest-event-of-
+    one-type lookup a bounded index seek instead of a growing reverse scan.
     """
     settings.data_dir.mkdir(parents=True, exist_ok=True)
     settings.data_dir.chmod(0o700)
@@ -2573,6 +2605,8 @@ def initialize_database(settings: Settings) -> None:
             _migrate_v25(connection)
         if _schema_version(connection) < 26 or not _migration_recorded(connection, 26):
             _migrate_v26(connection)
+        if _schema_version(connection) < 27 or not _migration_recorded(connection, 27):
+            _migrate_v27(connection)
         _ensure_opportunity_conditions_shape(connection)
         _ensure_funding_accruals_shape(connection)
         with connection:
@@ -2686,6 +2720,10 @@ def initialize_database(settings: Settings) -> None:
             connection.execute(
                 "INSERT OR IGNORE INTO schema_migrations (version, applied_at) VALUES (?, ?)",
                 (26, "2026-11-15T00:00:00.000Z"),
+            )
+            connection.execute(
+                "INSERT OR IGNORE INTO schema_migrations (version, applied_at) VALUES (?, ?)",
+                (27, "2026-11-15T12:00:00.000Z"),
             )
             _seed_prompt_defaults(connection)
             _ensure_reports_symbol_index(connection)

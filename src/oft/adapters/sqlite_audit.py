@@ -138,12 +138,13 @@ class SqliteAuditMixin:
         return _row_to_audit(row) if row is not None else None
 
     def last_audit_event_of_type(self, event_type: str) -> AuditEventRecord | None:
-        """The newest event of one type via a reverse-``seq`` scan.
+        """The newest event of one type via the v27 lookup index.
 
-        There is no ``event_type`` index in schema v26, so SQLite walks the
-        ``seq`` index backwards and table-looks-up each row until the newest
-        match; with no matching event it scans the whole appended chain.
-        Metadata-only callers use the ``system_state`` row instead.
+        Schema v27 indexes ``audit_events(event_type, seq DESC)``, so SQLite
+        seeks straight to the newest matching row instead of walking the whole
+        ``seq`` chain backwards. With no matching event the seek still visits
+        only that type's index range. Metadata-only callers can use the
+        ``system_state`` row instead.
         """
         connection = self._connect_read_only()
         if connection is None:

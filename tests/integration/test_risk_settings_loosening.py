@@ -93,7 +93,10 @@ def test_every_loosening_direction_requires_confirmation(tmp_path: Path, field: 
         assert refused.status_code == 422, refused.text
         error = refused.json()["error"]
         assert error["code"] == "VALIDATION_FAILED"
-        assert any(detail["field"] == field for detail in error["details"])
+        detail = next(item for item in error["details"] if item["field"] == field)
+        assert detail["code"] == "confirmation_required"
+        assert detail["before"] == getattr(DEFAULT_CAPS, field)
+        assert detail["after"] == LOOSER[field]
         assert all(detail["code"] == "confirmation_required" for detail in error["details"])
         assert store.get_system_state(RISK_CAPS_STATE_KEY) is None
         assert store.list_audit_events() == ()

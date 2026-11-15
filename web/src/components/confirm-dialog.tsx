@@ -75,6 +75,16 @@ export function ConfirmDialog({
     return null
   }
 
+  // Both controls stay focusable while the confirmed PUT is in flight: native
+  // ``disabled`` blurs the active element to ``<body>`` in real browsers and
+  // takes the whole modal out of the focus trap. ``aria-disabled`` plus these
+  // guards keep the busy state honest without losing focus.
+  function handleConfirm(): void {
+    if (!busy) {
+      onConfirm()
+    }
+  }
+
   return createPortal(
     <div
       className="dialog-overlay"
@@ -91,7 +101,13 @@ export function ConfirmDialog({
         <p className="status-message" id={DESCRIPTION_ID}>
           {description}
         </p>
-        <div className="table-wrap risk-diff-wrap">
+        <div
+          className="table-wrap risk-diff-wrap"
+          role="region"
+          // eslint-disable-next-line jsx-a11y/no-noninteractive-tabindex -- keyboard-scrollable diff table
+          tabIndex={0}
+          aria-label="上限变更前后对比"
+        >
           <table className="data risk-diff" aria-label="上限变更前后对比">
             <thead>
               <tr>
@@ -120,10 +136,21 @@ export function ConfirmDialog({
           audit，记录 before/after。取消不会写入任何变更。
         </p>
         <div className="action-row" style={{ justifyContent: 'flex-end', marginTop: 16 }}>
-          <button type="button" className="btn" data-autofocus disabled={busy} onClick={onCancel}>
+          <button
+            type="button"
+            className="btn"
+            data-autofocus
+            aria-disabled={busy || undefined}
+            onClick={requestClose}
+          >
             {cancelLabel}
           </button>
-          <button type="button" className="btn" disabled={busy} onClick={onConfirm}>
+          <button
+            type="button"
+            className="btn"
+            aria-disabled={busy || undefined}
+            onClick={handleConfirm}
+          >
             {busy ? '保存中…' : confirmLabel}
           </button>
         </div>

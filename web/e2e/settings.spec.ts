@@ -226,6 +226,33 @@ interface RiskAuditEvent {
   loosened: string[]
 }
 
+/**
+ * Delete the persisted risk-cap row so a journey starts from env defaults.
+ *
+ * The tighten and loosen journeys would otherwise inherit each other's caps;
+ * deleting the one `system_state.risk_caps` row makes every journey independent
+ * and keeps the audit-count assertions relative to a post-reset count.
+ */
+function resetRiskCaps(): void {
+  if (!DATA_DIR) {
+    throw new Error('OFT_E2E_SETTINGS_DATA_DIR is required for the settings journey')
+  }
+  const script = [
+    'import os, sqlite3',
+    'database = os.path.join(os.environ["OFT_DATA_DIR"], "oft.db")',
+    'connection = sqlite3.connect(database)',
+    'connection.execute("DELETE FROM system_state WHERE key = \'risk_caps\'")',
+    'connection.commit()',
+    'connection.close()',
+    'print("reset")',
+  ].join('\n')
+  execFileSync('python3', ['-c', script], {
+    cwd: ROOT,
+    env: { ...process.env, OFT_DATA_DIR: DATA_DIR },
+    encoding: 'utf8',
+  })
+}
+
 /** Read the persisted RISK_CAPS_UPDATED audit chain (oldest first). */
 function riskAuditEvents(): RiskAuditEvent[] {
   if (!DATA_DIR) {
@@ -676,6 +703,7 @@ test('tightens a risk cap with the keyboard and audits exactly one change', asyn
   test.setTimeout(60_000)
   const diagnostics = collectDiagnostics(page)
   await page.setViewportSize({ width: 1440, height: 900 })
+  resetRiskCaps()
   await authenticate(page)
   await page.goto('/settings/risk')
 
@@ -741,12 +769,13 @@ test('requires a diff confirmation to loosen and never writes on cancel or inlin
   test.setTimeout(90_000)
   const diagnostics = collectDiagnostics(page)
   await page.setViewportSize({ width: 1440, height: 900 })
+  resetRiskCaps()
   await authenticate(page)
   await page.goto('/settings/risk')
   await expect(page.getByRole('heading', RISK_HEADING)).toBeVisible()
 
   const stateBefore = await readRisk(page)
-  expect(stateBefore.caps.per_trade_risk_pct).toBe(0.5)
+  expect(stateBefore.caps.per_trade_risk_pct).toBe(0.8)
   const countsBefore = databaseCounts()
 
   // Loosening opens the diff dialog; Escape cancels and writes nothing.
@@ -760,16 +789,22 @@ test('requires a diff confirmation to loosen and never writes on cancel or inlin
   await expect(dialog).toBeVisible()
   await expect(dialog.getByRole('table', { name: '上限变更前后对比' })).toBeVisible()
   await expect(dialog).toContainText('单笔风险 %')
-  await expect(dialog).toContainText('0.5')
+  await expect(dialog).toContainText('0.8')
   await expect(dialog).toContainText('1')
   expect(databaseCounts()).toEqual(countsBefore)
 
-  // The kill switch stays outside the inert shell and is the final tab stop:
-  // Shift+Tab from 取消 reaches the ACTIVATE control, then Tab returns.
+  // The kill switch stays outside the inert shell and joins the cycle: the
+  // diff region is the dialog's first tab stop, so Shift+Tab from 取消 reaches
+  // it, the next Shift+Tab wraps to the ACTIVATE control, and Tab returns.
   const cancel = dialog.getByRole('button', { name: '取消' })
+  const diffRegion = dialog.getByRole('region', { name: '上限变更前后对比' })
   await expect(cancel).toBeFocused()
   await page.keyboard.press('Shift+Tab')
+  await expect(diffRegion).toBeFocused()
+  await page.keyboard.press('Shift+Tab')
   await expect(page.locator('[data-kill-switch-action="activate"]')).toBeFocused()
+  await page.keyboard.press('Tab')
+  await expect(diffRegion).toBeFocused()
   await page.keyboard.press('Tab')
   await expect(cancel).toBeFocused()
 
@@ -779,7 +814,7 @@ test('requires a diff confirmation to loosen and never writes on cancel or inlin
   // Focus returns to the control that opened the dialog, never lost to <body>.
   await expect(perTrade).toBeFocused()
   expect(databaseCounts()).toEqual(countsBefore)
-  expect((await readRisk(page)).caps.per_trade_risk_pct).toBe(0.5)
+  expect((await readRisk(page)).caps.per_trade_risk_pct).toBe(0.8)
 
   // The draft is retained; saving again opens the dialog, and confirming writes.
   await page.keyboard.press('Enter')
@@ -788,10 +823,46 @@ test('requires a diff confirmation to loosen and never writes on cancel or inlin
     path: path.join(SCREENS_DIR, 'settings-risk-loosen-dialog-1440.png'),
     fullPage: true,
   })
+
+  // Hold the confirmed PUT in flight so the modal's busy focus contract is
+  // observable in a real browser: native ``disabled`` would blur the control to
+  // <body>, so the buttons must stay enabled with ``aria-disabled`` instead.
+  await page.route('**/api/v1/settings/risk', async (route, request) => {
+    if (request.method() !== 'PUT') {
+      await route.continue()
+      return
+    }
+    await new Promise((resolve) => setTimeout(resolve, 400))
+    await route.continue()
+  })
   await dialog.getByRole('button', { name: '确认放宽' }).click()
 
+  const busyState = await page.evaluate(() => {
+    const panel = document.querySelector('[role="dialog"]')
+    const buttons = panel ? Array.from(panel.querySelectorAll('button')) : []
+    const confirm = buttons.find((button) => button.textContent?.includes('保存中'))
+    const cancel = buttons.find((button) => button.textContent?.includes('取消'))
+    return {
+      focusInsideDialog: document.activeElement?.closest('[role="dialog"]') !== null,
+      confirmAriaDisabled: confirm?.getAttribute('aria-disabled') ?? null,
+      cancelAriaDisabled: cancel?.getAttribute('aria-disabled') ?? null,
+      confirmNativeDisabled: confirm?.hasAttribute('disabled') ?? null,
+      cancelNativeDisabled: cancel?.hasAttribute('disabled') ?? null,
+    }
+  })
+  expect(busyState).toEqual({
+    focusInsideDialog: true,
+    confirmAriaDisabled: 'true',
+    cancelAriaDisabled: 'true',
+    confirmNativeDisabled: false,
+    cancelNativeDisabled: false,
+  })
+
+  // Let the delayed PUT finish before removing the interception: unroute while
+  // the handler is still sleeping makes its ``route.continue()`` invalid.
   await expect(page.getByTestId('settings-risk-save-visible')).toContainText('audit 已写入')
   await expect(dialog).toBeHidden()
+  await page.unroute('**/api/v1/settings/risk')
   const loosened = await readRisk(page)
   expect(loosened.caps.per_trade_risk_pct).toBe(1)
   const afterConfirm = databaseCounts()
@@ -803,7 +874,7 @@ test('requires a diff confirmation to loosen and never writes on cancel or inlin
   expect(confirmedEvents).toHaveLength(countsBefore.risk_audit + 1)
   const confirmed = confirmedEvents[confirmedEvents.length - 1]
   expect(confirmed.actorId).toBe('web')
-  expect(confirmed.before.per_trade_risk_pct).toBe(0.5)
+  expect(confirmed.before.per_trade_risk_pct).toBe(0.8)
   expect(confirmed.after.per_trade_risk_pct).toBe(1)
   expect(confirmed.loosened).toContain('per_trade_risk_pct')
 
@@ -875,6 +946,7 @@ test('replays risk idempotency and rejects a different payload under the same ke
 }) => {
   const diagnostics = collectDiagnostics(page)
   await page.setViewportSize({ width: 1440, height: 900 })
+  resetRiskCaps()
   await authenticate(page)
 
   const key = 'e2e-risk-replay-key'
@@ -904,6 +976,7 @@ test('renders the risk screen at 375/768/1440 and reports no axe violations', as
   const diagnostics = collectDiagnostics(page)
   fs.mkdirSync(SCREENS_DIR, { recursive: true })
   await page.setViewportSize({ width: 1440, height: 900 })
+  resetRiskCaps()
   await authenticate(page)
   await page.goto('/settings/risk')
   await expect(page.getByRole('heading', RISK_HEADING)).toBeVisible()

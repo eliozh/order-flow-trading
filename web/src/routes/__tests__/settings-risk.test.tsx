@@ -530,6 +530,321 @@ describe('SettingsRiskPage', () => {
     await screen.findByTestId('risk-source')
     expect(fetch).toHaveBeenCalledTimes(2)
   })
+
+  it('keeps a busy confirmation focusable instead of native-disabling its controls', async () => {
+    let resolveConfirm: ((envelope: RiskSettingsEnvelope) => void) | undefined
+    const update = vi
+      .fn<
+        (caps: Partial<RiskCaps>, confirm: boolean, key: string) => Promise<RiskSettingsEnvelope>
+      >()
+      .mockRejectedValueOnce(confirmationRefusal())
+      .mockImplementationOnce(
+        () =>
+          new Promise<RiskSettingsEnvelope>((resolve) => {
+            resolveConfirm = resolve
+          }),
+      )
+    await renderLoaded({ update })
+
+    changeCap(/单笔风险 %/, '1.0')
+    fireEvent.click(screen.getByRole('button', { name: '保存风控' }))
+    const dialog = await screen.findByRole('dialog', { name: '确认放宽风险上限' })
+
+    const confirm = within(dialog).getByRole('button', { name: '确认放宽' })
+    confirm.focus()
+    fireEvent.click(confirm)
+
+    const busyConfirm = await within(dialog).findByRole('button', { name: '保存中…' })
+    const cancel = within(dialog).getByRole('button', { name: '取消' })
+
+    // Native disabling blurs the active control to <body> in real browsers, so
+    // the busy state is announced with ``aria-disabled`` only.
+    expect(busyConfirm).not.toBeDisabled()
+    expect(busyConfirm).not.toHaveAttribute('disabled')
+    expect(cancel).not.toBeDisabled()
+    expect(cancel).not.toHaveAttribute('disabled')
+    expect(busyConfirm).toHaveAttribute('aria-disabled', 'true')
+    expect(cancel).toHaveAttribute('aria-disabled', 'true')
+    expect(document.activeElement).not.toBe(document.body)
+    expect(document.activeElement?.closest('[role="dialog"]')).not.toBeNull()
+
+    resolveConfirm?.(
+      riskEnvelope(riskData({ caps: { ...BASE_CAPS, per_trade_risk_pct: 1 }, source: 'user' })),
+    )
+    await waitFor(() => expect(screen.queryByRole('dialog')).toBeNull())
+  })
+
+  it('marks the diff table as a labelled keyboard-scrollable region', async () => {
+    const update = vi.fn(async () => {
+      throw confirmationRefusal()
+    })
+    await renderLoaded({ update })
+
+    changeCap(/单笔风险 %/, '1.0')
+    fireEvent.click(screen.getByRole('button', { name: '保存风控' }))
+    await screen.findByRole('dialog', { name: '确认放宽风险上限' })
+
+    const region = screen.getByRole('region', { name: '上限变更前后对比' })
+    expect(region).toHaveAttribute('tabindex', '0')
+    expect(within(region).getByRole('table', { name: '上限变更前后对比' })).toBeInTheDocument()
+  })
+
+  it('keeps the save announcer outside the inert app shell while the dialog is open', async () => {
+    const update = vi.fn(async () => {
+      throw confirmationRefusal()
+    })
+    render(
+      <div className="app-shell">
+        <SettingsRiskPage
+          fetchRiskSettingsFn={async () => riskEnvelope(riskData())}
+          updateRiskSettingsFn={update}
+          idempotencyKeyFn={() => 'risk-key'}
+          clearIdempotencyKeyFn={vi.fn()}
+          rotateIdempotencyKeyFn={() => 'rotated-risk-key'}
+        />
+      </div>,
+    )
+    await screen.findByTestId('risk-source')
+
+    changeCap(/单笔风险 %/, '1.0')
+    fireEvent.click(screen.getByRole('button', { name: '保存风控' }))
+    await screen.findByRole('dialog', { name: '确认放宽风险上限' })
+
+    const shell = document.querySelector('.app-shell')
+    expect(shell).not.toBeNull()
+    expect(Array.from(shell?.children ?? []).every((child) => child.hasAttribute('inert'))).toBe(
+      true,
+    )
+    const announcer = screen.getByTestId('settings-risk-save-status')
+    expect(announcer.closest('[inert]')).toBeNull()
+    expect(shell?.contains(announcer)).toBe(false)
+  })
+
+  it('builds the confirmation diff from the 422 details and lists only loosened caps', async () => {
+    const update = vi.fn(async () => {
+      throw new SettingsApiError(
+        'loosening per_trade_risk_pct requires confirmation',
+        'VALIDATION_FAILED',
+        {
+          httpStatus: 422,
+          details: [
+            {
+              field: 'per_trade_risk_pct',
+              code: 'confirmation_required',
+              message: 'loosening per_trade_risk_pct requires confirmation',
+              before: 0.75,
+              after: 1.2,
+            },
+          ],
+        },
+      )
+    })
+    await renderLoaded({ update })
+
+    // The patch changes a tightening too, but only the server's flagged
+    // loosening may appear in the safety dialog.
+    changeCap(/单笔风险 %/, '1.2')
+    changeCap(/杠杆上限 x/, '4')
+    fireEvent.click(screen.getByRole('button', { name: '保存风控' }))
+
+    const dialog = await screen.findByRole('dialog', { name: '确认放宽风险上限' })
+    expect(update).toHaveBeenCalledWith(
+      { per_trade_risk_pct: 1.2, max_leverage: 4 },
+      false,
+      'risk-key',
+    )
+    const table = within(dialog).getByRole('table', { name: '上限变更前后对比' })
+    expect(
+      within(table)
+        .getAllByRole('cell')
+        .map((cell) => cell.textContent),
+    ).toEqual(['0.75', '1.2'])
+    expect(within(dialog).queryByText('杠杆上限 x')).toBeNull()
+  })
+
+  it('falls back to the mounted caps and submitted patch when details lack before/after', async () => {
+    const update = vi.fn(async () => {
+      throw confirmationRefusal()
+    })
+    await renderLoaded({ update })
+
+    changeCap(/单笔风险 %/, '1.0')
+    fireEvent.click(screen.getByRole('button', { name: '保存风控' }))
+
+    const dialog = await screen.findByRole('dialog', { name: '确认放宽风险上限' })
+    const table = within(dialog).getByRole('table', { name: '上限变更前后对比' })
+    expect(
+      within(table)
+        .getAllByRole('cell')
+        .map((cell) => cell.textContent),
+    ).toEqual(['0.8', '1'])
+  })
+
+  it('reports an unknown outcome and the retry note for a transport failure', async () => {
+    const update = vi.fn(async () => {
+      throw new Error('network down')
+    })
+    const clear = vi.fn()
+    const rotate = vi.fn(() => 'rotated-risk-key')
+    await renderLoaded({ update, clear, rotate })
+
+    changeCap(/单笔风险 %/, '0.5')
+    fireEvent.click(screen.getByRole('button', { name: '保存风控' }))
+
+    const alert = await screen.findByRole('alert')
+    expect(alert).toHaveTextContent('结果未知')
+    expect(alert).toHaveTextContent('同一 Idempotency-Key')
+    expect(
+      screen.getByText('上一次保存结果未知；重试会使用同一 Idempotency-Key 重放，不会重复写入。'),
+    ).toBeInTheDocument()
+    expect(screen.queryByTestId('settings-risk-save-visible')).toBeNull()
+    // A possibly-committed plain save must keep its key so the retry replays it.
+    expect(clear).not.toHaveBeenCalled()
+    expect(rotate).not.toHaveBeenCalled()
+  })
+
+  it('rotates the idempotency key on a 409 conflict and asks for a retry', async () => {
+    const update = vi.fn(async () => {
+      throw new SettingsApiError('idempotency conflict', 'IDEMPOTENCY_CONFLICT', {
+        httpStatus: 409,
+      })
+    })
+    const rotate = vi.fn(() => 'rotated-risk-key')
+    const clear = vi.fn()
+    await renderLoaded({ update, rotate, clear })
+
+    changeCap(/单笔风险 %/, '0.5')
+    fireEvent.click(screen.getByRole('button', { name: '保存风控' }))
+
+    const alert = await screen.findByRole('alert')
+    expect(alert).toHaveTextContent('请求冲突')
+    expect(alert).toHaveTextContent('已生成新的 Idempotency-Key')
+    expect(rotate).toHaveBeenCalledTimes(1)
+    expect(clear).not.toHaveBeenCalled()
+  })
+
+  it('retires the key but leaks no state or focus after a deferred save settles post-unmount', async () => {
+    const consoleError = vi.spyOn(console, 'error').mockImplementation(() => {})
+    try {
+      let resolveUpdate: ((envelope: RiskSettingsEnvelope) => void) | undefined
+      const update = vi.fn(
+        () =>
+          new Promise<RiskSettingsEnvelope>((resolve) => {
+            resolveUpdate = resolve
+          }),
+      )
+      const clear = vi.fn()
+      const { unmount } = render(
+        <SettingsRiskPage
+          fetchRiskSettingsFn={async () => riskEnvelope(riskData())}
+          updateRiskSettingsFn={update}
+          idempotencyKeyFn={() => 'risk-key'}
+          clearIdempotencyKeyFn={clear}
+          rotateIdempotencyKeyFn={() => 'rotated-risk-key'}
+        />,
+      )
+      await screen.findByTestId('risk-source')
+
+      changeCap(/单笔风险 %/, '0.5')
+      fireEvent.click(screen.getByRole('button', { name: '保存风控' }))
+      await waitFor(() => expect(update).toHaveBeenCalledTimes(1))
+      expect(clear).not.toHaveBeenCalled()
+
+      unmount()
+      resolveUpdate?.(
+        riskEnvelope(riskData({ caps: { ...BASE_CAPS, per_trade_risk_pct: 0.5 }, source: 'user' })),
+      )
+      await new Promise((resolve) => setTimeout(resolve, 0))
+
+      // The success path retires the key before its mounted guard, but nothing
+      // observable may leak into an unmounted page: no status, no alert, and
+      // no post-settle focus move.
+      expect(clear).toHaveBeenCalledTimes(1)
+      expect(consoleError).not.toHaveBeenCalled()
+      expect(document.getElementById('settings-risk-heading')).toBeNull()
+      expect(screen.queryByTestId('settings-risk-save-status')).toBeNull()
+      expect(screen.queryByTestId('settings-risk-save-visible')).toBeNull()
+      expect(screen.queryByRole('alert')).toBeNull()
+      expect(document.activeElement).toBe(document.body)
+    } finally {
+      consoleError.mockRestore()
+    }
+  })
+
+  it('rotates the key and gives accurate guidance when the confirmed save fails', async () => {
+    const update = vi
+      .fn<
+        (caps: Partial<RiskCaps>, confirm: boolean, key: string) => Promise<RiskSettingsEnvelope>
+      >()
+      .mockRejectedValueOnce(confirmationRefusal())
+      .mockRejectedValueOnce(new Error('socket closed'))
+    const rotate = vi.fn(() => 'rotated-risk-key')
+    const clear = vi.fn()
+    await renderLoaded({ update, rotate, clear })
+
+    changeCap(/单笔风险 %/, '1.0')
+    fireEvent.click(screen.getByRole('button', { name: '保存风控' }))
+    const dialog = await screen.findByRole('dialog', { name: '确认放宽风险上限' })
+    fireEvent.click(within(dialog).getByRole('button', { name: '确认放宽' }))
+
+    await waitFor(() => expect(screen.queryByRole('dialog')).toBeNull())
+    const alert = await screen.findByRole('alert')
+    expect(alert).toHaveTextContent('结果未知')
+    expect(alert).toHaveTextContent('已生成新的 Idempotency-Key')
+    // The form's plain-save retry would resend this key with ``confirm: false``
+    // (guaranteed 409), so the misleading same-key replay copy must not render.
+    expect(alert).not.toHaveTextContent('同一 Idempotency-Key')
+    expect(
+      screen.getByText(
+        '上一次确认保存结果未知；已生成新的 Idempotency-Key。请重新保存并在确认对话框中再次确认。',
+      ),
+    ).toBeInTheDocument()
+    expect(
+      screen.queryByText('上一次保存结果未知；重试会使用同一 Idempotency-Key 重放，不会重复写入。'),
+    ).toBeNull()
+    expect(screen.queryByTestId('settings-risk-save-visible')).toBeNull()
+    // One rotation supplied the confirmed request key; the ambiguous outcome
+    // rotates again so the next save starts on a fresh key.
+    expect(rotate).toHaveBeenCalledTimes(2)
+    expect(update).toHaveBeenNthCalledWith(
+      2,
+      { per_trade_risk_pct: 1.0 },
+      true,
+      'rotated-risk-key',
+    )
+  })
+
+  it('does not call the API when the form is saved unchanged', async () => {
+    const update = vi.fn(async () => riskEnvelope(riskData()))
+    await renderLoaded({ update })
+
+    fireEvent.click(screen.getByRole('button', { name: '保存风控' }))
+
+    await waitFor(() =>
+      expect(screen.getByTestId('settings-risk-save-visible')).toHaveTextContent('未变更'),
+    )
+    expect(screen.getByTestId('settings-risk-save-visible')).toHaveTextContent('没有保存任何值')
+    expect(update).not.toHaveBeenCalled()
+  })
+
+  it('restores focus to the element that opened the dialog when it is cancelled', async () => {
+    const update = vi.fn(async () => {
+      throw confirmationRefusal()
+    })
+    await renderLoaded({ update })
+
+    const capInput = screen.getByRole('spinbutton', { name: /单笔风险 %/ })
+    capInput.focus()
+    changeCap(/单笔风险 %/, '1.0')
+    fireEvent.click(screen.getByRole('button', { name: '保存风控' }))
+    await screen.findByRole('dialog', { name: '确认放宽风险上限' })
+    await waitFor(() => expect(screen.getByRole('button', { name: '取消' })).toHaveFocus())
+
+    fireEvent.click(screen.getByRole('button', { name: '取消' }))
+
+    await waitFor(() => expect(screen.queryByRole('dialog')).toBeNull())
+    expect(capInput).toHaveFocus()
+  })
 })
 
 describe('risk route', () => {

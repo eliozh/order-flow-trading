@@ -1274,12 +1274,10 @@ class StorePort(Protocol):
     def last_audit_event_of_type(self, event_type: str) -> AuditEventRecord | None:
         """The newest chained event of one type, or ``None``.
 
-        This is a reverse-``seq`` scan over the append-only chain: schema v26
-        indexes only the primary key and ``seq``, so it walks backwards until
-        the first matching row and degenerates to a full table scan when no
-        event of that type has ever been written. Callers on hot metadata paths
-        should prefer ``get_system_state_updated_at`` (which reads the
-        ``system_state`` row) rather than scanning the chain.
+        Schema v27 indexes ``audit_events(event_type, seq DESC)``, so this is a
+        bounded index seek even when no event of that type has ever been
+        written. Callers on hot metadata paths may still prefer
+        ``get_system_state_updated_at`` (which reads the ``system_state`` row).
         """
         ...
 
