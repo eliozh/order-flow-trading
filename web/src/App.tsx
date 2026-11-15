@@ -18,6 +18,9 @@ import { ScanDetailPage } from './routes/scan-detail'
 import { ScansPage } from './routes/scans'
 import { SettingsPage } from './routes/settings'
 import { SettingsLLMPage } from './routes/settings-llm'
+import { SettingsPromptDetailPage } from './routes/settings-prompt-detail'
+import { SettingsPromptHistoryPage } from './routes/settings-prompt-history'
+import { SettingsPromptsPage } from './routes/settings-prompts'
 import { SettingsRiskPage } from './routes/settings-risk'
 import { SettingsScanPage } from './routes/settings-scan'
 import { SymbolInspectorPage } from './routes/symbol-inspector'
@@ -88,6 +91,12 @@ export default function App() {
               <SettingsScanPage />
             ) : route.isSettingsLlm ? (
               <SettingsLLMPage />
+            ) : route.isSettingsPromptHistory && route.promptId !== null ? (
+              <SettingsPromptHistoryPage key={route.promptId} promptId={route.promptId} />
+            ) : route.isSettingsPromptDetail && route.promptId !== null ? (
+              <SettingsPromptDetailPage key={route.promptId} promptId={route.promptId} />
+            ) : route.isSettingsPrompts ? (
+              <SettingsPromptsPage />
             ) : route.isSettingsRisk ? (
               <SettingsRiskPage />
             ) : route.isSettings ? (

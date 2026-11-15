@@ -18,6 +18,7 @@ from oft.api.schemas.settings import (
     LLMKeyUpdate,
     LLMSettingsData,
     LLMSettingsUpdate,
+    PromptSettingsData,
     RiskSettingsData,
     RiskSettingsUpdate,
     ScanSettingsData,
@@ -26,6 +27,11 @@ from oft.api.schemas.settings import (
     mutation_openapi,
 )
 from oft.application.entry_service import RiskCapsError
+from oft.application.prompt_service import (
+    USER_PROMPT_ROLES,
+    PromptService,
+    secret_values_from_settings,
+)
 from oft.application.secrets_service import SecretsService, SecretStoreUnavailable
 from oft.application.settings_service import SettingsService
 from oft.config import ConfigError
@@ -69,6 +75,15 @@ def _secrets(request: Request) -> SecretsService:
         store=container.store,
         settings=base,
         clock=container.clock,
+    )
+
+
+def _prompt_service(request: Request) -> PromptService:
+    container = request.app.state.container
+    return PromptService(
+        store=container.store,
+        clock=container.clock,
+        secret_values=secret_values_from_settings(container.settings),
     )
 
 
@@ -368,6 +383,37 @@ def delete_llm_key(
         raise ApiError("VALIDATION_FAILED", exc.message, details=exc.details) from exc
     except SecretStoreUnavailable as exc:
         raise ApiError("CONFIG_INVALID", exc.message) from exc
+
+
+# -- Prompt template aggregate (slice 36, F10b): list-only --------------------
+
+
+@router.get(
+    "/api/v1/settings/prompts",
+    response_model=Envelope[PromptSettingsData],
+    responses=ERROR_RESPONSES,
+)
+def list_prompt_settings(request: Request) -> dict[str, Any]:
+    """The four USER prompt roles with their active version metadata.
+
+    Deliberately list-only and read-only: no template body, hash, or credential
+    is returned, and no write is accepted here. Creating, activating, and
+    restoring versions stay on ``/api/v1/prompts``.
+    """
+    rows = _prompt_service(request).prompt_settings_rows()
+    items = [row.to_contract() for row in rows]
+    # A partial aggregate (1-3 of the four seeded roles) is reported as PARTIAL
+    # so seeded-template data loss is visible rather than silently "COMPLETE".
+    count = len(items)
+    data_quality = (
+        "MISSING" if count == 0 else "COMPLETE" if count == len(USER_PROMPT_ROLES) else "PARTIAL"
+    )
+    return success_envelope(
+        {"items": items, "total": count},
+        request_id=new_request_id(),
+        provenance="CALC",
+        data_quality=data_quality,
+    )
 
 
 __all__ = ["router"]

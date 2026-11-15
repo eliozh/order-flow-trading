@@ -1954,3 +1954,495 @@ test('LLM settings report no axe WCAG 2.1 A/AA violations', async ({ page }) => 
   expect(results.violations, `settings/llm axe violations:\n${summary.join('\n')}`).toEqual([])
   expectClean(diagnostics)
 })
+
+// -- Slice 36: prompt templates (F10b list, F10b.1 editor, F10b.2 history) ---
+
+const PROMPT_LIST_HEADING = { name: 'Prompt 模板', level: 1 } as const
+const PROMPT_EDITOR_HEADING = { name: 'Prompt 编辑器', level: 1 } as const
+const PROMPT_HISTORY_HEADING = { name: 'Prompt 版本历史', level: 1 } as const
+const PROMPT_ROLES = ['ANALYSIS', 'ENTRY_RECHECK', 'MANAGEMENT', 'REVIEW'] as const
+const PROMPT_IDS = ['analysis', 'entry_recheck', 'management', 'review'] as const
+
+const PROMPT_BODY = `Symbol: {{symbol}}
+Timeframe: {{timeframe}}
+<market_data>{{metrics}}</market_data>
+<knowledge>{{knowledge}}</knowledge>
+E2E PROMPT MARKER
+Respond with JSON matching this schema:
+{{schema}}
+`
+
+const PROMPT_HOSTILE_BODY = `${PROMPT_BODY}<script>alert(1)</script>
+<a href="javascript:alert(1)">click</a>
+`
+
+interface PromptSettingsItem {
+  prompt_id: string
+  role: string
+  active_version: number
+  author: string
+  updated_at: string
+  version_count: number
+  latest_version: number
+  required_variables: string[]
+  is_builtin_default: boolean
+}
+
+interface PromptSettingsPayload {
+  items: PromptSettingsItem[]
+  total: number
+}
+
+interface PromptVersionPayload {
+  prompt_id: string
+  version: number
+  status: 'ACTIVE' | 'DRAFT' | 'SUPERSEDED'
+  is_active: boolean
+  body: string
+  body_hash: string
+  required_variables: string[]
+  author: string
+  reason: string
+  is_default: boolean
+  created_at: string
+  system_prompt_id: string
+  system_prompt_version: number
+  system_prompt_hash: string
+  knowledge_artifact_hash: string | null
+}
+
+interface PromptDetailPayload {
+  prompt_id: string
+  role: string
+  kind: string
+  active_version: number
+  created_at: string
+  updated_at: string
+  versions: PromptVersionPayload[]
+}
+
+async function readPromptSettings(page: Page): Promise<PromptSettingsPayload> {
+  const response = await page.request.get('/api/v1/settings/prompts', {
+    headers: { Accept: 'application/json' },
+  })
+  expect(response.status(), 'GET /api/v1/settings/prompts').toBe(200)
+  const body = (await response.json()) as Envelope<PromptSettingsPayload>
+  expect(body.ok).toBe(true)
+  expect(body.data).not.toBeNull()
+  return body.data as PromptSettingsPayload
+}
+
+async function readPromptDetail(page: Page, promptId = 'analysis'): Promise<PromptDetailPayload> {
+  const response = await page.request.get(`/api/v1/prompts/${promptId}`, {
+    headers: { Accept: 'application/json' },
+  })
+  expect(response.status(), `GET /api/v1/prompts/${promptId}`).toBe(200)
+  const body = (await response.json()) as Envelope<PromptDetailPayload>
+  expect(body.ok).toBe(true)
+  expect(body.data).not.toBeNull()
+  return body.data as PromptDetailPayload
+}
+
+async function promptHeaders(page: Page, idempotencyKey: string): Promise<Record<string, string>> {
+  const csrf = await csrfToken(page)
+  return {
+    Accept: 'application/json',
+    'Content-Type': 'application/json',
+    'Idempotency-Key': idempotencyKey,
+    'X-CSRF-Token': csrf,
+    Origin: ORIGIN,
+  }
+}
+
+/** Create a NEW immutable version through the real prompt API. */
+async function postPromptVersion(
+  page: Page,
+  promptId: string,
+  body: string,
+  idempotencyKey: string,
+  activate = false,
+) {
+  return page.request.post(`/api/v1/prompts/${promptId}/versions`, {
+    headers: await promptHeaders(page, idempotencyKey),
+    data: { body, author: 'e2e-operator', reason: 'e2e prompt journey', activate },
+  })
+}
+
+async function expectAxeClean(page: Page, label: string): Promise<void> {
+  const tags = ['wcag2a', 'wcag2aa', 'wcag21a', 'wcag21aa']
+  const results = await new AxeBuilder({ page }).withTags(tags).analyze()
+  const summary = results.violations.map(
+    (violation) =>
+      `${violation.id} (${violation.impact ?? 'unknown'}): ${violation.nodes
+        .map((node) => node.target.join(' '))
+        .join(' | ')}`,
+  )
+  expect(results.violations, `${label} axe violations:\n${summary.join('\n')}`).toEqual([])
+}
+
+test('prompt list shows the four roles as built-in default v1 at 1440', async ({ page }) => {
+  test.setTimeout(60_000)
+  const diagnostics = collectDiagnostics(page)
+  await page.setViewportSize({ width: 1440, height: 900 })
+  await authenticate(page)
+  await page.goto('/settings/prompts')
+
+  await expect(page.getByRole('heading', PROMPT_LIST_HEADING)).toBeVisible()
+  await expect(page.locator('section.system-page')).toHaveAttribute('data-readonly', 'false')
+  await expect(page.getByTestId('prompts-builtin-banner')).toContainText('使用内置默认 v1')
+
+  const settings = await readPromptSettings(page)
+  expect(settings.items.map((item) => item.role)).toEqual([...PROMPT_ROLES])
+  expect(settings.items.map((item) => item.prompt_id)).toEqual([...PROMPT_IDS])
+  for (const item of settings.items) {
+    expect(item.active_version).toBe(1)
+    expect(item.author).toBe('system')
+    expect(item.version_count).toBe(1)
+    expect(item.is_builtin_default).toBe(true)
+    expect(item.updated_at).toMatch(UTC_TIME)
+    expect(item.required_variables).toContain('symbol')
+  }
+
+  for (const promptId of PROMPT_IDS) {
+    const row = page.getByTestId(`prompt-row-${promptId}`)
+    await expect(row).toBeVisible()
+    await expect(row.getByTestId(`prompt-active-${promptId}`)).toHaveText('v1 active')
+    await expect(row.getByTestId(`prompt-builtin-${promptId}`)).toHaveText('built-in default v1')
+    await expect(row.getByTestId(`prompt-author-${promptId}`)).toHaveText('system')
+    // The rendered author/time cell comes from the same active version.
+    const item = settings.items.find((entry) => entry.prompt_id === promptId)
+    await expect(row.getByTestId(`prompt-updated-${promptId}`)).toHaveText(
+      item?.updated_at as string,
+    )
+  }
+
+  await expectAxeClean(page, '/settings/prompts')
+  fs.mkdirSync(SCREENS_DIR, { recursive: true })
+  await page.screenshot({
+    path: path.join(SCREENS_DIR, 'settings-prompts-list-1440.png'),
+    fullPage: true,
+  })
+  expectClean(diagnostics)
+})
+
+test('prompt editor blocks a missing variable with zero writes and renders hostile text literally', async ({
+  page,
+}) => {
+  test.setTimeout(120_000)
+  const diagnostics = collectDiagnostics(page)
+  await page.setViewportSize({ width: 1440, height: 900 })
+  await authenticate(page)
+  await page.goto('/settings/prompts/analysis')
+  await expect(page.getByRole('heading', PROMPT_EDITOR_HEADING)).toBeVisible()
+
+  const versionPosts: string[] = []
+  page.on('request', (request) => {
+    if (
+      request.method() === 'POST' &&
+      new URL(request.url()).pathname === '/api/v1/prompts/analysis/versions'
+    ) {
+      versionPosts.push(request.postData() ?? '')
+    }
+  })
+
+  const textarea = page.locator('#prompt-body')
+  await expect(textarea).not.toBeEditable()
+  await expect(page.getByRole('button', { name: '保存为新版本' })).toBeDisabled()
+
+  // Editing is explicit; the body becomes editable and focus moves into it.
+  await page.getByRole('button', { name: '编辑' }).click()
+  await expect(textarea).toBeEditable()
+  await expect(textarea).toBeFocused()
+
+  // A missing required variable is blocked inline with no request at all.
+  const missing = PROMPT_BODY.replace(
+    '<market_data>{{metrics}}</market_data>',
+    '<market_data>metrics</market_data>',
+  )
+  await textarea.fill(missing)
+  await expect(page.getByText('缺少必需变量 {{metrics}}')).toBeVisible()
+  await page.getByRole('button', { name: '保存为新版本' }).click()
+  const summary = page.getByTestId('prompt-editor-error')
+  await expect(summary).toContainText('无法保存')
+  await expect(summary).toContainText('缺少必需变量 {{metrics}}')
+  await expect(summary).toBeFocused()
+  expect(versionPosts).toHaveLength(0)
+
+  // The preview is the ACTIVE version only; an unsaved hostile draft is never
+  // projected into it.
+  await textarea.fill(PROMPT_HOSTILE_BODY)
+  const preview = page.getByTestId('prompt-preview')
+  await expect(preview).toContainText('[redacted: symbol]')
+  await expect(preview).not.toContainText('E2E PROMPT MARKER')
+  await expect(preview.locator('script')).toHaveCount(0)
+  await expect(preview.locator('a')).toHaveCount(0)
+
+  // Saving creates a new DRAFT version; the active version is unchanged.
+  const before = await readPromptDetail(page)
+  await page.getByRole('button', { name: '保存为新版本' }).click()
+  const visible = page.getByTestId('prompt-editor-visible')
+  await expect(visible).toContainText('已创建 v')
+  await expect(visible).toContainText('DRAFT')
+  await expect(visible).toContainText('既有决策仍绑定其原始版本')
+  await expect(page.getByTestId('prompt-editor-status')).toContainText('已创建 v')
+  expect(versionPosts).toHaveLength(1)
+  expect(JSON.parse(versionPosts[0] as string).activate).toBe(false)
+
+  const after = await readPromptDetail(page)
+  expect(after.active_version).toBe(before.active_version)
+  expect(after.versions.length).toBe(before.versions.length + 1)
+  const latest = after.versions[after.versions.length - 1]
+  expect(latest.status).toBe('DRAFT')
+  expect(latest.body).toContain('<script>alert(1)</script>')
+  expect(latest.body).toContain('<a href="javascript:alert(1)">click</a>')
+
+  // Reload: the editor shows the active (unchanged) body, not the draft.
+  await page.reload()
+  await expect(page.getByRole('heading', PROMPT_EDITOR_HEADING)).toBeVisible()
+  const activeBody = after.versions.find(
+    (version) => version.version === after.active_version,
+  )?.body
+  await expect(page.locator('#prompt-body')).toHaveValue(activeBody as string)
+  await expect(page.locator('#prompt-body')).not.toBeEditable()
+
+  await expectAxeClean(page, '/settings/prompts/analysis')
+  fs.mkdirSync(SCREENS_DIR, { recursive: true })
+  await page.screenshot({
+    path: path.join(SCREENS_DIR, 'settings-prompt-editor-1440.png'),
+    fullPage: true,
+  })
+  expectClean(diagnostics)
+})
+
+test('prompt history renders text-only diffs, activates explicitly, and restores as a new version', async ({
+  page,
+}) => {
+  test.setTimeout(120_000)
+  const diagnostics = collectDiagnostics(page)
+  await page.setViewportSize({ width: 1440, height: 900 })
+  await authenticate(page)
+
+  // A custom active version makes the history and diff meaningful.
+  const createdResponse = await postPromptVersion(
+    page,
+    'analysis',
+    PROMPT_HOSTILE_BODY,
+    'e2e-prompt-history-create',
+    true,
+  )
+  expect(createdResponse.status()).toBe(201)
+  const created = ((await createdResponse.json()) as Envelope<PromptVersionPayload>)
+    .data as PromptVersionPayload
+  expect(created.status).toBe('ACTIVE')
+
+  // With the hostile body active, the redacted preview renders it literally:
+  // no script element, no anchor, no execution.
+  await page.goto('/settings/prompts/analysis')
+  await expect(page.getByRole('heading', PROMPT_EDITOR_HEADING)).toBeVisible()
+  const activePreview = page.getByTestId('prompt-preview')
+  await expect(activePreview).toContainText('<script>alert(1)</script>')
+  await expect(activePreview).toContainText('<a href="javascript:alert(1)">click</a>')
+  await expect(activePreview).toContainText('[redacted: symbol]')
+  await expect(activePreview.locator('script')).toHaveCount(0)
+  await expect(activePreview.locator('a')).toHaveCount(0)
+
+  await page.goto('/settings/prompts/analysis/history')
+  await expect(page.getByRole('heading', PROMPT_HISTORY_HEADING)).toBeVisible()
+  const activeRow = page.getByTestId(`prompt-version-${created.version}`)
+  await expect(activeRow).toContainText('ACTIVE')
+  await expect(activeRow).toContainText('e2e-operator')
+  await expect(page.getByTestId('prompt-version-1')).toContainText('built-in default')
+
+  // The default comparison is v1 -> active and stays literal text.
+  const diffBody = page.getByTestId('prompt-diff-body')
+  await expect(diffBody).toContainText('<script>alert(1)</script>')
+  await expect(diffBody.locator('script')).toHaveCount(0)
+  await expect(diffBody.locator('a')).toHaveCount(0)
+
+  // Activation is explicit and confirmed.
+  await page.getByRole('button', { name: '激活 v1' }).click()
+  const activateDialog = page.getByRole('dialog', { name: '激活 Prompt 版本' })
+  await expect(activateDialog).toBeVisible()
+  // The shared dialog is parameterized for version changes, not risk caps.
+  await expect(activateDialog.getByRole('table', { name: '版本变更前后对比' })).toBeVisible()
+  await expect(activateDialog).toContainText('v1')
+  await activateDialog.getByRole('button', { name: '激活' }).click()
+  await expect(page.getByTestId('prompt-history-visible')).toContainText('已激活 v1')
+  expect((await readPromptDetail(page)).active_version).toBe(1)
+
+  // Restore requires confirmation, shows the replaced active version, and a
+  // cancelled restore writes nothing.
+  const versionsBefore = (await readPromptDetail(page)).versions.length
+  await page.getByRole('button', { name: '恢复内置默认' }).click()
+  const restoreDialog = page.getByRole('dialog', { name: '恢复 Prompt 默认版本' })
+  await expect(restoreDialog).toContainText('当前 active 版本（被替换）')
+  await expect(restoreDialog).toContainText('v1')
+  await expect(restoreDialog).toContainText('新的 built-in default 版本（新建，DRAFT）')
+  await page.keyboard.press('Escape')
+  await expect(restoreDialog).toBeHidden()
+  expect((await readPromptDetail(page)).versions.length).toBe(versionsBefore)
+
+  await page.getByRole('button', { name: '恢复内置默认' }).click()
+  await restoreDialog.getByRole('button', { name: '恢复默认' }).click()
+  const restoreVisible = page.getByTestId('prompt-history-visible')
+  await expect(restoreVisible).toContainText('已创建 v')
+  await expect(restoreVisible).toContainText('将替换 active v1')
+
+  const afterRestore = await readPromptDetail(page)
+  expect(afterRestore.active_version).toBe(1)
+  const restored = afterRestore.versions[afterRestore.versions.length - 1]
+  expect(restored.status).toBe('DRAFT')
+  expect(restored.is_default).toBe(true)
+  expect(afterRestore.versions.length).toBe(versionsBefore + 1)
+
+  // The restored default only takes effect after an explicit activation.
+  const activateRestored = page.getByRole('button', { name: `激活 v${restored.version}` })
+  await expect(activateRestored).toBeVisible()
+  await activateRestored.click()
+  await page
+    .getByRole('dialog', { name: '激活 Prompt 版本' })
+    .getByRole('button', { name: '激活' })
+    .click()
+  await expect(restoreVisible).toContainText(`已激活 v${restored.version}`)
+  const final = await readPromptDetail(page)
+  expect(final.active_version).toBe(restored.version)
+  // History stays complete: every earlier version is still present.
+  expect(final.versions.length).toBe(versionsBefore + 1)
+
+  await expectAxeClean(page, '/settings/prompts/analysis/history')
+  fs.mkdirSync(SCREENS_DIR, { recursive: true })
+  await page.screenshot({
+    path: path.join(SCREENS_DIR, 'settings-prompt-history-1440.png'),
+    fullPage: true,
+  })
+  expectClean(diagnostics)
+})
+
+test('prompt screens are read-only at 375 and the editor is keyboard savable at 1440', async ({
+  page,
+  browser,
+}) => {
+  test.setTimeout(120_000)
+  const diagnostics = collectDiagnostics(page)
+  await page.setViewportSize({ width: 1440, height: 900 })
+  await authenticate(page)
+  await page.goto('/settings/prompts/analysis')
+  await expect(page.getByRole('heading', PROMPT_EDITOR_HEADING)).toBeVisible()
+  await expect(page.locator('section.system-page')).toHaveAttribute('data-readonly', 'false')
+
+  // Keyboard: list -> editor -> variable checklist -> save.
+  const isEditButton = () =>
+    page.evaluate(
+      () =>
+        document.activeElement instanceof HTMLElement &&
+        document.activeElement.textContent?.trim() === '编辑',
+    )
+  await tabUntil(page, isEditButton, 'the 编辑 control')
+  await page.keyboard.press('Enter')
+  await expect(page.locator('#prompt-body')).toBeFocused()
+  // author -> reason -> discard -> save
+  await page.keyboard.press('Tab')
+  await page.keyboard.press('Tab')
+  await page.keyboard.press('Tab')
+  await page.keyboard.press('Tab')
+  await expect(page.getByRole('button', { name: '保存为新版本' })).toBeFocused()
+  await page.keyboard.press('Enter')
+  await expect(page.getByTestId('prompt-editor-visible')).toContainText('已创建 v')
+  // The required-variable checklist stays in the same keyboard cycle.
+  const variableRegion = page.getByRole('region', { name: '必需变量检查' })
+  await tabUntil(
+    page,
+    () =>
+      page.evaluate(() => document.activeElement?.getAttribute('aria-label') === '必需变量检查'),
+    'the required-variable region',
+  )
+  await expect(variableRegion).toBeFocused()
+
+  // 768 stays editable for the whole list -> editor -> history journey.
+  await page.setViewportSize({ width: 768, height: 1024 })
+  await page.goto('/settings/prompts')
+  await expect(page.getByRole('heading', PROMPT_LIST_HEADING)).toBeVisible()
+  await expect(page.locator('section.system-page')).toHaveAttribute('data-readonly', 'false')
+  await expect(page.getByTestId('prompt-row-analysis')).toBeVisible()
+
+  await page.goto('/settings/prompts/analysis')
+  await expect(page.getByRole('heading', PROMPT_EDITOR_HEADING)).toBeVisible()
+  await expect(page.locator('section.system-page')).toHaveAttribute('data-readonly', 'false')
+  await expect(page.getByRole('button', { name: '编辑' })).toBeEnabled()
+
+  await page.goto('/settings/prompts/analysis/history')
+  await expect(page.getByRole('heading', PROMPT_HISTORY_HEADING)).toBeVisible()
+  await expect(page.locator('section.system-page')).toHaveAttribute('data-readonly', 'false')
+  await expect(page.getByRole('button', { name: '恢复内置默认' })).toBeEnabled()
+
+  fs.mkdirSync(SCREENS_DIR, { recursive: true })
+
+  const touchContext = await browser.newContext({
+    baseURL: BASE_URL,
+    hasTouch: true,
+    isMobile: true,
+    viewport: { width: 375, height: 812 },
+  })
+  const touchPage = await touchContext.newPage()
+  const touchDiagnostics = collectDiagnostics(touchPage)
+  try {
+    await authenticate(touchPage)
+
+    await touchPage.goto('/settings/prompts')
+    await expect(touchPage.getByRole('heading', PROMPT_LIST_HEADING)).toBeVisible()
+    await expect(touchPage.locator('section.system-page')).toHaveAttribute('data-readonly', 'true')
+    await expect(touchPage.locator('section.system-page').getByRole('note')).toContainText(
+      '在桌面端或 CLI 修改',
+    )
+    await expect(touchPage.getByTestId('prompt-row-analysis')).toBeVisible()
+    await touchPage.screenshot({
+      path: path.join(SCREENS_DIR, 'settings-prompts-list-375.png'),
+      fullPage: true,
+    })
+
+    await touchPage.goto('/settings/prompts/analysis')
+    await expect(touchPage.getByRole('heading', PROMPT_EDITOR_HEADING)).toBeVisible()
+    await expect(touchPage.locator('section.system-page')).toHaveAttribute('data-readonly', 'true')
+    await expect(touchPage.locator('section.system-page').getByRole('note')).toContainText(
+      '在桌面端或 CLI 修改',
+    )
+    await expect(touchPage.locator('#prompt-body')).not.toBeEditable()
+    await expect(touchPage.getByRole('button', { name: '编辑' })).toBeDisabled()
+    await expect(touchPage.getByRole('button', { name: '保存为新版本' })).toBeDisabled()
+    await expect(touchPage.getByTestId('prompt-preview')).toBeVisible()
+    await touchPage.screenshot({
+      path: path.join(SCREENS_DIR, 'settings-prompt-editor-375.png'),
+      fullPage: true,
+    })
+
+    await touchPage.goto('/settings/prompts/analysis/history')
+    await expect(touchPage.getByRole('heading', PROMPT_HISTORY_HEADING)).toBeVisible()
+    await expect(touchPage.locator('section.system-page')).toHaveAttribute('data-readonly', 'true')
+    await expect(touchPage.getByRole('button', { name: '恢复内置默认' })).toBeDisabled()
+    await expect(touchPage.getByTestId('prompt-version-1')).toBeVisible()
+
+    for (const pathName of [
+      '/settings/prompts',
+      '/settings/prompts/analysis',
+      '/settings/prompts/analysis/history',
+    ]) {
+      await touchPage.goto(pathName)
+      const widths = await touchPage.evaluate(() => ({
+        document: document.documentElement.scrollWidth,
+        viewport: window.innerWidth,
+      }))
+      expect(widths.document, `no horizontal overflow at 375 on ${pathName}`).toBeLessThanOrEqual(
+        widths.viewport,
+      )
+    }
+    await touchPage.screenshot({
+      path: path.join(SCREENS_DIR, 'settings-prompt-history-375.png'),
+      fullPage: true,
+    })
+  } finally {
+    await touchContext.close()
+  }
+
+  expectClean(diagnostics)
+  expectClean(touchDiagnostics)
+})

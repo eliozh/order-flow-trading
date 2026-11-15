@@ -8,6 +8,7 @@ from pydantic import BaseModel, ConfigDict, Field
 
 from oft.api.schemas.envelope import Envelope
 from oft.api.schemas.errors import ErrorBody, ErrorEnvelope, catalog_responses
+from oft.domain.prompts import PromptRole
 
 
 class ScanSettingsUpdate(BaseModel):
@@ -176,6 +177,28 @@ class LLMKeyStatusData(BaseModel):
     updated_by: str | None = None
 
 
+# -- slice 36: prompt templates (F10b), list-only read aggregate -------------
+
+
+class PromptSettingsRowData(BaseModel):
+    """One USER prompt role, metadata only (no body, hash, or secret)."""
+
+    prompt_id: str
+    role: PromptRole
+    active_version: int
+    author: str
+    updated_at: str
+    version_count: int
+    latest_version: int
+    required_variables: list[str]
+    is_builtin_default: bool
+
+
+class PromptSettingsData(BaseModel):
+    items: list[PromptSettingsRowData]
+    total: int
+
+
 _CATALOG_ERRORS = {
     400: ("IDEMPOTENCY_KEY_REQUIRED", "A state-changing settings request omitted Idempotency-Key."),
     401: ("AUTH_REQUIRED", "The local API credential is missing or invalid."),
@@ -228,6 +251,8 @@ __all__ = [
     "LLMRolesData",
     "LLMSettingsData",
     "LLMSettingsUpdate",
+    "PromptSettingsData",
+    "PromptSettingsRowData",
     "RiskSettingsData",
     "RiskSettingsUpdate",
     "RiskUtilizationData",

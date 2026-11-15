@@ -106,6 +106,14 @@ class RenderedPrompt:
 
 @dataclass(frozen=True)
 class PromptSummary:
+    """Legacy catalog row, kept to exactly these fields.
+
+    ``/api/v1/prompts`` and ``oft prompt list --json`` serialize this with
+    ``asdict()``; the F10b aggregate reads the active version through the
+    separate :meth:`PromptService.prompt_settings_rows` path instead of adding
+    fields here, so neither existing surface drifts.
+    """
+
     prompt_id: str
     role: PromptRole
     kind: PromptKind
@@ -113,6 +121,57 @@ class PromptSummary:
     version_count: int
     latest_version: int
     updated_at: str
+
+
+@dataclass(frozen=True)
+class PromptSettingsRow:
+    """One list-only row of the F10b prompt settings aggregate.
+
+    Metadata only: the template body, its hash, and every credential stay out
+    of this payload. Writes continue to go through ``/api/v1/prompts``.
+    """
+
+    prompt_id: str
+    role: PromptRole
+    active_version: int
+    author: str
+    updated_at: str
+    version_count: int
+    latest_version: int
+    required_variables: tuple[str, ...]
+    is_builtin_default: bool
+
+    def to_contract(self) -> dict[str, Any]:
+        return {
+            "prompt_id": self.prompt_id,
+            "role": self.role,
+            "active_version": self.active_version,
+            "author": self.author,
+            "updated_at": self.updated_at,
+            "version_count": self.version_count,
+            "latest_version": self.latest_version,
+            "required_variables": list(self.required_variables),
+            "is_builtin_default": self.is_builtin_default,
+        }
+
+
+# The four USER roles behind F10b, in presentation order. System prompts are
+# versioned separately and never appear in the settings aggregate.
+USER_PROMPT_ROLES: tuple[PromptRole, ...] = (
+    PromptRole.ANALYSIS,
+    PromptRole.ENTRY_RECHECK,
+    PromptRole.MANAGEMENT,
+    PromptRole.REVIEW,
+)
+
+
+def is_builtin_default(*, active_is_default: bool, version_count: int) -> bool:
+    """True only for a seeded family with no custom version at all.
+
+    A restored default is a *new* version, so ``is_default`` alone would claim
+    a built-in v1 after history has diverged; the version count is the guard.
+    """
+    return active_is_default and version_count == 1
 
 
 @dataclass(frozen=True)
@@ -282,6 +341,56 @@ class PromptService:
                 )
             )
         return tuple(summaries)
+
+    def prompt_settings_rows(self) -> tuple[PromptSettingsRow, ...]:
+        """The F10b aggregate: the four USER roles in fixed presentation order.
+
+        Kept deliberately separate from :meth:`list_templates` so the legacy
+        catalog/CLI contract stays byte-for-byte stable. Reads the active
+        version record directly (author, default flag, required variables).
+
+        A missing role is omitted rather than invented: the aggregate is a read
+        surface and must not fabricate a template. Seeded installs always have
+        all four.
+        """
+        templates = {
+            template.prompt_id: template for template in self._store.list_prompt_templates()
+        }
+        rows: list[PromptSettingsRow] = []
+        for role in USER_PROMPT_ROLES:
+            prompt_id = PROMPT_IDS[role]
+            template = templates.get(prompt_id)
+            if template is None:
+                continue
+            versions = self._store.list_prompt_versions(prompt_id)
+            active_record = next(
+                (record for record in versions if record.version == template.active_version),
+                None,
+            )
+            version_count = len(versions)
+            rows.append(
+                PromptSettingsRow(
+                    prompt_id=prompt_id,
+                    role=role,
+                    active_version=template.active_version,
+                    author=active_record.author if active_record is not None else "",
+                    updated_at=template.updated_at,
+                    version_count=version_count,
+                    latest_version=versions[-1].version if versions else 0,
+                    required_variables=(
+                        _parse_required(active_record.required_variables_json, role)
+                        if active_record is not None
+                        else REQUIRED_VARIABLES[role]
+                    ),
+                    is_builtin_default=is_builtin_default(
+                        active_is_default=(
+                            active_record.is_default if active_record is not None else False
+                        ),
+                        version_count=version_count,
+                    ),
+                )
+            )
+        return tuple(rows)
 
     def show(self, prompt_id: str) -> PromptDetail:
         resolved = resolve_prompt_id(prompt_id)
@@ -810,11 +919,14 @@ __all__ = [
     "PromptDetail",
     "PromptNotFoundError",
     "PromptService",
+    "PromptSettingsRow",
     "PromptSummary",
     "PromptValidationError",
     "PromptVersionMissingError",
     "PromptVersionView",
     "RenderedPrompt",
+    "USER_PROMPT_ROLES",
+    "is_builtin_default",
     "resolve_prompt_id",
     "secret_values_from_settings",
 ]
