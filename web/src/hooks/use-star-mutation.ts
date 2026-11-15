@@ -11,7 +11,7 @@
 import { useEffect, useRef, useState } from 'react'
 
 import { RequestTimeoutError } from '../api/request-timeout'
-import type { StarEnvelope } from '../api/watchlist'
+import { WatchlistOutcomeUnknownError, type StarEnvelope } from '../api/watchlist'
 
 export interface StarMutationHandlers {
   /** Show the requested state before the server answers. */
@@ -40,12 +40,19 @@ export interface StarMutation {
 }
 
 /**
- * A timeout or a network-level fetch failure leaves the outcome unknown.
- * ``TypeError`` is what ``fetch`` throws when the request never reached the
- * server. A typed API error is definitive and rolls back.
+ * A timeout, a network-level fetch failure, or an unusable 2xx body leaves the
+ * outcome unknown: the server may already have committed. ``TypeError`` is how
+ * ``fetch`` reports a network-level failure; the request may or may not have
+ * reached the server. ``WatchlistOutcomeUnknownError`` covers a body the client
+ * could not trust. A typed ``WatchlistApiError`` (non-2xx envelope) is
+ * definitive and rolls back.
  */
 export function isUnknownStarOutcome(cause: unknown): boolean {
-  return cause instanceof RequestTimeoutError || cause instanceof TypeError
+  return (
+    cause instanceof RequestTimeoutError ||
+    cause instanceof TypeError ||
+    cause instanceof WatchlistOutcomeUnknownError
+  )
 }
 
 export function useStarMutation(options: UseStarMutationOptions): StarMutation {

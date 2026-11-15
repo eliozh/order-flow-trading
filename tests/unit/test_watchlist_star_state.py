@@ -136,6 +136,37 @@ def test_unstarring_twice_is_a_noop_and_clears_starred_at_once(tmp_path: Path) -
     assert second.after == StarState(starred=False, starred_at=None)
     assert registry.get_star_state("BTCUSDT") == StarState(False, None)
     assert len(store.list_audit_events()) == 2
+    # The unstar direction's audit payload is asserted, not only the star one.
+    # ``list_audit_events`` is newest first, so index 0 is the unstar event.
+    bodies = [_audit_body(record) for record in store.list_audit_events()]
+    assert bodies[0]["payload"] == {
+        "symbol": "BTCUSDT",
+        "before": {"starred": True, "starred_at": NOW_TEXT},
+        "after": {"starred": False, "starred_at": None},
+    }
+
+
+def test_watchlist_snapshot_agrees_with_point_reads(tmp_path: Path) -> None:
+    registry, _, _ = _registry(tmp_path)
+    registry.set_star_with_audit("BTCUSDT", True, actor="web")
+    registry.set_star_with_audit("XAUUSDT", True, actor="web")
+
+    snapshot = registry.watchlist_snapshot(limit=2)
+
+    # The counts describe the whole registry even though the page is bounded.
+    assert snapshot.total == registry.count() == 3
+    assert snapshot.crypto_count == 2
+    assert snapshot.tradfi_count == 1
+    assert snapshot.starred_count == len(registry.list_starred()) == 2
+    # Rows are ordered tradifi ASC, symbol ASC and capped at the limit.
+    assert [entry.contract.symbol for entry in snapshot.entries] == ["BTCUSDT", "ETHUSDT"]
+    assert {entry.contract.symbol: entry.starred for entry in snapshot.entries} == {
+        "BTCUSDT": True,
+        "ETHUSDT": False,
+    }
+    assert snapshot.entries[0].starred_at == NOW_TEXT
+    assert snapshot.entries[1].starred_at is None
+    assert str(snapshot.entries[0].contract.tick_size) == "0.10"
 
 
 def test_unknown_symbol_returns_none_and_writes_no_audit(tmp_path: Path) -> None:

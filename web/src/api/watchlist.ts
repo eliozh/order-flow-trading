@@ -31,8 +31,9 @@ export interface WatchlistData {
   groups: WatchlistGroup[]
   total: number
   rows: WatchlistRow[]
-  starred_count: number
   next_scan_count: number
+  /** The bounded page omits registry rows; ``total`` is still the true count. */
+  truncated: boolean
   star_mutation: boolean
 }
 
@@ -56,6 +57,23 @@ export class WatchlistApiError extends Error {
   }
 }
 
+/**
+ * A 2xx response whose body could not be trusted as a confirmation.
+ *
+ * The server may already have committed the change (a truncated stream, or an
+ * unexpected ``ok``/``data`` shape), so the caller must refetch rather than
+ * roll back. ``parseCause`` keeps the original JSON parse cause.
+ */
+export class WatchlistOutcomeUnknownError extends Error {
+  readonly parseCause: unknown
+
+  constructor(message: string, parseCause: unknown) {
+    super(message)
+    this.name = 'WatchlistOutcomeUnknownError'
+    this.parseCause = parseCause
+  }
+}
+
 async function requestEnvelope<T>(
   path: string,
   init: RequestInit,
@@ -64,29 +82,81 @@ async function requestEnvelope<T>(
 ): Promise<ApiEnvelope<T>> {
   const response = await fetchWithTimeout(path, init, signal, timeoutMs)
   let envelope: ApiEnvelope<T> | null = null
+  let parseCause: unknown = null
   try {
     envelope = (await response.json()) as ApiEnvelope<T>
-  } catch {
+  } catch (cause: unknown) {
     envelope = null
+    parseCause = cause
   }
-  if (!response.ok || envelope === null || !envelope.ok || envelope.data === null) {
+  if (!response.ok) {
+    // Only a non-2xx response is a definitive refusal; use the envelope error
+    // when it parsed, otherwise the HTTP status.
     const error: ApiError | null = envelope?.error ?? null
     throw new WatchlistApiError(
       error?.message ?? `Watchlist request failed with HTTP ${response.status}`,
       error?.code,
     )
   }
+  if (envelope === null) {
+    throw new WatchlistOutcomeUnknownError(
+      `Watchlist response could not be parsed (HTTP ${response.status}).`,
+      parseCause,
+    )
+  }
+  if (envelope.ok !== true || envelope.data === null) {
+    throw new WatchlistOutcomeUnknownError(
+      'Watchlist response did not confirm the request.',
+      parseCause,
+    )
+  }
   return envelope
+}
+
+/** A ``StarResult`` whose fields can be trusted as a confirmation. */
+function isStarResult(data: unknown): data is StarResult {
+  if (typeof data !== 'object' || data === null) {
+    return false
+  }
+  const candidate = data as Record<string, unknown>
+  return (
+    typeof candidate.symbol === 'string' &&
+    typeof candidate.starred === 'boolean' &&
+    (candidate.starred_at === null || typeof candidate.starred_at === 'string')
+  )
+}
+
+/** A ``WatchlistData`` page the route can render without inventing state. */
+function isWatchlistData(data: unknown): data is WatchlistData {
+  if (typeof data !== 'object' || data === null) {
+    return false
+  }
+  const candidate = data as Record<string, unknown>
+  return (
+    Array.isArray(candidate.rows) &&
+    typeof candidate.total === 'number' &&
+    typeof candidate.next_scan_count === 'number' &&
+    typeof candidate.truncated === 'boolean'
+  )
 }
 
 /** Read the grouped registry, every row's star state, and the next-scan count. */
 export async function fetchWatchlist(signal?: AbortSignal): Promise<WatchlistEnvelope> {
-  return requestEnvelope<WatchlistData>(
+  const envelope = await requestEnvelope<WatchlistData>(
     WATCHLIST_PATH,
     { method: 'GET', headers: { Accept: 'application/json' }, credentials: 'same-origin' },
     signal,
     READ_TIMEOUT_MS,
   )
+  // A 2xx body with a valid envelope but an unusable page is not a usable
+  // load: the caller must treat it as a failure, never apply it as data.
+  if (!isWatchlistData(envelope.data)) {
+    throw new WatchlistOutcomeUnknownError(
+      'Watchlist response did not include a usable page.',
+      null,
+    )
+  }
+  return envelope
 }
 
 /** Star (POST) or unstar (DELETE) one symbol; the server is idempotent. */
@@ -95,7 +165,7 @@ export async function setStar(
   starred: boolean,
   signal?: AbortSignal,
 ): Promise<StarEnvelope> {
-  return requestEnvelope<StarResult>(
+  const envelope = await requestEnvelope<StarResult>(
     `${WATCHLIST_PATH}/${encodeURIComponent(symbol)}`,
     {
       method: starred ? 'POST' : 'DELETE',
@@ -105,4 +175,13 @@ export async function setStar(
     signal,
     MUTATION_TIMEOUT_MS,
   )
+  // Never confirm from a body the client cannot trust: the server may or may
+  // not have committed, so the caller refetches instead.
+  if (!isStarResult(envelope.data)) {
+    throw new WatchlistOutcomeUnknownError(
+      'Watchlist response did not confirm the star change.',
+      null,
+    )
+  }
+  return envelope
 }

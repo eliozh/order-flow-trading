@@ -6,7 +6,7 @@ Covers the ``symbols`` table plus its row mapper and value helpers.
 from __future__ import annotations
 
 import sqlite3
-from contextlib import closing
+from contextlib import closing, suppress
 from decimal import Decimal
 from typing import Any
 
@@ -20,6 +20,8 @@ from oft.ports.store import (
     StarState,
     StoreUnavailableError,
     SymbolUpsertResult,
+    WatchlistEntry,
+    WatchlistSnapshot,
 )
 
 
@@ -27,6 +29,11 @@ def _like_pattern(query: str) -> str:
     """Escape LIKE metacharacters so a literal ``_``/``%`` does not match all."""
     escaped = query.strip().lower().replace("\\", "\\\\").replace("%", "\\%").replace("_", "\\_")
     return f"%{escaped}%"
+
+
+def _count(connection: sqlite3.Connection, sql: str) -> int:
+    row = connection.execute(sql).fetchone()
+    return int(row[0]) if row is not None else 0
 
 
 _SYMBOL_SPEC_COLUMNS = _SYMBOLS_COLUMNS[:-1]
@@ -288,6 +295,52 @@ class SymbolStoreMixin(SqliteConnectionMixin, SqliteAuditMixin):
         finally:
             connection.close()
         return tuple(_row_to_symbol(row) for row in rows)
+
+    def watchlist_snapshot(self, *, limit: int) -> WatchlistSnapshot:
+        """One read transaction: bounded rows plus true registry counts.
+
+        A ``BEGIN`` read transaction makes the row page and the ``COUNT(*)``
+        values one consistent snapshot, so a concurrent ingest or star change
+        cannot make the counts disagree with the rows they accompany. Returns
+        an empty snapshot when the database does not exist yet (read-only
+        diagnostics never create it).
+        """
+        connection = self._connect_read_only()
+        if connection is None:
+            return WatchlistSnapshot(
+                entries=(), total=0, crypto_count=0, tradfi_count=0, starred_count=0
+            )
+        try:
+            connection.execute("BEGIN")
+            rows = connection.execute(
+                "SELECT * FROM symbols ORDER BY tradifi ASC, symbol ASC LIMIT ?", (limit,)
+            ).fetchall()
+            total = _count(connection, "SELECT COUNT(*) FROM symbols")
+            crypto_count = _count(connection, "SELECT COUNT(*) FROM symbols WHERE tradifi = 0")
+            tradfi_count = _count(connection, "SELECT COUNT(*) FROM symbols WHERE tradifi = 1")
+            starred_count = _count(connection, "SELECT COUNT(*) FROM symbols WHERE starred = 1")
+            connection.execute("COMMIT")
+        except sqlite3.Error as exc:
+            with suppress(sqlite3.Error):
+                connection.execute("ROLLBACK")
+            raise StoreUnavailableError(f"watchlist snapshot read failed: {exc}") from exc
+        finally:
+            connection.close()
+        entries = tuple(
+            WatchlistEntry(
+                contract=_row_to_symbol(row),
+                starred=bool(row["starred"]),
+                starred_at=row["starred_at"],
+            )
+            for row in rows
+        )
+        return WatchlistSnapshot(
+            entries=entries,
+            total=total,
+            crypto_count=crypto_count,
+            tradfi_count=tradfi_count,
+            starred_count=starred_count,
+        )
 
 
 def _row_to_symbol(row: sqlite3.Row) -> SymbolContract:

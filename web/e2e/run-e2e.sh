@@ -181,7 +181,7 @@ for symbol in BTCUSDT ETHUSDT XAUUSDT; do
 done
 if ! curl -fsS -H "Authorization: Bearer $SYMBOLS_TOKEN" \
   "$SYMBOLS_BASE_URL/api/v1/watchlist" |
-  jq -e '.ok == true and .data.starred_count == 3 and .data.next_scan_count == 3' >/dev/null; then
+  jq -e '.ok == true and .data.next_scan_count == 3 and .data.truncated == false' >/dev/null; then
   echo "E2E watchlist stars were not seeded on the symbol daemon" >&2
   exit 1
 fi

@@ -20,7 +20,13 @@ from oft.domain.symbols import (
 )
 from oft.domain.time import utc_timestamp
 from oft.ports.clock import ClockPort
-from oft.ports.store import StarChangeResult, StarState, StorePort, SymbolUpsertResult
+from oft.ports.store import (
+    StarChangeResult,
+    StarState,
+    StorePort,
+    SymbolUpsertResult,
+    WatchlistSnapshot,
+)
 
 _SYMBOL_PATTERN = re.compile(r"^[A-Z0-9]{2,24}$")
 _TRADING = "TRADING"
@@ -373,6 +379,10 @@ class SymbolRegistry:
 
     def list_starred(self) -> tuple[SymbolContract, ...]:
         return self._store.list_starred()
+
+    def watchlist_snapshot(self, *, limit: int) -> WatchlistSnapshot:
+        """Bounded watchlist rows plus true registry totals from one snapshot."""
+        return self._store.watchlist_snapshot(limit=limit)
 
     def count(self) -> int:
         return self._store.count_symbols()

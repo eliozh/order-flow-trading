@@ -22,6 +22,7 @@ interface WatchlistState {
   state: 'loading' | 'ready' | 'error'
   rows: WatchlistRow[]
   total: number
+  truncated: boolean
   message?: string
 }
 
@@ -29,6 +30,7 @@ const EMPTY_STATE: WatchlistState = {
   state: 'loading',
   rows: [],
   total: 0,
+  truncated: false,
 }
 
 function SymbolGroup({
@@ -36,12 +38,14 @@ function SymbolGroup({
   items,
   pending,
   narrow,
+  disabled,
   onToggle,
 }: {
   label: string
   items: WatchlistRow[]
   pending: ReadonlySet<string>
   narrow: boolean
+  disabled: boolean
   onToggle: (row: WatchlistRow) => void
 }) {
   if (items.length === 0) {
@@ -86,6 +90,7 @@ function SymbolGroup({
                         symbol={item.symbol}
                         starred={item.starred}
                         pending={isPending}
+                        disabled={disabled}
                         onToggle={() => onToggle(item)}
                       />
                     )}
@@ -124,6 +129,17 @@ export function WatchlistPage({
   const [announcement, setAnnouncement] = useState('')
   const [mutationError, setMutationError] = useState<string | null>(null)
   const [attempt, setAttempt] = useState(0)
+  // True from a Retry click until the retry fetch settles; keeps the Retry
+  // control mounted (aria-busy/aria-disabled) so focus is never dropped.
+  const [retrying, setRetrying] = useState(false)
+  // The server's authoritative next-scan count for a truncated page.
+  // Optimistic toggles apply +-1, a rollback reverses it, and every successful
+  // load replaces it. When the page is complete the display derives the count
+  // from the row flags instead, so the two can never disagree.
+  const [serverNextScanCount, setServerNextScanCount] = useState(0)
+  // Symbols whose mutation outcome is unknown: their rows stay visible until
+  // the refetch replaces the row set, so focus is not unmounted mid-refetch.
+  const [unresolved, setUnresolved] = useState<ReadonlySet<string>>(new Set())
   const narrow = useNarrowCompact(isNarrow)
   const fetcherRef = useRef(fetchWatchlistFn)
   const setStarRef = useRef(setStarFn)
@@ -131,6 +147,16 @@ export function WatchlistPage({
   const orderRef = useRef<string[]>([])
   const snapshotsRef = useRef<Map<string, WatchlistRow>>(new Map())
   const announcedQueryRef = useRef('')
+  // Scope every focus query to this page; a stale frame must never touch
+  // another route.
+  const containerRef = useRef<HTMLElement | null>(null)
+  const focusFrameRef = useRef<number | null>(null)
+  // What should receive focus after the next ready load: a symbol, 'retry',
+  // or null (nothing).
+  const pendingFocusRef = useRef<string | null>(null)
+  // The exact unknown-outcome alert message this refetch was started for. A
+  // load success clears only that message; a newer rollback alert survives.
+  const unknownOutcomeErrorRef = useRef<string | null>(null)
 
   useEffect(() => {
     fetcherRef.current = fetchWatchlistFn
@@ -150,31 +176,95 @@ export function WatchlistPage({
         if (!data) {
           throw new Error('Watchlist response was empty.')
         }
-        // The rendered count derives from these rows; the server's
-        // next_scan_count is only an initial cross-check of the same value.
-        setLoad({ state: 'ready', rows: data.rows, total: data.total })
-        const included = data.rows.filter((row) => row.starred).length
+        // next_scan_count is the server's authoritative inclusive count; the
+        // optimistic toggle deltas are provisional until this replaces them.
+        setLoad({
+          state: 'ready',
+          rows: data.rows,
+          total: data.total,
+          truncated: data.truncated,
+        })
+        setServerNextScanCount(data.next_scan_count)
+        setUnresolved(new Set())
+        setRetrying(false)
+        // Clear the alert this refetch was started for, but never a newer
+        // mutation alert that landed while the request was in flight.
+        const unknownOutcomeMessage = unknownOutcomeErrorRef.current
+        setMutationError((current) =>
+          current !== null && current === unknownOutcomeMessage ? null : current,
+        )
+        unknownOutcomeErrorRef.current = null
         setAnnouncement(
-          included === 0
+          data.next_scan_count === 0
             ? 'No symbols are included in the next scan.'
-            : `${included} of ${data.total} symbols included in next scan.`,
+            : `${data.next_scan_count} of ${data.total} symbols included in next scan.`,
         )
       })
       .catch((cause: unknown) => {
         if (controller.signal.aborted) {
           return
         }
-        setLoad({
+        // Keep any previously loaded rows visible while showing the error.
+        setLoad((previous) => ({
+          ...previous,
           state: 'error',
-          rows: [],
-          total: 0,
           message: cause instanceof Error ? cause.message : 'Unknown error',
-        })
+        }))
+        setRetrying(false)
       })
     return () => {
       controller.abort()
     }
   }, [attempt])
+
+  // Restore focus once a refetch resolves: the originating toggle, else the
+  // first results region, else the search box. The target is consumed once.
+  useEffect(() => {
+    if (load.state !== 'ready') {
+      return
+    }
+    const target = pendingFocusRef.current
+    if (target === null) {
+      return
+    }
+    pendingFocusRef.current = null
+    const container = containerRef.current
+    if (container === null) {
+      return
+    }
+    // Never steal focus the user moved while the refetch was in flight. The
+    // Retry button unmounts on success (activeElement falls back to <body>),
+    // so the intended restore still happens when nobody else owns focus.
+    const active = document.activeElement
+    if (active instanceof HTMLElement && active !== document.body && active.isConnected) {
+      return
+    }
+    if (target !== 'retry') {
+      const toggles = Array.from(container.querySelectorAll<HTMLElement>('[data-star-symbol]'))
+      const match = toggles.find((element) => element.dataset.starSymbol === target)
+      if (match) {
+        match.focus()
+        return
+      }
+    }
+    const region = container.querySelector<HTMLElement>('.table-wrap')
+    if (region) {
+      region.focus()
+      return
+    }
+    container.querySelector<HTMLElement>('#symbol-search')?.focus()
+  }, [load.state])
+
+  // A pending focus frame must not fire after unmount or a route change.
+  useEffect(
+    () => () => {
+      if (focusFrameRef.current !== null) {
+        cancelAnimationFrame(focusFrameRef.current)
+        focusFrameRef.current = null
+      }
+    },
+    [],
+  )
 
   const mutation = useStarMutation({
     setStarFn: (symbol, starred) => setStarRef.current(symbol, starred),
@@ -183,6 +273,7 @@ export function WatchlistPage({
     onAnnounce: setAnnouncement,
     onOptimistic: (symbol, starred) => {
       setMutationError(null)
+      setServerNextScanCount((current) => current + (starred ? 1 : -1))
       setLoad((current) => ({
         ...current,
         rows: current.rows.map((item) =>
@@ -207,6 +298,8 @@ export function WatchlistPage({
     onRollback: (symbol, cause) => {
       const snapshot = snapshotsRef.current.get(symbol)
       if (snapshot) {
+        // Undo the optimistic delta in the opposite direction.
+        setServerNextScanCount((current) => current + (snapshot.starred ? 1 : -1))
         setLoad((current) => ({
           ...current,
           rows: current.rows.map((item) => (item.symbol === symbol ? snapshot : item)),
@@ -217,24 +310,38 @@ export function WatchlistPage({
       snapshotsRef.current.delete(symbol)
     },
     onUnknownOutcome: (symbol) => {
-      setMutationError(`Could not confirm the ${symbol} change; refreshing the watchlist.`)
+      const message = `Could not confirm the ${symbol} change; refreshing the watchlist.`
+      unknownOutcomeErrorRef.current = message
+      setMutationError(message)
+      // Keep the row (and its focused toggle) mounted until the refetch
+      // replaces the row set, then return focus to the originating toggle.
+      setUnresolved((current) => new Set(current).add(symbol))
+      pendingFocusRef.current = symbol
       snapshotsRef.current.delete(symbol)
       setAttempt((n) => n + 1)
     },
   })
 
   // A row being unstarred stays visible until the mutation resolves so the
-  // pending state and any rollback remain on screen.
-  const displayedRows = load.rows.filter((row) => row.starred || mutation.pending.has(row.symbol))
+  // pending state and any rollback remain on screen; an unresolved row also
+  // stays visible until the refetch replaces it.
+  const displayedRows = load.rows.filter(
+    (row) => row.starred || mutation.pending.has(row.symbol) || unresolved.has(row.symbol),
+  )
   const matched = filterSymbols(displayedRows, query)
   const groups = groupSymbols(matched)
   const searching = query.trim() !== ''
-  // Derived from the same rows the user sees, not separate state.
-  const nextScanCount = load.rows.filter((row) => row.starred).length
+  // Rows survive a refetch: they are shown when ready or while a previous page
+  // is still loaded, so the tables never blink out of the DOM.
+  const showRows = load.state === 'ready' || load.rows.length > 0
+  // A complete page's count must agree with the row flags it renders; only a
+  // truncated page needs the server's whole-registry count.
+  const rowStarredCount = load.rows.filter((item) => item.starred).length
+  const nextScanCount = load.truncated ? serverNextScanCount : rowStarredCount
   const countLabel = `${nextScanCount} of ${load.total} symbols included in next scan`
 
-  // One polite announcement for filter-result changes; the mount-time load
-  // summary above is the only other write to this region.
+  // One polite announcement for filter-result changes; filter results, load
+  // summaries, retry notices, and star successes all write here.
   useEffect(() => {
     if (load.state !== 'ready') {
       return
@@ -247,43 +354,66 @@ export function WatchlistPage({
     if (trimmed === '') {
       return
     }
-    setAnnouncement(
-      `${matched.length} of ${displayedRows.length} starred match “${trimmed}”.`,
-    )
+    setAnnouncement(`${matched.length} of ${displayedRows.length} starred match “${trimmed}”.`)
   }, [load.state, query, matched.length, displayedRows.length])
 
   function moveFocusAfterRemoval(removed: string): void {
+    const active = document.activeElement
+    // Only restore when the user was operating the removed control; a click
+    // that never focused it must leave focus alone.
+    if (!(active instanceof HTMLElement) || active.dataset.starSymbol !== removed) {
+      return
+    }
     const order = orderRef.current
     const index = order.indexOf(removed)
-    requestAnimationFrame(() => {
-      // Never steal focus the user has already moved elsewhere in this frame;
-      // a removed focused button falls back to <body>.
-      const active = document.activeElement
-      if (active !== null && active !== document.body) {
+    if (focusFrameRef.current !== null) {
+      cancelAnimationFrame(focusFrameRef.current)
+    }
+    focusFrameRef.current = requestAnimationFrame(() => {
+      focusFrameRef.current = null
+      const container = containerRef.current
+      if (container === null || !container.isConnected) {
         return
       }
-      const toggles = Array.from(
-        document.querySelectorAll<HTMLElement>('[data-star-symbol]'),
-      )
+      // Never steal focus the user has already moved elsewhere; only the
+      // removed (now detached) control, <body>, or nothing counts as ours.
+      const current = document.activeElement
+      if (
+        current instanceof HTMLElement &&
+        current !== document.body &&
+        current !== active &&
+        current.isConnected
+      ) {
+        return
+      }
+      const toggles = Array.from(container.querySelectorAll<HTMLElement>('[data-star-symbol]'))
       const find = (symbol: string): HTMLElement | undefined =>
         toggles.find((element) => element.dataset.starSymbol === symbol)
-      const after = order.slice(index + 1).map(find).find(Boolean)
-      const before = order
-        .slice(0, Math.max(0, index))
-        .reverse()
+      const after = order
+        .slice(index + 1)
         .map(find)
         .find(Boolean)
+      const before = order.slice(0, Math.max(0, index)).reverse().map(find).find(Boolean)
       const target = after ?? before
       if (target) {
         target.focus()
         return
       }
-      document.getElementById('symbol-search')?.focus()
+      container.querySelector<HTMLElement>('#symbol-search')?.focus()
     })
   }
 
+  function retry(): void {
+    setRetrying(true)
+    pendingFocusRef.current = 'retry'
+    setAnnouncement('Refreshing the watchlist…')
+    setAttempt((n) => n + 1)
+  }
+
   function toggle(row: WatchlistRow): void {
-    if (narrow || mutation.pending.has(row.symbol)) {
+    // No mutation may overlap a refetch: a request issued before the toggle
+    // commits could land later and desync rows from the count.
+    if (load.state !== 'ready' || narrow || mutation.pending.has(row.symbol)) {
       return
     }
     orderRef.current = displayedRows.map((item) => item.symbol)
@@ -293,6 +423,7 @@ export function WatchlistPage({
 
   return (
     <section
+      ref={containerRef}
       className="system-page"
       lang="en"
       aria-labelledby="watchlist-heading"
@@ -331,7 +462,7 @@ export function WatchlistPage({
       <section className="panel" aria-label="Symbol search">
         <div className="panel-head">
           <label htmlFor="symbol-search">Search symbols</label>
-          {load.state === 'ready' && (
+          {showRows && (
             <span className="mono-muted">
               {matched.length} of {displayedRows.length} starred
             </span>
@@ -349,22 +480,47 @@ export function WatchlistPage({
         </div>
       </section>
 
-      {load.state === 'ready' && (
+      {showRows && (
         <p className="status-message" data-testid="watchlist-count">
           {countLabel}
         </p>
       )}
 
-      {load.state === 'loading' && <p className="status-message">Loading symbol registry…</p>}
+      {showRows && load.truncated && (
+        <p className="status-message" data-testid="watchlist-truncation-note">
+          Showing first {load.rows.length} of {load.total} symbols.
+        </p>
+      )}
 
-      {load.state === 'error' && (
+      {load.state === 'loading' && (
+        <p className="status-message">
+          {retrying || load.rows.length > 0 ? 'Refreshing…' : 'Loading symbol registry…'}
+        </p>
+      )}
+
+      {(load.state === 'error' || (load.state === 'loading' && retrying)) && (
         <div>
-          <p className="status-message status-message--error" role="alert">
-            Watchlist unavailable: {load.message}
-          </p>
+          {load.state === 'error' && (
+            <p className="status-message status-message--error" role="alert">
+              Watchlist unavailable: {load.message}
+            </p>
+          )}
           {/* Read-only recovery: this is not a star mutation, so it stays
-              available at every width, including the 375 read-only surface. */}
-          <button type="button" className="control-btn" onClick={() => setAttempt((n) => n + 1)}>
+              available at every width, including the 375 read-only surface.
+              The control stays mounted through the retry (aria-disabled, not
+              native disabled) so focus survives until the load resolves. */}
+          <button
+            type="button"
+            className="control-btn"
+            aria-busy={retrying && load.state === 'loading' ? 'true' : undefined}
+            aria-disabled={retrying && load.state === 'loading' ? 'true' : undefined}
+            onClick={() => {
+              if (retrying && load.state === 'loading') {
+                return
+              }
+              retry()
+            }}
+          >
             Retry
           </button>
         </div>
@@ -376,7 +532,7 @@ export function WatchlistPage({
         </p>
       )}
 
-      {load.state === 'ready' && displayedRows.length === 0 && (
+      {load.state === 'ready' && displayedRows.length === 0 && nextScanCount === 0 && (
         <div className="panel">
           <div className="panel-head">
             <h2>No symbols in the next scan</h2>
@@ -393,27 +549,45 @@ export function WatchlistPage({
         </div>
       )}
 
+      {load.state === 'ready' &&
+        displayedRows.length === 0 &&
+        load.truncated &&
+        nextScanCount > 0 && (
+          <div className="panel">
+            <div className="panel-head">
+              <h2>Starred symbols are outside this page</h2>
+            </div>
+            <p className="panel-foot">
+              The next scan includes {nextScanCount} of {load.total} symbols, but none of them fall
+              in the first {load.rows.length} registry rows shown here. Manage them with the CLI
+              (<code>oft watchlist add|remove</code>) or a narrower registry page.
+            </p>
+          </div>
+        )}
+
       {load.state === 'ready' && displayedRows.length > 0 && searching && matched.length === 0 && (
         <p className="status-message">
           No matches for “{query}”. Try an exact symbol such as BTCUSDT.
         </p>
       )}
 
-      {load.state === 'ready' && (
+      {showRows && (
         <SymbolGroup
           label="CRYPTO"
           items={groups.crypto}
           pending={mutation.pending}
           narrow={narrow}
+          disabled={load.state !== 'ready'}
           onToggle={toggle}
         />
       )}
-      {load.state === 'ready' && (
+      {showRows && (
         <SymbolGroup
           label="TRADFI"
           items={groups.tradfi}
           pending={mutation.pending}
           narrow={narrow}
+          disabled={load.state !== 'ready'}
           onToggle={toggle}
         />
       )}

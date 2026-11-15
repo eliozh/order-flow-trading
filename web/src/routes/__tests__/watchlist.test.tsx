@@ -6,6 +6,7 @@ import type { ApiMeta } from '../../api/status'
 import type { SymbolContract } from '../../api/symbols'
 import {
   WatchlistApiError,
+  WatchlistOutcomeUnknownError,
   type StarEnvelope,
   type WatchlistEnvelope,
   type WatchlistRow,
@@ -56,7 +57,11 @@ function row(symbol: string, starred: boolean, overrides: Partial<WatchlistRow> 
   }
 }
 
-function watchlistEnvelope(rows: WatchlistRow[], total = rows.length): WatchlistEnvelope {
+function watchlistEnvelope(
+  rows: WatchlistRow[],
+  total = rows.length,
+  truncated = false,
+): WatchlistEnvelope {
   return {
     ok: true,
     error: null,
@@ -65,8 +70,8 @@ function watchlistEnvelope(rows: WatchlistRow[], total = rows.length): Watchlist
       groups: [],
       total,
       rows,
-      starred_count: rows.filter((item) => item.starred).length,
       next_scan_count: rows.filter((item) => item.starred).length,
+      truncated,
       star_mutation: true,
     },
   }
@@ -102,9 +107,13 @@ function deferred<T>(): {
 const baseRows = [row('BTCUSDT', true), row('ETHUSDT', false), row('XAUUSDT', true)]
 
 describe('isUnknownStarOutcome', () => {
-  it('classifies a timeout or network failure as unknown, not a refusal', () => {
+  it('classifies a timeout, network failure, or unusable 2xx body as unknown', () => {
     expect(isUnknownStarOutcome(new RequestTimeoutError())).toBe(true)
     expect(isUnknownStarOutcome(new TypeError('Failed to fetch'))).toBe(true)
+    expect(
+      isUnknownStarOutcome(new WatchlistOutcomeUnknownError('truncated', new SyntaxError('x'))),
+    ).toBe(true)
+    // A typed non-2xx refusal is definitive and rolls back.
     expect(isUnknownStarOutcome(new WatchlistApiError('nope', 'NOT_FOUND'))).toBe(false)
   })
 })
@@ -216,6 +225,34 @@ describe('WatchlistPage stars', () => {
     await waitFor(() => expect(eth).toHaveFocus())
   })
 
+  it('does not move focus when the removed control was not focused', async () => {
+    const pending = deferred<StarEnvelope>()
+    render(
+      <WatchlistPage
+        fetchWatchlistFn={async () =>
+          watchlistEnvelope([row('BTCUSDT', true), row('ETHUSDT', true)], 2)
+        }
+        setStarFn={() => pending.promise}
+      />,
+    )
+
+    const btc = await screen.findByRole('button', { name: 'BTCUSDT in next scan' })
+    // Click without focusing the control: focus restoration must stay out.
+    fireEvent.click(btc)
+
+    await act(async () => {
+      pending.resolve(starEnvelope('BTCUSDT', false))
+    })
+
+    await waitFor(() =>
+      expect(
+        screen.queryByRole('button', { name: 'BTCUSDT in next scan' }),
+      ).not.toBeInTheDocument(),
+    )
+    const eth = screen.getByRole('button', { name: 'ETHUSDT in next scan' })
+    expect(eth).not.toHaveFocus()
+  })
+
   it('rolls back visibly and announces when the mutation is refused', async () => {
     render(
       <WatchlistPage
@@ -241,7 +278,12 @@ describe('WatchlistPage stars', () => {
   })
 
   it('refetches instead of rolling back when the outcome is unknown', async () => {
-    const fetchWatchlistFn = vi.fn(async () => watchlistEnvelope([row('BTCUSDT', true)], 1))
+    const refresh = deferred<WatchlistEnvelope>()
+    let calls = 0
+    const fetchWatchlistFn = vi.fn(async () => {
+      calls += 1
+      return calls === 1 ? watchlistEnvelope([row('BTCUSDT', true)], 1) : refresh.promise
+    })
     render(
       <WatchlistPage
         fetchWatchlistFn={fetchWatchlistFn}
@@ -251,13 +293,64 @@ describe('WatchlistPage stars', () => {
       />,
     )
 
-    fireEvent.click(await screen.findByRole('button', { name: 'BTCUSDT in next scan' }))
+    const toggle = await screen.findByRole('button', { name: 'BTCUSDT in next scan' })
+    toggle.focus()
+    fireEvent.click(toggle)
 
     expect(await screen.findByRole('alert')).toHaveTextContent(
       'Could not confirm the BTCUSDT change; refreshing the watchlist.',
     )
     await waitFor(() => expect(fetchWatchlistFn).toHaveBeenCalledTimes(2))
-    // The server state reconciles the optimistic flip; there is no blind rollback copy.
+    // The originating row and its toggle stay mounted during the refetch, so
+    // focus is not dropped to <body>.
+    const stillMounted = screen.getByRole('button', { name: 'BTCUSDT in next scan' })
+    expect(stillMounted).toBeInTheDocument()
+
+    await act(async () => {
+      refresh.resolve(watchlistEnvelope([row('BTCUSDT', true)], 1))
+    })
+
+    // The server state reconciles the optimistic flip, the stale mutation
+    // alert clears, and focus returns to the originating toggle.
+    await waitFor(() =>
+      expect(screen.queryByRole('alert')).not.toBeInTheDocument(),
+    )
+    await waitFor(() =>
+      expect(screen.getByRole('button', { name: 'BTCUSDT in next scan' })).toHaveAttribute(
+        'aria-pressed',
+        'true',
+      ),
+    )
+    await waitFor(() =>
+      expect(screen.getByRole('button', { name: 'BTCUSDT in next scan' })).toHaveFocus(),
+    )
+  })
+
+  it('refetches instead of rolling back when a 2xx body is unusable', async () => {
+    const refresh = deferred<WatchlistEnvelope>()
+    let calls = 0
+    const fetchWatchlistFn = vi.fn(async () => {
+      calls += 1
+      return calls === 1 ? watchlistEnvelope([row('BTCUSDT', true)], 1) : refresh.promise
+    })
+    const setStarFn = vi.fn(async () => {
+      throw new WatchlistOutcomeUnknownError('truncated 2xx body', new SyntaxError('unexpected end'))
+    })
+    render(<WatchlistPage fetchWatchlistFn={fetchWatchlistFn} setStarFn={setStarFn} />)
+
+    fireEvent.click(await screen.findByRole('button', { name: 'BTCUSDT in next scan' }))
+
+    expect(await screen.findByRole('alert')).toHaveTextContent(
+      'Could not confirm the BTCUSDT change; refreshing the watchlist.',
+    )
+    // A definitive refusal would have rolled back and shown "Could not remove";
+    // an unknown outcome refetches instead.
+    await waitFor(() => expect(fetchWatchlistFn).toHaveBeenCalledTimes(2))
+    expect(setStarFn).toHaveBeenCalledTimes(1)
+
+    await act(async () => {
+      refresh.resolve(watchlistEnvelope([row('BTCUSDT', true)], 1))
+    })
     await waitFor(() =>
       expect(screen.getByRole('button', { name: 'BTCUSDT in next scan' })).toHaveAttribute(
         'aria-pressed',
@@ -389,6 +482,229 @@ describe('WatchlistPage stars', () => {
 
     expect(await screen.findByRole('link', { name: 'BTCUSDT' })).toBeInTheDocument()
     expect(calls).toBe(2)
+    expect(screen.getAllByRole('status')).toHaveLength(1)
+  })
+
+  it('does not steal focus from the search box when a delayed retry resolves', async () => {
+    const refresh = deferred<WatchlistEnvelope>()
+    let calls = 0
+    const fetchWatchlistFn = vi.fn(async () => {
+      calls += 1
+      if (calls === 1) {
+        throw new Error('registry locked')
+      }
+      return refresh.promise
+    })
+    render(<WatchlistPage fetchWatchlistFn={fetchWatchlistFn} />)
+
+    await screen.findByRole('button', { name: 'Retry' })
+    fireEvent.click(screen.getByRole('button', { name: 'Retry' }))
+    await waitFor(() => expect(screen.getByText('Refreshing…')).toBeInTheDocument())
+
+    // The user moves focus while the retry is in flight.
+    const search = screen.getByLabelText('Search symbols')
+    search.focus()
+    expect(search).toHaveFocus()
+
+    await act(async () => {
+      refresh.resolve(watchlistEnvelope([row('BTCUSDT', true)], 1))
+    })
+
+    await screen.findByRole('link', { name: 'BTCUSDT' })
+    // Focus was not yanked to the results region.
+    expect(search).toHaveFocus()
+  })
+
+  it('makes star toggles non-interactive while a retry is in flight', async () => {
+    const refresh = deferred<WatchlistEnvelope>()
+    let calls = 0
+    const fetchWatchlistFn = vi.fn(async () => {
+      calls += 1
+      if (calls === 1) {
+        return watchlistEnvelope([row('BTCUSDT', true)], 1)
+      }
+      if (calls === 2) {
+        // The unknown-outcome refetch fails; rows stay mounted.
+        throw new Error('daemon down')
+      }
+      return refresh.promise
+    })
+    const setStarFn = vi.fn(async () => {
+      throw new RequestTimeoutError()
+    })
+    render(<WatchlistPage fetchWatchlistFn={fetchWatchlistFn} setStarFn={setStarFn} />)
+
+    fireEvent.click(await screen.findByRole('button', { name: 'BTCUSDT in next scan' }))
+    await waitFor(() => expect(fetchWatchlistFn).toHaveBeenCalledTimes(2))
+    fireEvent.click(await screen.findByRole('button', { name: 'Retry' }))
+    await waitFor(() => expect(fetchWatchlistFn).toHaveBeenCalledTimes(3))
+
+    // Rows are retained through the retry, but no overlap mutation is allowed.
+    const retained = screen.getByRole('button', { name: 'BTCUSDT in next scan' })
+    expect(retained).toHaveAttribute('aria-disabled', 'true')
+    fireEvent.click(retained)
+    expect(setStarFn).toHaveBeenCalledTimes(1)
+
+    await act(async () => {
+      refresh.resolve(watchlistEnvelope([row('BTCUSDT', true)], 1))
+    })
+  })
+
+  it('derives the count label from rows when a deferred refetch resolves', async () => {
+    const refresh = deferred<WatchlistEnvelope>()
+    let calls = 0
+    const fetchWatchlistFn = vi.fn(async () => {
+      calls += 1
+      return calls === 1
+        ? watchlistEnvelope([row('BTCUSDT', true), row('ETHUSDT', false)], 2)
+        : refresh.promise
+    })
+    render(
+      <WatchlistPage
+        fetchWatchlistFn={fetchWatchlistFn}
+        setStarFn={async () => {
+          throw new RequestTimeoutError()
+        }}
+      />,
+    )
+
+    fireEvent.click(await screen.findByRole('button', { name: 'BTCUSDT in next scan' }))
+    await waitFor(() => expect(fetchWatchlistFn).toHaveBeenCalledTimes(2))
+
+    // The response's whole-registry count is stale; the complete page must
+    // agree with the row flags it renders.
+    const stale = watchlistEnvelope(
+      [row('BTCUSDT', true), row('ETHUSDT', false), row('XAUUSDT', false)],
+      3,
+    )
+    stale.data = { ...stale.data!, next_scan_count: 7 }
+    await act(async () => {
+      refresh.resolve(stale)
+    })
+
+    await waitFor(() =>
+      expect(screen.getByTestId('watchlist-count')).toHaveTextContent(
+        '1 of 3 symbols included in next scan',
+      ),
+    )
+    expect(screen.getByRole('button', { name: 'BTCUSDT in next scan' })).toHaveAttribute(
+      'aria-pressed',
+      'true',
+    )
+  })
+
+  it('explains a truncated page whose starred rows are all outside it', async () => {
+    const envelope = watchlistEnvelope(
+      [row('ETHUSDT', false), row('SOLUSDT', false), row('DOGEUSDT', false)],
+      5,
+      true,
+    )
+    envelope.data = { ...envelope.data!, next_scan_count: 2 }
+    render(<WatchlistPage fetchWatchlistFn={async () => envelope} />)
+
+    expect(
+      await screen.findByRole('heading', { name: 'Starred symbols are outside this page' }),
+    ).toBeInTheDocument()
+    expect(screen.getByTestId('watchlist-count')).toHaveTextContent(
+      '2 of 5 symbols included in next scan',
+    )
+    expect(screen.queryByText('No symbols in the next scan')).not.toBeInTheDocument()
+  })
+
+  it('cancels a pending focus-restore frame when the page unmounts', async () => {
+    const pending = deferred<StarEnvelope>()
+    let frameId = 0
+    const rafSpy = vi.spyOn(window, 'requestAnimationFrame').mockImplementation(() => {
+      frameId += 1
+      return frameId
+    })
+    const cancelSpy = vi.spyOn(window, 'cancelAnimationFrame').mockImplementation(() => undefined)
+
+    const { unmount } = render(
+      <WatchlistPage
+        fetchWatchlistFn={async () =>
+          watchlistEnvelope([row('BTCUSDT', true), row('ETHUSDT', true)], 2)
+        }
+        setStarFn={() => pending.promise}
+      />,
+    )
+
+    const btc = await screen.findByRole('button', { name: 'BTCUSDT in next scan' })
+    btc.focus()
+    fireEvent.click(btc)
+    await act(async () => {
+      pending.resolve(starEnvelope('BTCUSDT', false))
+    })
+    expect(rafSpy).toHaveBeenCalled()
+
+    unmount()
+    // The focus-restore frame scheduled by the removal was cancelled, so it
+    // can never fire against a route that is gone.
+    expect(cancelSpy).toHaveBeenCalledWith(rafSpy.mock.results.at(-1)?.value)
+
+    rafSpy.mockRestore()
+    cancelSpy.mockRestore()
+
+    render(<button type="button">sibling</button>)
+    const sibling = screen.getByRole('button', { name: 'sibling' })
+    sibling.focus()
+    await act(async () => {
+      await new Promise<void>((resolve) => requestAnimationFrame(() => resolve()))
+    })
+    expect(sibling).toHaveFocus()
+  })
+
+  it('keeps Retry mounted, focused, and busy until the retry load resolves', async () => {
+    const refresh = deferred<WatchlistEnvelope>()
+    let calls = 0
+    const fetchWatchlistFn = vi.fn(async () => {
+      calls += 1
+      if (calls === 1) {
+        throw new Error('registry locked')
+      }
+      return refresh.promise
+    })
+    render(<WatchlistPage fetchWatchlistFn={fetchWatchlistFn} />)
+
+    expect(await screen.findByRole('alert')).toHaveTextContent('registry locked')
+    const retry = screen.getByRole('button', { name: 'Retry' })
+    retry.focus()
+    fireEvent.click(retry)
+
+    await waitFor(() =>
+      expect(screen.getByRole('button', { name: 'Retry' })).toHaveAttribute(
+        'aria-busy',
+        'true',
+      ),
+    )
+    const pendingRetry = screen.getByRole('button', { name: 'Retry' })
+    expect(pendingRetry).toHaveAttribute('aria-disabled', 'true')
+    // Focusable, not natively disabled, and still focused: focus survives.
+    expect(pendingRetry).toBeEnabled()
+    expect(pendingRetry).toHaveFocus()
+    expect(screen.getByText('Refreshing…')).toBeInTheDocument()
+
+    await act(async () => {
+      refresh.resolve(watchlistEnvelope([row('BTCUSDT', true)], 1))
+    })
+
+    expect(await screen.findByRole('link', { name: 'BTCUSDT' })).toBeInTheDocument()
+    const region = screen.getByRole('region', { name: 'CRYPTO symbols table' })
+    await waitFor(() => expect(region).toHaveFocus())
+  })
+
+  it('warns when the bounded page omits registry symbols', async () => {
+    render(
+      <WatchlistPage
+        fetchWatchlistFn={async () => watchlistEnvelope(baseRows.slice(0, 2), 3, true)}
+        setStarFn={async (symbol, starred) => starEnvelope(symbol, starred)}
+      />,
+    )
+
+    expect(await screen.findByTestId('watchlist-truncation-note')).toHaveTextContent(
+      'Showing first 2 of 3 symbols.',
+    )
+    // A plain paragraph, not a second polite live region.
     expect(screen.getAllByRole('status')).toHaveLength(1)
   })
 
@@ -568,6 +884,175 @@ describe('WatchlistSearchPage add', () => {
     )
     expect(screen.queryAllByRole('button', { name: /in next scan/ })).toHaveLength(0)
     expect(screen.getByRole('button', { name: 'Retry' })).toBeInTheDocument()
+  })
+
+  it('keeps Retry mounted and focused through the retry, then focuses the results', async () => {
+    const refresh = deferred<WatchlistEnvelope>()
+    let calls = 0
+    const fetchWatchlistFn = vi.fn(async () => {
+      calls += 1
+      if (calls === 1) {
+        throw new Error('daemon down')
+      }
+      return refresh.promise
+    })
+    render(<WatchlistSearchPage fetchWatchlistFn={fetchWatchlistFn} />)
+
+    expect(await screen.findByRole('alert')).toHaveTextContent(
+      'Symbol search unavailable: daemon down',
+    )
+    const retry = screen.getByRole('button', { name: 'Retry' })
+    retry.focus()
+    fireEvent.click(retry)
+
+    await waitFor(() =>
+      expect(screen.getByRole('button', { name: 'Retry' })).toHaveAttribute(
+        'aria-busy',
+        'true',
+      ),
+    )
+    expect(screen.getByRole('button', { name: 'Retry' })).toHaveAttribute(
+      'aria-disabled',
+      'true',
+    )
+    expect(screen.getByRole('button', { name: 'Retry' })).toHaveFocus()
+    expect(screen.getByText('Refreshing…')).toBeInTheDocument()
+
+    await act(async () => {
+      refresh.resolve(watchlistEnvelope([row('BTCUSDT', false)]))
+    })
+
+    const region = await screen.findByRole('region', { name: 'CRYPTO search results' })
+    await waitFor(() => expect(region).toHaveFocus())
+  })
+
+  it('returns focus to the originating add toggle after an unknown-outcome refetch', async () => {
+    const refresh = deferred<WatchlistEnvelope>()
+    let calls = 0
+    const fetchWatchlistFn = vi.fn(async () => {
+      calls += 1
+      return calls === 1
+        ? watchlistEnvelope([row('BTCUSDT', false), row('ETHUSDT', false)])
+        : refresh.promise
+    })
+    render(
+      <WatchlistSearchPage
+        fetchWatchlistFn={fetchWatchlistFn}
+        setStarFn={async () => {
+          throw new TypeError('Failed to fetch')
+        }}
+      />,
+    )
+
+    const add = await screen.findByRole('button', { name: 'BTCUSDT in next scan' })
+    add.focus()
+    fireEvent.click(add)
+
+    expect(await screen.findByRole('alert')).toHaveTextContent(
+      'Could not confirm the BTCUSDT change; refreshing the symbol list.',
+    )
+    await waitFor(() => expect(fetchWatchlistFn).toHaveBeenCalledTimes(2))
+    expect(screen.getByRole('button', { name: 'BTCUSDT in next scan' })).toBeInTheDocument()
+
+    await act(async () => {
+      refresh.resolve(watchlistEnvelope([row('BTCUSDT', false), row('ETHUSDT', false)]))
+    })
+
+    await waitFor(() => expect(screen.queryByRole('alert')).not.toBeInTheDocument())
+    await waitFor(() =>
+      expect(screen.getByRole('button', { name: 'BTCUSDT in next scan' })).toHaveFocus(),
+    )
+  })
+
+  it('does not steal focus from the search box when a delayed retry resolves', async () => {
+    const refresh = deferred<WatchlistEnvelope>()
+    let calls = 0
+    const fetchWatchlistFn = vi.fn(async () => {
+      calls += 1
+      if (calls === 1) {
+        throw new Error('daemon down')
+      }
+      return refresh.promise
+    })
+    render(<WatchlistSearchPage fetchWatchlistFn={fetchWatchlistFn} />)
+
+    await screen.findByRole('button', { name: 'Retry' })
+    fireEvent.click(screen.getByRole('button', { name: 'Retry' }))
+    await waitFor(() => expect(screen.getByText('Refreshing…')).toBeInTheDocument())
+
+    const search = screen.getByLabelText('Search symbols')
+    search.focus()
+    expect(search).toHaveFocus()
+
+    await act(async () => {
+      refresh.resolve(watchlistEnvelope([row('BTCUSDT', false)]))
+    })
+
+    await screen.findByRole('link', { name: 'BTCUSDT' })
+    expect(search).toHaveFocus()
+  })
+
+  it('makes add toggles non-interactive while a retry is in flight', async () => {
+    const refresh = deferred<WatchlistEnvelope>()
+    let calls = 0
+    const fetchWatchlistFn = vi.fn(async () => {
+      calls += 1
+      if (calls === 1) {
+        return watchlistEnvelope([row('BTCUSDT', false)], 1)
+      }
+      if (calls === 2) {
+        throw new Error('daemon down')
+      }
+      return refresh.promise
+    })
+    const setStarFn = vi.fn(async () => {
+      throw new RequestTimeoutError()
+    })
+    render(<WatchlistSearchPage fetchWatchlistFn={fetchWatchlistFn} setStarFn={setStarFn} />)
+
+    fireEvent.click(await screen.findByRole('button', { name: 'BTCUSDT in next scan' }))
+    await waitFor(() => expect(fetchWatchlistFn).toHaveBeenCalledTimes(2))
+    fireEvent.click(await screen.findByRole('button', { name: 'Retry' }))
+    await waitFor(() => expect(fetchWatchlistFn).toHaveBeenCalledTimes(3))
+
+    const retained = screen.getByRole('button', { name: 'BTCUSDT in next scan' })
+    expect(retained).toHaveAttribute('aria-disabled', 'true')
+    fireEvent.click(retained)
+    expect(setStarFn).toHaveBeenCalledTimes(1)
+
+    await act(async () => {
+      refresh.resolve(watchlistEnvelope([row('BTCUSDT', false)], 1))
+    })
+  })
+
+  it('warns when the bounded registry page omits symbols', async () => {
+    render(
+      <WatchlistSearchPage
+        fetchWatchlistFn={async () => watchlistEnvelope(items, 5, true)}
+        setStarFn={async (symbol, starred) => starEnvelope(symbol, starred)}
+      />,
+    )
+
+    expect(await screen.findByTestId('search-truncation-note')).toHaveTextContent(
+      'Showing first 3 of 5 symbols.',
+    )
+    expect(screen.getAllByRole('status')).toHaveLength(1)
+  })
+
+  it('caps rendered matches at 200 while keeping the header count truthful', async () => {
+    const many = Array.from({ length: 250 }, (_, index) => row(`S${index}USDT`, false))
+    render(
+      <WatchlistSearchPage
+        fetchWatchlistFn={async () => watchlistEnvelope(many)}
+        setStarFn={async (symbol, starred) => starEnvelope(symbol, starred)}
+      />,
+    )
+
+    expect(await screen.findByTestId('search-result-limit-note')).toHaveTextContent(
+      'Showing the first 200 of 250 matches. Refine the search to narrow the list.',
+    )
+    expect(screen.getAllByRole('button', { name: /in next scan/ })).toHaveLength(200)
+    expect(screen.getByText('250 matches')).toBeInTheDocument()
   })
 
   it('announces filter result changes through the single polite region', async () => {

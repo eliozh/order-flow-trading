@@ -5,6 +5,7 @@ import {
   fetchWatchlist,
   setStar,
   WatchlistApiError,
+  WatchlistOutcomeUnknownError,
   type WatchlistRow,
 } from '../watchlist'
 
@@ -52,6 +53,7 @@ function fetchMockReturning(response: Response | (() => Response)): ReturnType<t
 
 afterEach(() => {
   vi.unstubAllGlobals()
+  document.cookie = 'oft_csrf=; expires=Thu, 01 Jan 1970 00:00:00 GMT'
 })
 
 describe('fetchWatchlist', () => {
@@ -63,8 +65,8 @@ describe('fetchWatchlist', () => {
           groups: [],
           total: 1,
           rows: [row],
-          starred_count: 1,
           next_scan_count: 1,
+          truncated: false,
           star_mutation: true,
         },
         error: null,
@@ -82,18 +84,55 @@ describe('fetchWatchlist', () => {
     expect(init.method).toBe('GET')
     expect(init.credentials).toBe('same-origin')
   })
+
+  it('treats a 2xx page without rows as an unknown outcome', async () => {
+    vi.stubGlobal(
+      'fetch',
+      fetchMockReturning(
+        jsonResponse({
+          ok: true,
+          data: { groups: [], total: 1, next_scan_count: 1, truncated: false },
+          error: null,
+          meta,
+        }),
+      ),
+    )
+
+    const failure = await fetchWatchlist().catch((cause: unknown) => cause)
+
+    expect(failure).toBeInstanceOf(WatchlistOutcomeUnknownError)
+    expect(failure).not.toBeInstanceOf(WatchlistApiError)
+  })
+
+  it('treats a 2xx page with missing numeric fields as an unknown outcome', async () => {
+    vi.stubGlobal(
+      'fetch',
+      fetchMockReturning(
+        jsonResponse({
+          ok: true,
+          data: { groups: [], rows: [], truncated: false },
+          error: null,
+          meta,
+        }),
+      ),
+    )
+
+    const failure = await fetchWatchlist().catch((cause: unknown) => cause)
+
+    expect(failure).toBeInstanceOf(WatchlistOutcomeUnknownError)
+    expect(failure).not.toBeInstanceOf(WatchlistApiError)
+  })
 })
 
 describe('setStar', () => {
   it('uses POST to star and DELETE to unstar', async () => {
-    const fetchMock = fetchMockReturning(
-      () =>
-        jsonResponse({
-          ok: true,
-          data: { symbol: 'BTCUSDT', starred: true, starred_at: null },
-          error: null,
-          meta,
-        }),
+    const fetchMock = fetchMockReturning(() =>
+      jsonResponse({
+        ok: true,
+        data: { symbol: 'BTCUSDT', starred: true, starred_at: null },
+        error: null,
+        meta,
+      }),
     )
     vi.stubGlobal('fetch', fetchMock)
 
@@ -104,6 +143,28 @@ describe('setStar', () => {
     const unstarInit = fetchMock.mock.calls[1]?.[1] as RequestInit
     expect(starInit.method).toBe('POST')
     expect(unstarInit.method).toBe('DELETE')
+  })
+
+  it('sends CSRF, idempotency, credentials, and JSON headers', async () => {
+    document.cookie = 'oft_csrf=test-csrf'
+    const fetchMock = fetchMockReturning(
+      jsonResponse({
+        ok: true,
+        data: { symbol: 'BTCUSDT', starred: true, starred_at: null },
+        error: null,
+        meta,
+      }),
+    )
+    vi.stubGlobal('fetch', fetchMock)
+
+    await setStar('BTCUSDT', true)
+
+    const init = fetchMock.mock.calls[0]?.[1] as RequestInit
+    const headers = init.headers as Record<string, string>
+    expect(headers['X-CSRF-Token']).toBe('test-csrf')
+    expect(headers['Idempotency-Key']).toMatch(/^watchlist-/)
+    expect(headers['Content-Type']).toBe('application/json')
+    expect(init.credentials).toBe('same-origin')
   })
 
   it('encodes the symbol into the path', async () => {
@@ -164,5 +225,65 @@ describe('setStar', () => {
       code: undefined,
       message: 'Watchlist request failed with HTTP 502',
     })
+  })
+
+  it('treats a malformed 2xx body as an unknown outcome, keeping the parse cause', async () => {
+    vi.stubGlobal(
+      'fetch',
+      fetchMockReturning(
+        new Response('{"ok":true,"data":', {
+          status: 200,
+          headers: { 'Content-Type': 'application/json' },
+        }),
+      ),
+    )
+
+    const failure = await setStar('BTCUSDT', true).catch((cause: unknown) => cause)
+
+    expect(failure).toBeInstanceOf(WatchlistOutcomeUnknownError)
+    expect(failure).not.toBeInstanceOf(WatchlistApiError)
+    expect((failure as WatchlistOutcomeUnknownError).parseCause).toBeInstanceOf(SyntaxError)
+  })
+
+  it('treats a 2xx envelope without confirmed data as an unknown outcome', async () => {
+    vi.stubGlobal(
+      'fetch',
+      fetchMockReturning(jsonResponse({ ok: true, data: null, error: null, meta })),
+    )
+
+    const failure = await setStar('BTCUSDT', true).catch((cause: unknown) => cause)
+
+    expect(failure).toBeInstanceOf(WatchlistOutcomeUnknownError)
+    expect(failure).not.toBeInstanceOf(WatchlistApiError)
+  })
+
+  it('treats a 2xx body with an unusable data shape as an unknown outcome, not a confirmation', async () => {
+    vi.stubGlobal(
+      'fetch',
+      fetchMockReturning(jsonResponse({ ok: true, data: {}, error: null, meta })),
+    )
+
+    const failure = await setStar('BTCUSDT', true).catch((cause: unknown) => cause)
+
+    expect(failure).toBeInstanceOf(WatchlistOutcomeUnknownError)
+    expect(failure).not.toBeInstanceOf(WatchlistApiError)
+  })
+
+  it('rejects a 2xx body whose starred flag is not a boolean', async () => {
+    vi.stubGlobal(
+      'fetch',
+      fetchMockReturning(
+        jsonResponse({
+          ok: true,
+          data: { symbol: 'BTCUSDT', starred: 'yes', starred_at: null },
+          error: null,
+          meta,
+        }),
+      ),
+    )
+
+    const failure = await setStar('BTCUSDT', true).catch((cause: unknown) => cause)
+
+    expect(failure).toBeInstanceOf(WatchlistOutcomeUnknownError)
   })
 })

@@ -1,4 +1,10 @@
-"""Read-only ``oft watchlist list|search|groups`` (symbol registry)."""
+"""``oft watchlist``: list/search/groups plus star/unstar mutation commands.
+
+``list``, ``search``, and ``groups`` read the SQLite symbol registry directly.
+``star``/``unstar`` change only the local star flag through the API and are
+aliased by ``add``/``remove``; no exchange call, metadata edit, or scan trigger
+is involved.
+"""
 
 from __future__ import annotations
 
@@ -144,7 +150,7 @@ def list_command(
     _emit(
         contracts,
         {"total": len(contracts), "group": group, "starred": starred},
-        render_symbols_table(contracts, title="WATCHLIST · read-only symbol registry"),
+        render_symbols_table(contracts, title="WATCHLIST · symbol registry"),
         as_json,
     )
 

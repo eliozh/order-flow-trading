@@ -1,4 +1,4 @@
-import { useEffect, useRef, useState } from 'react'
+import { useEffect, useMemo, useRef, useState } from 'react'
 
 import { filterSymbols, groupSymbols } from '../api/symbols'
 import {
@@ -12,6 +12,18 @@ import { StarState, StarToggle } from '../components/star-toggle'
 import { useNarrowCompact } from '../hooks/use-compact'
 import { useStarMutation } from '../hooks/use-star-mutation'
 
+/**
+ * Display cap for one search result set.
+ *
+ * The server already caps the watchlist view at ``_WATCHLIST_ROW_CAP`` (2,000
+ * rows) even though ingest can hold 5,000 (``MAX_EXCHANGE_INFO_SYMBOLS``); the
+ * symbols endpoint uses the matching ``_MAX_LIMIT`` of 2,000, so the client
+ * never receives more than 2,000 rows either way. Rendering all of them
+ * synchronously on every keystroke is still too much, so the page displays at
+ * most 200 grouped matches and tells the user to refine the search.
+ */
+const SEARCH_RENDER_LIMIT = 200
+
 interface WatchlistSearchPageProps {
   fetchWatchlistFn?: (signal?: AbortSignal) => Promise<WatchlistEnvelope>
   setStarFn?: (symbol: string, starred: boolean) => Promise<StarEnvelope>
@@ -22,10 +34,11 @@ interface SearchState {
   state: 'loading' | 'ready' | 'error'
   rows: WatchlistRow[]
   total: number
+  truncated: boolean
   message?: string
 }
 
-const EMPTY_STATE: SearchState = { state: 'loading', rows: [], total: 0 }
+const EMPTY_STATE: SearchState = { state: 'loading', rows: [], total: 0, truncated: false }
 
 function tradable(row: WatchlistRow): boolean {
   return row.status === 'TRADING'
@@ -41,11 +54,23 @@ export function WatchlistSearchPage({
   const [announcement, setAnnouncement] = useState('')
   const [mutationError, setMutationError] = useState<string | null>(null)
   const [attempt, setAttempt] = useState(0)
+  // True from a Retry click until the retry fetch settles; keeps the Retry
+  // control mounted (aria-busy/aria-disabled) so focus is never dropped.
+  const [retrying, setRetrying] = useState(false)
   const narrow = useNarrowCompact(isNarrow)
   const watchlistRef = useRef(fetchWatchlistFn)
   const setStarRef = useRef(setStarFn)
   const snapshotsRef = useRef<Map<string, WatchlistRow>>(new Map())
   const announcedQueryRef = useRef('')
+  // Scope every focus query to this page; a stale frame must never touch
+  // another route.
+  const containerRef = useRef<HTMLElement | null>(null)
+  // What should receive focus after the next ready load: a symbol, 'retry',
+  // or null (nothing).
+  const pendingFocusRef = useRef<string | null>(null)
+  // The exact unknown-outcome alert message this refetch was started for. A
+  // load success clears only that message; a newer rollback alert survives.
+  const unknownOutcomeErrorRef = useRef<string | null>(null)
 
   useEffect(() => {
     watchlistRef.current = fetchWatchlistFn
@@ -64,22 +89,74 @@ export function WatchlistSearchPage({
         if (!data) {
           throw new Error('The symbol search response was empty.')
         }
-        setLoad({ state: 'ready', rows: data.rows, total: data.total })
-        setAnnouncement(`${data.rows.length} symbols available to add to the next scan.`)
+        setLoad({
+          state: 'ready',
+          rows: data.rows,
+          total: data.total,
+          truncated: data.truncated,
+        })
+        setRetrying(false)
+        // Clear the alert this refetch was started for, but never a newer
+        // mutation alert that landed while the request was in flight.
+        const unknownOutcomeMessage = unknownOutcomeErrorRef.current
+        setMutationError((current) =>
+          current !== null && current === unknownOutcomeMessage ? null : current,
+        )
+        unknownOutcomeErrorRef.current = null
+        setAnnouncement(`${data.total} symbols available to add to the next scan.`)
       })
       .catch((cause: unknown) => {
         if (controller.signal.aborted) {
           return
         }
-        setLoad({
+        // Keep any previously loaded rows visible while showing the error.
+        setLoad((previous) => ({
+          ...previous,
           state: 'error',
-          rows: [],
-          total: 0,
           message: cause instanceof Error ? cause.message : 'Unknown error',
-        })
+        }))
+        setRetrying(false)
       })
     return () => controller.abort()
   }, [attempt])
+
+  // Restore focus once a refetch resolves: the originating toggle, else the
+  // first results region, else the search box. The target is consumed once.
+  useEffect(() => {
+    if (load.state !== 'ready') {
+      return
+    }
+    const target = pendingFocusRef.current
+    if (target === null) {
+      return
+    }
+    pendingFocusRef.current = null
+    const container = containerRef.current
+    if (container === null) {
+      return
+    }
+    // Never steal focus the user moved while the refetch was in flight. The
+    // Retry button unmounts on success (activeElement falls back to <body>),
+    // so the intended restore still happens when nobody else owns focus.
+    const active = document.activeElement
+    if (active instanceof HTMLElement && active !== document.body && active.isConnected) {
+      return
+    }
+    if (target !== 'retry') {
+      const toggles = Array.from(container.querySelectorAll<HTMLElement>('[data-star-symbol]'))
+      const match = toggles.find((element) => element.dataset.starSymbol === target)
+      if (match) {
+        match.focus()
+        return
+      }
+    }
+    const region = container.querySelector<HTMLElement>('.table-wrap')
+    if (region) {
+      region.focus()
+      return
+    }
+    container.querySelector<HTMLElement>('#symbol-search')?.focus()
+  }, [load.state])
 
   const mutation = useStarMutation({
     setStarFn: (symbol, starred) => setStarRef.current(symbol, starred),
@@ -119,14 +196,22 @@ export function WatchlistSearchPage({
       snapshotsRef.current.delete(symbol)
     },
     onUnknownOutcome: (symbol) => {
-      setMutationError(`Could not confirm the ${symbol} change; refreshing the symbol list.`)
+      const message = `Could not confirm the ${symbol} change; refreshing the symbol list.`
+      unknownOutcomeErrorRef.current = message
+      setMutationError(message)
+      // Return focus to the originating toggle when the refetch resolves.
+      pendingFocusRef.current = symbol
       snapshotsRef.current.delete(symbol)
       setAttempt((n) => n + 1)
     },
   })
 
-  const matched = filterSymbols(load.rows, query)
-  const groups = groupSymbols(matched)
+  // Rows survive a refetch: they are shown when ready or while a previous page
+  // is still loaded, so the tables never blink out of the DOM.
+  const showRows = load.state === 'ready' || load.rows.length > 0
+  const matched = useMemo(() => filterSymbols(load.rows, query), [load.rows, query])
+  const rendered = useMemo(() => matched.slice(0, SEARCH_RENDER_LIMIT), [matched])
+  const groups = useMemo(() => groupSymbols(rendered), [rendered])
   const trimmedQuery = query.trim()
   const noMatches = `No matches for “${trimmedQuery}”. Try an exact symbol such as BTCUSDT.`
 
@@ -147,8 +232,17 @@ export function WatchlistSearchPage({
     )
   }, [load.state, trimmedQuery, matched.length])
 
+  function retry(): void {
+    setRetrying(true)
+    pendingFocusRef.current = 'retry'
+    setAnnouncement('Refreshing the symbol list…')
+    setAttempt((n) => n + 1)
+  }
+
   function toggle(row: WatchlistRow): void {
-    if (narrow || mutation.pending.has(row.symbol)) {
+    // No mutation may overlap a refetch: a request issued before the toggle
+    // commits could land later and desync the page from the server.
+    if (load.state !== 'ready' || narrow || mutation.pending.has(row.symbol)) {
       return
     }
     snapshotsRef.current.set(row.symbol, row)
@@ -166,8 +260,13 @@ export function WatchlistSearchPage({
             {label} ({items.length})
           </h2>
         </div>
-        {/* eslint-disable-next-line jsx-a11y/no-noninteractive-tabindex -- scrollable table */}
-        <div className="table-wrap" role="region" aria-label={`${label} search results`} tabIndex={0}>
+        <div
+          className="table-wrap"
+          role="region"
+          aria-label={`${label} search results`}
+          // eslint-disable-next-line jsx-a11y/no-noninteractive-tabindex -- scrollable table
+          tabIndex={0}
+        >
           <table className="data-table">
             <caption className="visually-hidden">{label} symbol search results</caption>
             <thead>
@@ -217,7 +316,7 @@ export function WatchlistSearchPage({
                           symbol={row.symbol}
                           starred={row.starred}
                           pending={isPending}
-                          disabled={blocked}
+                          disabled={blocked || load.state !== 'ready'}
                           describedBy={blocked ? reasonId : undefined}
                           onToggle={() => toggle(row)}
                         />
@@ -235,6 +334,7 @@ export function WatchlistSearchPage({
 
   return (
     <section
+      ref={containerRef}
       className="system-page"
       lang="en"
       aria-labelledby="watchlist-heading"
@@ -248,8 +348,8 @@ export function WatchlistSearchPage({
           <p className="kicker">Watchlist / search</p>
           <h1 id="watchlist-heading">Watchlist</h1>
           <p className="page-sub">
-            Search the registry and add symbols to the next scan. Adding only changes the local
-            star flag; the registry stays upstream/read-only.
+            Search the registry and add symbols to the next scan. Adding only changes the local star
+            flag; the registry stays upstream/read-only.
           </p>
         </div>
         {narrow && (
@@ -263,7 +363,7 @@ export function WatchlistSearchPage({
       <section className="panel" aria-label="Symbol search">
         <div className="panel-head">
           <label htmlFor="symbol-search">Search symbols</label>
-          {load.state === 'ready' && <span className="mono-muted">{matched.length} matches</span>}
+          {showRows && <span className="mono-muted">{matched.length} matches</span>}
         </div>
         <div className="panel-foot">
           <input
@@ -277,16 +377,35 @@ export function WatchlistSearchPage({
         </div>
       </section>
 
-      {load.state === 'loading' && <p className="status-message">Loading symbol registry…</p>}
+      {load.state === 'loading' && (
+        <p className="status-message">
+          {retrying || load.rows.length > 0 ? 'Refreshing…' : 'Loading symbol registry…'}
+        </p>
+      )}
 
-      {load.state === 'error' && (
+      {(load.state === 'error' || (load.state === 'loading' && retrying)) && (
         <div>
-          <p className="status-message status-message--error" role="alert">
-            Symbol search unavailable: {load.message}
-          </p>
+          {load.state === 'error' && (
+            <p className="status-message status-message--error" role="alert">
+              Symbol search unavailable: {load.message}
+            </p>
+          )}
           {/* Read-only recovery: the Retry button is not a star mutation, so it
-              stays available at every width, including the 375 surface. */}
-          <button type="button" className="control-btn" onClick={() => setAttempt((n) => n + 1)}>
+              stays available at every width, including the 375 surface. It
+              stays mounted through the retry (aria-disabled, not native
+              disabled) so focus survives until the load resolves. */}
+          <button
+            type="button"
+            className="control-btn"
+            aria-busy={retrying && load.state === 'loading' ? 'true' : undefined}
+            aria-disabled={retrying && load.state === 'loading' ? 'true' : undefined}
+            onClick={() => {
+              if (retrying && load.state === 'loading') {
+                return
+              }
+              retry()
+            }}
+          >
             Retry
           </button>
         </div>
@@ -298,12 +417,25 @@ export function WatchlistSearchPage({
         </p>
       )}
 
+      {showRows && load.truncated && (
+        <p className="status-message" data-testid="search-truncation-note">
+          Showing first {load.rows.length} of {load.total} symbols.
+        </p>
+      )}
+
+      {showRows && matched.length > rendered.length && (
+        <p className="status-message" data-testid="search-result-limit-note">
+          Showing the first {rendered.length} of {matched.length} matches. Refine the search to
+          narrow the list.
+        </p>
+      )}
+
       {load.state === 'ready' && matched.length === 0 && (
         <p className="status-message">{noMatches}</p>
       )}
 
-      {load.state === 'ready' && group('CRYPTO', groups.crypto)}
-      {load.state === 'ready' && group('TRADFI', groups.tradfi)}
+      {showRows && group('CRYPTO', groups.crypto)}
+      {showRows && group('TRADFI', groups.tradfi)}
 
       <p className="status-message" style={{ marginTop: 12 }}>
         <a className="control-link" href="/watchlist">

@@ -72,8 +72,8 @@ interface WatchlistBody {
   ok: boolean
   data: {
     rows: WatchlistRowBody[]
-    starred_count: number
     next_scan_count: number
+    truncated: boolean
     star_mutation: boolean
   } | null
   error: { code: string } | null
