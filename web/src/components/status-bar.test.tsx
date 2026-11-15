@@ -2,7 +2,7 @@ import { fireEvent, render, screen } from '@testing-library/react'
 import { describe, expect, it } from 'vitest'
 
 import { LiveUpdatesProvider } from '../hooks/live-updates-provider'
-import { StatusBar } from './status-bar'
+import { PauseControl, StatusBar } from './status-bar'
 
 describe('StatusBar', () => {
   it('shows environment, daemon, version, and readiness', () => {
@@ -16,21 +16,38 @@ describe('StatusBar', () => {
     expect(screen.getByText('READY')).toBeInTheDocument()
   })
 
-  it('has no dead kill-switch placeholder button', () => {
+  it('has no dead kill-switch placeholder and no chrome controls', () => {
     render(<StatusBar env="PAPER" daemon="UP" version="0.1.0" readiness="READY" />)
 
-    // The only status-bar control is the real pause toggle; the only
-    // kill-switch affordance is the live KillSwitchBar above the shell.
+    // Status bar facts only: the kill switch and the pause toggle are rendered
+    // after it in the shell chrome so the first three tab stops are the skip
+    // links and the kill switch (DESIGN A2.2 / A12 #7).
     expect(screen.queryByText(/not available in this build/i)).not.toBeInTheDocument()
-    const buttons = screen.getAllByRole('button')
-    expect(buttons).toHaveLength(1)
-    expect(buttons[0]).toHaveTextContent('暂停实时更新')
+    expect(screen.queryAllByRole('button')).toHaveLength(0)
   })
 
+  it('shows OFFLINE when the daemon probe fails', () => {
+    render(<StatusBar daemon="OFFLINE" readiness="UNKNOWN" />)
+
+    expect(screen.getByText('OFFLINE')).toBeInTheDocument()
+    expect(screen.getAllByText('UNKNOWN').length).toBeGreaterThan(0)
+  })
+
+  it('never claims health with hardcoded defaults', () => {
+    render(<StatusBar />)
+
+    expect(screen.getByText('OFFLINE')).toBeInTheDocument()
+    expect(screen.getAllByText('UNKNOWN').length).toBeGreaterThan(0)
+    expect(screen.queryByText('UP')).not.toBeInTheDocument()
+    expect(screen.queryByText('READY')).not.toBeInTheDocument()
+  })
+})
+
+describe('PauseControl', () => {
   it('toggles the DESIGN A6 global pause with aria-pressed, a visible PAUSED stamp, and an announcement', () => {
     render(
       <LiveUpdatesProvider>
-        <StatusBar env="PAPER" daemon="UP" version="0.1.0" readiness="READY" />
+        <PauseControl />
       </LiveUpdatesProvider>,
     )
 
@@ -55,19 +72,13 @@ describe('StatusBar', () => {
     expect(screen.getByRole('status')).toHaveTextContent('实时更新已恢复')
   })
 
-  it('shows OFFLINE when the daemon probe fails', () => {
-    render(<StatusBar daemon="OFFLINE" readiness="UNKNOWN" />)
+  it('renders exactly one control so the kill switch stays the third tab stop', () => {
+    render(
+      <LiveUpdatesProvider>
+        <PauseControl />
+      </LiveUpdatesProvider>,
+    )
 
-    expect(screen.getByText('OFFLINE')).toBeInTheDocument()
-    expect(screen.getAllByText('UNKNOWN').length).toBeGreaterThan(0)
-  })
-
-  it('never claims health with hardcoded defaults', () => {
-    render(<StatusBar />)
-
-    expect(screen.getByText('OFFLINE')).toBeInTheDocument()
-    expect(screen.getAllByText('UNKNOWN').length).toBeGreaterThan(0)
-    expect(screen.queryByText('UP')).not.toBeInTheDocument()
-    expect(screen.queryByText('READY')).not.toBeInTheDocument()
+    expect(screen.getAllByRole('button')).toHaveLength(1)
   })
 })

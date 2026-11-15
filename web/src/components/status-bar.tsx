@@ -10,10 +10,10 @@ interface StatusBarProps {
 }
 
 /**
- * The global status bar. Besides env/daemon/version/readiness it hosts the
- * DESIGN A6 global "暂停实时更新" control (WCAG 2.2.2): a real toggle button
- * with ``aria-pressed``, a visible, flipping label, a visible PAUSED stamp, and
- * a separate polite live region that announces each state change exactly once.
+ * The global status bar: environment, daemon, version, and readiness facts only.
+ * Focusable chrome controls are rendered after it (kill switch, then pause) so
+ * the first three tab stops are the two skip links and the kill switch
+ * (DESIGN A2.2 / A12 #7).
  */
 export function StatusBar({
   env = 'PAPER',
@@ -22,17 +22,6 @@ export function StatusBar({
   readiness = 'UNKNOWN',
 }: StatusBarProps) {
   const daemonOnline = daemon === 'UP'
-  const { paused, toggle } = useLiveUpdates()
-  const [announcement, setAnnouncement] = useState('')
-  const previousPaused = useRef(paused)
-
-  useEffect(() => {
-    if (previousPaused.current === paused) {
-      return
-    }
-    previousPaused.current = paused
-    setAnnouncement(paused ? '实时更新已暂停' : '实时更新已恢复')
-  }, [paused])
 
   return (
     <header className="statusbar" role="region" aria-label="System status bar">
@@ -58,7 +47,32 @@ export function StatusBar({
       <span className="sb-item">
         readiness <b className={readiness === 'READY' ? 'sb-ok' : 'sb-warn'}>{readiness}</b>
       </span>
-      <span className="sb-grow" />
+    </header>
+  )
+}
+
+/**
+ * The DESIGN A6 global "暂停实时更新" control (WCAG 2.2.2). It is rendered after
+ * the kill switch in the shell chrome so the kill switch is the third tab stop.
+ * It keeps a real toggle button with ``aria-pressed``, a visible, flipping
+ * label, a visible PAUSED stamp, and a separate polite live region that
+ * announces each state change exactly once.
+ */
+export function PauseControl() {
+  const { paused, toggle } = useLiveUpdates()
+  const [announcement, setAnnouncement] = useState('')
+  const previousPaused = useRef(paused)
+
+  useEffect(() => {
+    if (previousPaused.current === paused) {
+      return
+    }
+    previousPaused.current = paused
+    setAnnouncement(paused ? '实时更新已暂停' : '实时更新已恢复')
+  }, [paused])
+
+  return (
+    <div className="pause-bar">
       {paused && (
         <span className="stamp stamp--stale" data-testid="statusbar-paused" lang="en">
           PAUSED
@@ -70,6 +84,6 @@ export function StatusBar({
       <span className="visually-hidden" role="status" aria-live="polite">
         {announcement}
       </span>
-    </header>
+    </div>
   )
 }

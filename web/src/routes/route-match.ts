@@ -1,5 +1,10 @@
+import { resolveActiveNav, type NavGroupId, type NavItemId } from './nav-items'
+
 export interface RouteMatch {
   path: string
+  /** Active group and item from the shared navigation source, if any. */
+  activeGroup: NavGroupId | null
+  activeNavItem: NavItemId | null
   inspectorSymbol: string | null
   isWatchlist: boolean
   isSearch: boolean
@@ -48,34 +53,71 @@ export function resolveRoute(pathname: string): RouteMatch {
   const triggerMatch = /^\/triggers\/([^/]+)$/.exec(path)
   const positionMatch = /^\/positions\/([^/]+)$/.exec(path)
   const journalMatch = /^\/journal\/([^/]+)$/.exec(path)
+  const isScans = path === '/scans' || path.startsWith('/scans/')
+  const isReports = path === '/reports' || path.startsWith('/reports/')
+  // The list or exactly one detail segment; a deeper path is not an
+  // opportunity route and must fall through to the not-found panel.
+  const isOpportunities = path === '/opportunities' || opportunityMatch !== null
+  const isTriggers = path === '/triggers'
+  // Same rule as opportunities: only `/positions` or exactly one detail
+  // segment is a position route.
+  const isPositions = path === '/positions' || positionMatch !== null
+  const isPaper = path === '/paper'
+  // Only `/journal` or exactly one detail segment is a journal route; a
+  // deeper path falls through to not-found.
+  const isJournal = path === '/journal' || journalMatch !== null
+  // Only the shell and the scan section exist in this slice; any deeper
+  // settings path falls through to not-found until its slice lands.
+  const isSettings = path === '/settings'
+  const isSettingsScan = path === '/settings/scan'
+  const isWatchlist = path === '/watchlist' || path.startsWith('/watchlist/')
+  const isSystem = path === '/' || path === '/system' || path.startsWith('/system/')
+
+  // The App renders the not-found panel exactly when none of these route
+  // shapes match. Derive the active nav item from the same resolution so a
+  // fabricated deeper path never announces a section that is not displayed.
+  const isResolved =
+    inspectorSymbol !== null ||
+    scanMatch !== null ||
+    reportMatch !== null ||
+    opportunityMatch !== null ||
+    triggerMatch !== null ||
+    positionMatch !== null ||
+    journalMatch !== null ||
+    isScans ||
+    isReports ||
+    isOpportunities ||
+    isTriggers ||
+    isPositions ||
+    isJournal ||
+    isPaper ||
+    isWatchlist ||
+    isSettingsScan ||
+    isSettings ||
+    isSystem
+  const activeNav = isResolved ? resolveActiveNav(path) : null
   return {
     path,
+    activeGroup: activeNav?.group.id ?? null,
+    activeNavItem: activeNav?.item.id ?? null,
     inspectorSymbol,
     isSearch,
-    isWatchlist: path === '/watchlist' || path.startsWith('/watchlist/'),
-    isSystem: path === '/' || path === '/system' || path.startsWith('/system/'),
-    isScans: path === '/scans' || path.startsWith('/scans/'),
+    isWatchlist,
+    isSystem,
+    isScans,
     scanId: scanMatch !== null ? decodeSegment(scanMatch[1]) : null,
-    isReports: path === '/reports' || path.startsWith('/reports/'),
+    isReports,
     reportId: reportMatch !== null ? decodeSegment(reportMatch[1]) : null,
-    // The list or exactly one detail segment; a deeper path is not an
-    // opportunity route and must fall through to the not-found panel.
-    isOpportunities: path === '/opportunities' || opportunityMatch !== null,
+    isOpportunities,
     opportunityId: opportunityMatch !== null ? decodeSegment(opportunityMatch[1]) : null,
-    isTriggers: path === '/triggers',
+    isTriggers,
     triggerId: triggerMatch !== null ? decodeSegment(triggerMatch[1]) : null,
-    // Same rule as opportunities: only `/positions` or exactly one detail
-    // segment is a position route.
-    isPositions: path === '/positions' || positionMatch !== null,
+    isPositions,
     positionId: positionMatch !== null ? decodeSegment(positionMatch[1]) : null,
-    isPaper: path === '/paper',
-    // Only `/journal` or exactly one detail segment is a journal route; a
-    // deeper path falls through to not-found.
-    isJournal: path === '/journal' || journalMatch !== null,
+    isPaper,
+    isJournal,
     journalTradeId: journalMatch !== null ? decodeSegment(journalMatch[1]) : null,
-    // Only the shell and the scan section exist in this slice; any deeper
-    // settings path falls through to not-found until its slice lands.
-    isSettings: path === '/settings',
-    isSettingsScan: path === '/settings/scan',
+    isSettings,
+    isSettingsScan,
   }
 }

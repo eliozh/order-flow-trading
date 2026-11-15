@@ -422,12 +422,16 @@ async function expectScanViewport(page: Page, viewport: ScanViewport): Promise<v
   const radio8h = form.getByRole('radio', { name: '8h' })
 
   if (viewport.readonly) {
-    await expect(page.getByRole('note')).toContainText(READ_ONLY_NOTE)
+    // Slice 33 adds a second `role="note"` (the compact nav's read-only note),
+    // so the settings-surface note is scoped to its own page section.
+    await expect(page.locator('section.system-page').getByRole('note')).toContainText(
+      READ_ONLY_NOTE,
+    )
     await expect(page.getByText('请在桌面端或 CLI 修改。', { exact: true })).toBeVisible()
     await expect(radio8h).toBeDisabled()
     await expect(save).toBeDisabled()
   } else {
-    await expect(page.getByRole('note')).toHaveCount(0)
+    await expect(page.locator('section.system-page').getByRole('note')).toHaveCount(0)
     await expect(radio8h).toBeEnabled()
     await expect(save).toBeEnabled()
   }

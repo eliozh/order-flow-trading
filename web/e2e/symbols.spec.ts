@@ -349,7 +349,7 @@ test.describe('slice 02 symbol registry journeys', () => {
 
     const surface = page.locator('section.system-page')
     await expect(surface).toHaveAttribute('data-readonly', 'true')
-    await expect(page.getByRole('note')).toContainText('Read-only at this width')
+    await expect(surface.getByRole('note')).toContainText('Read-only at this width')
 
     // The search input is present, but no mutation controls are.
     await expect(page.getByLabel('Search symbols')).toBeVisible()
@@ -390,7 +390,7 @@ test.describe('slice 02 symbol registry journeys', () => {
 
       const surface = page.locator('section.system-page')
       await expect(surface).toHaveAttribute('data-readonly', 'true')
-      await expect(page.getByRole('note')).toContainText('Read-only at this width')
+      await expect(surface.getByRole('note')).toContainText('Read-only at this width')
 
       const main = page.locator('main.app-main')
       for (const selector of ['button', 'select', 'textarea', 'form']) {

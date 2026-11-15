@@ -1,0 +1,275 @@
+/* Persistent navigation shell (slice 33).
+ *
+ * The shell reserves the nav column synchronously with CSS grid: 208px grouped
+ * sidebar at >=1280px, 56px icon rail from 481px to 1279px, and a compact
+ * wrapped grouped nav at <=480px. No JavaScript measurement is involved, so
+ * mounting the nav cannot shift the data page.
+ */
+
+.app-body {
+  display: grid;
+  grid-template-columns: 208px minmax(0, 1fr);
+  align-items: stretch;
+  flex: 1;
+  min-height: 0;
+}
+
+/* Skip links are visually hidden until they receive focus. */
+.skip-link {
+  position: fixed;
+  left: 8px;
+  top: -60px;
+  z-index: 700;
+  display: inline-flex;
+  align-items: center;
+  height: 44px;
+  padding: 0 14px;
+  border: 2px solid var(--oft-bg-canvas);
+  background: var(--oft-accent);
+  color: var(--oft-bg-canvas);
+  font: 700 13px var(--oft-font-sans);
+  text-decoration: none;
+  transition: top 120ms cubic-bezier(0.2, 0, 0, 1);
+}
+
+.skip-link:focus,
+.skip-link:focus-visible {
+  top: 8px;
+  outline: 2px solid var(--oft-text-primary);
+  outline-offset: 2px;
+}
+
+.skip-link--nav:focus,
+.skip-link--nav:focus-visible {
+  left: 176px;
+}
+
+/* Desktop: 208px grouped sidebar. */
+.nav {
+  min-width: 0;
+  border-right: 1px solid var(--oft-border-subtle);
+  background: var(--oft-bg-panel);
+  padding: 8px 0 40px;
+  overflow-y: auto;
+  scrollbar-color: var(--oft-border-strong) transparent;
+}
+
+.nav:focus-visible {
+  outline: 2px solid var(--oft-accent);
+  outline-offset: -2px;
+}
+
+.nav-group {
+  margin: 0;
+}
+
+.nav-group-label {
+  margin: 0;
+  padding: 8px 12px 2px;
+  color: var(--oft-text-muted);
+  font-family: var(--oft-font-mono);
+  font-size: 11px;
+  font-weight: 700;
+  letter-spacing: 0.1em;
+  text-transform: uppercase;
+}
+
+.nav-list {
+  display: flex;
+  flex-direction: column;
+  gap: 1px;
+  margin: 0;
+  padding: 0;
+  list-style: none;
+}
+
+.nav-link {
+  position: relative;
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  min-height: 34px;
+  padding: 0 12px;
+  border-left: 2px solid transparent;
+  color: var(--oft-text-secondary);
+  font-size: 13px;
+  text-decoration: none;
+  transition:
+    background-color 120ms cubic-bezier(0.2, 0, 0, 1),
+    color 120ms cubic-bezier(0.2, 0, 0, 1);
+}
+
+.nav-link:hover {
+  background: var(--oft-bg-hover);
+  color: var(--oft-text-primary);
+}
+
+.nav-link[aria-current='page'] {
+  border-left-color: var(--oft-accent);
+  background: var(--oft-accent-muted-surface);
+  color: var(--oft-text-primary);
+}
+
+.nav-link[aria-current='page'] .nav-ico {
+  color: var(--oft-accent);
+}
+
+.nav-link:focus-visible {
+  outline: 2px solid var(--oft-accent);
+  outline-offset: -2px;
+}
+
+.nav-ico {
+  display: grid;
+  flex: none;
+  place-items: center;
+  width: 16px;
+  height: 16px;
+  color: var(--oft-text-muted);
+}
+
+.nav-ico svg {
+  width: 16px;
+  height: 16px;
+  fill: none;
+  stroke: currentColor;
+  stroke-width: 1.5;
+  stroke-linecap: square;
+}
+
+.nav-label {
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+/* Icon rail: 56px. The label stays in the accessibility tree while its pixels
+ * are clipped, so every icon-only link keeps its accessible name. */
+@media (min-width: 481px) and (max-width: 1279px) {
+  .app-body {
+    grid-template-columns: 56px minmax(0, 1fr);
+  }
+
+  .nav-group-label {
+    padding: 8px 4px 2px;
+    overflow: hidden;
+    letter-spacing: 0.04em;
+    text-align: center;
+  }
+
+  .nav-link {
+    justify-content: center;
+    gap: 0;
+    min-height: 42px;
+    padding: 0;
+  }
+
+  .nav-label {
+    position: absolute;
+    width: 1px;
+    height: 1px;
+    padding: 0;
+    margin: -1px;
+    overflow: hidden;
+    clip: rect(0, 0, 0, 0);
+    white-space: nowrap;
+    border: 0;
+  }
+}
+
+/* Touch widths (<=768px): every target is at least 44px high with at least
+ * 8px separation (DESIGN A3 / A12 #15), matching the preview's mobile
+ * override. Applies to the rail between 481px and 768px. */
+@media (max-width: 768px) {
+  .nav-list {
+    gap: 8px;
+  }
+
+  .nav-link {
+    min-height: 44px;
+  }
+}
+
+/* 375px: one column, compact grouped nav above the read-only workspace. The
+ * kill switch stays rendered above this shell at every width. */
+.nav--compact {
+  border-right: 0;
+  border-bottom: 1px solid var(--oft-border-subtle);
+  padding: 8px 8px 0;
+  overflow: visible;
+}
+
+.nav-compact-note {
+  margin: 0 0 8px;
+  padding: 8px 10px;
+  border: 1px solid var(--oft-border-strong);
+  background: var(--oft-bg-raised);
+  color: var(--oft-text-secondary);
+  font-size: 12px;
+}
+
+.nav-compact-note strong {
+  color: var(--oft-text-primary);
+}
+
+.nav-compact-groups {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 8px;
+  padding-bottom: 8px;
+}
+
+.nav-group--compact {
+  flex: 0 1 auto;
+  min-width: 0;
+  max-width: 100%;
+}
+
+.nav-group--compact .nav-group-label {
+  padding: 0 0 4px;
+}
+
+.nav-group--compact .nav-list {
+  flex-direction: row;
+  flex-wrap: wrap;
+  gap: 8px;
+}
+
+.nav-group--compact .nav-link {
+  gap: 6px;
+  min-height: 44px;
+  padding: 0 10px;
+  border-left: 0;
+  border-top: 2px solid transparent;
+}
+
+.nav-group--compact .nav-link[aria-current='page'] {
+  border-top-color: var(--oft-accent);
+  border-left-color: transparent;
+}
+
+.nav-group--compact .nav-label {
+  position: static;
+  width: auto;
+  height: auto;
+  padding: 0;
+  margin: 0;
+  overflow: visible;
+  clip: auto;
+  white-space: nowrap;
+  border: 0;
+}
+
+@media (max-width: 480px) {
+  .app-body {
+    grid-template-columns: minmax(0, 1fr);
+  }
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .skip-link,
+  .nav-link,
+  .nav-ico {
+    transition: none;
+  }
+}
