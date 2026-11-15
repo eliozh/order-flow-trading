@@ -593,7 +593,7 @@ describe('SettingsRiskPage', () => {
     const update = vi.fn(async () => {
       throw confirmationRefusal()
     })
-    render(
+    const { container } = render(
       <div className="app-shell">
         <SettingsRiskPage
           fetchRiskSettingsFn={async () => riskEnvelope(riskData())}
@@ -610,10 +610,16 @@ describe('SettingsRiskPage', () => {
     fireEvent.click(screen.getByRole('button', { name: '保存风控' }))
     await screen.findByRole('dialog', { name: '确认放宽风险上限' })
 
-    const shell = document.querySelector('.app-shell')
+    // Scope the query to THIS render's shell: a global document lookup could
+    // pick another `.app-shell` left by a sibling test. The inert attributes
+    // are applied by a passive effect after the dialog commits, so wait for
+    // them instead of racing the effect flush.
+    const shell = container.querySelector<HTMLElement>('.app-shell')
     expect(shell).not.toBeNull()
-    expect(Array.from(shell?.children ?? []).every((child) => child.hasAttribute('inert'))).toBe(
-      true,
+    await waitFor(() =>
+      expect(Array.from(shell?.children ?? []).every((child) => child.hasAttribute('inert'))).toBe(
+        true,
+      ),
     )
     const announcer = screen.getByTestId('settings-risk-save-status')
     expect(announcer.closest('[inert]')).toBeNull()

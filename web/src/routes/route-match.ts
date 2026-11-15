@@ -31,6 +31,10 @@ export interface RouteMatch {
   isSettingsScan: boolean
   isSettingsRisk: boolean
   isSettingsLlm: boolean
+  isSettingsPrompts: boolean
+  isSettingsPromptDetail: boolean
+  isSettingsPromptHistory: boolean
+  promptId: string | null
 }
 
 function decodeSegment(segment: string): string {
@@ -71,6 +75,19 @@ export function resolveRoute(pathname: string): RouteMatch {
   const isSettingsScan = path === '/settings/scan'
   const isSettingsRisk = path === '/settings/risk'
   const isSettingsLlm = path === '/settings/llm'
+  const isSettingsPrompts = path === '/settings/prompts'
+  // One detail segment, or exactly one detail segment plus `/history`. A
+  // deeper path falls through to the not-found panel.
+  const promptDetailMatch = /^\/settings\/prompts\/([^/]+)$/.exec(path)
+  const promptHistoryMatch = /^\/settings\/prompts\/([^/]+)\/history$/.exec(path)
+  const isSettingsPromptDetail = promptDetailMatch !== null
+  const isSettingsPromptHistory = promptHistoryMatch !== null
+  const promptId =
+    promptHistoryMatch !== null
+      ? decodeSegment(promptHistoryMatch[1])
+      : promptDetailMatch !== null
+        ? decodeSegment(promptDetailMatch[1])
+        : null
   const isWatchlist = path === '/watchlist' || path.startsWith('/watchlist/')
   const isSystem = path === '/' || path === '/system' || path.startsWith('/system/')
 
@@ -96,6 +113,9 @@ export function resolveRoute(pathname: string): RouteMatch {
     isSettingsScan ||
     isSettingsRisk ||
     isSettingsLlm ||
+    isSettingsPrompts ||
+    isSettingsPromptDetail ||
+    isSettingsPromptHistory ||
     isSettings ||
     isSystem
   const activeNav = isResolved ? resolveActiveNav(path) : null
@@ -124,5 +144,9 @@ export function resolveRoute(pathname: string): RouteMatch {
     isSettingsScan,
     isSettingsRisk,
     isSettingsLlm,
+    isSettingsPrompts,
+    isSettingsPromptDetail,
+    isSettingsPromptHistory,
+    promptId,
   }
 }

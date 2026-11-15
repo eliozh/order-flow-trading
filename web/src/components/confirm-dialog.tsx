@@ -6,23 +6,31 @@ import { useDialogFocus } from '../hooks/use-dialog-focus'
 
 export interface ConfirmDiffRow {
   field: string
-  label: string
-  before: string
-  after: string
+  label: ReactNode
+  before: ReactNode
+  after: ReactNode
 }
 
 interface ConfirmDialogProps {
   open: boolean
-  title: string
-  description: string
+  title: ReactNode
+  description: ReactNode
   rows: ConfirmDiffRow[]
   confirmLabel?: string
   cancelLabel?: string
   busy?: boolean
+  /** Busy label for the confirm control; defaults to the risk-cap wording. */
+  busyLabel?: string
   /** Stable focus target when the invoker was disabled (e.g. the save button). */
   restoreFocusId?: string
   /** Unique id/testid prefix; defaults keep the slice-34 risk dialog contract. */
   idPrefix?: string
+  /** Accessible name shared by the diff table and its scroll region. */
+  tableLabel?: string
+  /** Column headers; defaults keep the slice-34 risk-cap wording. */
+  fieldHeader?: string
+  beforeHeader?: string
+  afterHeader?: string
   /** Consequence hint below the (optional) diff table. */
   hint?: ReactNode
   onCancel: () => void
@@ -49,8 +57,13 @@ export function ConfirmDialog({
   confirmLabel = '确认放宽',
   cancelLabel = '取消',
   busy = false,
+  busyLabel = '保存中…',
   restoreFocusId,
   idPrefix = 'risk-confirm',
+  tableLabel = '上限变更前后对比',
+  fieldHeader = '上限',
+  beforeHeader = '旧值',
+  afterHeader = '新值',
   hint = DEFAULT_HINT,
   onCancel,
   onConfirm,
@@ -120,17 +133,17 @@ export function ConfirmDialog({
             role="region"
             // eslint-disable-next-line jsx-a11y/no-noninteractive-tabindex -- keyboard-scrollable diff table
             tabIndex={0}
-            aria-label="上限变更前后对比"
+            aria-label={tableLabel}
           >
-            <table className="data risk-diff" aria-label="上限变更前后对比">
+            <table className="data risk-diff" aria-label={tableLabel}>
               <thead>
                 <tr>
-                  <th scope="col">上限</th>
+                  <th scope="col">{fieldHeader}</th>
                   <th scope="col" className="num">
-                    旧值
+                    {beforeHeader}
                   </th>
                   <th scope="col" className="num">
-                    新值
+                    {afterHeader}
                   </th>
                 </tr>
               </thead>
@@ -163,7 +176,7 @@ export function ConfirmDialog({
             aria-disabled={busy || undefined}
             onClick={handleConfirm}
           >
-            {busy ? '保存中…' : confirmLabel}
+            {busy ? busyLabel : confirmLabel}
           </button>
         </div>
       </div>

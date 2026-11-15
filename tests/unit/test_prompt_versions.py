@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import json
 import logging
 import sqlite3
 from datetime import UTC, datetime
@@ -130,6 +131,30 @@ def test_restore_default_creates_a_new_version_instead_of_deleting_history(
 
     service.activate("analysis", 3)
     assert service.active_for(PromptRole.ANALYSIS).body == DEFAULT_USER_BODIES[PromptRole.ANALYSIS]
+
+
+def test_restore_default_audits_exactly_one_restored_event(tmp_path: Path) -> None:
+    service, store = _service(tmp_path)
+    restored = service.restore_default("analysis", author="tester", reason="restore")
+
+    events = store.list_audit_events(limit=50)
+    prompt_events = [event for event in events if event.event_type.startswith("PROMPT_")]
+    restored_events = [
+        event for event in prompt_events if event.event_type == "PROMPT_DEFAULT_RESTORED"
+    ]
+
+    assert len(restored_events) == 1
+    body = json.loads(restored_events[0].payload_json)
+    assert body["subject"] == {"kind": "PROMPT", "id": "analysis"}
+    assert body["payload"]["version"] == restored.version
+    assert body["payload"]["body_hash"] == restored.body_hash
+    # A restore is not a plain create: its event type must not be mislabelled.
+    created_versions = [
+        json.loads(event.payload_json)["payload"]["version"]
+        for event in prompt_events
+        if event.event_type == "PROMPT_VERSION_CREATED"
+    ]
+    assert restored.version not in created_versions
 
 
 def test_changing_the_body_changes_the_content_and_rendered_hashes(tmp_path: Path) -> None:
