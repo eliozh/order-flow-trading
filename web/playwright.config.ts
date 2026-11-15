@@ -73,5 +73,13 @@ export default defineConfig({
       testMatch: /reports\.spec\.ts/,
       use: { ...devices['Desktop Chrome'], baseURL: reportsBaseURL },
     },
+    {
+      // Slice 38: watchlist star/search journey over the symbols daemon. Last
+      // on purpose so the read-only symbols suite observes its seeded stars
+      // before this suite mutates them.
+      name: 'watchlist',
+      testMatch: /watchlist\.spec\.ts/,
+      use: { ...devices['Desktop Chrome'], baseURL: symbolsBaseURL },
+    },
   ],
 })

@@ -127,8 +127,11 @@ async function gotoWithSymbolsResponse(
   pathname: string,
 ): Promise<ObservedSymbolResponse> {
   await authenticate(page)
+  // Slice 38: `/watchlist` renders from the watchlist response (which carries
+  // every registry row); only the inspector still calls `/api/v1/symbols`.
+  const apiPath = pathname === '/watchlist' ? '/api/v1/watchlist' : '/api/v1/symbols'
   const responsePromise = page.waitForResponse((response) =>
-    response.url().includes('/api/v1/symbols'),
+    response.url().includes(apiPath),
   )
   await page.goto(pathname)
   const response = await responsePromise

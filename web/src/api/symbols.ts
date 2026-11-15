@@ -140,7 +140,7 @@ export async function fetchSymbol(symbol: string): Promise<SymbolDetailEnvelope>
 }
 
 /** Exact symbol match first, then case-insensitive substring on symbol/base. */
-export function filterSymbols(items: SymbolContract[], query: string): SymbolContract[] {
+export function filterSymbols<T extends SymbolContract>(items: T[], query: string): T[] {
   const needle = query.trim().toUpperCase()
   if (!needle) {
     return items
@@ -159,9 +159,9 @@ export function filterSymbols(items: SymbolContract[], query: string): SymbolCon
   })
 }
 
-export function groupSymbols(items: SymbolContract[]): {
-  crypto: SymbolContract[]
-  tradfi: SymbolContract[]
+export function groupSymbols<T extends SymbolContract>(items: T[]): {
+  crypto: T[]
+  tradfi: T[]
 } {
   return {
     crypto: items.filter((item) => !item.tradifi),

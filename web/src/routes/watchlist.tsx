@@ -1,30 +1,49 @@
 import { useEffect, useRef, useState } from 'react'
 
+import { filterSymbols, groupSymbols } from '../api/symbols'
 import {
-  fetchSymbols,
-  filterSymbols,
-  groupSymbols,
-  type SymbolContract,
-  type SymbolListEnvelope,
-  type SymbolQuery,
-} from '../api/symbols'
-import { useCompact } from '../hooks/use-compact'
-
-const SEARCH_DEBOUNCE_MS = 200
+  fetchWatchlist,
+  setStar,
+  type StarEnvelope,
+  type WatchlistEnvelope,
+  type WatchlistRow,
+} from '../api/watchlist'
+import { StarState, StarToggle } from '../components/star-toggle'
+import { useNarrowCompact } from '../hooks/use-compact'
+import { useStarMutation } from '../hooks/use-star-mutation'
 
 interface WatchlistPageProps {
-  fetchSymbolsFn?: (query?: SymbolQuery) => Promise<SymbolListEnvelope>
-  isCompact?: boolean
+  fetchWatchlistFn?: (signal?: AbortSignal) => Promise<WatchlistEnvelope>
+  setStarFn?: (symbol: string, starred: boolean) => Promise<StarEnvelope>
+  isNarrow?: boolean
 }
 
 interface WatchlistState {
   state: 'loading' | 'ready' | 'error'
-  items: SymbolContract[]
+  rows: WatchlistRow[]
   total: number
   message?: string
 }
 
-function SymbolGroup({ label, items }: { label: string; items: SymbolContract[] }) {
+const EMPTY_STATE: WatchlistState = {
+  state: 'loading',
+  rows: [],
+  total: 0,
+}
+
+function SymbolGroup({
+  label,
+  items,
+  pending,
+  narrow,
+  onToggle,
+}: {
+  label: string
+  items: WatchlistRow[]
+  pending: ReadonlySet<string>
+  narrow: boolean
+  onToggle: (row: WatchlistRow) => void
+}) {
   if (items.length === 0) {
     return null
   }
@@ -38,9 +57,13 @@ function SymbolGroup({ label, items }: { label: string; items: SymbolContract[] 
       {/* eslint-disable-next-line jsx-a11y/no-noninteractive-tabindex -- scrollable table */}
       <div className="table-wrap" role="region" aria-label={`${label} symbols table`} tabIndex={0}>
         <table className="data-table">
-          <caption className="visually-hidden">{label} symbols in the registry</caption>
+          <caption className="visually-hidden">{label} symbols in the next scan</caption>
           <thead>
             <tr>
+              <th scope="col">
+                <span aria-hidden="true">★</span>
+                <span className="visually-hidden">In next scan</span>
+              </th>
               <th scope="col">Symbol</th>
               <th scope="col">Contract type</th>
               <th scope="col">Tick</th>
@@ -51,24 +74,39 @@ function SymbolGroup({ label, items }: { label: string; items: SymbolContract[] 
             </tr>
           </thead>
           <tbody>
-            {items.map((item) => (
-              <tr key={item.symbol}>
-                <td>
-                  <a
-                    className="rowlink mono"
-                    href={`/watchlist/${encodeURIComponent(item.symbol)}`}
-                  >
-                    {item.symbol}
-                  </a>
-                </td>
-                <td>{item.contract_type}</td>
-                <td className="mono">{item.tick_size}</td>
-                <td className="mono">{item.step_size}</td>
-                <td className="mono">{item.min_notional}</td>
-                <td>{item.status}</td>
-                <td className="mono">{item.listed_date}</td>
-              </tr>
-            ))}
+            {items.map((item) => {
+              const isPending = pending.has(item.symbol)
+              return (
+                <tr key={item.symbol}>
+                  <td className="star-cell">
+                    {narrow ? (
+                      <StarState starred={item.starred} />
+                    ) : (
+                      <StarToggle
+                        symbol={item.symbol}
+                        starred={item.starred}
+                        pending={isPending}
+                        onToggle={() => onToggle(item)}
+                      />
+                    )}
+                  </td>
+                  <td>
+                    <a
+                      className="rowlink mono"
+                      href={`/watchlist/${encodeURIComponent(item.symbol)}`}
+                    >
+                      {item.symbol}
+                    </a>
+                  </td>
+                  <td>{item.contract_type}</td>
+                  <td className="mono">{item.tick_size}</td>
+                  <td className="mono">{item.step_size}</td>
+                  <td className="mono">{item.min_notional}</td>
+                  <td>{item.status}</td>
+                  <td className="mono">{item.listed_date}</td>
+                </tr>
+              )
+            })}
           </tbody>
         </table>
       </div>
@@ -76,81 +114,191 @@ function SymbolGroup({ label, items }: { label: string; items: SymbolContract[] 
   )
 }
 
-export function WatchlistPage({ fetchSymbolsFn = fetchSymbols, isCompact }: WatchlistPageProps) {
-  const [load, setLoad] = useState<WatchlistState>({
-    state: 'loading',
-    items: [],
-    total: 0,
-  })
+export function WatchlistPage({
+  fetchWatchlistFn = fetchWatchlist,
+  setStarFn = setStar,
+  isNarrow,
+}: WatchlistPageProps) {
+  const [load, setLoad] = useState<WatchlistState>(EMPTY_STATE)
   const [query, setQuery] = useState('')
-  const [debouncedQuery, setDebouncedQuery] = useState('')
   const [announcement, setAnnouncement] = useState('')
+  const [mutationError, setMutationError] = useState<string | null>(null)
   const [attempt, setAttempt] = useState(0)
-  const compact = useCompact(isCompact)
-  const fetcherRef = useRef(fetchSymbolsFn)
+  const narrow = useNarrowCompact(isNarrow)
+  const fetcherRef = useRef(fetchWatchlistFn)
+  const setStarRef = useRef(setStarFn)
+  // The rendered order before a toggle, so focus can move after a row unmounts.
+  const orderRef = useRef<string[]>([])
+  const snapshotsRef = useRef<Map<string, WatchlistRow>>(new Map())
+  const announcedQueryRef = useRef('')
 
   useEffect(() => {
-    fetcherRef.current = fetchSymbolsFn
-  }, [fetchSymbolsFn])
+    fetcherRef.current = fetchWatchlistFn
+  }, [fetchWatchlistFn])
 
   useEffect(() => {
-    const timer = setTimeout(() => setDebouncedQuery(query.trim()), SEARCH_DEBOUNCE_MS)
-    return () => clearTimeout(timer)
-  }, [query])
+    setStarRef.current = setStarFn
+  }, [setStarFn])
 
   useEffect(() => {
-    let active = true
+    const controller = new AbortController()
     setLoad((previous) => ({ ...previous, state: 'loading' }))
-    const request: SymbolQuery | undefined = debouncedQuery ? { q: debouncedQuery } : undefined
     fetcherRef
-      .current(request)
+      .current(controller.signal)
       .then((envelope) => {
-        if (!active) {
-          return
-        }
         const data = envelope.data
         if (!data) {
-          setLoad({
-            state: 'error',
-            items: [],
-            total: 0,
-            message: 'Symbol registry response was empty.',
-          })
-          setAnnouncement('Symbol registry unavailable.')
-          return
+          throw new Error('Watchlist response was empty.')
         }
-        setLoad({ state: 'ready', items: data.items, total: data.total })
+        // The rendered count derives from these rows; the server's
+        // next_scan_count is only an initial cross-check of the same value.
+        setLoad({ state: 'ready', rows: data.rows, total: data.total })
+        const included = data.rows.filter((row) => row.starred).length
         setAnnouncement(
-          data.total === 0
-            ? 'Symbol registry is empty.'
-            : `${data.items.length} of ${data.total} symbols shown.`,
+          included === 0
+            ? 'No symbols are included in the next scan.'
+            : `${included} of ${data.total} symbols included in next scan.`,
         )
       })
-      .catch((error: unknown) => {
-        if (!active) {
+      .catch((cause: unknown) => {
+        if (controller.signal.aborted) {
           return
         }
         setLoad({
           state: 'error',
-          items: [],
+          rows: [],
           total: 0,
-          message: error instanceof Error ? error.message : 'Unknown error',
+          message: cause instanceof Error ? cause.message : 'Unknown error',
         })
-        setAnnouncement('Symbol registry unavailable.')
       })
     return () => {
-      active = false
+      controller.abort()
     }
-  }, [debouncedQuery, attempt])
+  }, [attempt])
 
-  const matched = filterSymbols(load.items, query)
+  const mutation = useStarMutation({
+    setStarFn: (symbol, starred) => setStarRef.current(symbol, starred),
+    successMessage: (symbol, starred) =>
+      `${symbol} ${starred ? 'added to' : 'removed from'} next scan.`,
+    onAnnounce: setAnnouncement,
+    onOptimistic: (symbol, starred) => {
+      setMutationError(null)
+      setLoad((current) => ({
+        ...current,
+        rows: current.rows.map((item) =>
+          item.symbol === symbol
+            ? { ...item, starred, starred_at: starred ? item.starred_at : null }
+            : item,
+        ),
+      }))
+    },
+    onConfirmed: (symbol, starred, starredAt) => {
+      setLoad((current) => ({
+        ...current,
+        rows: current.rows.map((item) =>
+          item.symbol === symbol ? { ...item, starred, starred_at: starredAt } : item,
+        ),
+      }))
+      if (!starred) {
+        moveFocusAfterRemoval(symbol)
+      }
+      snapshotsRef.current.delete(symbol)
+    },
+    onRollback: (symbol, cause) => {
+      const snapshot = snapshotsRef.current.get(symbol)
+      if (snapshot) {
+        setLoad((current) => ({
+          ...current,
+          rows: current.rows.map((item) => (item.symbol === symbol ? snapshot : item)),
+        }))
+      }
+      const message = cause instanceof Error ? cause.message : 'Unknown error'
+      setMutationError(`Could not ${snapshot?.starred ? 'remove' : 'add'} ${symbol}: ${message}`)
+      snapshotsRef.current.delete(symbol)
+    },
+    onUnknownOutcome: (symbol) => {
+      setMutationError(`Could not confirm the ${symbol} change; refreshing the watchlist.`)
+      snapshotsRef.current.delete(symbol)
+      setAttempt((n) => n + 1)
+    },
+  })
+
+  // A row being unstarred stays visible until the mutation resolves so the
+  // pending state and any rollback remain on screen.
+  const displayedRows = load.rows.filter((row) => row.starred || mutation.pending.has(row.symbol))
+  const matched = filterSymbols(displayedRows, query)
   const groups = groupSymbols(matched)
-  const truncated = load.items.length < load.total
   const searching = query.trim() !== ''
+  // Derived from the same rows the user sees, not separate state.
+  const nextScanCount = load.rows.filter((row) => row.starred).length
+  const countLabel = `${nextScanCount} of ${load.total} symbols included in next scan`
+
+  // One polite announcement for filter-result changes; the mount-time load
+  // summary above is the only other write to this region.
+  useEffect(() => {
+    if (load.state !== 'ready') {
+      return
+    }
+    const trimmed = query.trim()
+    if (trimmed === announcedQueryRef.current) {
+      return
+    }
+    announcedQueryRef.current = trimmed
+    if (trimmed === '') {
+      return
+    }
+    setAnnouncement(
+      `${matched.length} of ${displayedRows.length} starred match “${trimmed}”.`,
+    )
+  }, [load.state, query, matched.length, displayedRows.length])
+
+  function moveFocusAfterRemoval(removed: string): void {
+    const order = orderRef.current
+    const index = order.indexOf(removed)
+    requestAnimationFrame(() => {
+      // Never steal focus the user has already moved elsewhere in this frame;
+      // a removed focused button falls back to <body>.
+      const active = document.activeElement
+      if (active !== null && active !== document.body) {
+        return
+      }
+      const toggles = Array.from(
+        document.querySelectorAll<HTMLElement>('[data-star-symbol]'),
+      )
+      const find = (symbol: string): HTMLElement | undefined =>
+        toggles.find((element) => element.dataset.starSymbol === symbol)
+      const after = order.slice(index + 1).map(find).find(Boolean)
+      const before = order
+        .slice(0, Math.max(0, index))
+        .reverse()
+        .map(find)
+        .find(Boolean)
+      const target = after ?? before
+      if (target) {
+        target.focus()
+        return
+      }
+      document.getElementById('symbol-search')?.focus()
+    })
+  }
+
+  function toggle(row: WatchlistRow): void {
+    if (narrow || mutation.pending.has(row.symbol)) {
+      return
+    }
+    orderRef.current = displayedRows.map((item) => item.symbol)
+    snapshotsRef.current.set(row.symbol, row)
+    mutation.toggle(row.symbol, !row.starred)
+  }
 
   return (
-    <section className="system-page" aria-labelledby="watchlist-heading" data-readonly={compact}>
-      <p className="visually-hidden" role="status" aria-live="polite">
+    <section
+      className="system-page"
+      lang="en"
+      aria-labelledby="watchlist-heading"
+      data-readonly={narrow}
+    >
+      <p className="visually-hidden" role="status" aria-live="polite" data-testid="watchlist-live">
         {announcement}
       </p>
       <div className="page-head">
@@ -158,13 +306,24 @@ export function WatchlistPage({ fetchSymbolsFn = fetchSymbols, isCompact }: Watc
           <p className="kicker">Watchlist / symbols</p>
           <h1 id="watchlist-heading">Watchlist</h1>
           <p className="page-sub">
-            Read-only symbol registry grouped by Crypto and TradFi. Star mutation is not part of
-            this slice.
+            Starred symbols grouped by Crypto and TradFi; the star decides whether a symbol is
+            included in the next scan.
           </p>
         </div>
-        {compact && (
+        {/* Always offered while ready, not only from the empty state: a
+            populated watchlist still needs the add-from-search path. A plain
+            anchor keeps it usable at the 375 read-only surface. */}
+        {load.state === 'ready' && (
+          <div className="action-row">
+            <a className="btn" href="/watchlist/search">
+              Search symbols
+            </a>
+          </div>
+        )}
+        {narrow && (
           <p className="readonly-note" role="note">
-            Read-only at this width. Use a desktop viewport or the CLI for actions.
+            Read-only at this width. Use a desktop viewport or the CLI (`oft watchlist add|remove`)
+            for actions.
           </p>
         )}
       </div>
@@ -172,9 +331,11 @@ export function WatchlistPage({ fetchSymbolsFn = fetchSymbols, isCompact }: Watc
       <section className="panel" aria-label="Symbol search">
         <div className="panel-head">
           <label htmlFor="symbol-search">Search symbols</label>
-          <span className="mono-muted">
-            {matched.length} of {load.total} symbols
-          </span>
+          {load.state === 'ready' && (
+            <span className="mono-muted">
+              {matched.length} of {displayedRows.length} starred
+            </span>
+          )}
         </div>
         <div className="panel-foot">
           <input
@@ -188,9 +349,9 @@ export function WatchlistPage({ fetchSymbolsFn = fetchSymbols, isCompact }: Watc
         </div>
       </section>
 
-      {truncated && (
-        <p className="status-message">
-          Showing first {load.items.length} of {load.total} symbols.
+      {load.state === 'ready' && (
+        <p className="status-message" data-testid="watchlist-count">
+          {countLabel}
         </p>
       )}
 
@@ -199,29 +360,63 @@ export function WatchlistPage({ fetchSymbolsFn = fetchSymbols, isCompact }: Watc
       {load.state === 'error' && (
         <div>
           <p className="status-message status-message--error" role="alert">
-            Symbol registry unavailable: {load.message}
+            Watchlist unavailable: {load.message}
           </p>
+          {/* Read-only recovery: this is not a star mutation, so it stays
+              available at every width, including the 375 read-only surface. */}
           <button type="button" className="control-btn" onClick={() => setAttempt((n) => n + 1)}>
             Retry
           </button>
         </div>
       )}
 
-      {load.state === 'ready' && !searching && load.items.length === 0 && (
-        <p className="status-message">
-          No symbols in the registry. Run <code>oft watchlist list</code> after the daemon ingests
-          exchangeInfo.
+      {mutationError !== null && (
+        <p className="status-message status-message--error" role="alert">
+          {mutationError}
         </p>
       )}
 
-      {load.state === 'ready' && searching && matched.length === 0 && (
+      {load.state === 'ready' && displayedRows.length === 0 && (
+        <div className="panel">
+          <div className="panel-head">
+            <h2>No symbols in the next scan</h2>
+          </div>
+          <p className="panel-foot">
+            Star at least one symbol, or add one from the CLI with{' '}
+            <code>oft watchlist add BTCUSDT</code>.
+          </p>
+          <div className="action-row" style={{ padding: '0 16px 16px' }}>
+            <a className="btn" href="/watchlist/search">
+              Search symbols
+            </a>
+          </div>
+        </div>
+      )}
+
+      {load.state === 'ready' && displayedRows.length > 0 && searching && matched.length === 0 && (
         <p className="status-message">
           No matches for “{query}”. Try an exact symbol such as BTCUSDT.
         </p>
       )}
 
-      {load.state === 'ready' && <SymbolGroup label="CRYPTO" items={groups.crypto} />}
-      {load.state === 'ready' && <SymbolGroup label="TRADFI" items={groups.tradfi} />}
+      {load.state === 'ready' && (
+        <SymbolGroup
+          label="CRYPTO"
+          items={groups.crypto}
+          pending={mutation.pending}
+          narrow={narrow}
+          onToggle={toggle}
+        />
+      )}
+      {load.state === 'ready' && (
+        <SymbolGroup
+          label="TRADFI"
+          items={groups.tradfi}
+          pending={mutation.pending}
+          narrow={narrow}
+          onToggle={toggle}
+        />
+      )}
     </section>
   )
 }

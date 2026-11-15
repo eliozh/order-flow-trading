@@ -20,7 +20,7 @@ from oft.domain.symbols import (
 )
 from oft.domain.time import utc_timestamp
 from oft.ports.clock import ClockPort
-from oft.ports.store import StorePort, SymbolUpsertResult
+from oft.ports.store import StarChangeResult, StarState, StorePort, SymbolUpsertResult
 
 _SYMBOL_PATTERN = re.compile(r"^[A-Z0-9]{2,24}$")
 _TRADING = "TRADING"
@@ -339,7 +339,37 @@ class SymbolRegistry:
         return self._store.get_symbol(symbol.strip().upper())
 
     def set_starred(self, symbol: str, starred: bool, *, starred_at: str | None = None) -> bool:
+        """Test/fixture seeding helper: set the flag without an audit event.
+
+        Product mutations must use :meth:`set_star_with_audit`; this helper
+        always overwrites ``starred_at`` and writes no audit event.
+        """
         return self._store.set_starred(symbol.strip().upper(), starred, starred_at=starred_at)
+
+    def set_star_with_audit(
+        self, symbol: str, starred: bool, *, actor: str = "web"
+    ) -> StarChangeResult | None:
+        """Star/unstar one symbol, auditing only an actual change.
+
+        Starring an already-starred symbol keeps the original ``starred_at``;
+        unstarring an unstarred symbol is a no-op. Both write no audit event, so
+        an idempotent replay never duplicates rows or audits.
+        """
+        resolved = symbol.strip().upper()
+        now = utc_timestamp(self._clock.now())
+        return self._store.set_starred_with_audit(
+            resolved,
+            starred,
+            starred_at=now,
+            actor={"kind": "USER", "id": actor},
+            created_at=now,
+        )
+
+    def get_star_state(self, symbol: str) -> StarState | None:
+        return self._store.get_star_state(symbol.strip().upper())
+
+    def star_states(self) -> dict[str, StarState]:
+        return self._store.star_states()
 
     def list_starred(self) -> tuple[SymbolContract, ...]:
         return self._store.list_starred()
