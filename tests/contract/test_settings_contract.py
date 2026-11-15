@@ -271,3 +271,110 @@ def test_settings_sections_include_the_risk_section(
         "max_spread_bps",
         "stale_mark_seconds",
     ]
+
+
+def test_llm_settings_payloads_validate_and_never_include_a_key(
+    tmp_path: Path, validator: Draft202012Validator, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from oft.application import secrets_service as secrets_module
+    from oft.application.secrets_service import SecretBackend
+
+    class _Memory(SecretBackend):
+        kind = "encrypted_file"
+
+        def __init__(self) -> None:
+            self.values: dict[str, str] = {}
+
+        def available(self) -> bool:
+            return True
+
+        def get(self, reference: str) -> str | None:
+            return self.values.get(reference)
+
+        def set(self, reference: str, value: str) -> None:
+            self.values[reference] = value
+
+        def delete(self, reference: str) -> None:
+            self.values.pop(reference, None)
+
+    memory = _Memory()
+    monkeypatch.setattr(secrets_module, "default_backend", lambda _settings: memory)
+    key = "sk-contract-SENTINEL-7c1d"
+    settings = Settings(env="test", port=8765, data_dir=tmp_path / "data")
+    app = create_app(settings, clock=FixedClock(NOW))
+    auth = _auth(app)
+
+    with TestClient(app) as client:
+        responses = [
+            client.get("/api/v1/settings/llm", headers=auth),
+            client.put(
+                "/api/v1/settings/llm",
+                json={"provider": "openai", "roles": {"ANALYSIS": "gpt-contract"}},
+                headers={**auth, "Idempotency-Key": "contract-llm-1"},
+            ),
+            client.put(
+                "/api/v1/settings/llm",
+                json={"base_urls": {"openai": "https://api.openai.com.evil.example"}},
+                headers={**auth, "Idempotency-Key": "contract-llm-2"},
+            ),
+            client.put(
+                "/api/v1/settings/llm/openai/key",
+                json={"api_key": key},
+                headers={**auth, "Idempotency-Key": "contract-llm-key"},
+            ),
+            client.get("/api/v1/settings/llm", headers=auth),
+            client.delete(
+                "/api/v1/settings/llm/openai/key",
+                headers={**auth, "Idempotency-Key": "contract-llm-delete"},
+            ),
+        ]
+
+    catalog_codes = {entry["code"] for entry in _load("error-catalog.json")["codes"]}
+    for response in responses:
+        _validate(validator, response.json())
+        assert key not in response.text
+        assert key[:12] not in response.text
+
+    get_data = responses[0].json()["data"]
+    assert set(get_data) == {
+        "provider",
+        "providers",
+        "roles",
+        "base_urls",
+        "allow_custom_base_url",
+        "concurrency",
+        "source",
+        "updated_at",
+        "updated_by",
+    }
+    for row in get_data["providers"]:
+        assert set(row) == {
+            "provider",
+            "configured",
+            "key_source",
+            "masked",
+            "fingerprint",
+            "updated_at",
+            "updated_by",
+            "base_url",
+            "capability",
+        }
+    key_data = responses[3].json()["data"]
+    assert set(key_data) == {
+        "provider",
+        "configured",
+        "key_source",
+        "masked",
+        "fingerprint",
+        "updated_at",
+        "updated_by",
+    }
+    assert key_data["masked"] == "****7c1d"
+    invalid = responses[2].json()["error"]
+    assert invalid["code"] == "VALIDATION_FAILED"
+    assert invalid["code"] in catalog_codes
+    assert invalid["details"][0]["field"] == "base_urls.openai"
+    assert invalid["details"][0]["code"] == "unofficial_host"
+    serialized = json.dumps([response.json() for response in responses]).lower()
+    for marker in ("api_key", "secret_value", "password"):
+        assert marker not in serialized

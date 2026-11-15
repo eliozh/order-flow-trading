@@ -22,6 +22,11 @@ from oft.application.entry_service import (
     decode_persisted_caps,
     effective_caps,
 )
+from oft.application.llm_settings_service import (
+    LLMSettings,
+    LLMSettingsMixin,
+    resolve_effective_llm_settings,
+)
 from oft.application.risk_utilization import (
     RiskUtilization,
     RiskUtilizationMetric,
@@ -148,7 +153,7 @@ class RiskCapsUpdateResult:
     changed: bool
 
 
-class SettingsService:
+class SettingsService(LLMSettingsMixin):
     """Read sections and persist a validated setting with one audit event.
 
     A save that *changes* the effective value writes one ``config`` row and one
@@ -610,6 +615,7 @@ __all__ = [
     "OVERLAY_MAX_JITTER_SECONDS",
     "RISK_CAPS_UPDATED_EVENT",
     "RISK_SECTION",
+    "LLMSettings",
     "RiskCapsUpdateResult",
     "RiskSettings",
     "RiskSummary",
@@ -618,5 +624,6 @@ __all__ = [
     "ScanSettings",
     "SettingsService",
     "TIMEZONE",
+    "resolve_effective_llm_settings",
     "resolve_schedule_state_overlay",
 ]

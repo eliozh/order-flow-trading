@@ -558,6 +558,10 @@ def _run_metrics_scan(request: Request, payload: ScanCreateRequest) -> dict[str,
     heartbeat = threading.Thread(target=_heartbeat, daemon=True)
     heartbeat.start()
     try:
+        # Resolve the persisted LLM overlay before the scan reads the provider
+        # name/model, so a save made through the API or CLI applies to this scan
+        # without a restart.
+        container.refresh_llm_settings()
         run = ScanService(
             container=container,
             lock=container.scan_lock,

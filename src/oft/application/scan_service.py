@@ -125,6 +125,8 @@ class ScanContainer(Protocol):
 
     def provider_for(self, requested: str | None = None) -> LLMPort | None: ...
 
+    def refresh_llm_settings(self) -> Settings: ...
+
 
 @dataclass(frozen=True)
 class ScanRequest:
@@ -748,9 +750,13 @@ class ScanService:
         report_id: str,
     ) -> tuple[dict[str, Any], str | None, str | None, tuple[str, ...]]:
         """Run the optional LLM stage; never fail the scan when it is unavailable."""
-        provider_name = (request.provider or container.settings.llm_provider or "").strip()
         if request.metrics_only:
             return {"configured": False, "reason": LLM_DISABLED_REASON}, None, None, ()
+        # Batch and scheduled runs construct one service over many symbols; read
+        # the provider from a freshly resolved snapshot so the first symbol does
+        # not use the provider/key that was active before an operator change.
+        container.refresh_llm_settings()
+        provider_name = (request.provider or container.settings.llm_provider or "").strip()
         if request.source == "live":
             verdict = check_live_source(container.settings, container.clock)
             if not verdict.fresh:

@@ -653,3 +653,8 @@ cd "$WEB_DIR"
 # test:e2e` gating the browser-level settings guarantees; its exit code
 # propagates through `set -e`.
 bash "$SCRIPT_DIR/run-settings-e2e.sh"
+
+# Slice 35: `/settings/llm` needs the encrypted-file secret store and a local
+# fake provider, so it owns its own daemon/runner as well. Its exit code
+# propagates through `set -e`.
+bash "$SCRIPT_DIR/run-llm-settings-e2e.sh"

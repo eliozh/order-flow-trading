@@ -1,4 +1,5 @@
 import { useCallback, useEffect, useRef } from 'react'
+import type { ReactNode } from 'react'
 import { createPortal } from 'react-dom'
 
 import { useDialogFocus } from '../hooks/use-dialog-focus'
@@ -20,12 +21,20 @@ interface ConfirmDialogProps {
   busy?: boolean
   /** Stable focus target when the invoker was disabled (e.g. the save button). */
   restoreFocusId?: string
+  /** Unique id/testid prefix; defaults keep the slice-34 risk dialog contract. */
+  idPrefix?: string
+  /** Consequence hint below the (optional) diff table. */
+  hint?: ReactNode
   onCancel: () => void
   onConfirm: () => void
 }
 
-const TITLE_ID = 'risk-confirm-title'
-const DESCRIPTION_ID = 'risk-confirm-description'
+const DEFAULT_HINT = (
+  <>
+    放宽上限会让代码强制的上限更宽松；确认后写入一条 <span lang="en">RISK_CAPS_UPDATED</span>{' '}
+    audit，记录 before/after。取消不会写入任何变更。
+  </>
+)
 
 /**
  * The reusable before/after confirmation dialog. Initial focus is the least
@@ -41,9 +50,13 @@ export function ConfirmDialog({
   cancelLabel = '取消',
   busy = false,
   restoreFocusId,
+  idPrefix = 'risk-confirm',
+  hint = DEFAULT_HINT,
   onCancel,
   onConfirm,
 }: ConfirmDialogProps) {
+  const titleId = `${idPrefix}-title`
+  const descriptionId = `${idPrefix}-description`
   // Keep the close callback identity stable across ``busy`` and parent
   // re-renders. ``useDialogFocus`` keys its whole focus effect on the callback,
   // so a new identity while the confirmed PUT is in flight would tear the trap
@@ -90,51 +103,50 @@ export function ConfirmDialog({
       className="dialog-overlay"
       role="dialog"
       aria-modal="true"
-      aria-labelledby={TITLE_ID}
-      aria-describedby={DESCRIPTION_ID}
-      data-testid="risk-confirm-dialog"
+      aria-labelledby={titleId}
+      aria-describedby={descriptionId}
+      data-testid={`${idPrefix}-dialog`}
     >
       <div className="dialog-panel" ref={panelRef} tabIndex={-1}>
-        <h2 id={TITLE_ID} style={{ marginTop: 0 }}>
+        <h2 id={titleId} style={{ marginTop: 0 }}>
           {title}
         </h2>
-        <p className="status-message" id={DESCRIPTION_ID}>
+        <p className="status-message" id={descriptionId}>
           {description}
         </p>
-        <div
-          className="table-wrap risk-diff-wrap"
-          role="region"
-          // eslint-disable-next-line jsx-a11y/no-noninteractive-tabindex -- keyboard-scrollable diff table
-          tabIndex={0}
-          aria-label="上限变更前后对比"
-        >
-          <table className="data risk-diff" aria-label="上限变更前后对比">
-            <thead>
-              <tr>
-                <th scope="col">上限</th>
-                <th scope="col" className="num">
-                  旧值
-                </th>
-                <th scope="col" className="num">
-                  新值
-                </th>
-              </tr>
-            </thead>
-            <tbody>
-              {rows.map((row) => (
-                <tr key={row.field}>
-                  <th scope="row">{row.label}</th>
-                  <td className="num mono">{row.before}</td>
-                  <td className="num mono">{row.after}</td>
+        {rows.length > 0 && (
+          <div
+            className="table-wrap risk-diff-wrap"
+            role="region"
+            // eslint-disable-next-line jsx-a11y/no-noninteractive-tabindex -- keyboard-scrollable diff table
+            tabIndex={0}
+            aria-label="上限变更前后对比"
+          >
+            <table className="data risk-diff" aria-label="上限变更前后对比">
+              <thead>
+                <tr>
+                  <th scope="col">上限</th>
+                  <th scope="col" className="num">
+                    旧值
+                  </th>
+                  <th scope="col" className="num">
+                    新值
+                  </th>
                 </tr>
-              ))}
-            </tbody>
-          </table>
-        </div>
-        <p className="hint">
-          放宽上限会让代码强制的上限更宽松；确认后写入一条 <span lang="en">RISK_CAPS_UPDATED</span>{' '}
-          audit，记录 before/after。取消不会写入任何变更。
-        </p>
+              </thead>
+              <tbody>
+                {rows.map((row) => (
+                  <tr key={row.field}>
+                    <th scope="row">{row.label}</th>
+                    <td className="num mono">{row.before}</td>
+                    <td className="num mono">{row.after}</td>
+                  </tr>
+                ))}
+              </tbody>
+            </table>
+          </div>
+        )}
+        <p className="hint">{hint}</p>
         <div className="action-row" style={{ justifyContent: 'flex-end', marginTop: 16 }}>
           <button
             type="button"

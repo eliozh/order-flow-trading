@@ -137,6 +137,24 @@ def test_two_orchestrators_share_one_semaphore_slot_count(tmp_path: Path) -> Non
     semaphore.release()
 
 
+def test_the_semaphore_is_rebuilt_only_when_the_saved_limit_changes(
+    tmp_path: Path,
+) -> None:
+    """M10(c): a changed concurrency limit returns a new semaphore; else reuse."""
+    settings = Settings(env="test", port=8765, data_dir=tmp_path / "data", llm_max_concurrency=2)
+    clock = _MutableClock(NOW)
+    runtime = LLMRuntimeRegistry(clock=clock, settings=settings)
+
+    first = runtime.semaphore("openai")
+    assert runtime.semaphore("openai") is first
+
+    runtime.update_settings(settings.model_copy(update={"llm_max_concurrency": 5}))
+    rebuilt = runtime.semaphore("openai")
+    assert runtime.limit("openai") == 5
+    assert rebuilt is not first
+    assert runtime.semaphore("openai") is rebuilt
+
+
 def test_half_open_admits_exactly_one_probe_under_concurrency() -> None:
     clock = _MutableClock(NOW)
     breaker = CircuitBreaker(clock=clock)

@@ -221,7 +221,7 @@ def test_schema_version_indexes_and_check_constraints(settings: Settings) -> Non
     finally:
         connection.close()
 
-    assert versions == set(range(1, 28))
+    assert versions == set(range(1, 29))
     assert {"symbols_tradifi_symbol", "symbols_contract_tradifi_symbol"} <= indexes
 
 

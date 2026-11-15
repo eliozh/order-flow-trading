@@ -1086,3 +1086,871 @@ async function expectRiskViewport(page: Page, viewport: RiskViewport): Promise<v
   )
   await page.screenshot({ path: path.join(SCREENS_DIR, viewport.name), fullPage: true })
 }
+
+// -- slice 35: LLM providers, write-only key masking -------------------------
+
+const LLM_HEADING = { name: 'LLM providers 与模型', level: 1 } as const
+const LLM_KEY_SENTINEL = 'sk-e2e-SENTINEL-DO-NOT-RENDER-4f2a'
+
+test('LLM settings keep the provider key write-only and mask it everywhere', async ({
+  page,
+  browser,
+}) => {
+  const diagnostics = collectDiagnostics(page)
+  await authenticate(page)
+  await page.setViewportSize({ width: 1440, height: 900 })
+  await page.goto('/settings/llm')
+  await expect(page.getByRole('heading', LLM_HEADING)).toBeVisible()
+
+  await expect(page.getByTestId('llm-provider-mask-openai')).toHaveText('—')
+  await expect(page.getByText('密钥只写：保存后仅显示固定掩码与最后 4 位').first()).toBeVisible()
+
+  await page.getByTestId('llm-key-input-anthropic').fill(LLM_KEY_SENTINEL)
+  await page.getByTestId('llm-key-save-anthropic').click()
+
+  await expect(page.getByTestId('llm-provider-mask-anthropic')).toHaveText('****4f2a')
+  await expect(page.getByTestId('llm-key-input-anthropic')).toHaveValue('')
+  const html = await page.content()
+  expect(html).not.toContain(LLM_KEY_SENTINEL)
+  expect(html).not.toContain(LLM_KEY_SENTINEL.slice(0, 12))
+
+  const response = await page.request.get('/api/v1/settings/llm', {
+    headers: { Accept: 'application/json' },
+  })
+  expect(response.status()).toBe(200)
+  const text = await response.text()
+  expect(text).not.toContain(LLM_KEY_SENTINEL)
+  expect(text).not.toContain(LLM_KEY_SENTINEL.slice(0, 12))
+  const body = JSON.parse(text) as {
+    data: { providers: { provider: string; masked: string | null; key_source: string }[] }
+  }
+  const anthropic = body.data.providers.find((row) => row.provider === 'anthropic')
+  expect(anthropic?.masked).toBe('****4f2a')
+  // Either secure store is acceptable; the value must never come from the
+  // environment or be missing once saved.
+  expect(['keyring', 'encrypted_file']).toContain(anthropic?.key_source)
+
+  for (const width of [1440, 768, 375]) {
+    await page.setViewportSize({ width, height: width === 375 ? 812 : 1024 })
+    await page.goto('/settings/llm')
+    await expect(page.getByRole('heading', LLM_HEADING)).toBeVisible()
+    const widths = await page.evaluate(() => ({
+      document: document.documentElement.scrollWidth,
+      viewport: window.innerWidth,
+    }))
+    expect(widths.document, `no horizontal overflow at ${width}`).toBeLessThanOrEqual(
+      widths.viewport,
+    )
+    await page.screenshot({
+      path: path.join(SCREENS_DIR, `settings-llm-${width}.png`),
+      fullPage: true,
+    })
+  }
+
+  const axe = await new AxeBuilder({ page })
+    .withTags(['wcag2a', 'wcag2aa', 'wcag21a', 'wcag21aa'])
+    .analyze()
+  expect(
+    axe.violations,
+    JSON.stringify(
+      axe.violations.map((item) => ({ id: item.id, target: item.nodes.map((n) => n.target) })),
+    ),
+  ).toEqual([])
+
+  // Remove the test key so the journey leaves the daemon and either secret
+  // backend clean (it is a temporary data dir, but a keyring backend is global).
+  const csrf = await csrfToken(page)
+  const deleted = await page.request.delete('/api/v1/settings/llm/anthropic/key', {
+    headers: {
+      Accept: 'application/json',
+      'Idempotency-Key': 'e2e-llm-key-delete',
+      'X-CSRF-Token': csrf,
+      Origin: ORIGIN,
+    },
+  })
+  expect(deleted.status(), 'DELETE /api/v1/settings/llm/anthropic/key').toBe(200)
+  const afterDelete = (await deleted.json()).data
+  // The stored key is gone; an operator-owned environment key may remain and is
+  // reported as `env` with no last4. Neither case exposes a value.
+  expect(['unset', 'env']).toContain(afterDelete.key_source)
+  expect(afterDelete.masked).toBeNull()
+
+  const touchContext = await browser.newContext({
+    baseURL: BASE_URL,
+    hasTouch: true,
+    isMobile: true,
+    viewport: { width: 375, height: 812 },
+  })
+  const touchPage = await touchContext.newPage()
+  const touchDiagnostics = collectDiagnostics(touchPage)
+  try {
+    await authenticate(touchPage)
+    await touchPage.goto('/settings/llm')
+    await expect(touchPage.getByRole('heading', LLM_HEADING)).toBeVisible()
+    await expect(touchPage.locator('section.system-page')).toHaveAttribute('data-readonly', 'true')
+    await expect(touchPage.locator('section.system-page').getByRole('note')).toContainText(
+      '在桌面端或 CLI 修改',
+    )
+    await expect(touchPage.getByTestId('llm-key-input-anthropic')).toBeDisabled()
+  } finally {
+    await touchContext.close()
+  }
+
+  expectClean(diagnostics)
+  expectClean(touchDiagnostics)
+})
+
+// -- Slice 35: full `/settings/llm` journeys --------------------------------
+
+interface LLMProviderStatus {
+  provider: string
+  configured: boolean
+  key_source: string
+  masked: string | null
+  fingerprint: string | null
+  updated_at: string | null
+  updated_by: string | null
+  base_url: string
+  capability: null | {
+    status: string
+    strict_schema: boolean
+    degraded: boolean
+    checked_at: string
+    notes: string
+  }
+}
+
+interface LLMSettingsPayload {
+  provider: string | null
+  providers: LLMProviderStatus[]
+  roles: Record<string, string | null>
+  base_urls: Record<string, string>
+  allow_custom_base_url: boolean
+  concurrency: { global: number; deepseek: number }
+  source: 'default' | 'user'
+  updated_at: string | null
+  updated_by: string | null
+}
+
+const LLM_FAKE_BASE = process.env.OFT_E2E_LLM_FAKE_BASE_URL
+const FORBIDDEN_REVEAL = /查看|显示原值|显示密钥|reveal|show key/i
+
+async function readLLM(page: Page): Promise<LLMSettingsPayload> {
+  const response = await page.request.get('/api/v1/settings/llm', {
+    headers: { Accept: 'application/json' },
+  })
+  expect(response.status(), 'GET /api/v1/settings/llm').toBe(200)
+  const body = (await response.json()) as Envelope<LLMSettingsPayload>
+  expect(body.ok).toBe(true)
+  expect(body.data).not.toBeNull()
+  return body.data as LLMSettingsPayload
+}
+
+async function llmHeaders(page: Page, idempotencyKey: string): Promise<Record<string, string>> {
+  const csrf = await csrfToken(page)
+  return {
+    Accept: 'application/json',
+    'Content-Type': 'application/json',
+    'Idempotency-Key': idempotencyKey,
+    'X-CSRF-Token': csrf,
+    Origin: ORIGIN,
+  }
+}
+
+async function putLLMKey(page: Page, provider: string, apiKey: string, idempotencyKey: string) {
+  return page.request.put(`/api/v1/settings/llm/${provider}/key`, {
+    headers: await llmHeaders(page, idempotencyKey),
+    data: { api_key: apiKey },
+  })
+}
+
+async function putLLMSettings(page: Page, patch: Record<string, unknown>, idempotencyKey: string) {
+  return page.request.put('/api/v1/settings/llm', {
+    headers: await llmHeaders(page, idempotencyKey),
+    data: patch,
+  })
+}
+
+interface FakeRequests {
+  count: number
+  paths: string[]
+  auth_present: boolean
+}
+
+async function fakeRequests(page: Page): Promise<FakeRequests> {
+  if (!LLM_FAKE_BASE) {
+    throw new Error('OFT_E2E_LLM_FAKE_BASE_URL is required for the LLM probe journey')
+  }
+  const response = await page.request.get(`${LLM_FAKE_BASE}/__requests`)
+  expect(response.status(), 'GET fake provider /__requests').toBe(200)
+  return (await response.json()) as FakeRequests
+}
+
+function daemonLog(): string {
+  if (!DATA_DIR) {
+    throw new Error('OFT_E2E_SETTINGS_DATA_DIR is required for the settings journey')
+  }
+  return fs.readFileSync(path.join(DATA_DIR, 'daemon.log'), 'utf8')
+}
+
+function expectCleanExceptRefusals(
+  diagnostics: BrowserDiagnostics,
+  refusalMarkers: readonly string[],
+): void {
+  expect(diagnostics.pageErrors, 'uncaught page errors').toEqual([])
+  expect(
+    diagnostics.consoleErrors.filter(
+      (message) => !refusalMarkers.some((marker) => message.includes(marker)),
+    ),
+    'unexpected console errors',
+  ).toEqual([])
+}
+
+async function tabUntil(
+  page: Page,
+  matches: () => Promise<boolean>,
+  description: string,
+  max = 220,
+): Promise<void> {
+  for (let index = 0; index < max; index += 1) {
+    if (await matches()) {
+      return
+    }
+    await page.keyboard.press('Tab')
+  }
+  throw new Error(`Tab did not reach ${description} within ${max} presses`)
+}
+
+function activeIdIs(page: Page, id: string): Promise<boolean> {
+  return page.evaluate(
+    (target) =>
+      document.activeElement instanceof HTMLElement && document.activeElement.id === target,
+    id,
+  )
+}
+
+function activeTestIdIs(page: Page, testId: string): Promise<boolean> {
+  return page.evaluate(
+    (target) =>
+      document.activeElement instanceof HTMLElement &&
+      document.activeElement.getAttribute('data-testid') === target,
+    testId,
+  )
+}
+
+test('LLM key add, reload, rotate, and delete stay write-only through the UI', async ({ page }) => {
+  test.setTimeout(90_000)
+  const diagnostics = collectDiagnostics(page)
+  await page.setViewportSize({ width: 1440, height: 900 })
+  await authenticate(page)
+  await page.goto('/settings/llm')
+  await expect(page.getByRole('heading', LLM_HEADING)).toBeVisible()
+  await expect(page.getByTestId('llm-key-input-anthropic')).toBeVisible()
+
+  const first = 'sk-test-SENTINEL-35-ADD-4f2a'
+  const firstPrefix = first.slice(0, 18)
+  const rotated = 'sk-test-SENTINEL-35-ROT-c3d4'
+  const rotatedPrefix = rotated.slice(0, 18)
+
+  // Add: the full value never survives the successful save.
+  await page.getByTestId('llm-key-input-anthropic').fill(first)
+  await page.getByTestId('llm-key-save-anthropic').click()
+  await expect(page.getByTestId('llm-provider-mask-anthropic')).toHaveText('****4f2a')
+  await expect(page.getByTestId('llm-key-input-anthropic')).toHaveValue('')
+  expect(await page.content()).not.toContain(first)
+  expect(await page.content()).not.toContain(firstPrefix)
+
+  const afterAdd = await readLLM(page)
+  const anthropic = afterAdd.providers.find((row) => row.provider === 'anthropic')
+  expect(anthropic?.configured).toBe(true)
+  expect(anthropic?.masked).toBe('****4f2a')
+  expect(['keyring', 'encrypted_file', 'stored']).toContain(anthropic?.key_source)
+  const getText = await (
+    await page.request.get('/api/v1/settings/llm', { headers: { Accept: 'application/json' } })
+  ).text()
+  expect(getText).not.toContain(first)
+  expect(getText).not.toContain(firstPrefix)
+  expect(daemonLog()).not.toContain(first)
+
+  // A reload renders only the mask; the DOM still has no key value.
+  await page.reload()
+  await expect(page.getByRole('heading', LLM_HEADING)).toBeVisible()
+  await expect(page.getByTestId('llm-provider-mask-anthropic')).toHaveText('****4f2a')
+  await expect(page.getByTestId('llm-key-input-anthropic')).toHaveValue('')
+  const reloadedHtml = await page.content()
+  expect(reloadedHtml).not.toContain(first)
+  expect(reloadedHtml).not.toContain(firstPrefix)
+
+  // There is no reveal control anywhere on the screen.
+  await expect(page.getByRole('button', { name: FORBIDDEN_REVEAL })).toHaveCount(0)
+  await expect(page.locator('[data-testid*="reveal"]')).toHaveCount(0)
+
+  // And no reveal endpoint: the key route only accepts PUT/DELETE.
+  const reveal = await page.request.get('/api/v1/settings/llm/anthropic/key', {
+    headers: { Accept: 'application/json' },
+  })
+  expect([404, 405]).toContain(reveal.status())
+  expect(await reveal.text()).not.toContain(first)
+
+  // Rotate through the same write-only input.
+  await page.getByTestId('llm-key-input-anthropic').fill(rotated)
+  await page.getByRole('button', { name: '替换密钥' }).click()
+  await expect(page.getByTestId('llm-provider-mask-anthropic')).toHaveText('****c3d4')
+  await expect(page.getByTestId('llm-key-input-anthropic')).toHaveValue('')
+  const rotatedHtml = await page.content()
+  expect(rotatedHtml).not.toContain(rotated)
+  expect(rotatedHtml).not.toContain(rotatedPrefix)
+  const afterRotate = await readLLM(page)
+  expect(afterRotate.providers.find((row) => row.provider === 'anthropic')?.masked).toBe('****c3d4')
+
+  // Delete through the write-only control: the provider becomes unconfigured
+  // and no other provider key is substituted.
+  await page.getByRole('button', { name: '删除密钥' }).click()
+  const deleteDialog = page.getByRole('dialog')
+  await expect(deleteDialog).toContainText('删除 anthropic 密钥后该 provider 未配置')
+  await deleteDialog.getByRole('button', { name: '确认删除' }).click()
+  await expect(page.getByTestId('llm-provider-mask-anthropic')).toHaveText('—')
+  await expect(page.getByTestId('settings-llm-save-status')).toContainText('密钥已删除')
+  const afterDelete = await readLLM(page)
+  const deleted = afterDelete.providers.find((row) => row.provider === 'anthropic')
+  expect(deleted?.configured).toBe(false)
+  expect(deleted?.masked).toBeNull()
+  expect(deleted?.key_source).toBe('unset')
+  const deletedHtml = await page.content()
+  expect(deletedHtml).not.toContain(first)
+  expect(deletedHtml).not.toContain(rotated)
+
+  fs.mkdirSync(SCREENS_DIR, { recursive: true })
+  await page.screenshot({
+    path: path.join(SCREENS_DIR, 'settings-llm-key-deleted-1440.png'),
+    fullPage: true,
+  })
+
+  expectClean(diagnostics)
+})
+
+test('LLM base URL rejects unsafe forms inline, writes nothing, and needs the opt-in', async ({
+  page,
+}) => {
+  test.setTimeout(120_000)
+  const diagnostics = collectDiagnostics(page)
+  await page.setViewportSize({ width: 1440, height: 900 })
+  await authenticate(page)
+  await page.goto('/settings/llm')
+  await expect(page.getByRole('heading', LLM_HEADING)).toBeVisible()
+  await expect(page.locator('#llm-base-url-openai')).toBeVisible()
+
+  const before = await readLLM(page)
+  const beforeCounts = databaseCounts()
+  const openAi = page.locator('#llm-base-url-openai')
+  const inlineError = page.locator('#llm-base-url-error-openai')
+  const save = page.getByRole('button', { name: '保存 LLM 设置' })
+
+  const refusals: Array<{ value: string; pattern: RegExp }> = [
+    {
+      value: 'http://example.com/v1',
+      pattern: /must use https; http is allowed only for loopback/,
+    },
+    {
+      value: 'https://user:pass@api.openai.com/v1',
+      pattern: /must not contain userinfo/,
+    },
+    { value: 'https://api.openai.com/v1?token=1', pattern: /must not contain a query/ },
+    { value: 'https://api.openai.com/v1#frag', pattern: /must not contain a fragment/ },
+  ]
+
+  for (const refusal of refusals) {
+    await openAi.fill(refusal.value)
+    await save.click()
+    await expect(inlineError).toBeVisible()
+    await expect(inlineError).toHaveText(refusal.pattern)
+    await expect(openAi).toHaveAttribute('aria-invalid', 'true')
+  }
+
+  // A non-official https host is refused until the explicit opt-in is checked.
+  await openAi.fill('https://llm.example.test/v1')
+  await save.click()
+  await expect(inlineError).toHaveText(/official openai host or loopback/)
+  await expect(inlineError).toHaveText(/opt-in/)
+
+  const afterInvalid = await readLLM(page)
+  expect(afterInvalid.base_urls.openai).toBe(before.base_urls.openai)
+  expect(afterInvalid.updated_at).toBe(before.updated_at)
+  expect(databaseCounts()).toEqual(beforeCounts)
+
+  // The opt-in accepts the same https custom host, and only when checked.
+  await page.locator('#llm-allow-custom').check()
+  await save.click()
+  await expect(page.getByTestId('settings-llm-save-status')).toContainText('已保存 LLM 设置')
+  const afterCustom = await readLLM(page)
+  expect(afterCustom.base_urls.openai).toBe('https://llm.example.test/v1')
+  expect(afterCustom.allow_custom_base_url).toBe(true)
+  expect(databaseCounts().config).toBe(beforeCounts.config + 1)
+  expect(databaseCounts().audit).toBe(beforeCounts.audit + 1)
+
+  // Restore the official host and opt out so later journeys start clean.
+  await page.locator('#llm-allow-custom').uncheck()
+  await openAi.fill('https://api.openai.com')
+  await save.click()
+  await expect(page.getByTestId('settings-llm-save-status')).toContainText('已保存 LLM 设置')
+  const restored = await readLLM(page)
+  expect(restored.base_urls.openai).toBe('https://api.openai.com')
+  expect(restored.allow_custom_base_url).toBe(false)
+
+  fs.mkdirSync(SCREENS_DIR, { recursive: true })
+  await page.screenshot({
+    path: path.join(SCREENS_DIR, 'settings-llm-base-url-1440.png'),
+    fullPage: true,
+  })
+
+  // The refusals are designed 422s; any other page/console error is a failure.
+  expectCleanExceptRefusals(diagnostics, ['status of 422'])
+})
+
+test('LLM role mapping edits all four roles and persists concurrency without hidden columns', async ({
+  page,
+}) => {
+  test.setTimeout(90_000)
+  const diagnostics = collectDiagnostics(page)
+  await page.setViewportSize({ width: 1440, height: 900 })
+  await authenticate(page)
+  await page.goto('/settings/llm')
+  await expect(page.getByRole('heading', LLM_HEADING)).toBeVisible()
+  await expect(page.locator('#llm-role-ANALYSIS')).toBeVisible()
+
+  // No temperature/timeout column or control exists in the role table.
+  const roleHeaders = (
+    await page.locator('[aria-label="角色模型映射"] thead th').allTextContents()
+  ).map((value) => value.trim())
+  expect(roleHeaders).toEqual(['Role', 'Provider', 'Model'])
+  expect(roleHeaders.join(' ').toLowerCase()).not.toMatch(/temperature|timeout|温度|超时/)
+  await expect(page.locator('input[id*="temperature"], input[id*="timeout"]')).toHaveCount(0)
+
+  await page.locator('#llm-active-provider').selectOption('anthropic')
+  const roleModels: Record<string, string> = {
+    ANALYSIS: 'claude-e2e-analysis-saved',
+    ENTRY_RECHECK: 'claude-e2e-entry-saved',
+    MANAGEMENT: 'claude-e2e-management-saved',
+    REVIEW: 'claude-e2e-review-saved',
+  }
+  for (const [role, model] of Object.entries(roleModels)) {
+    await page.locator(`#llm-role-${role}`).fill(model)
+  }
+  await page.locator('#llm-max-concurrency').fill('5')
+  await page.locator('#llm-max-concurrency-deepseek').fill('3')
+  await page.getByRole('button', { name: '保存 LLM 设置' }).click()
+  await expect(page.getByTestId('settings-llm-save-status')).toContainText('已保存 LLM 设置')
+
+  const saved = await readLLM(page)
+  expect(saved.provider).toBe('anthropic')
+  for (const [role, model] of Object.entries(roleModels)) {
+    expect(saved.roles[role]).toBe(model)
+  }
+  expect(saved.concurrency).toEqual({ global: 5, deepseek: 3 })
+  expect(Object.keys(saved.roles).sort()).toEqual([
+    'ANALYSIS',
+    'ENTRY_RECHECK',
+    'MANAGEMENT',
+    'REVIEW',
+  ])
+
+  // The saved document survives a reload.
+  await page.reload()
+  await expect(page.getByRole('heading', LLM_HEADING)).toBeVisible()
+  await expect(page.locator('#llm-active-provider')).toHaveValue('anthropic')
+  for (const [role, model] of Object.entries(roleModels)) {
+    await expect(page.locator(`#llm-role-${role}`)).toHaveValue(model)
+  }
+  await expect(page.locator('#llm-max-concurrency')).toHaveValue('5')
+  await expect(page.locator('#llm-max-concurrency-deepseek')).toHaveValue('3')
+
+  fs.mkdirSync(SCREENS_DIR, { recursive: true })
+  await page.screenshot({
+    path: path.join(SCREENS_DIR, 'settings-llm-roles-1440.png'),
+    fullPage: true,
+  })
+
+  expectClean(diagnostics)
+})
+
+test('LLM test panel probes the saved key through the local fake and shows usage', async ({
+  page,
+}) => {
+  test.setTimeout(120_000)
+  expect(LLM_FAKE_BASE, 'run-llm-settings-e2e.sh must export the fake provider URL').toBeTruthy()
+  const diagnostics = collectDiagnostics(page)
+  await page.setViewportSize({ width: 1440, height: 900 })
+  await authenticate(page)
+
+  // Configure the fake provider: key, active provider, analysis model, base URL.
+  const sentinel = 'sk-test-SENTINEL-35-PROBE-9b71'
+  const keyResponse = await putLLMKey(page, 'anthropic', sentinel, 'e2e-llm-probe-key')
+  expect(keyResponse.status(), 'PUT anthropic key').toBe(200)
+  const settingsResponse = await putLLMSettings(
+    page,
+    {
+      provider: 'anthropic',
+      roles: { ANALYSIS: 'claude-e2e-probe' },
+      base_urls: { anthropic: LLM_FAKE_BASE },
+    },
+    'e2e-llm-probe-settings',
+  )
+  expect(settingsResponse.status(), 'PUT LLM settings').toBe(200)
+
+  const configured = await readLLM(page)
+  expect(configured.providers.find((row) => row.provider === 'anthropic')?.masked).toBe('****9b71')
+  expect(configured.base_urls.anthropic).toBe(LLM_FAKE_BASE)
+
+  await page.goto('/settings/llm')
+  await expect(page.getByRole('heading', LLM_HEADING)).toBeVisible()
+  await expect(page.getByTestId('llm-provider-mask-anthropic')).toHaveText('****9b71')
+  await expect(page.locator('#llm-base-url-anthropic')).toHaveValue(LLM_FAKE_BASE as string)
+
+  const probes: Array<{ provider?: string; role?: string }> = []
+  page.on('request', (request) => {
+    if (request.method() === 'POST' && new URL(request.url()).pathname === '/api/v1/llm/test') {
+      probes.push(request.postDataJSON() as { provider?: string; role?: string })
+    }
+  })
+
+  const beforeFake = await fakeRequests(page)
+  const providerRow = page
+    .locator('[aria-label="Providers"] tbody tr')
+    .filter({ hasText: 'Anthropic' })
+  await providerRow.getByRole('button', { name: '测试连接' }).click()
+
+  await expect(page.getByTestId('llm-probe-anthropic')).toBeVisible()
+  await expect(page.getByTestId('llm-probe-anthropic')).toHaveText(/STRICT|DEGRADED/)
+  await expect(page.getByTestId('llm-probe-anthropic')).toHaveText(/\d+ ms/)
+
+  expect(probes).toHaveLength(1)
+  expect(probes[0].provider).toBe('anthropic')
+  expect(probes[0].role).toBe('ANALYSIS')
+
+  // The probe reached the local fake transport, never a real provider.
+  await expect
+    .poll(async () => (await fakeRequests(page)).count, { timeout: 10_000 })
+    .toBeGreaterThan(beforeFake.count)
+  const afterFake = await fakeRequests(page)
+  expect(afterFake.paths).toContain('/v1/messages')
+  expect(afterFake.auth_present).toBe(true)
+
+  // Usage shows the three windows and the unpriced count; missing is never 0.
+  await expect(page.getByText('Today', { exact: true })).toBeVisible()
+  await expect(page.getByText('This week', { exact: true })).toBeVisible()
+  await expect(page.getByText('This month', { exact: true })).toBeVisible()
+  await expect(page.getByTestId('llm-usage-day')).toContainText('$')
+  await expect(page.getByTestId('llm-usage-week')).toContainText('$')
+  await expect(page.getByTestId('llm-usage-month')).toContainText('$')
+  await expect(page.getByText('Unpriced calls', { exact: true })).toBeVisible()
+  await expect(page.getByTestId('llm-usage-unpriced')).toBeVisible()
+
+  // The fake key never reaches the DOM or the API response.
+  expect(await page.content()).not.toContain(sentinel)
+  const apiText = await (
+    await page.request.get('/api/v1/settings/llm', { headers: { Accept: 'application/json' } })
+  ).text()
+  expect(apiText).not.toContain(sentinel)
+
+  fs.mkdirSync(SCREENS_DIR, { recursive: true })
+  await page.screenshot({
+    path: path.join(SCREENS_DIR, 'settings-llm-probe-usage-1440.png'),
+    fullPage: true,
+  })
+
+  expectClean(diagnostics)
+})
+
+test('LLM settings and key rotation are fully keyboard operable', async ({ page }) => {
+  test.setTimeout(120_000)
+  const diagnostics = collectDiagnostics(page)
+  await page.setViewportSize({ width: 1440, height: 900 })
+  await authenticate(page)
+
+  // Seed an OpenAI key so the replace/delete controls exist before the keyboard
+  // run. OpenAI is used here so this journey is independent of the Anthropic
+  // capability probe's runtime refresh (see the dedicated regression below).
+  const seeded = 'sk-test-SENTINEL-35-SEED-7a1b'
+  const seedResponse = await putLLMKey(page, 'openai', seeded, 'e2e-llm-kbd-seed')
+  expect(seedResponse.status(), 'PUT openai seed key').toBe(200)
+
+  await page.goto('/settings/llm')
+  await expect(page.getByRole('heading', LLM_HEADING)).toBeVisible()
+  await expect(page.getByTestId('llm-key-input-openai')).toBeVisible()
+
+  // Reach the concurrency field with Tab, change it, Tab to save, Enter.
+  await tabUntil(page, () => activeIdIs(page, 'llm-max-concurrency'), 'the concurrency input')
+  await page.keyboard.press('ControlOrMeta+A')
+  await page.keyboard.type('4')
+  await page.keyboard.press('Tab')
+  await expect(page.locator('#llm-max-concurrency-deepseek')).toBeFocused()
+  await page.keyboard.press('Tab')
+  await expect(page.getByRole('button', { name: '保存 LLM 设置' })).toBeFocused()
+  await page.keyboard.press('Enter')
+  await expect(page.getByTestId('settings-llm-save-status')).toContainText('已保存 LLM 设置')
+  expect((await readLLM(page)).concurrency.global).toBe(4)
+
+  // Replace the key with the keyboard only (Enter submits the write-only input).
+  const replacement = 'sk-test-SENTINEL-35-KBD-3c9d'
+  await tabUntil(page, () => activeTestIdIs(page, 'llm-key-input-openai'), 'the openai key input')
+  await page.keyboard.type(replacement)
+  await page.keyboard.press('Enter')
+  await expect(page.getByTestId('llm-provider-mask-openai')).toHaveText('****3c9d')
+  await expect(page.getByTestId('llm-key-input-openai')).toHaveValue('')
+
+  // Open the delete confirmation and dismiss it with Escape; the invoking
+  // control regains focus (DESIGN A7 / A11Y-02).
+  const openAiField = page
+    .locator('div.field[role="group"]')
+    .filter({ has: page.getByTestId('llm-key-input-openai') })
+  await page.keyboard.press('Tab')
+  await expect(openAiField.getByRole('button', { name: '替换密钥' })).toBeFocused()
+  await page.keyboard.press('Tab')
+  const deleteButton = openAiField.getByRole('button', { name: '删除密钥' })
+  await expect(deleteButton).toBeFocused()
+  await page.keyboard.press('Enter')
+  const dialog = page.getByRole('dialog')
+  await expect(dialog).toBeVisible()
+  const cancelButton = dialog.getByRole('button', { name: '取消' })
+  await expect(cancelButton).toBeFocused()
+  await page.keyboard.press('Escape')
+  await expect(dialog).toBeHidden()
+  await expect(deleteButton).toBeFocused()
+
+  // Reopen it with the keyboard, confirm, and mark the provider unconfigured.
+  await page.keyboard.press('Enter')
+  await expect(dialog).toBeVisible()
+  await expect(cancelButton).toBeFocused()
+  await page.keyboard.press('Tab')
+  await expect(dialog.getByRole('button', { name: '确认删除' })).toBeFocused()
+  await page.keyboard.press('Enter')
+  await expect(page.getByTestId('llm-provider-mask-openai')).toHaveText('—')
+  await expect(page.getByTestId('settings-llm-save-status')).toContainText('密钥已删除')
+  await expect(page.getByTestId('llm-key-input-openai')).toBeFocused()
+  expect((await readLLM(page)).providers.find((row) => row.provider === 'openai')?.configured).toBe(
+    false,
+  )
+
+  expectClean(diagnostics)
+})
+
+test('LLM deleting a freshly probed provider key reports the provider unconfigured', async ({
+  page,
+}) => {
+  test.setTimeout(90_000)
+  expect(LLM_FAKE_BASE, 'run-llm-settings-e2e.sh must export the fake provider URL').toBeTruthy()
+  await page.setViewportSize({ width: 1440, height: 900 })
+  await authenticate(page)
+
+  const sentinel = 'sk-test-SENTINEL-35-STALE-2d3e'
+  const keyResponse = await putLLMKey(page, 'anthropic', sentinel, 'e2e-llm-stale-key')
+  expect(keyResponse.status(), 'PUT anthropic key').toBe(200)
+  const settingsResponse = await putLLMSettings(
+    page,
+    {
+      provider: 'anthropic',
+      roles: { ANALYSIS: 'claude-e2e-stale' },
+      base_urls: { anthropic: LLM_FAKE_BASE },
+    },
+    'e2e-llm-stale-settings',
+  )
+  expect(settingsResponse.status(), 'PUT LLM settings').toBe(200)
+
+  await page.goto('/settings/llm')
+  await expect(page.getByRole('heading', LLM_HEADING)).toBeVisible()
+  await expect(page.getByTestId('llm-provider-mask-anthropic')).toHaveText('****2d3e')
+
+  // The normal pre-delete flow: test the provider, which refreshes runtime.
+  const providerRow = page
+    .locator('[aria-label="Providers"] tbody tr')
+    .filter({ hasText: 'Anthropic' })
+  await providerRow.getByRole('button', { name: '测试连接' }).click()
+  await expect(page.getByTestId('llm-probe-anthropic')).toBeVisible()
+
+  const anthropicField = page
+    .locator('div.field[role="group"]')
+    .filter({ has: page.getByTestId('llm-key-input-anthropic') })
+  await anthropicField.getByRole('button', { name: '删除密钥' }).click()
+  await page.getByRole('dialog').getByRole('button', { name: '确认删除' }).click()
+  await expect(page.getByTestId('settings-llm-save-status')).toContainText('密钥已删除')
+
+  // Required: the provider is unconfigured, not resurrected as an env key.
+  await expect(page.getByTestId('llm-provider-mask-anthropic')).toHaveText('—')
+  const after = await readLLM(page)
+  const deleted = after.providers.find((row) => row.provider === 'anthropic')
+  expect(deleted?.configured).toBe(false)
+  expect(deleted?.key_source).toBe('unset')
+})
+
+test('LLM delete confirmation restores keyboard focus after both exits', async ({ page }) => {
+  test.setTimeout(90_000)
+  await page.setViewportSize({ width: 1440, height: 900 })
+  await authenticate(page)
+
+  const seeded = 'sk-test-SENTINEL-35-FOCUS-5e6f'
+  const seedResponse = await putLLMKey(page, 'anthropic', seeded, 'e2e-llm-focus-seed')
+  expect(seedResponse.status(), 'PUT anthropic seed key').toBe(200)
+
+  await page.goto('/settings/llm')
+  await expect(page.getByRole('heading', LLM_HEADING)).toBeVisible()
+  await expect(page.getByTestId('llm-key-input-anthropic')).toBeVisible()
+
+  await tabUntil(
+    page,
+    () => activeTestIdIs(page, 'llm-key-input-anthropic'),
+    'the anthropic key input',
+  )
+  await page.keyboard.press('Tab')
+  await page.keyboard.press('Tab')
+  const deleteButton = page.getByRole('button', { name: '删除密钥' })
+  await expect(deleteButton).toBeFocused()
+  await page.keyboard.press('Enter')
+
+  const dialog = page.getByRole('dialog')
+  const cancelButton = dialog.getByRole('button', { name: '取消' })
+  await expect(dialog).toBeVisible()
+  await expect(cancelButton).toBeFocused()
+  await page.keyboard.press('Enter')
+  await expect(dialog).toBeHidden()
+
+  // Required: focus returns to the control that opened the confirmation.
+  await expect(deleteButton).toBeFocused()
+
+  // The confirm exit restores focus to the row's stable key input.
+  await page.keyboard.press('Enter')
+  await expect(dialog).toBeVisible()
+  await expect(cancelButton).toBeFocused()
+  await page.keyboard.press('Tab')
+  await page.keyboard.press('Enter')
+  await expect(page.getByTestId('llm-provider-mask-anthropic')).toHaveText('—')
+  await expect(page.getByTestId('llm-key-input-anthropic')).toBeFocused()
+})
+
+test('LLM settings are read-only at 375 with the desktop/CLI note and editable at 768/1440', async ({
+  page,
+  browser,
+}) => {
+  test.setTimeout(120_000)
+  const diagnostics = collectDiagnostics(page)
+  fs.mkdirSync(SCREENS_DIR, { recursive: true })
+  await authenticate(page)
+
+  async function expectLLMViewport(
+    target: Page,
+    viewport: { width: number; height: number; readonly: boolean; name: string },
+  ): Promise<void> {
+    await target.setViewportSize({ width: viewport.width, height: viewport.height })
+    await target.goto('/settings/llm')
+    await expect(target.getByRole('heading', LLM_HEADING)).toBeVisible()
+    await expect(target.getByTestId('llm-key-input-anthropic')).toBeVisible()
+    await expect(target.locator('section.system-page')).toHaveAttribute(
+      'data-readonly',
+      viewport.readonly ? 'true' : 'false',
+    )
+
+    const keyInput = target.getByTestId('llm-key-input-anthropic')
+    const save = target.getByRole('button', { name: '保存 LLM 设置' })
+    const note = target.locator('section.system-page').getByRole('note')
+    if (viewport.readonly) {
+      await expect(note).toContainText('在桌面端或 CLI 修改')
+      await expect(keyInput).toBeDisabled()
+      await expect(save).toBeDisabled()
+    } else {
+      await expect(note).toHaveCount(0)
+      await expect(keyInput).toBeEnabled()
+      await expect(save).toBeEnabled()
+    }
+
+    const widths = await target.evaluate(() => ({
+      document: document.documentElement.scrollWidth,
+      viewport: window.innerWidth,
+    }))
+    expect(widths.document, `no horizontal overflow at ${viewport.width}`).toBeLessThanOrEqual(
+      widths.viewport,
+    )
+    await target.screenshot({ path: path.join(SCREENS_DIR, viewport.name), fullPage: true })
+  }
+
+  await expectLLMViewport(page, {
+    width: 1440,
+    height: 900,
+    readonly: false,
+    name: 'settings-llm-viewport-1440.png',
+  })
+
+  const touchContext = await browser.newContext({
+    baseURL: BASE_URL,
+    hasTouch: true,
+    isMobile: true,
+    viewport: { width: 375, height: 812 },
+  })
+  const touchPage = await touchContext.newPage()
+  const touchDiagnostics = collectDiagnostics(touchPage)
+  try {
+    await authenticate(touchPage)
+    await expectLLMViewport(touchPage, {
+      width: 375,
+      height: 812,
+      readonly: true,
+      name: 'settings-llm-viewport-375.png',
+    })
+    await expectLLMViewport(touchPage, {
+      width: 768,
+      height: 1024,
+      readonly: false,
+      name: 'settings-llm-viewport-768.png',
+    })
+  } finally {
+    await touchContext.close()
+  }
+
+  expectClean(diagnostics)
+  expectClean(touchDiagnostics)
+})
+
+test('LLM settings report no axe WCAG 2.1 A/AA violations', async ({ page }) => {
+  test.setTimeout(120_000)
+  const diagnostics = collectDiagnostics(page)
+  fs.mkdirSync(SCREENS_DIR, { recursive: true })
+  await page.setViewportSize({ width: 1440, height: 900 })
+  await authenticate(page)
+  await page.goto('/settings/llm')
+  await expect(page.getByRole('heading', LLM_HEADING)).toBeVisible()
+  await expect(page.getByTestId('llm-key-input-anthropic')).toBeVisible()
+  await page.waitForLoadState('networkidle')
+
+  const tags = ['wcag2a', 'wcag2aa', 'wcag21a', 'wcag21aa']
+  const results = await new AxeBuilder({ page }).withTags(tags).analyze()
+  const summary = results.violations.map(
+    (violation) =>
+      `${violation.id} (${violation.impact ?? 'unknown'}): ${violation.nodes
+        .map((node) => node.target.join(' '))
+        .join(' | ')}`,
+  )
+
+  fs.writeFileSync(
+    path.join(SCREENS_DIR, 'settings-llm-axe.json'),
+    JSON.stringify(
+      {
+        url: '/settings/llm',
+        tags,
+        violationCount: results.violations.length,
+        violations: results.violations.map((violation) => ({
+          id: violation.id,
+          impact: violation.impact ?? null,
+          targets: violation.nodes.map((node) => node.target.join(' ')),
+        })),
+      },
+      null,
+      2,
+    ),
+  )
+
+  await page.screenshot({
+    path: path.join(SCREENS_DIR, 'settings-llm-axe-1440.png'),
+    fullPage: true,
+  })
+
+  expect(results.violations, `settings/llm axe violations:\n${summary.join('\n')}`).toEqual([])
+  expectClean(diagnostics)
+})

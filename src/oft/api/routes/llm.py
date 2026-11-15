@@ -18,6 +18,7 @@ from oft.application.llm_orchestrator import (
     model_catalog,
     provider_catalog,
 )
+from oft.application.secrets_service import SecretsService
 from oft.domain.time import utc_timestamp
 from oft.ports.llm import LLMRole
 
@@ -35,8 +36,11 @@ class ProbeRequest(BaseModel):
 
 def _probe_service(request: Request) -> CapabilityProbeService:
     container = request.app.state.container
+    # Resolve the persisted provider/model/base-URL/key overlay at call time, so
+    # a save made through the API or CLI applies to this probe without a restart.
+    effective = container.refresh_llm_settings()
     return CapabilityProbeService(
-        settings=container.settings,
+        settings=effective,
         store=container.store,
         clock=container.clock,
         runtime=container.llm_runtime,
@@ -47,7 +51,18 @@ def _probe_service(request: Request) -> CapabilityProbeService:
 def list_providers(request: Request) -> dict[str, Any]:
     """Configured providers, role models, and the capability chip; never a key."""
     container = request.app.state.container
-    items = provider_catalog(container.settings, container.store)
+    # Refresh before deriving ``configured``: right after a key save/delete the
+    # shared snapshot must be current, or this route disagrees with
+    # ``/api/v1/settings/llm``.
+    effective = container.refresh_llm_settings()
+    # Key presence/source comes from the same secret status the settings route
+    # uses, so an unavailable store reports ``configured: false,
+    # key_source: "unavailable"`` instead of a phantom stored key. The pristine
+    # pre-overlay settings keep an env key distinguishable from a stored one.
+    base = container.llm_base_settings or container.settings
+    secrets = SecretsService(store=container.store, settings=base, clock=container.clock)
+    statuses = {status.provider: status for status in secrets.list_statuses()}
+    items = provider_catalog(effective, container.store, statuses=statuses)
     return success_envelope(
         {"items": items, "total": len(items)},
         request_id=new_request_id(),

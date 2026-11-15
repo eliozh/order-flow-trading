@@ -2,7 +2,9 @@
 
 from __future__ import annotations
 
+import getpass
 import json
+import sys
 from typing import Annotated, Any
 
 import structlog
@@ -18,9 +20,11 @@ from oft.application.llm_orchestrator import (
     model_catalog,
     provider_catalog,
 )
+from oft.application.secrets_service import SecretsService, SecretStoreUnavailable
 from oft.bootstrap import build_container
 from oft.cli.commands.doctor import emit_error, exit_code_for
 from oft.config import ConfigError, load_settings
+from oft.domain.settings import SettingValidationError
 from oft.domain.time import utc_timestamp
 from oft.ports.llm import LLMRole
 
@@ -29,6 +33,12 @@ llm_app = typer.Typer(
     no_args_is_help=True,
     add_completion=False,
 )
+key_app = typer.Typer(
+    help="Write-only provider keys (the value is read from stdin).",
+    no_args_is_help=True,
+    add_completion=False,
+)
+llm_app.add_typer(key_app, name="key")
 
 LOGGER = structlog.get_logger(__name__)
 
@@ -63,15 +73,18 @@ def _chip(item: dict[str, Any]) -> str:
 
 
 def _render_providers(items: list[dict[str, Any]]) -> str:
-    lines = [f"{'PROVIDER':<12}{'KEYS':<8}{'CHIP':<12}ROLES"]
+    lines = [f"{'PROVIDER':<12}{'KEY':<14}{'CHIP':<12}ROLES"]
     for item in items:
         roles = ", ".join(
             f"{role}={model or '-'}" for role, model in (item.get("roles") or {}).items()
         )
-        lines.append(
-            f"{item['provider']:<12}{'set' if item['configured'] else 'unset':<8}"
-            f"{_chip(item):<12}{roles}"
-        )
+        if item.get("masked"):
+            key = str(item["masked"])
+        elif item.get("key_source") == "env":
+            key = "env"
+        else:
+            key = "unset"
+        lines.append(f"{item['provider']:<12}{key:<14}{_chip(item):<12}{roles}")
     return "\n".join(lines)
 
 
@@ -122,7 +135,18 @@ def providers_command(
     """List providers, key presence, role models, and the capability chip."""
     settings = _settings_or_exit(json_output)
     container = build_container(settings)
-    items = provider_catalog(settings, container.store)
+    effective = container.refresh_llm_settings()
+    items = provider_catalog(effective, container.store)
+    base = container.llm_base_settings or container.settings
+    secrets = SecretsService(store=container.store, settings=base, clock=container.clock)
+    statuses = {status.provider: status for status in secrets.list_statuses()}
+    for item in items:
+        status = statuses.get(str(item["provider"]))
+        if status is not None:
+            item["configured"] = status.configured
+            item["key_source"] = status.key_source
+            item["masked"] = status.masked
+            item["fingerprint"] = status.fingerprint
     if json_output:
         _emit_json({"items": items, "total": len(items)})
         return
@@ -168,8 +192,9 @@ def test_command(
         raise typer.Exit(code=2) from None
     settings = _settings_or_exit(json_output)
     container = build_container(settings, initialize=True)
+    effective = container.refresh_llm_settings()
     service = CapabilityProbeService(
-        settings=settings,
+        settings=effective,
         store=container.store,
         clock=container.clock,
         runtime=container.llm_runtime,
@@ -231,4 +256,88 @@ def usage_command(
     typer.echo(_render_usage(usage))
 
 
-__all__ = ["llm_app"]
+def _read_key_from_stdin() -> str:
+    """Read one key from stdin without echoing it.
+
+    A TTY uses ``getpass``; a pipe reads one line. The value is never placed on
+    argv, printed, or logged.
+    """
+    if sys.stdin.isatty():
+        return getpass.getpass("Provider API key (input hidden): ")
+    return sys.stdin.readline()
+
+
+def _key_service(settings: Any) -> tuple[Any, SecretsService]:
+    container = build_container(settings, initialize=True)
+    base = container.llm_base_settings or container.settings
+    # The environment baseline is the pristine snapshot, never the overlay that
+    # ``refresh`` writes the stored key into; otherwise a deleted key would look
+    # like an environment key in the reported status.
+    service = SecretsService(store=container.store, settings=base, clock=container.clock)
+    return container, service
+
+
+@key_app.command("set")
+def key_set_command(
+    provider: Annotated[str, typer.Option("--provider", help="openai|anthropic|deepseek")],
+    read_stdin: Annotated[
+        bool, typer.Option("--stdin", help="Read the key from stdin (the only accepted source).")
+    ] = False,
+    json_output: Annotated[bool, typer.Option("--json", help="Emit JSON.")] = False,
+) -> None:
+    """Store or rotate one provider key from stdin; output is the mask only."""
+    if not read_stdin:
+        emit_error(
+            "VALIDATION_FAILED",
+            "a provider key is accepted only on stdin; pass --stdin and never argv",
+            json_output=json_output,
+        )
+        raise typer.Exit(code=2)
+    key = _read_key_from_stdin()
+    settings = _settings_or_exit(json_output)
+    try:
+        _container, service = _key_service(settings)
+        status = service.set_key(provider, key, actor="cli")
+    except SettingValidationError as exc:
+        emit_error("VALIDATION_FAILED", exc.message, json_output=json_output)
+        raise typer.Exit(code=2) from exc
+    except SecretStoreUnavailable as exc:
+        emit_error("CONFIG_INVALID", exc.message, json_output=json_output)
+        raise typer.Exit(code=exit_code_for("CONFIG_INVALID")) from exc
+    payload = status.to_contract()
+    if json_output:
+        _emit_json(payload)
+        return
+    typer.echo(f"{status.provider} key stored · {status.masked}")
+
+
+@key_app.command("delete")
+def key_delete_command(
+    provider: Annotated[str, typer.Option("--provider", help="openai|anthropic|deepseek")],
+    json_output: Annotated[bool, typer.Option("--json", help="Emit JSON.")] = False,
+) -> None:
+    """Delete one provider key; a decision that needs it reports unconfigured."""
+    settings = _settings_or_exit(json_output)
+    try:
+        _container, service = _key_service(settings)
+        status = service.delete_key(provider, actor="cli")
+    except SettingValidationError as exc:
+        emit_error("VALIDATION_FAILED", exc.message, json_output=json_output)
+        raise typer.Exit(code=2) from exc
+    except SecretStoreUnavailable as exc:
+        emit_error("CONFIG_INVALID", exc.message, json_output=json_output)
+        raise typer.Exit(code=exit_code_for("CONFIG_INVALID")) from exc
+    payload = status.to_contract()
+    if json_output:
+        _emit_json(payload)
+        return
+    if not status.configured:
+        suffix = "key unset"
+    elif status.key_source == "env":
+        suffix = "stored key removed; env key still in effect"
+    else:
+        suffix = status.masked or "key stored"
+    typer.echo(f"{status.provider} deleted · {suffix}")
+
+
+__all__ = ["key_app", "llm_app"]

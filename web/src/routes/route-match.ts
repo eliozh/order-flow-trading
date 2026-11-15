@@ -30,6 +30,7 @@ export interface RouteMatch {
   isSettings: boolean
   isSettingsScan: boolean
   isSettingsRisk: boolean
+  isSettingsLlm: boolean
 }
 
 function decodeSegment(segment: string): string {
@@ -69,6 +70,7 @@ export function resolveRoute(pathname: string): RouteMatch {
   const isSettings = path === '/settings'
   const isSettingsScan = path === '/settings/scan'
   const isSettingsRisk = path === '/settings/risk'
+  const isSettingsLlm = path === '/settings/llm'
   const isWatchlist = path === '/watchlist' || path.startsWith('/watchlist/')
   const isSystem = path === '/' || path === '/system' || path.startsWith('/system/')
 
@@ -93,6 +95,7 @@ export function resolveRoute(pathname: string): RouteMatch {
     isWatchlist ||
     isSettingsScan ||
     isSettingsRisk ||
+    isSettingsLlm ||
     isSettings ||
     isSystem
   const activeNav = isResolved ? resolveActiveNav(path) : null
@@ -120,5 +123,6 @@ export function resolveRoute(pathname: string): RouteMatch {
     isSettings,
     isSettingsScan,
     isSettingsRisk,
+    isSettingsLlm,
   }
 }

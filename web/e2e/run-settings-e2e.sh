@@ -159,8 +159,11 @@ echo "screens: $SCREENS_DIR"
 
 cd "$WEB_DIR"
 set +e
+# Slice 35 LLM cases need the dedicated secure-store daemon and the local fake
+# provider; they are excluded here and run by run-llm-settings-e2e.sh.
 ./node_modules/.bin/playwright test \
   --config "$CONFIG" \
+  --grep-invert "LLM " \
   e2e/settings.spec.ts "$@"
 STATUS=$?
 set -e

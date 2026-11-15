@@ -481,20 +481,32 @@ def _start_management_scheduler(
     if expired:
         _LOGGER.warning("management_leases_expired", count=expired)
     ledger = JobLedger(store=container.store, clock=container.clock)
-    service = ManagementService(
-        store=container.store,
-        clock=container.clock,
-        provider=container.llm_provider,
-        settings=container.settings,
-        kill_switch=KillSwitch(
-            settings=container.settings,
+
+    def _build_service() -> Any:
+        """Rebuild the management service from the effective settings.
+
+        The adapters capture the key/base URL at construction, so a service
+        built once would keep the startup provider forever. Building per run
+        makes a rotated key or a changed provider/base URL apply without a
+        restart.
+        """
+        container.refresh_llm_settings()
+        return ManagementService(
             store=container.store,
             clock=container.clock,
-        ),
-        runtime=container.llm_runtime,
-        funding_settlement_enabled=settings.management_funding_settlement_enabled,
-        risk_breach_enabled=settings.management_risk_breach_enabled,
-    )
+            provider=container.provider_for(),
+            settings=container.settings,
+            kill_switch=KillSwitch(
+                settings=container.settings,
+                store=container.store,
+                clock=container.clock,
+            ),
+            runtime=container.llm_runtime,
+            funding_settlement_enabled=settings.management_funding_settlement_enabled,
+            risk_breach_enabled=settings.management_risk_breach_enabled,
+        )
+
+    service = _build_service()
 
     def _current_state() -> ScheduleState:
         return scan_scheduler.state if scan_scheduler is not None else state
@@ -505,7 +517,7 @@ def _start_management_scheduler(
         return _current_state().period_at(container.clock.now())
 
     def _run_current(window: datetime) -> Any:
-        runner = _management_runner(service, ledger, container, settings, _period())
+        runner = _management_runner(_build_service(), ledger, container, settings, _period())
         return runner.run_window(window_start=window)
 
     scheduler = ManagementDaemonScheduler(

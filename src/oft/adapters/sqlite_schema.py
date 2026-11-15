@@ -33,7 +33,7 @@ from oft.domain.prompts import (
 _LOGGER = logging.getLogger(__name__)
 
 
-_SCHEMA_VERSION = 27
+_SCHEMA_VERSION = 28
 # ``PRAGMA journal_mode=WAL`` needs an exclusive lock and does not reliably
 # consult the busy handler, so a concurrent initializer can still see
 # SQLITE_BUSY with the timeout installed. Retry the switch briefly.
@@ -585,6 +585,22 @@ _V26_DDL: tuple[str, ...] = (
 _V27_DDL: tuple[str, ...] = (
     "CREATE INDEX IF NOT EXISTS audit_events_event_type_seq ON audit_events(event_type, seq DESC);",
 )
+# v28: write-only provider secret metadata. The plaintext key is never stored in
+# SQLite; only the fingerprint, last four characters, and provenance are kept so
+# the UI can prove a key exists and detect a rotation.
+_SECRETS_META_DEFINITION = """
+    provider TEXT NOT NULL,
+    name TEXT NOT NULL,
+    fingerprint TEXT NOT NULL,
+    last4 TEXT NOT NULL,
+    updated_at TEXT NOT NULL,
+    updated_by TEXT NOT NULL,
+    PRIMARY KEY (provider, name)
+"""
+_V28_DDL: tuple[str, ...] = (
+    f"CREATE TABLE IF NOT EXISTS secrets_meta ({_SECRETS_META_DEFINITION});",
+    "CREATE INDEX IF NOT EXISTS secrets_meta_updated_at ON secrets_meta(updated_at);",
+)
 _OPPORTUNITY_CONDITION_INDEX_NAMES = (
     "opportunity_conditions_opportunity",
     "opportunity_conditions_type",
@@ -888,6 +904,8 @@ _SCHEMA_SQL = f"""
     );
     {_V26_DDL[0]}
     {_V26_DDL[1]}
+    {_V28_DDL[0]}
+    {_V28_DDL[1]}
 {_OPPORTUNITY_CONDITIONS_DDL}
 {_V22_DDL}
 {_V23_DDL}
@@ -2347,6 +2365,28 @@ def _migrate_v27(connection: sqlite3.Connection) -> None:
         raise
 
 
+def _migrate_v28(connection: sqlite3.Connection) -> None:
+    """Add the ``secrets_meta`` metadata table for write-only keys (slice 35).
+
+    Additive and idempotent: a populated v27 database keeps every row and gains
+    an empty table plus its ``updated_at`` index. Only provider/name,
+    fingerprint, last4, and provenance are stored; no key value or prefix is
+    ever written. The fresh schema carries the same statements so fresh and
+    migrated shapes cannot drift.
+    """
+    if connection.in_transaction:
+        connection.commit()
+    connection.execute("BEGIN IMMEDIATE")
+    try:
+        for statement in _V28_DDL:
+            connection.execute(statement)
+        connection.execute("COMMIT")
+    except Exception:
+        if connection.in_transaction:
+            connection.execute("ROLLBACK")
+        raise
+
+
 def _opportunity_conditions_pk(
     connection: sqlite3.Connection,
 ) -> tuple[str, ...]:
@@ -2535,7 +2575,10 @@ def initialize_database(settings: Settings) -> None:
     (``key`` primary key plus an ``updated_at`` index) so runtime settings can
     be persisted and audited in one transaction. v27 adds the additive
     ``audit_events(event_type, seq DESC)`` index that makes the newest-event-of-
-    one-type lookup a bounded index seek instead of a growing reverse scan.
+    one-type lookup a bounded index seek instead of a growing reverse scan. v28
+    adds the additive ``secrets_meta`` table (provider/name, fingerprint, last4,
+    provenance) that records write-only provider keys; the key value itself is
+    never stored in SQLite.
     """
     settings.data_dir.mkdir(parents=True, exist_ok=True)
     settings.data_dir.chmod(0o700)
@@ -2607,6 +2650,8 @@ def initialize_database(settings: Settings) -> None:
             _migrate_v26(connection)
         if _schema_version(connection) < 27 or not _migration_recorded(connection, 27):
             _migrate_v27(connection)
+        if _schema_version(connection) < 28 or not _migration_recorded(connection, 28):
+            _migrate_v28(connection)
         _ensure_opportunity_conditions_shape(connection)
         _ensure_funding_accruals_shape(connection)
         with connection:
@@ -2724,6 +2769,10 @@ def initialize_database(settings: Settings) -> None:
             connection.execute(
                 "INSERT OR IGNORE INTO schema_migrations (version, applied_at) VALUES (?, ?)",
                 (27, "2026-11-15T12:00:00.000Z"),
+            )
+            connection.execute(
+                "INSERT OR IGNORE INTO schema_migrations (version, applied_at) VALUES (?, ?)",
+                (28, "2026-11-15T18:00:00.000Z"),
             )
             _seed_prompt_defaults(connection)
             _ensure_reports_symbol_index(connection)

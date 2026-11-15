@@ -17,10 +17,15 @@ export { MUTATION_TIMEOUT_MS, READ_TIMEOUT_MS }
 export const SETTINGS_SECTIONS_PATH = '/api/v1/settings'
 export const SCAN_SETTINGS_PATH = '/api/v1/settings/scan'
 export const RISK_SETTINGS_PATH = '/api/v1/settings/risk'
+export const LLM_SETTINGS_PATH = '/api/v1/settings/llm'
+export const LLM_USAGE_PATH = '/api/v1/llm/usage'
+export const LLM_TEST_PATH = '/api/v1/llm/test'
 export const SCAN_PERIOD_KEY_PREFIX = 'oft.settings.scan.'
 export const RISK_SETTINGS_KEY_PREFIX = 'oft.settings.risk.'
+export const LLM_SETTINGS_KEY_PREFIX = 'oft.settings.llm.'
 const SCAN_PERIOD_KEY_ID = 'period'
 const RISK_SETTINGS_KEY_ID = 'caps'
+const LLM_SETTINGS_KEY_ID = 'document'
 
 export type SettingSource = 'default' | 'user'
 
@@ -440,5 +445,383 @@ export async function updateRiskSettings(
     isRiskSettings,
     signal,
     MUTATION_TIMEOUT_MS,
+  )
+}
+
+// -- slice 35: LLM provider/model settings and write-only keys ---------------
+
+export type LLMProviderName = 'openai' | 'anthropic' | 'deepseek'
+export type LLMRoleName = 'ANALYSIS' | 'ENTRY_RECHECK' | 'MANAGEMENT' | 'REVIEW'
+export type LLMKeySource = 'env' | 'keyring' | 'encrypted_file' | 'stored' | 'unset' | 'unavailable'
+export type LLMCapabilityStatus = 'STRICT' | 'DEGRADED' | 'FAILED' | 'UNCHECKED'
+export type LMUsagePeriod = 'day' | 'week' | 'month'
+
+export const LLM_PROVIDERS: readonly LLMProviderName[] = ['openai', 'anthropic', 'deepseek']
+export const LLM_ROLE_NAMES: readonly LLMRoleName[] = [
+  'ANALYSIS',
+  'ENTRY_RECHECK',
+  'MANAGEMENT',
+  'REVIEW',
+]
+
+export interface LLMCapability {
+  status: LLMCapabilityStatus
+  strict_schema: boolean
+  degraded: boolean
+  checked_at: string
+  notes: string
+}
+
+export interface LLMProviderRow {
+  provider: LLMProviderName
+  configured: boolean
+  key_source: LLMKeySource
+  /** The only key-shaped value: the fixed mask plus the last four characters. */
+  masked: string | null
+  fingerprint: string | null
+  updated_at: string | null
+  updated_by: string | null
+  base_url: string
+  capability: LLMCapability | null
+}
+
+export type LLMRoles = Record<LLMRoleName, string | null>
+
+export interface LLMSettingsData {
+  provider: LLMProviderName | null
+  providers: LLMProviderRow[]
+  roles: LLMRoles
+  base_urls: Record<LLMProviderName, string>
+  allow_custom_base_url: boolean
+  concurrency: { global: number; deepseek: number }
+  source: SettingSource
+  updated_at: string | null
+  updated_by: string | null
+}
+
+export interface LLMSettingsPatch {
+  provider?: LLMProviderName | null
+  roles?: Partial<LLMRoles>
+  base_urls?: Partial<Record<LLMProviderName, string>>
+  allow_custom_base_url?: boolean
+  max_concurrency?: number
+  max_concurrency_deepseek?: number
+}
+
+export interface LLMKeyStatus {
+  provider: LLMProviderName
+  configured: boolean
+  key_source: LLMKeySource
+  masked: string | null
+  fingerprint: string | null
+  updated_at: string | null
+  updated_by: string | null
+}
+
+export interface LLMTestResult {
+  provider: LLMProviderName
+  model: string
+  status: LLMCapabilityStatus
+  strict_schema: boolean
+  degraded: boolean
+  max_output_tokens: number
+  error_code: string | null
+  notes: string
+  latency_ms: number
+  checked_at: string
+}
+
+export interface LLMUsageData {
+  period: LMUsagePeriod
+  period_key: string
+  spend_usd: string
+  call_count: number
+  unpriced_count: number
+  budget_state: string
+  thresholds: {
+    daily_usd: string
+    weekly_usd: string
+    monthly_usd: string
+    warn_pct: number
+  }
+  by_provider: { provider: string; spend_usd: string; call_count: number; unpriced_count: number }[]
+  by_model: { model: string; spend_usd: string; call_count: number; unpriced_count: number }[]
+}
+
+export type LLMSettingsEnvelope = ApiEnvelope<LLMSettingsData>
+export type LLMKeyStatusEnvelope = ApiEnvelope<LLMKeyStatus>
+export type LLMTestEnvelope = ApiEnvelope<LLMTestResult>
+export type LLMUsageEnvelope = ApiEnvelope<LLMUsageData>
+
+const llmKeys = createPendingKeyStore('web-settings-llm', LLM_SETTINGS_KEY_PREFIX)
+
+export function llmSettingsKey(): string {
+  return llmKeys.keyFor(LLM_SETTINGS_KEY_ID)
+}
+
+export function rotateLLMSettingsKey(): string {
+  return llmKeys.rotateKey(LLM_SETTINGS_KEY_ID)
+}
+
+export function clearLLMSettingsKey(): void {
+  llmKeys.clearKey(LLM_SETTINGS_KEY_ID)
+}
+
+export function llmProviderKey(provider: LLMProviderName): string {
+  return llmKeys.keyFor(`${provider}.key`)
+}
+
+export function rotateLLMProviderKey(provider: LLMProviderName): string {
+  return llmKeys.rotateKey(`${provider}.key`)
+}
+
+export function clearLLMProviderKey(provider: LLMProviderName): void {
+  llmKeys.clearKey(`${provider}.key`)
+}
+
+function isProviderName(value: unknown): value is LLMProviderName {
+  return value === 'openai' || value === 'anthropic' || value === 'deepseek'
+}
+
+function isKeySource(value: unknown): value is LLMKeySource {
+  return (
+    value === 'env' ||
+    value === 'keyring' ||
+    value === 'encrypted_file' ||
+    value === 'stored' ||
+    value === 'unset' ||
+    value === 'unavailable'
+  )
+}
+
+function isCapabilityStatus(value: unknown): value is LLMCapabilityStatus {
+  return value === 'STRICT' || value === 'DEGRADED' || value === 'FAILED' || value === 'UNCHECKED'
+}
+
+function isCapability(value: unknown): value is LLMCapability {
+  if (!isRecord(value)) {
+    return false
+  }
+  return (
+    isCapabilityStatus(value.status) &&
+    typeof value.strict_schema === 'boolean' &&
+    typeof value.degraded === 'boolean' &&
+    typeof value.checked_at === 'string' &&
+    typeof value.notes === 'string'
+  )
+}
+
+function isNullableString(value: unknown): value is string | null {
+  return value === null || typeof value === 'string'
+}
+
+function isProviderRow(value: unknown): value is LLMProviderRow {
+  if (!isRecord(value)) {
+    return false
+  }
+  return (
+    isProviderName(value.provider) &&
+    typeof value.configured === 'boolean' &&
+    isKeySource(value.key_source) &&
+    isNullableString(value.masked) &&
+    isNullableString(value.fingerprint) &&
+    isNullableString(value.updated_at) &&
+    isNullableString(value.updated_by) &&
+    typeof value.base_url === 'string' &&
+    (value.capability === null || isCapability(value.capability))
+  )
+}
+
+function isRoles(value: unknown): value is LLMRoles {
+  if (!isRecord(value)) {
+    return false
+  }
+  return LLM_ROLE_NAMES.every((role) => isNullableString(value[role]))
+}
+
+function isBaseUrls(value: unknown): value is Record<LLMProviderName, string> {
+  if (!isRecord(value)) {
+    return false
+  }
+  return LLM_PROVIDERS.every((provider) => typeof value[provider] === 'string')
+}
+
+function isLLMSettings(value: unknown): value is LLMSettingsData {
+  if (!isRecord(value) || !Array.isArray(value.providers) || !isRecord(value.concurrency)) {
+    return false
+  }
+  return (
+    (value.provider === null || isProviderName(value.provider)) &&
+    value.providers.every(isProviderRow) &&
+    isRoles(value.roles) &&
+    isBaseUrls(value.base_urls) &&
+    typeof value.allow_custom_base_url === 'boolean' &&
+    typeof value.concurrency.global === 'number' &&
+    typeof value.concurrency.deepseek === 'number' &&
+    isSource(value.source) &&
+    isNullableString(value.updated_at) &&
+    isNullableString(value.updated_by)
+  )
+}
+
+function isKeyStatus(value: unknown): value is LLMKeyStatus {
+  if (!isRecord(value)) {
+    return false
+  }
+  return (
+    isProviderName(value.provider) &&
+    typeof value.configured === 'boolean' &&
+    isKeySource(value.key_source) &&
+    isNullableString(value.masked) &&
+    isNullableString(value.fingerprint) &&
+    isNullableString(value.updated_at) &&
+    isNullableString(value.updated_by)
+  )
+}
+
+function isTestResult(value: unknown): value is LLMTestResult {
+  if (!isRecord(value)) {
+    return false
+  }
+  return (
+    isProviderName(value.provider) &&
+    typeof value.model === 'string' &&
+    isCapabilityStatus(value.status) &&
+    typeof value.strict_schema === 'boolean' &&
+    typeof value.degraded === 'boolean' &&
+    typeof value.max_output_tokens === 'number' &&
+    (value.error_code === null || typeof value.error_code === 'string') &&
+    typeof value.notes === 'string' &&
+    typeof value.latency_ms === 'number' &&
+    typeof value.checked_at === 'string'
+  )
+}
+
+function isUsage(value: unknown): value is LLMUsageData {
+  if (!isRecord(value) || !isRecord(value.thresholds)) {
+    return false
+  }
+  return (
+    (value.period === 'day' || value.period === 'week' || value.period === 'month') &&
+    typeof value.period_key === 'string' &&
+    typeof value.spend_usd === 'string' &&
+    typeof value.call_count === 'number' &&
+    typeof value.unpriced_count === 'number' &&
+    typeof value.budget_state === 'string' &&
+    typeof value.thresholds.daily_usd === 'string' &&
+    typeof value.thresholds.weekly_usd === 'string' &&
+    typeof value.thresholds.monthly_usd === 'string' &&
+    typeof value.thresholds.warn_pct === 'number' &&
+    Array.isArray(value.by_provider) &&
+    Array.isArray(value.by_model)
+  )
+}
+
+/** Read the effective LLM document plus masked provider metadata. */
+export async function fetchLLMSettings(signal?: AbortSignal): Promise<LLMSettingsEnvelope> {
+  return requestSettings<LLMSettingsData>(
+    LLM_SETTINGS_PATH,
+    { method: 'GET', headers: { Accept: 'application/json' }, credentials: 'same-origin' },
+    isLLMSettings,
+    signal,
+    READ_TIMEOUT_MS,
+  )
+}
+
+/** Persist a partial LLM document; the response carries only masked keys. */
+export async function updateLLMSettings(
+  patch: LLMSettingsPatch,
+  idempotencyKey: string,
+  signal?: AbortSignal,
+): Promise<LLMSettingsEnvelope> {
+  return requestSettings<LLMSettingsData>(
+    LLM_SETTINGS_PATH,
+    {
+      method: 'PUT',
+      headers: mutationHeaders(idempotencyKey),
+      body: JSON.stringify(patch),
+      credentials: 'same-origin',
+    },
+    isLLMSettings,
+    signal,
+    MUTATION_TIMEOUT_MS,
+  )
+}
+
+/** Store or rotate one provider key; the request body is never echoed. */
+export async function setLLMKey(
+  provider: LLMProviderName,
+  apiKey: string,
+  idempotencyKey: string,
+  signal?: AbortSignal,
+): Promise<LLMKeyStatusEnvelope> {
+  return requestSettings<LLMKeyStatus>(
+    `${LLM_SETTINGS_PATH}/${provider}/key`,
+    {
+      method: 'PUT',
+      headers: mutationHeaders(idempotencyKey),
+      body: JSON.stringify({ api_key: apiKey }),
+      credentials: 'same-origin',
+    },
+    isKeyStatus,
+    signal,
+    MUTATION_TIMEOUT_MS,
+  )
+}
+
+/** Delete one provider key; the provider becomes unconfigured (no fallback). */
+export async function deleteLLMKey(
+  provider: LLMProviderName,
+  idempotencyKey: string,
+  signal?: AbortSignal,
+): Promise<LLMKeyStatusEnvelope> {
+  return requestSettings<LLMKeyStatus>(
+    `${LLM_SETTINGS_PATH}/${provider}/key`,
+    {
+      method: 'DELETE',
+      headers: mutationHeaders(idempotencyKey),
+      credentials: 'same-origin',
+    },
+    isKeyStatus,
+    signal,
+    MUTATION_TIMEOUT_MS,
+  )
+}
+
+/** Run the capability probe for one provider/role. */
+export async function probeLLM(
+  provider: LLMProviderName,
+  role: LLMRoleName = 'ANALYSIS',
+  signal?: AbortSignal,
+): Promise<LLMTestEnvelope> {
+  return requestSettings<LLMTestResult>(
+    LLM_TEST_PATH,
+    {
+      method: 'POST',
+      headers: {
+        Accept: 'application/json',
+        'Content-Type': 'application/json',
+        ...mutationHeaders('probe'),
+      },
+      body: JSON.stringify({ provider, role }),
+      credentials: 'same-origin',
+    },
+    isTestResult,
+    signal,
+    MUTATION_TIMEOUT_MS,
+  )
+}
+
+/** Spend and unpriced counts for one budget window. */
+export async function fetchLLMUsage(
+  period: LMUsagePeriod,
+  signal?: AbortSignal,
+): Promise<LLMUsageEnvelope> {
+  return requestSettings<LLMUsageData>(
+    `${LLM_USAGE_PATH}?period=${period}`,
+    { method: 'GET', headers: { Accept: 'application/json' }, credentials: 'same-origin' },
+    isUsage,
+    signal,
+    READ_TIMEOUT_MS,
   )
 }

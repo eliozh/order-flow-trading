@@ -90,6 +90,92 @@ class RiskSettingsData(BaseModel):
     updated_by: str | None = None
 
 
+class LLMRolesData(BaseModel):
+    """The four role models; the active provider applies to every role."""
+
+    ANALYSIS: str | None = None
+    ENTRY_RECHECK: str | None = None
+    MANAGEMENT: str | None = None
+    REVIEW: str | None = None
+
+
+class LLMConcurrencyData(BaseModel):
+    global_: int = Field(alias="global")
+    deepseek: int
+
+    model_config = ConfigDict(populate_by_name=True)
+
+
+class LLMCapabilityData(BaseModel):
+    status: Literal["STRICT", "DEGRADED", "FAILED", "UNCHECKED"]
+    strict_schema: bool
+    degraded: bool
+    checked_at: str
+    notes: str
+
+
+class LLMProviderRowData(BaseModel):
+    """One provider row; ``masked`` is the only key-shaped value."""
+
+    provider: Literal["openai", "anthropic", "deepseek"]
+    configured: bool
+    key_source: Literal["env", "keyring", "encrypted_file", "stored", "unset", "unavailable"]
+    masked: str | None = None
+    fingerprint: str | None = None
+    updated_at: str | None = None
+    updated_by: str | None = None
+    base_url: str
+    capability: LLMCapabilityData | None = None
+
+
+class LLMSettingsData(BaseModel):
+    provider: Literal["openai", "anthropic", "deepseek"] | None = None
+    providers: list[LLMProviderRowData]
+    roles: LLMRolesData
+    base_urls: dict[str, str]
+    allow_custom_base_url: bool
+    concurrency: LLMConcurrencyData
+    source: Literal["default", "user"]
+    updated_at: str | None = None
+    updated_by: str | None = None
+
+
+class LLMSettingsUpdate(BaseModel):
+    """A partial LLM settings patch; unknown fields are rejected."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    provider: str | None = None
+    roles: dict[str, str | None] | None = None
+    base_urls: dict[str, str] | None = None
+    allow_custom_base_url: bool | None = None
+    max_concurrency: int | None = None
+    max_concurrency_deepseek: int | None = None
+    reason: str = Field(default="", max_length=500)
+
+
+class LLMKeyUpdate(BaseModel):
+    """The write-only key payload; it is never echoed in a response."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    api_key: str = Field(min_length=1, max_length=512)
+
+
+class LLMKeyDelete(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+
+class LLMKeyStatusData(BaseModel):
+    provider: Literal["openai", "anthropic", "deepseek"]
+    configured: bool
+    key_source: Literal["env", "keyring", "encrypted_file", "stored", "unset", "unavailable"]
+    masked: str | None = None
+    fingerprint: str | None = None
+    updated_at: str | None = None
+    updated_by: str | None = None
+
+
 _CATALOG_ERRORS = {
     400: ("IDEMPOTENCY_KEY_REQUIRED", "A state-changing settings request omitted Idempotency-Key."),
     401: ("AUTH_REQUIRED", "The local API credential is missing or invalid."),
@@ -133,6 +219,15 @@ __all__ = [
     "Envelope",
     "ErrorBody",
     "ErrorEnvelope",
+    "LLMCapabilityData",
+    "LLMConcurrencyData",
+    "LLMKeyDelete",
+    "LLMKeyStatusData",
+    "LLMKeyUpdate",
+    "LLMProviderRowData",
+    "LLMRolesData",
+    "LLMSettingsData",
+    "LLMSettingsUpdate",
     "RiskSettingsData",
     "RiskSettingsUpdate",
     "RiskUtilizationData",
