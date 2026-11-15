@@ -146,6 +146,11 @@ def update_budget(
             )
         except BudgetConfigError as exc:
             raise ApiError("VALIDATION_FAILED", exc.message, details=exc.details) from exc
+        except _USAGE_READ_ERRORS as exc:
+            # A corrupted stored money value surfaces here from the store's
+            # build step; GET maps the same failure to 503, so PUT must too.
+            LOGGER.warning("budget_thresholds_unavailable", error=str(exc))
+            raise ApiError("STORAGE_UNAVAILABLE") from exc
         return {**_snapshot(service, at, thresholds), "changed": changed}
 
     presented = (idempotency_key or "").strip()

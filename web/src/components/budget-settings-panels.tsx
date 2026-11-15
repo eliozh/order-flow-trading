@@ -34,10 +34,16 @@ function LangTerm({ children }: { children: ReactNode }) {
   return <span lang="en">{children}</span>
 }
 
-function thresholdFor(
-  thresholds: BudgetData['thresholds'],
-  period: BudgetPeriod,
-): string {
+/**
+ * A threshold field label: English names switch language for AT, while the
+ * Chinese warn label must stay untagged (SC 3.1.2 tags the *foreign* text).
+ */
+function BudgetFieldLabel({ field }: { field: BudgetField }) {
+  const label = BUDGET_LABELS[field]
+  return field === 'warn_pct' ? <>{label}</> : <LangTerm>{label}</LangTerm>
+}
+
+function thresholdFor(thresholds: BudgetData['thresholds'], period: BudgetPeriod): string {
   return period === 'day'
     ? thresholds.daily_usd
     : period === 'week'
@@ -118,9 +124,7 @@ function UsageMeter({ period, row, thresholdUsd }: UsageMeterProps) {
       aria-valuenow={valueNow}
       aria-valuetext={`${label}：${money(row.spend_usd)} / ${money(
         thresholdUsd,
-      )}；状态 ${row.budget_state}；调用 ${row.call_count} 次；unpriced ${
-        row.unpriced_count
-      } 次`}
+      )}；状态 ${row.budget_state}；调用 ${row.call_count} 次；unpriced ${row.unpriced_count} 次`}
       data-testid={`budget-meter-${period}`}
     >
       <span className="budget-meter-head">
@@ -177,6 +181,22 @@ function MissingUsage({ reason }: { reason: string }) {
   )
 }
 
+/**
+ * The visible refresh notice. It carries no live role: the single persistent
+ * ``BudgetUsageStatus`` outside this panel's ``aria-busy`` subtree is the one
+ * polite announcer, so a failure is not announced twice.
+ */
+function RefreshNotice({ notice }: { notice: string }) {
+  if (notice === '') {
+    return null
+  }
+  return (
+    <p className="status-message" data-testid="budget-refresh-notice">
+      {notice}
+    </p>
+  )
+}
+
 export function BudgetUsagePanel({
   data,
   reason,
@@ -212,7 +232,7 @@ export function BudgetUsagePanel({
                 type="button"
                 className="control-btn"
                 onClick={onRefresh}
-                disabled={refreshing || saving}
+                aria-disabled={refreshing || saving ? true : undefined}
                 aria-busy={refreshing}
               >
                 {refreshing ? '刷新中…' : '重试用量'}
@@ -221,10 +241,9 @@ export function BudgetUsagePanel({
           </div>
         </div>
         <MissingUsage reason={reason ?? '用量不可用；不会以 0 代替缺失数据。'} />
+        <RefreshNotice notice={notice} />
         <p className="panel-foot">
-          {degraded
-            ? '阈值仍可编辑；'
-            : '阈值不可编辑，直到重新加载成功；'}
+          {degraded ? '阈值仍可编辑；' : '阈值不可编辑，直到重新加载成功；'}
           <LangTerm>unpriced</LangTerm> 调用绝不静默归零。
         </p>
       </section>
@@ -253,7 +272,7 @@ export function BudgetUsagePanel({
             type="button"
             className="control-btn"
             onClick={onRefresh}
-            disabled={refreshing || saving}
+            aria-disabled={refreshing || saving ? true : undefined}
             aria-busy={refreshing}
           >
             {refreshing ? '刷新中…' : '刷新用量'}
@@ -291,9 +310,7 @@ export function BudgetUsagePanel({
           </dt>
           <dd className="mono">
             <span data-testid="budget-projection">
-              {data.projected_month_end_usd === null
-                ? 'N/A'
-                : money(data.projected_month_end_usd)}
+              {data.projected_month_end_usd === null ? 'N/A' : money(data.projected_month_end_usd)}
             </span>
             {data.projection_basis !== null && data.projected_month_end_usd !== null ? (
               <small className="stat-note">
@@ -331,19 +348,20 @@ export function BudgetUsagePanel({
         ))}
       </div>
       {month.unpriced_count > 0 && (
-        <p className="status-message status-message--warn" role="note" data-testid="budget-unpriced-banner">
-          <span aria-hidden="true">⚠</span> 存在 {month.unpriced_count} 次 <LangTerm>unpriced</LangTerm>{' '}
-          调用：模型价格未知，预算总额可能低估；<LangTerm>unpriced</LangTerm> 调用绝不静默归零。
+        <p
+          className="status-message status-message--warn"
+          role="note"
+          data-testid="budget-unpriced-banner"
+        >
+          <span aria-hidden="true">⚠</span> 存在 {month.unpriced_count} 次{' '}
+          <LangTerm>unpriced</LangTerm> 调用：模型价格未知，预算总额可能低估；
+          <LangTerm>unpriced</LangTerm> 调用绝不静默归零。
         </p>
       )}
-      {notice !== '' && (
-        <p className="status-message" role="status" data-testid="budget-refresh-notice">
-          {notice}
-        </p>
-      )}
+      <RefreshNotice notice={notice} />
       <p className="panel-foot">
-        阈值只在达到 warn {data.thresholds.warn_pct}% 与 100% 时本地告警；绝不停止或阻断调用；不会通过
-        Telegram 投递。成本按 token 与模型价格记账。
+        阈值只在达到 warn {data.thresholds.warn_pct}% 与 100%
+        时本地告警；绝不停止或阻断调用；不会通过 Telegram 投递。成本按 token 与模型价格记账。
       </p>
     </section>
   )
@@ -376,8 +394,7 @@ export function BudgetLastAlertPanel({
         <div className="panel-foot" data-testid="budget-last-alert">
           <p className="mono">
             {alert.occurred_at} · {alert.period} · <LangTerm>{alert.state}</LangTerm> ·{' '}
-            {money(alert.spend_usd)} / {money(alert.threshold_usd)} · {alert.provider}{' '}
-            {alert.model}
+            {money(alert.spend_usd)} / {money(alert.threshold_usd)} · {alert.provider} {alert.model}
           </p>
           <p className="hint">
             该告警仅为本地审计记录；阈值达到 warn 或 100% 时不会停止、阻断或拒绝任何调用。
@@ -429,12 +446,12 @@ export function BudgetThresholdsPanel({
             const error = errors[field]
             const hint =
               field === 'warn_pct'
-                ? '1–100；达到该百分比时告警'
+                ? '大于 0 且不超过 100；达到该百分比时告警'
                 : `warn ${warnPct}% · alert 100%`
             return (
               <div className="field" key={field}>
                 <label className="field-label" htmlFor={id}>
-                  <LangTerm>{BUDGET_LABELS[field]}</LangTerm>
+                  <BudgetFieldLabel field={field} />
                 </label>
                 <input
                   id={id}
@@ -443,6 +460,7 @@ export function BudgetThresholdsPanel({
                   inputMode="decimal"
                   value={draft[field]}
                   disabled={readOnly}
+                  aria-disabled={saving ? true : undefined}
                   aria-invalid={error !== undefined ? 'true' : undefined}
                   aria-describedby={error ? `${id}-hint ${id}-error` : `${id}-hint`}
                   onChange={(event) => onChange(field, event.target.value)}
@@ -464,7 +482,8 @@ export function BudgetThresholdsPanel({
             ref={saveButtonRef}
             type="submit"
             className="btn primary"
-            disabled={readOnly || saving}
+            disabled={readOnly}
+            aria-disabled={saving ? true : undefined}
           >
             {saving ? '保存中…' : '保存阈值'}
           </button>
@@ -481,11 +500,7 @@ export function BudgetThresholdsPanel({
 /** Polite refresh announcements; kept outside the panel's ``aria-busy`` subtree. */
 export function BudgetUsageStatus({ message }: { message: string }) {
   return (
-    <p
-      role="status"
-      className="visually-hidden"
-      data-testid="budget-usage-status"
-    >
+    <p role="status" className="visually-hidden" data-testid="budget-usage-status">
       {message}
     </p>
   )
@@ -533,11 +548,9 @@ export function BudgetErrorSummary({
       {invalidFields.map((field) => (
         <span key={field}>
           {' '}
-          <a
-            href={`#${BUDGET_FIELD_IDS[field]}`}
-            aria-label={`转到${BUDGET_LABELS[field]}`}
-          >
-            转到<LangTerm>{BUDGET_LABELS[field]}</LangTerm>
+          <a href={`#${BUDGET_FIELD_IDS[field]}`} aria-label={`转到${BUDGET_LABELS[field]}`}>
+            转到
+            <BudgetFieldLabel field={field} />
           </a>
         </span>
       ))}
@@ -558,8 +571,6 @@ export function BudgetSaveVisible({ message }: { message: string }) {
 
 export function BudgetUnknownOutcomeHint() {
   return (
-    <p className="hint">
-      上一次保存结果未知；重试会使用同一 Idempotency-Key 重放，不会重复写入。
-    </p>
+    <p className="hint">上一次保存结果未知；重试会使用同一 Idempotency-Key 重放，不会重复写入。</p>
   )
 }

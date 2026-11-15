@@ -49,6 +49,18 @@ type MoneyField = 'daily_usd' | 'weekly_usd' | 'monthly_usd'
 
 const MONEY_FIELDS: readonly MoneyField[] = ['daily_usd', 'weekly_usd', 'monthly_usd']
 
+/**
+ * Editing one field invalidates the ordering errors that involve it: the
+ * validator pairs daily/weekly and weekly/monthly, so an error on a neighbour
+ * would otherwise stay stale after the operator fixes the draft.
+ */
+const COUPLED_ERROR_FIELDS: Record<BudgetField, readonly BudgetField[]> = {
+  daily_usd: ['daily_usd', 'weekly_usd'],
+  weekly_usd: ['weekly_usd', 'daily_usd', 'monthly_usd'],
+  monthly_usd: ['monthly_usd', 'weekly_usd'],
+  warn_pct: ['warn_pct'],
+}
+
 export function draftFromThresholds(thresholds: BudgetThresholds): BudgetDraft {
   return {
     daily_usd: thresholds.daily_usd,
@@ -82,8 +94,8 @@ function parseWarn(raw: string): { value?: number; error?: string } {
   if (!Number.isFinite(value)) {
     return { error: '警告阈值必须是有限数字' }
   }
-  if (value < 1 || value > 100) {
-    return { error: '警告阈值必须在 1–100 之间' }
+  if (value <= 0 || value > 100) {
+    return { error: '警告阈值必须大于 0 且不超过 100' }
   }
   return { value }
 }
@@ -94,8 +106,18 @@ export interface BudgetValidation {
   valid: boolean
 }
 
-/** Client mirror of the server: positive money, warn 1–100, daily ≤ weekly ≤ monthly. */
-export function validateBudgetDraft(draft: BudgetDraft): BudgetValidation {
+/**
+ * Mirrors the server Web update rule: positive money, warn greater than 0 and
+ * at most 100, and daily ≤ weekly ≤ monthly. Like ``candidate_thresholds``, an
+ * ordering error is reported only for a crossing the draft *introduces*
+ * relative to ``current`` (the loaded server thresholds), so a CLI-created
+ * crossed set stays editable for unrelated fields. Omitting ``current`` treats
+ * the prior set as uncrossed, preserving the pure validator's behavior.
+ */
+export function validateBudgetDraft(
+  draft: BudgetDraft,
+  current?: BudgetThresholds,
+): BudgetValidation {
   const errors: BudgetErrors = {}
   const payload: BudgetUpdatePayload = {}
   for (const field of MONEY_FIELDS) {
@@ -113,12 +135,20 @@ export function validateBudgetDraft(draft: BudgetDraft): BudgetValidation {
     payload.warn_pct = warn.value
   }
   if (errors.daily_usd === undefined && errors.weekly_usd === undefined) {
-    if (Number(payload.weekly_usd) < Number(payload.daily_usd)) {
+    const weekly = Number(payload.weekly_usd)
+    const daily = Number(payload.daily_usd)
+    const currentCrossed =
+      current !== undefined && Number(current.weekly_usd) < Number(current.daily_usd)
+    if (weekly < daily && !currentCrossed) {
       errors.weekly_usd = 'Weekly 必须 ≥ Daily'
     }
   }
   if (errors.weekly_usd === undefined && errors.monthly_usd === undefined) {
-    if (Number(payload.monthly_usd) < Number(payload.weekly_usd)) {
+    const monthly = Number(payload.monthly_usd)
+    const weekly = Number(payload.weekly_usd)
+    const currentCrossed =
+      current !== undefined && Number(current.monthly_usd) < Number(current.weekly_usd)
+    if (monthly < weekly && !currentCrossed) {
       errors.monthly_usd = 'Monthly 必须 ≥ Weekly'
     }
   }
@@ -242,6 +272,29 @@ export function useBudgetSettingsForm({
     setFocusTick((value) => value + 1)
   }
 
+  /**
+   * The single place a server snapshot reaches the screen.
+   *
+   * Initial load, usage refresh, save success, and the post-failure reconcile
+   * all funnel through it, so the displayed snapshot, the usage STALE marker,
+   * the notice, and the live announcement cannot diverge. A server snapshot
+   * also finalizes any read it superseded, so callers that need a specific
+   * announcement set ``usageLive`` explicitly afterwards.
+   */
+  const applySnapshot = useCallback(
+    (snapshot: BudgetData, options: { resetDraft?: boolean } = {}): void => {
+      setLoad({ state: 'ready', data: snapshot })
+      if (options.resetDraft === true) {
+        setDraft(draftFromThresholds(snapshot.thresholds))
+        setErrors({})
+      }
+      setUsageStale(false)
+      setUsageNotice('')
+      setUsageLive('')
+    },
+    [],
+  )
+
   useEffect(() => {
     let active = true
     const controller = new AbortController()
@@ -256,12 +309,7 @@ export function useBudgetSettingsForm({
           setLoad({ state: 'error', data: null, message: '预算响应为空。' })
           return
         }
-        setLoad({ state: 'ready', data })
-        setDraft(draftFromThresholds(data.thresholds))
-        setErrors({})
-        setUsageStale(false)
-        setUsageNotice('')
-        setUsageLive('')
+        applySnapshot(data, { resetDraft: true })
       })
       .catch((error: unknown) => {
         if (!active || isAbortError(error)) {
@@ -273,7 +321,7 @@ export function useBudgetSettingsForm({
       active = false
       controller.abort()
     }
-  }, [fetchBudgetFn, attempt])
+  }, [fetchBudgetFn, attempt, applySnapshot])
 
   useEffect(() => {
     if (saving) {
@@ -305,11 +353,14 @@ export function useBudgetSettingsForm({
     }
     setDraft((previous) => ({ ...previous, [field]: value }))
     setErrors((previous) => {
-      if (previous[field] === undefined) {
+      const coupled = COUPLED_ERROR_FIELDS[field]
+      if (coupled.every((name) => previous[name] === undefined)) {
         return previous
       }
       const next = { ...previous }
-      delete next[field]
+      for (const name of coupled) {
+        delete next[name]
+      }
       return next
     })
     setErrorText('')
@@ -319,13 +370,18 @@ export function useBudgetSettingsForm({
     if (refreshingRef.current || inFlight.current) {
       return
     }
+    // The degraded panel shows N/A with no STALE badge, so it must not claim a
+    // last-good value that the operator cannot see.
+    const degraded = data === null || data.periods === null
     const requestGeneration = snapshotGeneration.current
     refreshingRef.current = true
     setRefreshing(true)
     setUsageNotice('')
-    setUsageLive('正在刷新用量；显示上次值并标记 STALE。')
+    setUsageLive(
+      degraded ? '正在刷新用量；用量当前不可用（N/A）。' : '正在刷新用量；显示上次值并标记 STALE。',
+    )
     // Keep the last good values on screen; only mark them stale while the read
-    // is in flight.
+    // is in flight. The degraded branch ignores the marker and shows N/A.
     setUsageStale(true)
     try {
       const envelope = await fetchBudgetFn()
@@ -339,11 +395,14 @@ export function useBudgetSettingsForm({
       }
       if (envelope.data === null) {
         setUsageLive('')
-        setUsageNotice('刷新失败：响应为空；保留上次成功值并标记 STALE。')
+        setUsageNotice(
+          degraded
+            ? '刷新失败：响应为空；用量仍不可用（N/A），阈值可编辑。'
+            : '刷新失败：响应为空；保留上次成功值并标记 STALE。',
+        )
         return
       }
-      setLoad({ state: 'ready', data: envelope.data })
-      setUsageStale(false)
+      applySnapshot(envelope.data)
       setUsageLive(
         envelope.data.usage_quality === 'UNAVAILABLE'
           ? '用量刷新后仍不可用（N/A）；阈值可编辑。'
@@ -353,30 +412,33 @@ export function useBudgetSettingsForm({
       if (!mounted.current || isAbortError(error)) {
         return
       }
-      setUsageLive('')
+      if (snapshotGeneration.current !== requestGeneration) {
+        // A save (commit or unknown-outcome reconcile) already applied a newer
+        // authoritative snapshot; this older failed read must not stamp STALE
+        // or a failure notice over it.
+        return
+      }
+      const failure = degraded
+        ? `刷新失败：${errorMessage(error)}；用量仍不可用（N/A），阈值可编辑。`
+        : `刷新失败：${errorMessage(error)}。保留上次成功值并标记 STALE。`
+      // Keep the visible notice and announce the failure through the single
+      // polite status region instead of clearing it.
       setUsageStale(true)
-      setUsageNotice(`刷新失败：${errorMessage(error)}。保留上次成功值并标记 STALE。`)
+      setUsageNotice(failure)
+      setUsageLive(failure)
     } finally {
       refreshingRef.current = false
       if (mounted.current) {
         setRefreshing(false)
       }
     }
-  }, [fetchBudgetFn])
+  }, [fetchBudgetFn, applySnapshot, data])
 
-  function applySaved(
-    snapshot: BudgetUpdateData,
-    before: BudgetThresholds,
-  ): void {
+  function applySaved(snapshot: BudgetUpdateData, before: BudgetThresholds): void {
     // The PUT returns the authoritative server snapshot (thresholds, usage,
     // projection, last alert), so no client-side state math remains.
     snapshotGeneration.current += 1
-    setLoad({ state: 'ready', data: snapshot })
-    setDraft(draftFromThresholds(snapshot.thresholds))
-    setErrors({})
-    setUsageStale(false)
-    setUsageNotice('')
-    setUsageLive('')
+    applySnapshot(snapshot, { resetDraft: true })
     const message = snapshot.changed
       ? `已保存：日 ${before.daily_usd} → ${snapshot.thresholds.daily_usd}、周 ${before.weekly_usd} → ${snapshot.thresholds.weekly_usd}、月 ${before.monthly_usd} → ${snapshot.thresholds.monthly_usd}；audit 已写入。达到 warn ${snapshot.thresholds.warn_pct}% 与 100% 时仅告警，绝不停止或阻断调用；不会通过 Telegram 投递。`
       : `已保存：阈值未变更，未写入新 audit。阈值仅告警，绝不停止或阻断调用；不会通过 Telegram 投递。`
@@ -410,16 +472,27 @@ export function useBudgetSettingsForm({
     // A timeout/transport failure may have committed. Keep the key so a retry
     // replays the original payload, and reconcile the displayed snapshot.
     // Advancing the generation drops a refresh that was in flight before the
-    // save, so it can never restore the pre-save thresholds.
+    // save, so it can never restore the pre-save thresholds. The reconcile
+    // itself captures that generation: if a retry save commits first, this
+    // older read must not overwrite the newer authoritative snapshot.
     snapshotGeneration.current += 1
+    const reconcileGeneration = snapshotGeneration.current
     setUnknownOutcome(true)
     setErrorText(`结果未知，重试会使用同一 Idempotency-Key 重放。${message ? ` ${message}` : ''}`)
     requestFocus('summary')
     void fetchBudgetFn()
       .then((envelope) => {
-        if (mounted.current && envelope.data !== null) {
-          setLoad({ state: 'ready', data: envelope.data })
+        if (
+          !mounted.current ||
+          envelope.data === null ||
+          snapshotGeneration.current !== reconcileGeneration
+        ) {
+          return
         }
+        // Applying this snapshot also finalizes the refresh that was in flight
+        // when the save failed: it returns early on the generation change and
+        // would otherwise leave STALE and "正在刷新用量" on screen.
+        applySnapshot(envelope.data)
       })
       .catch(() => {
         // Keep the last good snapshot; the operator can retry safely.
@@ -431,7 +504,7 @@ export function useBudgetSettingsForm({
     if (!editable || data === null || inFlight.current) {
       return
     }
-    const outcome = validateBudgetDraft(draft)
+    const outcome = validateBudgetDraft(draft, data.thresholds)
     setErrors(outcome.errors)
     if (!outcome.valid) {
       setUnknownOutcome(false)

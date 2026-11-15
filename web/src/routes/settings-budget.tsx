@@ -35,8 +35,9 @@ export function SettingsBudgetPage(props: SettingsBudgetPageProps) {
           <p className="kicker">Settings / budget</p>
           <h1 id="settings-budget-heading">LLM 预算阈值</h1>
           <p className="page-sub">
-            日/周/月阈值与 warn 百分比；达到阈值时仅告警，绝不停止调用。使用量只读，展示当前花费、状态、
-            月末投影与 unpriced 调用；缺失数据显示 N/A，绝不显示 0。
+            日/周/月阈值与 warn
+            百分比；达到阈值时仅告警，绝不停止调用。使用量只读，展示当前花费、状态、 月末投影与
+            unpriced 调用；缺失数据显示 N/A，绝不显示 0。
           </p>
         </div>
       </div>
@@ -104,7 +105,7 @@ export function SettingsBudgetPage(props: SettingsBudgetPageProps) {
                   draft={form.draft}
                   errors={form.errors}
                   warnPct={Number(form.draft.warn_pct) || 0}
-                  readOnly={!form.editable || form.saving}
+                  readOnly={!form.editable}
                   saving={form.saving}
                   onChange={form.change}
                   onSubmit={(event) => {

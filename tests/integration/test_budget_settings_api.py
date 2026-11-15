@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import json
 import sqlite3
+import threading
 from datetime import UTC, datetime
 from decimal import ROUND_HALF_UP, Decimal
 from pathlib import Path
@@ -13,6 +14,8 @@ import pytest
 from fastapi.testclient import TestClient
 
 from oft.api.app import create_app
+from oft.application.budget_read_model import BudgetThresholds
+from oft.application.budget_service import BudgetService
 from oft.clock import FixedClock
 from oft.config import Settings
 from oft.domain.time import utc_timestamp
@@ -89,6 +92,11 @@ def _threshold_audits(client: TestClient) -> list[dict[str, Any]]:
         for event in client.app.state.container.store.list_audit_events()
         if event.event_type == "BUDGET_THRESHOLDS_UPDATED"
     ]
+
+
+def _service(client: TestClient) -> BudgetService:
+    container = client.app.state.container
+    return BudgetService(store=container.store, settings=container.settings)
 
 
 def _expected_projection(spend: str) -> str:
@@ -550,3 +558,188 @@ def test_budget_put_allows_equal_adjacent_thresholds(tmp_path: Path) -> None:
 
     assert response.status_code == 200, response.text
     assert response.json()["data"]["changed"] is True
+
+
+def test_budget_put_accepts_a_sub_one_warn_percentage(tmp_path: Path) -> None:
+    """The Web range mirrors the server/env/CLI ``(0, 100]`` inclusive bound."""
+    client, auth = _client(tmp_path)
+    try:
+        response = _put(client, auth, {"warn_pct": 0.5}, key="sub-one-warn")
+        stored = client.app.state.container.store.get_budget_settings()
+    finally:
+        client.close()
+
+    assert response.status_code == 200, response.text
+    assert response.json()["data"]["changed"] is True
+    assert response.json()["data"]["thresholds"]["warn_pct"] == 0.5
+    assert stored is not None
+    assert stored.warn_pct == 0.5
+
+
+def test_budget_put_over_a_cli_crossed_set_accepts_an_unrelated_field(tmp_path: Path) -> None:
+    """A CLI-created crossing must not block a partial Web save elsewhere."""
+    client, auth = _client(tmp_path)
+    try:
+        _service(client).set_thresholds(
+            daily_usd="50.00",
+            weekly_usd="10.00",
+            updated_at=utc_timestamp(NOW),
+        )
+        response = _put(client, auth, {"warn_pct": 75}, key="crossed-warn")
+    finally:
+        client.close()
+
+    assert response.status_code == 200, response.text
+    data = response.json()["data"]
+    assert data["changed"] is True
+    assert data["thresholds"]["daily_usd"] == "50.00"
+    assert data["thresholds"]["weekly_usd"] == "10.00"
+    assert data["thresholds"]["warn_pct"] == 75
+
+
+def test_budget_put_still_rejects_a_newly_introduced_crossing(tmp_path: Path) -> None:
+    client, auth = _client(tmp_path)
+    try:
+        response = _put(client, auth, {"daily_usd": "60.00"}, key="new-crossing")
+        audits = _threshold_audits(client)
+    finally:
+        client.close()
+
+    assert response.status_code == 422, response.text
+    assert response.json()["error"]["details"] == [
+        {
+            "field": "weekly_usd",
+            "code": "ordering",
+            "message": "weekly_usd must be greater than or equal to daily_usd",
+        }
+    ]
+    assert audits == []
+
+
+def test_budget_put_repairs_an_existing_crossing_without_a_stale_detail(
+    tmp_path: Path,
+) -> None:
+    client, auth = _client(tmp_path)
+    try:
+        _service(client).set_thresholds(
+            daily_usd="50.00",
+            weekly_usd="10.00",
+            updated_at=utc_timestamp(NOW),
+        )
+        response = _put(client, auth, {"weekly_usd": "60.00"}, key="repair-crossing")
+    finally:
+        client.close()
+
+    assert response.status_code == 200, response.text
+    data = response.json()["data"]
+    assert data["changed"] is True
+    assert data["thresholds"]["daily_usd"] == "50.00"
+    assert data["thresholds"]["weekly_usd"] == "60.00"
+
+
+def test_budget_put_maps_corrupt_stored_thresholds_to_storage_unavailable(
+    tmp_path: Path,
+) -> None:
+    client, auth = _client(tmp_path)
+    store = client.app.state.container.store
+    connection = sqlite3.connect(store.path)
+    try:
+        connection.execute(
+            """
+            INSERT INTO budget_settings
+                (id, daily_usd, weekly_usd, monthly_usd, warn_pct, updated_at)
+            VALUES ('default', 'not-a-number', '50.00', '150.00', 80.0, ?)
+            """,
+            (utc_timestamp(NOW),),
+        )
+        connection.commit()
+    finally:
+        connection.close()
+    try:
+        response = _put(client, auth, {"warn_pct": 75}, key="corrupt-money")
+        audits = _threshold_audits(client)
+    finally:
+        client.close()
+
+    assert response.status_code == 503, response.text
+    assert response.json()["error"]["code"] == "STORAGE_UNAVAILABLE"
+    assert audits == []
+
+
+def test_budget_put_rolls_back_when_the_audit_write_fails(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The upsert and its audit are one unit: a failed audit leaves no row."""
+    client, auth = _client(tmp_path)
+    store = client.app.state.container.store
+
+    def _fail(*_args: Any, **_kwargs: Any) -> Any:
+        raise sqlite3.OperationalError("audit chain unavailable")
+
+    monkeypatch.setattr(store, "_insert_audit_event", _fail)
+    try:
+        response = _put(client, auth, {"daily_usd": "20.00"})
+        stored = store.get_budget_settings()
+        audits = _threshold_audits(client)
+    finally:
+        client.close()
+
+    assert response.status_code == 503, response.text
+    assert response.json()["error"]["code"] == "STORAGE_UNAVAILABLE"
+    assert stored is None
+    assert audits == []
+
+
+def test_budget_put_concurrent_updates_are_serialized_and_audited(tmp_path: Path) -> None:
+    client, auth = _client(tmp_path)
+    container = client.app.state.container
+    service = BudgetService(store=container.store, settings=container.settings)
+    barrier = threading.Barrier(2)
+    outcomes: list[tuple[BudgetThresholds, bool]] = []
+    errors: list[Exception] = []
+
+    def _update(**fields: str) -> None:
+        try:
+            barrier.wait(timeout=5)
+            outcomes.append(service.update_thresholds(updated_at=utc_timestamp(NOW), **fields))
+        except Exception as exc:  # surfaced by the assertions below
+            errors.append(exc)
+
+    threads = [
+        threading.Thread(target=_update, kwargs={"daily_usd": "20.00"}),
+        threading.Thread(target=_update, kwargs={"weekly_usd": "60.00"}),
+    ]
+    for thread in threads:
+        thread.start()
+    for thread in threads:
+        thread.join(timeout=10)
+    try:
+        assert not any(thread.is_alive() for thread in threads)
+        assert errors == []
+        assert len(outcomes) == 2
+        assert all(changed for _, changed in outcomes)
+        stored = container.store.get_budget_settings()
+        assert stored is not None
+        # Each transaction read the row the other committed, so both changes
+        # survive instead of the second overwriting the first.
+        assert (stored.daily_usd, stored.weekly_usd, stored.monthly_usd) == (
+            "20.00",
+            "60.00",
+            "150.00",
+        )
+        events = [
+            event
+            for event in container.store.list_audit_events_ascending()
+            if event.event_type == "BUDGET_THRESHOLDS_UPDATED"
+        ]
+    finally:
+        client.close()
+
+    assert len(events) == 2
+    bodies = [json.loads(event.payload_json) for event in events]
+    after = [body["payload"]["after"] for body in bodies]
+    before = [body["payload"]["before"] for body in bodies]
+    assert before[1] == after[0]
+    assert bodies[0]["actor"] == {"kind": "USER", "id": "web"}
+    assert bodies[1]["actor"] == {"kind": "USER", "id": "web"}
+    assert (after[1]["daily_usd"], after[1]["weekly_usd"]) == ("20.00", "60.00")

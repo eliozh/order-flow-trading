@@ -154,9 +154,12 @@ def candidate_thresholds(
     """Build and validate a partial candidate, collecting one detail per field.
 
     ``enforce_ordering`` is true for the Web update path, where the form must
-    report which lower bound is below its predecessor. The CLI setter keeps its
-    historical permissiveness: the ledger tests use deliberately crossed
-    thresholds to prove that each period alerts against its own bound.
+    report which lower bound is below its predecessor. Only crossings the
+    candidate *introduces* are reported: a partial PUT over a CLI-created
+    crossed set must not be rejected for fields the caller never sent. The CLI
+    setter keeps its historical permissiveness: the ledger tests use
+    deliberately crossed thresholds to prove that each period alerts against
+    its own bound.
     """
     details: list[dict[str, Any]] = []
     parsed: dict[str, Decimal] = {}
@@ -176,7 +179,9 @@ def candidate_thresholds(
         monthly_usd=parsed["monthly_usd"],
         warn_pct=current.warn_pct if warn_pct is None else float(warn_pct),
     )
-    _collect_range_and_ordering(candidate, enforce_ordering=enforce_ordering, details=details)
+    _collect_range_and_ordering(
+        current, candidate, enforce_ordering=enforce_ordering, details=details
+    )
     if details:
         messages = "; ".join(str(detail["message"]) for detail in details)
         raise BudgetConfigError(messages, details=details)
@@ -184,6 +189,7 @@ def candidate_thresholds(
 
 
 def _collect_range_and_ordering(
+    current: BudgetThresholds,
     candidate: BudgetThresholds,
     *,
     enforce_ordering: bool,
@@ -201,7 +207,11 @@ def _collect_range_and_ordering(
     # derived ordering error on top of that would mislead the operator.
     if any(detail["field"] in MONEY_FIELDS for detail in details):
         return
-    if enforce_ordering and candidate.weekly_usd < candidate.daily_usd:
+    if (
+        enforce_ordering
+        and candidate.weekly_usd < candidate.daily_usd
+        and current.weekly_usd >= current.daily_usd
+    ):
         details.append(
             {
                 "field": "weekly_usd",
@@ -209,7 +219,11 @@ def _collect_range_and_ordering(
                 "message": "weekly_usd must be greater than or equal to daily_usd",
             }
         )
-    if enforce_ordering and candidate.monthly_usd < candidate.weekly_usd:
+    if (
+        enforce_ordering
+        and candidate.monthly_usd < candidate.weekly_usd
+        and current.monthly_usd >= current.weekly_usd
+    ):
         details.append(
             {
                 "field": "monthly_usd",

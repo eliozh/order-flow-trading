@@ -311,7 +311,8 @@ function promptAuditEvents(): PromptAuditEvent[] {
   return JSON.parse(output.trim()) as PromptAuditEvent[]
 }
 
-function isPeriodRadioFocused(): boolean {  const active = document.activeElement
+function isPeriodRadioFocused(): boolean {
+  const active = document.activeElement
   return (
     active instanceof HTMLInputElement && active.type === 'radio' && active.name === 'scan-period'
   )
@@ -2680,9 +2681,7 @@ test('budget thresholds save once with a web audit, reject ordering, and agree w
   await page.getByRole('button', { name: '保存阈值' }).click()
 
   await expect(page.getByTestId('settings-budget-save-visible')).toContainText('audit 已写入')
-  await expect(page.getByTestId('settings-budget-save-visible')).toContainText(
-    '绝不停止或阻断调用',
-  )
+  await expect(page.getByTestId('settings-budget-save-visible')).toContainText('绝不停止或阻断调用')
   await expect(page.getByTestId('settings-budget-save-visible')).toContainText(
     '不会通过 Telegram 投递',
   )
@@ -2739,14 +2738,14 @@ test('budget thresholds save once with a web audit, reject ordering, and agree w
   await expect(page.getByText('Weekly USD 必须大于 0')).toBeVisible()
   await weekly.fill('60.00')
 
-  // warn outside 1–100 is blocked inline.
+  // warn outside (0, 100] is blocked inline.
   for (const invalidWarn of ['0', '101']) {
     await warn.fill(invalidWarn)
     await save.click()
     await expect(summary).toBeFocused()
     await expect(warn).toHaveAttribute('aria-invalid', 'true')
     await expect(warn).toHaveAttribute('aria-describedby', /budget-warn-error/)
-    await expect(page.getByText('警告阈值必须在 1–100 之间')).toBeVisible()
+    await expect(page.getByText('警告阈值必须大于 0 且不超过 100')).toBeVisible()
   }
   await warn.fill('75')
 
@@ -2797,15 +2796,11 @@ test('budget thresholds save once with a web audit, reject ordering, and agree w
     expect(cli.periods[period].unpriced_count).toBe(api.periods[period].unpriced_count)
   }
   await expect(page.getByTestId('budget-today-spend')).toHaveText(`$${api.periods.day.spend_usd}`)
-  await expect(page.getByTestId('budget-weekly-spend')).toHaveText(
-    `$${api.periods.week.spend_usd}`,
-  )
+  await expect(page.getByTestId('budget-weekly-spend')).toHaveText(`$${api.periods.week.spend_usd}`)
   await expect(page.getByTestId('budget-monthly-spend')).toHaveText(
     `$${api.periods.month.spend_usd}`,
   )
-  await expect(page.getByTestId('budget-projection')).toHaveText(
-    `$${api.projected_month_end_usd}`,
-  )
+  await expect(page.getByTestId('budget-projection')).toHaveText(`$${api.projected_month_end_usd}`)
   await expect(page.getByTestId('budget-unpriced-count')).toHaveText(
     String(api.periods.month.unpriced_count),
   )
@@ -2856,9 +2851,7 @@ async function expectBudgetViewport(page: Page, viewport: BudgetViewport): Promi
   await page.screenshot({ path: path.join(SCREENS_DIR, viewport.name), fullPage: true })
 }
 
-test('budget degraded usage keeps thresholds editable with N/A and a marker', async ({
-  page,
-}) => {
+test('budget degraded usage keeps thresholds editable with N/A and a marker', async ({ page }) => {
   test.setTimeout(120_000)
   const diagnostics = collectDiagnostics(page)
   await page.setViewportSize({ width: 1440, height: 900 })
@@ -2985,9 +2978,7 @@ test('budget missing usage renders N/A everywhere and never zero', async ({ page
     await expect(page.getByTestId('budget-usage')).toContainText('unpriced 调用绝不静默归零')
     // A hard load error must not claim the thresholds are editable, and it
     // offers recovery through the load-error panel rather than a panel retry.
-    await expect(page.getByTestId('budget-usage')).toContainText(
-      '阈值不可编辑，直到重新加载成功',
-    )
+    await expect(page.getByTestId('budget-usage')).toContainText('阈值不可编辑，直到重新加载成功')
     await expect(page.getByTestId('budget-usage')).not.toContainText('阈值仍可编辑')
     await expect(page.getByRole('button', { name: '重试用量' })).toHaveCount(0)
     await expect(page.getByRole('button', { name: '重试' })).toBeVisible()
@@ -3039,7 +3030,10 @@ test('budget refresh keeps the last good values, marks them STALE, and clears on
     await expect(page.locator('[data-quality="STALE"]')).toBeVisible()
     await expect(page.getByTestId('budget-today-spend')).toHaveText(lastGood)
     await expect(page.getByTestId('budget-projection')).toHaveText(/^\$\d+\.\d+$/)
-    await expect(page.getByRole('button', { name: '刷新中…' })).toBeDisabled()
+    // The busy state uses ``aria-disabled`` so focus is not dropped to <body>.
+    const refreshing = page.getByRole('button', { name: '刷新中…' })
+    await expect(refreshing).toHaveAttribute('aria-disabled', 'true')
+    await expect(refreshing).not.toHaveAttribute('disabled')
   } finally {
     releaseRefresh()
   }
@@ -3229,7 +3223,10 @@ test('budget screen renders at 375/768/1440, is read-only at 375, and has no axe
   }
 
   const summary = [...desktopSummary, ...mobileSummary, ...tabletSummary]
-  expect(summary, `settings/budget axe violations (1440 + 375 + 768):\n${summary.join('\n')}`).toEqual([])
+  expect(
+    summary,
+    `settings/budget axe violations (1440 + 375 + 768):\n${summary.join('\n')}`,
+  ).toEqual([])
   expectClean(diagnostics)
   expectClean(touchDiagnostics)
 })

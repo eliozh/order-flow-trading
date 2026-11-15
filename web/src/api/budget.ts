@@ -166,11 +166,7 @@ function isPeriods(value: unknown): value is BudgetPeriods {
   if (!isRecord(value)) {
     return false
   }
-  return (
-    isPeriodRow(value.day) &&
-    isPeriodRow(value.week) &&
-    isPeriodRow(value.month)
-  )
+  return isPeriodRow(value.day) && isPeriodRow(value.week) && isPeriodRow(value.month)
 }
 
 function isProjectionBasis(value: unknown): value is BudgetProjectionBasis {
@@ -203,7 +199,9 @@ function isAlert(value: unknown): value is BudgetAlert {
   )
 }
 
-function isSnapshot(value: Record<string, unknown>): value is Record<string, unknown> & BudgetSnapshot {
+function isSnapshot(
+  value: Record<string, unknown>,
+): value is Record<string, unknown> & BudgetSnapshot {
   if (!isThresholds(value.thresholds) || !isUsageQuality(value.usage_quality)) {
     return false
   }

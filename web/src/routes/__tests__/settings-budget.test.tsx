@@ -1,4 +1,4 @@
-import { fireEvent, render, screen, waitFor, within } from '@testing-library/react'
+import { act, fireEvent, render, screen, waitFor, within } from '@testing-library/react'
 import { afterEach, describe, expect, it, vi } from 'vitest'
 
 import { fetchBudget } from '../../api/budget'
@@ -6,10 +6,12 @@ import type {
   BudgetAlert,
   BudgetData,
   BudgetEnvelope,
+  BudgetThresholds,
   BudgetUpdateData,
   BudgetUpdateEnvelope,
   BudgetUpdatePayload,
 } from '../../api/budget'
+import { validateBudgetDraft } from '../../hooks/use-budget-settings-form'
 import { SettingsApiError } from '../../api/settings'
 import type { ApiMeta } from '../../api/status'
 import { SettingsBudgetPage } from '../settings-budget'
@@ -96,22 +98,15 @@ function updateEnvelope(
 
 interface RenderOptions {
   fetch?: (signal?: AbortSignal) => Promise<BudgetEnvelope>
-  update?: (
-    payload: BudgetUpdatePayload,
-    key: string,
-  ) => Promise<BudgetUpdateEnvelope>
+  update?: (payload: BudgetUpdatePayload, key: string) => Promise<BudgetUpdateEnvelope>
   isCompact?: boolean
   clear?: () => void
   rotate?: () => string
 }
 
 async function renderLoaded(options: RenderOptions = {}) {
-  const fetch =
-    options.fetch ??
-    (async () => budgetEnvelope(budgetData({ last_alert: ALERT })))
-  const update =
-    options.update ??
-    (async () => updateEnvelope())
+  const fetch = options.fetch ?? (async () => budgetEnvelope(budgetData({ last_alert: ALERT })))
+  const update = options.update ?? (async () => updateEnvelope())
   const clear = options.clear ?? vi.fn()
   const rotate = options.rotate ?? vi.fn(() => 'rotated-budget-key')
   render(
@@ -201,9 +196,7 @@ describe('SettingsBudgetPage', () => {
     }
     expect(screen.queryByText('$0.00000000')).not.toBeInTheDocument()
     expect(screen.queryByRole('form', { name: '修改预算阈值' })).not.toBeInTheDocument()
-    expect(screen.getByTestId('budget-usage')).toHaveTextContent(
-      '阈值不可编辑，直到重新加载成功',
-    )
+    expect(screen.getByTestId('budget-usage')).toHaveTextContent('阈值不可编辑，直到重新加载成功')
     expect(screen.queryByText(/阈值仍可编辑/)).not.toBeInTheDocument()
     // The hard-error path keeps only the page-level reload retry.
     expect(screen.queryByRole('button', { name: '重试用量' })).not.toBeInTheDocument()
@@ -227,7 +220,9 @@ describe('SettingsBudgetPage', () => {
 
     fireEvent.click(screen.getByRole('button', { name: '刷新用量' }))
 
-    await waitFor(() => expect(screen.getByTestId('budget-usage')).toHaveAttribute('aria-busy', 'true'))
+    await waitFor(() =>
+      expect(screen.getByTestId('budget-usage')).toHaveAttribute('aria-busy', 'true'),
+    )
     expect(screen.getByTestId('budget-today-spend')).toHaveTextContent('$2.18000000')
     expect(screen.getAllByText('STALE').length).toBeGreaterThan(0)
 
@@ -250,8 +245,65 @@ describe('SettingsBudgetPage', () => {
     const notice = await screen.findByTestId('budget-refresh-notice')
     expect(notice).toHaveTextContent('刷新失败')
     expect(notice).toHaveTextContent('socket closed')
+    expect(notice).toHaveTextContent('保留上次成功值并标记 STALE。')
     expect(screen.getByTestId('budget-today-spend')).toHaveTextContent('$2.18000000')
     expect(screen.getAllByText('STALE').length).toBeGreaterThan(0)
+    await waitFor(() =>
+      expect(screen.getByTestId('budget-usage-status')).toHaveTextContent(
+        '刷新失败：socket closed。保留上次成功值并标记 STALE。',
+      ),
+    )
+  })
+
+  it('shows and announces degraded refresh copy without claiming STALE', async () => {
+    let rejectRefresh: ((error: unknown) => void) | undefined
+    const fetch = vi
+      .fn<(signal?: AbortSignal) => Promise<BudgetEnvelope>>()
+      .mockResolvedValueOnce(
+        budgetEnvelope(
+          budgetData({
+            usage_quality: 'UNAVAILABLE',
+            budget_state: null,
+            periods: null,
+            projected_month_end_usd: null,
+            projection_basis: null,
+            last_alert: null,
+          }),
+        ),
+      )
+      .mockImplementationOnce(
+        () =>
+          new Promise<BudgetEnvelope>((_resolve, reject) => {
+            rejectRefresh = reject
+          }),
+      )
+    await renderLoaded({ fetch })
+
+    fireEvent.click(screen.getByRole('button', { name: '重试用量' }))
+
+    // The degraded panel shows N/A with no STALE badge, so neither the
+    // in-flight nor the failure copy may reference a last-good value.
+    await waitFor(() =>
+      expect(screen.getByTestId('budget-usage-status')).toHaveTextContent(
+        '正在刷新用量；用量当前不可用（N/A）。',
+      ),
+    )
+    expect(screen.getByTestId('budget-usage-status')).not.toHaveTextContent('STALE')
+
+    await act(async () => {
+      rejectRefresh?.(new Error('socket closed'))
+    })
+
+    const notice = await screen.findByTestId('budget-refresh-notice')
+    expect(notice).toHaveTextContent('刷新失败：socket closed；用量仍不可用（N/A），阈值可编辑。')
+    await waitFor(() =>
+      expect(screen.getByTestId('budget-usage-status')).toHaveTextContent(
+        '刷新失败：socket closed；用量仍不可用（N/A），阈值可编辑。',
+      ),
+    )
+    expect(screen.getByTestId('budget-usage-status')).not.toHaveTextContent('STALE')
+    expect(screen.getByTestId('budget-usage-status')).not.toHaveTextContent('上次成功值')
+    expect(screen.getByTestId('budget-usage-degraded')).toBeInTheDocument()
   })
 
   it('blocks an ordering violation inline without calling update', async () => {
@@ -276,6 +328,45 @@ describe('SettingsBudgetPage', () => {
     expect(update).not.toHaveBeenCalled()
   })
 
+  it('accepts an unrelated save over a CLI-created crossed snapshot', async () => {
+    const crossed: BudgetThresholds = { ...THRESHOLDS, daily_usd: '50.00', weekly_usd: '10.00' }
+    const fetch = vi.fn(async () => budgetEnvelope(budgetData({ thresholds: crossed })))
+    const update = vi.fn(async () => updateEnvelope({ thresholds: { ...crossed, warn_pct: 75 } }))
+    await renderLoaded({ fetch, update })
+
+    // The stored set is already crossed (daily 50 > weekly 10), as a CLI write
+    // can leave it. Editing an unrelated field must not be blocked: the PUT
+    // accepts it because the draft introduces no new crossing.
+    change(/警告阈值 %/, '75')
+    fireEvent.click(screen.getByRole('button', { name: '保存阈值' }))
+
+    await waitFor(() => expect(update).toHaveBeenCalledTimes(1))
+    expect(update).toHaveBeenCalledWith(
+      {
+        daily_usd: '50.00',
+        weekly_usd: '10.00',
+        monthly_usd: '150.00',
+        warn_pct: 75,
+      },
+      'budget-key',
+    )
+    expect(screen.queryByText('Weekly 必须 ≥ Daily')).not.toBeInTheDocument()
+    expect(screen.queryByRole('alert')).not.toBeInTheDocument()
+  })
+
+  it('keeps the Chinese warn label out of lang="en" while English terms stay tagged', async () => {
+    await renderLoaded()
+
+    expect(screen.getByText('警告阈值 %').closest('[lang="en"]')).toBeNull()
+    expect(screen.getAllByText('Daily USD')[0].closest('[lang="en"]')).not.toBeNull()
+
+    change(/警告阈值 %/, '0')
+    fireEvent.click(screen.getByRole('button', { name: '保存阈值' }))
+
+    const link = await screen.findByRole('link', { name: '转到警告阈值 %' })
+    expect(link.querySelector('[lang="en"]')).toBeNull()
+  })
+
   it('blocks an out-of-range warn percentage inline without native validation', async () => {
     const update = vi.fn(async () => updateEnvelope())
     await renderLoaded({ update })
@@ -285,7 +376,56 @@ describe('SettingsBudgetPage', () => {
 
     const alert = await screen.findByRole('alert')
     expect(alert).toHaveTextContent('无法保存')
-    expect(screen.getByText('警告阈值必须在 1–100 之间')).toBeInTheDocument()
+    expect(screen.getByText('警告阈值必须大于 0 且不超过 100')).toBeInTheDocument()
+    expect(update).not.toHaveBeenCalled()
+  })
+
+  it('accepts a sub-one warn percentage and sends it unchanged', async () => {
+    const update = vi.fn(async () =>
+      updateEnvelope({ thresholds: { ...THRESHOLDS, warn_pct: 0.5 } }),
+    )
+    await renderLoaded({ update })
+
+    change(/警告阈值 %/, '0.5')
+    fireEvent.click(screen.getByRole('button', { name: '保存阈值' }))
+
+    await waitFor(() => expect(update).toHaveBeenCalled())
+    expect(update).toHaveBeenCalledWith(
+      {
+        daily_usd: '10.00',
+        weekly_usd: '50.00',
+        monthly_usd: '150.00',
+        warn_pct: 0.5,
+      },
+      'budget-key',
+    )
+    await waitFor(() =>
+      expect(screen.getByTestId('settings-budget-save-visible')).toHaveTextContent('已保存'),
+    )
+  })
+
+  it('clears a stale ordering error when a coupled field is edited', async () => {
+    const update = vi.fn(async () => updateEnvelope())
+    await renderLoaded({ update })
+
+    change(/Weekly USD/, '5.00')
+    fireEvent.click(screen.getByRole('button', { name: '保存阈值' }))
+    await screen.findByText('Weekly 必须 ≥ Daily')
+    expect(screen.getByRole('textbox', { name: 'Weekly USD' })).toHaveAttribute(
+      'aria-invalid',
+      'true',
+    )
+
+    // Editing the paired lower bound makes weekly 5 ≥ daily 2 valid, so the
+    // weekly error must clear without resubmitting.
+    change(/Daily USD/, '2.00')
+    expect(screen.queryByText('Weekly 必须 ≥ Daily')).not.toBeInTheDocument()
+    expect(screen.getByRole('textbox', { name: 'Weekly USD' })).not.toHaveAttribute('aria-invalid')
+
+    // Editing the field itself keeps the error clear.
+    change(/Weekly USD/, '60.00')
+    expect(screen.queryByText('Weekly 必须 ≥ Daily')).not.toBeInTheDocument()
+    expect(screen.getByRole('textbox', { name: 'Weekly USD' })).not.toHaveAttribute('aria-invalid')
     expect(update).not.toHaveBeenCalled()
   })
 
@@ -323,11 +463,61 @@ describe('SettingsBudgetPage', () => {
     )
   })
 
+  it('rotates the idempotency key on a 409 conflict and keeps the pending key unused', async () => {
+    const update = vi.fn(async () => {
+      throw new SettingsApiError('conflict', 'IDEMPOTENCY_CONFLICT', { httpStatus: 409 })
+    })
+    const clear = vi.fn()
+    const rotate = vi.fn(() => 'rotated-budget-key')
+    await renderLoaded({ update, clear, rotate })
+
+    change(/Daily USD/, '20.00')
+    fireEvent.click(screen.getByRole('button', { name: '保存阈值' }))
+
+    const alert = await screen.findByRole('alert')
+    expect(alert).toHaveTextContent('请求冲突')
+    expect(alert).toHaveTextContent('新的 Idempotency-Key')
+    expect(rotate).toHaveBeenCalledTimes(1)
+    expect(clear).not.toHaveBeenCalled()
+  })
+
+  it('clears the pending key after a definitive validation refusal', async () => {
+    const update = vi.fn(async () => {
+      throw new SettingsApiError('bad value', 'VALIDATION_FAILED', {
+        httpStatus: 422,
+        details: [
+          {
+            field: 'monthly_usd',
+            code: 'ordering',
+            message: 'monthly_usd must be greater than or equal to weekly_usd',
+          },
+        ],
+      })
+    })
+    const clear = vi.fn()
+    const rotate = vi.fn(() => 'rotated-budget-key')
+    await renderLoaded({ update, clear, rotate })
+
+    change(/Monthly USD/, '200.00')
+    fireEvent.click(screen.getByRole('button', { name: '保存阈值' }))
+
+    await waitFor(() =>
+      expect(screen.getByTestId('settings-budget-error')).toHaveTextContent('bad value'),
+    )
+    expect(clear).toHaveBeenCalledTimes(1)
+    expect(rotate).not.toHaveBeenCalled()
+    expect(screen.getByRole('textbox', { name: 'Monthly USD' })).toHaveAttribute(
+      'aria-invalid',
+      'true',
+    )
+    expect(
+      screen.getByText('monthly_usd must be greater than or equal to weekly_usd'),
+    ).toBeInTheDocument()
+  })
+
   it('saves a valid change with the pending key, announces the audit, and focuses save', async () => {
     const savedThresholds = { ...THRESHOLDS, daily_usd: '20.00' }
-    const update = vi.fn(async () =>
-      updateEnvelope({ thresholds: savedThresholds }),
-    )
+    const update = vi.fn(async () => updateEnvelope({ thresholds: savedThresholds }))
     const clear = vi.fn()
     await renderLoaded({ update, clear })
 
@@ -367,9 +557,7 @@ describe('SettingsBudgetPage', () => {
     await waitFor(() =>
       expect(screen.getByTestId('settings-budget-save-visible')).toHaveTextContent('未变更'),
     )
-    expect(screen.getByTestId('settings-budget-save-visible')).toHaveTextContent(
-      '未写入新 audit',
-    )
+    expect(screen.getByTestId('settings-budget-save-visible')).toHaveTextContent('未写入新 audit')
     expect(screen.getByTestId('settings-budget-save-visible')).toHaveTextContent('绝不停止')
   })
 
@@ -460,9 +648,7 @@ describe('SettingsBudgetPage', () => {
     fireEvent.click(screen.getByRole('button', { name: '刷新用量' }))
 
     await waitFor(() =>
-      expect(screen.getByTestId('budget-usage-status')).toHaveTextContent(
-        '正在刷新用量',
-      ),
+      expect(screen.getByTestId('budget-usage-status')).toHaveTextContent('正在刷新用量'),
     )
     resolveRefresh?.(budgetEnvelope(budgetData()))
     await waitFor(() =>
@@ -538,39 +724,152 @@ describe('SettingsBudgetPage', () => {
       expect(screen.getByTestId('budget-meter-day')).toHaveAttribute('aria-valuemax', '25'),
     )
 
+    // Applying the reconciled snapshot clears the superseded refresh's STALE
+    // badge and "正在刷新用量" announcement.
+    expect(screen.queryAllByText('STALE')).toHaveLength(0)
+    expect(screen.getByTestId('budget-usage-status')).toBeEmptyDOMElement()
+    expect(screen.queryByTestId('budget-refresh-notice')).not.toBeInTheDocument()
+
     // The pre-save refresh carries the older snapshot; the reconciliation
     // generation bump must keep the newer server thresholds on screen.
     resolveRefresh?.(budgetEnvelope(budgetData()))
-    await waitFor(() =>
-      expect(screen.getByRole('button', { name: '刷新用量' })).toBeEnabled(),
+    await waitFor(() => expect(screen.getByRole('button', { name: '刷新用量' })).toBeEnabled())
+    expect(screen.getByTestId('budget-meter-day')).toHaveAttribute('aria-valuemax', '25')
+
+    // The superseded refresh returned without finalizing its STALE/refresh
+    // notice; it must not bring them back.
+    expect(screen.queryAllByText('STALE')).toHaveLength(0)
+    expect(screen.getByTestId('budget-usage-status')).toBeEmptyDOMElement()
+    expect(screen.queryByTestId('budget-refresh-notice')).not.toBeInTheDocument()
+  })
+
+  it('drops a pre-save refresh rejection after the reconcile snapshot', async () => {
+    let rejectRefresh: ((error: unknown) => void) | undefined
+    const reconciled = budgetEnvelope(
+      budgetData({ thresholds: { ...THRESHOLDS, daily_usd: '25.00' } }),
     )
+    const fetch = vi
+      .fn<(signal?: AbortSignal) => Promise<BudgetEnvelope>>()
+      .mockResolvedValueOnce(budgetEnvelope(budgetData()))
+      .mockImplementationOnce(
+        () =>
+          new Promise<BudgetEnvelope>((_resolve, reject) => {
+            rejectRefresh = reject
+          }),
+      )
+      .mockResolvedValueOnce(reconciled)
+    const update = vi.fn(async () => {
+      throw new Error('network down')
+    })
+    await renderLoaded({ fetch, update })
+
+    fireEvent.click(screen.getByRole('button', { name: '刷新用量' }))
+    await waitFor(() =>
+      expect(screen.getByTestId('budget-usage')).toHaveAttribute('aria-busy', 'true'),
+    )
+
+    change(/Daily USD/, '25.00')
+    fireEvent.click(screen.getByRole('button', { name: '保存阈值' }))
+    await waitFor(() => expect(screen.getByRole('alert')).toHaveTextContent('结果未知'))
+    await waitFor(() =>
+      expect(screen.getByTestId('budget-meter-day')).toHaveAttribute('aria-valuemax', '25'),
+    )
+
+    // The refresh was started before the save; its rejection lands after the
+    // unknown-outcome reconcile applied the newer snapshot and must not stamp
+    // STALE or a failure notice over it.
+    await act(async () => {
+      rejectRefresh?.(new Error('socket closed'))
+    })
+    await waitFor(() => expect(screen.getByRole('button', { name: '刷新用量' })).toBeEnabled())
+    expect(screen.queryAllByText('STALE')).toHaveLength(0)
+    expect(screen.getByTestId('budget-usage-status')).toBeEmptyDOMElement()
+    expect(screen.queryByTestId('budget-refresh-notice')).not.toBeInTheDocument()
+    expect(screen.getByRole('textbox', { name: 'Daily USD' })).toHaveValue('25.00')
     expect(screen.getByTestId('budget-meter-day')).toHaveAttribute('aria-valuemax', '25')
   })
 
-  it('disables the usage refresh while a save is in flight', async () => {
+  it('drops a stale reconcile response when a retry save already committed', async () => {
+    let resolveReconcile: ((envelope: BudgetEnvelope) => void) | undefined
+    const fetch = vi
+      .fn<(signal?: AbortSignal) => Promise<BudgetEnvelope>>()
+      .mockResolvedValueOnce(budgetEnvelope(budgetData()))
+      .mockImplementationOnce(
+        () =>
+          new Promise<BudgetEnvelope>((resolve) => {
+            resolveReconcile = resolve
+          }),
+      )
+    const update = vi
+      .fn<(payload: BudgetUpdatePayload, idempotencyKey: string) => Promise<BudgetUpdateEnvelope>>()
+      .mockRejectedValueOnce(new Error('network down'))
+      .mockResolvedValueOnce(updateEnvelope({ thresholds: { ...THRESHOLDS, daily_usd: '30.00' } }))
+    await renderLoaded({ fetch, update })
+
+    change(/Daily USD/, '20.00')
+    fireEvent.click(screen.getByRole('button', { name: '保存阈值' }))
+    await waitFor(() => expect(screen.getByRole('alert')).toHaveTextContent('结果未知'))
+    await waitFor(() => expect(fetch).toHaveBeenCalledTimes(2))
+
+    // The retry succeeds and installs the authoritative daily 30 snapshot.
+    change(/Daily USD/, '30.00')
+    fireEvent.click(screen.getByRole('button', { name: '保存阈值' }))
+    await waitFor(() =>
+      expect(screen.getByTestId('settings-budget-save-visible')).toHaveTextContent('已保存'),
+    )
+    expect(screen.getByRole('textbox', { name: 'Daily USD' })).toHaveValue('30.00')
+
+    // The reconcile read was started before the retry committed; its older
+    // snapshot must not overwrite the newer authoritative one.
+    await act(async () => {
+      resolveReconcile?.(
+        budgetEnvelope(budgetData({ thresholds: { ...THRESHOLDS, daily_usd: '20.00' } })),
+      )
+    })
+    expect(screen.getByRole('textbox', { name: 'Daily USD' })).toHaveValue('30.00')
+    expect(screen.getByTestId('budget-meter-day')).toHaveAttribute('aria-valuemax', '30')
+  })
+
+  it('marks the controls busy with aria-disabled during a save without dropping focus', async () => {
     let resolveUpdate: ((envelope: BudgetUpdateEnvelope) => void) | undefined
+    const fetch = vi.fn(async () => budgetEnvelope(budgetData()))
     const update = vi.fn(
       () =>
         new Promise<BudgetUpdateEnvelope>((resolve) => {
           resolveUpdate = resolve
         }),
     )
-    await renderLoaded({ update })
+    await renderLoaded({ fetch, update })
 
     change(/Daily USD/, '20.00')
     fireEvent.click(screen.getByRole('button', { name: '保存阈值' }))
     await waitFor(() =>
-      expect(screen.getByRole('button', { name: '保存中…' })).toBeDisabled(),
+      expect(screen.getByRole('button', { name: '保存中…' })).toHaveAttribute(
+        'aria-disabled',
+        'true',
+      ),
     )
 
-    // A refresh would be silently ignored by the hook, so the control is
-    // disabled for the duration of the save.
-    expect(screen.getByRole('button', { name: '刷新用量' })).toBeDisabled()
+    // The busy save button and refresh stay focusable (native ``disabled`` on
+    // a focused control would drop focus to <body>), and the refresh click is
+    // ignored by the hook's in-flight guard.
+    expect(screen.getByRole('button', { name: '保存中…' })).not.toBeDisabled()
+    const refresh = screen.getByRole('button', { name: '刷新用量' })
+    expect(refresh).toHaveAttribute('aria-disabled', 'true')
+    expect(refresh).not.toBeDisabled()
+    fireEvent.click(refresh)
+    expect(fetch).toHaveBeenCalledTimes(1)
+
+    // Threshold inputs stay enabled but busy for the duration of the save.
+    const daily = screen.getByRole('textbox', { name: 'Daily USD' })
+    expect(daily).toBeEnabled()
+    expect(daily).toHaveAttribute('aria-disabled', 'true')
 
     resolveUpdate?.(updateEnvelope({ thresholds: { ...THRESHOLDS, daily_usd: '20.00' } }))
     await waitFor(() =>
-      expect(screen.getByRole('button', { name: '刷新用量' })).toBeEnabled(),
+      expect(screen.getByRole('button', { name: '刷新用量' })).not.toHaveAttribute('aria-disabled'),
     )
+    expect(screen.getByRole('textbox', { name: 'Daily USD' })).not.toHaveAttribute('aria-disabled')
   })
 
   it('renders the server snapshot state after a save instead of recomputing it', async () => {
@@ -602,6 +901,42 @@ describe('SettingsBudgetPage', () => {
   })
 })
 
+describe('validateBudgetDraft ordering parity', () => {
+  const crossedCurrent: BudgetThresholds = {
+    daily_usd: '50.00',
+    weekly_usd: '10.00',
+    monthly_usd: '150.00',
+    warn_pct: 80,
+  }
+  const crossedDraft = {
+    daily_usd: '50.00',
+    weekly_usd: '10.00',
+    monthly_usd: '150.00',
+    warn_pct: '75',
+  }
+
+  it('rejects a crossing the draft introduces over an uncrossed current set', () => {
+    const outcome = validateBudgetDraft(
+      { ...crossedDraft, daily_usd: '10.00', weekly_usd: '5.00' },
+      THRESHOLDS,
+    )
+    expect(outcome.errors.weekly_usd).toBe('Weekly 必须 ≥ Daily')
+    expect(outcome.valid).toBe(false)
+  })
+
+  it('accepts an already-crossed current pair while the pure call stays strict', () => {
+    // With no ``current`` the prior set is assumed uncrossed, so the pure
+    // validator still reports the crossing.
+    expect(validateBudgetDraft(crossedDraft).errors.weekly_usd).toBe('Weekly 必须 ≥ Daily')
+    // Passing an uncrossed current set reports the newly introduced crossing.
+    expect(validateBudgetDraft(crossedDraft, THRESHOLDS).errors.weekly_usd).toBe(
+      'Weekly 必须 ≥ Daily',
+    )
+    // The same crossing already exists on the server, so it is not new.
+    expect(validateBudgetDraft(crossedDraft, crossedCurrent).errors).toEqual({})
+  })
+})
+
 describe('fetchBudget envelope validation', () => {
   afterEach(() => {
     vi.unstubAllGlobals()
@@ -610,11 +945,12 @@ describe('fetchBudget envelope validation', () => {
   function stubResponse(data: unknown): void {
     vi.stubGlobal(
       'fetch',
-      vi.fn(async () =>
-        new Response(JSON.stringify({ ...budgetEnvelope(data as BudgetData) }), {
-          status: 200,
-          headers: { 'Content-Type': 'application/json' },
-        }),
+      vi.fn(
+        async () =>
+          new Response(JSON.stringify({ ...budgetEnvelope(data as BudgetData) }), {
+            status: 200,
+            headers: { 'Content-Type': 'application/json' },
+          }),
       ),
     )
   }
