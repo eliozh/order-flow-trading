@@ -1,4 +1,10 @@
-"""Read-only ``oft watchlist list|search|groups`` (symbol registry)."""
+"""``oft watchlist``: list/search/groups plus star/unstar mutation commands.
+
+``list``, ``search``, and ``groups`` read the SQLite symbol registry directly.
+``star``/``unstar`` change only the local star flag through the API and are
+aliased by ``add``/``remove``; no exchange call, metadata edit, or scan trigger
+is involved.
+"""
 
 from __future__ import annotations
 
@@ -18,7 +24,7 @@ from oft.domain.symbols import SymbolContract
 from oft.ports.store import StoreUnavailableError
 
 watchlist_app = typer.Typer(
-    help="Read-only symbol registry commands (star mutation is not implemented).",
+    help="Symbol registry and watchlist star commands.",
     no_args_is_help=True,
     add_completion=False,
 )
@@ -144,7 +150,7 @@ def list_command(
     _emit(
         contracts,
         {"total": len(contracts), "group": group, "starred": starred},
-        render_symbols_table(contracts, title="WATCHLIST · read-only symbol registry"),
+        render_symbols_table(contracts, title="WATCHLIST · symbol registry"),
         as_json,
     )
 
@@ -252,4 +258,22 @@ def unstar_command(
     json_output: Annotated[bool, typer.Option("--json", help="Emit JSON.")] = False,
 ) -> None:
     """Unstar a registry symbol."""
+    _set_star(symbol, False, json_output)
+
+
+@watchlist_app.command("add")
+def add_command(
+    symbol: str,
+    json_output: Annotated[bool, typer.Option("--json", help="Emit JSON.")] = False,
+) -> None:
+    """Alias for ``star``: add a symbol to the next scan."""
+    _set_star(symbol, True, json_output)
+
+
+@watchlist_app.command("remove")
+def remove_command(
+    symbol: str,
+    json_output: Annotated[bool, typer.Option("--json", help="Emit JSON.")] = False,
+) -> None:
+    """Alias for ``unstar``: remove a symbol from the next scan."""
     _set_star(symbol, False, json_output)

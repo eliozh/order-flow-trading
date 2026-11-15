@@ -85,7 +85,12 @@ class ApiClient:
         return self._request("POST", "/api/v1/scans", payload, extra_headers=headers)
 
     def set_starred(self, symbol: str, starred: bool) -> dict[str, Any]:
-        return self._request("PATCH", f"/api/v1/symbols/{symbol}/star", {"starred": starred})
+        return self._request(
+            "PATCH",
+            f"/api/v1/symbols/{symbol}/star",
+            {"starred": starred},
+            extra_headers={"X-OFT-Surface": "cli"},
+        )
 
     def list_scans(self, limit: int = 20) -> dict[str, Any]:
         return self._request("GET", f"/api/v1/scans?limit={limit}")

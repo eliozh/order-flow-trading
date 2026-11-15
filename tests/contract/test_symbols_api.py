@@ -320,17 +320,17 @@ def test_overflow_from_the_store_maps_to_validation_failed(settings: Settings) -
     assert response.json()["error"]["code"] == "VALIDATION_FAILED"
 
 
-def test_watchlist_uses_one_bounded_query(settings: Settings) -> None:
+def test_watchlist_uses_one_snapshot_read(settings: Settings) -> None:
     app = create_app(settings)
     registry = app.state.container.symbol_registry
     calls: list[dict[str, Any]] = []
-    original = registry.list_symbols
+    original = registry.watchlist_snapshot
 
     def spy(**kwargs: Any) -> Any:
         calls.append(kwargs)
         return original(**kwargs)
 
-    registry.list_symbols = spy  # type: ignore[method-assign]
+    registry.watchlist_snapshot = spy  # type: ignore[method-assign]
 
     with TestClient(app) as client:
         response = client.get("/api/v1/watchlist", headers=_auth(app))

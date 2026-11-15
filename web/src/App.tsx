@@ -29,6 +29,7 @@ import { SystemPage } from './routes/system'
 import { TriggerDetailPage } from './routes/trigger-detail'
 import { TriggersPage } from './routes/triggers'
 import { WatchlistPage } from './routes/watchlist'
+import { WatchlistSearchPage } from './routes/watchlist-search'
 import './styles/tokens.css'
 import './styles/app.css'
 import './styles/nav.css'
@@ -86,6 +87,8 @@ export default function App() {
               <JournalPage />
             ) : route.isPaper ? (
               <PaperPage />
+            ) : route.isSearch ? (
+              <WatchlistSearchPage />
             ) : route.isWatchlist ? (
               <WatchlistPage />
             ) : route.isSettingsScan ? (

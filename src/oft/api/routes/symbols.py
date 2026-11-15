@@ -10,7 +10,6 @@ from pydantic import BaseModel, ConfigDict
 from oft.api.envelope import new_request_id, success_envelope
 from oft.api.errors import ApiError
 from oft.domain.symbols import build_symbol_detail
-from oft.domain.time import utc_timestamp
 
 router = APIRouter()
 
@@ -19,9 +18,24 @@ _MAX_CONTRACT_TYPE_LENGTH = 32
 _DEFAULT_LIMIT = 50
 _MAX_LIMIT = 2000
 
+# Caller surfaces allowed to attribute a star change. Anything else (including
+# a missing header) is recorded as the default ``web`` surface.
+_STAR_SURFACES = frozenset({"cli"})
+
 
 def _registry(request: Request) -> Any:
     return request.app.state.container.symbol_registry
+
+
+def _star_actor(request: Request) -> str:
+    """Attribute a PATCH star change to the caller surface.
+
+    ``X-OFT-Surface: cli`` marks a CLI-originated mutation; every other value
+    (or no header) falls back to ``web`` so an untrusted client cannot invent
+    an audit actor id.
+    """
+    surface = request.headers.get("x-oft-surface", "").strip().lower()
+    return surface if surface in _STAR_SURFACES else "web"
 
 
 @router.get("/api/v1/symbols")
@@ -113,18 +127,22 @@ class StarRequest(BaseModel):
 
 @router.patch("/api/v1/symbols/{symbol}/star")
 def set_star(symbol: str, payload: StarRequest, request: Request) -> dict[str, Any]:
-    """Star or unstar one registry symbol (idempotent)."""
-    registry = _registry(request)
-    starred_at = utc_timestamp(request.app.state.container.clock.now())
-    updated = registry.set_starred(symbol, payload.starred, starred_at=starred_at)
-    if not updated:
+    """Star or unstar one registry symbol (idempotent, audited).
+
+    Starring an already-starred symbol keeps its original ``starred_at``;
+    unstarring an unstarred symbol is a no-op. Only an actual change writes an
+    audit event, so a repeated request cannot duplicate stars or audits.
+    """
+    result = _registry(request).set_star_with_audit(
+        symbol, payload.starred, actor=_star_actor(request)
+    )
+    if result is None:
         raise ApiError("NOT_FOUND", f"Symbol {symbol} does not exist.")
-    resolved = symbol.strip().upper()
     return success_envelope(
         {
-            "symbol": resolved,
-            "starred": payload.starred,
-            "starred_at": starred_at if payload.starred else None,
+            "symbol": result.symbol,
+            "starred": result.after.starred,
+            "starred_at": result.after.starred_at,
         },
         request_id=new_request_id(),
         provenance="CALC",

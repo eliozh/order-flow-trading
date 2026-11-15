@@ -65,6 +65,56 @@ class SymbolUpsertResult:
 
 
 @dataclass(frozen=True)
+class StarState:
+    """One symbol's watchlist star flag and the instant it last changed."""
+
+    starred: bool
+    starred_at: str | None
+
+
+@dataclass(frozen=True)
+class StarChangeResult:
+    """The outcome of one audited star write.
+
+    ``changed`` is ``False`` for a semantic no-op (starring an already-starred
+    symbol or unstarring an unstarred one); in that case ``after`` equals
+    ``before`` and no audit event was written.
+    """
+
+    symbol: str
+    before: StarState
+    after: StarState
+    changed: bool
+
+
+@dataclass(frozen=True)
+class WatchlistEntry:
+    """One bounded watchlist row: the contract plus its current star state."""
+
+    contract: SymbolContract
+    starred: bool
+    starred_at: str | None
+
+
+@dataclass(frozen=True)
+class WatchlistSnapshot:
+    """One consistent read of the bounded watchlist rows plus true totals.
+
+    Every field comes from a single read transaction, so the per-row
+    ``starred`` flags cannot disagree with ``starred_count`` (or the group
+    counts with ``total``) under a concurrent ingest or star change. ``entries``
+    is capped by the caller's limit while the counts describe the whole
+    registry.
+    """
+
+    entries: tuple[WatchlistEntry, ...]
+    total: int
+    crypto_count: int
+    tradfi_count: int
+    starred_count: int
+
+
+@dataclass(frozen=True)
 class ManifestEntry:
     """One published Parquet part."""
 
@@ -822,9 +872,52 @@ class StorePort(Protocol):
 
     def get_symbol(self, symbol: str) -> SymbolContract | None: ...
 
-    def set_starred(self, symbol: str, starred: bool, *, starred_at: str | None = None) -> bool: ...
+    def set_starred(self, symbol: str, starred: bool, *, starred_at: str | None = None) -> bool:
+        """Test/fixture seeding helper: set the flag without an audit event.
+
+        Product mutations must call :meth:`set_starred_with_audit` so every
+        star change is audited and idempotent. This helper intentionally
+        bypasses that path; it exists only for deterministic test seeding.
+        """
+        ...
+
+    def set_starred_with_audit(
+        self,
+        symbol: str,
+        starred: bool,
+        *,
+        starred_at: str | None,
+        actor: dict[str, Any],
+        created_at: str,
+        event_type: str = "WATCHLIST_STAR_TOGGLED",
+    ) -> StarChangeResult | None:
+        """Set the star flag and append one audit event atomically.
+
+        Returns ``None`` when the symbol does not exist. Starring an
+        already-starred symbol keeps the original ``starred_at`` and unstarring
+        an unstarred symbol is likewise a no-op: in both cases no row is
+        updated and no audit event is written (``changed=False``). Only an
+        actual state change updates the row and writes exactly one event.
+        """
+        ...
+
+    def get_star_state(self, symbol: str) -> StarState | None: ...
+
+    def star_states(self) -> dict[str, StarState]:
+        """Every symbol's star state keyed by symbol, in one query."""
+        ...
 
     def list_starred(self) -> tuple[SymbolContract, ...]: ...
+
+    def watchlist_snapshot(self, *, limit: int) -> WatchlistSnapshot:
+        """Read bounded watchlist rows and true registry totals consistently.
+
+        One read transaction yields the rows ordered ``tradifi ASC, symbol
+        ASC`` (capped at ``limit``) and ``COUNT(*)`` totals for the whole
+        registry (total, crypto, TradFi, starred), so the bounded page can
+        never contradict the counts it is rendered next to.
+        """
+        ...
 
     # -- Backfill state --------------------------------------------------
 

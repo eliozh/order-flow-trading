@@ -25,6 +25,20 @@ describe('resolveRoute', () => {
     expect(route.inspectorSymbol).toBeNull()
   })
 
+  it('keeps one search flag and resolves the search path ahead of the table', () => {
+    const search = resolveRoute('/watchlist/search')
+    const table = resolveRoute('/watchlist')
+
+    // The search route is a watchlist path too; App must branch on isSearch
+    // first. There is no second, duplicate flag to keep in sync.
+    expect(search.isSearch).toBe(true)
+    expect(search.isWatchlist).toBe(true)
+    expect(search.inspectorSymbol).toBeNull()
+    expect(table.isSearch).toBe(false)
+    expect(table.isWatchlist).toBe(true)
+    expect('isWatchlistSearch' in search).toBe(false)
+  })
+
   it('routes a trailing-slash symbol path to the inspector', () => {
     const route = resolveRoute('/watchlist/BTCUSDT/')
 

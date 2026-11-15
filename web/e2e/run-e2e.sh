@@ -168,6 +168,24 @@ if ! curl -fsS -H "Authorization: Bearer $SYMBOLS_TOKEN" \
   exit 1
 fi
 
+# Slice 38: `/watchlist` now renders only starred rows, so seed the three
+# fixture symbols as starred on the SYMBOLS daemon before the symbols suite
+# runs. The watchlist suite mutates this state afterwards (it is the last
+# project), and each of its tests resets the stars it touches.
+for symbol in BTCUSDT ETHUSDT XAUUSDT; do
+  curl -fsS -X PATCH \
+    -H "Authorization: Bearer $SYMBOLS_TOKEN" \
+    -H "Content-Type: application/json" \
+    -d '{"starred":true}' \
+    "$SYMBOLS_BASE_URL/api/v1/symbols/$symbol/star" >/dev/null
+done
+if ! curl -fsS -H "Authorization: Bearer $SYMBOLS_TOKEN" \
+  "$SYMBOLS_BASE_URL/api/v1/watchlist" |
+  jq -e '.ok == true and .data.next_scan_count == 3 and .data.truncated == false' >/dev/null; then
+  echo "E2E watchlist stars were not seeded on the symbol daemon" >&2
+  exit 1
+fi
+
 # Slice 08: one-week backfill -> metrics-only scan -> frozen CALC report.
 REPORTS_TOKEN="$(cat "$REPORTS_DATA_DIR/run/api-token" 2>/dev/null || true)"
 if [ -z "$REPORTS_TOKEN" ]; then

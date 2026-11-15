@@ -5,8 +5,12 @@ import type {
   ApiMeta,
   SymbolContract,
   SymbolDetailEnvelope,
-  SymbolListEnvelope,
 } from '../../api/symbols'
+import type {
+  StarEnvelope,
+  WatchlistEnvelope,
+  WatchlistRow,
+} from '../../api/watchlist'
 import { SymbolInspectorPage } from '../symbol-inspector'
 import { WatchlistPage } from '../watchlist'
 
@@ -79,10 +83,38 @@ function detailEnvelope(contract: SymbolContract): SymbolDetailEnvelope {
   }
 }
 
-function listEnvelope(items: SymbolContract[]): SymbolListEnvelope {
+function watchlistRow(contract: SymbolContract, starred: boolean): WatchlistRow {
+  return {
+    ...contract,
+    starred,
+    starred_at: starred ? '2026-11-06T04:00:00.000Z' : null,
+  }
+}
+
+function watchlistEnvelope(rows: WatchlistRow[], total = rows.length): WatchlistEnvelope {
   return {
     ok: true,
-    data: { items, total: items.length, query: null, group: null },
+    data: {
+      groups: [],
+      total,
+      rows,
+      next_scan_count: rows.filter((item) => item.starred).length,
+      truncated: false,
+      star_mutation: true,
+    },
+    error: null,
+    meta,
+  }
+}
+
+function starEnvelope(symbol: string, starred: boolean): StarEnvelope {
+  return {
+    ok: true,
+    data: {
+      symbol,
+      starred,
+      starred_at: starred ? '2026-11-06T04:00:00.000Z' : null,
+    },
     error: null,
     meta,
   }
@@ -220,12 +252,20 @@ describe('SymbolInspectorPage', () => {
   })
 })
 
+// Migrated from the deleted legacy registry view: these cases now exercise the
+// star-configured watchlist through ``fetchWatchlistFn``. The coverage is
+// preserved (grouping, search filtering, narrow read-only, empty state, one
+// live region); the obsolete "no star control" and server-truncation cases are
+// replaced by star-toggle and rendered-count assertions.
 describe('WatchlistPage search', () => {
+  const baseRows = [watchlistRow(btc, true), watchlistRow(eth, true), watchlistRow(xau, true)]
+
   it('renders grouped CRYPTO and TRADFI registries', async () => {
     render(
       <WatchlistPage
-        fetchSymbolsFn={async () => listEnvelope([btc, eth, xau])}
-        isCompact={false}
+        fetchWatchlistFn={async () => watchlistEnvelope(baseRows)}
+        setStarFn={async (symbol, starred) => starEnvelope(symbol, starred)}
+        isNarrow={false}
       />,
     )
 
@@ -239,8 +279,9 @@ describe('WatchlistPage search', () => {
   it('finds a symbol by exact code and by substring', async () => {
     render(
       <WatchlistPage
-        fetchSymbolsFn={async () => listEnvelope([btc, eth, xau])}
-        isCompact={false}
+        fetchWatchlistFn={async () => watchlistEnvelope(baseRows)}
+        setStarFn={async (symbol, starred) => starEnvelope(symbol, starred)}
+        isNarrow={false}
       />,
     )
     const search = await screen.findByLabelText('Search symbols')
@@ -260,70 +301,94 @@ describe('WatchlistPage search', () => {
     expect(within(rows[1]).getByText('BTCUSDT')).toBeInTheDocument()
   })
 
-  it('does not render any star mutation control', async () => {
+  it('renders star toggles with the row star state', async () => {
     render(
       <WatchlistPage
-        fetchSymbolsFn={async () => listEnvelope([btc, eth, xau])}
-        isCompact={false}
+        fetchWatchlistFn={async () =>
+          watchlistEnvelope([watchlistRow(btc, true), watchlistRow(eth, false), watchlistRow(xau, true)])
+        }
+        setStarFn={async (symbol, starred) => starEnvelope(symbol, starred)}
+        isNarrow={false}
       />,
     )
 
-    await screen.findByRole('heading', { name: 'Watchlist' })
-    expect(screen.queryByRole('button', { name: /star/i })).not.toBeInTheDocument()
+    const toggles = await screen.findAllByRole('button', { name: /in next scan/ })
+    expect(toggles).toHaveLength(2)
+    expect(toggles[0]).toHaveAttribute('aria-pressed', 'true')
+    expect(toggles[1]).toHaveAttribute('aria-pressed', 'true')
   })
 
   it('marks the 375px watchlist read-only', async () => {
-    render(<WatchlistPage fetchSymbolsFn={async () => listEnvelope([btc])} isCompact />)
+    render(
+      <WatchlistPage
+        fetchWatchlistFn={async () => watchlistEnvelope([watchlistRow(btc, true)])}
+        setStarFn={async (symbol, starred) => starEnvelope(symbol, starred)}
+        isNarrow
+      />,
+    )
 
     expect(await screen.findByRole('note')).toHaveTextContent('Read-only at this width')
   })
 
-  it('renders an empty registry without treating it as an error', async () => {
-    render(<WatchlistPage fetchSymbolsFn={async () => listEnvelope([])} isCompact={false} />)
-
-    expect(await screen.findByText(/No symbols in the registry/)).toBeInTheDocument()
-  })
-
-  it('uses a single live region and reports truncation with the server total', async () => {
-    const many = Array.from({ length: 500 }, (_, index) => ({
-      ...btc,
-      symbol: `SYM${String(index).padStart(4, '0')}USDT`,
-      base_asset: `SYM${index}`,
-    }))
+  it('renders an empty watchlist without treating it as an error', async () => {
     render(
       <WatchlistPage
-        fetchSymbolsFn={async () => ({
-          ...listEnvelope(many),
-          data: { items: many, total: 942, query: null, group: null },
-        })}
-        isCompact={false}
+        fetchWatchlistFn={async () => watchlistEnvelope([watchlistRow(eth, false)])}
+        setStarFn={async (symbol, starred) => starEnvelope(symbol, starred)}
+        isNarrow={false}
       />,
     )
 
-    expect(await screen.findByText('Showing first 500 of 942 symbols.')).toBeInTheDocument()
-    expect(screen.getAllByRole('status')).toHaveLength(1)
-    expect(screen.getByText('500 of 942 symbols')).toBeInTheDocument()
+    expect(
+      await screen.findByRole('heading', { name: 'No symbols in the next scan' }),
+    ).toBeInTheDocument()
   })
 
-  it('sends the debounced search term to the server', async () => {
-    const fetcher = vi.fn(async () => listEnvelope([xau]))
-    render(<WatchlistPage fetchSymbolsFn={fetcher} isCompact={false} />)
+  it('uses one live region and renders the count from the starred rows', async () => {
+    render(
+      <WatchlistPage
+        fetchWatchlistFn={async () =>
+          watchlistEnvelope([watchlistRow(btc, true), watchlistRow(eth, true), watchlistRow(xau, false)], 3)
+        }
+        setStarFn={async (symbol, starred) => starEnvelope(symbol, starred)}
+        isNarrow={false}
+      />,
+    )
+
+    expect(await screen.findByText('2 of 3 symbols included in next scan')).toBeInTheDocument()
+    expect(screen.getAllByRole('status')).toHaveLength(1)
+    // The rendered table carries exactly the two starred rows.
+    expect(screen.getAllByRole('button', { name: /in next scan/ })).toHaveLength(2)
+    expect(screen.queryByText('XAUUSDT')).not.toBeInTheDocument()
+  })
+
+  it('filters locally without refetching the watchlist', async () => {
+    const fetcher = vi.fn(async () => watchlistEnvelope(baseRows))
+    render(
+      <WatchlistPage
+        fetchWatchlistFn={fetcher}
+        setStarFn={async (symbol, starred) => starEnvelope(symbol, starred)}
+        isNarrow={false}
+      />,
+    )
     const search = await screen.findByLabelText('Search symbols')
 
     fireEvent.change(search, { target: { value: 'xau' } })
 
-    await waitFor(() => expect(fetcher).toHaveBeenCalledWith({ q: 'xau' }))
+    expect(screen.getByText('XAUUSDT')).toBeInTheDocument()
+    // Filtering is client-side; the removed server-side debounced read is gone.
+    await waitFor(() => expect(fetcher).toHaveBeenCalledTimes(1))
   })
 
   it('renders a retryable error state', async () => {
     let calls = 0
     render(
       <WatchlistPage
-        fetchSymbolsFn={async () => {
+        fetchWatchlistFn={async () => {
           calls += 1
           throw new Error('registry locked')
         }}
-        isCompact={false}
+        isNarrow={false}
       />,
     )
 
@@ -334,3 +399,4 @@ describe('WatchlistPage search', () => {
     expect(screen.getAllByRole('status')).toHaveLength(1)
   })
 })
+
