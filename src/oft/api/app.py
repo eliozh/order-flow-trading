@@ -41,6 +41,7 @@ from oft.api.routes.positions import router as positions_router
 from oft.api.routes.prompts import router as prompts_router
 from oft.api.routes.reports import router as reports_router
 from oft.api.routes.scans import router as scans_router
+from oft.api.routes.settings import router as settings_router
 from oft.api.routes.symbols import router as symbols_router
 from oft.api.routes.system import router as system_router
 from oft.api.routes.triggers import router as triggers_router
@@ -74,6 +75,8 @@ _SPA_ENTRY_PATHS = frozenset(
         "/positions/",
         "/journal",
         "/journal/",
+        "/settings",
+        "/settings/",
     }
 )
 _LOOPBACK_HOSTS = frozenset({"127.0.0.1", "localhost", "::1"})
@@ -149,6 +152,7 @@ def _is_spa_entry(path: str) -> bool:
         or path.startswith("/triggers/")
         or path.startswith("/positions/")
         or path.startswith("/journal/")
+        or path.startswith("/settings/")
     )
 
 
@@ -260,6 +264,7 @@ def create_app(settings: Settings | None = None, *, clock: ClockPort | None = No
     app.include_router(data_router)
     app.include_router(llm_router)
     app.include_router(budget_router)
+    app.include_router(settings_router)
 
     @app.exception_handler(ApiError)
     async def _api_error(_request: Request, exc: ApiError) -> JSONResponse:

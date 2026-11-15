@@ -33,7 +33,7 @@ from oft.domain.prompts import (
 _LOGGER = logging.getLogger(__name__)
 
 
-_SCHEMA_VERSION = 25
+_SCHEMA_VERSION = 26
 # ``PRAGMA journal_mode=WAL`` needs an exclusive lock and does not reliably
 # consult the busy handler, so a concurrent initializer can still see
 # SQLITE_BUSY with the timeout installed. Retry the switch briefly.
@@ -864,6 +864,16 @@ _SCHEMA_SQL = f"""
         value TEXT NOT NULL,
         updated_at TEXT NOT NULL
     );
+    -- Slice 32: one row per persisted runtime setting. ``value_json`` keeps the
+    -- typed value (a JSON string, number, boolean, or object) so later settings
+    -- slices reuse the same table.
+    CREATE TABLE IF NOT EXISTS config (
+        key TEXT PRIMARY KEY,
+        value_json TEXT NOT NULL,
+        updated_at TEXT NOT NULL,
+        updated_by TEXT NOT NULL
+    );
+    CREATE INDEX IF NOT EXISTS config_updated_at ON config(updated_at);
 {_OPPORTUNITY_CONDITIONS_DDL}
 {_V22_DDL}
 {_V23_DDL}
@@ -2279,6 +2289,36 @@ def _migrate_v25(connection: sqlite3.Connection) -> None:
         raise
 
 
+def _migrate_v26(connection: sqlite3.Connection) -> None:
+    """Add the ``config`` table for persisted runtime settings (slice 32).
+
+    The table is additive and idempotent: a populated v25 database keeps every
+    existing row and gains an empty ``config`` table plus its ``updated_at``
+    index. A fresh database runs this before ``_SCHEMA_SQL``, which creates the
+    same shape with ``IF NOT EXISTS``.
+    """
+    if connection.in_transaction:
+        connection.commit()
+    connection.execute("BEGIN IMMEDIATE")
+    try:
+        connection.execute(
+            """
+            CREATE TABLE IF NOT EXISTS config (
+                key TEXT PRIMARY KEY,
+                value_json TEXT NOT NULL,
+                updated_at TEXT NOT NULL,
+                updated_by TEXT NOT NULL
+            )
+            """
+        )
+        connection.execute("CREATE INDEX IF NOT EXISTS config_updated_at ON config(updated_at)")
+        connection.execute("COMMIT")
+    except Exception:
+        if connection.in_transaction:
+            connection.execute("ROLLBACK")
+        raise
+
+
 def _opportunity_conditions_pk(
     connection: sqlite3.Connection,
 ) -> tuple[str, ...]:
@@ -2448,7 +2488,7 @@ def _enable_wal(connection: sqlite3.Connection) -> None:
 
 
 def initialize_database(settings: Settings) -> None:
-    """Create the data directory and the schema, currently v25.
+    """Create the data directory and the schema, currently v26.
 
     v19 adds the trigger snapshot provenance columns (``snapshot_hash``,
     ``as_of``, ``data_quality``, ``condition_count``) and backfills them from
@@ -2463,7 +2503,9 @@ def initialize_database(settings: Settings) -> None:
     family (idempotent) for the position-management path. v25 seeds the
     ``REVIEW`` prompt family and adds the nullable
     ``trade_logs.review_decision_id`` link (indexed), preserving every existing
-    trade-log row and payload.
+    trade-log row and payload. v26 adds the additive ``config`` key/value table
+    (``key`` primary key plus an ``updated_at`` index) so runtime settings can
+    be persisted and audited in one transaction.
     """
     settings.data_dir.mkdir(parents=True, exist_ok=True)
     settings.data_dir.chmod(0o700)
@@ -2531,6 +2573,8 @@ def initialize_database(settings: Settings) -> None:
             _migrate_v24(connection)
         if _schema_version(connection) < 25 or not _migration_recorded(connection, 25):
             _migrate_v25(connection)
+        if _schema_version(connection) < 26 or not _migration_recorded(connection, 26):
+            _migrate_v26(connection)
         _ensure_opportunity_conditions_shape(connection)
         _ensure_funding_accruals_shape(connection)
         with connection:
@@ -2640,6 +2684,10 @@ def initialize_database(settings: Settings) -> None:
             connection.execute(
                 "INSERT OR IGNORE INTO schema_migrations (version, applied_at) VALUES (?, ?)",
                 (25, "2026-11-14T18:00:00.000Z"),
+            )
+            connection.execute(
+                "INSERT OR IGNORE INTO schema_migrations (version, applied_at) VALUES (?, ?)",
+                (26, "2026-11-15T00:00:00.000Z"),
             )
             _seed_prompt_defaults(connection)
             _ensure_reports_symbol_index(connection)

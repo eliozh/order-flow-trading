@@ -508,6 +508,20 @@ class PaperAccountRecord:
 
 
 @dataclass(frozen=True)
+class ConfigRecord:
+    """One persisted runtime setting row (``config`` table).
+
+    ``value_json`` is the JSON-encoded setting value, so the column can hold a
+    string, number, boolean, or object without a per-setting schema change.
+    """
+
+    key: str
+    value_json: str
+    updated_at: str
+    updated_by: str
+
+
+@dataclass(frozen=True)
 class AuditEventRecord:
     event_id: str
     seq: int
@@ -1269,4 +1283,18 @@ class StorePort(Protocol):
         self, *, value: str, updated_at: str, audit: AuditEventDraft
     ) -> AuditEventRecord:
         """Persist the caps document and its ``RISK_CAPS_UPDATED`` audit atomically."""
+        ...
+
+    # -- Persisted runtime settings --------------------------------------
+
+    def get_config(self, key: str) -> ConfigRecord | None: ...
+
+    def list_config(self) -> tuple[ConfigRecord, ...]: ...
+
+    def set_config(self, record: ConfigRecord) -> None: ...
+
+    def save_config_with_audit(
+        self, record: ConfigRecord, audit: AuditEventDraft
+    ) -> AuditEventRecord:
+        """Upsert one setting row and append its audit event in one transaction."""
         ...

@@ -9,6 +9,7 @@ import typer
 
 from oft.cli.commands.backfill import backfill_app
 from oft.cli.commands.budget import budget_app
+from oft.cli.commands.config import config_app
 from oft.cli.commands.daemon import daemon_app
 from oft.cli.commands.doctor import doctor_command, emit_error
 from oft.cli.commands.kill import kill_app
@@ -60,6 +61,7 @@ app.add_typer(kill_app, name="kill")
 app.add_typer(llm_app, name="llm")
 app.add_typer(budget_app, name="budget")
 app.add_typer(risk_app, name="risk")
+app.add_typer(config_app, name="config")
 app.add_typer(replay_app, name="replay")
 
 _LOOPBACK_HOSTS = frozenset({"127.0.0.1", "localhost", "::1"})

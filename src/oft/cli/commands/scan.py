@@ -295,7 +295,7 @@ def _emit_schedule(settings: Any, json_output: bool) -> None:
     container = build_container(settings)
     from oft.cli.commands.daemon import _schedule_state
 
-    state = _schedule_state(settings)
+    state = _schedule_state(settings, json_output=json_output)
     now = container.clock.now()
     last = next(
         (run for run in container.store.list_job_runs("scan") if run.trigger_source == "SCHEDULED"),

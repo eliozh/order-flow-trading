@@ -25,13 +25,14 @@ from apscheduler.schedulers.background import BackgroundScheduler
 from apscheduler.triggers.date import DateTrigger
 from apscheduler.triggers.interval import IntervalTrigger
 
+from oft.domain.settings import SUPPORTED_SCAN_PERIODS
 from oft.domain.time import utc_timestamp
 from oft.ports.clock import ClockPort
 
 if TYPE_CHECKING:
     from oft.config import Settings
 
-SCAN_PERIODS = ("4h", "8h")
+SCAN_PERIODS = SUPPORTED_SCAN_PERIODS
 PERIOD_HOURS: dict[str, int] = {"4h": 4, "8h": 8}
 BOUNDARY_HOURS: dict[str, tuple[int, ...]] = {
     "4h": (0, 4, 8, 12, 16, 20),
@@ -229,6 +230,31 @@ class ScheduleState:
             effective_from=boundary,
         )
 
+    def apply_persisted(
+        self, persisted: str | None, *, now: datetime
+    ) -> tuple[ScheduleState, bool]:
+        """Overlay one persisted period on the schedule without rewriting a window.
+
+        Returns ``(state, changed)``. ``None`` and an already-active or already
+        pending value are no-ops. A persisted value equal to the active period
+        collapses a stale pending change (an operator revert); any other value
+        is requested as a pending change that applies at the next boundary of
+        the active schedule.
+        """
+        if persisted is None:
+            return self, False
+        resolved = _require_aware(now)
+        validate_period(persisted)
+        active = self.period_at(resolved)
+        if persisted == self.pending_period:
+            return self, False
+        if persisted == active:
+            if self.pending_period is None or self.pending_period == active:
+                return self, False
+            collapsed = ScheduleState(period=active, jitter_seconds_max=self.jitter_seconds_max)
+            return collapsed, True
+        return self.request_period(persisted, now=resolved), True
+
     def next_run(self, now: datetime) -> datetime:
         """Next jittered UTC fire time, respecting a pending period change."""
         resolved = _require_aware(now)
@@ -373,6 +399,24 @@ class ScanDaemonScheduler:
             save_schedule_state(self._state_path, self._state)
         self._schedule_next()
 
+    def refresh_period(self, new_period: str, *, now: datetime | None = None) -> bool:
+        """Apply a persisted period only when it changes the schedule.
+
+        Returns ``True`` when a pending change was requested or a stale pending
+        change was collapsed. Repeating the same value (including while the
+        change is pending) is a no-op, so a periodic sync cannot keep shifting
+        ``effective_from`` or rewrite the current window.
+        """
+        resolved = now or self._clock.now()
+        updated, changed = self._state.apply_persisted(new_period, now=resolved)
+        if not changed:
+            return False
+        self._state = updated
+        if self._state_path is not None:
+            save_schedule_state(self._state_path, self._state)
+        self._schedule_next()
+        return True
+
     def start(self) -> None:
         self._schedule_next()
         self._scheduler.start()
@@ -414,6 +458,31 @@ class ScanDaemonScheduler:
 
 
 TRIGGER_JOB_ID = "trigger_evaluate"
+
+
+class SettingsPeriodSync:
+    """Apply a persisted scan period to the live scheduler without a restart.
+
+    The daemon runs :meth:`sync` on a short interval. ``period_provider`` returns
+    the persisted value (``None`` when no operator row exists), and the
+    scheduler only requests a change when it differs from the active or pending
+    period, so the current window is never rewritten.
+    """
+
+    def __init__(
+        self,
+        *,
+        scheduler: ScanDaemonScheduler,
+        period_provider: Callable[[], str | None],
+    ) -> None:
+        self._scheduler = scheduler
+        self._period_provider = period_provider
+
+    def sync(self) -> bool:
+        period = self._period_provider()
+        if period is None:
+            return False
+        return self._scheduler.refresh_period(period)
 
 
 class _IntervalDaemonScheduler:
@@ -483,6 +552,26 @@ class TriggerDaemonScheduler(_IntervalDaemonScheduler):
 
 POSITION_MONITOR_JOB_ID = "position_monitor"
 MANAGEMENT_JOB_ID = "position_manage"
+CONFIG_SYNC_JOB_ID = "config_sync"
+CONFIG_SYNC_INTERVAL_SECONDS = 15
+
+
+class SettingsSyncDaemonScheduler(_IntervalDaemonScheduler):
+    """The ~15 s interval that applies a saved ``scan.period`` without a restart."""
+
+    def __init__(
+        self,
+        *,
+        job: Callable[[], Any],
+        interval_seconds: int = CONFIG_SYNC_INTERVAL_SECONDS,
+        timezone: str = "UTC",
+    ) -> None:
+        super().__init__(
+            job_id=CONFIG_SYNC_JOB_ID,
+            interval_seconds=interval_seconds,
+            job=job,
+            timezone=timezone,
+        )
 
 
 class PositionMonitorDaemonScheduler(_IntervalDaemonScheduler):
