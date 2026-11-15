@@ -1394,7 +1394,7 @@ test('LLM key add, reload, rotate, and delete stay write-only through the UI', a
 
   // Rotate through the same write-only input.
   await page.getByTestId('llm-key-input-anthropic').fill(rotated)
-  await page.getByRole('button', { name: '替换密钥' }).click()
+  await page.getByRole('button', { name: '替换密钥（Anthropic）' }).click()
   await expect(page.getByTestId('llm-provider-mask-anthropic')).toHaveText('****c3d4')
   await expect(page.getByTestId('llm-key-input-anthropic')).toHaveValue('')
   const rotatedHtml = await page.content()
@@ -1405,9 +1405,9 @@ test('LLM key add, reload, rotate, and delete stay write-only through the UI', a
 
   // Delete through the write-only control: the provider becomes unconfigured
   // and no other provider key is substituted.
-  await page.getByRole('button', { name: '删除密钥' }).click()
+  await page.getByRole('button', { name: '删除密钥（Anthropic）' }).click()
   const deleteDialog = page.getByRole('dialog')
-  await expect(deleteDialog).toContainText('删除 anthropic 密钥后该 provider 未配置')
+  await expect(deleteDialog).toContainText('删除只移除 anthropic 存储的密钥')
   await deleteDialog.getByRole('button', { name: '确认删除' }).click()
   await expect(page.getByTestId('llm-provider-mask-anthropic')).toHaveText('—')
   await expect(page.getByTestId('settings-llm-save-status')).toContainText('密钥已删除')
@@ -1617,7 +1617,7 @@ test('LLM test panel probes the saved key through the local fake and shows usage
   const providerRow = page
     .locator('[aria-label="Providers"] tbody tr')
     .filter({ hasText: 'Anthropic' })
-  await providerRow.getByRole('button', { name: '测试连接' }).click()
+  await providerRow.getByRole('button', { name: '测试连接（Anthropic，角色 ANALYSIS）' }).click()
 
   await expect(page.getByTestId('llm-probe-anthropic')).toBeVisible()
   await expect(page.getByTestId('llm-probe-anthropic')).toHaveText(/STRICT|DEGRADED/)
@@ -1704,9 +1704,9 @@ test('LLM settings and key rotation are fully keyboard operable', async ({ page 
     .locator('div.field[role="group"]')
     .filter({ has: page.getByTestId('llm-key-input-openai') })
   await page.keyboard.press('Tab')
-  await expect(openAiField.getByRole('button', { name: '替换密钥' })).toBeFocused()
+  await expect(openAiField.getByRole('button', { name: '替换密钥（OpenAI）' })).toBeFocused()
   await page.keyboard.press('Tab')
-  const deleteButton = openAiField.getByRole('button', { name: '删除密钥' })
+  const deleteButton = openAiField.getByRole('button', { name: '删除密钥（OpenAI）' })
   await expect(deleteButton).toBeFocused()
   await page.keyboard.press('Enter')
   const dialog = page.getByRole('dialog')
@@ -1764,13 +1764,13 @@ test('LLM deleting a freshly probed provider key reports the provider unconfigur
   const providerRow = page
     .locator('[aria-label="Providers"] tbody tr')
     .filter({ hasText: 'Anthropic' })
-  await providerRow.getByRole('button', { name: '测试连接' }).click()
+  await providerRow.getByRole('button', { name: '测试连接（Anthropic，角色 ANALYSIS）' }).click()
   await expect(page.getByTestId('llm-probe-anthropic')).toBeVisible()
 
   const anthropicField = page
     .locator('div.field[role="group"]')
     .filter({ has: page.getByTestId('llm-key-input-anthropic') })
-  await anthropicField.getByRole('button', { name: '删除密钥' }).click()
+  await anthropicField.getByRole('button', { name: '删除密钥（Anthropic）' }).click()
   await page.getByRole('dialog').getByRole('button', { name: '确认删除' }).click()
   await expect(page.getByTestId('settings-llm-save-status')).toContainText('密钥已删除')
 
@@ -1802,7 +1802,7 @@ test('LLM delete confirmation restores keyboard focus after both exits', async (
   )
   await page.keyboard.press('Tab')
   await page.keyboard.press('Tab')
-  const deleteButton = page.getByRole('button', { name: '删除密钥' })
+  const deleteButton = page.getByRole('button', { name: '删除密钥（Anthropic）' })
   await expect(deleteButton).toBeFocused()
   await page.keyboard.press('Enter')
 

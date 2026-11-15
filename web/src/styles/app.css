@@ -449,7 +449,8 @@ code {
   font-size: 11px;
 }
 
-.data-table {
+.data-table,
+.data {
   width: 100%;
   border-collapse: collapse;
   font-size: 12px;
@@ -498,14 +499,17 @@ code {
 }
 
 .data-table th,
-.data-table td {
+.data-table td,
+.data th,
+.data td {
   height: 32px;
   padding: 0 var(--oft-space-4);
   border-bottom: 1px solid var(--oft-border-subtle);
   text-align: left;
 }
 
-.data-table th {
+.data-table th,
+.data th {
   color: var(--oft-text-muted);
   font-family: var(--oft-font-mono);
   font-size: 10px;
@@ -514,7 +518,8 @@ code {
   text-transform: uppercase;
 }
 
-.data-table tbody tr:hover {
+.data-table tbody tr:hover,
+.data tbody tr:hover {
   background: var(--oft-bg-hover);
 }
 
@@ -648,7 +653,8 @@ code {
     min-height: 44px;
   }
 
-  .data-table a.rowlink {
+  .data-table a.rowlink,
+  .data a.rowlink {
     display: inline-flex;
     align-items: center;
     min-height: 44px;
@@ -2004,6 +2010,33 @@ code {
   cursor: not-allowed;
 }
 
+/* Slice 35 fix: LLM Base URL / role-model / key inputs meet the 36px desktop
+   and 44px touch target standard while keeping focus and invalid affordances. */
+.settings-input {
+  width: 100%;
+  min-height: 36px;
+  padding: 4px 8px;
+  border: 1px solid var(--oft-border-control);
+  border-radius: var(--oft-radius-sm);
+  background: var(--oft-bg-panel);
+  color: var(--oft-text-primary);
+  font: 13px var(--oft-font-mono);
+}
+
+.settings-input:focus-visible {
+  outline: 2px solid var(--oft-accent);
+  outline-offset: 1px;
+}
+
+.settings-input[aria-invalid='true'] {
+  border-color: var(--oft-status-danger);
+}
+
+.settings-input:disabled {
+  opacity: 0.65;
+  cursor: not-allowed;
+}
+
 .risk-meters {
   display: grid;
   grid-template-columns: repeat(auto-fit, minmax(240px, 1fr));
@@ -2071,6 +2104,10 @@ code {
   }
 
   .num-input {
+    min-height: 44px;
+  }
+
+  .settings-input {
     min-height: 44px;
   }
 }

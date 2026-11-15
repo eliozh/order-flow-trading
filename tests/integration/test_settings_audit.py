@@ -194,7 +194,7 @@ def test_fresh_database_matches_a_migrated_v25_database(tmp_path: Path) -> None:
     migrated = _config_shape(migrated_settings)
 
     assert fresh == migrated
-    assert fresh["version"] == 28
+    assert fresh["version"] == 29
     column_names = [column[1] for column in fresh["columns"]]
     assert column_names == ["key", "value_json", "updated_at", "updated_by"]
     assert any(name == "config_updated_at" for name, _sql in fresh["indexes"])

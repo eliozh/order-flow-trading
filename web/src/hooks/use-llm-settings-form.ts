@@ -148,7 +148,12 @@ class FieldError extends Error {
   }
 }
 
-/** Load/save state for `/settings/llm`; keys never enter this hook. */
+/**
+ * Load/save state for `/settings/llm`.
+ *
+ * Key values pass through the submit call only; this hook never stores them in
+ * state and never exposes them to the rendered DOM.
+ */
 export function useLLMSettingsForm({
   fetchSettingsFn = fetchLLMSettings,
   updateSettingsFn = updateLLMSettings,
@@ -314,6 +319,42 @@ export function useLLMSettingsForm({
     })
   }
 
+  function applyProbeCapability(provider: LLMProviderName, result: LLMTestResult): void {
+    // M3: merge the probe into the row's capability so the status chip and
+    // "最后测试" never disagree until a reload.
+    setLoad((previous) => {
+      if (previous.settings === null) {
+        return previous
+      }
+      const providers = previous.settings.providers.map((row) =>
+        row.provider === provider
+          ? {
+              ...row,
+              capability: {
+                status: result.status,
+                strict_schema: result.strict_schema,
+                degraded: result.degraded,
+                checked_at: result.checked_at,
+                notes: result.notes,
+              },
+            }
+          : row,
+      )
+      return { ...previous, settings: { ...previous.settings, providers } }
+    })
+  }
+
+  function clearProbeError(): void {
+    // A key/probe error must not outlive the next mutation: the headline is
+    // cleared at mutation start, so a stale probe error would otherwise show a
+    // generic (and misleading) summary.
+    setProbe((previous) =>
+      previous !== null && previous.error
+        ? { ...previous, error: '' }
+        : previous,
+    )
+  }
+
   async function save(event: FormEvent<HTMLFormElement>): Promise<void> {
     event.preventDefault()
     if (!editable() || inFlight.current || saving || draft === null) {
@@ -327,6 +368,8 @@ export function useLLMSettingsForm({
     }
     setErrorText('')
     setFieldErrors({})
+    setKeyErrors({})
+    clearProbeError()
     setStatusMessage('')
     let patch: LLMSettingsPatch | null = null
     try {
@@ -424,6 +467,7 @@ export function useLLMSettingsForm({
     }
     setKeyBusy(provider)
     setErrorText('')
+    clearProbeError()
     setKeyErrors((previous) => ({ ...previous, [provider]: '' }))
     setLiveMessage('保存密钥中…')
     try {
@@ -433,6 +477,8 @@ export function useLLMSettingsForm({
         return false
       }
       replaceProvider(envelope.data)
+      // A replaced key invalidates any prior probe error/result for this row.
+      setProbe((previous) => (previous?.provider === provider ? null : previous))
       const message = `${provider} 密钥已保存 · ${envelope.data.masked ?? '已配置'}（仅显示掩码）`
       setStatusMessage(message)
       setLiveMessage(message)
@@ -464,6 +510,7 @@ export function useLLMSettingsForm({
     }
     setKeyBusy(provider)
     setErrorText('')
+    clearProbeError()
     setKeyErrors((previous) => ({ ...previous, [provider]: '' }))
     try {
       const envelope = await deleteKeyFn(provider, providerKeyFn(provider))
@@ -473,8 +520,8 @@ export function useLLMSettingsForm({
       }
       replaceProvider(envelope.data)
       const message = envelope.data.configured
-        ? `${provider} 存储的密钥已删除；环境变量密钥仍然生效。`
-        : `${provider} 密钥已删除；该 provider 未配置，不会回退到其他密钥。`
+        ? `${provider} 存储的密钥已删除；同一 provider 的环境变量密钥仍然生效。`
+        : `${provider} 存储的密钥已删除；没有同一 provider 的环境变量密钥，也不会回退到其他 provider；需要它的决策返回 LLM_PROVIDER_NOT_CONFIGURED。`
       setStatusMessage(message)
       setLiveMessage(message)
       setProbe((previous) => (previous?.provider === provider ? null : previous))
@@ -499,6 +546,11 @@ export function useLLMSettingsForm({
     if (readonly || probeBusy !== null || keyBusy !== null || inFlight.current || saving) {
       return
     }
+    // M4: only the active provider's role models are probed. A non-active row
+    // belongs to a different provider and must not run this role probe.
+    if (draft?.provider !== provider) {
+      return
+    }
     setProbeBusy(provider)
     setErrorText('')
     try {
@@ -507,6 +559,7 @@ export function useLLMSettingsForm({
         return
       }
       setProbe({ provider, result: envelope.data, error: '' })
+      applyProbeCapability(provider, envelope.data)
       setLiveMessage(`${provider} 测试：${envelope.data.status} · ${envelope.data.latency_ms} ms`)
       await loadUsage.current()
     } catch (error: unknown) {

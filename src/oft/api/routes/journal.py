@@ -44,11 +44,16 @@ def _journal_service(request: Request) -> JournalService:
 
 def _review_service(request: Request, provider: str | None) -> ReviewService:
     container = request.app.state.container
+    # Resolve the provider first: ``provider_for`` refreshes the shared
+    # snapshot, so reading ``container.settings`` afterwards gives the one
+    # effective snapshot the adapter was built from (no stale-settings/fresh-
+    # adapter mixture within a single request).
+    resolved_provider = container.provider_for(provider)
     return ReviewService(
         store=container.store,
         clock=container.clock,
         settings=container.settings,
-        provider=container.provider_for(provider),
+        provider=resolved_provider,
         runtime=container.llm_runtime,
     )
 

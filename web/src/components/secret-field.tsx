@@ -1,8 +1,14 @@
-import { useId, useState } from 'react'
+import { useId, useRef, useState } from 'react'
 import type { KeyboardEvent } from 'react'
 
 import type { LLMProviderName, LLMProviderRow } from '../api/settings'
 import { ConfirmDialog } from './confirm-dialog'
+
+const PROVIDER_LABELS: Record<LLMProviderName, string> = {
+  openai: 'OpenAI',
+  anthropic: 'Anthropic',
+  deepseek: 'DeepSeek',
+}
 
 interface SecretFieldProps {
   provider: LLMProviderName
@@ -45,6 +51,8 @@ export function SecretField({
   const [value, setValue] = useState('')
   const [confirmingDelete, setConfirmingDelete] = useState(false)
   const [localError, setLocalError] = useState('')
+  const inputRef = useRef<HTMLInputElement>(null)
+  const providerLabel = PROVIDER_LABELS[provider]
 
   const label = row.configured ? `替换 ${provider} 密钥（只写）` : `添加 ${provider} 密钥（只写）`
   const status = row.configured
@@ -63,6 +71,9 @@ export function SecretField({
     setLocalError('')
     if (!value.trim()) {
       setLocalError('请输入密钥；留空不会保存。')
+      // H6: the empty-key error is announced (role=alert) and the key field
+      // receives focus so a screen-reader user can correct it immediately.
+      requestAnimationFrame(() => inputRef.current?.focus())
       return
     }
     const saved = await onSave(provider, value)
@@ -105,7 +116,9 @@ export function SecretField({
         <input
           id={inputId}
           data-testid={inputId}
+          ref={inputRef}
           type="password"
+          className="settings-input mono"
           autoComplete="new-password"
           spellCheck={false}
           value={value}
@@ -126,6 +139,7 @@ export function SecretField({
           data-testid={`llm-key-save-${provider}`}
           disabled={readOnly}
           aria-disabled={busy || undefined}
+          aria-label={`${row.configured ? '替换密钥' : '保存密钥'}（${providerLabel}）`}
           onClick={() => void submit()}
         >
           {row.configured ? '替换密钥' : '保存密钥'}
@@ -137,6 +151,7 @@ export function SecretField({
             className="control-btn"
             disabled={readOnly}
             aria-disabled={busy || undefined}
+            aria-label={`删除密钥（${providerLabel}）`}
             onClick={() => {
               if (!busy) {
                 setConfirmingDelete(true)
@@ -151,7 +166,7 @@ export function SecretField({
         密钥只写：保存后仅显示固定掩码与最后 4 位；没有查看原值的控件。粘贴允许，绝不会被阻止。
       </p>
       {localError && (
-        <p className="status-message status-message--error" id={localErrorId}>
+        <p className="status-message status-message--error" id={localErrorId} role="alert">
           错误：{localError}
         </p>
       )}
@@ -164,12 +179,12 @@ export function SecretField({
         open={confirmingDelete}
         idPrefix={`llm-delete-${provider}`}
         title={`删除 ${provider} 密钥`}
-        description={`删除 ${provider} 密钥后该 provider 未配置，需要它的决策会返回配置错误，不会回退到其他密钥。`}
+        description={`删除只移除 ${provider} 存储的密钥；同一 provider 的环境变量密钥，如果已设置，仍然生效；不会回退到其他 provider。两者都没有时，需要该 provider 的决策返回 LLM_PROVIDER_NOT_CONFIGURED。`}
         rows={[]}
         confirmLabel="确认删除"
         busy={busy}
         restoreFocusId={inputId}
-        hint="删除只移除存储的密钥；如果该 provider 另有环境变量密钥，它会继续生效。"
+        hint="密钥值从不显示；删除后仅保留最终配置状态。"
         onCancel={cancelDelete}
         onConfirm={confirmDelete}
       />

@@ -769,7 +769,13 @@ export async function setLLMKey(
   )
 }
 
-/** Delete one provider key; the provider becomes unconfigured (no fallback). */
+/**
+ * Delete one stored provider key.
+ *
+ * Only the store entry is removed: a same-provider environment key, if set,
+ * still applies and no other provider is substituted. With neither, a decision
+ * needing this provider returns `LLM_PROVIDER_NOT_CONFIGURED`.
+ */
 export async function deleteLLMKey(
   provider: LLMProviderName,
   idempotencyKey: string,

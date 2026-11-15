@@ -4,6 +4,7 @@ from __future__ import annotations
 
 from typing import Any
 
+import structlog
 from fastapi import APIRouter, Header, Request
 
 from oft.api.envelope import new_request_id, success_envelope
@@ -31,6 +32,21 @@ from oft.config import ConfigError
 from oft.domain.settings import SettingValidationError
 
 router = APIRouter()
+LOGGER = structlog.get_logger(__name__)
+
+
+def _refresh_after_commit(request: Request) -> None:
+    """Best-effort post-commit runtime refresh.
+
+    The mutation has already committed; a refresh failure must not turn a
+    successful key/document write into a 500 (which would release the key and
+    cause a duplicate rotation on retry). The next provider resolution refreshes
+    again anyway.
+    """
+    try:
+        request.app.state.container.refresh_llm_settings()
+    except Exception:  # noqa: BLE001 - the committed write still succeeds
+        LOGGER.warning("llm_refresh_after_commit_failed", exc_info=True)
 
 
 def _service(request: Request) -> SettingsService:
@@ -250,8 +266,9 @@ def update_llm_settings(
     def _mutate() -> dict[str, Any]:
         result = _service(request).update_llm_settings(changes, actor="web", reason=reason)
         # A committed save applies to the next runtime call (and to provider
-        # rows/keys) without a restart.
-        request.app.state.container.refresh_llm_settings()
+        # rows/keys) without a restart. Best effort: the write is already
+        # committed and must be reported as such.
+        _refresh_after_commit(request)
         return result.to_contract()
 
     try:
@@ -291,8 +308,9 @@ def set_llm_key(
     def _mutate() -> dict[str, Any]:
         status = _secrets(request).set_key(provider, payload.api_key, actor="web")
         # Clear the stale in-memory overlay so a following GET/provider read
-        # reflects the new stored key rather than the previous snapshot.
-        request.app.state.container.refresh_llm_settings()
+        # reflects the new stored key rather than the previous snapshot. The
+        # key is already committed; a refresh failure must not report a 500.
+        _refresh_after_commit(request)
         return status.to_contract()
 
     try:
@@ -320,17 +338,22 @@ def delete_llm_key(
     request: Request,
     idempotency_key: str | None = Header(default=None, alias="Idempotency-Key"),
 ) -> Any:
-    """Delete one provider key and mark it unconfigured; never falls back.
+    """Delete one stored provider key; never falls back to another provider.
 
-    A missing key is a deterministic no-op (no audit). A missing secure store
-    with metadata present is ``CONFIG_INVALID``.
+    Only the secret store entry and its metadata are removed. A same-provider
+    environment key, if set, still applies; deletion does not disable it and
+    does not substitute another provider. With neither a stored nor an
+    environment key, decisions needing that provider return
+    ``LLM_PROVIDER_NOT_CONFIGURED``. A missing key is a deterministic no-op (no
+    audit); a missing secure store with metadata present is ``CONFIG_INVALID``.
     """
 
     def _mutate() -> dict[str, Any]:
         status = _secrets(request).delete_key(provider, actor="web")
         # Re-resolve from the pristine baseline: the deleted key must not
-        # survive in the shared settings as a phantom ``env`` key.
-        request.app.state.container.refresh_llm_settings()
+        # survive in the shared settings as a phantom ``env`` key. Best effort
+        # so a committed delete is never reported as a failed 500.
+        _refresh_after_commit(request)
         return status.to_contract()
 
     try:

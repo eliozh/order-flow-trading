@@ -88,7 +88,7 @@ def test_v1_database_upgrades_to_v2_with_effective_checks(tmp_path: Path) -> Non
     finally:
         connection.close()
 
-    assert versions == set(range(1, 29))
+    assert versions == set(range(1, 30))
 
 
 _V2_BACKFILL = """
@@ -146,7 +146,7 @@ def test_v2_database_gains_the_backfill_heartbeat_column(tmp_path: Path) -> None
 
     assert "updated_at" in columns
     assert updated_at == "2026-11-06T00:00:00.000Z"
-    assert versions == set(range(1, 29))
+    assert versions == set(range(1, 30))
 
 
 def test_v5_checks_indexes_and_foreign_keys(tmp_path: Path) -> None:
@@ -243,7 +243,7 @@ def test_v5_database_migrates_manifest_metrics_columns(tmp_path: Path) -> None:
 
     assert {"metric_version", "input_manifest_hash", "window_start", "window_end"} <= columns
     assert legacy == ("/tmp/legacy.parquet", None, None)
-    assert versions == set(range(1, 29))
+    assert versions == set(range(1, 30))
 
 
 def test_v6_database_migrates_starred_columns(tmp_path: Path) -> None:
@@ -302,7 +302,7 @@ def test_v6_database_migrates_starred_columns(tmp_path: Path) -> None:
 
     assert {"starred", "starred_at"} <= columns
     assert row == ("BTCUSDT", 0, None)
-    assert versions == set(range(1, 29))
+    assert versions == set(range(1, 30))
 
 
 def test_manifest_run_metadata_columns_are_added_idempotently(tmp_path: Path) -> None:
@@ -319,7 +319,7 @@ def test_manifest_run_metadata_columns_are_added_idempotently(tmp_path: Path) ->
         connection.close()
 
     assert {"run_id", "last_n", "recomputed_from", "parent_run_id"} <= columns
-    assert versions == set(range(1, 29))
+    assert versions == set(range(1, 30))
 
 
 _V12_JOB_RUNS = """
@@ -385,7 +385,7 @@ def test_v12_database_gains_the_job_run_scope_symbol_column(tmp_path: Path) -> N
 
     assert "symbol" in columns
     assert symbol is None  # pre-v13 batch rows keep a null (batch) scope
-    assert versions == set(range(1, 29))
+    assert versions == set(range(1, 30))
 
 
 _V13_JOB_RUNS = """
@@ -636,7 +636,7 @@ def test_v9_database_upgrades_to_v10_with_ledgers_and_indexes(tmp_path: Path) ->
     finally:
         connection.close()
 
-    assert versions == set(range(1, 29))
+    assert versions == set(range(1, 30))
     assert "llm_json" in report_columns
     assert {
         "llm_calls",
@@ -792,7 +792,7 @@ def test_v15_prompt_and_llm_rows_upgrade_to_v16_and_seed_only_missing_families(
         "review:system",
     }
     assert tuple(llm_defaults) == ("", 1, "")
-    assert versions == set(range(1, 29))
+    assert versions == set(range(1, 30))
 
 
 def test_prompt_versions_are_immutable_and_have_one_active_row_per_prompt(
@@ -954,7 +954,7 @@ def test_v16_database_gains_budget_periods_settings_and_provider_capabilities(
     assert {"budget_ledger_week", "budget_ledger_month"} <= indexes
     # 2026-11-04 is ISO week 2026-W45.
     assert tuple(backfilled) == ("2026-11-04", "2026-W45", "2026-11", "")
-    assert versions == set(range(1, 29))
+    assert versions == set(range(1, 30))
 
 
 def _v16_budget_connection(settings: Settings) -> sqlite3.Connection:
@@ -1137,7 +1137,7 @@ def test_v18_trigger_events_gain_snapshot_provenance_and_backfill(
     assert tuple(good) == ("HASH-V18", "2026-11-09T10:00:00.000Z", "PARTIAL", 2)
     # A malformed legacy payload is skipped with its defaults, never aborting boot.
     assert tuple(bad) == ("", "", "", 0)
-    assert versions == set(range(1, 29))
+    assert versions == set(range(1, 30))
     skipped = [
         record
         for record in caplog.records
@@ -1205,7 +1205,7 @@ def test_concurrent_initializes_upgrade_v19_idempotently(tmp_path: Path) -> None
     assert tuple(good) == ("HASH-V18", "2026-11-09T10:00:00.000Z", "PARTIAL", 2)
     # Exactly one recorded v19 upgrade; v20 and v21 are recorded on the same boot.
     assert versions == {19}
-    assert highest_version == 28
+    assert highest_version == 29
     assert immutable_triggers == 1
     assert journal_mode.lower() == "wal"
 
@@ -1693,7 +1693,7 @@ def test_populated_v20_database_upgrades_to_v21_preserving_every_row(
     finally:
         connection.close()
 
-    assert to_version == 28
+    assert to_version == 29
     assert {20, 21} <= versions
     # Every populated row survives the rebuild: one row in every table.
     assert counts == {
@@ -2154,7 +2154,7 @@ def test_v21_database_migrates_to_v22_with_the_journal_tables(tmp_path: Path) ->
     finally:
         connection.close()
 
-    assert version == 28
+    assert version == 29
     assert {"trade_logs", "position_events"} <= tables
     assert {
         "trade_logs_closed",
@@ -2395,7 +2395,7 @@ def test_v22_database_migrates_to_v23_preserving_events_and_funding_uniqueness(
     finally:
         connection.close()
 
-    assert version == 28
+    assert version == 29
     assert "funding_accruals" in tables
     assert "reports_symbol_generated" in report_indexes
     assert "position_events_position_at" not in event_indexes
@@ -2460,7 +2460,7 @@ def test_a_stamped_v23_funding_table_without_side_size_is_repaired(tmp_path: Pat
         columns = {str(row[1]) for row in connection.execute("PRAGMA table_info(funding_accruals)")}
         version = connection.execute("SELECT MAX(version) FROM schema_migrations").fetchone()[0]
     assert {"side", "size"} <= columns
-    assert version == 28
+    assert version == 29
 
 
 def test_ensure_funding_accruals_shape_rolls_back_a_failed_repair(
@@ -2572,7 +2572,148 @@ def test_v23_database_reseeds_the_management_family_on_upgrade_to_v24(
     # The operator's active non-v1 version is preserved untouched.
     assert analysis_active == 2
     assert analysis_v2 == "CUSTOM V2"
-    assert versions == set(range(1, 29))
+    assert versions == set(range(1, 30))
+
+
+def _make_v28_secrets_meta(settings: Settings) -> None:
+    """Replace ``secrets_meta`` with the true six-column v28 shape plus a row."""
+    from oft.adapters.sqlite_schema import initialize_database
+
+    initialize_database(settings)
+    connection = sqlite3.connect(database_path(settings))
+    try:
+        connection.execute("DROP TABLE secrets_meta")
+        connection.execute(
+            """
+            CREATE TABLE secrets_meta (
+                provider TEXT NOT NULL,
+                name TEXT NOT NULL,
+                fingerprint TEXT NOT NULL,
+                last4 TEXT NOT NULL,
+                updated_at TEXT NOT NULL,
+                updated_by TEXT NOT NULL,
+                PRIMARY KEY (provider, name)
+            )
+            """
+        )
+        connection.execute(
+            "INSERT INTO secrets_meta VALUES (?, ?, ?, ?, ?, ?)",
+            (
+                "openai",
+                "api_key",
+                "f" * 64,
+                "4f2a",
+                "2026-11-06T10:00:00.000Z",
+                "legacy",
+            ),
+        )
+        connection.execute("DELETE FROM schema_migrations WHERE version = 29")
+        connection.commit()
+    finally:
+        connection.close()
+
+
+def test_a_v28_database_reads_status_without_traceback(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """H-A: a previous-release v28 DB serves reads before migration."""
+    import json
+    import os
+    import subprocess
+    import sys
+
+    from oft.bootstrap import build_container
+
+    settings = Settings(env="test", port=8765, data_dir=tmp_path / "data")
+    _make_v28_secrets_meta(settings)
+    # Never let a developer's real OS keyring be consulted by this read-only test.
+    from oft.adapters import keyring_secrets as keyring_module
+
+    monkeypatch.setattr(keyring_module, "keyring_available", lambda: False)
+
+    container = build_container(settings)
+    meta = container.store.get_secret_meta("openai")
+    assert meta is not None
+    assert meta.backend == "unknown"
+
+    # Run the real CLI in a subprocess: pytest log capture must not be able to
+    # hide an expected-unavailable traceback (H-A/H2/H3).
+    executable = Path(sys.executable).with_name("oft")
+    assert executable.is_file()
+    env = {key: value for key, value in os.environ.items() if not key.startswith("OFT_")}
+    env.update(
+        {
+            "OFT_ENV": "test",
+            "OFT_DATA_DIR": str(settings.data_dir),
+            "PYTHON_KEYRING_BACKEND": "keyring.backends.fail.Keyring",
+        }
+    )
+    completed = subprocess.run(
+        [str(executable), "status", "--json"],
+        capture_output=True,
+        text=True,
+        env=env,
+        cwd=tmp_path,
+        timeout=60,
+        check=False,
+    )
+
+    assert completed.returncode == 0, completed.stderr
+    assert json.loads(completed.stdout)["ok"] is True
+    combined = completed.stdout + completed.stderr
+    assert "no such column" not in combined.lower()
+    assert "traceback" not in combined.lower()
+    assert "SecretStoreUnavailable" not in combined
+
+
+def test_a_real_v28_secrets_meta_migrates_to_v29_preserving_the_row(tmp_path: Path) -> None:
+    """M-D: the ALTER path preserves the row and converges on the v29 shape."""
+    from oft.adapters.sqlite_schema import initialize_database
+
+    fresh_settings = Settings(env="test", port=8765, data_dir=tmp_path / "fresh")
+    initialize_database(fresh_settings)
+    fresh = sqlite3.connect(database_path(fresh_settings))
+    try:
+        fresh_shape = fresh.execute("PRAGMA table_info(secrets_meta)").fetchall()
+    finally:
+        fresh.close()
+
+    migrated_settings = Settings(env="test", port=8765, data_dir=tmp_path / "migrated")
+    _make_v28_secrets_meta(migrated_settings)
+    initialize_database(migrated_settings)
+
+    migrated = sqlite3.connect(database_path(migrated_settings))
+    try:
+        migrated_shape = migrated.execute("PRAGMA table_info(secrets_meta)").fetchall()
+        row = migrated.execute(
+            "SELECT provider, name, fingerprint, last4, updated_at, updated_by, backend "
+            "FROM secrets_meta"
+        ).fetchone()
+        version = migrated.execute("SELECT MAX(version) FROM schema_migrations").fetchone()[0]
+    finally:
+        migrated.close()
+
+    assert migrated_shape == fresh_shape
+    assert [column[1] for column in migrated_shape] == [
+        "provider",
+        "name",
+        "fingerprint",
+        "last4",
+        "updated_at",
+        "updated_by",
+        "backend",
+    ]
+    assert row is not None
+    assert row[6] == "unknown"
+    assert row[0:6] == (
+        "openai",
+        "api_key",
+        "f" * 64,
+        "4f2a",
+        "2026-11-06T10:00:00.000Z",
+        "legacy",
+    )
+    assert version == 29
 
 
 def test_v27_audit_event_type_index_is_created_and_preserved_on_migration(
@@ -2622,7 +2763,7 @@ def test_v27_audit_event_type_index_is_created_and_preserved_on_migration(
         connection.close()
 
     assert "audit_events_event_type_seq" in indexes
-    assert version == 28
+    assert version == 29
     # The migration is additive: every existing audit row survives.
     assert rows == [("RISK_CAPS_UPDATED", event.seq)]
     assert index_row is not None

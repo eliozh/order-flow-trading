@@ -116,3 +116,50 @@ def test_a_configured_key_never_reaches_reports_decisions_or_logs(tmp_path: Path
     log_path = settings.data_dir / "logs" / "daemon.log"
     assert log_path.is_file()
     assert sentinel not in log_path.read_text(encoding="utf-8")
+
+
+class _CountingContainer:
+    """Delegate to a real container while counting LLM snapshot refresh calls."""
+
+    def __init__(self, inner: object) -> None:
+        self._inner = inner
+        self.refreshes = 0
+        self.provider_calls: list[object] = []
+
+    def __getattr__(self, name: str) -> object:
+        return getattr(self._inner, name)
+
+    def refresh_llm_settings(self) -> object:
+        self.refreshes += 1
+        return self._inner.refresh_llm_settings()  # type: ignore[attr-defined]
+
+    def provider_for(
+        self, requested: str | None = None, *, effective: object | None = None
+    ) -> object:
+        self.provider_calls.append(effective)
+        return self._inner.provider_for(requested, effective=effective)  # type: ignore[attr-defined]
+
+
+def test_a_batch_refreshed_once_does_not_reread_secrets_per_symbol(tmp_path: Path) -> None:
+    """M9: ``refresh_llm=False`` never refreshes inside a scan."""
+    settings = Settings(
+        env="test",
+        port=8765,
+        data_dir=tmp_path / "data",
+        archive_fixture_dir=ARCHIVE,
+        llm_provider="openai",
+    )
+    container = build_container(settings, initialize=True, clock=FixedClock(NOW))
+    backfill = container.backfill.run(symbol="BTCUSDT", data_type="aggTrades", start=START, end=END)
+    assert backfill.run.status == "COMPLETE"
+
+    counting = _CountingContainer(container)
+    run = ScanService(
+        container=counting,  # type: ignore[arg-type]
+        lock=container.scan_lock,
+        refresh_llm=False,
+    ).run(ScanRequest(symbol="BTCUSDT", period="4h", metrics_only=False, provider="openai"))
+
+    assert counting.refreshes == 0
+    assert counting.provider_calls
+    assert "LLM_PROVIDER_NOT_CONFIGURED" in run.llm_state["reason"]

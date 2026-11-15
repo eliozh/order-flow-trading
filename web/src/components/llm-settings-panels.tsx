@@ -169,8 +169,15 @@ export function LLMProvidersPanel({ form, readOnly }: ProvidersPanelProps) {
           <tbody>
             {settings.providers.map((row) => {
               const provider = row.provider
+              const isActive = draft.provider === provider
               const baseUrlError = fieldError(form, `base_urls.${provider}`)
               const probe = form.probe?.provider === provider ? form.probe : null
+              const probeDisabled = readOnly || !isActive || !row.configured
+              const probeDescription = !isActive
+                ? `llm-probe-active-hint-${provider}`
+                : !row.configured
+                  ? `llm-probe-hint-${provider}`
+                  : undefined
               return (
                 <tr key={provider}>
                   <th scope="row" className="sym">
@@ -202,14 +209,18 @@ export function LLMProvidersPanel({ form, readOnly }: ProvidersPanelProps) {
                     </label>
                     <input
                       id={`llm-base-url-${provider}`}
-                      className="mono"
+                      className="settings-input mono"
                       type="url"
                       value={draft.base_urls[provider]}
                       disabled={readOnly}
                       readOnly={form.saving}
                       aria-disabled={form.saving || undefined}
                       aria-invalid={baseUrlError ? true : undefined}
-                      aria-describedby={baseUrlError ? `llm-base-url-error-${provider}` : undefined}
+                      aria-describedby={
+                        baseUrlError
+                          ? `llm-base-url-error-${provider} llm-custom-host-hint`
+                          : 'llm-custom-host-hint'
+                      }
                       onChange={(event) => {
                         form.change({
                           base_urls: { ...draft.base_urls, [provider]: event.target.value },
@@ -237,24 +248,41 @@ export function LLMProvidersPanel({ form, readOnly }: ProvidersPanelProps) {
                         <span lang="en">{probe.result.status}</span> · {probe.result.latency_ms} ms
                       </span>
                     )}
-                    {probe?.error && <span className="field-error"> 错误：{probe.error}</span>}
+                    {probe?.error && (
+                      <span className="field-error" id={`llm-probe-error-${provider}`}>
+                        {' '}
+                        错误：{probe.error}
+                      </span>
+                    )}
                   </td>
                   <td>
                     <button
                       type="button"
                       className="control-btn"
-                      disabled={readOnly}
-                      aria-disabled={form.probeBusy !== null || !row.configured || undefined}
-                      aria-describedby={row.configured ? undefined : `llm-probe-hint-${provider}`}
+                      disabled={probeDisabled}
+                      aria-disabled={form.probeBusy !== null || undefined}
+                      aria-label={`${
+                        form.probeBusy === provider ? '测试中…' : '测试连接'
+                      }（${PROVIDER_LABELS[provider]}，角色 ANALYSIS）`}
+                      aria-describedby={probeDescription}
                       onClick={() => {
-                        if (form.probeBusy === null && row.configured) {
+                        if (form.probeBusy === null && row.configured && isActive) {
                           void form.runProbe(provider)
                         }
                       }}
                     >
                       {form.probeBusy === provider ? '测试中…' : '测试连接'}
                     </button>
-                    {!row.configured && (
+                    <p className="hint">
+                      测试角色 <span lang="en">ANALYSIS</span>
+                    </p>
+                    {!isActive && (
+                      <p className="hint" id={`llm-probe-active-hint-${provider}`}>
+                        只有当前 provider（
+                        {draft.provider ? PROVIDER_LABELS[draft.provider] : '未配置'}）可以测试。
+                      </p>
+                    )}
+                    {isActive && !row.configured && (
                       <p className="hint" id={`llm-probe-hint-${provider}`}>
                         未配置：请先保存该 provider 的密钥。
                       </p>
@@ -290,11 +318,14 @@ export function LLMProvidersPanel({ form, readOnly }: ProvidersPanelProps) {
             checked={draft.allow_custom_base_url}
             disabled={readOnly}
             aria-disabled={form.saving || undefined}
+            aria-describedby="llm-custom-host-hint"
             onChange={(event) => form.change({ allow_custom_base_url: event.target.checked })}
           />
           允许自定义 Base URL
         </label>
-        <p className="hint">默认只接受官方 host 或 loopback；显式勾选后才允许其他 host。</p>
+        <p className="hint" id="llm-custom-host-hint">
+          默认只接受官方 host 或 loopback；显式勾选后才允许其他 host。
+        </p>
       </div>
     </section>
   )
@@ -333,7 +364,9 @@ export function LLMRoleModelsPanel({ form, readOnly }: ProvidersPanelProps) {
               const error = fieldError(form, `roles.${role}`)
               return (
                 <tr key={role}>
-                  <th scope="row">{ROLE_LABELS[role]}</th>
+                  <th scope="row">
+                    <span lang="en">{ROLE_LABELS[role]}</span>
+                  </th>
                   <td className="mono">
                     {draft.provider ? PROVIDER_LABELS[draft.provider] : '未配置'}
                   </td>
@@ -343,7 +376,7 @@ export function LLMRoleModelsPanel({ form, readOnly }: ProvidersPanelProps) {
                     </label>
                     <input
                       id={`llm-role-${role}`}
-                      className="mono"
+                      className="settings-input mono"
                       value={draft.roles[role]}
                       disabled={readOnly}
                       readOnly={form.saving}
@@ -532,9 +565,19 @@ export function LLMSaveStatus({ message }: { message: string }) {
 
 export function LLMErrorSummary({ form }: { form: LLMSettingsForm }) {
   const entries = Object.entries(form.fieldErrors)
+  const keyEntries = (
+    Object.entries(form.keyErrors) as [LLMProviderName, string | undefined][]
+  ).filter((entry): entry is [LLMProviderName, string] => Boolean(entry[1]))
+  const probeError = form.probe?.error
+    ? { provider: form.probe.provider, message: form.probe.error }
+    : null
   const summaryRef = useRef<HTMLDivElement>(null)
   const wasError = useRef(false)
-  const hasError = Boolean(form.errorText) || entries.length > 0
+  const hasError =
+    Boolean(form.errorText) ||
+    entries.length > 0 ||
+    keyEntries.length > 0 ||
+    probeError !== null
 
   useEffect(() => {
     // Focus only when an error first appears. Editing an invalid field can
@@ -554,6 +597,11 @@ export function LLMErrorSummary({ form }: { form: LLMSettingsForm }) {
   if (!hasError) {
     return null
   }
+
+  function focusKeyInput(provider: LLMProviderName): void {
+    document.getElementById(`llm-key-input-${provider}`)?.focus()
+  }
+
   return (
     <div
       role="alert"
@@ -586,6 +634,38 @@ export function LLMErrorSummary({ form }: { form: LLMSettingsForm }) {
               </li>
             )
           })}
+        </ul>
+      )}
+      {(keyEntries.length > 0 || probeError !== null) && (
+        <ul>
+          {keyEntries.map(([provider, message]) => (
+            <li key={`key-${provider}`}>
+              <a
+                href={`#llm-key-input-${provider}`}
+                onClick={(event) => {
+                  event.preventDefault()
+                  focusKeyInput(provider)
+                }}
+              >
+                {PROVIDER_LABELS[provider]} 密钥
+              </a>
+              ：{message}
+            </li>
+          ))}
+          {probeError !== null && (
+            <li key="probe-error">
+              <a
+                href={`#llm-key-input-${probeError.provider}`}
+                onClick={(event) => {
+                  event.preventDefault()
+                  focusKeyInput(probeError.provider)
+                }}
+              >
+                {PROVIDER_LABELS[probeError.provider]} 测试连接
+              </a>
+              ：{probeError.message}
+            </li>
+          )}
         </ul>
       )}
     </div>

@@ -31,6 +31,7 @@ from oft.domain.llm_settings import (
     PROVIDERS,
     ROLE_MODEL_FIELDS,
     ROLE_NAMES,
+    LLMSettingsValidationError,
     validate_base_url,
     validate_concurrency,
     validate_provider,
@@ -139,7 +140,13 @@ class LLMSettingsMixin:
         # keeps it separately (see ``resolve_effective_llm_settings``).
         if raw.strip().lower() == "stub":
             return None
-        return validate_provider(raw)
+        try:
+            return validate_provider(raw)
+        except LLMSettingsValidationError as exc:
+            # The overlay is composed for every CLI/daemon/API entry point; an
+            # environment provider typo must surface as ``CONFIG_INVALID``, not
+            # as an untyped traceback.
+            raise ConfigError(f"OFT_LLM_PROVIDER is invalid: {exc.message}") from exc
 
     def _env_allow_custom(self) -> bool:
         return (
@@ -305,6 +312,12 @@ class LLMSettingsMixin:
         def _build(record: ConfigRecord | None) -> tuple[ConfigRecord, AuditEventDraft] | None:
             before = self._decode_llm(record) if record is not None else self._env_llm_document()
             proposed = self._merge_llm_document(before, changes)
+            # The complete final document must satisfy the same validator the
+            # read path applies. An out-of-range/invalid environment-inherited
+            # field (a bad role model, a hand-built concurrency) is refused here
+            # instead of being persisted into a document that makes every later
+            # read ``CONFIG_INVALID`` with no repair path.
+            proposed = self._normalize_document(proposed)
             if proposed == before:
                 return None
             config = ConfigRecord(
@@ -477,12 +490,17 @@ def resolve_effective_llm_settings(*, settings: Settings, store: Any, clock: Any
     for provider in PROVIDERS:
         try:
             key = secrets.resolve_key(provider)
-        except SecretStoreUnavailable:
-            # A metadata row whose store is unavailable is surfaced as an
-            # explicit ``unavailable`` state on the settings API; the runtime
-            # simply has no stored key to install (the env key, if any, stays).
-            _LOGGER.error("llm_secret_store_unavailable provider=%s", provider)
-            key = None
+        except SecretStoreUnavailable as exc:
+            # Metadata says a stored key exists but the value/store is
+            # unavailable: fail closed. The environment key for this provider
+            # must not stay usable as a silent substitute.
+            _LOGGER.error(
+                "llm_secret_store_unavailable provider=%s reason=%s",
+                provider,
+                exc.reason,
+            )
+            update[PROVIDER_KEY_FIELDS[provider]] = None
+            continue
         if key is not None:
             update[PROVIDER_KEY_FIELDS[provider]] = SecretStr(key)
     return settings.model_copy(update=update)

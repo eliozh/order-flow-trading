@@ -526,7 +526,9 @@ class SecretMetaRecord:
     """Write-only secret metadata; the value is never part of this record.
 
     ``fingerprint`` is a SHA-256 of the key (used to detect a rotation) and
-    ``last4`` is the only part of the value a surface may render.
+    ``last4`` is the only part of the value a surface may render. ``backend``
+    records which secret store holds the value so a later read/delete targets
+    its provenance (``"unknown"`` for rows written before v29).
     """
 
     provider: str
@@ -535,6 +537,7 @@ class SecretMetaRecord:
     last4: str
     updated_at: str
     updated_by: str
+    backend: str = "unknown"
 
 
 @dataclass(frozen=True)

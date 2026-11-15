@@ -827,10 +827,10 @@ class ScheduledScanRunner:
         total_tokens = 0
         total_cost = Decimal("0")
         any_unpriced = False
-        # One refresh per batch: every symbol then resolves the same effective
-        # provider/model/base URL/key snapshot, so a provider change mid-batch
-        # cannot leave the batch internally inconsistent.
-        self._container.refresh_llm_settings()
+        # One refresh per batch, captured once: every symbol then uses the same
+        # immutable provider/model/base URL/key snapshot, so a provider change
+        # mid-batch cannot leave the batch internally inconsistent.
+        batch_effective = self._container.refresh_llm_settings()
 
         def _finish_symbol(
             symbol: str,
@@ -922,6 +922,8 @@ class ScheduledScanRunner:
                     container=self._container,  # type: ignore[arg-type]
                     lock=self._container.scan_lock,
                     on_stage=_stage,
+                    refresh_llm=False,
+                    effective=batch_effective,
                 ).run(
                     ScanRequest(
                         symbol=symbol,

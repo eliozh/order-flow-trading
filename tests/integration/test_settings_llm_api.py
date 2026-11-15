@@ -336,10 +336,10 @@ def test_secrets_meta_shape_is_identical_for_a_fresh_and_a_migrated_database(
     initialize_database(migrated_settings)
     migrated = sqlite3.connect(migrated_settings.data_dir / "oft.db")
     try:
-        # Simulate a v27 database: remove both the table and its version row,
-        # then let the v28 migration recreate the documented shape.
+        # Simulate a v27 database: remove both the table and its version rows,
+        # then let the v28/v29 migrations recreate the documented shape.
         migrated.execute("DROP TABLE secrets_meta")
-        migrated.execute("DELETE FROM schema_migrations WHERE version = 28")
+        migrated.execute("DELETE FROM schema_migrations WHERE version IN (28, 29)")
         migrated.commit()
     finally:
         migrated.close()
@@ -359,8 +359,9 @@ def test_secrets_meta_shape_is_identical_for_a_fresh_and_a_migrated_database(
         "last4",
         "updated_at",
         "updated_by",
+        "backend",
     ]
-    assert version == 28
+    assert version == 29
 
 
 def test_disabling_the_custom_opt_in_with_a_custom_url_is_rejected(
@@ -447,6 +448,88 @@ def test_an_env_stub_provider_is_reported_as_null_and_never_persisted(
     persisted = app.state.container.store.get_config("llm.settings")
     assert persisted is not None
     assert json.loads(persisted.value_json)["provider"] is None
+
+
+def test_an_invalid_env_inherited_field_refuses_the_save_and_writes_nothing(
+    tmp_path: Path, backend: MemorySecretBackend
+) -> None:
+    """H1: the final document is validated with the read-path validator.
+
+    An invalid environment-inherited role model must make the save a 422 and
+    write nothing, never persist a document that makes every later read
+    ``CONFIG_INVALID``. The environment document itself stays readable.
+    """
+    settings = _settings(tmp_path, llm_model_analysis="bad model")
+    app = create_app(settings, clock=FixedClock(NOW))
+    auth = _auth(app)
+
+    with TestClient(app) as client:
+        refused = _put(client, auth, {"max_concurrency": 3}, "invalid-env-save")
+        fetched = client.get("/api/v1/settings/llm", headers=auth)
+
+    assert refused.status_code == 422, refused.text
+    error = refused.json()["error"]
+    assert error["code"] == "VALIDATION_FAILED"
+    assert error["details"][0]["field"] == "roles.ANALYSIS"
+    assert app.state.container.store.list_config() == ()
+    assert app.state.container.store.list_audit_events() == ()
+    assert fetched.status_code == 200, fetched.text
+    assert fetched.json()["data"]["roles"]["ANALYSIS"] == "bad model"
+
+
+def test_a_saved_role_model_appears_in_the_models_catalog(
+    tmp_path: Path, backend: MemorySecretBackend
+) -> None:
+    """M7/M-K: models read the persisted overlay, not the startup snapshot."""
+    from oft.application.settings_service import SettingsService
+
+    app = create_app(_settings(tmp_path, llm_provider="openai"), clock=FixedClock(NOW))
+    auth = _auth(app)
+    # Persist directly so the runtime snapshot stays stale; only a refresh in
+    # the models route can make this test pass.
+    base = app.state.container.llm_base_settings or app.state.container.settings
+    SettingsService(
+        store=app.state.container.store,
+        clock=app.state.container.clock,
+        settings=base,
+    ).update_llm_settings(
+        {"provider": "openai", "roles": {"ANALYSIS": "gpt-persisted"}},
+        actor="test",
+    )
+    assert "gpt-persisted" not in (app.state.container.settings.llm_model_analysis or "")
+
+    with TestClient(app) as client:
+        models = client.get("/api/v1/llm/models?provider=openai", headers=auth)
+
+    assert models.status_code == 200, models.text
+    names = [item["model"] for item in models.json()["data"]["items"]]
+    assert "gpt-persisted" in names
+
+
+def test_a_refresh_failure_after_a_committed_document_write_returns_200(
+    tmp_path: Path, backend: MemorySecretBackend, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """M1: a committed document write is never reported as a failed 500."""
+    from oft.bootstrap import AppContainer
+
+    app = create_app(_settings(tmp_path), clock=FixedClock(NOW))
+    auth = _auth(app)
+
+    def _fail(_self: AppContainer) -> None:
+        raise RuntimeError("refresh down")
+
+    monkeypatch.setattr(AppContainer, "refresh_llm_settings", _fail)
+    with TestClient(app) as client:
+        first = _put(client, auth, {"max_concurrency": 4}, "refresh-doc")
+        replay = _put(client, auth, {"max_concurrency": 4}, "refresh-doc")
+
+    assert first.status_code == 200, first.text
+    assert first.json()["data"]["concurrency"]["global"] == 4
+    assert replay.status_code == 200, replay.text
+    assert replay.json()["meta"]["idempotent_replay"] is True
+    assert [event.event_type for event in app.state.container.store.list_audit_events()] == [
+        "CONFIG_UPDATED"
+    ]
 
 
 def test_providers_route_reports_the_stored_mask_after_a_key_save(

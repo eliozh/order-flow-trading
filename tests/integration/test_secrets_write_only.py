@@ -457,3 +457,480 @@ def test_an_unreadable_store_reports_unavailable_not_unset(
     assert row["configured"] is False
     assert row["key_source"] == "unavailable"
     assert row["masked"] is None
+
+
+# -- Fix round 1: fail-closed provenance and rollback branches ----------------
+
+
+def test_a_missing_stored_value_never_falls_back_to_the_env_key(
+    tmp_path: Path, backend: MemorySecretBackend
+) -> None:
+    """H4: metadata says a key exists; a missing value fails closed."""
+    app = create_app(_settings(tmp_path, openai_api_key=SENTINEL), clock=FixedClock(NOW))
+    auth = _auth(app)
+
+    with TestClient(app) as client:
+        assert _put_key(client, auth, "openai", "sk-stored-missing-9e8d").status_code == 200
+        # The metadata row survives, but the backend value is gone.
+        backend.values.clear()
+        settings_response = client.get("/api/v1/settings/llm", headers=auth)
+        providers = client.get("/api/v1/llm/providers", headers=auth)
+        probe = client.post(
+            "/api/v1/llm/test",
+            json={"provider": "openai", "role": "ANALYSIS"},
+            headers=auth,
+        )
+
+    settings_row = next(
+        item
+        for item in settings_response.json()["data"]["providers"]
+        if item["provider"] == "openai"
+    )
+    providers_row = next(
+        item for item in providers.json()["data"]["items"] if item["provider"] == "openai"
+    )
+    for row in (settings_row, providers_row):
+        assert row["configured"] is False
+        assert row["key_source"] == "unavailable"
+        assert row["masked"] is None
+    assert probe.status_code == 412, probe.text
+    assert probe.json()["error"]["code"] == "LLM_PROVIDER_NOT_CONFIGURED"
+
+
+def test_an_unavailable_store_fails_closed_even_with_an_env_key(
+    tmp_path: Path, backend: MemorySecretBackend
+) -> None:
+    """H4: metadata + unavailable store must not leave the env key usable."""
+    app = create_app(_settings(tmp_path, openai_api_key=SENTINEL), clock=FixedClock(NOW))
+    auth = _auth(app)
+
+    with TestClient(app) as client:
+        assert _put_key(client, auth, "openai", "sk-stored-unavailable-4f2a").status_code == 200
+        backend.available = lambda: False  # type: ignore[method-assign]
+        settings_response = client.get("/api/v1/settings/llm", headers=auth)
+        providers = client.get("/api/v1/llm/providers", headers=auth)
+        probe = client.post(
+            "/api/v1/llm/test",
+            json={"provider": "openai", "role": "ANALYSIS"},
+            headers=auth,
+        )
+
+    settings_row = next(
+        item
+        for item in settings_response.json()["data"]["providers"]
+        if item["provider"] == "openai"
+    )
+    providers_row = next(
+        item for item in providers.json()["data"]["items"] if item["provider"] == "openai"
+    )
+    for row in (settings_row, providers_row):
+        assert row["configured"] is False
+        assert row["key_source"] == "unavailable"
+    assert probe.status_code == 412, probe.text
+    assert probe.json()["error"]["code"] == "LLM_PROVIDER_NOT_CONFIGURED"
+
+
+MASTER_KEY = "unit-test-master-key-0123456789abcdef"
+
+
+class _FakeKeyring:
+    """In-memory OS keyring; never touches the developer's real keyring."""
+
+    def __init__(self) -> None:
+        self.values: dict[tuple[str, str], str] = {}
+
+    def get_password(self, service: str, reference: str) -> str | None:
+        return self.values.get((service, reference))
+
+    def set_password(self, service: str, reference: str, value: str) -> None:
+        self.values[(service, reference)] = value
+
+    def delete_password(self, service: str, reference: str) -> None:
+        from oft.adapters import keyring_secrets as keyring_module
+
+        if self.values.pop((service, reference), None) is None:
+            raise keyring_module._PasswordDeleteError("absent")  # noqa: SLF001
+
+
+def _install_keyring(
+    monkeypatch: pytest.MonkeyPatch, fake: _FakeKeyring, *, available: bool
+) -> None:
+    from oft.adapters import keyring_secrets as keyring_module
+
+    monkeypatch.setattr(keyring_module, "_keyring", fake)
+    monkeypatch.setattr(keyring_module, "keyring_available", lambda: available)
+
+
+def _fake_keyring(monkeypatch: pytest.MonkeyPatch, *, available: bool) -> _FakeKeyring:
+    fake = _FakeKeyring()
+    _install_keyring(monkeypatch, fake, available=available)
+    return fake
+
+
+def _record_meta(
+    app: Any, stored: str, *, provider: str = "openai", backend: str = "unknown"
+) -> None:
+    from oft.domain.llm_settings import SECRET_NAME, fingerprint_secret, last4
+    from oft.ports.store import SecretChangePlan, SecretMetaRecord
+
+    def _build(_current: object) -> SecretChangePlan:
+        return SecretChangePlan(
+            record=SecretMetaRecord(
+                provider=provider,
+                name=SECRET_NAME,
+                fingerprint=fingerprint_secret(stored),
+                last4=last4(stored),
+                updated_at="2026-11-06T10:00:00.000Z",
+                updated_by="legacy",
+                backend=backend,
+            ),
+            audit=None,
+        )
+
+    app.state.container.store.save_secret_change(provider, SECRET_NAME, _build)
+
+
+def _record_unknown_meta(app: Any, stored: str) -> None:
+    _record_meta(app, stored, backend="unknown")
+
+
+def test_provenance_routes_reads_and_deletes_and_purges_the_old_ciphertext(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """H7: a key stored in the file stays visible after a keyring appears."""
+    from oft.application.secrets_service import EncryptedFileSecretBackend
+
+    monkeypatch.setenv("OFT_MASTER_KEY", MASTER_KEY)
+    _fake_keyring(monkeypatch, available=False)
+    settings = _settings(tmp_path)
+    app = create_app(settings, clock=FixedClock(NOW))
+    auth = _auth(app)
+    stored = "sk-provenance-SENTINEL-7c1d"
+
+    with TestClient(app) as client:
+        assert _put_key(client, auth, "anthropic", stored, key="provenance-set").status_code == 200
+        # A keyring appears after the file write; selection now prefers it.
+        _fake_keyring(monkeypatch, available=True)
+        providers = client.get("/api/v1/llm/providers", headers=auth)
+        settings_response = client.get("/api/v1/settings/llm", headers=auth)
+        deleted = client.delete(
+            "/api/v1/settings/llm/anthropic/key",
+            headers={**auth, "Idempotency-Key": "provenance-delete"},
+        )
+
+    providers_row = next(
+        item for item in providers.json()["data"]["items"] if item["provider"] == "anthropic"
+    )
+    settings_row = next(
+        item
+        for item in settings_response.json()["data"]["providers"]
+        if item["provider"] == "anthropic"
+    )
+    # Reads route by recorded provenance, not the newly selected keyring.
+    for row in (providers_row, settings_row):
+        assert row["configured"] is True
+        assert row["key_source"] == "encrypted_file"
+        assert row["masked"] == "****7c1d"
+    assert deleted.status_code == 200, deleted.text
+    # The delete removed the file ciphertext and reported the truthful state.
+    file_backend = EncryptedFileSecretBackend(data_dir=settings.data_dir)
+    assert file_backend.get("llm.anthropic.api_key") is None
+    assert deleted.json()["data"]["configured"] is False
+
+
+def test_a_legacy_unknown_row_probes_the_available_backends(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """H7: a pre-v29 ``unknown`` row is probed instead of treated as missing."""
+    from oft.application.secrets_service import EncryptedFileSecretBackend
+
+    monkeypatch.setenv("OFT_MASTER_KEY", MASTER_KEY)
+    _fake_keyring(monkeypatch, available=False)
+    settings = _settings(tmp_path)
+    app = create_app(settings, clock=FixedClock(NOW))
+    auth = _auth(app)
+    stored = "sk-legacy-unknown-7c1d"
+    EncryptedFileSecretBackend(data_dir=settings.data_dir).set("llm.openai.api_key", stored)
+    _record_unknown_meta(app, stored)
+
+    with TestClient(app) as client:
+        response = client.get("/api/v1/settings/llm", headers=auth)
+
+    row = next(
+        item for item in response.json()["data"]["providers"] if item["provider"] == "openai"
+    )
+    assert row["configured"] is True
+    assert row["masked"] == "****7c1d"
+    assert row["key_source"] == "encrypted_file"
+
+
+def test_an_injected_backend_never_touches_another_backend(
+    tmp_path: Path, backend: MemorySecretBackend, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """H-C: an injected backend isolates the service from the real keyring."""
+    from oft.application.secrets_service import SecretsService
+
+    settings = _settings(tmp_path)
+    app = create_app(settings, clock=FixedClock(NOW))
+    backend.values["llm.openai.api_key"] = SENTINEL
+    _record_meta(app, SENTINEL, backend=backend.kind)
+    calls: list[tuple[str, Settings | None]] = []
+
+    def _fail(kind: str, settings_value: Settings | None) -> object:
+        calls.append((kind, settings_value))
+        raise AssertionError("an injected backend must not construct another backend")
+
+    monkeypatch.setattr(secrets_module, "backend_for_kind", _fail)
+    # Monkeypatched ``default_backend`` (the fixture) is also isolated.
+    from_default = SecretsService(
+        store=app.state.container.store, settings=settings, clock=FixedClock(NOW)
+    )
+    assert from_default.resolve_key("openai") == SENTINEL
+    from_default.delete_key("openai", actor="test")
+    # Explicit constructor injection is isolated too.
+    backend.values["llm.openai.api_key"] = SENTINEL
+    _record_meta(app, SENTINEL, backend=backend.kind)
+    injected = SecretsService(
+        store=app.state.container.store,
+        settings=settings,
+        clock=FixedClock(NOW),
+        backend=backend,
+    )
+    assert injected.status("openai").configured is True
+    injected.delete_key("openai", actor="test")
+    assert calls == []
+
+
+def test_a_legacy_unknown_row_with_no_value_is_not_falsely_revoked(
+    tmp_path: Path, backend: MemorySecretBackend
+) -> None:
+    """H-B(a): no readable value means no delete and no SECRET_DELETED audit."""
+    app = create_app(_settings(tmp_path), clock=FixedClock(NOW))
+    auth = _auth(app)
+    _record_unknown_meta(app, "sk-missing-legacy-4f2a")
+
+    with TestClient(app) as client:
+        deleted = client.delete(
+            "/api/v1/settings/llm/openai/key",
+            headers={**auth, "Idempotency-Key": "legacy-missing"},
+        )
+
+    assert deleted.status_code == 500, deleted.text
+    assert deleted.json()["error"]["code"] == "CONFIG_INVALID"
+    assert app.state.container.store.get_secret_meta("openai") is not None
+    assert app.state.container.store.list_audit_events() == ()
+
+
+def test_a_recorded_backend_that_is_unavailable_does_not_audit_a_revoke(
+    tmp_path: Path, backend: MemorySecretBackend
+) -> None:
+    """H-B(b): a lost backend must not produce a false revocation."""
+    app = create_app(_settings(tmp_path), clock=FixedClock(NOW))
+    auth = _auth(app)
+    with TestClient(app) as client:
+        assert _put_key(client, auth, "openai", SENTINEL, key="lost-backend-set").status_code == 200
+        backend.available = lambda: False  # type: ignore[method-assign]
+        deleted = client.delete(
+            "/api/v1/settings/llm/openai/key",
+            headers={**auth, "Idempotency-Key": "lost-backend-delete"},
+        )
+
+    assert deleted.status_code == 500, deleted.text
+    assert deleted.json()["error"]["code"] == "CONFIG_INVALID"
+    assert app.state.container.store.get_secret_meta("openai") is not None
+    events = [event.event_type for event in app.state.container.store.list_audit_events()]
+    assert events == ["SECRET_ADDED"]
+
+
+class _Recorder:
+    def __init__(self) -> None:
+        self.events: list[tuple[str, dict[str, Any]]] = []
+
+    def _record(self, event: str, **fields: Any) -> None:
+        self.events.append((event, fields))
+
+    info = _record
+    warning = _record
+    error = _record
+
+
+def test_rotation_purges_superseded_backend_ciphertext(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """M-F: keyring -> file rotation logs residue; a later rotation cleans it."""
+    from oft.application.secrets_service import EncryptedFileSecretBackend, SecretsService
+
+    monkeypatch.setenv("OFT_MASTER_KEY", MASTER_KEY)
+    fake = _fake_keyring(monkeypatch, available=True)
+    settings = _settings(tmp_path)
+    app = create_app(settings, clock=FixedClock(NOW))
+    store = app.state.container.store
+    reference = "llm.openai.api_key"
+    first = "sk-rotation-keyring-1111"
+    second = "sk-rotation-file-2222"
+    third = "sk-rotation-keyring-3333"
+
+    SecretsService(store=store, settings=settings, clock=FixedClock(NOW)).set_key(
+        "openai", first, actor="test"
+    )
+    assert fake.values[("oft", reference)] == first
+
+    # The keyring disappears; rotate into the encrypted file. The superseded
+    # keyring value cannot be purged, so the residue is logged.
+    recording = _Recorder()
+    monkeypatch.setattr(secrets_module, "LOGGER", recording)
+    _install_keyring(monkeypatch, fake, available=False)
+    SecretsService(store=store, settings=settings, clock=FixedClock(NOW)).set_key(
+        "openai", second, actor="test"
+    )
+    file_backend = EncryptedFileSecretBackend(data_dir=settings.data_dir)
+    assert file_backend.get(reference) == second
+    assert any(event == "secret_rotation_residue_unavailable" for event, _ in recording.events)
+
+    # The keyring returns; the next rotation back to it removes the file copy.
+    _install_keyring(monkeypatch, fake, available=True)
+    SecretsService(store=store, settings=settings, clock=FixedClock(NOW)).set_key(
+        "openai", third, actor="test"
+    )
+    assert fake.values[("oft", reference)] == third
+    assert file_backend.get(reference) is None
+
+
+def test_a_metadata_failure_rolls_back_a_newly_stored_key(
+    tmp_path: Path, backend: MemorySecretBackend, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """M6: a metadata write failure never leaves the backend ahead."""
+    from oft.application.secrets_service import SecretsService
+
+    settings = _settings(tmp_path)
+    app = create_app(settings, clock=FixedClock(NOW))
+    service = SecretsService(
+        store=app.state.container.store, settings=settings, clock=FixedClock(NOW)
+    )
+
+    def _boom(*_args: object, **_kwargs: object) -> None:
+        raise RuntimeError("metadata write failed")
+
+    monkeypatch.setattr(app.state.container.store, "save_secret_change", _boom)
+    with pytest.raises(RuntimeError):
+        service.set_key("openai", SENTINEL, actor="web")
+    assert backend.values == {}
+
+
+def test_a_metadata_failure_restores_the_previous_key_on_rotation(
+    tmp_path: Path, backend: MemorySecretBackend, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """M6: a failed rotation restores the previous backend value."""
+    from oft.application.secrets_service import SecretsService
+
+    settings = _settings(tmp_path)
+    app = create_app(settings, clock=FixedClock(NOW))
+    service = SecretsService(
+        store=app.state.container.store, settings=settings, clock=FixedClock(NOW)
+    )
+    first = "sk-rollback-first-1111"
+    second = "sk-rollback-second-2222"
+    service.set_key("openai", first, actor="web")
+
+    def _boom(*_args: object, **_kwargs: object) -> None:
+        raise RuntimeError("metadata write failed")
+
+    monkeypatch.setattr(app.state.container.store, "save_secret_change", _boom)
+    with pytest.raises(RuntimeError):
+        service.set_key("openai", second, actor="web")
+    assert backend.values["llm.openai.api_key"] == first
+
+
+def test_a_metadata_failure_restores_a_deleted_key(
+    tmp_path: Path, backend: MemorySecretBackend, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """M6: a failed delete restores the value instead of claiming revocation."""
+    from oft.application.secrets_service import SecretsService
+
+    settings = _settings(tmp_path)
+    app = create_app(settings, clock=FixedClock(NOW))
+    service = SecretsService(
+        store=app.state.container.store, settings=settings, clock=FixedClock(NOW)
+    )
+    stored = "sk-delete-rollback-4f2a"
+    service.set_key("openai", stored, actor="web")
+
+    def _boom(*_args: object, **_kwargs: object) -> None:
+        raise RuntimeError("metadata write failed")
+
+    monkeypatch.setattr(app.state.container.store, "save_secret_change", _boom)
+    with pytest.raises(RuntimeError):
+        service.delete_key("openai", actor="web")
+    assert backend.values["llm.openai.api_key"] == stored
+
+
+def test_an_overlong_key_is_422_and_the_value_is_never_echoed(
+    tmp_path: Path, backend: MemorySecretBackend
+) -> None:
+    """M6: the Pydantic max-length refusal never repeats the sentinel."""
+    overlong = "sk-SENTINEL-" + "a" * 600
+    app = create_app(_settings(tmp_path), clock=FixedClock(NOW))
+
+    with TestClient(app) as client:
+        response = _put_key(client, _auth(app), "openai", overlong, key="too-long")
+
+    assert response.status_code == 422, response.text
+    assert response.json()["error"]["code"] == "VALIDATION_FAILED"
+    assert overlong not in response.text
+    assert overlong[:24] not in response.text
+    assert app.state.container.store.list_secret_meta() == ()
+    assert app.state.container.store.list_audit_events() == ()
+
+
+def test_a_short_master_key_without_a_keyring_does_not_crash_composition(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """H3: selection records a reason; only a store write raises it."""
+    from oft.adapters import keyring_secrets as keyring_module
+    from oft.bootstrap import build_container
+
+    monkeypatch.setenv("OFT_MASTER_KEY", "too-short")
+    monkeypatch.setattr(keyring_module, "keyring_available", lambda: False)
+    settings = _settings(tmp_path)
+
+    container = build_container(settings, clock=FixedClock(NOW))
+    assert container.settings is not None
+
+    app = create_app(settings, clock=FixedClock(NOW))
+    with TestClient(app) as client:
+        response = _put_key(client, _auth(app), "openai", SENTINEL, key="short-master")
+
+    assert response.status_code == 500, response.text
+    error = response.json()["error"]
+    assert error["code"] == "CONFIG_INVALID"
+    assert "at least 32" in error["message"].lower()
+    assert SENTINEL not in response.text
+    assert not (settings.data_dir / "secrets.enc").exists()
+
+
+def test_a_refresh_failure_after_a_committed_key_write_still_returns_200(
+    tmp_path: Path, backend: MemorySecretBackend, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """M1: the post-commit refresh is best effort and never re-rotates."""
+    from oft.bootstrap import AppContainer
+
+    app = create_app(_settings(tmp_path), clock=FixedClock(NOW))
+    auth = _auth(app)
+    container = app.state.container
+
+    def _fail(_self: AppContainer) -> None:
+        raise RuntimeError("refresh down")
+
+    monkeypatch.setattr(AppContainer, "refresh_llm_settings", _fail)
+    with TestClient(app) as client:
+        first = _put_key(client, auth, "openai", SENTINEL, key="refresh-failure")
+        replay = _put_key(client, auth, "openai", SENTINEL, key="refresh-failure")
+
+    assert first.status_code == 200, first.text
+    assert first.json()["data"]["masked"] == "****4f2a"
+    assert replay.status_code == 200, replay.text
+    assert replay.json()["meta"]["idempotent_replay"] is True
+    # One commit, one audit event, one backend value: no duplicate rotation.
+    audits = [event.event_type for event in container.store.list_audit_events()]
+    assert audits == ["SECRET_ADDED"]
+    assert backend.values["llm.openai.api_key"] == SENTINEL

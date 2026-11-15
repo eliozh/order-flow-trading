@@ -106,6 +106,56 @@ def test_models_lists_priced_rows_and_unpriced_role_models(
     assert items["gpt-fixture"]["unpriced"] is True
 
 
+def test_models_uses_the_persisted_role_model_overlay(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """M7: a saved role model is listed without a restart."""
+    from oft.application.settings_service import SettingsService
+    from oft.bootstrap import build_container
+
+    settings = _configure(monkeypatch, tmp_path)
+    container = build_container(settings, initialize=True, clock=None)
+    SettingsService(
+        store=container.store, clock=container.clock, settings=settings
+    ).update_llm_settings(
+        {"provider": "openai", "roles": {"ANALYSIS": "gpt-persisted"}},
+        actor="test",
+    )
+
+    result = CliRunner().invoke(app, ["llm", "models", "--provider", "openai", "--json"])
+
+    assert result.exit_code == 0, result.output
+    names = [item["model"] for item in json.loads(result.stdout)["data"]["items"]]
+    assert "gpt-persisted" in names
+
+
+def test_llm_models_reports_a_corrupt_persisted_document_as_config_invalid(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """M-I: a corrupt overlay is typed CONFIG_INVALID, never a traceback."""
+    from oft.adapters.sqlite_store import SqliteStore
+    from oft.ports.store import ConfigRecord
+
+    settings = _configure(monkeypatch, tmp_path)
+    store = SqliteStore(settings)
+    store.initialize()
+    store.set_config(
+        ConfigRecord(
+            key="llm.settings",
+            value_json="not-json",
+            updated_at="2026-11-06T10:00:00.000Z",
+            updated_by="web",
+        )
+    )
+
+    result = CliRunner().invoke(app, ["llm", "models", "--provider", "openai", "--json"])
+
+    assert result.exit_code == 5, result.output
+    payload = json.loads(result.stdout)
+    assert payload["error"]["code"] == "CONFIG_INVALID"
+    assert "traceback" not in result.output.lower()
+
+
 def test_llm_test_records_the_capability_and_a_sentinel_never_reaches_disk(
     monkeypatch: pytest.MonkeyPatch, tmp_path: Path
 ) -> None:

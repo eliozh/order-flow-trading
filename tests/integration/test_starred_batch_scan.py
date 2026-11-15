@@ -1057,3 +1057,67 @@ def test_non_scan_error_leaves_a_terminal_checkpoint_row(tmp_path: Path, monkeyp
     assert run.status == "FAILED"
     assert rows["BTCUSDT"].stage == "FAILED"
     assert rows["BTCUSDT"].error_code == "SCAN_FAILED"
+
+
+def test_a_batch_freezes_one_effective_snapshot_across_symbols(
+    tmp_path: Path, monkeypatch: Any
+) -> None:
+    """M-E: both symbols use the one snapshot captured at batch entry."""
+    settings = _seed(tmp_path)
+    container = build_container(settings, initialize=True)
+    real_refresh = bootstrap.AppContainer.refresh_llm_settings
+    refreshes = {"count": 0}
+
+    def _counted(self: Any) -> Any:
+        refreshes["count"] += 1
+        return real_refresh(self)
+
+    monkeypatch.setattr(bootstrap.AppContainer, "refresh_llm_settings", _counted)
+    real_service = jobs_module.ScanService
+    seen: list[dict[str, Any]] = []
+
+    class _SpyScanService(real_service):  # type: ignore[misc, valid-type]
+        def __init__(
+            self,
+            *,
+            container: Any,
+            lock: Any = None,
+            inputs: Any = None,
+            on_stage: Any = None,
+            refresh_llm: bool = True,
+            effective: Any = None,
+        ) -> None:
+            seen.append({"refresh": refresh_llm, "effective": effective})
+            super().__init__(
+                container=container,
+                lock=lock,
+                inputs=inputs,
+                on_stage=on_stage,
+                refresh_llm=refresh_llm,
+                effective=effective,
+            )
+
+        def run(self, request: Any, *, scan_id: str | None = None) -> Any:
+            result = super().run(request, scan_id=scan_id)
+            if len(seen) == 1:
+                # Mutate the shared container snapshot between symbols; the
+                # second symbol must still use the frozen batch snapshot.
+                object.__setattr__(
+                    container,
+                    "settings",
+                    container.settings.model_copy(update={"llm_provider": None}),
+                )
+            return result
+
+    monkeypatch.setattr(jobs_module, "ScanService", _SpyScanService)
+    outcome = ScheduledScanRunner(
+        container=container, clock=FixedClock(NOW + timedelta(seconds=60))
+    ).run_manual(period="4h")
+
+    assert outcome.failed_symbols == ()
+    assert refreshes["count"] == 1
+    assert len(seen) == 2
+    assert all(entry["refresh"] is False for entry in seen)
+    assert seen[0]["effective"] is seen[1]["effective"]
+    assert seen[1]["effective"].llm_provider == "stub"
+    assert container.settings.llm_provider is None

@@ -51,6 +51,24 @@ def _settings_or_exit(json_output: bool) -> Any:
         raise typer.Exit(code=5) from exc
 
 
+def _container_or_exit(
+    settings: Any, json_output: bool, *, initialize: bool = False
+) -> tuple[Any, Any]:
+    """Build the container and refresh the overlay, mapping failures to exit 5.
+
+    A corrupt persisted ``llm.settings`` (or an invalid environment overlay)
+    must be a typed ``CONFIG_INVALID`` for every CLI surface, never a traceback.
+    """
+    try:
+        container = build_container(settings, initialize=initialize)
+        effective = container.refresh_llm_settings()
+    except (ConfigError, SecretStoreUnavailable, SettingValidationError) as exc:
+        message = getattr(exc, "message", None) or str(exc)
+        emit_error("CONFIG_INVALID", message, json_output=json_output)
+        raise typer.Exit(code=exit_code_for("CONFIG_INVALID")) from exc
+    return container, effective
+
+
 def _emit_json(data: dict[str, Any], *, data_quality: str = "COMPLETE") -> None:
     typer.echo(
         json.dumps(
@@ -134,8 +152,7 @@ def providers_command(
 ) -> None:
     """List providers, key presence, role models, and the capability chip."""
     settings = _settings_or_exit(json_output)
-    container = build_container(settings)
-    effective = container.refresh_llm_settings()
+    container, effective = _container_or_exit(settings, json_output)
     items = provider_catalog(effective, container.store)
     base = container.llm_base_settings or container.settings
     secrets = SecretsService(store=container.store, settings=base, clock=container.clock)
@@ -168,7 +185,10 @@ def models_command(
         )
         raise typer.Exit(code=2)
     settings = _settings_or_exit(json_output)
-    items = model_catalog(settings, name)
+    # Read the persisted overlay like providers/test so a saved role model is
+    # listed immediately, not only after a restart.
+    _container, effective = _container_or_exit(settings, json_output)
+    items = model_catalog(effective, name)
     if json_output:
         _emit_json(
             {"provider": name, "items": items, "total": len(items)},
@@ -191,8 +211,7 @@ def test_command(
         emit_error("VALIDATION_FAILED", f"unknown role {role!r}", json_output=json_output)
         raise typer.Exit(code=2) from None
     settings = _settings_or_exit(json_output)
-    container = build_container(settings, initialize=True)
-    effective = container.refresh_llm_settings()
+    container, effective = _container_or_exit(settings, json_output, initialize=True)
     service = CapabilityProbeService(
         settings=effective,
         store=container.store,
@@ -316,7 +335,12 @@ def key_delete_command(
     provider: Annotated[str, typer.Option("--provider", help="openai|anthropic|deepseek")],
     json_output: Annotated[bool, typer.Option("--json", help="Emit JSON.")] = False,
 ) -> None:
-    """Delete one provider key; a decision that needs it reports unconfigured."""
+    """Delete one stored key; a same-provider env key, if set, still applies.
+
+    Deletion never falls back to another provider. With neither a stored nor an
+    environment key, a decision needing this provider returns
+    ``LLM_PROVIDER_NOT_CONFIGURED``.
+    """
     settings = _settings_or_exit(json_output)
     try:
         _container, service = _key_service(settings)

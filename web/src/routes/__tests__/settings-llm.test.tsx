@@ -1,4 +1,4 @@
-import { fireEvent, render, screen, waitFor } from '@testing-library/react'
+import { fireEvent, render, screen, waitFor, within } from '@testing-library/react'
 import { describe, expect, it, vi } from 'vitest'
 
 import type { ApiMeta } from '../../api/status'
@@ -133,6 +133,8 @@ interface RenderOptions {
   deleteKey?: (provider: string, key: string) => Promise<LLMKeyStatusEnvelope>
   probe?: (provider: string, role: string) => Promise<LLMTestEnvelope>
   isCompact?: boolean
+  rotateSettingsKey?: () => string
+  rotateProviderKey?: (provider: string) => string
 }
 
 async function renderPage(options: RenderOptions = {}) {
@@ -176,6 +178,8 @@ async function renderPage(options: RenderOptions = {}) {
       meta,
     }))
   const fetchUsage = async (period: LMUsagePeriod) => usageEnvelope(period)
+  const rotateSettingsKey = options.rotateSettingsKey ?? vi.fn(() => 'rotated')
+  const rotateProviderKey = options.rotateProviderKey ?? vi.fn(() => 'rotated-provider')
   const { unmount } = render(
     <SettingsLLMPage
       fetchSettingsFn={async () => settingsEnvelope(data)}
@@ -186,15 +190,23 @@ async function renderPage(options: RenderOptions = {}) {
       fetchUsageFn={fetchUsage}
       settingsKeyFn={() => 'settings-key'}
       clearSettingsKeyFn={vi.fn()}
-      rotateSettingsKeyFn={vi.fn(() => 'rotated')}
+      rotateSettingsKeyFn={rotateSettingsKey}
       providerKeyFn={() => 'provider-key'}
-      rotateProviderKeyFn={vi.fn(() => 'rotated-provider')}
+      rotateProviderKeyFn={rotateProviderKey}
       clearProviderKeyFn={vi.fn()}
       isCompact={options.isCompact}
     />,
   )
   await screen.findByTestId('llm-provider-mask-openai')
-  return { update, setKey, removeKey, probe, unmount }
+  return {
+    update,
+    setKey,
+    removeKey,
+    probe,
+    unmount,
+    rotateSettingsKey,
+    rotateProviderKey,
+  }
 }
 
 describe('SettingsLLMPage', () => {
@@ -276,7 +288,7 @@ describe('SettingsLLMPage', () => {
     }))
     await renderPage({ deleteKey: removeKey })
 
-    fireEvent.click(screen.getByRole('button', { name: '删除密钥' }))
+    fireEvent.click(screen.getByRole('button', { name: '删除密钥（OpenAI）' }))
     expect(removeKey).not.toHaveBeenCalled()
     fireEvent.click(screen.getByRole('button', { name: '确认删除' }))
 
@@ -306,7 +318,7 @@ describe('SettingsLLMPage', () => {
     }))
     await renderPage({ probe })
 
-    fireEvent.click(screen.getAllByRole('button', { name: '测试连接' })[0])
+    fireEvent.click(screen.getByRole('button', { name: '测试连接（OpenAI，角色 ANALYSIS）' }))
 
     await waitFor(() =>
       expect(screen.getByTestId('llm-probe-openai')).toHaveTextContent('DEGRADED'),
@@ -326,7 +338,7 @@ describe('SettingsLLMPage', () => {
 describe('SettingsLLMPage regressions', () => {
   it('opens the delete confirmation as a modal and restores focus on Escape', async () => {
     await renderPage()
-    const deleteButton = screen.getByRole('button', { name: '删除密钥' })
+    const deleteButton = screen.getByRole('button', { name: '删除密钥（OpenAI）' })
     deleteButton.focus()
     fireEvent.click(deleteButton)
 
@@ -402,6 +414,10 @@ describe('SettingsLLMPage regressions', () => {
       '未保存任何内容',
     )
     expect(screen.getByTestId('llm-error-summary')).toHaveTextContent('密钥被拒绝')
+    // M10: the summary names the provider and links to its key input.
+    const keyLink = screen.getByRole('link', { name: 'Anthropic 密钥' })
+    fireEvent.click(keyLink)
+    expect(input).toHaveFocus()
   })
 
   it('keeps focus in the edited field while other errors keep the summary visible', async () => {
@@ -510,7 +526,7 @@ describe('SettingsLLMPage regressions', () => {
       meta,
     }))
     await renderPage({ deleteKey: removeKey })
-    fireEvent.click(screen.getByRole('button', { name: '删除密钥' }))
+    fireEvent.click(screen.getByRole('button', { name: '删除密钥（OpenAI）' }))
     fireEvent.click(screen.getByRole('button', { name: '确认删除' }))
 
     await waitFor(() =>
@@ -519,5 +535,194 @@ describe('SettingsLLMPage regressions', () => {
       ),
     )
     expect(screen.getByTestId('llm-provider-mask-openai')).toHaveTextContent('env')
+  })
+
+  it('announces that a deleted key neither falls back nor leaves a config error hidden', async () => {
+    const removeKey = vi.fn(async () => ({
+      ok: true as const,
+      data: keyStatus(false, null),
+      error: null,
+      meta,
+    }))
+    await renderPage({ deleteKey: removeKey })
+    fireEvent.click(screen.getByRole('button', { name: '删除密钥（OpenAI）' }))
+    fireEvent.click(screen.getByRole('button', { name: '确认删除' }))
+
+    await waitFor(() =>
+      expect(screen.getByTestId('settings-llm-save-status')).toHaveTextContent(
+        'LLM_PROVIDER_NOT_CONFIGURED',
+      ),
+    )
+  })
+})
+
+describe('SettingsLLMPage fix round 1', () => {
+  it('merges a successful probe into the row capability chip (M3)', async () => {
+    const probe = vi.fn(async () => ({
+      ok: true as const,
+      data: {
+        provider: 'openai' as const,
+        model: 'gpt-a',
+        status: 'DEGRADED' as const,
+        strict_schema: false,
+        degraded: true,
+        max_output_tokens: 4096,
+        error_code: null,
+        notes: 'degraded: JSON mode fallback',
+        latency_ms: 42,
+        checked_at: '2026-11-06T10:00:00.000Z',
+      },
+      error: null,
+      meta,
+    }))
+    await renderPage({ probe })
+
+    fireEvent.click(screen.getByRole('button', { name: '测试连接（OpenAI，角色 ANALYSIS）' }))
+
+    const mask = await screen.findByTestId('llm-provider-mask-openai')
+    const row = mask.closest('tr') as HTMLElement
+    const chip = within(row).getByTitle('2026-11-06T10:00:00.000Z')
+    await waitFor(() => expect(chip).toHaveTextContent('DEGRADED'))
+  })
+
+  it('disables probing a non-active provider and names the probed role (M4)', async () => {
+    const base = settingsData()
+    const data = settingsData({
+      providers: base.providers.map((row) =>
+        row.provider === 'anthropic'
+          ? {
+              ...row,
+              configured: true,
+              key_source: 'encrypted_file' as const,
+              masked: '****9c1d',
+              fingerprint: 'a'.repeat(64),
+            }
+          : row,
+      ),
+    })
+    const probe = vi.fn()
+    await renderPage({ data, probe })
+
+    const inactive = screen.getByRole('button', { name: '测试连接（Anthropic，角色 ANALYSIS）' })
+    expect(inactive).toBeDisabled()
+    const describedBy = inactive.getAttribute('aria-describedby') ?? ''
+    expect(document.getElementById(describedBy)).toHaveTextContent('只有当前 provider')
+    fireEvent.click(inactive)
+    expect(probe).not.toHaveBeenCalled()
+    // The visible text states the probed role.
+    expect(screen.getAllByText('ANALYSIS').length).toBeGreaterThan(0)
+  })
+
+  it('announces an empty key error and focuses the key input (H6)', async () => {
+    await renderPage()
+    const input = screen.getByTestId('llm-key-input-anthropic')
+    fireEvent.click(screen.getByRole('button', { name: '保存密钥（Anthropic）' }))
+
+    const alert = await screen.findByRole('alert')
+    expect(alert).toHaveTextContent('请输入密钥')
+    await waitFor(() => expect(input).toHaveFocus())
+  })
+
+  it('links a probe failure to the provider key input (M10)', async () => {
+    const probe = vi.fn(async () => {
+      throw new SettingsApiError('测试失败', 'LLM_PROVIDER_NOT_CONFIGURED', { kind: 'refusal' })
+    })
+    await renderPage({ probe })
+    fireEvent.click(screen.getByRole('button', { name: '测试连接（OpenAI，角色 ANALYSIS）' }))
+
+    const link = await screen.findByRole('link', { name: 'OpenAI 测试连接' })
+    fireEvent.click(link)
+    expect(screen.getByTestId('llm-key-input-openai')).toHaveFocus()
+  })
+
+  it('connects the custom-host hint to the checkbox and base URLs (M10)', async () => {
+    await renderPage()
+    const checkbox = screen.getByRole('checkbox', { name: '允许自定义 Base URL' })
+    expect(checkbox).toHaveAttribute('aria-describedby', 'llm-custom-host-hint')
+    expect(document.getElementById('llm-custom-host-hint')).toHaveTextContent('官方 host')
+    expect(screen.getByLabelText('OpenAI Base URL').getAttribute('aria-describedby')).toContain(
+      'llm-custom-host-hint',
+    )
+  })
+
+  it('marks English role row headers with lang="en" (M10)', async () => {
+    await renderPage()
+    const header = screen
+      .getAllByRole('rowheader')
+      .find((element) => element.textContent === 'analysis')
+    expect(header).toBeDefined()
+    expect(header?.querySelector('[lang="en"]')).not.toBeNull()
+  })
+
+  it('rotates the settings idempotency key on a conflict, not on an unknown outcome (M6)', async () => {
+    const conflict = vi.fn(async () => {
+      throw new SettingsApiError('冲突', 'IDEMPOTENCY_CONFLICT', { kind: 'refusal' })
+    })
+    const conflicted = await renderPage({ update: conflict })
+    fireEvent.click(screen.getByRole('button', { name: '保存 LLM 设置' }))
+    await waitFor(() => expect(conflicted.rotateSettingsKey).toHaveBeenCalledTimes(1))
+    conflicted.unmount()
+
+    const unknown = vi.fn(async () => {
+      throw new Error('network down')
+    })
+    const unknownPage = await renderPage({ update: unknown })
+    fireEvent.click(screen.getByRole('button', { name: '保存 LLM 设置' }))
+    await waitFor(() =>
+      expect(screen.getByTestId('llm-error-summary')).toHaveTextContent('结果未知'),
+    )
+    expect(unknownPage.rotateSettingsKey).not.toHaveBeenCalled()
+  })
+
+  it('clears a stale probe error when a key is saved (M-A)', async () => {
+    const probe = vi.fn(async () => {
+      throw new SettingsApiError('测试失败', 'LLM_PROVIDER_NOT_CONFIGURED', { kind: 'refusal' })
+    })
+    const setKey = vi.fn(async () => ({
+      ok: true as const,
+      data: { ...keyStatus(true, '****9c1d'), provider: 'anthropic' as const },
+      error: null,
+      meta,
+    }))
+    await renderPage({ probe, setKey })
+    fireEvent.click(screen.getByRole('button', { name: '测试连接（OpenAI，角色 ANALYSIS）' }))
+    await waitFor(() =>
+      expect(screen.getByTestId('llm-error-summary')).toHaveTextContent('测试失败'),
+    )
+
+    fireEvent.change(screen.getByTestId('llm-key-input-anthropic'), {
+      target: { value: SECRET },
+    })
+    fireEvent.click(screen.getByTestId('llm-key-save-anthropic'))
+
+    await waitFor(() =>
+      expect(screen.getByTestId('settings-llm-save-status')).toHaveTextContent('密钥已保存'),
+    )
+    expect(screen.queryByTestId('llm-error-summary')).not.toBeInTheDocument()
+    expect(document.body.textContent).not.toContain('测试失败')
+  })
+
+  it('rotates the provider idempotency key on a key conflict, not on an unknown outcome (M6)', async () => {
+    const conflict = vi.fn(async () => {
+      throw new SettingsApiError('冲突', 'IDEMPOTENCY_CONFLICT', { kind: 'refusal' })
+    })
+    const conflicted = await renderPage({ setKey: conflict })
+    const input = screen.getByTestId('llm-key-input-anthropic')
+    fireEvent.change(input, { target: { value: SECRET } })
+    fireEvent.click(screen.getByTestId('llm-key-save-anthropic'))
+    await waitFor(() => expect(conflicted.rotateProviderKey).toHaveBeenCalledWith('anthropic'))
+    conflicted.unmount()
+
+    const unknown = vi.fn(async () => {
+      throw new Error('network down')
+    })
+    const unknownPage = await renderPage({ setKey: unknown })
+    const secondInput = screen.getByTestId('llm-key-input-anthropic')
+    fireEvent.change(secondInput, { target: { value: SECRET } })
+    fireEvent.click(screen.getByTestId('llm-key-save-anthropic'))
+    await waitFor(() =>
+      expect(screen.getByTestId('llm-error-summary')).toHaveTextContent('network down'),
+    )
+    expect(unknownPage.rotateProviderKey).not.toHaveBeenCalled()
   })
 })

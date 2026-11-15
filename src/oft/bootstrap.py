@@ -30,11 +30,13 @@ from oft.application.rate_limiter import (
     StructlogAlertSink,
     WsSubscriptionBudget,
 )
+from oft.application.secrets_service import SecretStoreUnavailable
 from oft.application.settings_service import resolve_effective_llm_settings
 from oft.application.status import StatusReport, build_status
 from oft.application.symbol_registry import SymbolRegistry
 from oft.clock import SystemClock
-from oft.config import Settings, load_settings
+from oft.config import ConfigError, Settings, load_settings
+from oft.domain.settings import SettingValidationError
 from oft.ports.archive import ArchiveSourcePort
 from oft.ports.clock import ClockPort
 from oft.ports.llm import LLMPort
@@ -162,15 +164,24 @@ class AppContainer:
         a new provider and an old key or base URL.
         """
         base = self.llm_base_settings or self.settings
-        effective = resolve_effective_llm_settings(
-            settings=base, store=self.store, clock=self.clock
-        )
+        try:
+            effective = resolve_effective_llm_settings(
+                settings=base, store=self.store, clock=self.clock
+            )
+        except (SettingValidationError, SecretStoreUnavailable, ConfigError) as exc:
+            # Every CLI/daemon/API path refreshes through here; an invalid
+            # environment value or unavailable store must be a typed
+            # ``CONFIG_INVALID``, never an untyped traceback.
+            message = getattr(exc, "message", None) or str(exc)
+            raise ConfigError(message) from exc
         with _LLM_REFRESH_LOCK:
             object.__setattr__(self, "settings", effective)
         self.llm_runtime.update_settings(effective)
         return effective
 
-    def provider_for(self, requested: str | None = None) -> LLMPort | None:
+    def provider_for(
+        self, requested: str | None = None, *, effective: Settings | None = None
+    ) -> LLMPort | None:
         """Resolve the provider for a scan/entry request from effective settings.
 
         The requested name (or the active provider) is resolved against the
@@ -179,8 +190,13 @@ class AppContainer:
         resolves to ``None``; it never falls back to another provider's key.
         A rebuilt adapter for the configured provider is cached under its
         signature, so repeated calls do not reconstruct it.
+
+        ``effective`` lets a batch/request that already refreshed once pass its
+        single snapshot, so per-symbol resolution does not re-read the config,
+        secret metadata, or OS keyring.
         """
-        effective = self.refresh_llm_settings()
+        if effective is None:
+            effective = self.refresh_llm_settings()
         configured = (effective.llm_provider or "").strip().lower()
         name = (requested or "").strip().lower() or configured
         if not name:
@@ -259,10 +275,16 @@ def build_container(
         _seed_symbol_registry(symbol_registry, resolved)
     # Resolve the persisted LLM overlay before any caller reads settings, so the
     # CLI and a freshly started daemon agree on the effective provider/models.
-    effective = resolve_effective_llm_settings(
-        settings=llm_base_settings, store=store, clock=resolved_clock
-    )
-    llm_provider = resolve_llm_provider(effective)
+    try:
+        effective = resolve_effective_llm_settings(
+            settings=llm_base_settings, store=store, clock=resolved_clock
+        )
+        llm_provider = resolve_llm_provider(effective)
+    except (SettingValidationError, SecretStoreUnavailable, ConfigError) as exc:
+        # A bad environment provider or a key whose store is unavailable is a
+        # configuration error the API/CLI report as ``CONFIG_INVALID``.
+        message = getattr(exc, "message", None) or str(exc)
+        raise ConfigError(message) from exc
     llm_runtime = LLMRuntimeRegistry(clock=resolved_clock, settings=effective)
     return AppContainer(
         settings=effective,

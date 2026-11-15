@@ -107,9 +107,17 @@ class KeyringSecretBackend:
             raise KeyringUnavailable("the OS keyring is unavailable")
         try:
             _keyring.delete_password(self._service_name, reference)
-        except _PasswordDeleteError:
-            # Deleting a key that is already absent is a successful no-op.
-            return
+        except _PasswordDeleteError as exc:
+            # ``PasswordDeleteError`` is a real delete failure, not proof the
+            # value is absent. Only a confirming read makes it a safe no-op;
+            # otherwise the caller must not record a false revocation.
+            try:
+                remaining = _keyring.get_password(self._service_name, reference)
+            except _KeyringError as read_exc:
+                raise KeyringUnavailable("the OS keyring rejected the delete") from read_exc
+            if remaining is None:
+                return
+            raise KeyringUnavailable("the OS keyring rejected the delete") from exc
         except _KeyringError as exc:
             raise KeyringUnavailable("the OS keyring rejected the delete") from exc
 

@@ -37,7 +37,7 @@ class SecretStoreMixin:
         try:
             row = connection.execute(
                 """
-                SELECT provider, name, fingerprint, last4, updated_at, updated_by
+                SELECT provider, name, fingerprint, last4, updated_at, updated_by, backend
                 FROM secrets_meta WHERE provider = ? AND name = ?
                 """,
                 (provider, name),
@@ -45,7 +45,21 @@ class SecretStoreMixin:
         except sqlite3.OperationalError as exc:
             if _missing_secrets_table(exc):
                 return None
-            raise
+            if not _missing_backend_column(exc):
+                raise
+            # A pre-v29 database still serves reads before it is migrated.
+            try:
+                row = connection.execute(
+                    """
+                    SELECT provider, name, fingerprint, last4, updated_at, updated_by
+                    FROM secrets_meta WHERE provider = ? AND name = ?
+                    """,
+                    (provider, name),
+                ).fetchone()
+            except sqlite3.OperationalError as fallback_exc:
+                if _missing_secrets_table(fallback_exc):
+                    return None
+                raise
         finally:
             connection.close()
         return _row_to_secret_meta(row) if row is not None else None
@@ -57,14 +71,26 @@ class SecretStoreMixin:
         try:
             rows = connection.execute(
                 """
-                SELECT provider, name, fingerprint, last4, updated_at, updated_by
+                SELECT provider, name, fingerprint, last4, updated_at, updated_by, backend
                 FROM secrets_meta ORDER BY provider ASC, name ASC
                 """
             ).fetchall()
         except sqlite3.OperationalError as exc:
             if _missing_secrets_table(exc):
                 return ()
-            raise
+            if not _missing_backend_column(exc):
+                raise
+            try:
+                rows = connection.execute(
+                    """
+                    SELECT provider, name, fingerprint, last4, updated_at, updated_by
+                    FROM secrets_meta ORDER BY provider ASC, name ASC
+                    """
+                ).fetchall()
+            except sqlite3.OperationalError as fallback_exc:
+                if _missing_secrets_table(fallback_exc):
+                    return ()
+                raise
         finally:
             connection.close()
         return tuple(_row_to_secret_meta(row) for row in rows)
@@ -88,7 +114,7 @@ class SecretStoreMixin:
             try:
                 row = connection.execute(
                     """
-                    SELECT provider, name, fingerprint, last4, updated_at, updated_by
+                    SELECT provider, name, fingerprint, last4, updated_at, updated_by, backend
                     FROM secrets_meta WHERE provider = ? AND name = ?
                     """,
                     (provider, name),
@@ -114,13 +140,14 @@ class SecretStoreMixin:
                 connection.execute(
                     """
                     INSERT INTO secrets_meta
-                        (provider, name, fingerprint, last4, updated_at, updated_by)
-                    VALUES (?, ?, ?, ?, ?, ?)
+                        (provider, name, fingerprint, last4, updated_at, updated_by, backend)
+                    VALUES (?, ?, ?, ?, ?, ?, ?)
                     ON CONFLICT(provider, name) DO UPDATE SET
                         fingerprint = excluded.fingerprint,
                         last4 = excluded.last4,
                         updated_at = excluded.updated_at,
-                        updated_by = excluded.updated_by
+                        updated_by = excluded.updated_by,
+                        backend = excluded.backend
                     """,
                     (
                         plan.record.provider,
@@ -129,6 +156,7 @@ class SecretStoreMixin:
                         plan.record.last4,
                         plan.record.updated_at,
                         plan.record.updated_by,
+                        plan.record.backend,
                     ),
                 )
                 committed = plan.record
@@ -148,7 +176,12 @@ def _missing_secrets_table(error: sqlite3.OperationalError) -> bool:
     return "no such table" in str(error).lower()
 
 
+def _missing_backend_column(error: sqlite3.OperationalError) -> bool:
+    return "no such column: backend" in str(error).lower()
+
+
 def _row_to_secret_meta(row: sqlite3.Row) -> SecretMetaRecord:
+    columns = row.keys()
     return SecretMetaRecord(
         provider=str(row["provider"]),
         name=str(row["name"]),
@@ -156,6 +189,7 @@ def _row_to_secret_meta(row: sqlite3.Row) -> SecretMetaRecord:
         last4=str(row["last4"]),
         updated_at=str(row["updated_at"]),
         updated_by=str(row["updated_by"]),
+        backend=str(row["backend"]) if "backend" in columns else "unknown",
     )
 
 

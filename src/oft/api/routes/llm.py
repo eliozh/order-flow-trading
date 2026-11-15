@@ -78,7 +78,10 @@ def list_models(
 ) -> dict[str, Any]:
     """The versioned price catalog plus role-configured models (unpriced)."""
     container = request.app.state.container
-    items = model_catalog(container.settings, provider)
+    # Use the same refreshed overlay as providers/test so a persisted role
+    # model appears here immediately after a save.
+    effective = container.refresh_llm_settings()
+    items = model_catalog(effective, provider)
     return success_envelope(
         {"provider": provider, "items": items, "total": len(items)},
         request_id=new_request_id(),

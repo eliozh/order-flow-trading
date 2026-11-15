@@ -109,6 +109,40 @@ def test_invalid_log_level_is_reported_as_config_invalid(
     assert caught.value.code == "CONFIG_INVALID"
 
 
+@pytest.mark.parametrize(
+    "variable", ["OFT_LLM_MAX_CONCURRENCY", "OFT_LLM_MAX_CONCURRENCY_DEEPSEEK"]
+)
+def test_out_of_range_llm_concurrency_is_rejected_at_load(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path, variable: str
+) -> None:
+    """H1: the environment bound matches MAX_CONCURRENCY; >64 is a ConfigError."""
+    _clear_oft_environment(monkeypatch)
+    monkeypatch.chdir(tmp_path)
+    monkeypatch.setenv(variable, "65")
+
+    with pytest.raises(ConfigError) as caught:
+        load_settings()
+
+    assert caught.value.code == "CONFIG_INVALID"
+    assert "llm_max_concurrency" in caught.value.message.lower()
+
+
+def test_a_blank_provider_is_unset_and_an_unknown_one_is_config_invalid(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """H2: an unknown OFT_LLM_PROVIDER is typed, never a composition traceback."""
+    _clear_oft_environment(monkeypatch)
+    monkeypatch.chdir(tmp_path)
+    monkeypatch.setenv("OFT_LLM_PROVIDER", "   ")
+    assert load_settings().llm_provider is None
+
+    monkeypatch.setenv("OFT_LLM_PROVIDER", "bogus")
+    with pytest.raises(ConfigError) as caught:
+        load_settings()
+    assert caught.value.code == "CONFIG_INVALID"
+    assert "llm_provider" in caught.value.message.lower()
+
+
 def test_secrets_are_not_required(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
     _clear_oft_environment(monkeypatch)
     monkeypatch.chdir(tmp_path)
