@@ -29,6 +29,10 @@ class _StrictAdapter:
 
 
 def _configure(monkeypatch: pytest.MonkeyPatch, tmp_path: Path, **overrides: Any) -> Settings:
+    # Never let the developer's OS keyring leak a provider key into a CLI test.
+    from oft.application import secrets_service as secrets_module
+
+    monkeypatch.setattr(secrets_module, "default_backend", lambda _settings: None)
     values: dict[str, Any] = {
         "env": "test",
         "port": 8765,
@@ -100,6 +104,56 @@ def test_models_lists_priced_rows_and_unpriced_role_models(
     items = {item["model"]: item for item in json.loads(result.stdout)["data"]["items"]}
     assert items["gpt-priced"]["unpriced"] is False
     assert items["gpt-fixture"]["unpriced"] is True
+
+
+def test_models_uses_the_persisted_role_model_overlay(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """M7: a saved role model is listed without a restart."""
+    from oft.application.settings_service import SettingsService
+    from oft.bootstrap import build_container
+
+    settings = _configure(monkeypatch, tmp_path)
+    container = build_container(settings, initialize=True, clock=None)
+    SettingsService(
+        store=container.store, clock=container.clock, settings=settings
+    ).update_llm_settings(
+        {"provider": "openai", "roles": {"ANALYSIS": "gpt-persisted"}},
+        actor="test",
+    )
+
+    result = CliRunner().invoke(app, ["llm", "models", "--provider", "openai", "--json"])
+
+    assert result.exit_code == 0, result.output
+    names = [item["model"] for item in json.loads(result.stdout)["data"]["items"]]
+    assert "gpt-persisted" in names
+
+
+def test_llm_models_reports_a_corrupt_persisted_document_as_config_invalid(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """M-I: a corrupt overlay is typed CONFIG_INVALID, never a traceback."""
+    from oft.adapters.sqlite_store import SqliteStore
+    from oft.ports.store import ConfigRecord
+
+    settings = _configure(monkeypatch, tmp_path)
+    store = SqliteStore(settings)
+    store.initialize()
+    store.set_config(
+        ConfigRecord(
+            key="llm.settings",
+            value_json="not-json",
+            updated_at="2026-11-06T10:00:00.000Z",
+            updated_by="web",
+        )
+    )
+
+    result = CliRunner().invoke(app, ["llm", "models", "--provider", "openai", "--json"])
+
+    assert result.exit_code == 5, result.output
+    payload = json.loads(result.stdout)
+    assert payload["error"]["code"] == "CONFIG_INVALID"
+    assert "traceback" not in result.output.lower()
 
 
 def test_llm_test_records_the_capability_and_a_sentinel_never_reaches_disk(
@@ -387,3 +441,125 @@ def test_budget_show_reports_real_spend_and_the_crossed_state(
     assert human.exit_code == 0, human.output
     assert "Budget state" in human.stdout
     assert "EXCEEDED" in human.stdout
+
+
+# -- slice 35: ``oft llm key set|delete`` --------------------------------------
+
+
+class _MemorySecretBackend:
+    kind = "encrypted_file"
+
+    def __init__(self) -> None:
+        self.values: dict[str, str] = {}
+
+    def available(self) -> bool:
+        return True
+
+    def get(self, reference: str) -> str | None:
+        return self.values.get(reference)
+
+    def set(self, reference: str, value: str) -> None:
+        self.values[reference] = value
+
+    def delete(self, reference: str) -> None:
+        self.values.pop(reference, None)
+
+
+def _memory_backend(monkeypatch: pytest.MonkeyPatch) -> _MemorySecretBackend:
+    from oft.application import secrets_service as secrets_module
+
+    backend = _MemorySecretBackend()
+    monkeypatch.setattr(secrets_module, "default_backend", lambda _settings: backend)
+    return backend
+
+
+def test_llm_key_set_reads_stdin_and_never_echoes_the_key(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    settings = _configure(monkeypatch, tmp_path)
+    _memory_backend(monkeypatch)
+    key = "sk-cli-SENTINEL-4f2a"
+    runner = CliRunner()
+
+    result = runner.invoke(
+        app, ["llm", "key", "set", "--provider", "anthropic", "--stdin"], input=f"{key}\n"
+    )
+
+    assert result.exit_code == 0, result.output
+    assert "****4f2a" in result.stdout
+    assert key not in result.stdout
+    assert key[:10] not in result.stdout
+
+    providers = runner.invoke(app, ["llm", "providers", "--json"])
+    assert providers.exit_code == 0, providers.output
+    row = next(
+        item
+        for item in json.loads(providers.stdout)["data"]["items"]
+        if item["provider"] == "anthropic"
+    )
+    assert row["configured"] is True
+    assert row["key_source"] == "encrypted_file"
+    assert row["masked"] == "****4f2a"
+    assert key not in providers.stdout
+    assert key[:10] not in providers.stdout
+    assert key.encode() not in database_path(settings).read_bytes()
+
+
+def test_llm_key_set_refuses_to_read_a_key_from_argv(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    _configure(monkeypatch, tmp_path)
+    _memory_backend(monkeypatch)
+    key = "sk-cli-argv-SENTINEL"
+
+    result = CliRunner().invoke(app, ["llm", "key", "set", "--provider", "anthropic", "--key", key])
+
+    assert result.exit_code == 2
+    assert key not in result.output
+
+
+def test_llm_key_set_without_stdin_is_refused_and_writes_nothing(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    _configure(monkeypatch, tmp_path)
+    backend = _memory_backend(monkeypatch)
+
+    result = CliRunner().invoke(app, ["llm", "key", "set", "--provider", "anthropic", "--json"])
+
+    assert result.exit_code == 2, result.output
+    assert json.loads(result.stdout)["error"]["code"] == "VALIDATION_FAILED"
+    assert backend.values == {}
+
+
+def test_llm_key_delete_removes_the_key_and_audits_it(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    settings = _configure(monkeypatch, tmp_path)
+    _memory_backend(monkeypatch)
+    runner = CliRunner()
+    key = "sk-cli-delete-9b71"
+
+    runner.invoke(app, ["llm", "key", "set", "--provider", "deepseek", "--stdin"], input=f"{key}\n")
+    deleted = runner.invoke(app, ["llm", "key", "delete", "--provider", "deepseek"])
+
+    assert deleted.exit_code == 0, deleted.output
+    assert key not in deleted.stdout
+    # The reported state must be truthful after the delete, not "key unchanged".
+    assert "key unset" in deleted.stdout
+    json_deleted = runner.invoke(app, ["llm", "key", "delete", "--provider", "deepseek", "--json"])
+    assert json_deleted.exit_code == 0, json_deleted.output
+    assert json.loads(json_deleted.stdout)["data"]["key_source"] == "unset"
+    providers = runner.invoke(app, ["llm", "providers", "--json"])
+    row = next(
+        item
+        for item in json.loads(providers.stdout)["data"]["items"]
+        if item["provider"] == "deepseek"
+    )
+    assert row["configured"] is False
+    assert row["key_source"] == "unset"
+    assert row["masked"] is None
+
+    store = SqliteStore(settings)
+    events = [event.event_type for event in store.list_audit_events()]
+    assert sorted(events) == ["SECRET_ADDED", "SECRET_DELETED"]
+    assert key.encode() not in database_path(settings).read_bytes()

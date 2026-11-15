@@ -13,10 +13,10 @@ import random
 import threading
 import time
 import uuid
-from collections.abc import Callable
+from collections.abc import Callable, Mapping
 from dataclasses import dataclass, replace
 from datetime import datetime, timedelta
-from typing import Any, cast
+from typing import Any, Protocol, cast
 
 import structlog
 
@@ -28,6 +28,7 @@ from oft.application.llm_validation import (
     validate_output,
 )
 from oft.config import Settings
+from oft.domain.llm_settings import MASK_PREFIX
 from oft.domain.prompts import rendered_prompt_hash
 from oft.domain.time import utc_timestamp
 from oft.ports.clock import ClockPort
@@ -268,22 +269,33 @@ class LLMRuntimeRegistry:
         self._settings = settings
         self.breaker = CircuitBreaker(clock=clock)
         self._semaphores: dict[str, threading.BoundedSemaphore] = {}
+        self._limits: dict[str, int] = {}
         self._lock = threading.Lock()
 
+    def update_settings(self, settings: Settings | None) -> None:
+        """Adopt a freshly refreshed settings snapshot for the next limit read."""
+        with self._lock:
+            self._settings = settings
+
+    def limit(self, provider: str) -> int:
+        """The configured concurrency cap for one provider (never guessed)."""
+        if self._settings is None:
+            return 1 if provider == "deepseek" else 2
+        if provider == "deepseek":
+            return int(self._settings.llm_max_concurrency_deepseek)
+        return int(self._settings.llm_max_concurrency)
+
     def semaphore(self, provider: str) -> threading.BoundedSemaphore:
+        limit = self.limit(provider)
         with self._lock:
             existing = self._semaphores.get(provider)
-            if existing is not None:
+            if existing is not None and self._limits.get(provider) == limit:
                 return existing
-            limit = 1 if provider == "deepseek" else 2
-            if self._settings is not None:
-                limit = (
-                    self._settings.llm_max_concurrency_deepseek
-                    if provider == "deepseek"
-                    else self._settings.llm_max_concurrency
-                )
+            # A saved concurrency change takes effect on the next call. In-flight
+            # callers keep the old permit; new callers share the new semaphore.
             created = threading.BoundedSemaphore(limit)
             self._semaphores[provider] = created
+            self._limits[provider] = limit
             return created
 
 
@@ -1071,18 +1083,94 @@ def capability_payload(record: ProviderCapabilityRecord | None) -> dict[str, Any
     }
 
 
-def provider_catalog(settings: Settings, store: StorePort) -> list[dict[str, Any]]:
-    """Provider presence, role models, and the recorded capability chip."""
+class ProviderKeyStatus(Protocol):
+    """The key-shaped fields a provider row may expose (structural contract).
+
+    :class:`oft.application.secrets_service.SecretStatus` satisfies it; the
+    protocol keeps this module free of an application→application import that
+    would pull the adapter layer into every orchestrator consumer.
+    """
+
+    @property
+    def provider(self) -> str: ...
+
+    @property
+    def configured(self) -> bool: ...
+
+    @property
+    def key_source(self) -> str: ...
+
+    @property
+    def masked(self) -> str | None: ...
+
+    @property
+    def fingerprint(self) -> str | None: ...
+
+    @property
+    def updated_at(self) -> str | None: ...
+
+    @property
+    def updated_by(self) -> str | None: ...
+
+
+def provider_catalog(
+    settings: Settings,
+    store: StorePort,
+    *,
+    statuses: Mapping[str, ProviderKeyStatus] | None = None,
+) -> list[dict[str, Any]]:
+    """Provider presence, masked key metadata, role models, and the chip.
+
+    ``statuses`` is the :class:`SecretsService` truth for each provider. When it
+    is supplied every key field comes from it, so a metadata row whose store is
+    unavailable reports ``configured: false, key_source: "unavailable"`` exactly
+    like ``/api/v1/settings/llm`` instead of claiming a stored key.
+    """
     capabilities = {record.provider: record for record in store.list_provider_capabilities()}
+    metadata = {
+        record.provider: record for record in store.list_secret_meta() if record.name == "api_key"
+    }
     roles = role_models(settings)
     rows: list[dict[str, Any]] = []
     for name in REAL_PROVIDERS:
-        configured = provider_configured(settings, name)
+        status = statuses.get(name) if statuses is not None else None
+        if status is not None:
+            configured = status.configured
+            key_source = status.key_source
+            masked = status.masked
+            fingerprint = status.fingerprint
+            updated_at = status.updated_at
+            updated_by = status.updated_by
+        else:
+            configured = provider_configured(settings, name)
+            meta = metadata.get(name)
+            if meta is not None and configured:
+                key_source = "stored"
+                masked = f"{MASK_PREFIX}{meta.last4}"
+                fingerprint = meta.fingerprint
+                updated_at = meta.updated_at
+                updated_by = meta.updated_by
+            elif configured:
+                key_source = "env"
+                masked = None
+                fingerprint = None
+                updated_at = None
+                updated_by = None
+            else:
+                key_source = "unset"
+                masked = None
+                fingerprint = None
+                updated_at = None
+                updated_by = None
         rows.append(
             {
                 "provider": name,
                 "configured": configured,
-                "key_source": "env" if configured else "unset",
+                "key_source": key_source,
+                "masked": masked,
+                "fingerprint": fingerprint,
+                "updated_at": updated_at,
+                "updated_by": updated_by,
                 "roles": dict(roles),
                 "capability": capability_payload(capabilities.get(name)),
             }

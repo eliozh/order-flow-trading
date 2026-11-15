@@ -19,6 +19,8 @@ from pydantic import (
 )
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
+from oft.domain.llm_settings import MAX_CONCURRENCY
+
 if TYPE_CHECKING:
     from oft.domain.pricing import PriceTable
 
@@ -117,8 +119,8 @@ class Settings(BaseSettings):
     llm_anthropic_base_url: str = DEFAULT_ANTHROPIC_BASE_URL
     llm_deepseek_base_url: str = DEFAULT_DEEPSEEK_BASE_URL
     llm_price_table: Path | None = None
-    llm_max_concurrency: int = Field(default=2, ge=1)
-    llm_max_concurrency_deepseek: int = Field(default=1, ge=1)
+    llm_max_concurrency: int = Field(default=2, ge=1, le=MAX_CONCURRENCY)
+    llm_max_concurrency_deepseek: int = Field(default=1, ge=1, le=MAX_CONCURRENCY)
 
     # Budget thresholds (ADR-0005 defaults; operator rows override at runtime).
     budget_daily_usd: str = "10.00"
@@ -187,7 +189,17 @@ class Settings(BaseSettings):
         if value is None:
             return None
         normalized = value.strip().lower()
-        return normalized or None
+        if not normalized:
+            return None
+        # ``stub`` is the environment-only test transport; the real providers
+        # are the persisted vocabulary. An unknown value is a startup error, not
+        # a late ``LLMSettingsValidationError`` traceback from composition.
+        if normalized not in {"openai", "anthropic", "deepseek", "stub"}:
+            raise ValueError(
+                "llm_provider must be one of: openai, anthropic, deepseek, stub; "
+                f"got {normalized!r}"
+            )
+        return normalized
 
     @field_validator("management_cadence")
     @classmethod

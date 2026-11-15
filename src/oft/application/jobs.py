@@ -215,6 +215,8 @@ class ScanContainer(Protocol):
     @property
     def scan_lock(self) -> Any: ...
 
+    def refresh_llm_settings(self) -> Any: ...
+
 
 def _new_run_id(job_type: str, now: datetime) -> str:
     return f"JOB-{job_type.upper()}-{now:%Y%m%d%H%M%S}-{uuid.uuid4().hex[:8].upper()}"
@@ -825,6 +827,10 @@ class ScheduledScanRunner:
         total_tokens = 0
         total_cost = Decimal("0")
         any_unpriced = False
+        # One refresh per batch, captured once: every symbol then uses the same
+        # immutable provider/model/base URL/key snapshot, so a provider change
+        # mid-batch cannot leave the batch internally inconsistent.
+        batch_effective = self._container.refresh_llm_settings()
 
         def _finish_symbol(
             symbol: str,
@@ -916,6 +922,8 @@ class ScheduledScanRunner:
                     container=self._container,  # type: ignore[arg-type]
                     lock=self._container.scan_lock,
                     on_stage=_stage,
+                    refresh_llm=False,
+                    effective=batch_effective,
                 ).run(
                     ScanRequest(
                         symbol=symbol,

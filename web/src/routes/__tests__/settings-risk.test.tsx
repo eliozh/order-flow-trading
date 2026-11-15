@@ -806,12 +806,7 @@ describe('SettingsRiskPage', () => {
     // One rotation supplied the confirmed request key; the ambiguous outcome
     // rotates again so the next save starts on a fresh key.
     expect(rotate).toHaveBeenCalledTimes(2)
-    expect(update).toHaveBeenNthCalledWith(
-      2,
-      { per_trade_risk_pct: 1.0 },
-      true,
-      'rotated-risk-key',
-    )
+    expect(update).toHaveBeenNthCalledWith(2, { per_trade_risk_pct: 1.0 }, true, 'rotated-risk-key')
   })
 
   it('does not call the API when the form is saved unchanged', async () => {

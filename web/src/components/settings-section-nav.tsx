@@ -1,6 +1,6 @@
 /** The settings section index shared by the shell and every settings screen. */
 
-export type SettingsSectionId = 'scan' | 'risk'
+export type SettingsSectionId = 'scan' | 'risk' | 'llm'
 
 interface SettingsSectionNavProps {
   active: 'overview' | SettingsSectionId
@@ -10,6 +10,7 @@ const ITEMS: { id: 'overview' | SettingsSectionId; href: string; label: string }
   { id: 'overview', href: '/settings', label: '概览 / Overview' },
   { id: 'scan', href: '/settings/scan', label: '扫描与排程 / Scan' },
   { id: 'risk', href: '/settings/risk', label: '风险上限 / Risk' },
+  { id: 'llm', href: '/settings/llm', label: 'LLM providers / LLM' },
 ]
 
 export function SettingsSectionNav({ active }: SettingsSectionNavProps) {

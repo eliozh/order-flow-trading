@@ -154,7 +154,8 @@ def test_config_rows_round_trip_without_secret_fields(tmp_path: Path) -> None:
     assert [item.key for item in store.list_config()] == [SCAN_PERIOD_KEY]
     raw = (settings.data_dir / "oft.db").read_bytes()
     assert b"api_key" not in raw
-    assert b"secret" not in raw
+    assert b"secret_value" not in raw
+    assert b"sk-" not in raw
 
 
 def _config_shape(settings: Settings) -> dict[str, Any]:
@@ -193,7 +194,7 @@ def test_fresh_database_matches_a_migrated_v25_database(tmp_path: Path) -> None:
     migrated = _config_shape(migrated_settings)
 
     assert fresh == migrated
-    assert fresh["version"] == 27
+    assert fresh["version"] == 29
     column_names = [column[1] for column in fresh["columns"]]
     assert column_names == ["key", "value_json", "updated_at", "updated_by"]
     assert any(name == "config_updated_at" for name, _sql in fresh["indexes"])

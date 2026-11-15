@@ -558,10 +558,16 @@ def _run_metrics_scan(request: Request, payload: ScanCreateRequest) -> dict[str,
     heartbeat = threading.Thread(target=_heartbeat, daemon=True)
     heartbeat.start()
     try:
+        # Resolve the persisted LLM overlay once before the scan reads the
+        # provider name/model, and freeze that snapshot for every stage so a
+        # concurrent save cannot mix snapshots within one request.
+        effective = container.refresh_llm_settings()
         run = ScanService(
             container=container,
             lock=container.scan_lock,
             on_stage=_record_stage(container, scan_id, payload.symbol, started_at),
+            refresh_llm=False,
+            effective=effective,
         ).run(
             ScanRequest(
                 symbol=payload.symbol,

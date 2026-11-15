@@ -26,6 +26,7 @@ from oft.adapters.sqlite_prompt_store import PromptStoreMixin
 from oft.adapters.sqlite_scan_store import ScanStoreMixin
 from oft.adapters.sqlite_schema import _period_parts as _period_parts
 from oft.adapters.sqlite_schema import database_path, initialize_database
+from oft.adapters.sqlite_secrets_store import SecretStoreMixin
 from oft.adapters.sqlite_symbol_store import SymbolStoreMixin
 from oft.config import Settings
 from oft.ports.store import AuditEventDraft, AuditEventRecord
@@ -42,6 +43,7 @@ class SqliteStore(
     BackfillStoreMixin,
     JobStoreMixin,
     PromptStoreMixin,
+    SecretStoreMixin,
     ConfigStoreMixin,
     SqliteConnectionMixin,
     SqliteAuditMixin,

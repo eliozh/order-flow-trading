@@ -5,11 +5,12 @@ from __future__ import annotations
 import json
 from pathlib import Path
 
+import pytest
 from typer.testing import CliRunner
 
 from oft.bootstrap import get_status
 from oft.cli.main import app
-from oft.config import Settings
+from oft.config import ConfigError, Settings, load_settings
 
 
 def _configure_cli(monkeypatch, tmp_path: Path) -> Settings:
@@ -147,3 +148,70 @@ def test_open_without_a_daemon_reports_an_error(monkeypatch, tmp_path: Path) -> 
 
     assert result.exit_code == 1
     assert "oft serve" in _combined_output(result)
+
+
+def test_an_unknown_env_provider_is_config_invalid_without_a_traceback(
+    monkeypatch, tmp_path: Path
+) -> None:
+    """H2: an unknown OFT_LLM_PROVIDER is typed at load and in the CLI."""
+    _configure_cli(monkeypatch, tmp_path)
+    monkeypatch.setenv("OFT_LLM_PROVIDER", "bogus")
+
+    with pytest.raises(ConfigError) as caught:
+        load_settings()
+    assert caught.value.code == "CONFIG_INVALID"
+
+    result = CliRunner().invoke(app, ["status", "--json"])
+
+    assert result.exit_code == 5, result.output
+    payload = json.loads(result.stdout)
+    assert payload["error"]["code"] == "CONFIG_INVALID"
+    assert "traceback" not in _combined_output(result).lower()
+
+
+def test_refresh_converts_a_setting_validation_error_to_config_invalid(
+    monkeypatch, tmp_path: Path
+) -> None:
+    """H2: the refresh path never leaks an untyped validation error."""
+    _configure_cli(monkeypatch, tmp_path)
+    import oft.bootstrap as bootstrap_module
+    from oft.domain.settings import SettingValidationError
+
+    settings = Settings(env="test", port=8765, data_dir=tmp_path / "data")
+    container = bootstrap_module.build_container(settings)
+
+    def _raise(*_args: object, **_kwargs: object) -> None:
+        raise SettingValidationError("bad provider")
+
+    monkeypatch.setattr(bootstrap_module, "resolve_effective_llm_settings", _raise)
+    with pytest.raises(ConfigError) as caught:
+        container.refresh_llm_settings()
+    assert caught.value.code == "CONFIG_INVALID"
+
+
+def test_the_inner_env_provider_conversion_is_a_config_error(tmp_path: Path) -> None:
+    """M-N: ``_env_provider`` itself converts a validation failure."""
+    import oft.bootstrap as bootstrap_module
+
+    settings = Settings.model_construct(llm_provider="bogus", data_dir=tmp_path / "data")
+    with pytest.raises(ConfigError) as caught:
+        bootstrap_module.build_container(settings)
+    assert caught.value.code == "CONFIG_INVALID"
+    assert "OFT_LLM_PROVIDER" in caught.value.message
+
+
+def test_a_short_master_key_without_a_keyring_still_runs_status(
+    monkeypatch, tmp_path: Path
+) -> None:
+    """H3: selection never raises during composition; status still works."""
+    from oft.adapters import keyring_secrets as keyring_module
+
+    _configure_cli(monkeypatch, tmp_path)
+    monkeypatch.setenv("OFT_MASTER_KEY", "too-short")
+    monkeypatch.setattr(keyring_module, "keyring_available", lambda: False)
+
+    result = CliRunner().invoke(app, ["status", "--json"])
+
+    assert result.exit_code == 0, result.output
+    assert json.loads(result.stdout)["ok"] is True
+    assert "traceback" not in _combined_output(result).lower()

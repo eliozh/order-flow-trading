@@ -123,7 +123,11 @@ class ScanContainer(Protocol):
     @property
     def llm_runtime(self) -> LLMRuntimeRegistry | None: ...
 
-    def provider_for(self, requested: str | None = None) -> LLMPort | None: ...
+    def provider_for(
+        self, requested: str | None = None, *, effective: Settings | None = None
+    ) -> LLMPort | None: ...
+
+    def refresh_llm_settings(self) -> Settings: ...
 
 
 @dataclass(frozen=True)
@@ -529,11 +533,19 @@ class ScanService:
         lock: threading.Lock | None = None,
         inputs: MetricInputs | None = None,
         on_stage: Callable[[str], None] | None = None,
+        refresh_llm: bool = True,
+        effective: Settings | None = None,
     ) -> None:
         self._container = container
         self._lock = lock or threading.Lock()
         self._inputs = inputs
         self._on_stage = on_stage
+        # A batch/request refreshes once and passes both ``refresh_llm=False``
+        # and the captured ``effective`` snapshot; every symbol then uses that
+        # one immutable snapshot instead of re-reading config, secret metadata,
+        # and the OS keyring per symbol.
+        self._refresh_llm = refresh_llm
+        self._effective = effective
 
     def _stage(self, name: str) -> None:
         if self._on_stage is not None:
@@ -748,11 +760,21 @@ class ScanService:
         report_id: str,
     ) -> tuple[dict[str, Any], str | None, str | None, tuple[str, ...]]:
         """Run the optional LLM stage; never fail the scan when it is unavailable."""
-        provider_name = (request.provider or container.settings.llm_provider or "").strip()
         if request.metrics_only:
             return {"configured": False, "reason": LLM_DISABLED_REASON}, None, None, ()
+        # Batch and scheduled runs construct one service over many symbols. A
+        # caller that refreshes once passes ``effective`` (and
+        # ``refresh_llm=False``) so every symbol uses the same frozen snapshot;
+        # without one, only an explicit ``refresh_llm`` re-reads the overlay.
+        if self._effective is not None:
+            effective = self._effective
+        elif self._refresh_llm:
+            effective = container.refresh_llm_settings()
+        else:
+            effective = container.settings
+        provider_name = (request.provider or effective.llm_provider or "").strip()
         if request.source == "live":
-            verdict = check_live_source(container.settings, container.clock)
+            verdict = check_live_source(effective, container.clock)
             if not verdict.fresh:
                 return (
                     {
@@ -770,7 +792,7 @@ class ScanService:
                 None,
                 (),
             )
-        provider = container.provider_for(provider_name)
+        provider = container.provider_for(provider_name, effective=effective)
         if provider is None:
             return (
                 {"configured": False, "reason": LLM_PROVIDER_NOT_CONFIGURED_REASON},
@@ -778,7 +800,7 @@ class ScanService:
                 None,
                 (),
             )
-        if not provider_configured(container.settings, provider_name):
+        if not provider_configured(effective, provider_name):
             # A named provider without a key must not call out and degrade with
             # an auth error; report the explicit configuration reason (M16).
             return (
@@ -795,7 +817,7 @@ class ScanService:
                 store=container.store,
                 clock=container.clock,
                 provider=provider,
-                settings=container.settings,
+                settings=effective,
                 runtime=container.llm_runtime,
             )
             outcome = service.analyze(

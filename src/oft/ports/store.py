@@ -522,6 +522,33 @@ class ConfigRecord:
 
 
 @dataclass(frozen=True)
+class SecretMetaRecord:
+    """Write-only secret metadata; the value is never part of this record.
+
+    ``fingerprint`` is a SHA-256 of the key (used to detect a rotation) and
+    ``last4`` is the only part of the value a surface may render. ``backend``
+    records which secret store holds the value so a later read/delete targets
+    its provenance (``"unknown"`` for rows written before v29).
+    """
+
+    provider: str
+    name: str
+    fingerprint: str
+    last4: str
+    updated_at: str
+    updated_by: str
+    backend: str = "unknown"
+
+
+@dataclass(frozen=True)
+class SecretChangePlan:
+    """The outcome of one secret-metadata transaction (``None`` deletes)."""
+
+    record: SecretMetaRecord | None
+    audit: AuditEventDraft | None
+
+
+@dataclass(frozen=True)
 class AuditEventRecord:
     event_id: str
     seq: int
@@ -1347,5 +1374,26 @@ class StorePort(Protocol):
         ``None``). ``before`` values derived inside the callback are therefore
         accurate under concurrency. Returns the committed row (or the existing
         row when nothing was written) and the committed audit record, if any.
+        """
+        ...
+
+    # -- Write-only secret metadata --------------------------------------
+
+    def get_secret_meta(self, provider: str, name: str = "api_key") -> SecretMetaRecord | None: ...
+
+    def list_secret_meta(self) -> tuple[SecretMetaRecord, ...]: ...
+
+    def save_secret_change(
+        self,
+        provider: str,
+        name: str,
+        build: Callable[[SecretMetaRecord | None], SecretChangePlan | None],
+    ) -> tuple[SecretMetaRecord | None, AuditEventRecord | None]:
+        """Read-modify-write one secret's metadata atomically.
+
+        The plaintext value is handled by the secret backend outside SQLite.
+        ``build`` receives the committed metadata row and returns either a plan
+        (upsert when ``record`` is set, delete when it is ``None``) plus an
+        optional audit draft, or ``None`` for a deterministic no-op.
         """
         ...
