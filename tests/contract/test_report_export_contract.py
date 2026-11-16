@@ -128,6 +128,8 @@ def test_json_export_validates_as_the_envelope_with_contract_sections(
     body = json.loads(response.text)
     _validate("api-envelope.schema.json", body)
     assert body["ok"] is True
+    # This harness runs a metrics-only scan, so the export has no LLM block.
+    assert body["meta"]["provenance"] == "CALC"
     assert body["data"]["report_id"] == report_id
     _validate("market-snapshot.schema.json", body["data"]["snapshot"])
     _validate("orderflow-metrics.schema.json", body["data"]["metrics"])
@@ -152,6 +154,27 @@ def test_invalid_format_error_envelope_validates(tmp_path: Path) -> None:
     assert body["error"]["code"] == "VALIDATION_FAILED"
 
 
+def _assert_local_refs_resolve(document: dict[str, Any]) -> None:
+    """Fail on any local ``$ref`` that does not resolve in the OpenAPI document."""
+
+    def walk(node: Any) -> None:
+        if isinstance(node, dict):
+            ref = node.get("$ref")
+            if isinstance(ref, str) and ref.startswith("#/"):
+                target: Any = document
+                for raw in ref[2:].split("/"):
+                    part = raw.replace("~1", "/").replace("~0", "~")
+                    assert isinstance(target, dict) and part in target, f"dangling $ref {ref}"
+                    target = target[part]
+            for value in node.values():
+                walk(value)
+        elif isinstance(node, list):
+            for item in node:
+                walk(item)
+
+    walk(document)
+
+
 def test_the_export_route_exposes_no_caller_path_parameter(tmp_path: Path) -> None:
     harness = _harness(tmp_path)
     try:
@@ -172,7 +195,19 @@ def test_the_export_route_exposes_no_caller_path_parameter(tmp_path: Path) -> No
     success = operation["responses"]["200"]
     assert set(success["content"]) == {"text/markdown", "application/json"}
     assert success["content"]["text/markdown"]["schema"] == {"type": "string"}
-    assert success["content"]["application/json"]["schema"] == {"type": "object"}
+    json_schema = success["content"]["application/json"]["schema"]
+    components = schema.get("components", {}).get("schemas", {})
+    # The JSON response is the shared typed envelope, registered once in
+    # components and referenced, so its meta ``$ref`` resolves at the document
+    # root (an inline ``model_json_schema()`` would leave dangling ``#/$defs``).
+    ref = json_schema.get("$ref", "")
+    assert ref.startswith("#/components/schemas/"), json_schema
+    component = components[ref.rsplit("/", 1)[-1]]
+    properties = component["properties"]
+    assert {"ok", "data", "error", "meta"} <= set(properties)
+    assert {"ok", "data", "meta"} <= set(component["required"])
+    assert properties["meta"]["$ref"] == "#/components/schemas/EnvelopeMeta"
+    _assert_local_refs_resolve(schema)
     assert {name.lower() for name in success["headers"]} >= {
         "content-disposition",
         "x-oft-calc-blocks",

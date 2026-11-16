@@ -111,8 +111,8 @@ def test_markdown_export_is_an_attachment_with_calc_llm_and_provenance(
     assert llm["narrative"] in text
     for opportunity_id in llm["opportunity_ids"]:
         assert opportunity_id in text
-    # The metrics/snapshot stamps from the frozen report survive verbatim and
-    # drive each CALC row instead of the placeholder.
+    # The metrics stamp is the per-CALC-row fallback; the snapshot stamp is a
+    # separate row in the stamps table.
     metrics_quality = detail["metrics"]["data_quality"]
     snapshot_quality = detail["snapshot"]["data_quality"]
     assert f"| metrics | {metrics_quality} |" in text
@@ -131,6 +131,10 @@ def test_json_export_is_the_shared_envelope_as_an_attachment(tmp_path: Path) -> 
     harness = _harness(tmp_path)
     try:
         report_id = _create_report(harness)
+        detail_envelope = harness.client.get(
+            f"/api/v1/reports/{report_id}", headers=harness.auth
+        ).json()
+        detail = detail_envelope["data"]
         response = _export(harness, report_id, "json")
     finally:
         harness.client.close()
@@ -147,7 +151,9 @@ def test_json_export_is_the_shared_envelope_as_an_attachment(tmp_path: Path) -> 
     assert response.headers["x-oft-llm-blocks"] == str(counts["llm"])
     assert counts["llm"] == 1
     assert body["ok"] is True
-    assert body["meta"]["provenance"] == "CALC"
+    # The stub LLM produced a narrative, so both views report mixed provenance.
+    assert body["meta"]["provenance"] == "MIXED"
+    assert detail_envelope["meta"]["provenance"] == "MIXED"
     data = body["data"]
     assert data["report_id"] == report_id
     assert data["snapshot"]["symbol"] == "BTCUSDT"
@@ -156,6 +162,9 @@ def test_json_export_is_the_shared_envelope_as_an_attachment(tmp_path: Path) -> 
     assert data["llm"]["validation_status"] in {"VALID", "REPAIRED"}
     assert data["llm"]["prompt_version"] >= 1
     assert data["llm"]["opportunity_ids"]
+    # The exported data-quality stamps equal the frozen report's stamps.
+    assert data["metrics"]["data_quality"] == detail["metrics"]["data_quality"]
+    assert data["snapshot"]["data_quality"] == detail["snapshot"]["data_quality"]
     assert "<script" not in json.dumps(body).lower()
     assert "api_key" not in json.dumps(body).lower()
     assert "authorization" not in json.dumps(body).lower()
@@ -309,6 +318,7 @@ def test_a_hostile_stored_report_is_redacted_and_escaped_in_both_formats(
                     "validation_status": "VALID",
                     "narrative": "<script>alert('x')</script><img src=x onerror=alert(1)>",
                     "opportunity_ids": ["OPP-HOSTILE"],
+                    "reason": "the price table /var/lib/oft/prices.json is not valid",
                     "api_key": "sk-super-secret",
                     "authorization": "Bearer super-secret",
                     "prompt": "RAW-PROMPT-BODY-DO-NOT-EXPORT",
@@ -347,4 +357,14 @@ def test_a_hostile_stored_report_is_redacted_and_escaped_in_both_formats(
     assert body["data"]["llm"]["prompt_id"] == "analysis"
     assert body["data"]["llm"]["prompt_version"] == 9
     assert body["data"]["llm"]["usage"]["total_tokens"] == 42
+    # Redaction must not over-redact: the hostile text survives as inert JSON
+    # data and the opportunity id is preserved.
+    assert (
+        body["data"]["llm"]["narrative"]
+        == "<script>alert('x')</script><img src=x onerror=alert(1)>"
+    )
+    assert body["data"]["llm"]["opportunity_ids"] == ["OPP-HOSTILE"]
+    # Daemon-absolute paths in the reason are reduced to the basename.
+    assert "/var/lib/oft" not in exported_json.text
+    assert body["data"]["llm"]["reason"] == "the price table prices.json is not valid"
     assert body["meta"]["data_quality"] == "PARTIAL"

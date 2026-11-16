@@ -1,9 +1,10 @@
 """E2E: ``oft report export`` against a real loopback daemon.
 
 The daemon runs offline against the committed archive fixtures and the
-deterministic ``stub`` provider. Markdown/JSON exports are validated as
-documents, ``--stdout`` carries only the export, and ``--output`` never
-overwrites or follows a traversal path.
+deterministic ``stub`` provider. JSON exports are validated against the envelope
+schema and Markdown exports are checked by content assertions; ``--stdout``
+carries only the export, and ``--output`` never overwrites or follows a
+traversal path.
 """
 
 from __future__ import annotations
@@ -240,6 +241,7 @@ def test_md_stdout_writes_only_the_export_document(live_daemon: Settings) -> Non
 def test_json_stdout_is_the_shared_envelope(live_daemon: Settings) -> None:
     runner = CliRunner()
     report_id = _new_report(live_daemon)
+    detail = ApiClient.from_settings(live_daemon).get_report(report_id)
 
     result = _export(runner, report_id, "--format", "json", "--stdout")
 
@@ -247,8 +249,14 @@ def test_json_stdout_is_the_shared_envelope(live_daemon: Settings) -> None:
     document = json.loads(result.stdout)
     _validate_envelope(document)
     assert document["ok"] is True
-    assert document["meta"]["provenance"] == "CALC"
+    # The stub LLM produced a narrative, so the envelope is mixed provenance.
+    assert document["meta"]["provenance"] == "MIXED"
     assert document["data"]["report_id"] == report_id
+    # The exported stamps equal the stored report's stamps.
+    assert document["data"]["metrics"]["data_quality"] == detail["data"]["metrics"]["data_quality"]
+    assert (
+        document["data"]["snapshot"]["data_quality"] == detail["data"]["snapshot"]["data_quality"]
+    )
     assert result.stderr == ""
 
 
@@ -260,7 +268,9 @@ def test_output_writes_exact_bytes_names_the_path_and_leaves_no_temp(
     output_dir = tmp_path / "output"
     output_dir.mkdir()
     path = output_dir / "report.md"
-    expected, _headers = ApiClient.from_settings(live_daemon).export_report(report_id, format="md")
+    expected, _headers = ApiClient.from_settings(live_daemon).export_report(
+        report_id, export_format="md"
+    )
 
     result = _export(runner, report_id, "--format", "md", "--output", str(path))
 
@@ -359,6 +369,7 @@ def test_malformed_report_id_exits_two_with_validation_failed(live_daemon: Setti
     assert result.exit_code == 2
     assert result.stdout == ""
     assert "VALIDATION_FAILED" in result.stderr
+    assert "REQ-" in result.stderr
 
 
 def test_default_flags_and_format_normalization(live_daemon: Settings) -> None:
@@ -411,6 +422,13 @@ def test_a_hostile_stored_report_is_redacted_in_both_cli_formats(
     assert body["data"]["llm"]["prompt_id"] == "analysis"
     assert body["data"]["llm"]["prompt_version"] == 9
     assert body["data"]["llm"]["usage"]["total_tokens"] == 42
+    # Redaction must not over-redact: the hostile narrative survives as inert
+    # JSON data and the opportunity id is preserved.
+    assert (
+        body["data"]["llm"]["narrative"]
+        == "<script>alert('x')</script><img src=x onerror=alert(1)>"
+    )
+    assert body["data"]["llm"]["opportunity_ids"] == ["OPP-HOSTILE"]
 
 
 def test_missing_report_exits_one(live_daemon: Settings) -> None:
@@ -421,6 +439,8 @@ def test_missing_report_exits_one(live_daemon: Settings) -> None:
     assert result.exit_code == 1
     assert result.stdout == ""
     assert "does not exist" in result.stderr
+    # The daemon's reference id is surfaced so support can find the failure.
+    assert "REQ-" in result.stderr
 
 
 def test_invalid_format_exits_two_with_validation_failed(live_daemon: Settings) -> None:

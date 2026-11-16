@@ -1,9 +1,13 @@
-"""Deterministic, redacted Markdown/JSON rendering for report export (slice 42).
+"""Deterministic Markdown/JSON rendering for report export (slice 42).
 
 The export is a *view* of ``report_payload``; it never re-reads or re-computes a
 report, so frozen content, provenance, and data-quality stamps cannot drift.
-Every value is allowlisted and escaped: the Markdown never renders a raw tag,
-and the redactor drops secret/prompt keys before either format is built.
+Every value is allowlisted and escaped: the Markdown never renders a raw tag.
+
+The renderer does **not** redact. Redaction is a caller precondition: the route
+applies :func:`redact_report_payload` before calling either renderer, and
+:func:`render_report_json` is public and serializes exactly what it is given.
+A caller that renders an unredacted payload is responsible for that choice.
 
 This module is pure and imports only the standard library. It has no CLI or API
 coupling: the renderer is deterministic for identical input, and both surfaces
@@ -14,6 +18,7 @@ payload in the shared envelope, which carries a fresh request id per response.)
 from __future__ import annotations
 
 import json
+import re
 from collections.abc import Mapping
 from typing import Any
 
@@ -21,8 +26,8 @@ from typing import Any
 EXPORT_FORMATS: tuple[str, ...] = ("md", "json")
 
 #: Exact-key denylist (case-insensitive). It is intentionally *exact*: keys such
-#: as ``prompt_id``, ``prompt_version``, ``llm_tokens``, and ``total_tokens``
-#: are provenance metadata and must survive.
+#: as ``prompt_id``, ``prompt_version``, ``llm_tokens``, ``total_tokens``,
+#: ``cost``, and ``usage`` are provenance metadata and must survive.
 SENSITIVE_KEYS: frozenset[str] = frozenset(
     {
         "api_key",
@@ -51,8 +56,38 @@ SENSITIVE_KEYS: frozenset[str] = frozenset(
     }
 )
 
-#: The metric families the CALC table renders, in table order. Nothing outside
-#: this allowlist (or the fixed metadata fields below) reaches the Markdown.
+#: Additional spellings of the same secrets, matched by exact *normalized*
+#: equality (lowercase, ``_`` and ``-`` removed) rather than by substring. The
+#: normalized denylist above already covers keys such as ``API-KEY``; these
+#: named variants cover the provider conventions that appear in stored JSON.
+_SENSITIVE_KEY_VARIANTS: frozenset[str] = frozenset(
+    {
+        "apikey",
+        "openaiapikey",
+        "xapikey",
+        "clientsecret",
+        "secretvalue",
+    }
+)
+
+
+def _normalize_key(key: str) -> str:
+    return key.lower().replace("_", "").replace("-", "")
+
+
+_SENSITIVE_KEY_NORMALIZED: frozenset[str] = (
+    frozenset(_normalize_key(key) for key in SENSITIVE_KEYS) | _SENSITIVE_KEY_VARIANTS
+)
+
+
+def _is_sensitive_key(key: str) -> bool:
+    # Normalization subsumes the exact denylist: every denylist key's
+    # normalized form is already in the normalized set.
+    return _normalize_key(key) in _SENSITIVE_KEY_NORMALIZED
+
+
+#: Metric-family order used by the data-quality stamp scan. The CALC table
+#: reads families explicitly; this tuple only drives per-family stamp rows.
 _METRIC_FAMILIES: tuple[str, ...] = (
     "cvd",
     "volume_profile",
@@ -87,6 +122,17 @@ _ESCAPES = str.maketrans(
 
 _NO_STAMP = "—"
 
+#: C0/C1 controls that can move a cursor or start a terminal escape. Tab, CR,
+#: and LF are excluded: CR/LF are normalized to spaces and a tab is inert inline.
+_CONTROL_CHARACTERS = re.compile(r"[\x00-\x08\x0b\x0c\x0e-\x1f\x7f-\x9f]")
+
+#: Absolute POSIX paths and Windows drive paths in an error reason. Only
+#: ``llm.reason`` is passed through these; other payload strings are untouched.
+_ABSOLUTE_PATHS = (
+    re.compile(r"(?<![\w:/])/(?:[^\s/]+/)*[^\s/]+"),
+    re.compile(r"\b[A-Za-z]:\\(?:[^\\\s]+\\)*[^\\\s]+"),
+)
+
 
 def _mapping(value: Any) -> dict[str, Any]:
     return value if isinstance(value, dict) else {}
@@ -105,13 +151,17 @@ def _text(value: Any, default: str = "N/A") -> str:
 def escape_markdown_text(value: object) -> str:
     """Escape one dynamic value for inline Markdown (``''`` for ``None``).
 
-    Underscores are escaped only at a word boundary: CommonMark never turns an
-    intraword ``_`` into emphasis, so identifiers such as ``OPPORTUNITY_PROPOSAL``
-    and ``open_interest`` stay readable while ``_emphasis_`` stays inert.
+    CR/LF become spaces, dangerous C0/C1 control characters are stripped (a tab
+    is kept because it is inert inline), and the remaining Markdown/HTML
+    metacharacters are escaped. Underscores are escaped only at a word
+    boundary: CommonMark never turns an intraword ``_`` into emphasis, so
+    identifiers such as ``OPPORTUNITY_PROPOSAL`` and ``open_interest`` stay
+    readable while ``_emphasis_`` stays inert.
     """
     if value is None:
         return ""
     text = str(value).replace("\r\n", " ").replace("\r", " ").replace("\n", " ")
+    text = _CONTROL_CHARACTERS.sub("", text)
     escaped: list[str] = []
     for index, character in enumerate(text):
         if character == "_":
@@ -128,17 +178,36 @@ def _redact_value(value: Any) -> Any:
         return {
             str(key): _redact_value(item)
             for key, item in value.items()
-            if str(key).lower() not in SENSITIVE_KEYS
+            if not _is_sensitive_key(str(key))
         }
     if isinstance(value, (list, tuple)):
         return [_redact_value(item) for item in value]
     return value
 
 
+def _basename_absolute_paths(text: str) -> str:
+    """Replace absolute POSIX/Windows paths with their basename only."""
+    for pattern in _ABSOLUTE_PATHS:
+        text = pattern.sub(lambda match: match.group(0).replace("\\", "/").rsplit("/", 1)[-1], text)
+    return text
+
+
 def redact_report_payload(payload: Mapping[str, Any]) -> dict[str, Any]:
-    """Return a fresh, recursively redacted copy (drop ``SENSITIVE_KEYS``)."""
+    """Return a fresh, recursively redacted copy.
+
+    Exact ``SENSITIVE_KEYS`` and their named normalized variants (``apiKey``,
+    ``openai_api_key``, ``x-api-key``, ``client_secret``, ``secret_value``) are
+    dropped. Daemon-absolute paths inside ``llm.reason`` are reduced to their
+    basename; no other payload string is rewritten. This is the export path's
+    redaction step: both formats render the returned copy.
+    """
     redacted = _redact_value(payload)
-    return redacted if isinstance(redacted, dict) else {}
+    if not isinstance(redacted, dict):
+        return {}
+    llm = redacted.get("llm")
+    if isinstance(llm, dict) and isinstance(llm.get("reason"), str):
+        llm["reason"] = _basename_absolute_paths(llm["reason"])
+    return redacted
 
 
 def _has_items(mapping: Mapping[str, Any], key: str) -> bool:
@@ -146,7 +215,12 @@ def _has_items(mapping: Mapping[str, Any], key: str) -> bool:
 
 
 def provenance_counts(payload: Mapping[str, Any]) -> dict[str, int]:
-    """Count rendered CALC families and whether a valid LLM band is present."""
+    """Count measured CALC families plus the snapshot stamp and the LLM band.
+
+    A CALC block is credited when a family carries measured data; the snapshot
+    stamp itself counts as one block. Untrusted JSON values are type-checked
+    before membership so a list/dict value cannot raise ``TypeError``.
+    """
     metrics = _mapping(payload.get("metrics"))
     snapshot = _mapping(payload.get("snapshot"))
     llm = _mapping(payload.get("llm"))
@@ -165,21 +239,21 @@ def provenance_counts(payload: Mapping[str, Any]) -> dict[str, int]:
     liquidations = _mapping(metrics.get("liquidations"))
     count = liquidations.get("count")
     coverage = liquidations.get("coverage")
-    if (isinstance(count, int) and count > 0) or coverage in {"SINCE_DEPLOYMENT", "PARTIAL"}:
+    if (isinstance(count, int) and count > 0) or (
+        isinstance(coverage, str) and coverage in ("SINCE_DEPLOYMENT", "PARTIAL")
+    ):
         calc += 1
     if _has_items(metrics, "gaps"):
         calc += 1
     if snapshot.get("data_quality"):
         calc += 1
 
+    status = llm.get("validation_status")
     llm_blocks = (
         1
         if bool(llm.get("configured"))
-        and llm.get("validation_status")
-        in {
-            "VALID",
-            "REPAIRED",
-        }
+        and isinstance(status, str)
+        and status in ("VALID", "REPAIRED")
         else 0
     )
     return {"calc": calc, "llm": llm_blocks}
@@ -280,10 +354,24 @@ def _quality_stamp_rows(metrics: Mapping[str, Any], snapshot: Mapping[str, Any])
     ]
 
 
+def is_configuration_reason(reason: str) -> bool:
+    """True when a ``configured=false`` reason is a configuration skip.
+
+    ``LLM_DISABLED_REASON`` starts "LLM not configured" and
+    ``LLM_PROVIDER_NOT_CONFIGURED_REASON`` starts
+    ``LLM_PROVIDER_NOT_CONFIGURED``; every other skip (for example
+    ``LIVE_DATA_STALE``) is not a configuration failure.
+    """
+    lowered = reason.lower()
+    return lowered.startswith("llm not configured") or lowered.startswith(
+        "llm_provider_not_configured"
+    )
+
+
 def _llm_lines(llm: Mapping[str, Any]) -> list[str]:
     configured = bool(llm.get("configured"))
     status = llm.get("validation_status")
-    if configured and status in {"VALID", "REPAIRED"}:
+    if configured and isinstance(status, str) and status in ("VALID", "REPAIRED"):
         narrative = llm.get("narrative") or llm.get("rationale") or "(no narrative)"
         return [f"LLM › {escape_markdown_text(narrative)}"]
     if configured:
@@ -295,8 +383,8 @@ def _llm_lines(llm: Mapping[str, Any]) -> list[str]:
     reason = _text(llm.get("reason"), "LLM not configured; no narrative or decision was generated.")
     notice = (
         escape_markdown_text(reason)
-        if reason.lower().startswith("llm not configured")
-        else f"LLM not configured — {escape_markdown_text(reason)}"
+        if is_configuration_reason(reason)
+        else f"LLM skipped — {escape_markdown_text(reason)}"
     )
     return [
         notice,
@@ -305,7 +393,12 @@ def _llm_lines(llm: Mapping[str, Any]) -> list[str]:
 
 
 def render_report_markdown(payload: Mapping[str, Any]) -> str:
-    """Render the allowlisted Markdown export; exactly one trailing newline."""
+    """Render the allowlisted Markdown export; exactly one trailing newline.
+
+    This renderer does not redact: pass a payload already processed by
+    :func:`redact_report_payload` (as the route does) when it may contain
+    secrets or raw prompts. Values are still HTML/Markdown-escaped here.
+    """
     report_id = payload.get("report_id")
     symbol = payload.get("symbol")
     timeframe = payload.get("timeframe")
@@ -370,14 +463,19 @@ def render_report_markdown(payload: Mapping[str, Any]) -> str:
 
 
 def render_report_json(envelope: Mapping[str, Any]) -> str:
-    """Serialize the shared envelope deterministically (sorted, 2-space, UTF-8)."""
-    return json.dumps(envelope, indent=2, sort_keys=True, ensure_ascii=False) + "\n"
+    """Serialize the shared envelope deterministically (sorted, 2-space, UTF-8).
+
+    The renderer does not redact: it serializes exactly the mapping it is given,
+    so the caller applies :func:`redact_report_payload` first when needed.
+    """
+    return json.dumps(dict(envelope), indent=2, sort_keys=True, ensure_ascii=False) + "\n"
 
 
 __all__ = [
     "EXPORT_FORMATS",
     "SENSITIVE_KEYS",
     "escape_markdown_text",
+    "is_configuration_reason",
     "provenance_counts",
     "redact_report_payload",
     "render_report_json",

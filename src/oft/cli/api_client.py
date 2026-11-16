@@ -2,8 +2,10 @@
 
 from __future__ import annotations
 
+import http.client
 import json
 import os
+import re
 import urllib.error
 import urllib.request
 from typing import Any, cast
@@ -14,15 +16,48 @@ from oft.config import Settings
 
 _JSON_HEADERS = {"Accept": "application/json", "Content-Type": "application/json"}
 
+#: Daemon-supplied diagnostics are untrusted text: one bounded line, no controls.
+_CONTROL_CHARACTERS = re.compile(r"[\x00-\x1f\x7f-\x9f]")
+_MAX_ERROR_TEXT = 500
+#: Catalog codes are uppercase words; anything else is an internal failure.
+_ERROR_CODE = re.compile(r"^[A-Z][A-Z0-9_]{0,63}$")
+#: ``new_request_id()`` emits ``REQ-`` plus uppercase hex.
+_REFERENCE_ID = re.compile(r"^REQ-[A-Za-z0-9]{1,64}$")
+
+
+def _safe_error_text(value: str) -> str:
+    """Return a control-stripped, length-bounded one-line diagnostic."""
+    return _CONTROL_CHARACTERS.sub("", value)[:_MAX_ERROR_TEXT]
+
+
+def _safe_error_code(value: object) -> str:
+    if isinstance(value, str) and _ERROR_CODE.fullmatch(value):
+        return value
+    return "INTERNAL_ERROR"
+
+
+def _safe_reference_id(value: object) -> str | None:
+    if isinstance(value, str) and _REFERENCE_ID.fullmatch(value):
+        return value
+    return None
+
 
 class ApiClientError(Exception):
     """A typed API failure; ``code`` matches ``error-catalog.json``."""
 
-    def __init__(self, code: str, message: str, *, status: int | None = None) -> None:
+    def __init__(
+        self,
+        code: str,
+        message: str,
+        *,
+        status: int | None = None,
+        reference_id: str | None = None,
+    ) -> None:
         super().__init__(message)
         self.code = code
         self.message = message
         self.status = status
+        self.reference_id = reference_id
 
 
 class ApiClient:
@@ -46,20 +81,43 @@ class ApiClient:
     ) -> ApiClientError:
         """Map a transport failure to the typed error both request paths raise."""
         if isinstance(exc, urllib.error.HTTPError):
-            body = exc.read().decode("utf-8")
+            # The daemon normally sends UTF-8 JSON, but a proxy or crash can
+            # return arbitrary bytes -- or fail mid-body. Neither may raise past
+            # the CLI or escape the typed-error contract.
+            try:
+                raw_body = exc.read()
+            except (http.client.HTTPException, OSError) as read_exc:
+                return ApiClientError(
+                    "INTERNAL_ERROR",
+                    f"Could not read the daemon error body: {_safe_error_text(str(read_exc))}",
+                    status=exc.code,
+                )
+            body = raw_body.decode("utf-8", errors="replace")
+            safe_body = _safe_error_text(body)
             try:
                 envelope = json.loads(body)
             except json.JSONDecodeError:
-                return ApiClientError("INTERNAL_ERROR", body, status=exc.code)
-            error = envelope.get("error") or {}
+                return ApiClientError("INTERNAL_ERROR", safe_body, status=exc.code)
+            error = envelope.get("error") if isinstance(envelope, dict) else None
+            if not isinstance(error, dict):
+                return ApiClientError("INTERNAL_ERROR", safe_body, status=exc.code)
+            message = error.get("message")
             return ApiClientError(
-                error.get("code", "INTERNAL_ERROR"),
-                error.get("message", body),
+                _safe_error_code(error.get("code")),
+                _safe_error_text(message) if isinstance(message, str) and message else safe_body,
                 status=exc.code,
+                reference_id=_safe_reference_id(error.get("reference_id")),
             )
         return ApiClientError(
             "DAEMON_NOT_RUNNING",
             f"Local daemon is not reachable at {self._base_url}: {exc}",
+        )
+
+    def _malformed_response_error(self, exc: http.client.HTTPException) -> ApiClientError:
+        """Map a truncated/malformed HTTP response to a typed internal error."""
+        return ApiClientError(
+            "INTERNAL_ERROR",
+            f"Malformed HTTP response from {self._base_url}: {_safe_error_text(str(exc))}",
         )
 
     def _request(
@@ -86,6 +144,8 @@ class ApiClient:
             raise self._api_client_error(exc) from exc
         except (urllib.error.URLError, TimeoutError, OSError) as exc:
             raise self._api_client_error(exc) from exc
+        except http.client.HTTPException as exc:
+            raise self._malformed_response_error(exc) from exc
 
     def create_scan(
         self, payload: dict[str, Any], *, idempotency_key: str | None = None
@@ -116,11 +176,12 @@ class ApiClient:
     def get_report(self, report_id: str) -> dict[str, Any]:
         return self._request("GET", f"/api/v1/reports/{quote(report_id, safe='')}")
 
-    def export_report(self, report_id: str, *, format: str) -> tuple[bytes, dict[str, str]]:
+    def export_report(self, report_id: str, *, export_format: str) -> tuple[bytes, dict[str, str]]:
         """Fetch a report export; return the raw body plus lowercase headers."""
         return self._request_bytes(
             "GET",
-            f"/api/v1/reports/{quote(report_id, safe='')}/export?format={quote(format, safe='')}",
+            f"/api/v1/reports/{quote(report_id, safe='')}/export"
+            f"?format={quote(export_format, safe='')}",
         )
 
     def _request_bytes(self, method: str, path: str) -> tuple[bytes, dict[str, str]]:
@@ -138,6 +199,8 @@ class ApiClient:
             raise self._api_client_error(exc) from exc
         except (urllib.error.URLError, TimeoutError, OSError) as exc:
             raise self._api_client_error(exc) from exc
+        except http.client.HTTPException as exc:
+            raise self._malformed_response_error(exc) from exc
 
     def create_backfill(self, payload: dict[str, Any]) -> dict[str, Any]:
         return self._request("POST", "/api/v1/backfill", payload)

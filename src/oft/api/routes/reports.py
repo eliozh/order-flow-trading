@@ -1,4 +1,4 @@
-"""Report routes: CALC-only reports produced by metrics-only scans."""
+"""Report routes: frozen scan reports with CALC metrics and an optional LLM band."""
 
 from __future__ import annotations
 
@@ -9,6 +9,7 @@ from fastapi import APIRouter, Path, Query, Request, Response
 
 from oft.api.envelope import new_request_id, success_envelope
 from oft.api.errors import ApiError
+from oft.api.schemas.envelope import Envelope
 from oft.application.chart_service import (
     SUPPORTED_CHART_PERIODS,
     derive_overlays,
@@ -78,14 +79,20 @@ def read_report(
     request: Request,
     report_id: str = Path(min_length=1, max_length=128, pattern=r"^[A-Za-z0-9._:-]+$"),
 ) -> dict[str, Any]:
-    """Return one frozen CALC report: metric manifest, snapshot, and metrics."""
+    """Return one frozen report: metric manifest, snapshot, metrics, and LLM state.
+
+    Provenance is derived from the same ``provenance_counts`` the export uses,
+    so the detail view and the export agree (``MIXED`` when an LLM block is
+    present, otherwise ``CALC``).
+    """
     record = _report_or_404(request, report_id)
     payload = report_payload(record)
+    counts = provenance_counts(payload)
     return success_envelope(
         payload,
         request_id=new_request_id(),
         generated_at=record.generated_at,
-        provenance="CALC",
+        provenance="MIXED" if counts["llm"] > 0 else "CALC",
         data_quality=record.data_quality,
     )
 
@@ -96,14 +103,16 @@ def read_report(
     responses={
         200: {
             "description": "Redacted report export attachment.",
-            "content": {
-                "text/markdown": {"schema": {"type": "string"}},
-                "application/json": {"schema": {"type": "object"}},
-            },
+            # ``model`` registers the shared envelope (and its meta) in
+            # components and references it by ``$ref``; inlining
+            # ``model_json_schema()`` would leave ``#/$defs`` pointers dangling
+            # at the OpenAPI document root.
+            "model": Envelope[dict[str, Any]],
+            "content": {"text/markdown": {"schema": {"type": "string"}}},
             "headers": {
                 "Content-Disposition": {"schema": {"type": "string"}},
-                "X-OFT-Calc-Blocks": {"schema": {"type": "integer"}},
-                "X-OFT-Llm-Blocks": {"schema": {"type": "integer"}},
+                "X-OFT-Calc-Blocks": {"schema": {"type": "string"}},
+                "X-OFT-Llm-Blocks": {"schema": {"type": "string"}},
             },
         },
         404: {"description": "NOT_FOUND — report does not exist."},
@@ -120,7 +129,8 @@ def export_report(
     The route accepts only ``report_id`` (path) and ``format`` (query); it never
     accepts a caller filesystem path. Both formats reuse ``report_payload`` so
     the frozen metrics, provenance, and data-quality stamps cannot drift, then
-    redact secret/prompt keys before rendering.
+    redact secret/prompt keys before rendering. The JSON envelope reports
+    ``MIXED`` provenance when the payload has an LLM block, else ``CALC``.
     """
     record = _report_or_404(request, report_id)
     payload = redact_report_payload(report_payload(record))
@@ -136,7 +146,7 @@ def export_report(
             payload,
             request_id=new_request_id(),
             generated_at=record.generated_at,
-            provenance="CALC",
+            provenance="MIXED" if counts["llm"] > 0 else "CALC",
             data_quality=record.data_quality,
         )
         return Response(

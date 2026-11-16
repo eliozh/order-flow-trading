@@ -1,19 +1,24 @@
 """Pure renderer tests for the report export (slice 42).
 
 The renderer is deterministic and allowlisted: only the known report sections
-reach the Markdown, every dynamic value is escaped, and secrets/raw prompts are
-removed before rendering.
+reach the Markdown, every dynamic value is escaped, and the caller
+(``redact_report_payload`` on the export path) removes secrets/raw prompts
+before rendering.
 """
 
 from __future__ import annotations
 
 import copy
+import errno
 import json
+import os
+import stat
 from pathlib import Path
 from typing import Any
 
 import pytest
 import typer
+from typer.testing import CliRunner
 
 from oft.api.envelope import success_envelope
 from oft.application.report_export import (
@@ -25,6 +30,7 @@ from oft.application.report_export import (
 )
 from oft.cli.commands import report
 from oft.cli.commands.report import export_exit_code
+from oft.cli.main import app as cli_app
 
 
 def _payload() -> dict[str, Any]:
@@ -138,6 +144,53 @@ def test_unmeasured_open_interest_and_funding_render_na_with_a_reason() -> None:
     assert "| Open interest Δ | N/A — open interest not measured |" in text
     assert "| Funding | N/A — funding not measured |" in text
     assert "0 · 0" not in text
+
+
+@pytest.mark.parametrize("status", ["VALID", "REPAIRED"])
+def test_a_valid_or_repaired_llm_band_counts_one_block_in_text_and_json(status: str) -> None:
+    # VALID and REPAIRED are both LLM bands. A regression that only accepts
+    # ``{"VALID"}`` would silently strip REPAIRED provenance from both formats.
+    payload = copy.deepcopy(_payload())
+    payload["llm"]["validation_status"] = status
+    envelope = success_envelope(
+        payload,
+        request_id="REQ-TEST",
+        generated_at="2026-10-07T12:00:00.000Z",
+        provenance="MIXED",
+        data_quality="PARTIAL",
+    )
+
+    text = _render(payload)
+    document = json.loads(render_report_json(envelope))
+
+    assert "LLM › Price is rotating inside the range." in text
+    assert "LLM blocks: 1" in text
+    assert provenance_counts(payload)["llm"] == 1
+    assert document["data"]["llm"]["narrative"] == "Price is rotating inside the range."
+    assert provenance_counts(document["data"])["llm"] == 1
+
+
+def test_measured_open_interest_and_funding_render_their_measured_values() -> None:
+    payload = copy.deepcopy(_payload())
+    payload["metrics"]["open_interest"] = {
+        "points": [{"ts": "2026-10-07T08:00:00.000Z", "value": "10"}],
+        "delta_over_window": "42.5",
+        "sampling": "REGULAR",
+    }
+    payload["metrics"]["funding"] = {
+        "history": [{"ts": "2026-10-07T00:00:00.000Z", "rate": "0.0001"}],
+        "current_rate": "0.00012",
+    }
+
+    text = _render(payload)
+
+    assert "| Open interest Δ | 42.5 |" in text
+    assert "| Funding | 0.00012 |" in text
+    assert "N/A — open interest not measured" not in text
+    assert "N/A — funding not measured" not in text
+    # The base payload's 6 measured CALC blocks plus OI and funding.
+    assert "CALC blocks: 8 · LLM blocks: 1" in text
+    assert provenance_counts(payload) == {"calc": 8, "llm": 1}
 
 
 def test_data_quality_stamps_use_the_metrics_and_snapshot_levels() -> None:
@@ -281,6 +334,115 @@ def test_redaction_drops_secrets_and_prompts_but_keeps_prompt_metadata() -> None
     assert payload["api_key"] == "sk-super-secret"
 
 
+def test_redaction_removes_the_named_secret_key_variants() -> None:
+    payload: dict[str, Any] = {
+        "apiKey": "secret-1",
+        "apikey": "secret-2",
+        "openai_api_key": "secret-3",
+        "x-api-key": "secret-4",
+        "x_api_key": "secret-5",
+        "xapikey": "secret-6",
+        "client_secret": "secret-7",
+        "secret_value": "secret-8",
+        "nested": {"apiKey": "secret-9", "keep": 1},
+    }
+
+    redacted = redact_report_payload(payload)
+
+    assert redacted == {"nested": {"keep": 1}}
+    assert "secret-" not in json.dumps(redacted)
+
+
+def test_redaction_keeps_llm_usage_cost_and_prompt_metadata() -> None:
+    payload: dict[str, Any] = {
+        "llm_tokens": 10,
+        "total_tokens": 20,
+        "prompt_id": "analysis",
+        "prompt_version": 3,
+        "cost": {"amount_usd": "0.1"},
+        "usage": {"total_tokens": 20},
+    }
+
+    assert redact_report_payload(payload) == payload
+
+
+def test_redaction_basenames_absolute_paths_in_the_llm_reason_only() -> None:
+    payload: dict[str, Any] = {
+        "llm": {
+            "configured": True,
+            "validation_status": "REJECTED",
+            "reason": "the price table /var/lib/oft/prices.json is not valid",
+        },
+        "other": "keep /var/lib/oft/prices.json intact",
+    }
+
+    redacted = redact_report_payload(payload)
+
+    reason = redacted["llm"]["reason"]
+    assert "/var/lib/oft" not in reason
+    assert "prices.json" in reason
+    assert reason == "the price table prices.json is not valid"
+    # Only ``llm.reason`` is touched; unrelated payload strings survive.
+    assert redacted["other"] == "keep /var/lib/oft/prices.json intact"
+
+
+def test_redaction_basenames_windows_drive_paths_in_the_llm_reason() -> None:
+    payload: dict[str, Any] = {"llm": {"reason": r"cannot read C:\oft\data\prices.json now"}}
+
+    reason = redact_report_payload(payload)["llm"]["reason"]
+
+    assert "C:\\oft" not in reason
+    assert reason == "cannot read prices.json now"
+
+
+def test_redaction_leaves_a_non_string_llm_reason_untouched() -> None:
+    payload: dict[str, Any] = {"llm": {"configured": False, "reason": ["LIVE_DATA_STALE"]}}
+
+    assert redact_report_payload(payload)["llm"]["reason"] == ["LIVE_DATA_STALE"]
+
+
+def test_non_string_untrusted_values_do_not_raise_and_do_not_count() -> None:
+    payload = copy.deepcopy(_payload())
+    payload["metrics"]["liquidations"] = {"count": 0, "coverage": ["SINCE_DEPLOYMENT"]}
+    payload["llm"]["validation_status"] = {"VALID": True}
+
+    counts = provenance_counts(payload)
+    text = _render(payload)
+
+    assert counts["calc"] == 5
+    assert counts["llm"] == 0
+    assert "LLM rejected" in text
+
+
+def test_a_non_configuration_skip_renders_with_a_neutral_prefix() -> None:
+    payload = copy.deepcopy(_payload())
+    payload["llm"] = {
+        "configured": False,
+        "reason": "LIVE_DATA_STALE: the live snapshot is older than the allowed window",
+    }
+
+    text = _render(payload)
+
+    assert (
+        "LLM skipped — LIVE_DATA_STALE: the live snapshot is older than the allowed window" in text
+    )
+    assert "LLM not configured" not in text
+
+
+def test_escape_markdown_text_strips_dangerous_controls_but_keeps_tabs() -> None:
+    text = escape_markdown_text("a\x1b[31mred\x1b[0m\x00\x07\x7f\x9f")
+
+    assert "\x1b" not in text
+    assert "\x00" not in text
+    assert "\x07" not in text
+    assert "\x7f" not in text
+    assert "\x9f" not in text
+    # The printable remainder stays; ``[`` is still escaped for Markdown.
+    assert "a\\[31mred\\[0m" in text
+    # A tab is left intact: it is inert inline and cannot start an escape.
+    assert escape_markdown_text("a\tb") == "a\tb"
+
+
 def test_provenance_counts_calc_families_and_a_valid_llm_band() -> None:
     counts = provenance_counts(_payload())
 
@@ -381,25 +543,224 @@ def test_write_export_reports_storage_unavailable_and_removes_the_partial_file(
 
     assert excinfo.value.exit_code == 1
     assert not path.exists()
+    assert list(tmp_path.glob(".*")) == []
     captured = capsys.readouterr()
     assert "STORAGE_UNAVAILABLE" in captured.err
     assert "REQ-" in captured.err
+    # The bounded cause is retained instead of being discarded.
+    assert "OSError" in captured.err
+    assert "disk full" in captured.err
 
 
-def test_write_export_refuses_a_file_created_after_the_precheck(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+def test_write_export_never_overwrites_an_existing_file(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
 ) -> None:
     path = tmp_path / "report.md"
     path.write_bytes(b"original")
-    # Simulate the TOCTOU window: the pre-check sees no file, but the exclusive
-    # create still fails because the file exists.
-    monkeypatch.setattr(Path, "is_symlink", lambda self: False)
-    monkeypatch.setattr(Path, "exists", lambda self: False)
 
     with pytest.raises(typer.Exit) as excinfo:
         report._write_export(path, b"new", {})
 
     assert excinfo.value.exit_code == 2
     assert path.read_bytes() == b"original"
+    # The same-directory temporary file is cleaned up on the refusal path.
+    assert list(tmp_path.glob(".*")) == []
     captured = capsys.readouterr()
     assert "VALIDATION_FAILED" in captured.err
+    assert "REQ-" in captured.err
+
+
+def test_write_export_falls_back_to_exclusive_create_without_hard_links(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    path = tmp_path / "report.md"
+
+    def no_links(_source: object, _destination: object) -> None:
+        raise OSError(errno.EPERM, "hard links are not supported")
+
+    monkeypatch.setattr(report.os, "link", no_links)
+
+    report._write_export(path, b"body", {})
+
+    assert path.read_bytes() == b"body"
+    # The staged temporary file is removed after the fallback publish.
+    assert list(tmp_path.glob(".*")) == []
+
+
+def test_fallback_refuses_an_existing_destination_and_leaves_it_untouched(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    path = tmp_path / "report.md"
+    path.write_bytes(b"original")
+
+    def no_links(_source: object, _destination: object) -> None:
+        raise OSError(errno.EPERM, "hard links are not supported")
+
+    monkeypatch.setattr(report.os, "link", no_links)
+
+    with pytest.raises(typer.Exit) as excinfo:
+        report._write_export(path, b"new", {})
+
+    # The fallback still uses an exclusive create: no overwrite, exit 2.
+    assert excinfo.value.exit_code == 2
+    assert path.read_bytes() == b"original"
+    assert list(tmp_path.glob(".*")) == []
+    assert "VALIDATION_FAILED" in capsys.readouterr().err
+
+
+def test_fallback_write_failure_removes_the_partial_final_file(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    path = tmp_path / "report.md"
+    real_fsync = report.os.fsync
+    calls = {"count": 0}
+
+    def fail_second_fsync(file_descriptor: int) -> None:
+        calls["count"] += 1
+        # Call 1 fsyncs the staged temp; call 2 fsyncs the fallback's final file.
+        if calls["count"] == 2:
+            raise OSError(errno.ENOSPC, "No space left on device")
+        real_fsync(file_descriptor)
+
+    def no_links(_source: object, _destination: object) -> None:
+        raise OSError(errno.EPERM, "hard links are not supported")
+
+    monkeypatch.setattr(report.os, "link", no_links)
+    monkeypatch.setattr(report.os, "fsync", fail_second_fsync)
+
+    with pytest.raises(typer.Exit) as excinfo:
+        report._write_export(path, b"body", {})
+
+    assert excinfo.value.exit_code == 1
+    assert not path.exists()
+    assert list(tmp_path.glob(".*")) == []
+    captured = capsys.readouterr()
+    assert "STORAGE_UNAVAILABLE" in captured.err
+    assert "ENOSPC" in captured.err
+
+
+def test_staging_temp_is_created_beside_the_destination(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    path = tmp_path / "report.md"
+    seen: list[Path] = []
+    real_link = report.os.link
+
+    def capture_link(source: Any, destination: Any) -> None:
+        seen.append(Path(str(source)))
+        real_link(source, destination)
+
+    monkeypatch.setattr(report.os, "link", capture_link)
+
+    report._write_export(path, b"body", {})
+
+    assert seen and seen[0].parent == path.parent
+
+
+def test_bounded_cause_strips_controls_and_is_capped() -> None:
+    cause = report._bounded_cause(OSError(errno.ENOSPC, "\x1b[31m" + "x" * 400))
+
+    assert "ENOSPC" in cause
+    assert "\x1b" not in cause
+    assert len(cause) <= 200
+
+
+@pytest.mark.skipif(os.name == "nt", reason="POSIX file modes")
+def test_export_mode_is_owner_only_on_both_publish_paths(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    primary = tmp_path / "primary.md"
+    report._write_export(primary, b"body", {})
+    assert stat.S_IMODE(primary.stat().st_mode) == 0o600
+
+    fallback = tmp_path / "fallback.md"
+
+    def no_links(*_args: Any, **_kwargs: Any) -> None:
+        raise OSError(errno.EPERM, "hard links are not supported")
+
+    monkeypatch.setattr(report.os, "link", no_links)
+    report._write_export(fallback, b"body", {})
+    assert stat.S_IMODE(fallback.stat().st_mode) == 0o600
+
+
+@pytest.mark.skipif(os.name == "nt", reason="POSIX file modes")
+def test_fallback_creates_the_file_owner_only_before_restrict_mode(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The fallback's create syscall itself must be 0600, not 0666-then-chmod."""
+    path = tmp_path / "report.md"
+    previous_umask = os.umask(0)
+    try:
+
+        def no_links(*_args: Any, **_kwargs: Any) -> None:
+            raise OSError(errno.EPERM, "hard links are not supported")
+
+        monkeypatch.setattr(report.os, "link", no_links)
+        # Disable normalization so the assertion observes the create mode.
+        monkeypatch.setattr(report, "_restrict_mode", lambda _file_descriptor: None)
+        report._write_export(path, b"body", {})
+        assert stat.S_IMODE(path.stat().st_mode) == 0o600
+    finally:
+        os.umask(previous_umask)
+
+
+def test_write_export_names_a_leftover_temp_file_on_cleanup_failure(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    path = tmp_path / "report.md"
+
+    def refuse_unlink(self: Path, missing_ok: bool = False) -> None:
+        raise OSError(errno.EACCES, "permission denied")
+
+    monkeypatch.setattr(Path, "unlink", refuse_unlink)
+
+    report._write_export(path, b"body", {})
+
+    assert path.read_bytes() == b"body"
+    captured = capsys.readouterr()
+    assert "could not remove the temporary export file" in captured.err
+    assert ".report.md." in captured.err
+    leftovers = list(tmp_path.glob(".report.md.*.tmp"))
+    assert len(leftovers) == 1
+    # Restore the real ``unlink`` and remove what the simulated failure left.
+    monkeypatch.undo()
+    leftovers[0].unlink()
+
+
+def test_write_export_warns_but_keeps_the_file_when_parent_fsync_fails(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    path = tmp_path / "report.md"
+
+    def fail_sync(_parent: Path) -> None:
+        raise OSError(errno.EIO, "I/O error")
+
+    monkeypatch.setattr(report, "_fsync_parent", fail_sync)
+
+    report._write_export(path, b"body", {})
+
+    assert path.read_bytes() == b"body"
+    captured = capsys.readouterr()
+    assert "Wrote" in captured.out
+    assert "could not be fsynced" in captured.err
+
+
+def test_an_invalid_output_path_is_refused_before_the_api_client_is_built(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    def fail(*_args: Any, **_kwargs: Any) -> Any:
+        raise AssertionError("the API client must not be built for an invalid output path")
+
+    monkeypatch.setattr(report.ApiClient, "from_settings", fail)
+    existing = tmp_path / "existing.md"
+    existing.write_bytes(b"sentinel")
+    runner = CliRunner()
+
+    result = runner.invoke(
+        cli_app,
+        ["report", "export", "RPT-ANY", "--output", str(existing)],
+    )
+
+    assert result.exit_code == 2
+    assert "VALIDATION_FAILED" in result.stderr
+    assert existing.read_bytes() == b"sentinel"

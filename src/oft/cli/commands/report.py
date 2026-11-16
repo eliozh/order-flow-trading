@@ -2,9 +2,11 @@
 
 from __future__ import annotations
 
+import errno
 import json
 import os
-from contextlib import suppress
+import re
+import tempfile
 from decimal import Decimal, InvalidOperation
 from pathlib import Path
 from typing import Annotated, Any, NoReturn
@@ -12,7 +14,7 @@ from typing import Annotated, Any, NoReturn
 import typer
 
 from oft.api.envelope import new_request_id
-from oft.application.report_export import EXPORT_FORMATS
+from oft.application.report_export import EXPORT_FORMATS, is_configuration_reason
 from oft.cli.api_client import ApiClient, ApiClientError
 from oft.cli.commands.doctor import emit_error, exit_code_for
 from oft.config import ConfigError, load_settings
@@ -27,6 +29,16 @@ report_app = typer.Typer(
 def export_exit_code(code: str) -> int:
     """Export-only exit mapping: an API validation failure is a usage error (2)."""
     return 2 if code == "VALIDATION_FAILED" else exit_code_for(code)
+
+
+#: Errnos from filesystems that cannot create a hard link. In that case the
+#: publisher falls back to an exclusive ``os.open(..., O_CREAT | O_EXCL, 0o600)``
+#: create of the final path.
+_LINK_UNSUPPORTED_ERRNOS = frozenset({errno.EPERM, errno.EOPNOTSUPP, errno.ENOSYS, errno.EXDEV})
+
+#: C0/C1 controls never belong in a one-line diagnostic; cap the cause too.
+_CONTROL_CHARACTERS = re.compile(r"[\x00-\x1f\x7f-\x9f]")
+_CAUSE_LIMIT = 200
 
 
 def _settings_or_exit(json_output: bool) -> Any:
@@ -90,7 +102,7 @@ def _section_lines(metrics: dict[str, Any]) -> list[str]:
 
 
 def render_report_table(data: dict[str, Any]) -> str:
-    """Render CALC metrics before the explicit LLM-not-configured notice."""
+    """Render CALC metrics before the explicit LLM state/notice."""
     snapshot = data.get("snapshot") or {}
     metrics = data.get("metrics") or {}
     window = snapshot.get("window") or metrics.get("window") or {}
@@ -125,14 +137,10 @@ def render_report_table(data: dict[str, Any]) -> str:
             lines.append(f"LLM rejected — {reason}")
             lines.append("No narrative, opportunity, or order was created from this output.")
     else:
-        reason = llm.get("reason") or (
-            "LLM not configured; no narrative or decision was generated."
+        reason = str(
+            llm.get("reason") or "LLM not configured; no narrative or decision was generated."
         )
-        notice = (
-            reason
-            if reason.lower().startswith("llm not configured")
-            else f"LLM not configured — {reason}"
-        )
+        notice = reason if is_configuration_reason(reason) else f"LLM skipped — {reason}"
         lines.append(notice)
         lines.append("No LLM call, order, or credential was required or recorded.")
     return "\n".join(lines)
@@ -220,13 +228,145 @@ def _output_path_problem(path: Path) -> str | None:
     return None
 
 
-def _write_export(path: Path, body: bytes, headers: dict[str, str]) -> None:
-    """Create ``path`` exclusively, never overwriting or leaving a partial file."""
+def _bounded_cause(exc: OSError) -> str:
+    """A short single-line cause with the errno name and control bytes stripped."""
+    label = type(exc).__name__
+    if exc.errno is not None:
+        code = errno.errorcode.get(exc.errno)
+        if code:
+            label = f"{label} ({code})"
+    detail = _CONTROL_CHARACTERS.sub("", exc.strerror or str(exc))
+    return f"{label}: {detail}".strip()[:_CAUSE_LIMIT]
+
+
+def _refuse_storage(path: Path, exc: OSError) -> NoReturn:
+    """Refuse a failed write with a bounded cause and a fresh reference."""
+    _refuse(
+        "STORAGE_UNAVAILABLE",
+        f"STORAGE_UNAVAILABLE: could not write export to {path}: {_bounded_cause(exc)}. "
+        f"Reference: {new_request_id()}.",
+        1,
+    )
+
+
+def _remove_temp(temp_path: Path) -> None:
+    """Remove a staged temporary file; name it on stderr if that fails."""
     try:
-        with path.open("xb") as handle:
+        temp_path.unlink()
+    except FileNotFoundError:
+        return
+    except OSError as exc:
+        typer.echo(
+            f"Warning: could not remove the temporary export file {temp_path} "
+            f"({_bounded_cause(exc)}); remove it manually.",
+            err=True,
+        )
+
+
+def _restrict_mode(file_descriptor: int) -> None:
+    """Force the export to mode 0600 (owner read/write) where POSIX modes exist.
+
+    ``mkstemp`` requests 0600 and the fallback requests 0600 at create time, but
+    the operator's umask can reduce either. ``fchmod`` makes both publish paths
+    exactly 0600. Platforms without ``fchmod`` keep their native permission
+    model.
+    """
+    if hasattr(os, "fchmod"):
+        os.fchmod(file_descriptor, 0o600)
+
+
+def _publish_exclusive(path: Path, body: bytes) -> None:
+    """Fallback publish without hard links: exclusive create, then fsync.
+
+    The file is created at mode 0600 by the creating syscall (``O_EXCL``), so a
+    local reader cannot observe the body through a permissive umask before the
+    mode is normalized. The exclusive create happens before the cleanup guard,
+    so a pre-existing destination still raises ``FileExistsError`` and is never
+    deleted. A write or fsync failure removes the partial file this call
+    created; if that removal fails, the leftover final path is named on stderr.
+    """
+    descriptor = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
+    try:
+        handle = os.fdopen(descriptor, "wb")
+    except BaseException:
+        os.close(descriptor)
+        raise
+    try:
+        with handle:
+            _restrict_mode(handle.fileno())
             handle.write(body)
             handle.flush()
             os.fsync(handle.fileno())
+    except OSError:
+        try:
+            path.unlink()
+        except FileNotFoundError:
+            pass
+        except OSError as cleanup_exc:
+            typer.echo(
+                f"Warning: could not remove the incomplete export file {path} "
+                f"({_bounded_cause(cleanup_exc)}); remove it manually.",
+                err=True,
+            )
+        raise
+
+
+def _fsync_parent(parent: Path) -> None:
+    """Make the new directory entry durable (POSIX)."""
+    descriptor = os.open(parent, os.O_RDONLY | getattr(os, "O_DIRECTORY", 0))
+    try:
+        os.fsync(descriptor)
+    finally:
+        os.close(descriptor)
+
+
+def _write_export(path: Path, body: bytes, headers: dict[str, str]) -> None:
+    """Publish ``path`` exclusively; never overwrite, and clean up on handled failures.
+
+    The body goes to a same-directory temporary file with an exclusive create,
+    is flushed and fsynced, then published with ``os.link``. The link fails with
+    ``FileExistsError`` when the destination exists, so an existing file is
+    never replaced and the hard-link publish is atomic (no reader sees a partial
+    final file). After publishing, the temporary name is removed and the parent
+    directory is fsynced. Filesystems without hard links fall back to an
+    exclusive ``os.open(..., O_CREAT | O_EXCL, 0o600)`` create of the final path
+    (still no overwrite), and the
+    file and parent are fsynced there too; a handled failure removes that
+    partial file, but the fallback is not crash-atomic (a SIGKILL/power loss
+    between create and cleanup can leave a partial final file). The published
+    file is mode 0600 on both paths.
+
+    A refusal or failure removes the temporary file; if that cleanup fails, the
+    leftover temporary path is named explicitly on stderr. Failures report a
+    bounded, control-stripped cause: ``FileExistsError`` is
+    ``VALIDATION_FAILED`` (exit 2) with the original file untouched, and any
+    other ``OSError`` is ``STORAGE_UNAVAILABLE`` (exit 1). A parent-directory
+    fsync failure after a successful publish is reported as a warning and the
+    complete export is kept.
+    """
+    parent = path.parent
+    try:
+        file_descriptor, temp_name = tempfile.mkstemp(
+            dir=parent, prefix=f".{path.name}.", suffix=".tmp"
+        )
+    except OSError as exc:
+        _refuse_storage(path, exc)
+    temp_path = Path(temp_name)
+    try:
+        with os.fdopen(file_descriptor, "wb") as handle:
+            _restrict_mode(handle.fileno())
+            handle.write(body)
+            handle.flush()
+            os.fsync(handle.fileno())
+        try:
+            os.link(temp_path, path)
+        except FileExistsError:
+            raise
+        except OSError as exc:
+            if exc.errno in _LINK_UNSUPPORTED_ERRNOS:
+                _publish_exclusive(path, body)
+            else:
+                raise
     except FileExistsError:
         _refuse(
             "VALIDATION_FAILED",
@@ -234,15 +374,18 @@ def _write_export(path: Path, body: bytes, headers: dict[str, str]) -> None:
             f"choose a new path. Reference: {new_request_id()}.",
             2,
         )
-    except OSError:
-        # The ``with`` block closed the handle; remove anything it created.
-        with suppress(OSError):
-            path.unlink()
-        _refuse(
-            "STORAGE_UNAVAILABLE",
-            f"STORAGE_UNAVAILABLE: could not write export to {path}. "
-            f"Reference: {new_request_id()}.",
-            1,
+    except OSError as exc:
+        _refuse_storage(path, exc)
+    finally:
+        _remove_temp(temp_path)
+
+    try:
+        _fsync_parent(parent)
+    except OSError as exc:
+        typer.echo(
+            f"Warning: export {path} was written, but its parent directory could not be "
+            f"fsynced ({_bounded_cause(exc)}).",
+            err=True,
         )
 
     parts = [f"Wrote {path}", f"{len(body)} bytes"]
@@ -257,7 +400,7 @@ def _write_export(path: Path, body: bytes, headers: dict[str, str]) -> None:
 @report_app.command("export")
 def report_export(
     report_id: str,
-    format: Annotated[
+    export_format: Annotated[
         str,
         typer.Option("--format", help="Export format: md or json."),
     ] = "md",
@@ -271,11 +414,11 @@ def report_export(
     ] = False,
 ) -> None:
     """Export one frozen report as redacted Markdown or JSON."""
-    resolved_format = format.strip().lower()
+    resolved_format = export_format.strip().lower()
     if resolved_format not in EXPORT_FORMATS:
         _refuse(
             "VALIDATION_FAILED",
-            f"VALIDATION_FAILED: format must be one of md, json; got {format!r}.",
+            f"VALIDATION_FAILED: format must be one of md, json; got {export_format!r}.",
             2,
         )
     if output is not None and stdout:
@@ -284,16 +427,9 @@ def report_export(
             "VALIDATION_FAILED: --output and --stdout are mutually exclusive; choose one.",
             2,
         )
-
-    settings = _settings_or_exit(False)
-    try:
-        body, headers = ApiClient.from_settings(settings).export_report(
-            report_id, format=resolved_format
-        )
-    except ApiClientError as exc:
-        emit_error(exc.code, f"{exc.code}: {exc.message}", json_output=False)
-        raise typer.Exit(code=export_exit_code(exc.code)) from exc
-
+    # Validate a local output path before any daemon call or settings load, so a
+    # usage error is not masked by a transport error. ``_write_export`` keeps
+    # the exclusive publish as the TOCTOU authority.
     if output is not None:
         problem = _output_path_problem(output)
         if problem is not None:
@@ -310,6 +446,20 @@ def report_export(
                 f"choose a new path. Reference: {new_request_id()}.",
                 2,
             )
+
+    settings = _settings_or_exit(False)
+    try:
+        body, headers = ApiClient.from_settings(settings).export_report(
+            report_id, export_format=resolved_format
+        )
+    except ApiClientError as exc:
+        message = f"{exc.code}: {exc.message}"
+        if exc.reference_id is not None:
+            message += f" Reference: {exc.reference_id}."
+        emit_error(exc.code, message, json_output=False)
+        raise typer.Exit(code=export_exit_code(exc.code)) from exc
+
+    if output is not None:
         _write_export(output, body, headers)
         return
 
