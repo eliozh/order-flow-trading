@@ -8,6 +8,7 @@ import { resolveRoute } from './routes/route-match'
 import { ChartPanelPage } from './routes/chart-panel'
 import { OpportunityDetailPage } from './routes/opportunity-detail'
 import { OpportunitiesPage } from './routes/opportunities'
+import { OnboardingPage } from './routes/onboarding'
 import { JournalDetailPage } from './routes/journal-detail'
 import { JournalPage } from './routes/journal'
 import { PaperPage } from './routes/paper'
@@ -114,6 +115,8 @@ export default function App() {
               <SettingsRiskPage />
             ) : route.isSettings ? (
               <SettingsPage />
+            ) : route.isOnboarding ? (
+              <OnboardingPage step={route.onboardingStep} />
             ) : route.isSystem ? (
               <SystemPage />
             ) : (

@@ -32,6 +32,10 @@ function statusClass(status: string): string {
   if (status === 'degraded' || status === 'not_ready') {
     return 'chip chip--warn'
   }
+  // UNKNOWN is not a failure; keep it neutral rather than danger.
+  if (status === 'unknown') {
+    return 'chip chip--muted'
+  }
   return 'chip chip--danger'
 }
 

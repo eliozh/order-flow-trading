@@ -2663,3 +2663,109 @@ code {
     font-size: 10px;
   }
 }
+
+/* Slice 44: paper-only onboarding wizard (F01). */
+/* DESIGN A2.3: the step list is static (non-focusable); the current item and
+   completed status are carried in text and the accent rule, never focus. */
+.onboarding-page .onboarding-step-list {
+  list-style: none;
+  margin: 0;
+  padding: 0;
+}
+
+.onboarding-page .onboarding-step-list > li {
+  display: flex;
+  align-items: center;
+  flex-wrap: wrap;
+  gap: 8px;
+  padding: 8px 12px;
+  border-left: 2px solid transparent;
+  color: var(--oft-text-secondary);
+}
+
+.onboarding-page .onboarding-step-list > li[aria-current='step'] {
+  border-left-color: var(--oft-accent);
+  color: var(--oft-text-primary);
+  background: var(--oft-bg-raised);
+}
+
+.onboarding-page .onboarding-step-list > li > .chip,
+.onboarding-page .onboarding-complete {
+  margin-left: auto;
+}
+
+.onboarding-page .onboarding-complete {
+  display: inline-flex;
+  align-items: center;
+  gap: 4px;
+}
+
+.onboarding-page .onboarding-step-buttons {
+  padding: 0 16px 16px;
+}
+
+.onboarding-page .onboarding-pad {
+  padding: 0 16px 12px;
+}
+
+.onboarding-page .onboarding-symbol-list {
+  margin: 0;
+}
+
+/* The onboarding star control carries a visible text label, so it must not
+   inherit the glyph-only `.star-toggle` fixed square (DESIGN A3). */
+.onboarding-page .onboarding-star-btn {
+  width: auto;
+  min-width: 0;
+  padding: 0 var(--oft-space-3);
+  white-space: nowrap;
+}
+
+.onboarding-page .onboarding-star-btn[aria-disabled='true'] {
+  opacity: 0.65;
+  cursor: not-allowed;
+}
+
+.onboarding-page .onboarding-star-btn[aria-busy='true'] {
+  cursor: progress;
+}
+
+/* DESIGN A3: the wizard's previous/next, deferred `继续`, and `/scans` CTA are
+   links, so raise them with their container rather than relying on `.btn`. */
+@media (max-width: 768px) {
+  .onboarding-page .settings-actions .btn {
+    min-height: 44px;
+  }
+}
+
+.onboarding-page .onboarding-error-list {
+  margin: 6px 0 0;
+  padding-left: 18px;
+}
+
+/* WCAG 2.2 SC 2.5.8: each field link is its whole list row (no inline prose),
+   so it needs a real 24px target at every width; row spacing keeps adjacent
+   links from sharing the same 24px band. */
+.onboarding-page .onboarding-error-list li + li {
+  margin-top: 4px;
+}
+
+.onboarding-page .onboarding-error-list a {
+  display: inline-flex;
+  align-items: center;
+  min-height: 24px;
+  padding: 2px 0;
+}
+
+.onboarding-page .check {
+  display: flex;
+  align-items: flex-start;
+  gap: 8px;
+  padding: 4px 0;
+  font-size: 12px;
+}
+
+.onboarding-page .check small {
+  display: block;
+  color: var(--oft-text-muted);
+}

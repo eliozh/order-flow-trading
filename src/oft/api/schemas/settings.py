@@ -4,10 +4,11 @@ from __future__ import annotations
 
 from typing import Any, Literal
 
-from pydantic import BaseModel, ConfigDict, Field
+from pydantic import BaseModel, ConfigDict, Field, model_validator
 
 from oft.api.schemas.envelope import Envelope
 from oft.api.schemas.errors import ErrorBody, ErrorEnvelope, catalog_responses
+from oft.domain.onboarding import OnboardingStepId
 from oft.domain.prompts import PromptRole
 
 
@@ -199,6 +200,48 @@ class PromptSettingsData(BaseModel):
     total: int
 
 
+# -- slice 44: paper-only onboarding progress --------------------------------
+
+
+class OnboardingProgressUpdate(BaseModel):
+    """One step completion; the service still rejects the deferred 3/4."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    step: int = Field(strict=True, ge=1, le=5)
+
+
+class OnboardingStepData(BaseModel):
+    """One step's state; the deferred/milestone pair must stay consistent."""
+
+    step: int = Field(ge=1, le=5)
+    id: OnboardingStepId
+    title: str
+    deferred: bool
+    deferred_milestone: int | None = None
+    completed: bool
+
+    @model_validator(mode="after")
+    def _check_deferred_invariant(self) -> OnboardingStepData:
+        if self.deferred != (self.deferred_milestone is not None):
+            raise ValueError("deferred must match deferred_milestone presence")
+        if self.deferred_milestone is not None and self.deferred_milestone < 1:
+            raise ValueError("deferred_milestone must be a positive integer")
+        return self
+
+
+class OnboardingProgressData(BaseModel):
+    """Completed steps and the resume point; never a secret or a key value."""
+
+    steps: list[OnboardingStepData]
+    completed_steps: list[int]
+    resumed_step: int = Field(ge=1, le=5)
+    all_complete: bool
+    environment: Literal["paper"]
+    updated_at: str | None = None
+    updated_by: str | None = None
+
+
 _CATALOG_ERRORS = {
     400: ("IDEMPOTENCY_KEY_REQUIRED", "A state-changing settings request omitted Idempotency-Key."),
     401: ("AUTH_REQUIRED", "The local API credential is missing or invalid."),
@@ -251,6 +294,10 @@ __all__ = [
     "LLMRolesData",
     "LLMSettingsData",
     "LLMSettingsUpdate",
+    "OnboardingProgressData",
+    "OnboardingProgressUpdate",
+    "OnboardingStepData",
+    "OnboardingStepId",
     "PromptSettingsData",
     "PromptSettingsRowData",
     "RiskSettingsData",

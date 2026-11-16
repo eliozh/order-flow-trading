@@ -1,3 +1,4 @@
+import type { OnboardingStepNumber } from '../api/onboarding'
 import { resolveActiveNav, type NavGroupId, type NavItemId } from './nav-items'
 import { normalizePath } from './path'
 
@@ -38,6 +39,8 @@ export interface RouteMatch {
   isSettingsPromptDetail: boolean
   isSettingsPromptHistory: boolean
   promptId: string | null
+  isOnboarding: boolean
+  onboardingStep: OnboardingStepNumber | null
 }
 
 function decodeSegment(segment: string): string {
@@ -46,6 +49,12 @@ function decodeSegment(segment: string): string {
   } catch {
     return segment
   }
+}
+
+/** Narrow a regex-matched digit to the literal step union. */
+function toOnboardingStep(segment: string): OnboardingStepNumber | null {
+  const value = Number(segment)
+  return value === 1 || value === 2 || value === 3 || value === 4 || value === 5 ? value : null
 }
 
 export function resolveRoute(pathname: string): RouteMatch {
@@ -96,6 +105,12 @@ export function resolveRoute(pathname: string): RouteMatch {
         : null
   const isWatchlist = path === '/watchlist' || path.startsWith('/watchlist/')
   const isSystem = path === '/' || path === '/system' || path.startsWith('/system/')
+  // Exactly `/onboarding` or `/onboarding/1..5`; `/onboarding/0`,
+  // `/onboarding/6`, `/onboarding/foo`, and deeper paths fall through to
+  // not-found rather than silently rendering a step.
+  const onboardingMatch = /^\/onboarding\/([1-5])$/.exec(path)
+  const isOnboarding = path === '/onboarding' || onboardingMatch !== null
+  const onboardingStep = onboardingMatch !== null ? toOnboardingStep(onboardingMatch[1]) : null
 
   // The App renders the not-found panel exactly when none of these route
   // shapes match. Derive the active nav item from the same resolution so a
@@ -125,7 +140,8 @@ export function resolveRoute(pathname: string): RouteMatch {
     isSettingsPromptDetail ||
     isSettingsPromptHistory ||
     isSettings ||
-    isSystem
+    isSystem ||
+    isOnboarding
   const activeNav = isResolved ? resolveActiveNav(path) : null
   return {
     path,
@@ -159,5 +175,7 @@ export function resolveRoute(pathname: string): RouteMatch {
     isSettingsPromptDetail,
     isSettingsPromptHistory,
     promptId,
+    isOnboarding,
+    onboardingStep,
   }
 }

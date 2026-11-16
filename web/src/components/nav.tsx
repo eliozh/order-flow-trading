@@ -81,7 +81,13 @@ function NavIcon({ name }: { name: NavIconName }) {
   )
 }
 
-function markNavFocus(): void {
+/**
+ * Mark the next full-page navigation as needing destination focus.
+ *
+ * Exported for in-page route links (e.g. the onboarding `/scans` CTA) that also
+ * perform a full-page load: the destination `RouteFocus` consumes it.
+ */
+export function markNavFocus(): void {
   try {
     sessionStorage.setItem(NAV_FOCUS_KEY, '1')
   } catch {

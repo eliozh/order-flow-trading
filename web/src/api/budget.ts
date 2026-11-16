@@ -26,6 +26,11 @@ const BUDGET_KEY_ID = 'thresholds'
 /** The contract money shape: a non-negative decimal string. */
 const MONEY_PATTERN = /^\d+(?:\.\d+)?$/
 
+/** Shared validity check for a contract money string (draft input). */
+export function isMoneyValue(value: string): boolean {
+  return MONEY_PATTERN.test(value)
+}
+
 export type BudgetPeriod = 'day' | 'week' | 'month'
 export type BudgetField = 'daily_usd' | 'weekly_usd' | 'monthly_usd' | 'warn_pct'
 export type BudgetState = 'OK' | 'WARN' | 'EXCEEDED'

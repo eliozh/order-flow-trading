@@ -18,6 +18,8 @@ from oft.api.schemas.settings import (
     LLMKeyUpdate,
     LLMSettingsData,
     LLMSettingsUpdate,
+    OnboardingProgressData,
+    OnboardingProgressUpdate,
     PromptSettingsData,
     RiskSettingsData,
     RiskSettingsUpdate,
@@ -164,6 +166,63 @@ def update_scan_settings(
         )
     except SettingValidationError as exc:
         raise ApiError("VALIDATION_FAILED", exc.message, details=exc.details) from exc
+
+
+@router.get(
+    "/api/v1/settings/onboarding",
+    response_model=Envelope[OnboardingProgressData],
+    responses=ERROR_RESPONSES,
+)
+def get_onboarding_progress(request: Request) -> dict[str, Any]:
+    """Completed first-run steps and the server-derived resume point.
+
+    A fresh install needs no persisted config: steps are empty and the wizard
+    resumes at step 1. Deferred steps are listed with their milestone and are
+    never completed. No secret or key value can appear in this payload.
+    """
+    try:
+        data = _service(request).read_onboarding_progress().to_contract()
+    except ConfigError as exc:
+        raise ApiError("CONFIG_INVALID", exc.message) from exc
+    return success_envelope(
+        data,
+        request_id=new_request_id(),
+        provenance="CALC",
+        data_quality="COMPLETE",
+    )
+
+
+@router.put(
+    "/api/v1/settings/onboarding",
+    response_model=Envelope[OnboardingProgressData],
+    responses=ERROR_RESPONSES,
+    openapi_extra=mutation_openapi(),
+)
+def update_onboarding_progress(
+    payload: OnboardingProgressUpdate,
+    request: Request,
+    idempotency_key: str | None = Header(default=None, alias="Idempotency-Key"),
+) -> Any:
+    """Mark one active step complete; a repeat is a deterministic no-op.
+
+    Steps 3 (Binance) and 4 (Telegram) are deferred to Milestones 5 and 6 and
+    are rejected with a ``step_deferred`` detail, writing nothing. A corrupt
+    persisted progress document is ``CONFIG_INVALID`` and is never overwritten.
+    """
+    try:
+        return idempotent_mutation(
+            request,
+            presented_key=idempotency_key,
+            payload=payload,
+            status=200,
+            mutate=lambda: (
+                _service(request).complete_onboarding_step(payload.step, actor="web").to_contract()
+            ),
+        )
+    except SettingValidationError as exc:
+        raise ApiError("VALIDATION_FAILED", exc.message, details=exc.details) from exc
+    except ConfigError as exc:
+        raise ApiError("CONFIG_INVALID", exc.message) from exc
 
 
 @router.get(
