@@ -2,10 +2,17 @@
 
 from __future__ import annotations
 
+import contextlib
+import functools
+import http.client
 import json
 import os
+import re
 import signal
-from datetime import datetime
+import subprocess
+import sys
+import time
+from datetime import UTC, datetime
 from pathlib import Path
 from typing import Annotated, Any
 
@@ -41,6 +48,12 @@ from oft.domain.time import utc_timestamp
 
 _LOGGER = structlog.get_logger(__name__)
 
+# Module-size note: this file is deliberately above the 800-line soft ceiling.
+# The daemon lifecycle commands share one security-critical contract -- the
+# PID-file format, the start-time fence, the scheduler state handoff, and the
+# detached restart capture -- so splitting them would duplicate that contract
+# (and invite the two halves to drift apart).
+
 daemon_app = typer.Typer(
     help="Daemon lifecycle (local API/UI, live ingestion, and the scan scheduler).",
     no_args_is_help=True,
@@ -56,6 +69,27 @@ def log_path(settings: Settings) -> Path:
     return settings.data_dir / "logs" / "daemon.log"
 
 
+# ``os.kill(0, ...)`` signals the caller's process group and ``os.kill(-1, ...)``
+# signals every process the caller may signal. A PID file is untrusted input, so
+# only an ordinary positive PID that cannot address a group is ever accepted.
+_PID_MAX_FALLBACK = 4194304
+
+
+@functools.cache
+def _pid_max() -> int:
+    try:
+        raw = Path("/proc/sys/kernel/pid_max").read_text(encoding="utf-8").strip()
+        value = int(raw)
+    except (OSError, ValueError):
+        return _PID_MAX_FALLBACK
+    return value if value > 1 else _PID_MAX_FALLBACK
+
+
+def _valid_pid(pid: int) -> bool:
+    """Whether ``pid`` names one ordinary process we may safely signal."""
+    return 2 <= pid <= _pid_max()
+
+
 def read_pid(settings: Settings) -> int | None:
     path = pid_path(settings)
     try:
@@ -63,12 +97,15 @@ def read_pid(settings: Settings) -> int | None:
     except OSError:
         return None
     try:
-        return int(raw)
+        pid = int(raw)
     except ValueError:
         return None
+    return pid if _valid_pid(pid) else None
 
 
 def process_alive(pid: int) -> bool:
+    if not _valid_pid(pid):
+        return False
     try:
         os.kill(pid, 0)
     except ProcessLookupError:
@@ -78,7 +115,11 @@ def process_alive(pid: int) -> bool:
     return True
 
 
-def _process_start_time(pid: int) -> str | None:
+_PS_TIMEOUT_SECONDS = 2.0
+
+
+def _proc_start_time(pid: int) -> str | None:
+    """The Linux ``/proc/<pid>/stat`` start time, or ``None`` if unavailable."""
     try:
         stat = Path(f"/proc/{pid}/stat").read_text(encoding="utf-8")
     except OSError:
@@ -87,23 +128,75 @@ def _process_start_time(pid: int) -> str | None:
     return fields[19] if len(fields) > 19 else None
 
 
+def _ps_executable() -> str | None:
+    """Resolve ``ps`` directly so a PATH-shadowed binary cannot be executed."""
+    for candidate in ("/bin/ps", "/usr/bin/ps"):
+        if Path(candidate).is_file():
+            return candidate
+    return None
+
+
+def _ps_start_time(pid: int) -> str | None:
+    """``ps -o lstart=`` in the C locale, the portable (macOS) fence source."""
+    executable = _ps_executable()
+    if executable is None:
+        return None
+    try:
+        completed = subprocess.run(
+            [executable, "-o", "lstart=", "-p", str(pid)],
+            capture_output=True,
+            text=True,
+            timeout=_PS_TIMEOUT_SECONDS,
+            check=False,
+            env={**os.environ, "LC_ALL": "C"},
+        )
+    except (OSError, subprocess.SubprocessError):
+        return None
+    value = completed.stdout.strip()
+    return value if completed.returncode == 0 and value else None
+
+
+def _process_start_time(pid: int) -> str | None:
+    """The process start time used by the PID fence.
+
+    ``/proc`` is Linux-only and ADR-0001/0012 support launchd on macOS, so a
+    missing or malformed ``/proc`` entry falls back to ``ps -o lstart=``
+    (``LC_ALL=C``, short timeout, no shell) instead of failing the fence closed
+    for every process on that platform. Both the recorded and re-read value use
+    this same function, so the fence stays stable.
+    """
+    start = _proc_start_time(pid)
+    if start is not None:
+        return start
+    return _ps_start_time(pid)
+
+
 def pid_meta_path(settings: Settings) -> Path:
     return settings.data_dir / "run" / "daemon.pid.json"
 
 
 def pid_matches(settings: Settings, pid: int) -> bool:
-    """Verify the PID still names the daemon we started (start-time fence)."""
+    """Verify the PID still names the daemon we started (start-time fence).
+
+    Fail closed: the fence needs the recorded start time and a re-read of the
+    current one (``/proc`` or the portable ``ps`` fallback). A
+    missing/unreadable/corrupt meta file, an unrecorded start time, or an
+    unavailable current start time all return ``False`` so control is refused
+    rather than sent to a recycled PID.
+    """
     if not process_alive(pid):
         return False
     try:
-        import json
-
         meta = json.loads(pid_meta_path(settings).read_text(encoding="utf-8"))
     except (OSError, ValueError):
-        return True
+        return False
+    if not isinstance(meta, dict):
+        return False
     expected = meta.get("start_time")
+    if not isinstance(expected, str) or not expected:
+        return False
     current = _process_start_time(pid)
-    return expected is None or current is None or expected == current
+    return current is not None and expected == current
 
 
 def write_pid(settings: Settings) -> None:
@@ -112,17 +205,23 @@ def write_pid(settings: Settings) -> None:
     pid = os.getpid()
     path.write_text(str(pid), encoding="utf-8")
     path.chmod(0o600)
-    import json
 
     meta = pid_meta_path(settings)
     meta.write_text(
-        json.dumps({"pid": pid, "start_time": _process_start_time(pid)}),
+        json.dumps(
+            {
+                "pid": pid,
+                "start_time": _process_start_time(pid),
+                # Additive: ``system info`` derives uptime from this stamp.
+                "started_at": utc_timestamp(datetime.now(UTC)),
+            }
+        ),
         encoding="utf-8",
     )
     meta.chmod(0o600)
 
 
-def _settings_or_exit(json_output: bool) -> Settings:
+def settings_or_exit(json_output: bool) -> Settings:
     try:
         return load_settings()
     except ConfigError as exc:
@@ -134,7 +233,7 @@ def schedule_state_path(settings: Settings) -> Path:
     return settings.data_dir / "run" / "schedule.json"
 
 
-def _schedule_state(
+def schedule_state(
     settings: Settings | None = None,
     *,
     container: Any | None = None,
@@ -176,6 +275,12 @@ def _schedule_state(
         message = exc.message if isinstance(exc, ConfigError) else str(exc)
         emit_error("CONFIG_INVALID", message, json_output=json_output)
         raise typer.Exit(code=5) from exc
+
+
+# Compatibility aliases for callers that predate the public names. New code
+# imports ``settings_or_exit`` / ``schedule_state`` directly.
+_settings_or_exit = settings_or_exit
+_schedule_state = schedule_state
 
 
 def _last_scheduled_run(settings: Settings, *, container: Any | None = None) -> Any:
@@ -258,7 +363,11 @@ def daemon_start(
 
     settings = _resolve_serve_settings(host, port, allow_non_loopback)
     pid = read_pid(settings)
-    if pid is not None and pid_matches(settings, pid):
+    # ``start`` never signals the PID, so its availability guard is deliberately
+    # conservative: refuse to start while any recorded PID is alive, even when
+    # the start-time fence cannot verify it. Stop/restart keep the strict
+    # fail-closed ``pid_matches`` fence because they send signals.
+    if pid is not None and (pid_matches(settings, pid) or process_alive(pid)):
         emit_error(
             "DAEMON_ALREADY_RUNNING",
             f"daemon already running with pid {pid}",
@@ -268,7 +377,8 @@ def daemon_start(
     from oft.bootstrap import build_container
 
     container = build_container(settings, initialize=True)
-    # Positional call only: tests replace this seam with a one-argument lambda.
+    # Call the private alias so the existing test seam (which patches
+    # ``_schedule_state``) stays effective; the public name is for new callers.
     state = _schedule_state(settings)
     _run_live_ingestion(settings, replay_file, symbols, container=container)
     scheduler = _start_scheduler(settings, state, container=container)
@@ -637,21 +747,38 @@ def _catch_up_on_start(container: Any, state: ScheduleState) -> None:
         runner.run_window(final_plan.run_window, period=period)
 
 
+def _emit_not_running(json_output: bool) -> None:
+    if json_output:
+        typer.echo(json.dumps({"ok": True, "data": {"state": "NOT_RUNNING"}}, indent=2))
+    else:
+        typer.echo("daemon is not running")
+
+
 @daemon_app.command("stop")
 def daemon_stop(
     json_output: Annotated[bool, typer.Option("--json", help="Emit the result as JSON.")] = False,
 ) -> None:
     """Signal the daemon to stop; safe when it is already offline."""
-    settings = _settings_or_exit(json_output)
+    settings = settings_or_exit(json_output)
     pid = read_pid(settings)
     if pid is None or not pid_matches(settings, pid):
-        if json_output:
-            typer.echo(json.dumps({"ok": True, "data": {"state": "NOT_RUNNING"}}, indent=2))
-        else:
-            typer.echo("daemon is not running")
+        _emit_not_running(json_output)
         return
-    os.kill(pid, signal.SIGTERM)
-    pid_path(settings).unlink(missing_ok=True)
+    # Re-check the start-time fence immediately before signalling: the PID may
+    # have been recycled between the check above and ``os.kill`` (TOCTOU), and a
+    # stale PID must never receive SIGTERM.
+    if not pid_matches(settings, pid):
+        _emit_not_running(json_output)
+        return
+    try:
+        os.kill(pid, signal.SIGTERM)
+    except ProcessLookupError:
+        # The daemon exited between the fence check and the signal: mirror
+        # ``_stop_daemon`` -- clear the stale artifacts and report NOT_RUNNING.
+        _remove_pid_files(settings)
+        _emit_not_running(json_output)
+        return
+    _remove_pid_files(settings)
     if json_output:
         typer.echo(json.dumps({"ok": True, "data": {"state": "STOPPED", "pid": pid}}, indent=2))
     else:
@@ -665,11 +792,11 @@ def daemon_status(
     ] = False,
 ) -> None:
     """Show PID state plus the next and last UTC scan windows."""
-    settings = _settings_or_exit(json_output)
+    settings = settings_or_exit(json_output)
     from oft.bootstrap import build_container
 
     container = build_container(settings)
-    state = _schedule_state(settings, container=container, json_output=json_output)
+    state = schedule_state(settings, container=container, json_output=json_output)
     payload = _status_payload(settings, state, container=container)
     if json_output:
         typer.echo(
@@ -707,7 +834,7 @@ def daemon_logs(
     json_output: Annotated[bool, typer.Option("--json", help="Emit the tail as JSON.")] = False,
 ) -> None:
     """Print the daemon's structured log tail."""
-    settings = _settings_or_exit(json_output)
+    settings = settings_or_exit(json_output)
     path = log_path(settings)
     try:
         text = path.read_text(encoding="utf-8")
@@ -724,15 +851,424 @@ def daemon_logs(
         typer.echo("\n".join(tail))
 
 
+_RESTART_TIMEOUT_SECONDS = 10.0
+_RESTART_POLL_SECONDS = 0.05
+_CHILD_TERMINATE_TIMEOUT_SECONDS = 5.0
+_STARTUP_OUTPUT_LIMIT = 500
+# Read a larger bounded window than the reported tail so a redaction match (for
+# example a long configured secret) is seen whole before the tail is truncated.
+_STARTUP_OUTPUT_READ_BYTES = 8192
+# C0/C1 controls (except tab) must never reach a terminal from child output.
+_CONTROL_CHARS = re.compile(r"[\x00-\x08\x0b-\x1f\x7f-\x9f]")
+
+
+def _remove_pid_files(settings: Settings) -> None:
+    """Remove both PID artifacts on a successful/already-gone stop path."""
+    pid_path(settings).unlink(missing_ok=True)
+    pid_meta_path(settings).unlink(missing_ok=True)
+
+
+def _reap_child(pid: int) -> bool:
+    """Reap ``pid`` if it is our child and has exited (never blocks)."""
+    if not _valid_pid(pid):
+        return False
+    try:
+        reaped, _status = os.waitpid(pid, os.WNOHANG)
+    except OSError:
+        return False
+    return reaped == pid
+
+
+def _stop_daemon(
+    settings: Settings,
+    pid: int,
+    *,
+    timeout_seconds: float = _RESTART_TIMEOUT_SECONDS,
+) -> bool:
+    """SIGTERM the daemon and wait for it to exit; never SIGKILL.
+
+    The start-time fence is re-checked immediately before ``os.kill`` so a PID
+    recycled while the caller prompted is never signalled. A child of this
+    process is reaped while polling, so a zombie cannot make ``process_alive``
+    report it as running until the timeout. The stale PID artifacts are removed
+    on success or when the process is already gone; a timeout keeps them so
+    ``daemon stop`` / ``daemon status`` can retry against the still-live daemon.
+    A non-positive PID is never signalled: ``os.kill(0, ...)`` and
+    ``os.kill(-1, ...)`` address a process group / every process.
+    """
+    if not _valid_pid(pid):
+        return False
+    if not pid_matches(settings, pid):
+        # The caller verified the fence earlier; refuse without signalling if
+        # it no longer matches (recycled PID or a vanished meta file).
+        return False
+    try:
+        os.kill(pid, signal.SIGTERM)
+    except ProcessLookupError:
+        _remove_pid_files(settings)
+        return True
+    deadline = time.monotonic() + timeout_seconds
+    while time.monotonic() < deadline:
+        if _reap_child(pid) or not process_alive(pid):
+            _remove_pid_files(settings)
+            return True
+        time.sleep(_RESTART_POLL_SECONDS)
+    # The daemon may still be alive: keep the PID artifacts so a later
+    # ``daemon stop``/``status`` can observe and retry it.
+    return False
+
+
+def _restart_stderr_path(settings: Settings) -> Path:
+    """Where a detached restart child's stderr (only) is captured."""
+    return settings.data_dir / "run" / "restart-stderr.log"
+
+
+def _spawn_detached_daemon(settings: Settings) -> subprocess.Popen[bytes]:
+    """Start a detached daemon process that outlives the restarting CLI.
+
+    The module entrypoint is preferred over a PATH-discovered ``oft`` so a
+    shadowed executable cannot hijack the restart. structlog already writes the
+    daemon log, so the child's stdout is discarded; only stderr (low-volume
+    uvicorn startup/error output) goes to a private (0600) file, truncated per
+    restart, so a startup failure can be reported instead of vanishing into
+    ``DEVNULL``.
+    """
+    log_file = _restart_stderr_path(settings)
+    log_file.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
+
+    def _private_opener(path: str | os.PathLike[str], flags: int) -> int:
+        # ``O_CREAT`` applies ``0o600`` at creation (and ``fchmod`` fixes a file
+        # left by an older version), closing the brief world-readable window
+        # that ``open("wb")`` followed by ``chmod`` leaves.
+        fd = os.open(path, flags, 0o600)
+        os.fchmod(fd, 0o600)
+        return fd
+
+    # The child holds its own dup of the descriptor after fork/exec, so the
+    # parent handle is closed as soon as the spawn returns.
+    with open(log_file, "wb", opener=_private_opener) as handle:
+        child = subprocess.Popen(
+            [sys.executable, "-m", "oft.cli.main", "daemon", "start"],
+            stdin=subprocess.DEVNULL,
+            stdout=subprocess.DEVNULL,
+            stderr=handle,
+            start_new_session=True,
+            close_fds=True,
+        )
+    return child
+
+
+def _terminate_child(child: subprocess.Popen[bytes]) -> None:
+    """Terminate a spawned daemon whose startup did not report a new PID."""
+    if child.poll() is not None:
+        return
+    child.terminate()
+    try:
+        child.wait(timeout=_CHILD_TERMINATE_TIMEOUT_SECONDS)
+    except subprocess.TimeoutExpired:
+        child.kill()
+        with contextlib.suppress(subprocess.TimeoutExpired):
+            child.wait(timeout=_CHILD_TERMINATE_TIMEOUT_SECONDS)
+
+
+def _startup_output_tail(settings: Settings, *, limit: int = _STARTUP_OUTPUT_LIMIT) -> str:
+    """A bounded, fully redacted, control-stripped tail of the child's output.
+
+    Up to 8 KiB is read and redacted *before* truncation, so a redaction match
+    (notably a long configured secret) is seen whole and never emitted as a
+    partial value. The full ``system.py`` redactor is reused (imported lazily to
+    avoid the module import cycle), so headers, cookies, token shapes, and
+    configured secret values are all removed -- not just the subset
+    ``redact_secrets`` covers. Only the last ``limit`` characters are kept.
+    """
+    from oft.cli.commands.system import _configured_secret_values, redact_record
+
+    path = _restart_stderr_path(settings)
+    try:
+        with path.open("rb") as handle:
+            handle.seek(0, os.SEEK_END)
+            size = handle.tell()
+            handle.seek(max(0, size - _STARTUP_OUTPUT_READ_BYTES))
+            raw = handle.read(_STARTUP_OUTPUT_READ_BYTES)
+    except OSError:
+        return f"child output unavailable; see {path}"
+    decoded = _CONTROL_CHARS.sub("", raw.decode("utf-8", errors="replace"))
+    text = str(redact_record(decoded, secret_values=_configured_secret_values(settings))).strip()
+    if not text:
+        return f"no child output; see {path}"
+    return f"{text[-limit:]} (see {path})"
+
+
+def _child_exit_code(child: Any) -> int | None:
+    """The child's exit code when it has exited, else ``None``.
+
+    Tests replace the spawned child with an opaque sentinel, so a missing
+    ``poll`` is treated as "still running" rather than an error.
+    """
+    poll = getattr(child, "poll", None)
+    if poll is None:
+        return None
+    code = poll()
+    return code if isinstance(code, int) else None
+
+
+def _wait_for_new_pid(
+    settings: Settings,
+    previous_pid: int,
+    *,
+    timeout_seconds: float = _RESTART_TIMEOUT_SECONDS,
+    child: Any | None = None,
+) -> int | None:
+    """Wait for the restarted daemon to publish a live PID different from the old.
+
+    When ``child`` is supplied, an already exited child fails the wait
+    immediately so the caller reports its exit code instead of waiting the full
+    timeout.
+    """
+    deadline = time.monotonic() + timeout_seconds
+    while time.monotonic() < deadline:
+        if child is not None and _child_exit_code(child) is not None:
+            return None
+        pid = read_pid(settings)
+        if pid is not None and pid != previous_pid and pid_matches(settings, pid):
+            return pid
+        time.sleep(_RESTART_POLL_SECONDS)
+    return None
+
+
+def _wait_for_ready(
+    settings: Settings,
+    *,
+    timeout_seconds: float = _RESTART_TIMEOUT_SECONDS,
+    child: Any | None = None,
+) -> bool:
+    """Poll ``GET /ready`` directly over loopback until HTTP 200 or the deadline.
+
+    ``http.client`` is used instead of ``urllib`` so ambient ``http_proxy`` /
+    ``HTTP_PROXY`` settings (with loopback outside ``no_proxy``) cannot route
+    the readiness probe through a proxy -- which would time out and make a
+    healthy restart look failed. Connection errors, malformed responses, and
+    any non-200 status are retried. When ``child`` is supplied, an already
+    exited child fails the wait immediately so the caller reports its exit code
+    instead of waiting the full timeout.
+    """
+    deadline = time.monotonic() + timeout_seconds
+    while True:
+        if child is not None and child.poll() is not None:
+            return False
+        connection: http.client.HTTPConnection | None = None
+        try:
+            connection = http.client.HTTPConnection(settings.host, settings.port, timeout=1.0)
+            connection.request("GET", "/ready")
+            response = connection.getresponse()
+            if response.status == 200:
+                return True
+        except (OSError, http.client.HTTPException):
+            pass
+        finally:
+            if connection is not None:
+                connection.close()
+        if time.monotonic() >= deadline:
+            return False
+        time.sleep(_RESTART_POLL_SECONDS)
+
+
+def _restart_warning(open_positions: int, position_ids: list[str]) -> str:
+    if open_positions == 0:
+        return "No open positions are affected by this restart."
+    if open_positions == 1:
+        summary = "1 open position remains open; restarting the daemon never closes it."
+    else:
+        summary = (
+            f"{open_positions} open positions remain open; restarting the daemon never closes them."
+        )
+    lines = [f"warning: {summary}"]
+    if position_ids:
+        shown = ", ".join(position_ids)
+        suffix = " ..." if open_positions > len(position_ids) else ""
+        lines.append(f"Open positions: {shown}{suffix}")
+    return "\n".join(lines)
+
+
+def _stdin_is_tty() -> bool:
+    try:
+        return bool(sys.stdin.isatty())
+    except (AttributeError, ValueError):
+        return False
+
+
+# Restart is deliberately colocated with start/stop/status rather than split
+# into its own module: it reuses the same PID-file, ``pid_path``, and
+# ``pid_matches`` start-time fence contract, and splitting would duplicate that
+# security-critical lifecycle logic across modules.
+@daemon_app.command("restart")
+def daemon_restart(
+    yes: Annotated[
+        bool,
+        typer.Option("--yes", "-y", help="Skip the confirmation prompt."),
+    ] = False,
+    json_output: Annotated[
+        bool, typer.Option("--json", help="Emit the restart result as JSON.")
+    ] = False,
+) -> None:
+    """Stop and start the daemon, warning about open positions first.
+
+    The restart spawns ``daemon start`` with the current environment and
+    defaults; flags passed to an earlier ``daemon start`` (``--host``,
+    ``--port``, ``--allow-non-loopback``, ``--replay-file``, ``--symbols``)
+    are not persisted and are therefore not reused.
+    """
+    settings = settings_or_exit(json_output)
+    pid = read_pid(settings)
+    if pid is None or not pid_matches(settings, pid):
+        emit_error(
+            "DAEMON_NOT_RUNNING",
+            "daemon is not running; start it with `oft daemon start`",
+            json_output=json_output,
+        )
+        raise typer.Exit(code=1)
+
+    from oft.bootstrap import build_container
+
+    try:
+        container = build_container(settings)
+    except ConfigError as exc:
+        emit_error("CONFIG_INVALID", exc.message, json_output=json_output)
+        raise typer.Exit(code=5) from exc
+
+    # Read-only: a restart must never close or mutate an open position. The
+    # count is exact; only the first 10 ids are read for the warning.
+    open_position_count = container.store.count_positions(state="OPEN")
+    open_position_ids = [
+        position.position_id for position in container.store.list_positions(state="OPEN", limit=10)
+    ]
+    warning = _restart_warning(open_position_count, open_position_ids)
+    # Keep stdout a clean envelope in JSON mode.
+    typer.echo(warning, err=json_output)
+
+    if not yes:
+        if not _stdin_is_tty():
+            emit_error(
+                "VALIDATION_FAILED",
+                "non-interactive: pass --yes to confirm daemon restart",
+                json_output=json_output,
+            )
+            raise typer.Exit(code=2)
+        if not typer.confirm(
+            "restart the daemon? it stops local management until it starts",
+            default=False,
+            err=json_output,
+        ):
+            if json_output:
+                typer.echo(
+                    json.dumps(
+                        success_envelope(
+                            {"state": "CANCELLED", "pid": pid},
+                            request_id=new_request_id(),
+                            generated_at=utc_timestamp(container.clock.now()),
+                            provenance="CALC",
+                            data_quality="COMPLETE",
+                        ),
+                        indent=2,
+                    )
+                )
+            else:
+                typer.echo("restart cancelled")
+            raise typer.Exit(code=0)
+
+    if not _stop_daemon(settings, pid, timeout_seconds=_RESTART_TIMEOUT_SECONDS):
+        emit_error(
+            "INTERNAL_ERROR",
+            f"daemon pid {pid} did not stop within "
+            f"{_RESTART_TIMEOUT_SECONDS:g}s; it was not force-killed",
+            json_output=json_output,
+        )
+        raise typer.Exit(code=1)
+
+    try:
+        child = _spawn_detached_daemon(settings)
+    except OSError as exc:
+        emit_error(
+            "INTERNAL_ERROR",
+            f"daemon stopped but the restart process could not start: {type(exc).__name__}",
+            json_output=json_output,
+        )
+        raise typer.Exit(code=1) from exc
+
+    new_pid = _wait_for_new_pid(
+        settings, pid, timeout_seconds=_RESTART_TIMEOUT_SECONDS, child=child
+    )
+    if new_pid is None:
+        exited = _child_exit_code(child)
+        _terminate_child(child)
+        if exited is not None:
+            cause = f"restarted daemon exited during startup (exit {exited}); "
+        else:
+            cause = f"daemon did not come up within {_RESTART_TIMEOUT_SECONDS:g}s after a restart; "
+        emit_error(
+            "INTERNAL_ERROR",
+            cause + _startup_output_tail(settings),
+            json_output=json_output,
+        )
+        raise typer.Exit(code=1)
+
+    # A published PID only proves the process started; wait for the API to be
+    # ready so a child that crashes or hangs during startup is not reported as
+    # a successful restart. An early child exit fails the wait immediately.
+    if not _wait_for_ready(settings, timeout_seconds=_RESTART_TIMEOUT_SECONDS, child=child):
+        exited = child.poll()
+        _terminate_child(child)
+        if exited is not None:
+            cause = f"restarted daemon exited during startup (exit {exited}); "
+        else:
+            cause = (
+                f"daemon published pid {new_pid} but was not ready within "
+                f"{_RESTART_TIMEOUT_SECONDS:g}s; "
+            )
+        emit_error(
+            "INTERNAL_ERROR",
+            cause + _startup_output_tail(settings),
+            json_output=json_output,
+        )
+        raise typer.Exit(code=1)
+
+    if json_output:
+        typer.echo(
+            json.dumps(
+                success_envelope(
+                    {
+                        "state": "RESTARTED",
+                        "previous_pid": pid,
+                        "pid": new_pid,
+                        "open_positions": open_position_count,
+                    },
+                    request_id=new_request_id(),
+                    generated_at=utc_timestamp(container.clock.now()),
+                    provenance="CALC",
+                    data_quality="COMPLETE",
+                ),
+                indent=2,
+            )
+        )
+        return
+    typer.echo(f"restarted daemon (pid {pid} → {new_pid})")
+
+
 __all__ = [
     "daemon_app",
     "daemon_logs",
+    "daemon_restart",
     "daemon_start",
     "daemon_status",
     "daemon_stop",
     "log_path",
+    "pid_matches",
+    "pid_meta_path",
     "pid_path",
     "process_alive",
     "read_pid",
+    "schedule_state",
+    "settings_or_exit",
+    "write_pid",
     "_run_settings_sync",
 ]

@@ -26,6 +26,7 @@ from oft.cli.commands.report import report_app
 from oft.cli.commands.risk import risk_app
 from oft.cli.commands.scan import scan_app
 from oft.cli.commands.status import status_command
+from oft.cli.commands.system import system_app
 from oft.cli.commands.trigger import trigger_app
 from oft.cli.commands.watchlist import watchlist_app
 from oft.config import ConfigError, Settings, load_settings
@@ -63,6 +64,7 @@ app.add_typer(budget_app, name="budget")
 app.add_typer(risk_app, name="risk")
 app.add_typer(config_app, name="config")
 app.add_typer(replay_app, name="replay")
+app.add_typer(system_app, name="system")
 
 _LOOPBACK_HOSTS = frozenset({"127.0.0.1", "localhost", "::1"})
 
@@ -120,6 +122,11 @@ def _run_uvicorn(settings: Settings) -> None:
         port=settings.port,
         log_level=settings.log_level.lower(),
         access_log=False,
+        # Do not let uvicorn install its stderr loggers: the app factory calls
+        # ``configure_logging`` (stdout + daemon.log, force=True), and with no
+        # uvicorn log_config its messages propagate there instead of growing a
+        # detached capture file for the daemon's lifetime.
+        log_config=None,
     )
 
 
@@ -261,3 +268,8 @@ def serve(
 
 def main() -> None:
     app()
+
+
+if __name__ == "__main__":
+    # The detached-restart fallback launches ``python -m oft.cli.main daemon start``.
+    main()
