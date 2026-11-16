@@ -18,6 +18,8 @@ export interface RouteMatch {
   scanId: string | null
   isReports: boolean
   reportId: string | null
+  isChartPanel: boolean
+  chartReportId: string | null
   isOpportunities: boolean
   opportunityId: string | null
   isTriggers: boolean
@@ -53,6 +55,8 @@ export function resolveRoute(pathname: string): RouteMatch {
   const inspectorSymbol = symbolMatch !== null && !isSearch ? decodeSegment(symbolMatch[1]) : null
   const scanMatch = /^\/scans\/([^/]+)$/.exec(path)
   const reportMatch = /^\/reports\/([^/]+)$/.exec(path)
+  // One report segment plus `/chart` exactly; a deeper path stays unmatched.
+  const chartMatch = /^\/reports\/([^/]+)\/chart$/.exec(path)
   const opportunityMatch = /^\/opportunities\/([^/]+)$/.exec(path)
   const triggerMatch = /^\/triggers\/([^/]+)$/.exec(path)
   const positionMatch = /^\/positions\/([^/]+)$/.exec(path)
@@ -100,6 +104,7 @@ export function resolveRoute(pathname: string): RouteMatch {
     inspectorSymbol !== null ||
     scanMatch !== null ||
     reportMatch !== null ||
+    chartMatch !== null ||
     opportunityMatch !== null ||
     triggerMatch !== null ||
     positionMatch !== null ||
@@ -134,6 +139,8 @@ export function resolveRoute(pathname: string): RouteMatch {
     scanId: scanMatch !== null ? decodeSegment(scanMatch[1]) : null,
     isReports,
     reportId: reportMatch !== null ? decodeSegment(reportMatch[1]) : null,
+    isChartPanel: chartMatch !== null,
+    chartReportId: chartMatch !== null ? decodeSegment(chartMatch[1]) : null,
     isOpportunities,
     opportunityId: opportunityMatch !== null ? decodeSegment(opportunityMatch[1]) : null,
     isTriggers,

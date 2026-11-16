@@ -1,16 +1,9 @@
 import { fireEvent, render, screen, waitFor, within } from '@testing-library/react'
-import { describe, expect, it, vi } from 'vitest'
+import { afterEach, describe, expect, it, vi } from 'vitest'
 
-import type {
-  ApiMeta,
-  SymbolContract,
-  SymbolDetailEnvelope,
-} from '../../api/symbols'
-import type {
-  StarEnvelope,
-  WatchlistEnvelope,
-  WatchlistRow,
-} from '../../api/watchlist'
+import type { ApiMeta, SymbolContract, SymbolDetailEnvelope } from '../../api/symbols'
+import type { ReportSummary } from '../../api/reports'
+import type { StarEnvelope, WatchlistEnvelope, WatchlistRow } from '../../api/watchlist'
 import { SymbolInspectorPage } from '../symbol-inspector'
 import { WatchlistPage } from '../watchlist'
 
@@ -80,6 +73,24 @@ function detailEnvelope(contract: SymbolContract): SymbolDetailEnvelope {
     },
     error: null,
     meta,
+  }
+}
+
+function latestReport(): ReportSummary {
+  return {
+    report_id: 'RPT-BTCUSDT-1',
+    scan_id: 'SCAN-1',
+    symbol: 'BTCUSDT',
+    timeframe: '4h',
+    generated_at: '2026-11-06T04:00:00.000Z',
+    data_quality: 'PARTIAL',
+    llm_decision_id: null,
+    narrative_ref: null,
+    llm_stage: 'SKIPPED',
+    llm_tokens: 0,
+    cost_usd: '0',
+    cost_unpriced: false,
+    llm: { configured: false, validation_status: null, opportunity_ids: [] },
   }
 }
 
@@ -250,6 +261,114 @@ describe('SymbolInspectorPage', () => {
     expect(screen.queryByText('COIN')).not.toBeInTheDocument()
     expect(screen.getByRole('heading', { name: 'Symbol XAUUSDT', level: 1 })).toBeInTheDocument()
   })
+
+  it('links to the latest report chart when a report exists', async () => {
+    render(
+      <SymbolInspectorPage
+        symbol="BTCUSDT"
+        fetchSymbolFn={async () => detailEnvelope(btc)}
+        fetchLatestReportFn={async () => latestReport()}
+        isCompact={false}
+      />,
+    )
+
+    const link = await screen.findByRole('link', { name: /Open latest report chart/i })
+    expect(link).toHaveAttribute('href', '/reports/RPT-BTCUSDT-1/chart')
+  })
+
+  it('renders no chart link when no report exists yet', async () => {
+    render(
+      <SymbolInspectorPage
+        symbol="BTCUSDT"
+        fetchSymbolFn={async () => detailEnvelope(btc)}
+        fetchLatestReportFn={async () => null}
+        isCompact={false}
+      />,
+    )
+
+    await screen.findByRole('heading', { name: 'Symbol BTCUSDT', level: 1 })
+    expect(
+      screen.queryByRole('link', { name: /Open latest report chart/i }),
+    ).not.toBeInTheDocument()
+  })
+})
+
+describe('SymbolInspectorPage latest report failures', () => {
+  afterEach(() => {
+    vi.unstubAllGlobals()
+  })
+
+  it('shows a non-blocking note when the latest report read fails', async () => {
+    render(
+      <SymbolInspectorPage
+        symbol="BTCUSDT"
+        fetchSymbolFn={async () => detailEnvelope(btc)}
+        fetchLatestReportFn={async () => {
+          throw new Error('reports endpoint down')
+        }}
+        isCompact={false}
+      />,
+    )
+
+    const note = await screen.findByText(/Latest report link unavailable: reports endpoint down/i)
+    expect(note).toHaveAttribute('role', 'status')
+    expect(
+      screen.queryByRole('link', { name: /Open latest report chart/i }),
+    ).not.toBeInTheDocument()
+    // The note is non-blocking: the contract panel still renders.
+    expect(await screen.findByRole('heading', { name: 'Contract specs' })).toBeInTheDocument()
+  })
+
+  it('ignores an aborted latest report read', async () => {
+    render(
+      <SymbolInspectorPage
+        symbol="BTCUSDT"
+        fetchSymbolFn={async () => detailEnvelope(btc)}
+        fetchLatestReportFn={async () => {
+          const error = new Error('aborted')
+          error.name = 'AbortError'
+          throw error
+        }}
+        isCompact={false}
+      />,
+    )
+
+    await screen.findByRole('heading', { name: 'Contract specs' })
+    expect(screen.queryByText(/Latest report link unavailable/i)).not.toBeInTheDocument()
+    expect(
+      screen.queryByRole('link', { name: /Open latest report chart/i }),
+    ).not.toBeInTheDocument()
+  })
+
+  it('renders the chart link through the real default client', async () => {
+    const summary = latestReport()
+    vi.stubGlobal(
+      'fetch',
+      vi.fn(
+        async () =>
+          new Response(
+            JSON.stringify({
+              ok: true,
+              data: { items: [summary], total: 1, scan_id: null },
+              error: null,
+              meta,
+            }),
+            { status: 200, headers: { 'Content-Type': 'application/json' } },
+          ),
+      ),
+    )
+
+    render(
+      <SymbolInspectorPage
+        symbol="BTCUSDT"
+        fetchSymbolFn={async () => detailEnvelope(btc)}
+        isCompact={false}
+      />,
+    )
+
+    const link = await screen.findByRole('link', { name: /Open latest report chart/i })
+    expect(link).toHaveAttribute('href', '/reports/RPT-BTCUSDT-1/chart')
+  })
 })
 
 // Migrated from the deleted legacy registry view: these cases now exercise the
@@ -305,7 +424,11 @@ describe('WatchlistPage search', () => {
     render(
       <WatchlistPage
         fetchWatchlistFn={async () =>
-          watchlistEnvelope([watchlistRow(btc, true), watchlistRow(eth, false), watchlistRow(xau, true)])
+          watchlistEnvelope([
+            watchlistRow(btc, true),
+            watchlistRow(eth, false),
+            watchlistRow(xau, true),
+          ])
         }
         setStarFn={async (symbol, starred) => starEnvelope(symbol, starred)}
         isNarrow={false}
@@ -348,7 +471,10 @@ describe('WatchlistPage search', () => {
     render(
       <WatchlistPage
         fetchWatchlistFn={async () =>
-          watchlistEnvelope([watchlistRow(btc, true), watchlistRow(eth, true), watchlistRow(xau, false)], 3)
+          watchlistEnvelope(
+            [watchlistRow(btc, true), watchlistRow(eth, true), watchlistRow(xau, false)],
+            3,
+          )
         }
         setStarFn={async (symbol, starred) => starEnvelope(symbol, starred)}
         isNarrow={false}
@@ -399,4 +525,3 @@ describe('WatchlistPage search', () => {
     expect(screen.getAllByRole('status')).toHaveLength(1)
   })
 })
-

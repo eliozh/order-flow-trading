@@ -74,6 +74,12 @@ export default defineConfig({
       use: { ...devices['Desktop Chrome'], baseURL: reportsBaseURL },
     },
     {
+      // Slice 39: the standalone chart panel route over the reports daemon.
+      name: 'chart',
+      testMatch: /chart\.spec\.ts/,
+      use: { ...devices['Desktop Chrome'], baseURL: reportsBaseURL },
+    },
+    {
       // Slice 38: watchlist star/search journey over the symbols daemon. Last
       // on purpose so the read-only symbols suite observes its seeded stars
       // before this suite mutates them.

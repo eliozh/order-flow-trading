@@ -6,11 +6,15 @@ import {
   type SymbolCoverage,
   type SymbolDetailEnvelope,
 } from '../api/symbols'
+import { fetchLatestReportForSymbol } from '../api/charts'
+import { isAbortError } from '../api/abort'
+import type { ReportSummary } from '../api/reports'
 import { useCompact } from '../hooks/use-compact'
 
 interface SymbolInspectorPageProps {
   symbol: string
   fetchSymbolFn?: (symbol: string) => Promise<SymbolDetailEnvelope>
+  fetchLatestReportFn?: (symbol: string, signal?: AbortSignal) => Promise<ReportSummary | null>
   isCompact?: boolean
 }
 
@@ -21,6 +25,17 @@ interface InspectorState {
   message?: string
 }
 
+/**
+ * The latest-report lookup is independent of the symbol read: an empty page is
+ * a normal "no report yet", while any other failure must stay visible instead of
+ * masquerading as "no report".
+ */
+type LatestReportState =
+  | { state: 'loading' }
+  | { state: 'empty' }
+  | { state: 'ready'; report: ReportSummary }
+  | { state: 'error'; message: string }
+
 function valueOrDash(value: string | null): string {
   return value === null || value === '' ? '—' : value
 }
@@ -28,9 +43,11 @@ function valueOrDash(value: string | null): string {
 export function SymbolInspectorPage({
   symbol,
   fetchSymbolFn = fetchSymbol,
+  fetchLatestReportFn = fetchLatestReportForSymbol,
   isCompact,
 }: SymbolInspectorPageProps) {
   const [load, setLoad] = useState<InspectorState>({ state: 'loading' })
+  const [latestReport, setLatestReport] = useState<LatestReportState>({ state: 'loading' })
   const [attempt, setAttempt] = useState(0)
   const compact = useCompact(isCompact)
   const alertRef = useRef<HTMLParagraphElement>(null)
@@ -39,6 +56,34 @@ export function SymbolInspectorPage({
   useEffect(() => {
     fetcherRef.current = fetchSymbolFn
   }, [fetchSymbolFn])
+
+  useEffect(() => {
+    const controller = new AbortController()
+    let active = true
+    setLatestReport({ state: 'loading' })
+    fetchLatestReportFn(symbol, controller.signal)
+      .then((report) => {
+        // Ignore stale responses and aborts; only a settled, current read wins.
+        if (!active || controller.signal.aborted) {
+          return
+        }
+        setLatestReport(report === null ? { state: 'empty' } : { state: 'ready', report })
+      })
+      .catch((error: unknown) => {
+        // A missing report is not an error; a failed read is. Aborts are cleanup.
+        if (!active || controller.signal.aborted || isAbortError(error)) {
+          return
+        }
+        setLatestReport({
+          state: 'error',
+          message: error instanceof Error ? error.message : 'Unknown error',
+        })
+      })
+    return () => {
+      active = false
+      controller.abort()
+    }
+  }, [symbol, fetchLatestReportFn])
 
   useEffect(() => {
     let active = true
@@ -139,6 +184,21 @@ export function SymbolInspectorPage({
 
       {load.state === 'ready' && contract && coverage && (
         <>
+          {latestReport.state === 'ready' && (
+            <p className="action-row">
+              <a
+                className="control-link"
+                href={`/reports/${encodeURIComponent(latestReport.report.report_id)}/chart`}
+              >
+                Open latest report chart
+              </a>
+            </p>
+          )}
+          {latestReport.state === 'error' && (
+            <p className="status-message status-message--error" role="status">
+              Latest report link unavailable: {latestReport.message}
+            </p>
+          )}
           <section className="panel" aria-labelledby="contract-heading">
             <div className="panel-head">
               <h2 id="contract-heading">Contract specs</h2>

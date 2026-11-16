@@ -1,17 +1,26 @@
 import { memo, useEffect, useId, useState } from 'react'
 import type { KeyboardEvent } from 'react'
 
-import type { MetricsDocument, SnapshotBar } from '../api/reports'
+import type { FootprintSection, SnapshotBar, VolumeProfileSection } from '../api/reports'
 import { signedDecimal, utcLabel } from '../api/reports'
 import { DataQualityBadge } from './data-quality'
 import { FootprintDock } from './footprint-dock'
 import { ProvenanceStamp } from './provenance'
 
+/**
+ * Structural subset of a metrics document that the chart actually draws, so a
+ * frozen report document and a chart payload both fit without casts.
+ */
+interface ChartMetrics {
+  footprint: Pick<FootprintSection, 'bars'>
+  volume_profile: Pick<VolumeProfileSection, 'bins' | 'poc'>
+}
+
 interface ChartProps {
   symbol: string
   timeframe: string
   bars: SnapshotBar[]
-  metrics: MetricsDocument
+  metrics: ChartMetrics
   quality: string
   qualityReasons?: string[]
   selectedBarStart?: string
@@ -182,6 +191,7 @@ function ChartComponent({
   return (
     <figure
       className="chart-frame"
+      lang="en"
       aria-label={`${symbol} ${timeframe} chart`}
       aria-describedby={summaryId}
     >
@@ -365,16 +375,30 @@ function ChartComponent({
                 {bars.map((bar, index) => {
                   const height = (numeric(bar.volume) / maxVolume) * VOLUME_HEIGHT
                   const x = PADDING + slot * index + slot / 2
+                  const up = numeric(bar.delta) >= 0
+                  const barTop = VOLUME_TOP + VOLUME_HEIGHT - height
+                  const barWidth = candleWidth
                   return (
-                    <rect
-                      key={`vol-${bar.bar_start}`}
-                      className={numeric(bar.delta) >= 0 ? 'vol-up' : 'vol-down'}
-                      data-direction={numeric(bar.delta) >= 0 ? 'up' : 'down'}
-                      x={x - candleWidth / 2}
-                      y={VOLUME_TOP + VOLUME_HEIGHT - height}
-                      width={candleWidth}
-                      height={Math.max(height, 1)}
-                    />
+                    <g key={`vol-${bar.bar_start}`} data-direction={up ? 'up' : 'down'}>
+                      <rect
+                        className={up ? 'vol-up' : 'vol-down'}
+                        x={x - barWidth / 2}
+                        y={barTop}
+                        width={barWidth}
+                        height={Math.max(height, 1)}
+                      />
+                      {up && (
+                        // Non-colour direction channel (DESIGN §13.2): a 1px
+                        // top cap on up bars; down bars are outlined only.
+                        <line
+                          className="vol-cap"
+                          x1={x - barWidth / 2}
+                          x2={x + barWidth / 2}
+                          y1={barTop}
+                          y2={barTop}
+                        />
+                      )}
+                    </g>
                   )
                 })}
               </g>
@@ -440,6 +464,7 @@ function ChartComponent({
         <span>
           <span className="swatch swatch--down" aria-hidden="true" /> down
         </span>
+        <span>up bars: filled bar with top cap · down bars: outline bar</span>
         <span>POC</span>
         <span>POC highlighted bin · value-area bins in table</span>
       </div>
@@ -473,7 +498,14 @@ function ChartComponent({
             </thead>
             <tbody>
               {bars.map((bar) => (
-                <tr key={`row-${bar.bar_start}`}>
+                <tr
+                  key={`row-${bar.bar_start}`}
+                  aria-current={bar.bar_start === selectedBar.bar_start ? 'true' : undefined}
+                  data-selected={bar.bar_start === selectedBar.bar_start ? 'true' : undefined}
+                  className={
+                    bar.bar_start === selectedBar.bar_start ? 'chart-row--selected' : undefined
+                  }
+                >
                   <td className="mono">{utcLabel(bar.bar_start)}</td>
                   <td className="mono">{bar.open}</td>
                   <td className="mono">{bar.high}</td>

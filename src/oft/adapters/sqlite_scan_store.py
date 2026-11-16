@@ -3,6 +3,8 @@
 Covers the ``scans``, ``reports``, ``idempotency_keys``, ``manifest``, and
 ``scan_symbols`` tables plus their row mappers. Owns the scan manifest rows
 (``_insert_manifest``); the backfill mixin owns the backfill part-manifest rows.
+Bounded symbol report pages, counts, and per-timeframe headers live in
+``sqlite_report_reads.py``.
 """
 
 from __future__ import annotations

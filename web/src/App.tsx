@@ -5,6 +5,7 @@ import { LiveUpdatesProvider } from './hooks/live-updates-provider'
 import { useNarrowCompact } from './hooks/use-compact'
 import { useStatusBar } from './hooks/use-status-bar'
 import { resolveRoute } from './routes/route-match'
+import { ChartPanelPage } from './routes/chart-panel'
 import { OpportunityDetailPage } from './routes/opportunity-detail'
 import { OpportunitiesPage } from './routes/opportunities'
 import { JournalDetailPage } from './routes/journal-detail'
@@ -55,11 +56,17 @@ export default function App() {
         <PauseControl />
         <div className="app-body">
           <Nav activeItemId={route.activeNavItem} compact={compactNav} />
-          <main id="app-main" className="app-main" tabIndex={-1}>
+          <main
+            id="app-main"
+            className={route.isChartPanel ? 'app-main app-main--wide' : 'app-main'}
+            tabIndex={-1}
+          >
             {route.inspectorSymbol !== null ? (
               <SymbolInspectorPage key={route.inspectorSymbol} symbol={route.inspectorSymbol} />
             ) : route.scanId !== null ? (
               <ScanDetailPage key={route.scanId} scanId={route.scanId} />
+            ) : route.chartReportId !== null ? (
+              <ChartPanelPage key={route.chartReportId} reportId={route.chartReportId} />
             ) : route.reportId !== null ? (
               <ReportDetailPage key={route.reportId} reportId={route.reportId} />
             ) : route.opportunityId !== null ? (

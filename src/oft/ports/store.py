@@ -196,6 +196,22 @@ class ReportRecord:
 
 
 @dataclass(frozen=True)
+class ReportHeader:
+    """A bounded report projection: identity and recency, no frozen documents.
+
+    The chart read path needs only these columns to list available periods and
+    pick the newest source per timeframe; reading the full ``snapshot_json`` and
+    ``metrics_json`` (hundreds of KB each) for every report would be an
+    unbounded read just to serve a few rows.
+    """
+
+    report_id: str
+    symbol: str
+    timeframe: str
+    generated_at: str
+
+
+@dataclass(frozen=True)
 class IdempotencyRecord:
     """A stored idempotent response for one ``(scope, key)`` pair."""
 
@@ -810,6 +826,32 @@ class StorePort(Protocol):
         bounds the read to the newest reports generated at/after the position's
         opening plus the single newest report before it; ``limit`` caps the
         post-entry rows.
+        """
+        ...
+
+    def list_reports_for_symbol_page(
+        self, symbol: str, *, scan_id: str | None = None, limit: int = 20, offset: int = 0
+    ) -> tuple[ReportRecord, ...]:
+        """One newest-first page of a symbol's reports, bounded in SQL.
+
+        Orders ``generated_at DESC, report_id DESC`` and applies ``LIMIT``/
+        ``OFFSET`` (plus an optional ``scan_id`` filter) in the query, so the
+        symbol-filter route never materializes every frozen document.
+        """
+        ...
+
+    def count_reports_for_symbol(self, symbol: str, *, scan_id: str | None = None) -> int:
+        """The true row count behind :meth:`list_reports_for_symbol_page`."""
+        ...
+
+    def list_report_headers_for_symbol(self, symbol: str) -> tuple[ReportHeader, ...]:
+        """The newest report header per timeframe for one symbol.
+
+        Selects only ``report_id``/``symbol``/``timeframe``/``generated_at``,
+        ordered newest first by the existing ``(generated_at, report_id)``
+        rule, and returns at most one row per timeframe. The chart service uses
+        it to build the available-period list and pick the newest source per
+        period without reading any full frozen document.
         """
         ...
 

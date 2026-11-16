@@ -1,10 +1,10 @@
 """SQLite transactional store (WAL) composition root.
 
 Composes the connection, audit, LLM-ledger, opportunity-ledger, paper-OMS,
-scan, symbol, backfill, job, and prompt mixins. The schema DDL and every migration live
-in ``sqlite_schema.py``. The daemon is the only writer. Diagnostic commands
-open the database with ``mode=ro`` so ``oft status`` / ``oft doctor`` never
-block or create files.
+scan, bounded report-read, symbol, backfill, job, and prompt mixins. The schema
+DDL and every migration live in ``sqlite_schema.py``. The daemon is the only
+writer. Diagnostic commands open the database with ``mode=ro`` so ``oft status``
+/ ``oft doctor`` never block or create files.
 """
 
 from __future__ import annotations
@@ -23,6 +23,7 @@ from oft.adapters.sqlite_llm_ledger import LLMStoreMixin
 from oft.adapters.sqlite_opportunity_ledger import OpportunityStoreMixin
 from oft.adapters.sqlite_paper_oms import PaperOmsStoreMixin
 from oft.adapters.sqlite_prompt_store import PromptStoreMixin
+from oft.adapters.sqlite_report_reads import ReportReadsMixin
 from oft.adapters.sqlite_scan_store import ScanStoreMixin
 from oft.adapters.sqlite_schema import _period_parts as _period_parts
 from oft.adapters.sqlite_schema import database_path, initialize_database
@@ -39,6 +40,7 @@ class SqliteStore(
     OpportunityStoreMixin,
     PaperOmsStoreMixin,
     ScanStoreMixin,
+    ReportReadsMixin,
     SymbolStoreMixin,
     BackfillStoreMixin,
     JobStoreMixin,
