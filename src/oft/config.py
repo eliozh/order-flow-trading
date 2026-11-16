@@ -356,6 +356,21 @@ class ConfigError(Exception):
         self.message = message
 
 
+def _format_validation_error(exc: ValidationError) -> str:
+    """Render field paths and messages only.
+
+    Pydantic's default ``str(exc)`` includes each error's ``input_value`` and
+    documentation URL. An invalid base URL can therefore echo a credential that
+    was embedded in it, so the input value never enters the CLI error path.
+    """
+    details: list[str] = []
+    for error in exc.errors(include_input=False, include_url=False):
+        location = ".".join(str(part) for part in error.get("loc", ())) or "settings"
+        message = str(error.get("msg", "invalid value"))
+        details.append(f"{location}: {message}")
+    return "; ".join(details) or "invalid configuration"
+
+
 def load_settings(**overrides: Any) -> Settings:
     """Load settings from the environment, applying explicit overrides last.
 
@@ -365,4 +380,4 @@ def load_settings(**overrides: Any) -> Settings:
     try:
         return Settings(**overrides)
     except ValidationError as exc:
-        raise ConfigError(str(exc)) from exc
+        raise ConfigError(_format_validation_error(exc)) from exc

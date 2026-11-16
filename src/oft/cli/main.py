@@ -26,6 +26,7 @@ from oft.cli.commands.report import report_app
 from oft.cli.commands.risk import risk_app
 from oft.cli.commands.scan import scan_app
 from oft.cli.commands.status import status_command
+from oft.cli.commands.system import system_app
 from oft.cli.commands.trigger import trigger_app
 from oft.cli.commands.watchlist import watchlist_app
 from oft.config import ConfigError, Settings, load_settings
@@ -63,6 +64,7 @@ app.add_typer(budget_app, name="budget")
 app.add_typer(risk_app, name="risk")
 app.add_typer(config_app, name="config")
 app.add_typer(replay_app, name="replay")
+app.add_typer(system_app, name="system")
 
 _LOOPBACK_HOSTS = frozenset({"127.0.0.1", "localhost", "::1"})
 
@@ -105,6 +107,58 @@ def _resolve_serve_settings(
         raise typer.Exit(code=5) from exc
 
 
+def _uvicorn_log_config() -> dict[str, Any]:
+    """uvicorn's own stderr loggers, isolated from the root (daemon.log) handlers.
+
+    ``configure_logging`` installs root handlers that write JSON to stdout and
+    ``daemon.log``. uvicorn emits plaintext diagnostics; letting them propagate
+    would append non-JSON lines to ``daemon.log`` and make a filtered
+    ``system logs`` report dropped/PARTIAL data. ``propagate: False`` on every
+    uvicorn logger keeps them on stderr only.
+    """
+    return {
+        "version": 1,
+        "disable_existing_loggers": False,
+        "formatters": {
+            "default": {
+                "()": "uvicorn.logging.DefaultFormatter",
+                "fmt": "%(levelprefix)s %(message)s",
+                "use_colors": False,
+            },
+            # uvicorn 0.54 indexes this key whenever ``use_colors`` is a bool,
+            # even with access logging disabled.
+            "access": {
+                "()": "uvicorn.logging.AccessFormatter",
+                "fmt": '%(levelprefix)s %(client_addr)s - "%(request_line)s" %(status_code)s',
+            },
+        },
+        "handlers": {
+            "default": {
+                "formatter": "default",
+                "class": "logging.StreamHandler",
+                "stream": "ext://sys.stderr",
+            },
+        },
+        "loggers": {
+            "uvicorn": {
+                "handlers": ["default"],
+                "level": "INFO",
+                "propagate": False,
+            },
+            "uvicorn.error": {
+                "handlers": ["default"],
+                "level": "INFO",
+                "propagate": False,
+            },
+            "uvicorn.access": {
+                "handlers": ["default"],
+                "level": "INFO",
+                "propagate": False,
+            },
+        },
+    }
+
+
 def _run_uvicorn(settings: Settings) -> None:
     def app_factory() -> Any:
         from oft.api.app import create_app
@@ -120,6 +174,10 @@ def _run_uvicorn(settings: Settings) -> None:
         port=settings.port,
         log_level=settings.log_level.lower(),
         access_log=False,
+        # uvicorn installs its own stderr handlers with propagation disabled, so
+        # its plaintext records never reach the root handlers that write
+        # daemon.log (which must stay JSON-only for ``system logs``).
+        log_config=_uvicorn_log_config(),
     )
 
 
@@ -261,3 +319,8 @@ def serve(
 
 def main() -> None:
     app()
+
+
+if __name__ == "__main__":
+    # The detached-restart fallback launches ``python -m oft.cli.main daemon start``.
+    main()
