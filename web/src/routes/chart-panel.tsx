@@ -347,6 +347,9 @@ export function ChartPanelPage({
               qualityReasons={chart.quality_reasons}
               selectedBarStart={selectedBarStart}
               onSelectBar={setSelectedBarStart}
+              zones={chart.zones}
+              markers={chart.markers}
+              gaps={chart.gaps}
             />
             <p className="chart-gaps explain">
               Gaps: {chart.gaps.length}. gaps are never interpolated.

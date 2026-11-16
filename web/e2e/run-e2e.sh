@@ -32,6 +32,7 @@ SYSTEM_SCREENS_DIR="$ROOT/.claude/ecc-workflow/screens/e2e"
 SYMBOLS_SCREENS_DIR="$ROOT/.claude/ecc-workflow/screens/e2e02"
 REPORTS_SCREENS_DIR="$ROOT/.claude/ecc-workflow/screens/e2e08"
 JOURNAL_SCREENS_DIR="$ROOT/.claude/ecc-workflow/screens/slice-30"
+CHART_SCREENS_DIR="$ROOT/.claude/ecc-workflow/screens/e2e40"
 MARKET_FIXTURE="$ROOT/tests/fixtures/market/btcusdt_agg-trades_sample.csv"
 EXCHANGE_INFO_FIXTURE="$ROOT/tests/fixtures/binance/exchange_info_sample.json"
 ARCHIVE_FIXTURE_DIR="$ROOT/tests/fixtures/archive"
@@ -365,6 +366,17 @@ if ! curl -fsS -H "Authorization: Bearer $REPORTS_TOKEN" \
   exit 1
 fi
 
+# Slice 40: the batch report's chart must expose the linked opportunity zone and
+# the accepted paper position's markers, so the browser suite can assert
+# overlays against the real server payload (never client-inferred).
+if ! curl -fsS -H "Authorization: Bearer $REPORTS_TOKEN" \
+  "$REPORTS_BASE_URL/api/v1/reports/$BATCH_REPORT_ID/chart" |
+  jq -e '.ok == true and .data.status == "AVAILABLE" and
+    (.data.zones | length) > 0 and (.data.markers | length) > 0' >/dev/null; then
+  echo "E2E overlay report $BATCH_REPORT_ID has no server-derived zones/markers" >&2
+  exit 1
+fi
+
 # Slice 30: seed one CLOSED trade for the journal journey on the same reports
 # daemon without touching the OPEN position above. A second starred batch scan
 # yields a fresh opportunity on the still-valid ANALYSIS fixture; it is
@@ -646,6 +658,9 @@ export OFT_E2E_JOURNAL_BATCH_ID="$(printf '%s' "$JOURNAL_BATCH_JSON" |
   jq -r '.data.scan_id // empty')"
 export OFT_E2E_JOURNAL_REPORT_ID="$JOURNAL_REPORT_ID"
 export OFT_E2E_JOURNAL_SCREENS_DIR="$JOURNAL_SCREENS_DIR"
+# Slice 40: the report whose chart carries server-derived overlays.
+export OFT_E2E_CHART_OVERLAY_REPORT_ID="$BATCH_REPORT_ID"
+export OFT_E2E_CHART_OVERLAY_SCREENS_DIR="$CHART_SCREENS_DIR"
 export OFT_E2E_REPORT_API_TOKEN="$REPORTS_TOKEN"
 export OFT_E2E_DATA_DIR="$SYSTEM_DATA_DIR"
 export OFT_E2E_SCAN_ID="$SCAN_ID"
@@ -653,11 +668,24 @@ export OFT_E2E_SCAN_DELTA="$SCAN_DELTA"
 export OFT_E2E_SYSTEM_SCREENS_DIR="$SYSTEM_SCREENS_DIR"
 export OFT_E2E_SYMBOLS_SCREENS_DIR="$SYMBOLS_SCREENS_DIR"
 export OFT_E2E_REPORT_SCREENS_DIR="$REPORTS_SCREENS_DIR"
-# Global Playwright report/artifact output for this run lands under e2e08.
-export OFT_E2E_SCREENS_DIR="$REPORTS_SCREENS_DIR"
-export OFT_E2E_REPORT_DIR="$REPORTS_SCREENS_DIR/report"
+# Global Playwright report/artifact output for this run lands under e2e08,
+# except a chart-only run, whose report, traces, and artifacts land under
+# e2e40 (the slice-40 screens directory).
+CHART_ONLY=false
+for arg in "$@"; do
+  case "$arg" in
+    --project=chart) CHART_ONLY=true ;;
+  esac
+done
+if [ "$CHART_ONLY" = true ]; then
+  export OFT_E2E_SCREENS_DIR="$CHART_SCREENS_DIR"
+  export OFT_E2E_REPORT_DIR="$CHART_SCREENS_DIR/report"
+else
+  export OFT_E2E_SCREENS_DIR="$REPORTS_SCREENS_DIR"
+  export OFT_E2E_REPORT_DIR="$REPORTS_SCREENS_DIR/report"
+fi
 
-mkdir -p "$SYSTEM_SCREENS_DIR" "$SYMBOLS_SCREENS_DIR" "$REPORTS_SCREENS_DIR" "$JOURNAL_SCREENS_DIR"
+mkdir -p "$SYSTEM_SCREENS_DIR" "$SYMBOLS_SCREENS_DIR" "$REPORTS_SCREENS_DIR" "$JOURNAL_SCREENS_DIR" "$CHART_SCREENS_DIR"
 echo "system e2e daemon: $SYSTEM_BASE_URL · data: $SYSTEM_DATA_DIR · scan: $SCAN_ID · delta: $SCAN_DELTA"
 echo "symbol e2e daemon: $SYMBOLS_BASE_URL · data: $SYMBOLS_DATA_DIR · seeded from $EXCHANGE_INFO_FIXTURE"
 echo "report e2e daemon: $REPORTS_BASE_URL · data: $REPORTS_DATA_DIR · report: $REPORT_ID"

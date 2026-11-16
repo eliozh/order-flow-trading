@@ -8,14 +8,19 @@ from fastapi import APIRouter, Path, Query, Request
 
 from oft.api.envelope import new_request_id, success_envelope
 from oft.api.errors import ApiError
-from oft.application.chart_service import SUPPORTED_CHART_PERIODS, resolve_chart
+from oft.application.chart_service import (
+    SUPPORTED_CHART_PERIODS,
+    derive_overlays,
+    resolve_chart,
+)
 from oft.application.scan_service import report_payload, report_summary
+from oft.ports.store import ReportRecord
 
 router = APIRouter()
 
 
-def _report_or_404(request: Request, report_id: str) -> Any:
-    record = request.app.state.container.store.get_report(report_id)
+def _report_or_404(request: Request, report_id: str) -> ReportRecord:
+    record: ReportRecord | None = request.app.state.container.store.get_report(report_id)
     if record is None:
         raise ApiError("NOT_FOUND", f"Report {report_id} does not exist.")
     return record
@@ -89,6 +94,10 @@ def read_report_chart(
     An omitted ``period`` means the report's native timeframe. Explicit values
     must be one of ``15m``/``1h``/``4h`` or that native timeframe; anything else
     is a validation failure naming the allowed values.
+
+    Overlays (opportunity zones/trigger lines and position markers) are derived
+    from this report's linked records, independent of ``period``. Switching the
+    timeframe changes only the drawn series; it never invents overlays.
     """
     record = _report_or_404(request, report_id)
     requested = period if period is not None else record.timeframe
@@ -98,7 +107,9 @@ def read_report_chart(
             "VALIDATION_FAILED",
             f"period must be one of {allowed}; got {requested!r}.",
         )
-    payload = resolve_chart(record, requested, request.app.state.container.store)
+    store = request.app.state.container.store
+    zones, markers = derive_overlays(record, store)
+    payload = resolve_chart(record, requested, store, zones=zones, markers=markers)
     generated_at = payload["generated_at"] or record.generated_at
     return success_envelope(
         payload,

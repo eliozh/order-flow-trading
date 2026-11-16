@@ -1,20 +1,27 @@
-import { memo, useEffect, useId, useState } from 'react'
-import type { KeyboardEvent } from 'react'
+import { memo, useEffect, useId, useMemo, useRef, useState } from 'react'
+import type { KeyboardEvent, PointerEvent } from 'react'
 
-import type { FootprintSection, SnapshotBar, VolumeProfileSection } from '../api/reports'
+import type { ChartMarker, ChartZone } from '../api/charts'
+import type { DataGap, SnapshotBar } from '../api/reports'
 import { signedDecimal, utcLabel } from '../api/reports'
+import { ChartCrosshair, ChartTooltip, crosshairSummary } from './chart-crosshair'
+import {
+  CVD_HEIGHT,
+  CVD_TOP,
+  ChartPlate,
+  HEIGHT,
+  PADDING,
+  PRICE_HEIGHT,
+  PRICE_TOP,
+  WIDTH,
+  numeric,
+  yForPrice,
+  type ChartMetrics,
+} from './chart-plate'
+import { barQualityStamp, numericPrice } from './chart-overlays'
 import { DataQualityBadge } from './data-quality'
 import { FootprintDock } from './footprint-dock'
 import { ProvenanceStamp } from './provenance'
-
-/**
- * Structural subset of a metrics document that the chart actually draws, so a
- * frozen report document and a chart payload both fit without casts.
- */
-interface ChartMetrics {
-  footprint: Pick<FootprintSection, 'bars'>
-  volume_profile: Pick<VolumeProfileSection, 'bins' | 'poc'>
-}
 
 interface ChartProps {
   symbol: string
@@ -30,34 +37,35 @@ interface ChartProps {
    * text label. It adds no indicator, pane, or series.
    */
   entryPrice?: string | number | null
+  /** Server-derived opportunity zones and trigger lines (never inferred). */
+  zones?: ChartZone[]
+  /** Server-derived entry/exit/stop/target markers (never inferred). */
+  markers?: ChartMarker[]
+  /** Server-declared data gaps, drawn as breaks instead of interpolated data. */
+  gaps?: DataGap[]
+  /**
+   * Test-only render instrumentation forwarded to the memoized plate. Production
+   * callers leave it undefined; tests use it to prove the plate does not rebuild
+   * on an equal-data poll.
+   */
+  onPlateRender?: () => void
 }
 
-const WIDTH = 760
-const PRICE_TOP = 18
-const PRICE_HEIGHT = 210
-const VOLUME_TOP = 250
-const VOLUME_HEIGHT = 58
-const CVD_TOP = 324
-const CVD_HEIGHT = 64
-const HEIGHT = 410
-const PADDING = 12
-
-function numeric(value: string | null): number {
-  if (value === null) {
-    return 0
-  }
-  const parsed = Number(value)
-  return Number.isFinite(parsed) ? parsed : 0
-}
+// Stable empty defaults: a `[]` literal in the parameter list would get a new
+// identity on every render and needlessly invalidate the announcement effect.
+const EMPTY_ZONES: ChartZone[] = []
+const EMPTY_MARKERS: ChartMarker[] = []
+const EMPTY_GAPS: DataGap[] = []
+const EMPTY_REASONS: string[] = []
 
 /**
- * The drawn price domain. An entry marker price is folded into the domain so
- * the marker is always inside the plotted range (the report snapshot predates
+ * The drawn price domain. Entry, zone, and marker prices are folded in so an
+ * overlay is always inside the plotted range (the report snapshot predates the
  * entry, so the entry is often above or below every bar).
  */
 function priceRange(
   bars: SnapshotBar[],
-  anchor: number | null = null,
+  anchors: Array<number | null> = [],
 ): { min: number; max: number } {
   let min = Number.POSITIVE_INFINITY
   let max = Number.NEGATIVE_INFINITY
@@ -65,17 +73,14 @@ function priceRange(
     min = Math.min(min, numeric(bar.low))
     max = Math.max(max, numeric(bar.high))
   }
-  if (anchor !== null && Number.isFinite(anchor)) {
-    min = Math.min(min, anchor)
-    max = Math.max(max, anchor)
+  for (const anchor of anchors) {
+    if (anchor !== null && Number.isFinite(anchor)) {
+      min = Math.min(min, anchor)
+      max = Math.max(max, anchor)
+    }
   }
   const pad = Math.max((max - min) * 0.08, 0.01)
   return { min: min - pad, max: max + pad }
-}
-
-function yForPrice(value: number, range: { min: number; max: number }): number {
-  const span = range.max - range.min || 1
-  return PRICE_TOP + ((range.max - value) / span) * PRICE_HEIGHT
 }
 
 function signedText(value: string): string {
@@ -88,34 +93,80 @@ function ChartComponent({
   bars,
   metrics,
   quality,
-  qualityReasons = [],
+  qualityReasons = EMPTY_REASONS,
   selectedBarStart,
   onSelectBar,
   entryPrice = null,
+  zones = EMPTY_ZONES,
+  markers = EMPTY_MARKERS,
+  gaps = EMPTY_GAPS,
+  onPlateRender,
 }: ChartProps) {
   const plotId = useId()
   const tableId = `${plotId}-table`
   const summaryId = `${plotId}-summary`
+  const overlaySummaryId = `${plotId}-overlays`
+  const hatchId = `${plotId}-hatch`
   const [internalSelection, setInternalSelection] = useState<string | undefined>(undefined)
+  const [crosshairBarStart, setCrosshairBarStart] = useState<string | undefined>(undefined)
   const [showTable, setShowTable] = useState(false)
   const [announcement, setAnnouncement] = useState('')
+  // Only a user-initiated selection warrants a bar announcement. The initial
+  // mount and a parent-driven period switch are announced once by the panel's
+  // own polite region, so two polite regions never queue back-to-back.
+  const hasUserSelectionRef = useRef(false)
+  // Cache the canvas rect across pointermove events instead of reading layout
+  // on every move; pointerenter/pointerleave own the cache lifetime.
+  const canvasRectRef = useRef<DOMRect | null>(null)
   const selected = selectedBarStart ?? internalSelection ?? bars[bars.length - 1]?.bar_start
 
   useEffect(() => {
-    if (!selected) {
+    if (!selected || !hasUserSelectionRef.current) {
       return
     }
     const timer = setTimeout(() => {
       const bar = bars.find((candidate) => candidate.bar_start === selected)
       if (bar) {
         setAnnouncement(
-          `${symbol} ${timeframe}. ${bars.length} bars. Selected ${utcLabel(bar.bar_start)} UTC, ` +
-            `close ${bar.close}, delta ${signedText(bar.delta)}.`,
+          `${symbol} ${timeframe}. ${bars.length} bars. ` +
+            crosshairSummary(bar, gaps, quality, qualityReasons),
         )
       }
     }, 500)
     return () => clearTimeout(timer)
-  }, [bars, selected, symbol, timeframe])
+  }, [bars, selected, symbol, timeframe, gaps, quality, qualityReasons])
+
+  // Escape must dismiss a pointer-opened crosshair even when no bar button has
+  // focus; the bar-level Escape handler still covers keyboard semantics.
+  useEffect(() => {
+    if (crosshairBarStart === undefined) {
+      return
+    }
+    function handleDocumentKeyDown(event: globalThis.KeyboardEvent) {
+      if (event.key === 'Escape') {
+        setCrosshairBarStart(undefined)
+      }
+    }
+    document.addEventListener('keydown', handleDocumentKeyDown)
+    return () => document.removeEventListener('keydown', handleDocumentKeyDown)
+  }, [crosshairBarStart])
+
+  const entryValue =
+    entryPrice === null || entryPrice === undefined || entryPrice === '' ? null : Number(entryPrice)
+  const entryText = entryValue === null ? null : String(entryPrice)
+  const anchoredEntry = entryValue !== null && Number.isFinite(entryValue) ? entryValue : null
+  // The drawn price domain. Entry, zone, and marker prices are folded in so an
+  // overlay is always inside the plotted range. Memoized so the crosshair layer
+  // can re-render without giving the memoized plate a new range identity.
+  const range = useMemo(() => {
+    const zoneAnchors = zones.flatMap((zone) => [
+      numericPrice(zone.low),
+      numericPrice(zone.high),
+      numericPrice(zone.trigger_price),
+    ])
+    const markerAnchors = markers.map((marker) => numericPrice(marker.price))
+    return priceRange(bars, [anchoredEntry, ...zoneAnchors, ...markerAnchors])
+  }, [bars, zones, markers, anchoredEntry])
 
   if (quality === 'MISSING' || bars.length === 0) {
     return (
@@ -135,40 +186,36 @@ function ChartComponent({
     )
   }
 
-  const entryValue =
-    entryPrice === null || entryPrice === undefined || entryPrice === '' ? null : Number(entryPrice)
-  const entryText = entryValue === null ? null : String(entryPrice)
-  const anchoredEntry = entryValue !== null && Number.isFinite(entryValue) ? entryValue : null
-  const range = priceRange(bars, anchoredEntry)
-  // The entry is part of the price domain above, so a finite entry always has a
-  // Y position and an off-range entry renders as an in-scale marker.
-  const entryY = anchoredEntry === null ? null : yForPrice(anchoredEntry, range)
   const slot = (WIDTH - PADDING * 2) / bars.length
   const candleWidth = Math.max(slot * 0.55, 3)
   const selectedBar = bars.find((bar) => bar.bar_start === selected) ?? bars[bars.length - 1]
+  const crosshairBar =
+    crosshairBarStart === undefined
+      ? undefined
+      : (bars.find((bar) => bar.bar_start === crosshairBarStart) ?? undefined)
+  const crosshairIndex =
+    crosshairBar === undefined
+      ? -1
+      : bars.findIndex((bar) => bar.bar_start === crosshairBar.bar_start)
+  const crosshairX = crosshairIndex < 0 ? null : PADDING + slot * crosshairIndex + slot / 2
   const footprint = metrics.footprint.bars.find((bar) => bar.bar_start === selectedBar.bar_start)
-  let cvdMin = 0
-  let cvdMax = 0
-  let maxVolume = 0.000001
-  for (const bar of bars) {
-    const cvd = numeric(bar.cvd)
-    cvdMin = Math.min(cvdMin, cvd)
-    cvdMax = Math.max(cvdMax, cvd)
-    maxVolume = Math.max(maxVolume, numeric(bar.volume))
-  }
-  const cvdSpan = cvdMax - cvdMin || 1
-  let maxProfileVolume = 0.000001
-  for (const bin of metrics.volume_profile.bins) {
-    maxProfileVolume = Math.max(maxProfileVolume, numeric(bin.volume))
-  }
 
   function selectBar(barStart: string) {
+    hasUserSelectionRef.current = true
     setInternalSelection(barStart)
+    // The crosshair is hidden initially and appears on the first selection or
+    // pointer hover; Escape hides it again.
+    setCrosshairBarStart(barStart)
     onSelectBar?.(barStart)
   }
 
   function handleBarKeyDown(event: KeyboardEvent<HTMLButtonElement>) {
     const index = Number(event.currentTarget.dataset.index)
+    if (event.key === 'Escape') {
+      event.preventDefault()
+      setCrosshairBarStart(undefined)
+      return
+    }
     let next = index
     if (event.key === 'ArrowRight') {
       next = Math.min(index + 1, bars.length - 1)
@@ -188,19 +235,95 @@ function ChartComponent({
     controls?.[next]?.focus()
   }
 
+  function handlePlotPointerEnter(event: PointerEvent<HTMLDivElement>) {
+    canvasRectRef.current = event.currentTarget.getBoundingClientRect()
+  }
+
+  function handlePlotPointerLeave() {
+    canvasRectRef.current = null
+    setCrosshairBarStart(undefined)
+  }
+
+  /**
+   * Pointer hover moves only the crosshair/tooltip and never commits the
+   * selection, so `aria-pressed` and the roving tab stop stay with the
+   * keyboard/click selection and focus survives a mouse pass.
+   */
+  function handlePlotPointerMove(event: PointerEvent<HTMLDivElement>) {
+    const rect = canvasRectRef.current ?? event.currentTarget.getBoundingClientRect()
+    canvasRectRef.current = rect
+    const clientX = event.clientX
+    if (rect.width <= 0 || bars.length === 0 || !Number.isFinite(clientX)) {
+      return
+    }
+    const svgX = ((clientX - rect.left) / rect.width) * WIDTH
+    const rawIndex = Math.floor((svgX - PADDING) / slot)
+    const index = Math.min(Math.max(rawIndex, 0), bars.length - 1)
+    const barStart = bars[index].bar_start
+    if (barStart !== crosshairBarStart) {
+      setCrosshairBarStart(barStart)
+    }
+  }
+
   return (
     <figure
       className="chart-frame"
       lang="en"
       aria-label={`${symbol} ${timeframe} chart`}
-      aria-describedby={summaryId}
+      aria-describedby={`${summaryId} ${overlaySummaryId}`}
     >
       <figcaption id={summaryId} className="visually-hidden">
         Candlestick chart with {bars.length} bars. Price range {range.min.toFixed(2)} to{' '}
         {range.max.toFixed(2)}. Volume, CVD, volume profile, and footprint are shown; the data table
         carries the same values.
-        {entryY !== null && entryText !== null ? ` Entry marker at ${entryText}.` : ''}
+        {anchoredEntry !== null && entryText !== null ? ` Entry marker at ${entryText}.` : ''}
       </figcaption>
+      {/*
+        Bounded text alternative for the overlay values that exist only inside
+        the aria-hidden SVG. It is static (server props), so it never competes
+        with the debounced polite region that announces the selected bar.
+      */}
+      <div
+        id={overlaySummaryId}
+        className="visually-hidden"
+        data-testid="chart-overlay-summary"
+      >
+        {zones.length === 0 && markers.length === 0 && gaps.length === 0 ? (
+          <p>No server-derived opportunity zones, position markers, or gaps.</p>
+        ) : (
+          <>
+            <p>Chart overlays from the server payload.</p>
+            {zones.length > 0 && (
+              <ul>
+                {zones.map((zone) => (
+                  <li key={`overlay-zone-${zone.opportunity_id}`}>
+                    Zone {zone.opportunity_id} {zone.side} state {zone.state}, low {zone.low}, high{' '}
+                    {zone.high}, trigger {zone.trigger_price}.
+                  </li>
+                ))}
+              </ul>
+            )}
+            {markers.length > 0 && (
+              <ul>
+                {markers.map((marker, index) => (
+                  <li key={`overlay-marker-${marker.kind}-${marker.price}-${index}`}>
+                    {marker.kind} marker at {marker.price}.
+                  </li>
+                ))}
+              </ul>
+            )}
+            {gaps.length > 0 && (
+              <ul>
+                {gaps.map((gap, index) => (
+                  <li key={`overlay-gap-${gap.gap_id ?? index}`}>
+                    Gap from {gap.start} to {gap.end}.
+                  </li>
+                ))}
+              </ul>
+            )}
+          </>
+        )}
+      </div>
       <div className="chart-head">
         <span className="chart-symbol">{symbol}</span>
         <span className="mono-muted">{timeframe} · UTC</span>
@@ -243,7 +366,13 @@ function ChartComponent({
             <span data-testid="cvd-zero-label">0</span>
             <span>POC {metrics.volume_profile.poc}</span>
           </div>
-          <div className="chart-canvas">
+          <div
+            className="chart-canvas"
+            onPointerEnter={handlePlotPointerEnter}
+            onPointerMove={handlePlotPointerMove}
+            onPointerLeave={handlePlotPointerLeave}
+            data-testid="chart-canvas"
+          >
             <div className="chart-axis-labels" data-testid="chart-axis-labels" aria-hidden="true">
               <span
                 data-testid="price-label-max"
@@ -278,150 +407,41 @@ function ChartComponent({
               aria-hidden="true"
               data-testid="chart-plot"
             >
-              <g className="chart-grid">
-                <line
-                  data-testid="grid-price-top"
-                  x1={PADDING}
-                  y1={PRICE_TOP}
-                  x2={WIDTH - PADDING}
-                  y2={PRICE_TOP}
+              <ChartPlate
+                bars={bars}
+                metrics={metrics}
+                zones={zones}
+                markers={markers}
+                gaps={gaps}
+                anchoredEntry={anchoredEntry}
+                entryText={entryText}
+                range={range}
+                slot={slot}
+                candleWidth={candleWidth}
+                hatchId={hatchId}
+                onPlateRender={onPlateRender}
+              />
+              {crosshairBar !== undefined && crosshairX !== null && (
+                <ChartCrosshair
+                  x={crosshairX}
+                  y={yForPrice(numeric(crosshairBar.close), range)}
+                  top={PRICE_TOP}
+                  bottom={CVD_TOP + CVD_HEIGHT}
+                  width={WIDTH}
+                  padding={PADDING}
                 />
-                <line
-                  data-testid="grid-price-mid"
-                  x1={PADDING}
-                  y1={PRICE_TOP + PRICE_HEIGHT / 2}
-                  x2={WIDTH - PADDING}
-                  y2={PRICE_TOP + PRICE_HEIGHT / 2}
-                />
-                <line
-                  data-testid="grid-price-bottom"
-                  x1={PADDING}
-                  y1={PRICE_TOP + PRICE_HEIGHT}
-                  x2={WIDTH - PADDING}
-                  y2={PRICE_TOP + PRICE_HEIGHT}
-                />
-              </g>
-              <g data-testid="chart-candles">
-                {bars.map((bar, index) => {
-                  const x = PADDING + slot * index + slot / 2
-                  const openY = yForPrice(numeric(bar.open), range)
-                  const closeY = yForPrice(numeric(bar.close), range)
-                  const up = numeric(bar.close) >= numeric(bar.open)
-                  const top = Math.min(openY, closeY)
-                  const bodyHeight = Math.max(Math.abs(closeY - openY), 1)
-                  return (
-                    <g
-                      key={bar.bar_start}
-                      className={up ? 'candle-up' : 'candle-down'}
-                      data-direction={up ? 'up' : 'down'}
-                    >
-                      <line
-                        x1={x}
-                        y1={yForPrice(numeric(bar.high), range)}
-                        x2={x}
-                        y2={yForPrice(numeric(bar.low), range)}
-                      />
-                      <rect
-                        x={x - candleWidth / 2}
-                        y={top}
-                        width={candleWidth}
-                        height={bodyHeight}
-                      />
-                    </g>
-                  )
-                })}
-              </g>
-              {entryY !== null && entryText !== null && (
-                <g className="chart-entry-marker" data-testid="chart-entry-marker">
-                  <line
-                    x1={PADDING}
-                    y1={entryY}
-                    x2={WIDTH - PADDING}
-                    y2={entryY}
-                    data-testid="chart-entry-line"
-                  />
-                  <text
-                    x={WIDTH - PADDING - 4}
-                    y={entryY - 4}
-                    textAnchor="end"
-                    className="chart-label"
-                    data-testid="chart-entry-label"
-                  >
-                    ENTRY {entryText}
-                  </text>
-                </g>
               )}
-              <g data-testid="chart-volume-profile">
-                {metrics.volume_profile.bins.map((bin) => {
-                  const width = (numeric(bin.volume) / maxProfileVolume) * 110
-                  const midPrice = (numeric(bin.price_low) + numeric(bin.price_high)) / 2
-                  const y = Math.min(
-                    Math.max(yForPrice(midPrice, range) - 5, PRICE_TOP),
-                    PRICE_TOP + PRICE_HEIGHT - 10,
-                  )
-                  return (
-                    <rect
-                      key={`${bin.price_low}-${bin.price_high}`}
-                      className={bin.is_poc ? 'vp-bin vp-bin--poc' : 'vp-bin'}
-                      x={PADDING}
-                      y={y}
-                      width={Math.max(width, 1)}
-                      height={10}
-                    />
-                  )
-                })}
-              </g>
-              <g data-testid="chart-volume">
-                {bars.map((bar, index) => {
-                  const height = (numeric(bar.volume) / maxVolume) * VOLUME_HEIGHT
-                  const x = PADDING + slot * index + slot / 2
-                  const up = numeric(bar.delta) >= 0
-                  const barTop = VOLUME_TOP + VOLUME_HEIGHT - height
-                  const barWidth = candleWidth
-                  return (
-                    <g key={`vol-${bar.bar_start}`} data-direction={up ? 'up' : 'down'}>
-                      <rect
-                        className={up ? 'vol-up' : 'vol-down'}
-                        x={x - barWidth / 2}
-                        y={barTop}
-                        width={barWidth}
-                        height={Math.max(height, 1)}
-                      />
-                      {up && (
-                        // Non-colour direction channel (DESIGN §13.2): a 1px
-                        // top cap on up bars; down bars are outlined only.
-                        <line
-                          className="vol-cap"
-                          x1={x - barWidth / 2}
-                          x2={x + barWidth / 2}
-                          y1={barTop}
-                          y2={barTop}
-                        />
-                      )}
-                    </g>
-                  )
-                })}
-              </g>
-              <g data-testid="chart-cvd">
-                <line
-                  className="cvd-zero"
-                  x1={PADDING}
-                  y1={CVD_TOP + ((cvdMax - 0) / cvdSpan) * CVD_HEIGHT}
-                  x2={WIDTH - PADDING}
-                  y2={CVD_TOP + ((cvdMax - 0) / cvdSpan) * CVD_HEIGHT}
-                />
-                <polyline
-                  className="cvd-line"
-                  points={bars
-                    .map((bar, index) => {
-                      const x = PADDING + slot * index + slot / 2
-                      const y = CVD_TOP + ((cvdMax - numeric(bar.cvd)) / cvdSpan) * CVD_HEIGHT
-                      return `${x},${y}`
-                    })
-                    .join(' ')}
-                />
-              </g>
             </svg>
+            {crosshairBar !== undefined && crosshairX !== null && (
+              <ChartTooltip
+                bar={crosshairBar}
+                gaps={gaps}
+                quality={quality}
+                qualityReasons={qualityReasons}
+                x={crosshairX}
+                width={WIDTH}
+              />
+            )}
           </div>
         </div>
 
@@ -465,6 +485,9 @@ function ChartComponent({
           <span className="swatch swatch--down" aria-hidden="true" /> down
         </span>
         <span>up bars: filled bar with top cap · down bars: outline bar</span>
+        <span>zone state: OPEN · TRIGGERED · EXPIRED · INVALIDATED (distinct dash + word)</span>
+        <span>markers: triangle entry · square exit · × stop · ○ target</span>
+        <span>gaps: hatched break, never interpolated</span>
         <span>POC</span>
         <span>POC highlighted bin · value-area bins in table</span>
       </div>
@@ -493,6 +516,7 @@ function ChartComponent({
                 <th scope="col">Vol</th>
                 <th scope="col">Delta</th>
                 <th scope="col">CVD</th>
+                <th scope="col">Quality</th>
                 <th scope="col">Dir</th>
               </tr>
             </thead>
@@ -517,6 +541,9 @@ function ChartComponent({
                   </td>
                   <td className={bar.cvd.startsWith('-') ? 'value-down' : 'value-up'}>
                     {signedText(bar.cvd)}
+                  </td>
+                  <td className="mono">
+                    {barQualityStamp(bar, gaps, quality, qualityReasons)}
                   </td>
                   <td>{numeric(bar.close) >= numeric(bar.open) ? 'up' : 'down'}</td>
                 </tr>

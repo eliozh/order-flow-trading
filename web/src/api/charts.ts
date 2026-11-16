@@ -14,10 +14,40 @@ export type ChartPeriod = '15m' | '1h' | '4h'
 
 export type ChartStatus = 'AVAILABLE' | 'MISSING'
 
+/** Opportunity state as the server stores it. Unknown values stay strings. */
+export type ChartZoneState = 'OPEN' | 'TRIGGERED' | 'EXPIRED' | 'INVALIDATED' | string
+
+/**
+ * One server-derived opportunity zone. Every price is the stored string
+ * verbatim; the client positions the band/trigger at exactly that price.
+ */
+export interface ChartZone {
+  opportunity_id: string
+  side: string
+  state: ChartZoneState
+  low: string
+  high: string
+  trigger_price: string
+  label: string
+}
+
+/** The four marker kinds the server derives from a linked position. */
+export type ChartMarkerKind = 'entry' | 'exit' | 'stop' | 'target'
+
+/** One server-derived marker at an exact price. */
+export interface ChartMarker {
+  kind: ChartMarkerKind
+  price: string
+  label: string
+  position_id: string | null
+}
+
 /**
  * One resolved chart payload. A frozen report already is published bar and
  * metric data, so the API either returns one report's frozen values verbatim
  * (`AVAILABLE`) or an explicit `MISSING` with a reason. It never upsamples.
+ * Overlays (`zones`, `markers`) are server-derived from the report's linked
+ * opportunity and position records; the client never infers them.
  */
 export interface ChartData {
   report_id: string
@@ -31,6 +61,8 @@ export interface ChartData {
   bars: SnapshotBar[]
   metrics: MetricsDocument | null
   gaps: DataGap[]
+  zones: ChartZone[]
+  markers: ChartMarker[]
   data_quality: string
   quality_reasons: string[]
   reason: string | null

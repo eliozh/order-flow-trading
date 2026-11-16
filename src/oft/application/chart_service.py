@@ -24,18 +24,35 @@ Reads are bounded: one header projection lists the newest report per timeframe
 full ``get_report`` source read; it costs none when the period is unpublished
 or the published source vanished before it could be read. The native period
 costs none because the requested report is already loaded by the route.
+
+Overlays are also server-derived, never client-inferred
+--------------------------------------------------------
+``derive_overlays`` reads at most 200 newest opportunities and 200 newest
+positions, keeps only rows linked to the route's report (the report whose panel
+is open), and projects the stored zone bounds, trigger, state, and position
+prices verbatim. Switching the timeframe changes only the drawn series: the
+overlays always come from the route's report, so a switch can never invent a
+zone or marker for another period.
 """
 
 from __future__ import annotations
 
 import json
 from collections.abc import Mapping, Sequence
-from typing import Any
+from decimal import Decimal, InvalidOperation
+from typing import Any, Literal
 
-from oft.ports.store import ReportHeader, ReportRecord, StorePort
+from oft.ports.store import OpportunityRecord, ReportHeader, ReportRecord, StorePort
 
 #: Periods the timeframe switch may offer beyond the report's native period.
 SUPPORTED_CHART_PERIODS: tuple[str, ...] = ("15m", "1h", "4h")
+
+#: Bound on the overlay ledger reads (both opportunities and positions).
+_OVERLAY_READ_LIMIT = 200
+#: Bound on the marker list; a chart never draws an unbounded marker set.
+_MAX_MARKERS = 40
+#: Bound on one overlay label (untrusted opportunity/position ids).
+_MAX_LABEL = 80
 
 _STATUS_AVAILABLE = "AVAILABLE"
 _STATUS_MISSING = "MISSING"
@@ -112,7 +129,7 @@ def _frozen(report: ReportRecord) -> tuple[list[dict[str, Any]], dict[str, Any]]
     try:
         snapshot = json.loads(report.snapshot_json)
         metrics = json.loads(report.metrics_json)
-    except (TypeError, ValueError) as exc:
+    except (TypeError, ValueError, RecursionError) as exc:
         raise _CorruptReportError(report.report_id, "the frozen JSON") from exc
     if not isinstance(snapshot, dict):
         raise _CorruptReportError(report.report_id, "snapshot")
@@ -154,6 +171,167 @@ def _frozen(report: ReportRecord) -> tuple[list[dict[str, Any]], dict[str, Any]]
     return bars, metrics
 
 
+def _payload_object(record_payload_json: str) -> Mapping[str, Any] | None:
+    """The persisted payload object, or ``None`` when it is unreadable.
+
+    Opportunity, trigger, and position rows are untrusted persisted JSON: a
+    truncated or hand-edited document is skipped, never raised out of a chart
+    read.
+    """
+    try:
+        payload = json.loads(record_payload_json)
+    except (TypeError, ValueError, RecursionError):
+        return None
+    return payload if isinstance(payload, Mapping) else None
+
+
+def _price_text(value: Any) -> str | None:
+    """The stored price string when it is a positive finite decimal, else ``None``.
+
+    A missing, zero, negative, non-finite, or unparseable price is omitted. It is
+    never coerced to ``"0"``: a marker at zero would be a fabricated price.
+    """
+    if not isinstance(value, str):
+        return None
+    try:
+        parsed = Decimal(value)
+    except (ArithmeticError, ValueError, InvalidOperation):
+        return None
+    if not parsed.is_finite() or parsed <= 0:
+        return None
+    return value
+
+
+def _zone_label(opportunity_id: str, side: str, confidence: Any) -> str:
+    """A bounded plain-text label; escaping is the renderer's responsibility."""
+    label = f"{opportunity_id} · {side}"
+    if isinstance(confidence, (int, float)) and not isinstance(confidence, bool):
+        label += f" · {confidence:.2f}"
+    return label[:_MAX_LABEL]
+
+
+def _zone_payload(
+    record: OpportunityRecord,
+    payload: Mapping[str, Any],
+) -> dict[str, Any] | None:
+    """One opportunity zone, or ``None`` when the row is not drawable.
+
+    The caller has already checked that the row is linked to the route's report
+    (one linkage predicate, not two), so this only validates the zone shape and
+    prices. Bounds run through the same positive-finite gate as markers: a
+    corrupt bound is skipped rather than advertised as a band the client drops.
+    """
+    zone = payload.get("zone")
+    if not isinstance(zone, Mapping):
+        return None
+    low = _price_text(zone.get("low"))
+    high = _price_text(zone.get("high"))
+    if low is None or high is None:
+        return None
+    side = payload.get("side")
+    if side == "LONG":
+        trigger_price = high
+    elif side == "SHORT":
+        trigger_price = low
+    else:
+        return None
+    return {
+        "opportunity_id": record.opportunity_id,
+        "side": side,
+        "state": record.state,
+        "low": low,
+        "high": high,
+        "trigger_price": trigger_price,
+        "label": _zone_label(record.opportunity_id, side, payload.get("confidence")),
+    }
+
+
+#: The marker kinds the chart schema accepts; an internal-only alias so a typo
+#: cannot silently bypass Pydantic (there is no response_model on the route).
+_MarkerKind = Literal["entry", "exit", "stop", "target"]
+
+
+def _marker(kind: _MarkerKind, price: str, position_id: str | None) -> dict[str, Any]:
+    label = f"{kind.upper()} {price}"
+    return {
+        "kind": kind,
+        "price": price,
+        "label": label[:_MAX_LABEL],
+        "position_id": position_id,
+    }
+
+
+def derive_overlays(
+    report: ReportRecord, store: StorePort
+) -> tuple[list[dict[str, Any]], list[dict[str, Any]]]:
+    """The report's linked opportunity zones and position markers.
+
+    Bounded: at most ``_OVERLAY_READ_LIMIT`` newest opportunities and positions
+    are read, one ``get_trigger_event`` point read per linked position, and the
+    marker list is capped at ``_MAX_MARKERS``. A row whose stored JSON is
+    unreadable is skipped rather than failing the chart.
+    """
+    linked_ids: set[str] = set()
+    zones: list[dict[str, Any]] = []
+    for record in store.list_opportunities(limit=_OVERLAY_READ_LIMIT):
+        payload = _payload_object(record.payload_json)
+        if payload is None:
+            continue
+        if payload.get("symbol") != report.symbol:
+            continue
+        source = payload.get("source")
+        if not isinstance(source, Mapping) or source.get("report_id") != report.report_id:
+            continue
+        linked_ids.add(record.opportunity_id)
+        zone = _zone_payload(record, payload)
+        if zone is not None:
+            zones.append(zone)
+
+    markers: list[dict[str, Any]] = []
+    seen: set[tuple[str, str]] = set()
+
+    def add(kind: _MarkerKind, raw_price: Any, position_id: str | None) -> bool:
+        price = _price_text(raw_price)
+        if price is None:
+            return True
+        key = (kind, price)
+        if key in seen:
+            return True
+        seen.add(key)
+        markers.append(_marker(kind, price, position_id))
+        return len(markers) < _MAX_MARKERS
+
+    for position_record in store.list_positions(limit=_OVERLAY_READ_LIMIT):
+        payload = _payload_object(position_record.payload_json)
+        if payload is None:
+            continue
+        if payload.get("symbol") != report.symbol:
+            continue
+        trigger_id = payload.get("source_trigger_id")
+        if not isinstance(trigger_id, str) or not trigger_id:
+            continue
+        trigger = store.get_trigger_event(trigger_id)
+        if trigger is None or trigger.opportunity_id not in linked_ids:
+            continue
+        position_id = position_record.position_id or payload.get("position_id")
+        entry = payload.get("avg_entry_price")
+        if entry in (None, ""):
+            entry = payload.get("entry_price")
+        candidates: list[tuple[_MarkerKind, Any]] = [
+            ("entry", entry),
+            ("stop", payload.get("stop_price")),
+        ]
+        targets = payload.get("target_prices")
+        if isinstance(targets, list):
+            candidates.extend(("target", target) for target in targets)
+        candidates.append(("exit", payload.get("exit_price")))
+        for kind, raw_price in candidates:
+            if not add(kind, raw_price, position_id):
+                return zones, markers
+
+    return zones, markers
+
+
 def _missing_payload(
     report: ReportRecord,
     native_period: str,
@@ -174,14 +352,28 @@ def _missing_payload(
         "bars": [],
         "metrics": None,
         "gaps": [],
+        "zones": [],
+        "markers": [],
         "data_quality": "MISSING",
         "quality_reasons": [],
         "reason": reason,
     }
 
 
-def resolve_chart(report: ReportRecord, requested_period: str, store: StorePort) -> dict[str, Any]:
-    """Build the chart payload for ``requested_period`` without inventing data."""
+def resolve_chart(
+    report: ReportRecord,
+    requested_period: str,
+    store: StorePort,
+    *,
+    zones: Sequence[Mapping[str, Any]] = (),
+    markers: Sequence[Mapping[str, Any]] = (),
+) -> dict[str, Any]:
+    """Build the chart payload for ``requested_period`` without inventing data.
+
+    ``zones``/``markers`` come from :func:`derive_overlays` for the route's
+    report. They are copied verbatim into an ``AVAILABLE`` payload; every
+    ``MISSING`` payload carries empty overlay lists because no series is drawn.
+    """
     native_period = report.timeframe
     # One bounded projection read lists the newest report per timeframe; the
     # frozen documents are only fetched for the single switched source below.
@@ -231,6 +423,8 @@ def resolve_chart(report: ReportRecord, requested_period: str, store: StorePort)
         "bars": bars,
         "metrics": metrics,
         "gaps": gaps,
+        "zones": [dict(zone) for zone in zones],
+        "markers": [dict(marker) for marker in markers],
         "data_quality": source.data_quality,
         "quality_reasons": quality_reasons,
         "reason": None,

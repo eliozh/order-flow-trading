@@ -387,13 +387,15 @@ describe('Chart accessibility and alignment', () => {
     expect(within(vpTable).getByText('70000.00')).toBeInTheDocument()
   })
 
-  it('debounces the polite live-region announcement by 500ms', () => {
+  it('debounces the polite live-region announcement by 500ms after a user selection', () => {
     vi.useFakeTimers()
     try {
       renderThreeBars()
       const live = document.querySelector('[aria-live="polite"]') as HTMLElement
+      // The initial mount is announced once by the panel's own region; the
+      // chart never announces its default bar unsolicited.
       act(() => vi.advanceTimersByTime(500))
-      expect(live).toHaveTextContent(/Selected 2026-10-03 00:00 UTC/)
+      expect(live.textContent).toBe('')
 
       const third = screen.getByRole('button', { name: /2026-10-03 00:00/i })
       fireEvent.keyDown(third, { key: 'ArrowLeft' })

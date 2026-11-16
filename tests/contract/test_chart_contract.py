@@ -8,6 +8,7 @@ from datetime import date
 from pathlib import Path
 from typing import Any
 
+import _helpers
 import pytest
 from fastapi.testclient import TestClient
 from pydantic import ValidationError
@@ -15,6 +16,7 @@ from pydantic import ValidationError
 from oft.api.app import create_app
 from oft.api.schemas.chart import ChartPayload
 from oft.bootstrap import build_container
+from oft.clock import FixedClock
 from oft.config import Settings
 
 ROOT = Path(__file__).resolve().parents[2]
@@ -181,6 +183,59 @@ def test_contract_rejects_unknown_fields(tmp_path: Path) -> None:
 
     with pytest.raises(ValidationError):
         ChartPayload.model_validate({**payload, "unexpected_field": True})
+
+
+def test_metrics_only_payload_has_no_overlays(tmp_path: Path) -> None:
+    """A metrics-only report has no linked opportunity or position markers."""
+    harness = _harness(tmp_path)
+    try:
+        report_id = _scan(harness, "4h", "contract-no-overlays")
+        body = _chart(harness, report_id).json()
+    finally:
+        harness.client.close()
+
+    payload = ChartPayload.model_validate(body["data"])
+    assert payload.status == "AVAILABLE"
+    assert payload.zones == []
+    assert payload.markers == []
+
+
+def test_seeded_loop_returns_the_linked_zone_and_position_markers(tmp_path: Path) -> None:
+    """The chart derives the triggered opportunity zone and accepted markers."""
+    loop = _helpers.build_loop(tmp_path)
+    opportunity = loop["opportunity"]
+    position = loop["result"].position
+    assert position is not None
+    report_id = opportunity["source"]["report_id"]
+
+    app = create_app(loop["container"].settings, clock=FixedClock(_helpers.NOW))
+    client = TestClient(app)
+    try:
+        body = client.get(
+            f"/api/v1/reports/{report_id}/chart",
+            headers={"Authorization": f"Bearer {app.state.api_token}"},
+        ).json()
+    finally:
+        client.close()
+
+    payload = ChartPayload.model_validate(body["data"])
+    assert payload.status == "AVAILABLE"
+
+    zone = next(
+        item for item in payload.zones if item.opportunity_id == opportunity["opportunity_id"]
+    )
+    assert zone.side == opportunity["side"] == "LONG"
+    assert zone.state == "TRIGGERED"
+    assert zone.low == opportunity["zone"]["low"]
+    assert zone.high == opportunity["zone"]["high"]
+    assert zone.trigger_price == opportunity["zone"]["high"]
+
+    prices = {(marker.kind, marker.price) for marker in payload.markers}
+    assert ("entry", position["avg_entry_price"]) in prices
+    if position["stop_price"] is not None:
+        assert ("stop", position["stop_price"]) in prices
+    for target in position["target_prices"]:
+        assert ("target", target) in prices
 
 
 def test_error_envelopes_use_the_catalog_codes(tmp_path: Path) -> None:

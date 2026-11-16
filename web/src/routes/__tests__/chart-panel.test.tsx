@@ -165,6 +165,8 @@ function availableChart(period: string, bars: SnapshotBar[]): ChartData {
     bars,
     metrics: metricsFor(period, bars),
     gaps: [],
+    zones: [],
+    markers: [],
     data_quality: 'PARTIAL',
     quality_reasons: ['open_interest not measured in this slice'],
     reason: null,
@@ -187,6 +189,8 @@ const MISSING_CHART: ChartData = {
   bars: [],
   metrics: null,
   gaps: [],
+  zones: [],
+  markers: [],
   data_quality: 'MISSING',
   quality_reasons: [],
   reason: REASON,
@@ -536,6 +540,9 @@ describe('ChartPanelPage review regressions', () => {
     render(<ChartPanelPage reportId="RPT-BTCUSDT-1" fetchChartFn={fetchChartFn} />)
 
     await screen.findByRole('figure', { name: /BTCUSDT 4h chart/i })
+    // Only the panel's "Showing …" region announces on mount; the chart's own
+    // polite region stays silent until the user selects a bar.
+    expect(document.querySelector('.chart-frame [aria-live="polite"]')?.textContent).toBe('')
     const sharedFourHourBar = within(
       screen.getByRole('group', { name: 'Bar selection' }),
     ).getByRole('button', { name: /2026-10-01 00:00/i })
@@ -568,6 +575,8 @@ describe('ChartPanelPage review regressions', () => {
       'false',
     )
     expect(screen.getByRole('status')).toHaveTextContent(/Showing 1h chart/i)
+    // The period switch is still announced once, by the panel region only.
+    expect(document.querySelector('.chart-frame [aria-live="polite"]')?.textContent).toBe('')
   })
 
   it('shows an explicit unavailable note when AVAILABLE has no drawable bars', async () => {
