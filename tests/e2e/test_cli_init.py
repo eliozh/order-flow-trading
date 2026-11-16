@@ -196,7 +196,9 @@ def test_key_entry_reads_stdin_without_echo_and_reports_only_the_mask(
 
 
 def test_init_accepts_no_value_taking_key_flag() -> None:
-    help_text = CliRunner().invoke(app, ["init", "--help"]).stdout
+    # Pin the width: Click/Rich wraps the option column to the terminal, which
+    # would split the literal flag across lines on narrow CI terminals.
+    help_text = CliRunner().invoke(app, ["init", "--help"], env={"COLUMNS": "200"}).stdout
 
     assert "--llm-key-stdin" in help_text
     assert re.search(r"--llm-key(?!-stdin)", help_text) is None
