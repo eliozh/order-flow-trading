@@ -1,4 +1,5 @@
 import { isAbortError } from './abort'
+import { triggerBlobDownload } from './blob-download'
 import { numberOrNull, type ApiEnvelope } from './contract'
 import { errorMessage } from './errors'
 import { createPendingKeyStore, mutationHeaders, newIdempotencyKey } from './idempotency'
@@ -579,28 +580,6 @@ export function exportFilename(
   }
   const stamp = now.toISOString().replace(/[-:.]/g, '').replace('T', 't').replace('Z', 'z')
   return `journal-${stamp}.${format}`
-}
-
-/** Trigger a browser download for a blob without navigating away. */
-function triggerBlobDownload(blob: Blob, filename: string): void {
-  if (typeof document === 'undefined' || typeof URL === 'undefined') {
-    return
-  }
-  if (typeof URL.createObjectURL !== 'function') {
-    return
-  }
-  const objectUrl = URL.createObjectURL(blob)
-  const revoke = typeof URL.revokeObjectURL === 'function' ? URL.revokeObjectURL : null
-  const anchor = document.createElement('a')
-  anchor.href = objectUrl
-  anchor.download = filename
-  anchor.rel = 'noopener'
-  document.body.appendChild(anchor)
-  anchor.click()
-  anchor.remove()
-  if (revoke !== null) {
-    window.setTimeout(() => revoke.call(URL, objectUrl), 0)
-  }
 }
 
 /**

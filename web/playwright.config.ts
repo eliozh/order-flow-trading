@@ -9,15 +9,17 @@ const reportDir = process.env.OFT_E2E_REPORT_DIR ?? `${screensDir}/report`
 /**
  * Chromium-only E2E config for the walking-skeleton `/system` journey, the
  * slice-02 read-only symbol registry journeys, the slice-08 report journeys,
- * the slice-29 positions journey, the slice-30 journal journeys, and the
- * slice-33 read-only navigation-shell journey.
+ * the slice-29 positions journey, the slice-30 journal journeys, the slice-33
+ * read-only navigation-shell journey, the slice-38 watchlist journey, the
+ * slice-39 chart panel journey, and the slice-41 read-only opportunity ledger
+ * journeys.
  *
  * Three daemons are started by `e2e/run-e2e.sh` (temporary data dirs, fixture
  * scan, exchangeInfo seed, backfill/report, one seeded OPEN paper position, and
  * one seeded CLOSED paper trade already applied). All suites are read-only
  * except the positions journey (one paper management POST) and the journal
- * journey (one advisory review POST), both against the reports daemon. Run
- * them with:
+ * journey (one advisory review POST) on the reports daemon, and the watchlist
+ * journey (star/unstar mutations on the symbols daemon). Run them with:
  *
  *   npm --prefix web run test:e2e
  */
@@ -77,6 +79,13 @@ export default defineConfig({
       // Slice 39: the standalone chart panel route over the reports daemon.
       name: 'chart',
       testMatch: /chart\.spec\.ts/,
+      use: { ...devices['Desktop Chrome'], baseURL: reportsBaseURL },
+    },
+    {
+      // Slice 41: the read-only opportunity ledger list/detail over the reports
+      // daemon, which seeds the ledger rows.
+      name: 'opportunities',
+      testMatch: /opportunities\.spec\.ts/,
       use: { ...devices['Desktop Chrome'], baseURL: reportsBaseURL },
     },
     {
