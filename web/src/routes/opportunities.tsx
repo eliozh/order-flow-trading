@@ -270,6 +270,7 @@ export function OpportunitiesPage({
                 <div
                   className="table-wrap"
                   role="region"
+                  aria-labelledby="ledger-table-heading"
                   // eslint-disable-next-line jsx-a11y/no-noninteractive-tabindex -- scrollable table
                   tabIndex={0}
                 >

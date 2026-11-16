@@ -669,6 +669,17 @@ code {
   border: 0;
 }
 
+/* Slice 41 / WCAG 2.2 SC 2.5.8: inline row links keep a 24px-high target at
+   every width (narrow links meet SC 2.5.8 via the spacing exception); the
+   <=768px block below raises them to the 44px project touch height. */
+.data-table a.rowlink,
+.data a.rowlink,
+.kv dd a.rowlink {
+  display: inline-flex;
+  align-items: center;
+  min-height: 24px;
+}
+
 @media (max-width: 768px) {
   /* The pause control is 44px on touch; let the bar grow and stop clipping so
      its :focus-visible ring is never cut off (DESIGN A6/A12). */
@@ -730,7 +741,8 @@ code {
   }
 
   .data-table a.rowlink,
-  .data a.rowlink {
+  .data a.rowlink,
+  .kv dd a.rowlink {
     display: inline-flex;
     align-items: center;
     min-height: 44px;

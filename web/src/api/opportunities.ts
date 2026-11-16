@@ -1,7 +1,13 @@
-import { fetchWithTimeout } from './request-timeout'
+import { isAbortError } from './abort'
+import { triggerBlobDownload } from './blob-download'
+import { errorMessage } from './errors'
+import { fetchWithTimeout, RequestTimeoutError } from './request-timeout'
 import type { ApiError, ApiMeta } from './status'
 
 export type { ApiError, ApiMeta }
+
+/** Upper bound on one export download (the server serializes the stored contract). */
+export const OPPORTUNITY_EXPORT_TIMEOUT_MS = 30_000
 
 export type OpportunityState = 'OPEN' | 'TRIGGERED' | 'EXPIRED' | 'INVALIDATED'
 
@@ -146,13 +152,21 @@ export interface OpportunityTimelineEnvelope {
   meta: ApiMeta
 }
 
+/** The result of one read-only contract export download. */
+export interface OpportunityExportDownload {
+  filename: string
+  bytes: number
+}
+
 export class OpportunityApiError extends Error {
   readonly code: string | undefined
+  readonly httpStatus: number | undefined
 
-  constructor(message: string, code?: string) {
+  constructor(message: string, code?: string, options: { httpStatus?: number } = {}) {
     super(message)
     this.name = 'OpportunityApiError'
     this.code = code
+    this.httpStatus = options.httpStatus
   }
 }
 
@@ -226,10 +240,11 @@ function stringParam(params: Record<string, unknown>, key: string): string | nul
 }
 
 /**
- * Age of a ledger entry against an explicit clock. `< 1h` is whole minutes
- * (`42m`), `< 24h` is hours plus zero-padded minutes (`2h 04m`), and anything
- * older is days plus zero-padded hours (`1d 02h`). A missing, unparseable, or
- * future timestamp renders `N/A` — never `NaN`, a blank, or an invented value.
+ * Age of a ledger entry against an explicit clock. Elapsed time is floored to
+ * whole minutes. `< 1h` is whole minutes (`42m`), `< 24h` is hours plus
+ * zero-padded minutes (`2h 04m`), and `>= 24h` (including exactly 24h) is days
+ * plus zero-padded hours (`1d 02h`). A missing, unparseable, or future
+ * timestamp renders `N/A` — never `NaN`, a blank, or an invented value.
  */
 export function formatOpportunityAge(createdAt: string | null | undefined, now: Date): string {
   if (!createdAt) {
@@ -255,6 +270,107 @@ export function formatOpportunityAge(createdAt: string | null | undefined, now: 
 /** The existing read-only contract export for one opportunity. */
 export function opportunityExportPath(opportunityId: string): string {
   return `/api/v1/opportunities/${encodeURIComponent(opportunityId)}/export`
+}
+
+/** Reduce a header value or id to a safe basename (path separators and C0 control characters removed). */
+function safeBasename(value: string): string {
+  const basename = value.split(/[\\/]/).pop() ?? ''
+  return Array.from(basename)
+    .filter((character) => character.charCodeAt(0) >= 0x20)
+    .join('')
+}
+
+/** Derive a safe download filename from Content-Disposition (no path input). */
+function exportFilename(contentDisposition: string | null, opportunityId: string): string {
+  const encoded = /filename\*=UTF-8''([^;]+)/i.exec(contentDisposition ?? '')
+  const plain = /filename="?([^";]+)"?/i.exec(contentDisposition ?? '')
+  const candidate = encoded?.[1] ?? plain?.[1]
+  if (candidate) {
+    let decoded = candidate
+    try {
+      decoded = decodeURIComponent(candidate)
+    } catch {
+      decoded = candidate
+    }
+    const safe = safeBasename(decoded)
+    if (safe !== '') {
+      return safe
+    }
+  }
+  const id = safeBasename(opportunityId)
+  return id === '' ? 'opportunity.json' : `opportunity-${id}.json`
+}
+
+/**
+ * Download the read-only contract export.
+ *
+ * The file is fetched (not linked) so a 401/404/500 envelope is surfaced as a
+ * typed error instead of being saved as a bogus download. A 200 body must still
+ * be a successful contract envelope before the blob is created. On success the
+ * blob is saved through an object URL whose filename comes from
+ * Content-Disposition, with an `opportunity-<id>.json` fallback.
+ */
+export async function downloadOpportunityExport(
+  opportunityId: string,
+  signal?: AbortSignal,
+): Promise<OpportunityExportDownload> {
+  let response: Response
+  try {
+    response = await fetchWithTimeout(
+      opportunityExportPath(opportunityId),
+      { headers: { Accept: 'application/json' }, credentials: 'same-origin' },
+      signal,
+      OPPORTUNITY_EXPORT_TIMEOUT_MS,
+    )
+  } catch (error: unknown) {
+    if (isAbortError(error)) {
+      throw error
+    }
+    if (error instanceof RequestTimeoutError) {
+      throw new OpportunityApiError('The opportunity export timed out.', 'TIMEOUT')
+    }
+    throw new OpportunityApiError(errorMessage(error))
+  }
+
+  if (!response.ok) {
+    let envelope: { error?: ApiError | null } | null = null
+    try {
+      envelope = (await response.json()) as { error?: ApiError | null }
+    } catch {
+      envelope = null
+    }
+    throw new OpportunityApiError(
+      envelope?.error?.message ?? `Opportunity export failed with HTTP ${response.status}`,
+      envelope?.error?.code,
+      { httpStatus: response.status },
+    )
+  }
+
+  const text = await response.text()
+  let envelope: { ok?: unknown; data?: unknown } | null = null
+  try {
+    envelope = JSON.parse(text) as { ok?: unknown; data?: unknown }
+  } catch {
+    envelope = null
+  }
+  if (
+    envelope === null ||
+    envelope.ok !== true ||
+    envelope.data === null ||
+    envelope.data === undefined
+  ) {
+    throw new OpportunityApiError(
+      'The opportunity export response was not a valid contract snapshot.',
+      undefined,
+      { httpStatus: response.status },
+    )
+  }
+
+  const contentType = response.headers.get('Content-Type') ?? 'application/json'
+  const blob = new Blob([text], { type: contentType })
+  const filename = exportFilename(response.headers.get('Content-Disposition'), opportunityId)
+  triggerBlobDownload(blob, filename)
+  return { filename, bytes: blob.size }
 }
 
 /** A short, deterministic label for a condition. Never derived from narrative. */

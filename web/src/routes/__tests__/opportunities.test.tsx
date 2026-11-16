@@ -1,9 +1,11 @@
 import { fireEvent, render, screen, within } from '@testing-library/react'
-import { describe, expect, it, vi } from 'vitest'
+import { afterEach, describe, expect, it, vi } from 'vitest'
 
 import type { ApiMeta } from '../../api/status'
 import {
+  downloadOpportunityExport,
   formatOpportunityAge,
+  OpportunityApiError,
   opportunityExportPath,
   type OpportunityCondition,
   type OpportunityData,
@@ -170,6 +172,63 @@ function detailById(items: OpportunityData[]) {
   }
 }
 
+/** The Source cell of a ledger row, found through the header column index. */
+function sourceCellOf(row: HTMLElement): HTMLElement {
+  const headers = screen
+    .getAllByRole('columnheader')
+    .map((cell) => cell.textContent?.trim().toLowerCase() ?? '')
+  const index = headers.indexOf('source')
+  if (index < 0) {
+    throw new Error('missing Source column')
+  }
+  return within(row).getAllByRole('cell')[index]
+}
+
+const originalCreateObjectURL = Object.getOwnPropertyDescriptor(URL, 'createObjectURL')
+const originalRevokeObjectURL = Object.getOwnPropertyDescriptor(URL, 'revokeObjectURL')
+
+function stubDownloadSpies() {
+  const createObjectURL = vi.fn(() => 'blob:opportunity-export')
+  const revokeObjectURL = vi.fn()
+  Object.defineProperty(URL, 'createObjectURL', { configurable: true, value: createObjectURL })
+  Object.defineProperty(URL, 'revokeObjectURL', { configurable: true, value: revokeObjectURL })
+  const click = vi.spyOn(HTMLAnchorElement.prototype, 'click').mockImplementation(() => {})
+  return { createObjectURL, revokeObjectURL, click }
+}
+
+/** Stub a 200 export response with the given body and attachment header. */
+function stubExportEnvironment(contentDisposition: string | null, body: string) {
+  const fetchMock = vi.fn<(input: string, init?: RequestInit) => Promise<unknown>>(async () => ({
+    ok: true,
+    status: 200,
+    headers: {
+      get: (name: string) =>
+        name.toLowerCase() === 'content-disposition' ? contentDisposition : null,
+    },
+    text: async () => body,
+    json: async () => JSON.parse(body) as unknown,
+  }))
+  vi.stubGlobal('fetch', fetchMock as unknown as typeof fetch)
+  return { fetchMock, ...stubDownloadSpies() }
+}
+
+afterEach(() => {
+  vi.restoreAllMocks()
+  vi.unstubAllGlobals()
+  // Restore the native descriptors where they exist (Node/jsdom), otherwise
+  // remove the stubs this file installed.
+  if (originalCreateObjectURL) {
+    Object.defineProperty(URL, 'createObjectURL', originalCreateObjectURL)
+  } else {
+    delete (URL as unknown as { createObjectURL?: unknown }).createObjectURL
+  }
+  if (originalRevokeObjectURL) {
+    Object.defineProperty(URL, 'revokeObjectURL', originalRevokeObjectURL)
+  } else {
+    delete (URL as unknown as { revokeObjectURL?: unknown }).revokeObjectURL
+  }
+})
+
 /** Emulate the server: the list filters by state and reports all-state counts. */
 function ledgerFetcher(all: OpportunityData[]) {
   return async (options: {
@@ -221,6 +280,70 @@ describe('formatOpportunityAge', () => {
 
   it('encodes the opportunity id in the export path', () => {
     expect(opportunityExportPath('OPP:1')).toBe('/api/v1/opportunities/OPP%3A1/export')
+  })
+})
+
+describe('downloadOpportunityExport', () => {
+  it('throws a typed error on an auth envelope and never starts a download', async () => {
+    const { createObjectURL, click } = stubDownloadSpies()
+    vi.stubGlobal(
+      'fetch',
+      vi.fn(async () => ({
+        ok: false,
+        status: 401,
+        headers: { get: () => null },
+        json: async () => ({
+          ok: false,
+          data: null,
+          error: {
+            code: 'AUTH_REQUIRED',
+            message: 'authentication required',
+            category: 'AUTH',
+            http_status: 401,
+            retryable: false,
+            reference_id: 'REQ-1',
+            details: [],
+          },
+          meta,
+        }),
+      })) as unknown as typeof fetch,
+    )
+
+    await expect(downloadOpportunityExport('OPP-1')).rejects.toMatchObject({
+      name: 'OpportunityApiError',
+      message: 'authentication required',
+      code: 'AUTH_REQUIRED',
+      httpStatus: 401,
+    })
+    expect(createObjectURL).not.toHaveBeenCalled()
+    expect(click).not.toHaveBeenCalled()
+  })
+
+  it('rejects a 200 body that is not a successful envelope without downloading', async () => {
+    const { createObjectURL, click } = stubExportEnvironment(
+      'attachment; filename="opportunity-OPP-1.json"',
+      JSON.stringify({ ok: false, data: null, error: null, meta }),
+    )
+
+    await expect(downloadOpportunityExport('OPP-1')).rejects.toBeInstanceOf(OpportunityApiError)
+    expect(createObjectURL).not.toHaveBeenCalled()
+    expect(click).not.toHaveBeenCalled()
+  })
+
+  it('downloads the export envelope as a JSON blob and returns its filename and size', async () => {
+    const body = JSON.stringify({ ok: true, data: opportunity(), error: null, meta })
+    const { fetchMock, createObjectURL, click } = stubExportEnvironment(
+      'attachment; filename="opportunity-OPP-1.json"',
+      body,
+    )
+
+    const result = await downloadOpportunityExport('OPP-1')
+
+    expect(fetchMock.mock.calls[0][0]).toBe('/api/v1/opportunities/OPP-1/export')
+    expect(createObjectURL).toHaveBeenCalledTimes(1)
+    expect(click).toHaveBeenCalledTimes(1)
+    expect(result.filename).toBe('opportunity-OPP-1.json')
+    expect(result.bytes).toBe(new Blob([body]).size)
   })
 })
 
@@ -347,6 +470,35 @@ describe('OpportunitiesPage filters and counts', () => {
       '/reports/RPT-1',
     )
     expect(within(row).getByText('42m')).toBeInTheDocument()
+    // Read-only at list level: the row exposes no accept/reject/trigger/cancel
+    // link, and the whole ledger has none either.
+    expect(
+      within(row).queryByRole('link', { name: /accept|reject|trigger|cancel/i }),
+    ).not.toBeInTheDocument()
+    expect(
+      screen.queryByRole('link', { name: /accept|reject|trigger|cancel/i }),
+    ).not.toBeInTheDocument()
+  })
+
+  it('percent-encodes colons in the opportunity, scan, and report links', async () => {
+    const item = opportunity({
+      opportunity_id: 'OPP:1',
+      source: { scan_id: 'SCAN:1', report_id: 'RPT:1', decision_id: 'DEC-1' },
+    })
+    render(
+      <OpportunitiesPage
+        fetchOpportunitiesFn={ledgerFetcher([item])}
+        now={() => new Date('2026-11-06T12:00:00.000Z')}
+      />,
+    )
+    await screen.findByRole('tab', { name: /Open/ })
+
+    expect(screen.getByRole('link', { name: 'OPP:1' })).toHaveAttribute(
+      'href',
+      '/opportunities/OPP%3A1',
+    )
+    expect(screen.getByRole('link', { name: 'SCAN:1' })).toHaveAttribute('href', '/scans/SCAN%3A1')
+    expect(screen.getByRole('link', { name: 'RPT:1' })).toHaveAttribute('href', '/reports/RPT%3A1')
   })
 
   it('renders N/A when a row has no source scan, never a blank or invented link', async () => {
@@ -366,9 +518,10 @@ describe('OpportunitiesPage filters and counts', () => {
     if (!row) {
       throw new Error('missing ledger row')
     }
-    expect(within(row).getByText('N/A')).toBeInTheDocument()
-    expect(within(row).queryByRole('link', { name: 'RPT-1' })).not.toBeInTheDocument()
-    expect(within(row).queryByRole('link', { name: /^SCAN/ })).not.toBeInTheDocument()
+    const sourceCell = sourceCellOf(row)
+    expect(sourceCell).toHaveTextContent(/^N\/A$/)
+    expect(within(sourceCell).queryByRole('link', { name: 'RPT-1' })).not.toBeInTheDocument()
+    expect(within(sourceCell).queryByRole('link', { name: /^SCAN/ })).not.toBeInTheDocument()
   })
 
   it('keeps the scan link and shows N/A when only the source report is missing', async () => {
@@ -388,11 +541,12 @@ describe('OpportunitiesPage filters and counts', () => {
     if (!row) {
       throw new Error('missing ledger row')
     }
-    expect(within(row).getByRole('link', { name: 'SCAN-9' })).toHaveAttribute(
+    const sourceCell = sourceCellOf(row)
+    expect(within(sourceCell).getByRole('link', { name: 'SCAN-9' })).toHaveAttribute(
       'href',
       '/scans/SCAN-9',
     )
-    expect(within(row).getByText('N/A')).toBeInTheDocument()
+    expect(within(sourceCell).getByText('N/A')).toBeInTheDocument()
   })
 
   it('announces the active filter and result count in a polite live region', async () => {
@@ -601,6 +755,27 @@ describe('OpportunityDetailPage', () => {
     expect(
       screen.queryByRole('link', { name: /accept|reject|trigger|cancel/i }),
     ).not.toBeInTheDocument()
+  })
+
+  it('surfaces an export failure instead of downloading an error body', async () => {
+    const downloadExportFn = vi.fn(async () => {
+      throw new OpportunityApiError('authentication required', 'AUTH_REQUIRED')
+    })
+    render(
+      <OpportunityDetailPage
+        opportunityId="OPP-1"
+        fetchOpportunityFn={detailById([opportunity()])}
+        downloadExportFn={downloadExportFn}
+      />,
+    )
+    await screen.findByRole('heading', { name: 'OPP-1' })
+
+    expect(screen.queryByRole('alert')).not.toBeInTheDocument()
+    fireEvent.click(screen.getByRole('link', { name: 'Export JSON' }))
+
+    const alert = await screen.findByRole('alert')
+    expect(alert).toHaveTextContent('Export failed: authentication required')
+    expect(downloadExportFn).toHaveBeenCalledWith('OPP-1', expect.any(AbortSignal))
   })
 
   it('renders only links and read-only text, with no accept or reject action', async () => {

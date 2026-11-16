@@ -1,15 +1,18 @@
-import { useEffect, useState } from 'react'
+import { useEffect, useRef, useState, type MouseEvent } from 'react'
 
 import {
   conditionThreshold,
   describeCondition,
+  downloadOpportunityExport,
   fetchOpportunity,
   opportunityExportPath,
   type OpportunityCondition,
   type OpportunityData,
   type OpportunityEnvelope,
+  type OpportunityExportDownload,
 } from '../api/opportunities'
 import { isAbortError } from '../api/abort'
+import { errorMessage } from '../api/errors'
 import { confidenceBand, utcLabel } from '../api/reports'
 import { DataQualityBadge } from '../components/data-quality'
 import { LlmBand, type LedgerLlmState } from '../components/llm-band'
@@ -19,6 +22,10 @@ import { useCompact } from '../hooks/use-compact'
 interface OpportunityDetailPageProps {
   opportunityId: string
   fetchOpportunityFn?: (opportunityId: string, signal?: AbortSignal) => Promise<OpportunityEnvelope>
+  downloadExportFn?: (
+    opportunityId: string,
+    signal?: AbortSignal,
+  ) => Promise<OpportunityExportDownload>
   isCompact?: boolean
 }
 
@@ -50,7 +57,7 @@ function ConditionTable({
 }) {
   return (
     // eslint-disable-next-line jsx-a11y/no-noninteractive-tabindex -- scrollable table
-    <div className="table-wrap" role="region" tabIndex={0}>
+    <div className="table-wrap" role="region" tabIndex={0} aria-label={tableLabel}>
       <table className="data-table condition-table">
         <caption className="visually-hidden">{tableLabel}</caption>
         <thead>
@@ -133,10 +140,21 @@ function ledgerLlmState(opportunity: OpportunityData): LedgerLlmState {
 export function OpportunityDetailPage({
   opportunityId,
   fetchOpportunityFn = fetchOpportunity,
+  downloadExportFn = downloadOpportunityExport,
   isCompact,
 }: OpportunityDetailPageProps) {
   const [load, setLoad] = useState<DetailState>({ state: 'loading' })
+  const [exporting, setExporting] = useState(false)
+  const [exportError, setExportError] = useState<string | null>(null)
+  const exportInFlight = useRef(false)
+  const exportController = useRef<AbortController | null>(null)
   const compact = useCompact(isCompact)
+
+  useEffect(() => {
+    return () => {
+      exportController.current?.abort()
+    }
+  }, [])
 
   useEffect(() => {
     const controller = new AbortController()
@@ -194,6 +212,34 @@ export function OpportunityDetailPage({
   const directionLabel =
     opportunity.side === 'SHORT' ? `▼ ${opportunity.side}` : `▲ ${opportunity.side}`
   const llm = ledgerLlmState(opportunity)
+
+  /**
+   * On a plain click, fetch the export instead of letting the browser save an
+   * error envelope. A failed request surfaces in the Source panel; an abort is
+   * cleanup only.
+   */
+  async function handleExport(event: MouseEvent<HTMLAnchorElement>): Promise<void> {
+    event.preventDefault()
+    if (exportInFlight.current) {
+      return
+    }
+    exportInFlight.current = true
+    setExporting(true)
+    setExportError(null)
+    const controller = new AbortController()
+    exportController.current = controller
+    try {
+      await downloadExportFn(opportunity.opportunity_id, controller.signal)
+    } catch (error: unknown) {
+      if (controller.signal.aborted || isAbortError(error)) {
+        return
+      }
+      setExportError(errorMessage(error))
+    } finally {
+      exportInFlight.current = false
+      setExporting(false)
+    }
+  }
 
   return (
     <section className="system-page" aria-labelledby="opportunity-heading" data-readonly={compact}>
@@ -310,6 +356,9 @@ export function OpportunityDetailPage({
                   className="rowlink"
                   href={opportunityExportPath(opportunity.opportunity_id)}
                   download
+                  aria-busy={exporting}
+                  aria-disabled={exporting}
+                  onClick={handleExport}
                 >
                   Export JSON
                 </a>
@@ -321,6 +370,11 @@ export function OpportunityDetailPage({
               Export JSON is the read-only contract snapshot; downloading it never changes ledger
               state.
             </p>
+            {exportError !== null && (
+              <p className="status-message status-message--error" role="alert">
+                Export failed: {exportError}
+              </p>
+            )}
           </section>
         </div>
 

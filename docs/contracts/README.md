@@ -159,7 +159,7 @@ A rejected output never creates an opportunity, never reaches the risk gate, and
 | Symbols/watchlist | `GET /api/v1/symbols[/{symbol}]`, `GET/POST/PATCH/DELETE /api/v1/watchlist[/{symbol}]` |
 | Scans | `POST /api/v1/scans`, `GET /api/v1/scans[/{scan_id}]` |
 | Reports | `GET /api/v1/reports[/{report_id}]`, `GET /api/v1/reports/{report_id}/chart`, `GET /api/v1/reports/{report_id}/export` |
-| Opportunities | `GET /api/v1/opportunities[/{id}][/timeline]` |
+| Opportunities | `GET /api/v1/opportunities[/{id}][/timeline]`, `GET /api/v1/opportunities/{id}/export` |
 | Triggers | `GET /api/v1/triggers[/{id}]`, `GET /api/v1/triggers/{id}/decision`, `POST /api/v1/triggers/{id}/{recheck,accept,reject}` |
 | Positions | `GET /api/v1/positions[/{id}]`, `POST /api/v1/positions/{id}/manage` |
 | Paper | `GET /api/v1/paper/{account,orders,fills,equity}`, `POST /api/v1/paper/reset` |

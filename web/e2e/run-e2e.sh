@@ -1,7 +1,10 @@
 #!/usr/bin/env bash
 # Run the slice-01 /system journey, the slice-02 read-only symbol journeys, the
-# slice-08 report journeys, the slice-29 positions journey, and the slice-30
-# journal journeys against real daemons.
+# slice-08 report journeys, the slice-29 positions journey, the slice-30
+# journal journeys, the slice-33 read-only navigation-shell journey, the
+# slice-38 watchlist journey, the slice-39 chart panel journey, and the
+# slice-41 opportunity ledger journeys against real daemons, then the trailing
+# settings and llm-settings runners.
 #
 # Starts `oft serve` three times with temporary OFT_DATA_DIRs:
 #   - 127.0.0.1:7622 for the walking-skeleton /system journey;

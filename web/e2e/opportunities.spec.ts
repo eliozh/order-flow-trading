@@ -1,7 +1,7 @@
 import fs from 'node:fs'
 import path from 'node:path'
 
-import { expect, test, type Page } from '@playwright/test'
+import { expect, test, type Locator, type Page } from '@playwright/test'
 import AxeBuilder from '@axe-core/playwright'
 
 /**
@@ -71,9 +71,9 @@ async function authenticate(page: Page): Promise<void> {
 }
 
 /**
- * Find a seeded opportunity through the real API. The reports daemon's default
- * OPEN filter can legitimately be empty, so try every state and keep the
- * per-state counts from whichever response answers first.
+ * Find a seeded opportunity through the real API. The ledger's default OPEN tab
+ * can legitimately be empty, so search the states in turn (stopping at the
+ * first populated one) and keep the all-state counts from the first response.
  */
 async function discoverOpportunity(page: Page): Promise<Discovered> {
   let counts: Record<string, number> | null = null
@@ -102,7 +102,15 @@ async function selectState(page: Page, state: string): Promise<void> {
 }
 
 async function runAxe(page: Page, label: string): Promise<void> {
-  const results = await new AxeBuilder({ page }).withTags([...AXE_TAGS]).analyze()
+  // `options()` replaces the builder options, so tags and the explicitly
+  // enabled WCAG 2.2 target-size rule (disabled by default in axe-core) are
+  // supplied together here rather than chaining `.withTags`.
+  const results = await new AxeBuilder({ page })
+    .options({
+      runOnly: { type: 'tag', values: [...AXE_TAGS, 'wcag22aa'] },
+      rules: { 'target-size': { enabled: true } },
+    })
+    .analyze()
   const summary = results.violations.map(
     (violation) =>
       `${violation.id} (${violation.impact ?? 'unknown'}): ${violation.nodes
@@ -110,6 +118,12 @@ async function runAxe(page: Page, label: string): Promise<void> {
         .join(' | ')}`,
   )
   expect(results.violations, `${label} axe violations:\n${summary.join('\n')}`).toEqual([])
+  // Prove the explicitly enabled WCAG 2.2 rule was evaluated, not silently
+  // dropped by the tag filter.
+  const targetSizeRan = [...results.passes, ...results.incomplete, ...results.violations].some(
+    (result) => result.id === 'target-size',
+  )
+  expect(targetSizeRan, `${label}: target-size rule did not run`).toBe(true)
 }
 
 async function expectNoHorizontalOverflow(page: Page, label: string): Promise<void> {
@@ -131,6 +145,11 @@ test.describe('opportunities ledger', () => {
     await expect(
       main.getByRole('heading', { level: 1, name: 'Opportunities', exact: true }),
     ).toBeVisible()
+
+    // Every state tab displays the server-side all-state count.
+    for (const state of DISCOVERY_STATES) {
+      await expect(stateTab(page, state).locator('.count')).toHaveText(String(counts[state] ?? 0))
+    }
 
     const openTab = stateTab(page, 'OPEN')
     await expect(openTab).toHaveAttribute('aria-selected', 'true')
@@ -158,6 +177,14 @@ test.describe('opportunities ledger', () => {
     await expect(stateTab(page, 'INVALIDATED')).toBeFocused()
     await expect(stateTab(page, 'INVALIDATED')).toHaveAttribute('aria-selected', 'true')
     await page.keyboard.press('Home')
+    await expect(openTab).toBeFocused()
+    await expect(openTab).toHaveAttribute('aria-selected', 'true')
+
+    // Arrow keys wrap from the first tab to the last and back.
+    await page.keyboard.press('ArrowLeft')
+    await expect(stateTab(page, 'INVALIDATED')).toBeFocused()
+    await expect(stateTab(page, 'INVALIDATED')).toHaveAttribute('aria-selected', 'true')
+    await page.keyboard.press('ArrowRight')
     await expect(openTab).toBeFocused()
     await expect(openTab).toHaveAttribute('aria-selected', 'true')
 
@@ -197,7 +224,51 @@ test.describe('opportunities ledger', () => {
 
     const ageCell = row.locator('td').nth(ageIndex)
     await expect(ageCell).toHaveText(/^(\d+m|\d+h \d{2}m|\d+d \d{2}h)$/)
-    await expect(ageCell).not.toHaveText('N/A')
+
+    // Keyboard order follows the row DOM: ID link, then scan link, then the
+    // report link when the source has one. Row-scoped locators avoid strict-mode
+    // ambiguity when several rows share a source.
+    const idLink = row.getByRole('link', { name: item.opportunity_id, exact: true })
+    await idLink.focus()
+    await expect(idLink).toBeFocused()
+    if (item.source.scan_id) {
+      const scanLink = sourceCell.getByRole('link', { name: item.source.scan_id, exact: true })
+      await page.keyboard.press('Tab')
+      await expect(scanLink).toBeFocused()
+      if (item.source.report_id) {
+        const reportLink = sourceCell.getByRole('link', {
+          name: item.source.report_id,
+          exact: true,
+        })
+        await page.keyboard.press('Tab')
+        await expect(reportLink).toBeFocused()
+      }
+    }
+
+    // The Source links navigate to the existing scan/report routes. The filter
+    // resets on a full navigation, so re-select it after returning.
+    if (item.source.scan_id) {
+      const scanPath = `/scans/${encodeURIComponent(item.source.scan_id)}`
+      await sourceCell.getByRole('link', { name: item.source.scan_id, exact: true }).click()
+      await page.waitForURL((url) => url.pathname === scanPath)
+      await expect(page.locator('#app-main').getByRole('heading', { level: 1 })).toHaveText(
+        item.source.scan_id,
+      )
+      await page.goBack()
+      await page.waitForURL((url) => url.pathname === '/opportunities')
+      await selectState(page, item.state)
+    }
+    if (item.source.report_id) {
+      const reportPath = `/reports/${encodeURIComponent(item.source.report_id)}`
+      await sourceCell.getByRole('link', { name: item.source.report_id, exact: true }).click()
+      await page.waitForURL((url) => url.pathname === reportPath)
+      await expect(page.locator('#app-main').getByRole('heading', { level: 1 })).toHaveText(
+        item.source.report_id,
+      )
+      await page.goBack()
+      await page.waitForURL((url) => url.pathname === '/opportunities')
+      await selectState(page, item.state)
+    }
   })
 
   test('detail exposes the read-only JSON export and no state-changing control', async ({
@@ -208,11 +279,30 @@ test.describe('opportunities ledger', () => {
     await authenticate(page)
     const { item } = await discoverOpportunity(page)
 
-    await page.goto(`/opportunities/${encodeURIComponent(item.opportunity_id)}`)
+    const detailPath = `/opportunities/${encodeURIComponent(item.opportunity_id)}`
+    await page.goto(detailPath)
     const main = page.locator('#app-main')
     await expect(
       main.getByRole('heading', { level: 1, name: item.opportunity_id, exact: true }),
     ).toBeVisible()
+
+    // The detail renders the existing source links, timeline, and both
+    // condition tables before the export is exercised.
+    const sourcePanel = main.getByRole('region', { name: 'Source', exact: true })
+    if (item.source.scan_id) {
+      await expect(
+        sourcePanel.getByRole('link', { name: item.source.scan_id, exact: true }),
+      ).toHaveAttribute('href', `/scans/${encodeURIComponent(item.source.scan_id)}`)
+    }
+    if (item.source.report_id) {
+      await expect(
+        sourcePanel.getByRole('link', { name: item.source.report_id, exact: true }),
+      ).toHaveAttribute('href', `/reports/${encodeURIComponent(item.source.report_id)}`)
+    }
+    const timeline = main.getByRole('list', { name: /State timeline/i })
+    await expect(timeline.locator('li').first()).toBeVisible()
+    await expect(main.getByRole('table', { name: /Trigger conditions/i })).toBeVisible()
+    await expect(main.getByRole('table', { name: /Invalidation conditions/i })).toBeVisible()
 
     const exportPath = `/api/v1/opportunities/${encodeURIComponent(item.opportunity_id)}/export`
     const exportLink = main.getByRole('link', { name: 'Export JSON', exact: true })
@@ -223,13 +313,26 @@ test.describe('opportunities ledger', () => {
     // No accept/reject/trigger/cancel control, link or button, exists in the
     // ledger body. (The global shell's pause/kill controls live outside main.)
     await expect(main.getByRole('button')).toHaveCount(0)
-    await expect(main.getByRole('link', { name: /accept|reject|cancel/i })).toHaveCount(0)
+    await expect(main.getByRole('link', { name: /accept|reject|trigger|cancel/i })).toHaveCount(0)
 
-    // The endpoint behind the link is a read-only attachment; do not click the
-    // link (that would navigate away from the rendered detail).
-    const download = await page.request.get(exportPath)
-    expect(download.status()).toBe(200)
-    const disposition = download.headers()['content-disposition'] ?? ''
+    // Clicking Export JSON fetches the contract envelope and saves it as a
+    // file without navigating away from the detail.
+    const [download] = await Promise.all([page.waitForEvent('download'), exportLink.click()])
+    expect(new URL(page.url()).pathname).toBe(detailPath)
+    expect(download.suggestedFilename()).toMatch(/\.json$/)
+    const downloadedPath = await download.path()
+    expect(downloadedPath, 'downloaded export path').toBeTruthy()
+    const exported = JSON.parse(fs.readFileSync(downloadedPath as string, 'utf8')) as {
+      ok: boolean
+      data: { opportunity_id?: string } | null
+    }
+    expect(exported.ok).toBe(true)
+    expect(exported.data?.opportunity_id).toBe(item.opportunity_id)
+
+    // The endpoint behind the link is a read-only attachment.
+    const attachment = await page.request.get(exportPath)
+    expect(attachment.status()).toBe(200)
+    const disposition = attachment.headers()['content-disposition'] ?? ''
     expect(disposition).toMatch(/attachment/)
     expect(disposition).toContain('.json')
   })
@@ -252,24 +355,111 @@ test.describe('opportunities ledger', () => {
       // Show a populated ledger rather than a legitimately empty OPEN filter.
       await selectState(page, item.state)
       await expect(main.getByRole('table', { name: /Opportunity ledger/i })).toBeVisible()
+
+      // WCAG 2.2 SC 2.5.8: row links are at least 24px high at desktop widths
+      // and 44px on compact/touch widths. This asserts the real bounding box;
+      // the axe target-size rule accepts these inline links via the spacing
+      // exception, so a green axe run cannot prove the CSS on its own.
+      const targetHeight = viewport.width <= 768 ? 44 : 24
+      const headerLabels = (await main.getByRole('columnheader').allTextContents()).map((text) =>
+        text.trim().toLowerCase(),
+      )
+      const sourceIndex = headerLabels.indexOf('source')
+      expect(sourceIndex, 'source column index').toBeGreaterThanOrEqual(0)
+      const row = main.getByRole('row').filter({ hasText: item.opportunity_id })
+      await expect(row).toHaveCount(1)
+      const sourceCell = row.locator('td').nth(sourceIndex)
+      const expectMinHeight = async (link: Locator, label: string): Promise<void> => {
+        const box = await link.boundingBox()
+        expect(box, `${label} at ${viewport.name} bounding box`).not.toBeNull()
+        expect(
+          box?.height ?? 0,
+          `${label} target height at ${viewport.name}`,
+        ).toBeGreaterThanOrEqual(targetHeight)
+      }
+      if (item.source.scan_id) {
+        await expectMinHeight(
+          sourceCell.getByRole('link', { name: item.source.scan_id, exact: true }),
+          'list scan link',
+        )
+      }
+      if (item.source.report_id) {
+        await expectMinHeight(
+          sourceCell.getByRole('link', { name: item.source.report_id, exact: true }),
+          'list report link',
+        )
+      }
+
       await page.screenshot({
         path: path.join(SCREENS_DIR, `opportunities-list-${viewport.name}.png`),
         fullPage: true,
       })
       await runAxe(page, `/opportunities at ${viewport.name}`)
+      if (viewport.width <= 768) {
+        await expect(page.getByText(/Read-only at this width/)).toBeVisible()
+        await expect(page.locator('section.system-page')).toHaveAttribute('data-readonly', 'true')
+        expect(
+          await page
+            .locator('#app-main input, #app-main select, #app-main textarea, #app-main form')
+            .count(),
+          'read-only list: no inputs or forms',
+        ).toBe(0)
+      }
       if (viewport.width === 375) {
         await expectNoHorizontalOverflow(page, '/opportunities')
+        expect(
+          await main.getByRole('link', { name: /accept|reject|trigger|cancel/i }).count(),
+          'read-only ledger: no state-changing link',
+        ).toBe(0)
+        // The focused scroll region moves horizontally with the arrow key.
+        const region = main.locator('.table-wrap[role="region"]')
+        await region.focus()
+        const before = await region.evaluate((element) => element.scrollLeft)
+        await page.keyboard.press('ArrowRight')
+        await expect
+          .poll(() => region.evaluate((element) => element.scrollLeft))
+          .toBeGreaterThan(before)
       }
 
       await page.goto(detailPath)
       await expect(
         main.getByRole('heading', { level: 1, name: item.opportunity_id, exact: true }),
       ).toBeVisible()
+
+      // The detail's Report/Scan/Export links share the same target-size rules.
+      const detailSource = main.getByRole('region', { name: 'Source', exact: true })
+      if (item.source.scan_id) {
+        await expectMinHeight(
+          detailSource.getByRole('link', { name: item.source.scan_id, exact: true }),
+          'detail scan link',
+        )
+      }
+      if (item.source.report_id) {
+        await expectMinHeight(
+          detailSource.getByRole('link', { name: item.source.report_id, exact: true }),
+          'detail report link',
+        )
+      }
+      await expectMinHeight(
+        main.getByRole('link', { name: 'Export JSON', exact: true }),
+        'detail export link',
+      )
+
       await page.screenshot({
         path: path.join(SCREENS_DIR, `opportunity-detail-${viewport.name}.png`),
         fullPage: true,
       })
       await runAxe(page, `${detailPath} at ${viewport.name}`)
+      if (viewport.width <= 768) {
+        await expect(page.getByText(/Read-only at this width/)).toBeVisible()
+        await expect(page.locator('section.system-page')).toHaveAttribute('data-readonly', 'true')
+        expect(
+          await page
+            .locator('#app-main input, #app-main select, #app-main textarea, #app-main form')
+            .count(),
+          'read-only detail: no inputs or forms',
+        ).toBe(0)
+      }
       if (viewport.width === 375) {
         await expectNoHorizontalOverflow(page, detailPath)
       }
