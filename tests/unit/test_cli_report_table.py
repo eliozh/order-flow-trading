@@ -1,4 +1,4 @@
-"""CLI report table parity: every API section is rendered, unmeasured stays N/A."""
+"""CLI report table parity: every API section renders; unmeasured stays "not measured"."""
 
 from __future__ import annotations
 
@@ -114,3 +114,19 @@ def test_rejected_narrative_renders_the_explicit_rejection_without_prose() -> No
     assert "LLM rejected — STOP_SIDE" in output
     assert "No narrative, opportunity, or order was created" in output
     assert "LLM ›" not in output
+
+
+def test_a_non_configuration_skip_is_not_labelled_not_configured() -> None:
+    data = _payload(measured=True)
+    data["llm"] = {
+        "configured": False,
+        "reason": "LIVE_DATA_STALE: the live snapshot is older than the allowed window",
+    }
+
+    output = render_report_table(data)
+
+    assert (
+        "LLM skipped — LIVE_DATA_STALE: the live snapshot is older than the allowed window"
+        in output
+    )
+    assert "LLM not configured" not in output
