@@ -1,6 +1,7 @@
 import { afterEach, describe, expect, it, vi } from 'vitest'
 
-import { fetchReadiness, ReadinessError } from './status'
+import { ApiShapeError, fetchReadiness, fetchStatus, ReadinessError } from './status'
+import { READ_TIMEOUT_MS } from './request-timeout'
 
 const notReadyEnvelope = {
   ok: false,
@@ -41,6 +42,7 @@ function stubFetch(body: unknown, status: number): void {
 
 describe('fetchReadiness', () => {
   afterEach(() => {
+    vi.useRealTimers()
     vi.unstubAllGlobals()
   })
 
@@ -54,5 +56,55 @@ describe('fetchReadiness', () => {
     expect((error as ReadinessError).message).toBe(
       'Required data does not exist or cannot be fetched.',
     )
+  })
+
+  it('rejects a JSON null body as a shape error, never a TypeError', async () => {
+    stubFetch(null, 200)
+
+    await expect(fetchReadiness()).rejects.toBeInstanceOf(ApiShapeError)
+    await expect(fetchStatus()).rejects.toBeInstanceOf(ApiShapeError)
+  })
+
+  it('times out a wedged readiness read instead of loading forever', async () => {
+    vi.useFakeTimers()
+    vi.stubGlobal(
+      'fetch',
+      vi.fn(
+        (_input: string, init?: RequestInit) =>
+          new Promise<Response>((_resolve, reject) => {
+            init?.signal?.addEventListener('abort', () => {
+              reject(Object.assign(new Error('aborted'), { name: 'AbortError' }))
+            })
+          }),
+      ),
+    )
+
+    const pending = fetchReadiness()
+    const assertion = expect(pending).rejects.toMatchObject({
+      name: 'RequestTimeoutError',
+      code: 'TIMEOUT',
+    })
+    await vi.advanceTimersByTimeAsync(READ_TIMEOUT_MS)
+    await assertion
+  })
+
+  it('forwards a caller abort to the status request', async () => {
+    const controller = new AbortController()
+    vi.stubGlobal(
+      'fetch',
+      vi.fn(
+        (_input: string, init?: RequestInit) =>
+          new Promise<Response>((_resolve, reject) => {
+            init?.signal?.addEventListener('abort', () => {
+              reject(Object.assign(new Error('aborted'), { name: 'AbortError' }))
+            })
+          }),
+      ),
+    )
+
+    const pending = fetchStatus(controller.signal)
+    controller.abort()
+
+    await expect(pending).rejects.toMatchObject({ name: 'AbortError' })
   })
 })

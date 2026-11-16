@@ -1,3 +1,5 @@
+import { fetchWithTimeout, READ_TIMEOUT_MS } from './request-timeout'
+
 export interface SymbolInfo {
   symbol: string
   base_asset: string
@@ -69,7 +71,7 @@ export interface HealthData {
 
 export interface ReadyCheck {
   name: string
-  status: 'ok' | 'degraded' | 'offline'
+  status: 'ok' | 'degraded' | 'offline' | 'unknown'
   detail: string
 }
 
@@ -124,6 +126,99 @@ function envelopeError(envelope: { ok: boolean; error: ApiError | null }, fallba
   return new Error(envelope.error?.message ?? fallback)
 }
 
+/** Read an envelope error message without dereferencing an unvalidated body. */
+function bodyErrorMessage(body: Record<string, unknown>, fallback: string): string {
+  const error = body.error
+  return isRecord(error) && typeof error.message === 'string' ? error.message : fallback
+}
+
+/** Read an envelope error code without dereferencing an unvalidated body. */
+function bodyErrorCode(body: Record<string, unknown> | null): string | undefined {
+  if (!body) {
+    return undefined
+  }
+  const error = body.error
+  return isRecord(error) && typeof error.code === 'string' ? error.code : undefined
+}
+
+/** A 2xx response whose body does not match the documented contract. */
+export class ApiShapeError extends Error {
+  constructor(message: string) {
+    super(message)
+    this.name = 'ApiShapeError'
+  }
+}
+
+function isRecord(value: unknown): value is Record<string, unknown> {
+  return typeof value === 'object' && value !== null
+}
+
+function isNullableString(value: unknown): value is string | null {
+  return value === null || typeof value === 'string'
+}
+
+function isReadyCheck(value: unknown): value is ReadyCheck {
+  if (!isRecord(value)) {
+    return false
+  }
+  return (
+    typeof value.name === 'string' &&
+    (value.status === 'ok' ||
+      value.status === 'degraded' ||
+      value.status === 'offline' ||
+      value.status === 'unknown') &&
+    typeof value.detail === 'string'
+  )
+}
+
+/** Shape guard for `StatusData`; a contract drift becomes a typed load error. */
+export function isStatusData(value: unknown): value is StatusData {
+  if (!isRecord(value) || !isRecord(value.universe)) {
+    return false
+  }
+  const universe = value.universe
+  const schedule = value.schedule
+  return (
+    value.status === 'ok' &&
+    typeof value.env === 'string' &&
+    typeof value.version === 'string' &&
+    typeof value.host === 'string' &&
+    typeof value.port === 'number' &&
+    typeof value.data_dir === 'string' &&
+    typeof value.log_level === 'string' &&
+    typeof value.generated_at === 'string' &&
+    typeof universe.source === 'string' &&
+    typeof universe.as_of === 'string' &&
+    typeof universe.count === 'number' &&
+    typeof universe.tradifi_count === 'number' &&
+    Array.isArray(universe.symbols) &&
+    (schedule === undefined ||
+      schedule === null ||
+      (isRecord(schedule) &&
+        typeof schedule.timezone === 'string' &&
+        typeof schedule.period === 'string' &&
+        isNullableString(schedule.pending_period) &&
+        typeof schedule.next_run_at === 'string'))
+  )
+}
+
+/** Shape guard for `ReadinessData`; never dereference an unvalidated body. */
+export function isReadinessData(value: unknown): value is ReadinessData {
+  if (!isRecord(value)) {
+    return false
+  }
+  return (
+    (value.status === 'ready' || value.status === 'not_ready') &&
+    typeof value.version === 'string' &&
+    typeof value.env === 'string' &&
+    typeof value.data_dir === 'string' &&
+    typeof value.checked_at === 'string' &&
+    Array.isArray(value.checks) &&
+    value.checks.every(isReadyCheck) &&
+    (value.latest_scan === null || isRecord(value.latest_scan))
+  )
+}
+
 /** The daemon answered `/ready` but readiness is not OK (non-2xx envelope). */
 export class ReadinessError extends Error {
   readonly code: string | undefined
@@ -135,18 +230,28 @@ export class ReadinessError extends Error {
   }
 }
 
-export async function fetchStatus(): Promise<StatusEnvelope> {
-  const response = await fetch('/api/v1/status', {
-    headers: { Accept: 'application/json' },
-  })
+export async function fetchStatus(signal?: AbortSignal): Promise<StatusEnvelope> {
+  const response = await fetchWithTimeout(
+    '/api/v1/status',
+    { headers: { Accept: 'application/json' } },
+    signal,
+    READ_TIMEOUT_MS,
+  )
   if (!response.ok) {
     throw new Error(`Status request failed with HTTP ${response.status}`)
   }
-  const envelope = (await response.json()) as StatusEnvelope
-  if (!envelope.ok || envelope.data === null) {
-    throw envelopeError(envelope, 'API returned an error')
+  const body: unknown = await response.json()
+  if (!isRecord(body)) {
+    throw new ApiShapeError('The status response was not in the expected shape.')
   }
-  return envelope
+  const data = body.data
+  if (!body.ok || data === null || data === undefined) {
+    throw new Error(bodyErrorMessage(body, 'API returned an error'))
+  }
+  if (!isStatusData(data)) {
+    throw new ApiShapeError('The status response was not in the expected shape.')
+  }
+  return body as unknown as StatusEnvelope
 }
 
 export async function fetchHealth(): Promise<HealthEnvelope> {
@@ -161,27 +266,42 @@ export async function fetchHealth(): Promise<HealthEnvelope> {
   return envelope
 }
 
-export async function fetchReadiness(): Promise<ReadinessEnvelope> {
-  const response = await fetch('/ready', { headers: { Accept: 'application/json' } })
-  let envelope: ReadinessEnvelope | null = null
+export async function fetchReadiness(signal?: AbortSignal): Promise<ReadinessEnvelope> {
+  const response = await fetchWithTimeout(
+    '/ready',
+    { headers: { Accept: 'application/json' } },
+    signal,
+    READ_TIMEOUT_MS,
+  )
+  let body: unknown = null
   try {
-    envelope = (await response.json()) as ReadinessEnvelope
+    body = await response.json()
   } catch {
-    envelope = null
+    body = null
   }
+  const envelope = isRecord(body) ? body : null
   if (!response.ok) {
     // A 503 still proves the daemon answered; surface it as a typed error so
     // the caller can render NOT_READY instead of OFFLINE.
     throw new ReadinessError(
-      envelope?.error?.message ?? `Readiness request failed with HTTP ${response.status}`,
-      envelope?.error?.code,
+      envelope
+        ? bodyErrorMessage(envelope, `Readiness request failed with HTTP ${response.status}`)
+        : `Readiness request failed with HTTP ${response.status}`,
+      bodyErrorCode(envelope),
     )
   }
-  if (!envelope || !envelope.ok || envelope.data === null) {
+  if (!envelope) {
+    throw new ApiShapeError('The readiness response was not in the expected shape.')
+  }
+  const data = envelope.data
+  if (!envelope.ok || data === null || data === undefined) {
     throw new ReadinessError(
-      envelope?.error?.message ?? 'Readiness check returned an error',
-      envelope?.error?.code,
+      bodyErrorMessage(envelope, 'Readiness check returned an error'),
+      bodyErrorCode(envelope),
     )
   }
-  return envelope
+  if (!isReadinessData(data)) {
+    throw new ApiShapeError('The readiness response was not in the expected shape.')
+  }
+  return envelope as unknown as ReadinessEnvelope
 }

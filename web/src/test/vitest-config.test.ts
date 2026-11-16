@@ -1,4 +1,6 @@
 // @vitest-environment node
+import { readFileSync } from 'node:fs'
+
 import { describe, expect, it } from 'vitest'
 
 import viteConfig from '../../vite.config'
@@ -9,6 +11,13 @@ describe('vitest configuration', () => {
 
     expect(testConfig?.include).toEqual(['src/**/*.{test,spec}.{ts,tsx}'])
     expect(testConfig?.exclude ?? []).toContain('e2e/**')
+  })
+
+  it('does not register the onboarding project in the aggregate Playwright config', () => {
+    // The onboarding journey owns its daemon and generated config via
+    // `e2e/run-onboarding-e2e.sh`; the aggregate runner starts no 7654 daemon.
+    const source = readFileSync(new URL('../../playwright.config.ts', import.meta.url), 'utf8')
+    expect(source).not.toMatch(/onboarding/i)
   })
 
   it('rewrites the Host header on every dev proxy (loopback allowlist)', () => {

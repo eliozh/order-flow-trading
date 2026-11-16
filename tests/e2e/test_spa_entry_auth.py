@@ -36,6 +36,9 @@ def _app(settings: Settings, tmp_path: Path, monkeypatch: pytest.MonkeyPatch) ->
         "/journal",
         "/journal/",
         "/journal/TRD-1/",
+        "/onboarding",
+        "/onboarding/",
+        "/onboarding/1/",
     ],
 )
 def test_spa_entry_deep_links_require_auth(
@@ -56,7 +59,7 @@ def test_spa_entry_deep_links_require_auth(
     assert app.state.api_token not in response.text
 
 
-@pytest.mark.parametrize("path", ["/triggers", "/positions", "/journal/TRD-1/"])
+@pytest.mark.parametrize("path", ["/triggers", "/positions", "/journal/TRD-1/", "/onboarding/1"])
 def test_authorized_spa_deep_link_serves_the_spa_shell(
     path: str,
     settings: Settings,

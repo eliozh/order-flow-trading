@@ -398,7 +398,7 @@ describe('SettingsLLMPage regressions', () => {
     expect(screen.getByLabelText('全局并发（1–64）')).toHaveFocus()
   })
 
-  it('associates a rejected key write with the key field', async () => {
+  it('associates a rejected key write with the key field through the single summary', async () => {
     const setKey = vi.fn(async () => {
       throw new SettingsApiError('密钥被拒绝', 'VALIDATION_FAILED', { kind: 'refusal' })
     })
@@ -408,12 +408,18 @@ describe('SettingsLLMPage regressions', () => {
     fireEvent.click(screen.getByTestId('llm-key-save-anthropic'))
 
     await waitFor(() => expect(input).toHaveAttribute('aria-invalid', 'true'))
+    // One announcement and one focus move: the summary owns both; the shared
+    // field does not add a second inline alert or race the focus.
+    const summary = screen.getByTestId('llm-error-summary')
+    expect(screen.getAllByRole('alert')).toHaveLength(1)
+    expect(summary).toHaveTextContent('密钥被拒绝')
+    await waitFor(() => expect(summary).toHaveFocus())
+    // Every IDREF on the field still resolves.
     const describedBy = input.getAttribute('aria-describedby') ?? ''
     expect(describedBy).not.toBe('')
-    expect(document.getElementById(describedBy.split(' ').pop() as string)).toHaveTextContent(
-      '未保存任何内容',
-    )
-    expect(screen.getByTestId('llm-error-summary')).toHaveTextContent('密钥被拒绝')
+    for (const id of describedBy.split(' ')) {
+      expect(document.getElementById(id), `missing description target ${id}`).not.toBeNull()
+    }
     // M10: the summary names the provider and links to its key input.
     const keyLink = screen.getByRole('link', { name: 'Anthropic 密钥' })
     fireEvent.click(keyLink)

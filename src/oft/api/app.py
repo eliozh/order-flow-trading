@@ -77,6 +77,8 @@ _SPA_ENTRY_PATHS = frozenset(
         "/journal/",
         "/settings",
         "/settings/",
+        "/onboarding",
+        "/onboarding/",
     }
 )
 _LOOPBACK_HOSTS = frozenset({"127.0.0.1", "localhost", "::1"})
@@ -153,6 +155,7 @@ def _is_spa_entry(path: str) -> bool:
         or path.startswith("/positions/")
         or path.startswith("/journal/")
         or path.startswith("/settings/")
+        or path.startswith("/onboarding/")
     )
 
 

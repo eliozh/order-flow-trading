@@ -27,6 +27,16 @@ from oft.application.llm_settings_service import (
     LLMSettingsMixin,
     resolve_effective_llm_settings,
 )
+from oft.application.onboarding_service import (
+    ACTIVE_ONBOARDING_STEPS,
+    DEFERRED_ONBOARDING_STEPS,
+    ONBOARDING_PROGRESS_KEY,
+    ONBOARDING_STEPS,
+    OnboardingProgress,
+    OnboardingProgressMixin,
+    OnboardingStep,
+    validate_onboarding_step,
+)
 from oft.application.risk_utilization import (
     RiskUtilization,
     RiskUtilizationMetric,
@@ -153,7 +163,7 @@ class RiskCapsUpdateResult:
     changed: bool
 
 
-class SettingsService(LLMSettingsMixin):
+class SettingsService(LLMSettingsMixin, OnboardingProgressMixin):
     """Read sections and persist a validated setting with one audit event.
 
     A save that *changes* the effective value writes one ``config`` row and one
@@ -612,10 +622,16 @@ def resolve_schedule_state_overlay(
 
 
 __all__ = [
+    "ACTIVE_ONBOARDING_STEPS",
+    "DEFERRED_ONBOARDING_STEPS",
+    "ONBOARDING_PROGRESS_KEY",
+    "ONBOARDING_STEPS",
     "OVERLAY_MAX_JITTER_SECONDS",
     "RISK_CAPS_UPDATED_EVENT",
     "RISK_SECTION",
     "LLMSettings",
+    "OnboardingProgress",
+    "OnboardingStep",
     "RiskCapsUpdateResult",
     "RiskSettings",
     "RiskSummary",
@@ -626,4 +642,5 @@ __all__ = [
     "TIMEZONE",
     "resolve_effective_llm_settings",
     "resolve_schedule_state_overlay",
+    "validate_onboarding_step",
 ]

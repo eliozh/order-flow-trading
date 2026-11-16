@@ -127,4 +127,28 @@ describe('resolveRoute', () => {
     expect(route.chartReportId).toBeNull()
     expect(route.reportId).toBeNull()
   })
+
+  it('matches only /onboarding and steps 1 through 5', () => {
+    const shell = resolveRoute('/onboarding')
+    expect(shell.isOnboarding).toBe(true)
+    expect(shell.onboardingStep).toBeNull()
+    expect(resolveRoute('/onboarding/').isOnboarding).toBe(true)
+
+    for (const step of [1, 2, 3, 4, 5]) {
+      const route = resolveRoute(`/onboarding/${step}`)
+      expect(route.isOnboarding).toBe(true)
+      expect(route.onboardingStep).toBe(step)
+    }
+
+    for (const path of [
+      '/onboarding/0',
+      '/onboarding/6',
+      '/onboarding/foo',
+      '/onboarding/1/extra',
+    ]) {
+      const route = resolveRoute(path)
+      expect(route.isOnboarding).toBe(false)
+      expect(route.onboardingStep).toBeNull()
+    }
+  })
 })

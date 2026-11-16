@@ -1,4 +1,4 @@
-import { useId, useRef, useState } from 'react'
+import { useEffect, useId, useRef, useState } from 'react'
 import type { KeyboardEvent } from 'react'
 
 import type { LLMProviderName, LLMProviderRow } from '../api/settings'
@@ -17,8 +17,23 @@ interface SecretFieldProps {
   busy: boolean
   /** Server-side key error for this provider (never a key value). */
   serverError?: string
+  /**
+   * Render the server error inline as an assertive alert and focus the input.
+   * Enable only when no external error summary owns the announcement; on
+   * `/settings/llm` the shared summary already announces and focuses it.
+   */
+  announceError?: boolean
+  /**
+   * The server definitively refused the write (nothing was stored). The
+   * "未保存任何内容。" suffix is appended only then; an unknown outcome must
+   * never claim the write did not happen.
+   */
+  serverErrorRefusal?: boolean
+  /** Status text under the field (defaults to the mask / configured state). */
+  statusText?: string
   onSave: (provider: LLMProviderName, value: string) => Promise<boolean>
-  onDelete: (provider: LLMProviderName) => Promise<void>
+  /** Omit to render a write-only field with no delete action (onboarding). */
+  onDelete?: (provider: LLMProviderName) => Promise<void>
 }
 
 /**
@@ -39,6 +54,9 @@ export function SecretField({
   readOnly,
   busy,
   serverError,
+  announceError = false,
+  serverErrorRefusal = false,
+  statusText,
   onSave,
   onDelete,
 }: SecretFieldProps) {
@@ -48,6 +66,7 @@ export function SecretField({
   const hintId = `${generatedId}-hint`
   const localErrorId = `${generatedId}-error`
   const serverErrorId = `${generatedId}-server-error`
+  const maskId = `${generatedId}-mask`
   const [value, setValue] = useState('')
   const [confirmingDelete, setConfirmingDelete] = useState(false)
   const [localError, setLocalError] = useState('')
@@ -55,14 +74,33 @@ export function SecretField({
   const providerLabel = PROVIDER_LABELS[provider]
 
   const label = row.configured ? `替换 ${provider} 密钥（只写）` : `添加 ${provider} 密钥（只写）`
-  const status = row.configured
-    ? (row.masked ?? (row.key_source === 'env' ? '环境变量已配置' : '已配置'))
-    : row.key_source === 'unavailable'
-      ? '不可用'
-      : '未配置'
-  const describedBy = [hintId, localError ? localErrorId : null, serverError ? serverErrorId : null]
+  const status =
+    statusText ??
+    (row.configured
+      ? (row.masked ?? (row.key_source === 'env' ? '环境变量已配置' : '已配置'))
+      : row.key_source === 'unavailable'
+        ? '不可用'
+        : '未配置')
+  // The mask/configured state is part of the field's description so a
+  // write-only status is announced when the input receives focus, not only in
+  // browse mode.
+  const describedBy = [
+    maskId,
+    hintId,
+    localError ? localErrorId : null,
+    announceError && serverError ? serverErrorId : null,
+  ]
     .filter((item): item is string => item !== null)
     .join(' ')
+
+  // A failed save keeps the typed value and announces the error; move focus to
+  // the field so the operator can correct it immediately. When an external
+  // summary owns the announcement (settings), it also owns the focus move.
+  useEffect(() => {
+    if (announceError && serverError) {
+      requestAnimationFrame(() => inputRef.current?.focus())
+    }
+  }, [announceError, serverError])
 
   async function submit(): Promise<void> {
     if (readOnly || busy) {
@@ -95,6 +133,9 @@ export function SecretField({
   }
 
   function confirmDelete(): void {
+    if (!onDelete) {
+      return
+    }
     setConfirmingDelete(false)
     void (async () => {
       await onDelete(provider)
@@ -109,7 +150,7 @@ export function SecretField({
       <label className="field-label" id={labelId} htmlFor={inputId}>
         {label}
       </label>
-      <p className="mono" data-testid={`llm-key-mask-${provider}`}>
+      <p className="mono" id={maskId} data-testid={`llm-key-mask-${provider}`}>
         {status}
       </p>
       <div className="action-row">
@@ -144,7 +185,7 @@ export function SecretField({
         >
           {row.configured ? '替换密钥' : '保存密钥'}
         </button>
-        {row.configured && (
+        {row.configured && onDelete && (
           <button
             type="button"
             id={`llm-key-delete-${provider}`}
@@ -170,24 +211,27 @@ export function SecretField({
           错误：{localError}
         </p>
       )}
-      {serverError && (
-        <p className="status-message status-message--error" id={serverErrorId}>
-          错误：{serverError} 未保存任何内容。
+      {announceError && serverError && (
+        <p className="status-message status-message--error" id={serverErrorId} role="alert">
+          错误：{serverError}
+          {serverErrorRefusal ? ' 未保存任何内容。' : ''}
         </p>
       )}
-      <ConfirmDialog
-        open={confirmingDelete}
-        idPrefix={`llm-delete-${provider}`}
-        title={`删除 ${provider} 密钥`}
-        description={`删除只移除 ${provider} 存储的密钥；同一 provider 的环境变量密钥，如果已设置，仍然生效；不会回退到其他 provider。两者都没有时，需要该 provider 的决策返回 LLM_PROVIDER_NOT_CONFIGURED。`}
-        rows={[]}
-        confirmLabel="确认删除"
-        busy={busy}
-        restoreFocusId={inputId}
-        hint="密钥值从不显示；删除后仅保留最终配置状态。"
-        onCancel={cancelDelete}
-        onConfirm={confirmDelete}
-      />
+      {onDelete && (
+        <ConfirmDialog
+          open={confirmingDelete}
+          idPrefix={`llm-delete-${provider}`}
+          title={`删除 ${provider} 密钥`}
+          description={`删除只移除 ${provider} 存储的密钥；同一 provider 的环境变量密钥，如果已设置，仍然生效；不会回退到其他 provider。两者都没有时，需要该 provider 的决策返回 LLM_PROVIDER_NOT_CONFIGURED。`}
+          rows={[]}
+          confirmLabel="确认删除"
+          busy={busy}
+          restoreFocusId={inputId}
+          hint="密钥值从不显示；删除后仅保留最终配置状态。"
+          onCancel={cancelDelete}
+          onConfirm={confirmDelete}
+        />
+      )}
     </div>
   )
 }
