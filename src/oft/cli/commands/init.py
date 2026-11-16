@@ -40,13 +40,15 @@ from oft.application.secrets_service import (
     SecretStoreUnavailable,
 )
 from oft.application.settings_service import SettingsService
-from oft.application.symbol_registry import SymbolRegistry
+from oft.application.symbol_registry import SymbolRegistry, SymbolRegistryError
 from oft.bootstrap import AppContainer, build_container
 from oft.cli.commands.doctor import emit_error
-from oft.config import ConfigError, Settings, load_settings
+from oft.config import ConfigError, Environment, Settings, load_settings
+from oft.domain.events import strip_control_characters
 from oft.domain.llm_settings import MAX_API_KEY_LENGTH, PROVIDERS, validate_provider
 from oft.domain.settings import SettingValidationError, validate_scan_period
 from oft.domain.time import utc_timestamp
+from oft.ports.store import StoreUnavailableError
 
 # Steps 3 (Binance) and 4 (Telegram) are deferred by the shared definition.
 _DEFERRED_STEPS = {step.step: step.deferred_milestone for step in ONBOARDING_STEPS if step.deferred}
@@ -61,6 +63,10 @@ _BUDGET_PATTERN = re.compile(
     rf"^(?:0|[1-9]\d{{0,{_BUDGET_MAX_INTEGER_DIGITS - 1}}})"
     rf"(?:\.\d{{1,{_BUDGET_MAX_FRACTION_DIGITS}}})?$"
 )
+# Registry symbols are shaped like ``BTCUSDT``; reject anything else before a
+# lookup so a hostile token is never echoed with its control characters.
+_WATCHLIST_SYMBOL_PATTERN = re.compile(r"[A-Z0-9]{2,24}")
+_MAX_REPORTED_TOKENS = 10
 
 
 class _MissingFlags(Exception):
@@ -146,7 +152,17 @@ def _print_environment(settings: Settings) -> None:
     typer.echo(f"1/5 {_STEP_TITLES[1]}")
     typer.echo(f"  data directory  {settings.data_dir}")
     typer.echo(f"  bind            {settings.host}:{settings.port}")
-    typer.echo("  environment     PAPER (Live is not offered by `oft init`)")
+    typer.echo(f"  environment     {settings.env.value} (Live is not offered by `oft init`)")
+
+
+def _warn_if_live(settings: Settings) -> None:
+    """Never claim Paper when the process is pointed at the Live profile."""
+    if settings.env == Environment.LIVE:
+        typer.echo(
+            "WARNING: `oft init` only configures Paper; no Live configuration "
+            "is written (OFT_ENV=live).",
+            err=True,
+        )
 
 
 def _print_providers(secrets: SecretsService) -> None:
@@ -199,6 +215,7 @@ def _print_summary(
     service: SettingsService,
     secrets: SecretsService,
     budget_service: BudgetService,
+    settings: Settings,
 ) -> None:
     progress = service.read_onboarding_progress()
     completed = ", ".join(str(step) for step in progress.completed_steps) or "none"
@@ -220,7 +237,7 @@ def _print_summary(
         f"month {format_text(thresholds.monthly_usd)} USD "
         f"(source {_budget_source(container)})"
     )
-    typer.echo("Environment: PAPER. Live is not offered by `oft init`.")
+    typer.echo(f"Environment: {settings.env.value}. Live is not offered by `oft init`.")
 
 
 # -- validation helpers ------------------------------------------------------
@@ -248,11 +265,40 @@ def _parse_symbols(raw: str | None, *, default: tuple[str, ...] = ()) -> tuple[s
     return tuple(dict.fromkeys(tokens))
 
 
+def _sanitized_token(token: str) -> str:
+    """Render a user-supplied token without escapes or invisible characters."""
+    cleaned = "".join(
+        character for character in strip_control_characters(token) if character.isprintable()
+    )
+    return cleaned or "?"
+
+
+def _render_tokens(tokens: list[str]) -> str:
+    """Bound and sanitize the tokens echoed into an error message."""
+    rendered = ", ".join(_sanitized_token(token) for token in tokens[:_MAX_REPORTED_TOKENS])
+    hidden = len(tokens) - _MAX_REPORTED_TOKENS
+    if hidden > 0:
+        rendered = f"{rendered} (+{hidden} more)"
+    return rendered
+
+
 def _validate_symbols(registry: SymbolRegistry, symbols: tuple[str, ...]) -> None:
+    invalid = [symbol for symbol in symbols if _WATCHLIST_SYMBOL_PATTERN.fullmatch(symbol) is None]
+    if invalid:
+        message = (
+            f"invalid watchlist symbol(s): {_render_tokens(invalid)}; "
+            "symbols must be 2-24 uppercase letters or digits"
+        )
+        raise SettingValidationError(
+            message,
+            details=[
+                {"field": "watchlist", "code": "invalid_symbol", "message": message},
+            ],
+        )
     unknown = [symbol for symbol in symbols if registry.get_symbol(symbol) is None]
     if unknown:
         message = (
-            f"unknown watchlist symbol(s): {', '.join(unknown)}; "
+            f"unknown watchlist symbol(s): {_render_tokens(unknown)}; "
             "star only symbols that exist in the registry"
         )
         raise SettingValidationError(
@@ -454,7 +500,7 @@ def _run_interactive(
     progress = service.read_onboarding_progress()
     if progress.all_complete:
         _print_deferred_steps()
-        _print_summary(container, service, secrets, budget_service)
+        _print_summary(container, service, secrets, budget_service, settings)
         return
     if options.resume:
         typer.echo(f"Resuming at step {progress.resumed_step}/5; completed steps are persisted.")
@@ -470,7 +516,7 @@ def _run_interactive(
         elif step == 5:
             _step_watchlist_interactive(container, service, budget_service)
     _print_deferred_steps()
-    _print_summary(container, service, secrets, budget_service)
+    _print_summary(container, service, secrets, budget_service, settings)
 
 
 # -- non-interactive path ----------------------------------------------------
@@ -496,7 +542,11 @@ def _plan_non_interactive(
     if 2 in incomplete:
         provider = validate_provider(options.llm_provider)
         if provider is None:
-            missing.append("--llm-provider")
+            # A key injected through OFT_*_API_KEY already satisfies the step;
+            # init then just points the active provider at it.
+            configured = any(status.configured for status in secrets.list_statuses())
+            if options.llm_provider is not None or not configured:
+                missing.append("--llm-provider")
         elif not secrets.status(provider).configured and not options.llm_key_stdin:
             missing.append("--llm-key-stdin")
 
@@ -539,7 +589,7 @@ def _run_non_interactive(
     progress = service.read_onboarding_progress()
     if progress.all_complete:
         _print_deferred_steps()
-        _print_summary(container, service, secrets, budget_service)
+        _print_summary(container, service, secrets, budget_service, settings)
         return
 
     plan = _plan_non_interactive(container, service, secrets, budget_service, options)
@@ -553,9 +603,9 @@ def _run_non_interactive(
     # Validation finished above; now apply prerequisites, then progress.
     if 2 in plan.incomplete:
         provider = plan.provider
-        if provider is None:  # planning guarantees this; never use assert for control flow
-            raise _MissingFlags(["--llm-provider"])
-        if plan.key_stdin:
+        # ``provider`` is None when an already-configured key is reused; the
+        # active provider is selected below without reading stdin.
+        if provider is not None and plan.key_stdin:
             key = _read_secret_key()
             secrets.set_key(provider, key, actor="cli")
             typer.echo(f"  {provider} key stored {_key_label(secrets.status(provider))}")
@@ -567,13 +617,45 @@ def _run_non_interactive(
         _apply_budget(budget_service, plan.budget, now=utc_timestamp(container.clock.now()))
     for step in plan.incomplete:
         service.complete_onboarding_step(step, actor="cli")
-    _print_summary(container, service, secrets, budget_service)
+    _print_summary(container, service, secrets, budget_service, settings)
 
 
 # -- entry point -------------------------------------------------------------
 
 
+def _supplied_non_interactive_flags(options: _InitOptions) -> list[str]:
+    """Flags the interactive wizard cannot honor; reject rather than ignore them."""
+    candidates = (
+        ("--llm-provider", options.llm_provider is not None),
+        ("--llm-key-stdin", options.llm_key_stdin),
+        ("--watchlist", options.watchlist is not None),
+        ("--scan-period", options.scan_period is not None),
+        ("--budget-daily", options.budget_daily is not None),
+        ("--budget-weekly", options.budget_weekly is not None),
+        ("--budget-monthly", options.budget_monthly is not None),
+    )
+    return [flag for flag, supplied in candidates if supplied]
+
+
 def _run(options: _InitOptions) -> None:
+    if not options.non_interactive:
+        supplied = _supplied_non_interactive_flags(options)
+        if supplied:
+            emit_error(
+                "VALIDATION_FAILED",
+                "these flags require --non-interactive: " + ", ".join(supplied),
+                json_output=False,
+            )
+            raise typer.Exit(code=2)
+
+    if options.non_interactive and options.llm_key_stdin and options.llm_provider is None:
+        # A configured key can satisfy step 2 without naming a provider, but a
+        # key supplied on stdin cannot be attributed to one: reject it rather
+        # than silently dropping a user-supplied secret before any read/write.
+        raise SettingValidationError(
+            "--llm-key-stdin requires --llm-provider: the key cannot be attributed to a provider"
+        )
+
     if not options.non_interactive and not _stdin_is_tty():
         emit_error(
             "VALIDATION_FAILED",
@@ -584,7 +666,14 @@ def _run(options: _InitOptions) -> None:
         raise typer.Exit(code=2)
 
     settings = load_settings()
-    container = build_container(settings, initialize=True)
+    _warn_if_live(settings)
+    try:
+        container = build_container(settings, initialize=True)
+    except OSError as exc:
+        raise OSError(
+            f"cannot create or use the data directory {settings.data_dir}; "
+            "check the path and its permissions, then run `oft doctor`"
+        ) from exc
     base = container.llm_base_settings or settings
     service = SettingsService(store=container.store, clock=container.clock, settings=base)
     secrets = SecretsService(store=container.store, settings=base, clock=container.clock)
@@ -625,34 +714,47 @@ def init_command(
         str | None,
         typer.Option(
             "--llm-provider",
-            help="openai|anthropic|deepseek; required when step 2 is incomplete.",
+            help=(
+                "openai|anthropic|deepseek; --non-interactive only; required when "
+                "step 2 is incomplete and no provider key is configured."
+            ),
         ),
     ] = None,
     llm_key_stdin: Annotated[
         bool,
         typer.Option(
             "--llm-key-stdin",
-            help="Read the provider key from stdin; a key is never accepted on argv.",
+            help=(
+                "Read the provider key from stdin; --non-interactive only; a key "
+                "is never accepted on argv."
+            ),
         ),
     ] = False,
     watchlist: Annotated[
         str | None,
         typer.Option(
             "--watchlist",
-            help="SYMBOL[,SYMBOL...] to star; required when no symbol is starred.",
+            help=(
+                "SYMBOL[,SYMBOL...] to star; --non-interactive only; required when "
+                "no symbol is starred."
+            ),
         ),
     ] = None,
     scan_period: Annotated[
-        str | None, typer.Option("--scan-period", help="Scan period: 4h or 8h.")
+        str | None,
+        typer.Option("--scan-period", help="Scan period: 4h or 8h; --non-interactive only."),
     ] = None,
     budget_daily: Annotated[
-        str | None, typer.Option("--budget-daily", help="Daily USD threshold.")
+        str | None,
+        typer.Option("--budget-daily", help="Daily USD threshold; --non-interactive only."),
     ] = None,
     budget_weekly: Annotated[
-        str | None, typer.Option("--budget-weekly", help="Weekly USD threshold.")
+        str | None,
+        typer.Option("--budget-weekly", help="Weekly USD threshold; --non-interactive only."),
     ] = None,
     budget_monthly: Annotated[
-        str | None, typer.Option("--budget-monthly", help="Monthly USD threshold.")
+        str | None,
+        typer.Option("--budget-monthly", help="Monthly USD threshold; --non-interactive only."),
     ] = None,
 ) -> None:
     """Paper-only first-run onboarding; steps 3 and 4 are deferred."""
@@ -693,6 +795,27 @@ def init_command(
     except ConfigError as exc:
         emit_error("CONFIG_INVALID", exc.message, json_output=False)
         raise typer.Exit(code=5) from exc
+    except StoreUnavailableError as exc:
+        emit_error("DATA_UNAVAILABLE", exc.message, json_output=False)
+        raise typer.Exit(code=1) from exc
+    except SymbolRegistryError as exc:
+        emit_error(exc.code, exc.message, json_output=False)
+        raise typer.Exit(code=1) from exc
+    except OSError as exc:
+        emit_error(
+            "CONFIG_INVALID",
+            str(exc) or "cannot use the data directory; run `oft doctor`",
+            json_output=False,
+        )
+        raise typer.Exit(code=5) from exc
+    except Exception as exc:
+        # Never leak a raw exception: its message may contain a secret.
+        emit_error(
+            "INTERNAL_ERROR",
+            "unexpected error while running `oft init`; run `oft doctor`",
+            json_output=False,
+        )
+        raise typer.Exit(code=1) from exc
 
 
 __all__ = ["init_command"]

@@ -111,7 +111,7 @@ def test_fresh_interactive_run_walks_steps_and_persists_progress(
     assert "1/5 " in result.stdout
     assert "data directory" in result.stdout
     assert "2/5 LLM providers" in result.stdout
-    assert "PAPER" in result.stdout
+    assert "environment     test" in result.stdout
     assert "Milestone 5" in result.output
     assert "Milestone 6" in result.output
     assert _progress(settings) == [1, 2, 5]
@@ -148,7 +148,7 @@ def test_resume_with_all_active_steps_complete_prints_the_review(
 
     assert result.exit_code == 0, result.output
     assert "Completed steps: 1, 2, 5" in result.stdout
-    assert "PAPER" in result.stdout
+    assert "Environment: test." in result.stdout
     assert "Live is not offered" in result.stdout
     assert _progress(settings) == [1, 2, 5]
 
@@ -312,3 +312,32 @@ def test_malformed_interactive_budget_exits_2_before_step_5_writes(
     assert store.get_config("scan.period") is None
     container, _ = _service(settings)
     assert container.symbol_registry.list_starred() == ()
+
+
+def test_scan_period_flag_without_non_interactive_exits_2_and_writes_nothing(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    _configure(monkeypatch, tmp_path)
+    _as_tty(monkeypatch)
+
+    result = CliRunner().invoke(app, ["init", "--scan-period", "8h"])
+
+    assert result.exit_code == 2, result.output
+    assert "--non-interactive" in result.output
+    assert "--scan-period" in result.output
+    # The usage error is raised before settings load, so no data dir is created.
+    assert not (tmp_path / "data").exists()
+
+
+def test_watchlist_flag_without_non_interactive_exits_2_and_writes_nothing(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    _configure(monkeypatch, tmp_path)
+    _as_tty(monkeypatch)
+
+    result = CliRunner().invoke(app, ["init", "--watchlist", "BTCUSDT"])
+
+    assert result.exit_code == 2, result.output
+    assert "--non-interactive" in result.output
+    assert "--watchlist" in result.output
+    assert not (tmp_path / "data").exists()

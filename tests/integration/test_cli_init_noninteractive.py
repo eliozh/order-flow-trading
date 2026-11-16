@@ -20,10 +20,12 @@ from oft.application.settings_service import SettingsService
 from oft.bootstrap import build_container
 from oft.cli.commands import init as init_module
 from oft.cli.main import app
-from oft.config import ConfigError, Settings
+from oft.config import ConfigError, Settings, load_settings
 from oft.domain.llm_settings import MAX_API_KEY_LENGTH
+from oft.ports.store import StoreUnavailableError
 
 SENTINEL = "sk-init-stdin-SENTINEL-9b71"
+ROTATED_SENTINEL = "sk-init-rotated-SENTINEL-2e18"
 
 
 class _MemoryBackend:
@@ -97,6 +99,25 @@ def _run(arguments: list[str], *, input_text: str | None = None):
     return CliRunner().invoke(app, ["init", "--non-interactive", *arguments], input=input_text)
 
 
+def _capture_errors(monkeypatch: pytest.MonkeyPatch) -> list[tuple[str, str]]:
+    """Record every ``emit_error`` code/message pair while still printing it."""
+    calls: list[tuple[str, str]] = []
+    real_emit_error = init_module.emit_error
+
+    def _spy(
+        code: str,
+        message: str,
+        *,
+        json_output: bool,
+        details: list[dict[str, Any]] | None = None,
+    ) -> None:
+        calls.append((code, message))
+        real_emit_error(code, message, json_output=json_output, details=details)
+
+    monkeypatch.setattr(init_module, "emit_error", _spy)
+    return calls
+
+
 def test_all_flags_succeed_without_prompts_and_persist_everything(
     monkeypatch: pytest.MonkeyPatch, tmp_path: Path
 ) -> None:
@@ -133,7 +154,8 @@ def test_all_flags_succeed_without_prompts_and_persist_everything(
 def test_a_missing_llm_provider_exits_2_and_writes_no_progress(
     monkeypatch: pytest.MonkeyPatch, tmp_path: Path
 ) -> None:
-    settings, _ = _configure(monkeypatch, tmp_path)
+    # No provider key in the environment: the flag is genuinely required.
+    settings, _ = _configure(monkeypatch, tmp_path, with_key=False)
 
     result = _run(["--watchlist", "BTCUSDT"])
 
@@ -169,7 +191,7 @@ def test_a_missing_watchlist_exits_2_when_nothing_is_starred(
 def test_every_missing_flag_is_named_and_no_step_is_marked_complete(
     monkeypatch: pytest.MonkeyPatch, tmp_path: Path
 ) -> None:
-    settings, _ = _configure(monkeypatch, tmp_path)
+    settings, _ = _configure(monkeypatch, tmp_path, with_key=False)
 
     result = _run([])
 
@@ -235,7 +257,7 @@ def test_deferred_steps_are_explicit_and_do_not_block_a_paper_finish(
     assert result.exit_code == 0, result.output
     assert "Milestone 5" in result.stdout
     assert "Milestone 6" in result.stdout
-    assert "PAPER" in result.stdout
+    assert "Environment: test." in result.stdout
     assert "Live is not offered" in result.stdout
 
 
@@ -439,3 +461,181 @@ def test_all_complete_non_interactive_resume_needs_no_flags(
     assert result.exit_code == 0, result.output
     assert "Completed steps: 1, 2, 5" in result.stdout
     assert _progress(settings) == [1, 2, 5]
+
+
+def test_a_configured_env_key_satisfies_the_llm_prerequisite(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """No --llm-provider is required when a provider key is already configured."""
+    settings, _ = _configure(monkeypatch, tmp_path)
+    # Keep only the key in the environment: the provider is selected by init.
+    monkeypatch.delenv("OFT_LLM_PROVIDER", raising=False)
+
+    result = _run(["--watchlist", "BTCUSDT"])
+
+    assert result.exit_code == 0, result.output
+    assert _progress(settings) == [1, 2, 5]
+    _container, service = _service(load_settings())
+    assert service.read_effective_llm().provider == "openai"
+
+
+def test_llm_key_stdin_without_a_provider_exits_2_before_reading_stdin(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """An unattributable key is rejected rather than silently dropped."""
+    settings, backend = _configure(monkeypatch, tmp_path)
+    # Only the env key is configured: no provider is named by flag or env.
+    monkeypatch.delenv("OFT_LLM_PROVIDER", raising=False)
+
+    def _unexpected_read() -> str:
+        raise AssertionError("stdin must not be read")
+
+    monkeypatch.setattr(init_module, "_read_secret_key", _unexpected_read)
+    calls = _capture_errors(monkeypatch)
+
+    result = _run(
+        ["--llm-key-stdin", "--watchlist", "BTCUSDT"],
+        input_text=f"{ROTATED_SENTINEL}\n",
+    )
+
+    assert result.exit_code == 2, result.output
+    assert "requires --llm-provider" in result.output
+    assert ROTATED_SENTINEL not in result.output
+    # The usage error precedes settings load, so nothing was written at all.
+    assert calls[-1][0] == "VALIDATION_FAILED"
+    assert backend.values == {}
+    assert not settings.data_dir.exists()
+
+
+def test_a_named_provider_with_llm_key_stdin_rotates_the_key(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    settings, backend = _configure(monkeypatch, tmp_path)
+
+    result = _run(
+        ["--llm-provider", "openai", "--llm-key-stdin", "--watchlist", "BTCUSDT"],
+        input_text=f"{ROTATED_SENTINEL}\n",
+    )
+
+    assert result.exit_code == 0, result.output
+    assert ROTATED_SENTINEL not in result.output
+    assert backend.values["llm.openai.api_key"] == ROTATED_SENTINEL
+    assert _progress(settings) == [1, 2, 5]
+
+
+def test_a_live_environment_is_reported_and_warned_about(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    _configure(monkeypatch, tmp_path)
+    monkeypatch.setenv("OFT_ENV", "live")
+
+    result = _run(["--llm-provider", "openai", "--watchlist", "BTCUSDT"])
+
+    assert result.exit_code == 0, result.output
+    assert "environment     live" in result.stdout
+    assert "Environment: live." in result.stdout
+    assert "PAPER" not in result.stdout
+    assert "no Live configuration is written" in result.output
+
+
+def test_a_data_dir_under_a_file_exits_5_without_a_traceback(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    _configure(monkeypatch, tmp_path)
+    blocker = tmp_path / "blocker"
+    blocker.write_text("not a directory")
+    data_dir = blocker / "data"
+    monkeypatch.setenv("OFT_DATA", str(data_dir))
+    calls = _capture_errors(monkeypatch)
+
+    result = _run(["--llm-provider", "openai", "--watchlist", "BTCUSDT"])
+
+    assert result.exit_code == 5, result.output
+    assert "Traceback" not in result.output
+    assert str(data_dir) in result.output
+    assert "oft doctor" in result.output
+    assert calls[-1][0] == "CONFIG_INVALID"
+
+
+def test_a_corrupt_database_exits_1_without_a_traceback(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    settings, _ = _configure(monkeypatch, tmp_path)
+    settings.data_dir.mkdir(parents=True)
+    (settings.data_dir / "oft.db").write_bytes(b"not a sqlite database")
+    calls = _capture_errors(monkeypatch)
+
+    result = _run(["--llm-provider", "openai", "--watchlist", "BTCUSDT"])
+
+    assert result.exit_code == 1, result.output
+    assert "Traceback" not in result.output
+    assert "oft.db" in result.output
+    assert "oft doctor" in result.output
+    assert calls[-1][0] == "DATA_UNAVAILABLE"
+
+
+def test_a_malformed_exchange_info_fixture_exits_1_typed(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    _configure(monkeypatch, tmp_path)
+    fixture = tmp_path / "exchange-info.json"
+    fixture.write_text('{"symbols": "not-an-array"}')
+    monkeypatch.setenv("OFT_EXCHANGE_INFO_FIXTURE", str(fixture))
+    calls = _capture_errors(monkeypatch)
+
+    result = _run(["--llm-provider", "openai", "--watchlist", "BTCUSDT"])
+
+    assert result.exit_code == 1, result.output
+    assert "Traceback" not in result.output
+    assert "exchangeInfo" in result.output
+    # ExchangeInfoParseError carries its own stable code.
+    assert calls[-1][0] == "SCHEMA_INVALID"
+
+
+def test_a_store_unavailable_error_exits_1_typed(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    _configure(monkeypatch, tmp_path)
+
+    def _unavailable(_self: SqliteStore, _symbol: str) -> None:
+        raise StoreUnavailableError("store read failed")
+
+    monkeypatch.setattr(SqliteStore, "get_symbol", _unavailable)
+    calls = _capture_errors(monkeypatch)
+
+    result = _run(["--llm-provider", "openai", "--watchlist", "BTCUSDT"])
+
+    assert result.exit_code == 1, result.output
+    assert "Traceback" not in result.output
+    assert calls[-1] == ("DATA_UNAVAILABLE", "store read failed")
+
+
+def test_an_ansi_watchlist_token_is_sanitized_and_writes_nothing(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    settings, _ = _configure(monkeypatch, tmp_path)
+    payload = "\x1b]0;pwned\x07BTCUSDT"
+
+    result = _run(["--llm-provider", "openai", "--watchlist", payload])
+
+    assert result.exit_code == 2, result.output
+    combined = result.stdout + result.output
+    assert "\x1b" not in combined
+    assert "\x07" not in combined
+    assert payload not in combined
+    assert _progress(settings) == []
+    container, _ = _service(settings)
+    assert container.symbol_registry.list_starred() == ()
+
+
+def test_the_watchlist_error_caps_the_reported_tokens(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    _configure(monkeypatch, tmp_path)
+    payload = ",".join(f"bad-symbol-{index}" for index in range(12))
+
+    result = _run(["--llm-provider", "openai", "--watchlist", payload])
+
+    assert result.exit_code == 2, result.output
+    assert "(+2 more)" in result.output
+    assert "bad-symbol-11" not in result.output
