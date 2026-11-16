@@ -10,12 +10,14 @@ the marker omission rules) are exercised without a database.
 from __future__ import annotations
 
 import json
-from collections.abc import Sequence
+from collections.abc import Mapping, Sequence
 from dataclasses import replace
+from types import SimpleNamespace
 from typing import Any
 
 import pytest
 
+from oft.api.routes.reports import read_report_chart
 from oft.application.chart_service import derive_overlays, resolve_chart
 from oft.ports.store import (
     OpportunityRecord,
@@ -131,8 +133,30 @@ def _position(
     )
 
 
+def _payload(record_json: str) -> Mapping[str, Any] | None:
+    """Mirror the adapter's defensive JSON read: corrupt rows are skipped."""
+    try:
+        payload = json.loads(record_json)
+    except (TypeError, ValueError, RecursionError):
+        return None
+    return payload if isinstance(payload, Mapping) else None
+
+
+def _opportunity_report_id(record: OpportunityRecord) -> Any:
+    payload = _payload(record.payload_json)
+    if payload is None:
+        return None
+    source = payload.get("source")
+    return source.get("report_id") if isinstance(source, Mapping) else None
+
+
 class FakeStore:
-    """The bounded reads ``derive_overlays`` performs, plus a MISSING chart read."""
+    """The scoped reads ``derive_overlays`` performs, plus a MISSING chart read.
+
+    ``list_opportunities``/``list_positions`` honour the same optional
+    ``symbol``/``report_id`` filters the SQLite adapter applies, including the
+    position linkage through trigger -> opportunity -> report.
+    """
 
     def __init__(
         self,
@@ -148,20 +172,59 @@ class FakeStore:
         self.headers = tuple(headers)
 
     def list_opportunities(
-        self, *, state: str | None = None, limit: int = 100, offset: int = 0
+        self,
+        *,
+        state: str | None = None,
+        symbol: str | None = None,
+        report_id: str | None = None,
+        limit: int = 100,
+        offset: int = 0,
     ) -> tuple[OpportunityRecord, ...]:
-        return self.opportunities[:limit]
+        rows = list(self.opportunities)
+        if state is not None:
+            rows = [record for record in rows if record.state == state]
+        if symbol is not None:
+            rows = [record for record in rows if record.symbol == symbol]
+        if report_id is not None:
+            rows = [record for record in rows if _opportunity_report_id(record) == report_id]
+        return tuple(rows[offset : offset + limit])
 
     def list_positions(
-        self, *, state: str | None = None, limit: int | None = 100, offset: int = 0
+        self,
+        *,
+        state: str | None = None,
+        symbol: str | None = None,
+        report_id: str | None = None,
+        limit: int | None = 100,
+        offset: int = 0,
     ) -> tuple[PositionRecord, ...]:
-        rows = self.positions
-        if limit is not None:
-            rows = rows[:limit]
-        return rows
+        rows = list(self.positions)
+        if state is not None:
+            rows = [record for record in rows if record.state == state]
+        if symbol is not None:
+            rows = [record for record in rows if record.symbol == symbol]
+        if report_id is not None:
+            linked_ids = {
+                record.opportunity_id
+                for record in self.opportunities
+                if _opportunity_report_id(record) == report_id
+            }
+            trigger_opportunities = {
+                trigger.trigger_id: trigger.opportunity_id for trigger in self.triggers.values()
+            }
 
-    def get_trigger_event(self, trigger_id: str) -> TriggerEventRecord | None:
-        return self.triggers.get(trigger_id)
+            def linked(record: PositionRecord) -> bool:
+                payload = _payload(record.payload_json)
+                if payload is None:
+                    return False
+                trigger_id = payload.get("source_trigger_id")
+                if not isinstance(trigger_id, str) or not trigger_id:
+                    return False
+                return trigger_opportunities.get(trigger_id) in linked_ids
+
+            rows = [record for record in rows if linked(record)]
+        rows = rows[offset : offset + limit] if limit is not None else rows[offset:]
+        return tuple(rows)
 
     def get_opportunity(self, opportunity_id: str) -> OpportunityRecord | None:
         return next(
@@ -194,7 +257,7 @@ def _markers(kind: str, markers: list[dict[str, Any]]) -> list[dict[str, Any]]:
 def test_triggered_long_zone_keeps_prices_verbatim_and_triggers_at_zone_high() -> None:
     store = FakeStore(opportunities=[_opportunity(side="LONG", low="69000.123", high="71000.456")])
 
-    zones, _ = _overlays(store)
+    zones, _, _ = _overlays(store)
 
     assert len(zones) == 1
     zone = zones[0]
@@ -210,7 +273,7 @@ def test_triggered_long_zone_keeps_prices_verbatim_and_triggers_at_zone_high() -
 def test_short_zone_triggers_at_zone_low_verbatim() -> None:
     store = FakeStore(opportunities=[_opportunity(side="SHORT", low="69000.123", high="71000.456")])
 
-    zones, _ = _overlays(store)
+    zones, _, _ = _overlays(store)
 
     assert zones[0]["side"] == "SHORT"
     assert zones[0]["trigger_price"] == "69000.123"
@@ -220,7 +283,7 @@ def test_short_zone_triggers_at_zone_low_verbatim() -> None:
 def test_opportunity_state_passes_through_unchanged(state: str) -> None:
     store = FakeStore(opportunities=[_opportunity(state=state)])
 
-    zones, _ = _overlays(store)
+    zones, _, _ = _overlays(store)
 
     assert zones[0]["state"] == state
 
@@ -236,7 +299,7 @@ def test_unknown_side_and_corrupt_payloads_are_skipped() -> None:
         ]
     )
 
-    zones, markers = _overlays(store)
+    zones, markers, _ = _overlays(store)
 
     assert [zone["opportunity_id"] for zone in zones] == ["OPP-LONG"]
     assert markers == []
@@ -251,7 +314,7 @@ def test_opportunity_for_another_report_or_symbol_is_skipped() -> None:
         ]
     )
 
-    zones, _ = _overlays(store)
+    zones, _, _ = _overlays(store)
 
     assert [zone["opportunity_id"] for zone in zones] == ["OPP-LINKED"]
 
@@ -260,7 +323,7 @@ def test_label_is_bounded_to_80_characters() -> None:
     long_id = "OPP-" + "9" * 120
     store = FakeStore(opportunities=[_opportunity(long_id)])
 
-    zones, _ = _overlays(store)
+    zones, _, _ = _overlays(store)
 
     assert len(zones[0]["label"]) == 80
     assert zones[0]["label"].startswith("OPP-999")
@@ -270,7 +333,7 @@ def test_label_carries_untrusted_text_verbatim_without_markup() -> None:
     hostile = '<img src=x onerror="alert(1)">'
     store = FakeStore(opportunities=[_opportunity(hostile)])
 
-    zones, _ = _overlays(store)
+    zones, _, _ = _overlays(store)
 
     label = zones[0]["label"]
     assert label.startswith(hostile)
@@ -282,7 +345,7 @@ def test_label_carries_untrusted_text_verbatim_without_markup() -> None:
 def test_label_omits_confidence_when_it_is_not_numeric() -> None:
     store = FakeStore(opportunities=[_opportunity(confidence="high")])
 
-    zones, _ = _overlays(store)
+    zones, _, _ = _overlays(store)
 
     assert zones[0]["label"] == "OPP-1 · LONG"
 
@@ -302,7 +365,7 @@ def test_zone_with_corrupt_bounds_is_skipped_not_advertised(low: Any, high: Any,
     """A non-positive or unparseable bound skips the zone, like a marker price."""
     store = FakeStore(opportunities=[_opportunity(low=low, high=high, side=side)])
 
-    zones, _ = _overlays(store)
+    zones, _, _ = _overlays(store)
 
     assert zones == []
 
@@ -318,7 +381,7 @@ def test_deeply_nested_opportunity_payload_is_skipped() -> None:
         opportunities=[_opportunity("OPP-DEEP", payload_override=_DEEP_JSON)],
     )
 
-    zones, markers = _overlays(store)
+    zones, markers, _ = _overlays(store)
 
     assert zones == []
     assert markers == []
@@ -331,7 +394,7 @@ def test_deeply_nested_position_payload_is_skipped() -> None:
         triggers=[_trigger()],
     )
 
-    _, markers = _overlays(store)
+    _, markers, _ = _overlays(store)
 
     assert markers == []
 
@@ -358,7 +421,7 @@ def test_markers_keep_exact_prices_and_carry_the_position_id() -> None:
         triggers=[_trigger()],
     )
 
-    _, markers = _overlays(store)
+    _, markers, _ = _overlays(store)
 
     entry = _markers("entry", markers)[0]
     stop = _markers("stop", markers)[0]
@@ -379,7 +442,7 @@ def test_closed_position_adds_an_exit_marker() -> None:
         triggers=[_trigger()],
     )
 
-    _, markers = _overlays(store)
+    _, markers, _ = _overlays(store)
 
     exit_marker = _markers("exit", markers)[0]
     assert exit_marker["price"] == "70500.00"
@@ -396,7 +459,7 @@ def test_missing_zero_or_unparseable_stop_is_omitted_not_placed_at_zero(
         triggers=[_trigger()],
     )
 
-    _, markers = _overlays(store)
+    _, markers, _ = _overlays(store)
 
     assert _markers("stop", markers) == []
     assert all(marker["price"] != "0" for marker in markers)
@@ -410,7 +473,7 @@ def test_missing_or_unparseable_entry_is_omitted(entry: Any) -> None:
         triggers=[_trigger()],
     )
 
-    _, markers = _overlays(store)
+    _, markers, _ = _overlays(store)
 
     assert _markers("entry", markers) == []
 
@@ -432,7 +495,7 @@ def test_entry_falls_back_to_entry_price_when_average_is_missing() -> None:
         triggers=[_trigger()],
     )
 
-    _, markers = _overlays(store)
+    _, markers, _ = _overlays(store)
 
     assert _markers("entry", markers)[0]["price"] == "70123.45"
 
@@ -453,7 +516,7 @@ def test_position_not_linked_to_the_report_is_omitted(
         triggers=[_trigger(trigger_id=trigger_id, opportunity_id=trigger_opportunity)],
     )
 
-    _, markers = _overlays(store)
+    _, markers, _ = _overlays(store)
 
     assert markers == []
 
@@ -465,7 +528,7 @@ def test_position_whose_trigger_row_is_missing_is_omitted() -> None:
         triggers=[],
     )
 
-    _, markers = _overlays(store)
+    _, markers, _ = _overlays(store)
 
     assert markers == []
 
@@ -477,7 +540,7 @@ def test_a_position_without_a_source_trigger_is_omitted() -> None:
         triggers=[_trigger()],
     )
 
-    _, markers = _overlays(store)
+    _, markers, _ = _overlays(store)
 
     assert markers == []
 
@@ -489,7 +552,7 @@ def test_each_target_price_expands_to_one_marker() -> None:
         triggers=[_trigger()],
     )
 
-    _, markers = _overlays(store)
+    _, markers, _ = _overlays(store)
 
     targets = _markers("target", markers)
     assert [marker["price"] for marker in targets] == ["72000.00", "73000.00", "74000.00"]
@@ -506,14 +569,14 @@ def test_duplicate_kind_and_price_markers_are_deduped() -> None:
         triggers=[_trigger("TRG-1"), _trigger("TRG-2")],
     )
 
-    _, markers = _overlays(store)
+    _, markers, _ = _overlays(store)
 
     keys = [(marker["kind"], marker["price"]) for marker in markers]
     assert len(keys) == len(set(keys))
     assert len(markers) == 3
 
 
-def test_markers_are_capped_at_40() -> None:
+def test_markers_are_capped_at_40_and_report_truncation() -> None:
     targets = tuple(f"{72000 + index}.00" for index in range(60))
     store = FakeStore(
         opportunities=[_opportunity()],
@@ -521,9 +584,28 @@ def test_markers_are_capped_at_40() -> None:
         triggers=[_trigger()],
     )
 
-    _, markers = _overlays(store)
+    _, markers, truncated = _overlays(store)
 
     assert len(markers) == 40
+    assert truncated is True
+
+
+def test_linked_read_over_the_bound_sets_truncated_and_slices_to_the_limit() -> None:
+    opportunities = [_opportunity(f"OPP-{index:03d}") for index in range(201)]
+    store = FakeStore(opportunities=opportunities)
+
+    zones, _, truncated = _overlays(store)
+
+    assert len(zones) == 200
+    assert truncated is True
+
+
+def test_linked_read_within_the_bound_is_not_truncated() -> None:
+    store = FakeStore(opportunities=[_opportunity()])
+
+    _, _, truncated = _overlays(store)
+
+    assert truncated is False
 
 
 def test_corrupt_position_payload_is_skipped() -> None:
@@ -533,7 +615,7 @@ def test_corrupt_position_payload_is_skipped() -> None:
         triggers=[_trigger()],
     )
 
-    _, markers = _overlays(store)
+    _, markers, _ = _overlays(store)
 
     assert markers == []
 
@@ -555,3 +637,45 @@ def test_missing_payload_returns_empty_overlays() -> None:
     assert payload["status"] == "MISSING"
     assert payload["zones"] == []
     assert payload["markers"] == []
+    assert payload["overlays_truncated"] is False
+
+
+class _MissingChartStore:
+    """A store whose overlay reads fail loudly if a MISSING chart asks for them."""
+
+    def __init__(self, report: ReportRecord) -> None:
+        self.report = report
+        self.overlay_reads = 0
+
+    def get_report(self, report_id: str) -> ReportRecord | None:
+        return self.report if report_id == self.report.report_id else None
+
+    def list_report_headers_for_symbol(self, symbol: str) -> tuple[ReportHeader, ...]:
+        return ()
+
+    def list_opportunities(self, **kwargs: Any) -> tuple[OpportunityRecord, ...]:
+        self.overlay_reads += 1
+        raise AssertionError("a MISSING chart must not read overlay opportunities")
+
+    def list_positions(self, **kwargs: Any) -> tuple[PositionRecord, ...]:
+        self.overlay_reads += 1
+        raise AssertionError("a MISSING chart must not read overlay positions")
+
+
+def _request_for(store: Any) -> Any:
+    return SimpleNamespace(
+        app=SimpleNamespace(state=SimpleNamespace(container=SimpleNamespace(store=store)))
+    )
+
+
+def test_missing_chart_never_derives_overlays() -> None:
+    store = _MissingChartStore(_report())
+
+    body = read_report_chart(_request_for(store), report_id=REPORT_ID, period="15m")
+
+    data = body["data"]
+    assert data["status"] == "MISSING"
+    assert data["zones"] == []
+    assert data["markers"] == []
+    assert data["overlays_truncated"] is False
+    assert store.overlay_reads == 0

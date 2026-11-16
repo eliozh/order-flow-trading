@@ -108,8 +108,17 @@ def read_report_chart(
             f"period must be one of {allowed}; got {requested!r}.",
         )
     store = request.app.state.container.store
-    zones, markers = derive_overlays(record, store)
-    payload = resolve_chart(record, requested, store, zones=zones, markers=markers)
+    # Resolve first: a MISSING chart draws no series, so it must not read (or
+    # announce) overlays that cannot be drawn.
+    payload = resolve_chart(record, requested, store)
+    if payload["status"] == "AVAILABLE":
+        zones, markers, truncated = derive_overlays(record, store)
+        payload = {
+            **payload,
+            "zones": zones,
+            "markers": markers,
+            "overlays_truncated": truncated,
+        }
     generated_at = payload["generated_at"] or record.generated_at
     return success_envelope(
         payload,

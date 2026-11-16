@@ -27,12 +27,19 @@ costs none because the requested report is already loaded by the route.
 
 Overlays are also server-derived, never client-inferred
 --------------------------------------------------------
-``derive_overlays`` reads at most 200 newest opportunities and 200 newest
-positions, keeps only rows linked to the route's report (the report whose panel
-is open), and projects the stored zone bounds, trigger, state, and position
-prices verbatim. Switching the timeframe changes only the drawn series: the
-overlays always come from the route's report, so a switch can never invent a
-zone or marker for another period.
+``derive_overlays`` has the store scope each linked read to the route's report
+(``symbol`` plus ``source.report_id``; positions through their trigger
+linkage). Each query asks SQL for ``_OVERLAY_READ_LIMIT + 1`` rows so an
+over-bound result is detected, then is sliced back to ``_OVERLAY_READ_LIMIT``.
+It re-checks the opportunity symbol/report linkage in Python and re-verifies
+each position's symbol and trigger id (the trigger -> opportunity -> report
+chain is enforced by the scoped join). It projects the stored zone bounds,
+trigger, state, and position prices verbatim, and ``_MAX_MARKERS`` caps the
+marker list. Both bounds are reported through the payload's
+``overlays_truncated`` flag, so a clipped list is never presented as complete.
+Switching the timeframe changes only the drawn series: the overlays always come
+from the route's report, so a switch can never invent a zone or marker for
+another period.
 """
 
 from __future__ import annotations
@@ -47,7 +54,8 @@ from oft.ports.store import OpportunityRecord, ReportHeader, ReportRecord, Store
 #: Periods the timeframe switch may offer beyond the report's native period.
 SUPPORTED_CHART_PERIODS: tuple[str, ...] = ("15m", "1h", "4h")
 
-#: Bound on the overlay ledger reads (both opportunities and positions).
+#: Bound on the overlay rows considered (each query fetches one extra row to
+#: detect truncation).
 _OVERLAY_READ_LIMIT = 200
 #: Bound on the marker list; a chart never draws an unbounded marker set.
 _MAX_MARKERS = 40
@@ -263,26 +271,40 @@ def _marker(kind: _MarkerKind, price: str, position_id: str | None) -> dict[str,
 
 def derive_overlays(
     report: ReportRecord, store: StorePort
-) -> tuple[list[dict[str, Any]], list[dict[str, Any]]]:
+) -> tuple[list[dict[str, Any]], list[dict[str, Any]], bool]:
     """The report's linked opportunity zones and position markers.
 
-    Bounded: at most ``_OVERLAY_READ_LIMIT`` newest opportunities and positions
-    are read, one ``get_trigger_event`` point read per linked position, and the
-    marker list is capped at ``_MAX_MARKERS``. A row whose stored JSON is
-    unreadable is skipped rather than failing the chart.
+    Bounds, all reported through the third return value:
+
+    * each linked read fetches ``_OVERLAY_READ_LIMIT + 1`` rows so an over-bound
+      result is detected, then is sliced back to ``_OVERLAY_READ_LIMIT``;
+    * the marker list is capped at ``_MAX_MARKERS``; a further unique marker is
+      dropped and counts as truncation.
+
+    The reads are scoped in SQL to the report's symbol and ``source.report_id``
+    (positions through trigger -> opportunity -> report), so newer rows for
+    other reports can never starve this report. The opportunity symbol/report
+    linkage is re-checked in Python; each position's symbol and trigger id are
+    re-verified, while its trigger -> opportunity -> report chain is enforced by
+    the scoped join. A row whose stored JSON is unreadable is skipped rather
+    than failing the chart.
     """
-    linked_ids: set[str] = set()
+    opportunity_rows = store.list_opportunities(
+        symbol=report.symbol,
+        report_id=report.report_id,
+        limit=_OVERLAY_READ_LIMIT + 1,
+    )
+    truncated = len(opportunity_rows) > _OVERLAY_READ_LIMIT
     zones: list[dict[str, Any]] = []
-    for record in store.list_opportunities(limit=_OVERLAY_READ_LIMIT):
+    for record in opportunity_rows[:_OVERLAY_READ_LIMIT]:
         payload = _payload_object(record.payload_json)
         if payload is None:
             continue
-        if payload.get("symbol") != report.symbol:
+        if record.symbol != report.symbol or payload.get("symbol") != report.symbol:
             continue
         source = payload.get("source")
         if not isinstance(source, Mapping) or source.get("report_id") != report.report_id:
             continue
-        linked_ids.add(record.opportunity_id)
         zone = _zone_payload(record, payload)
         if zone is not None:
             zones.append(zone)
@@ -290,28 +312,34 @@ def derive_overlays(
     markers: list[dict[str, Any]] = []
     seen: set[tuple[str, str]] = set()
 
-    def add(kind: _MarkerKind, raw_price: Any, position_id: str | None) -> bool:
+    def add(kind: _MarkerKind, raw_price: Any, position_id: str | None) -> None:
+        nonlocal truncated
         price = _price_text(raw_price)
         if price is None:
-            return True
+            return
         key = (kind, price)
         if key in seen:
-            return True
+            return
         seen.add(key)
+        if len(markers) >= _MAX_MARKERS:
+            truncated = True
+            return
         markers.append(_marker(kind, price, position_id))
-        return len(markers) < _MAX_MARKERS
 
-    for position_record in store.list_positions(limit=_OVERLAY_READ_LIMIT):
+    position_rows = store.list_positions(
+        symbol=report.symbol,
+        report_id=report.report_id,
+        limit=_OVERLAY_READ_LIMIT + 1,
+    )
+    truncated = truncated or len(position_rows) > _OVERLAY_READ_LIMIT
+    for position_record in position_rows[:_OVERLAY_READ_LIMIT]:
         payload = _payload_object(position_record.payload_json)
         if payload is None:
             continue
-        if payload.get("symbol") != report.symbol:
+        if position_record.symbol != report.symbol or payload.get("symbol") != report.symbol:
             continue
         trigger_id = payload.get("source_trigger_id")
         if not isinstance(trigger_id, str) or not trigger_id:
-            continue
-        trigger = store.get_trigger_event(trigger_id)
-        if trigger is None or trigger.opportunity_id not in linked_ids:
             continue
         position_id = position_record.position_id or payload.get("position_id")
         entry = payload.get("avg_entry_price")
@@ -326,10 +354,9 @@ def derive_overlays(
             candidates.extend(("target", target) for target in targets)
         candidates.append(("exit", payload.get("exit_price")))
         for kind, raw_price in candidates:
-            if not add(kind, raw_price, position_id):
-                return zones, markers
+            add(kind, raw_price, position_id)
 
-    return zones, markers
+    return zones, markers, truncated
 
 
 def _missing_payload(
@@ -354,6 +381,7 @@ def _missing_payload(
         "gaps": [],
         "zones": [],
         "markers": [],
+        "overlays_truncated": False,
         "data_quality": "MISSING",
         "quality_reasons": [],
         "reason": reason,
@@ -371,8 +399,10 @@ def resolve_chart(
     """Build the chart payload for ``requested_period`` without inventing data.
 
     ``zones``/``markers`` come from :func:`derive_overlays` for the route's
-    report. They are copied verbatim into an ``AVAILABLE`` payload; every
-    ``MISSING`` payload carries empty overlay lists because no series is drawn.
+    report. They are copied verbatim into an ``AVAILABLE`` payload (the route
+    overwrites them after resolving); every payload starts with
+    ``overlays_truncated`` False, and every ``MISSING`` payload keeps empty
+    overlay lists because no series and no overlays are drawn.
     """
     native_period = report.timeframe
     # One bounded projection read lists the newest report per timeframe; the
@@ -425,6 +455,7 @@ def resolve_chart(
         "gaps": gaps,
         "zones": [dict(zone) for zone in zones],
         "markers": [dict(marker) for marker in markers],
+        "overlays_truncated": False,
         "data_quality": source.data_quality,
         "quality_reasons": quality_reasons,
         "reason": None,

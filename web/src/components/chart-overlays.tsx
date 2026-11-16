@@ -71,6 +71,50 @@ export function gapBarIndices(bars: SnapshotBar[], gaps: DataGap[]): number[] {
 }
 
 /**
+ * True when the gap window sits strictly between two consecutive bars, e.g.
+ * 00:00-04:00 and 08:00-12:00 with a 04:00-08:00 gap. No present bar overlaps
+ * such a gap, so `overlapsGap` alone cannot see the missing window.
+ */
+function bracketsGap(before: SnapshotBar, after: SnapshotBar, gap: DataGap): boolean {
+  const beforeEnd = Date.parse(before.bar_end)
+  const afterStart = Date.parse(after.bar_start)
+  const gapStart = Date.parse(gap.start)
+  const gapEnd = Date.parse(gap.end)
+  if (![beforeEnd, afterStart, gapStart, gapEnd].every(Number.isFinite)) {
+    return false
+  }
+  return beforeEnd <= gapStart && gapEnd <= afterStart
+}
+
+/**
+ * Indices where a gap bracketed by consecutive bars breaks the series *before*
+ * that index. The two neighbouring bars are present, so they are never stamped
+ * MISSING; only the absent window between them is a break.
+ */
+export function gapBoundaryIndices(bars: SnapshotBar[], gaps: DataGap[]): number[] {
+  const indices: number[] = []
+  for (let index = 1; index < bars.length; index += 1) {
+    if (gaps.some((gap) => bracketsGap(bars[index - 1], bars[index], gap))) {
+      indices.push(index)
+    }
+  }
+  return indices
+}
+
+/**
+ * The first break-before index for a gap bracketed by two consecutive bars, or
+ * `null` when no such pair exists (for example, when a bar overlaps the gap).
+ */
+function boundaryIndexFor(bars: SnapshotBar[], gap: DataGap): number | null {
+  for (let index = 1; index < bars.length; index += 1) {
+    if (bracketsGap(bars[index - 1], bars[index], gap)) {
+      return index
+    }
+  }
+  return null
+}
+
+/**
  * Exact-token match over the server's free-text quality reasons. Substring
  * matching would let "not stale" or "staleness check skipped" mislabel every
  * bar as STALE; tokens are split on non-alphanumerics, uppercased, and a token
@@ -323,14 +367,16 @@ interface GapProps {
 }
 
 /**
- * Hatched break bands over the bars a server gap covers. A gap is a break in
- * the series, never a line interpolated across it.
+ * Hatched break marks for server gaps. A gap that covers present bars draws a
+ * band over those bars (`chart-gap-break`); a gap bracketed by consecutive bars
+ * draws a narrow hatched break at the boundary (`chart-gap-boundary`). Neither
+ * form is ever bridged by a CVD polyline.
  */
 export function ChartGapBands({ bars, gaps, xForIndex, slot, top, height, patternId }: GapProps) {
-  if (gaps.length === 0) {
+  if (gaps.length === 0 || bars.length === 0) {
     return null
   }
-  const groups = gaps
+  const overlapGroups = gaps
     .map((gap) => ({
       gap,
       indices: bars
@@ -338,12 +384,18 @@ export function ChartGapBands({ bars, gaps, xForIndex, slot, top, height, patter
         .filter((index) => index >= 0),
     }))
     .filter((group) => group.indices.length > 0)
-  if (groups.length === 0) {
+  const boundaryGroups = gaps.flatMap((gap) => {
+    const index = boundaryIndexFor(bars, gap)
+    return index === null ? [] : [{ gap, index }]
+  })
+  if (overlapGroups.length === 0 && boundaryGroups.length === 0) {
     return null
   }
+  const leftEdge = xForIndex(0) - slot / 2
+  const rightEdge = xForIndex(bars.length - 1) + slot / 2
   return (
     <g data-testid="chart-gaps">
-      {groups.map(({ gap, indices }) => {
+      {overlapGroups.map(({ gap, indices }) => {
         const first = indices[0]
         const last = indices[indices.length - 1]
         const x = xForIndex(first) - slot / 2
@@ -362,6 +414,34 @@ export function ChartGapBands({ bars, gaps, xForIndex, slot, top, height, patter
               fill={`url(#${patternId})`}
             />
             <text className="chart-gap-label" x={x + 4} y={top + 12}>
+              {gapLabelText(gap)}
+            </text>
+          </g>
+        )
+      })}
+      {boundaryGroups.map(({ gap, index }) => {
+        const boundaryX = (xForIndex(index - 1) + xForIndex(index)) / 2
+        const markWidth = Math.max(slot * 0.18, 3)
+        const nearRight = boundaryX > (leftEdge + rightEdge) / 2
+        return (
+          <g
+            key={`boundary-${gap.gap_id ?? `${gap.data_type}-${gap.start}-${gap.end}`}`}
+            data-testid="chart-gap-boundary"
+          >
+            <rect
+              className="chart-gap-boundary-mark"
+              x={boundaryX - markWidth / 2}
+              y={top}
+              width={markWidth}
+              height={height}
+              fill={`url(#${patternId})`}
+            />
+            <text
+              className="chart-gap-label"
+              x={boundaryX + (nearRight ? -5 : 5)}
+              y={top + 12}
+              textAnchor={nearRight ? 'end' : 'start'}
+            >
               {gapLabelText(gap)}
             </text>
           </g>

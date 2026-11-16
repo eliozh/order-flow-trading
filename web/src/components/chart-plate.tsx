@@ -1,4 +1,4 @@
-import { memo } from 'react'
+import { memo, useEffect } from 'react'
 
 import type { ChartMarker, ChartZone } from '../api/charts'
 import type {
@@ -7,7 +7,13 @@ import type {
   SnapshotBar,
   VolumeProfileSection,
 } from '../api/reports'
-import { ChartGapBands, ChartMarkers, ChartZones, gapBarIndices } from './chart-overlays'
+import {
+  ChartGapBands,
+  ChartMarkers,
+  ChartZones,
+  gapBarIndices,
+  gapBoundaryIndices,
+} from './chart-overlays'
 
 /**
  * Structural subset of a metrics document that the chart actually draws, so a
@@ -43,19 +49,34 @@ export function yForPrice(value: number, range: { min: number; max: number }): n
   return PRICE_TOP + ((range.max - value) / span) * PRICE_HEIGHT
 }
 
-/** Contiguous non-gap runs of bar indices; a gap is a break, never interpolated. */
-function cvdSegments(bars: SnapshotBar[], gapIndices: ReadonlySet<number>): number[][] {
+/**
+ * Contiguous non-gap runs of bar indices. A run ends at a bar that overlaps a
+ * gap, and also before a bar whose previous neighbour is separated from it by a
+ * bracketed gap window (no present bar inside it). A gap is a break, never
+ * interpolated.
+ */
+function cvdSegments(
+  bars: SnapshotBar[],
+  gapIndices: ReadonlySet<number>,
+  boundaryIndices: ReadonlySet<number>,
+): number[][] {
   const segments: number[][] = []
   let run: number[] = []
   bars.forEach((_bar, index) => {
     if (gapIndices.has(index)) {
+      // A bar that overlaps a gap is not drawn at all.
       if (run.length > 0) {
         segments.push(run)
         run = []
       }
-    } else {
-      run.push(index)
+      return
     }
+    if (index > 0 && boundaryIndices.has(index) && run.length > 0) {
+      // The bar itself is present; only the window before it is missing.
+      segments.push(run)
+      run = []
+    }
+    run.push(index)
   })
   if (run.length > 0) {
     segments.push(run)
@@ -86,7 +107,7 @@ interface ChartPlateProps {
  * The static plate: candles, volume, VP, CVD runs, zones, markers, and gap
  * breaks. Memoized so a crosshair move (local state) updates only the
  * crosshair/tooltip layer instead of rebuilding every SVG layer; every prop is
- * a stable server-derived array or a primitive.
+ * a stable server-derived array, the memoized `range` object, or a primitive.
  */
 export const ChartPlate = memo(function ChartPlate({
   bars,
@@ -102,12 +123,18 @@ export const ChartPlate = memo(function ChartPlate({
   hatchId,
   onPlateRender,
 }: ChartPlateProps) {
-  onPlateRender?.()
+  // Test-only instrumentation runs after every commit (never during render).
+  // No dependency array: a stable callback identity must not make the probe
+  // inert when the plate itself re-renders with changed data.
+  useEffect(() => {
+    onPlateRender?.()
+  })
   const entryY = anchoredEntry === null ? null : yForPrice(anchoredEntry, range)
   const markerOverlays =
     anchoredEntry === null ? markers : markers.filter((marker) => marker.kind !== 'entry')
   const gapColumns = new Set(gapBarIndices(bars, gaps))
-  const cvdRuns = cvdSegments(bars, gapColumns)
+  const gapBoundaries = new Set(gapBoundaryIndices(bars, gaps))
+  const cvdRuns = cvdSegments(bars, gapColumns, gapBoundaries)
   function xForIndex(index: number): number {
     return PADDING + slot * index + slot / 2
   }
@@ -276,7 +303,7 @@ export const ChartPlate = memo(function ChartPlate({
         />
         {cvdRuns.map((run, runIndex) => (
           <polyline
-            key={`cvd-run-${runIndex}`}
+            key={`cvd-run-${bars[run[0]].bar_start}`}
             className="cvd-line"
             data-testid={`chart-cvd-segment-${runIndex}`}
             points={run

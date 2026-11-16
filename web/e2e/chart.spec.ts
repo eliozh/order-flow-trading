@@ -36,7 +36,7 @@ const OVERLAY_SCREENS_DIR =
   process.env.OFT_E2E_CHART_OVERLAY_SCREENS_DIR ??
   path.resolve(process.cwd(), '..', '.claude', 'ecc-workflow', 'screens', 'e2e40')
 
-/** Matches `PRICE_TOP`/`PRICE_HEIGHT` in `web/src/components/chart.tsx`. */
+/** Matches `PRICE_TOP`/`PRICE_HEIGHT` in `web/src/components/chart-plate.tsx`. */
 const PRICE_TOP = 18
 const PRICE_HEIGHT = 210
 /** Matches `MAX_OVERLAY_LABEL` in `web/src/components/chart-overlays.tsx`. */
@@ -216,8 +216,35 @@ function gapBarIndices(bars: ChartBar[], gaps: ChartGap[]): number[] {
   return indices
 }
 
+/** Mirrors `gapBoundaryIndices`: break-before indices for gaps between bars. */
+function gapBoundaryIndices(bars: ChartBar[], gaps: ChartGap[]): number[] {
+  const indices: number[] = []
+  for (let index = 1; index < bars.length; index += 1) {
+    const before = bars[index - 1]
+    const after = bars[index]
+    const beforeEnd = Date.parse(before.bar_end)
+    const afterStart = Date.parse(after.bar_start)
+    const bracketed = gaps.some((gap) => {
+      const gapStart = Date.parse(gap.start)
+      const gapEnd = Date.parse(gap.end)
+      if (![beforeEnd, afterStart, gapStart, gapEnd].every(Number.isFinite)) {
+        return false
+      }
+      return beforeEnd <= gapStart && gapEnd <= afterStart
+    })
+    if (bracketed) {
+      indices.push(index)
+    }
+  }
+  return indices
+}
+
 /** Mirrors `cvdSegments`: one run per contiguous non-gap stretch. */
-function cvdRuns(bars: ChartBar[], gapIndices: ReadonlySet<number>): number[][] {
+function cvdRuns(
+  bars: ChartBar[],
+  gapIndices: ReadonlySet<number>,
+  boundaryIndices: ReadonlySet<number>,
+): number[][] {
   const runs: number[][] = []
   let run: number[] = []
   bars.forEach((_bar, index) => {
@@ -226,9 +253,13 @@ function cvdRuns(bars: ChartBar[], gapIndices: ReadonlySet<number>): number[][] 
         runs.push(run)
         run = []
       }
-    } else {
-      run.push(index)
+      return
     }
+    if (index > 0 && boundaryIndices.has(index) && run.length > 0) {
+      runs.push(run)
+      run = []
+    }
+    run.push(index)
   })
   if (run.length > 0) {
     runs.push(run)
@@ -250,7 +281,7 @@ async function selectedRowCells(page: Page) {
     volume: await cells.nth(5).innerText(),
     delta: await cells.nth(6).innerText(),
     cvd: await cells.nth(7).innerText(),
-    quality: await cells.nth(8).innerText(),
+    quality: await cells.nth(9).innerText(),
   }
 }
 
@@ -719,7 +750,8 @@ test('gaps are hatched breaks and the CVD is split into contiguous non-gap runs'
   const chart = await fetchChart(page, reportId)
   const gaps = chart.gaps ?? []
   const gapIndices = new Set(gapBarIndices(chart.bars, gaps))
-  const runs = cvdRuns(chart.bars, gapIndices)
+  const boundaryIndices = new Set(gapBoundaryIndices(chart.bars, gaps))
+  const runs = cvdRuns(chart.bars, gapIndices, boundaryIndices)
 
   const segments = page.locator('[data-testid^="chart-cvd-segment-"]')
   await expect(segments).toHaveCount(runs.length)
@@ -756,7 +788,7 @@ test('gaps are hatched breaks and the CVD is split into contiguous non-gap runs'
     if (gapIndices.size > 0 && gapIndices.size < chart.bars.length) {
       expect(runs.length, 'CVD runs around a gap').toBeGreaterThanOrEqual(2)
     }
-  } else {
+  } else if (gapBoundaryIndices(chart.bars, gaps).length === 0) {
     await expect(page.getByTestId('chart-gaps')).toHaveCount(0)
     await expect(breaks).toHaveCount(0)
     await expect(segments).toHaveCount(1)
@@ -819,8 +851,91 @@ test('a server gap renders a hatched break, split CVD runs, and a MISSING stamp'
     // The table stamps the gap bar MISSING while its neighbours stay COMPLETE.
     await page.getByRole('button', { name: /View data table/i }).click()
     const rows = page.locator('table[aria-label="Chart data table"] tbody tr')
-    await expect(rows.nth(1).locator('td').nth(8)).toHaveText('MISSING')
-    await expect(rows.nth(0).locator('td').nth(8)).not.toHaveText('MISSING')
+    await expect(rows.nth(1).locator('td').nth(9)).toHaveText('MISSING')
+    await expect(rows.nth(0).locator('td').nth(9)).not.toHaveText('MISSING')
+    expectClean(diagnostics)
+  } finally {
+    await page.unroute(chartApiPath(reportId))
+  }
+})
+
+test('a gap bracketed by two present bars breaks the CVD without a false MISSING stamp', async ({
+  page,
+}) => {
+  // The seeded overlay report has `gaps: []`, so drop one middle snapshot bar
+  // and inject a gap covering exactly its window. Both neighbours are present;
+  // the missing window is between them. Only the API response is replaced.
+  const reportId = overlayReportId()
+  const diagnostics = collectDiagnostics(page)
+  await authenticate(page)
+
+  const response = await page.request.get(chartApiPath(reportId))
+  expect(response.status()).toBe(200)
+  const envelope = (await response.json()) as ChartEnvelope
+  const chart = envelope.data as ChartData
+  expect(chart.bars.length).toBeGreaterThanOrEqual(3)
+
+  const dropped = chart.bars[1]
+  const remaining = chart.bars.filter((_bar, index) => index !== 1)
+  const gap: ChartGap = {
+    gap_id: 'E2E-GAP-BRACKET',
+    data_type: 'aggTrades',
+    start: dropped.bar_start,
+    end: dropped.bar_end,
+    reason: 'e2e synthetic bracketed gap',
+    severity: 'WARN',
+    resolved: false,
+  }
+  const injected: ChartData = { ...chart, bars: remaining, gaps: [gap] }
+  await page.route(chartApiPath(reportId), async (route) => {
+    await route.fulfill({
+      status: 200,
+      contentType: 'application/json',
+      body: JSON.stringify({ ...envelope, data: injected }),
+    })
+  })
+
+  try {
+    // Mirror the client segmentation: no bar overlaps the gap, one boundary.
+    expect(gapBarIndices(remaining, [gap])).toEqual([])
+    const boundaryIndices = new Set(gapBoundaryIndices(remaining, [gap]))
+    expect([...boundaryIndices]).toEqual([1])
+    const runs = cvdRuns(remaining, new Set<number>(), boundaryIndices)
+    expect(runs).toHaveLength(2)
+
+    await page.goto(chartPath(reportId))
+    await expect(page.getByTestId('chart-cvd')).toBeVisible()
+
+    // A boundary break, not an overlap band over a present bar.
+    await expect(page.getByTestId('chart-gap-boundary')).toHaveCount(1)
+    await expect(page.getByTestId('chart-gap-boundary').locator('.chart-gap-label')).toHaveText(
+      /^GAP /,
+    )
+    await expect(page.locator('[data-testid="chart-gap-break"]')).toHaveCount(0)
+
+    // Two disjoint polylines, and every present bar is drawn exactly once: no
+    // interpolated point bridges the missing window.
+    const segments = page.locator('[data-testid^="chart-cvd-segment-"]')
+    await expect(segments).toHaveCount(2)
+    let drawnPoints = 0
+    for (const [index, run] of runs.entries()) {
+      const points = await page
+        .getByTestId(`chart-cvd-segment-${index}`)
+        .getAttribute('points')
+      const count = (points ?? '').trim().split(/\s+/).filter(Boolean).length
+      expect(count, `CVD segment ${index} point count`).toBe(run.length)
+      drawnPoints += count
+    }
+    expect(drawnPoints).toBe(remaining.length)
+
+    // The neighbouring bars are present, so none is stamped MISSING.
+    await page.getByRole('button', { name: /View data table/i }).click()
+    const rows = page.locator('table[aria-label="Chart data table"] tbody tr')
+    await expect(rows).toHaveCount(remaining.length)
+    for (let index = 0; index < remaining.length; index += 1) {
+      await expect(rows.nth(index).locator('td').nth(9)).not.toHaveText('MISSING')
+    }
+
     expectClean(diagnostics)
   } finally {
     await page.unroute(chartApiPath(reportId))

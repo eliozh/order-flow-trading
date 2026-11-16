@@ -9,6 +9,7 @@ import { Chart } from '../chart'
 import {
   barQualityStamp,
   gapBarIndices,
+  gapBoundaryIndices,
   gapLabelText,
   numericPrice,
   zoneDash,
@@ -159,23 +160,26 @@ const MARKERS: ChartMarker[] = [
 ]
 
 function renderChart(overrides: {
+  bars?: SnapshotBar[]
   zones?: ChartZone[]
   markers?: ChartMarker[]
   gaps?: DataGap[]
   quality?: string
   qualityReasons?: string[]
+  overlaysTruncated?: boolean
 } = {}) {
   return render(
     <Chart
       symbol="BTCUSDT"
       timeframe="4h"
-      bars={BARS}
+      bars={overrides.bars ?? BARS}
       metrics={METRICS}
       quality={overrides.quality ?? 'COMPLETE'}
       qualityReasons={overrides.qualityReasons ?? []}
       zones={overrides.zones ?? []}
       markers={overrides.markers ?? []}
       gaps={overrides.gaps ?? []}
+      overlaysTruncated={overrides.overlaysTruncated}
     />,
   )
 }
@@ -332,6 +336,28 @@ describe('gap breaks and CVD segments', () => {
     expect(screen.getByTestId('chart-cvd-segment-0')).toBeInTheDocument()
     expect(screen.getByTestId('chart-cvd-segment-1')).toBeInTheDocument()
     expect(screen.queryByTestId('chart-cvd-segment-2')).toBeNull()
+  })
+
+  it('splits the CVD at a whole-day gap bracketed by consecutive present bars', () => {
+    // 00:00-04:00 and 08:00-12:00 with a 04:00-08:00 gap: no bar overlaps the
+    // gap, but the series must still break instead of interpolating across it.
+    const bracketed = [BARS[0], BARS[2]]
+    expect(gapBarIndices(bracketed, [GAP])).toEqual([])
+    expect(gapBoundaryIndices(bracketed, [GAP])).toEqual([1])
+
+    renderChart({ bars: bracketed, gaps: [GAP] })
+
+    expect(screen.getByTestId('chart-cvd-segment-0')).toBeInTheDocument()
+    expect(screen.getByTestId('chart-cvd-segment-1')).toBeInTheDocument()
+    expect(screen.queryByTestId('chart-cvd-segment-2')).toBeNull()
+    expect(screen.getByTestId('chart-gap-boundary')).toBeInTheDocument()
+    expect(screen.getByText(gapLabelText(GAP))).toBeInTheDocument()
+    // Overlap bands are reserved for gaps that cover a present bar.
+    expect(screen.queryByTestId('chart-gap-break')).toBeNull()
+
+    // The two neighbouring bars are present, so neither is stamped MISSING.
+    expect(barQualityStamp(bracketed[0], [GAP], 'COMPLETE')).toBe('COMPLETE')
+    expect(barQualityStamp(bracketed[1], [GAP], 'COMPLETE')).toBe('COMPLETE')
   })
 
   it('maps gaps to overlapping bar indices and stamps missing bars', () => {
@@ -518,6 +544,7 @@ describe('overlay text alternative', () => {
     const summary = screen.getByTestId('chart-overlay-summary')
     expect(figure.getAttribute('aria-describedby')?.split(' ')).toContain(summary.id)
     expect(summary).toHaveTextContent(/state TRIGGERED/)
+    expect(summary).toHaveTextContent(/Zone OPP-1 · LONG · 0\.72/)
     expect(summary).toHaveTextContent(/low 69400.00/)
     expect(summary).toHaveTextContent(/high 70400.00/)
     expect(summary).toHaveTextContent(/trigger 70400.00/)
@@ -535,6 +562,35 @@ describe('overlay text alternative', () => {
     expect(screen.getByTestId('chart-overlay-summary')).toHaveTextContent(
       /No server-derived opportunity zones, position markers, or gaps/i,
     )
+  })
+
+  it('states when overlay lists were truncated to the server bound', () => {
+    renderChart({ zones: [LONG_ZONE], overlaysTruncated: true })
+
+    expect(screen.getByTestId('chart-overlay-summary')).toHaveTextContent(
+      'Overlay lists were truncated to the server bound.',
+    )
+  })
+
+  it('does not claim truncation when the overlay lists are complete', () => {
+    renderChart({ zones: [LONG_ZONE] })
+
+    expect(screen.getByTestId('chart-overlay-summary')).not.toHaveTextContent(/truncated/i)
+  })
+})
+
+describe('crosshair key model', () => {
+  it('announces the keys in the figure description and the bar group description', () => {
+    renderChart()
+
+    const figure = screen.getByRole('figure', { name: /BTCUSDT 4h chart/i })
+    expect(figure).toHaveAccessibleDescription(/Left and Right/)
+    expect(figure).toHaveAccessibleDescription(/Home and End/)
+    expect(figure).toHaveAccessibleDescription(/Escape clears/)
+
+    // The group keeps its exact accessible name and gains a description.
+    const group = screen.getByRole('group', { name: 'Bar selection' })
+    expect(group).toHaveAccessibleDescription(/Escape/)
   })
 })
 
@@ -576,6 +632,22 @@ describe('pointer hover stays independent from selection', () => {
     )
   })
 
+  it('clears a stale pointer hover when a keyboard selection is committed', () => {
+    renderChart()
+    const canvas = screen.getByTestId('chart-canvas')
+    mockCanvasRect(canvas)
+
+    hoverCanvas(canvas, 20)
+    expect(screen.getByTestId('chart-tooltip')).toHaveTextContent('70002.00')
+
+    const first = screen.getByRole('button', { name: /2026-10-01 00:00/i })
+    first.focus()
+    fireEvent.keyDown(first, { key: 'ArrowRight' })
+
+    // The keyboard selection wins: the tooltip and live region agree.
+    expect(screen.getByTestId('chart-tooltip')).toHaveTextContent('69998.00')
+  })
+
   it('reads the canvas rect once across pointer moves', () => {
     renderChart()
     const canvas = screen.getByTestId('chart-canvas')
@@ -597,9 +669,59 @@ describe('pointer hover stays independent from selection', () => {
 
     expect(screen.getByTestId('chart-candles')).toBe(candles)
   })
+
+  it('keeps the chart frame and data table nodes across a pointer hover', () => {
+    renderChart()
+    fireEvent.click(screen.getByRole('button', { name: /view data table/i }))
+    const figure = screen.getByRole('figure')
+    const table = screen.getByRole('table', { name: /chart data table/i })
+    const canvas = screen.getByTestId('chart-canvas')
+    mockCanvasRect(canvas)
+
+    hoverCanvas(canvas, 300)
+
+    expect(screen.getByTestId('chart-tooltip')).toBeInTheDocument()
+    expect(screen.getByRole('figure')).toBe(figure)
+    expect(screen.getByRole('table', { name: /chart data table/i })).toBe(table)
+  })
+
+  it('invalidates the cached canvas rect on scroll and resize', () => {
+    renderChart()
+    const canvas = screen.getByTestId('chart-canvas')
+    const rect = mockCanvasRect(canvas)
+
+    hoverCanvas(canvas, 300)
+    hoverCanvas(canvas, 400)
+    expect(rect).toHaveBeenCalledTimes(1)
+
+    fireEvent(window, new Event('scroll'))
+    hoverCanvas(canvas, 300)
+    expect(rect).toHaveBeenCalledTimes(2)
+    // The fresh rect still maps to the same bar.
+    expect(screen.getByTestId('chart-tooltip')).toHaveTextContent('69998.00')
+
+    fireEvent(window, new Event('resize'))
+    hoverCanvas(canvas, 400)
+    expect(rect).toHaveBeenCalledTimes(3)
+  })
 })
 
 describe('crosshair dismissal', () => {
+  it('clears a keyboard/click crosshair with Escape after focus leaves the bars', () => {
+    renderChart()
+    const first = screen.getByRole('button', { name: /2026-10-01 00:00/i })
+    first.focus()
+    fireEvent.keyDown(first, { key: 'ArrowRight' })
+    expect(screen.getByTestId('chart-crosshair')).toBeInTheDocument()
+
+    // Focus leaves the bar buttons (the documented Escape scope).
+    screen.getByRole('button', { name: /view data table/i }).focus()
+    fireEvent.keyDown(document, { key: 'Escape' })
+
+    expect(screen.queryByTestId('chart-crosshair')).toBeNull()
+    expect(screen.queryByTestId('chart-tooltip')).toBeNull()
+  })
+
   it('dismisses a pointer-opened crosshair with Escape from anywhere', () => {
     renderChart()
     const canvas = screen.getByTestId('chart-canvas')

@@ -223,7 +223,6 @@ describe('Chart', () => {
     const rows = within(table).getAllByRole('row').slice(1)
     expect(rows).toHaveLength(2)
     const first = within(rows[0]).getAllByRole('cell')
-    expect(first[first.length - 1]).toHaveTextContent('up')
     expect(first[0]).toHaveTextContent('2026-10-01 00:00')
     expect(first[1]).toHaveTextContent('70000.00')
     expect(first[2]).toHaveTextContent('70002.00')
@@ -232,6 +231,9 @@ describe('Chart', () => {
     expect(first[5]).toHaveTextContent('0.60')
     expect(first[6]).toHaveTextContent('+0.20')
     expect(first[7]).toHaveTextContent('+0.20')
+    // Dir keeps its pre-existing index; the newer Quality column is last.
+    expect(first[8]).toHaveTextContent('up')
+    expect(first[9]).toHaveTextContent('PARTIAL')
   })
 
   it('moves bar selection with the keyboard and keeps the footprint in sync', () => {
@@ -299,6 +301,40 @@ describe('Chart', () => {
     expect(screen.getByTestId('chart-entry-marker')).toBeInTheDocument()
     expect(screen.getByText(/ENTRY 70016\.0004/)).toBeInTheDocument()
     expect(screen.getByRole('figure')).toHaveAccessibleDescription(/Entry marker at 70016\.0004/)
+  })
+
+  it('fires the plate render probe again when the plate re-renders', () => {
+    const onPlateRender = vi.fn()
+    const { rerender } = render(
+      <Chart
+        symbol="BTCUSDT"
+        timeframe="4h"
+        bars={bars}
+        metrics={metrics}
+        quality="PARTIAL"
+        qualityReasons={[]}
+        onPlateRender={onPlateRender}
+      />,
+    )
+    expect(onPlateRender).toHaveBeenCalledTimes(1)
+
+    const changed = bars.map((item, index) =>
+      index === 0 ? { ...item, close: '70005.00' } : item,
+    )
+    rerender(
+      <Chart
+        symbol="BTCUSDT"
+        timeframe="4h"
+        bars={changed}
+        metrics={metrics}
+        quality="PARTIAL"
+        qualityReasons={['changed']}
+        onPlateRender={onPlateRender}
+      />,
+    )
+
+    // A stable callback identity must not make the instrumentation inert.
+    expect(onPlateRender).toHaveBeenCalledTimes(2)
   })
 })
 

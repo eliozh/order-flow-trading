@@ -63,6 +63,8 @@ export interface ChartData {
   gaps: DataGap[]
   zones: ChartZone[]
   markers: ChartMarker[]
+  /** True when a linked read or the marker cap clipped the overlay list. */
+  overlays_truncated: boolean
   data_quality: string
   quality_reasons: string[]
   reason: string | null

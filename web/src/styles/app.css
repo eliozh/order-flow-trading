@@ -1032,6 +1032,15 @@ code {
   min-width: 720px;
 }
 
+/* The wrapper scrolls horizontally. Keep each time/price/number cell on one
+   line so narrow viewports cannot break a value at its hyphens or spaces. */
+.chart-table td,
+.chart-table th,
+.chart-vp-table td,
+.chart-vp-table th {
+  white-space: nowrap;
+}
+
 .chart-vp-table {
   border-top: 1px solid var(--oft-border-subtle);
 }
@@ -2562,6 +2571,11 @@ code {
 }
 
 .chart-gap-band {
+  stroke: var(--oft-status-warn);
+  stroke-width: 1;
+}
+
+.chart-gap-boundary-mark {
   stroke: var(--oft-status-warn);
   stroke-width: 1;
 }

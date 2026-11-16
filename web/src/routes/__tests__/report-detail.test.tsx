@@ -1,4 +1,4 @@
-import { render, screen, within } from '@testing-library/react'
+import { fireEvent, render, screen, within } from '@testing-library/react'
 import { describe, expect, it } from 'vitest'
 
 import type {
@@ -353,6 +353,44 @@ describe('ReportDetail unmeasured sections', () => {
     const funding = within(row('Funding'))
     expect(funding.getByText('0.0001')).toBeInTheDocument()
     expect(funding.getByText(/next 2026-10-01 08:00 UTC/)).toBeInTheDocument()
+  })
+})
+
+describe('ReportDetail chart gaps', () => {
+  it('passes server gaps to the chart and stamps the covered row MISSING', async () => {
+    const data = report()
+    data.metrics = {
+      ...data.metrics,
+      gaps: [
+        {
+          gap_id: 'GAP-1',
+          data_type: 'aggTrades',
+          start: '2026-10-01T00:00:00.000Z',
+          end: '2026-10-01T04:00:00.000Z',
+          reason: 'no recorded trades',
+          severity: 'WARN',
+          resolved: false,
+        },
+      ],
+    }
+    data.snapshot.orderflow = data.metrics
+    // A drawable series: the chart's MISSING branch would hide every overlay.
+    data.data_quality = 'PARTIAL'
+
+    await renderReport(data)
+
+    expect(screen.getByTestId('chart-gap-break')).toBeInTheDocument()
+    expect(screen.getByTestId('chart-overlay-summary')).toHaveTextContent(
+      /Gap from 2026-10-01T00:00:00\.000Z/,
+    )
+    expect(within(row('Gaps')).getByText('1')).toBeInTheDocument()
+
+    fireEvent.click(screen.getByRole('button', { name: /view data table/i }))
+    const table = screen.getByRole('table', { name: /chart data table/i })
+    const firstRow = within(table).getAllByRole('row')[1]
+    const cells = within(firstRow).getAllByRole('cell')
+    // Dir stays at index 8; the quality stamp follows it at index 9.
+    expect(cells[9]).toHaveTextContent('MISSING')
   })
 })
 

@@ -61,6 +61,9 @@ class ChartPayload(BaseModel):
     gaps: list[dict[str, Any]]
     zones: list[ChartZone]
     markers: list[ChartMarker]
+    #: True when a linked read or the marker cap clipped the overlay lists.
+    #: Always False on a MISSING payload (nothing is drawn).
+    overlays_truncated: bool
     data_quality: str
     quality_reasons: list[str]
     reason: str | None

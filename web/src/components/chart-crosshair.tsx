@@ -5,12 +5,14 @@ import { signedDecimal, utcLabel } from '../api/reports'
 import { barQualityStamp } from './chart-overlays'
 
 /**
- * Presentational crosshair lines, linked tooltip, and the shared aria-live
- * summary text (slice 40).
+ * Presentational crosshair lines, linked tooltip, and the live-region summary
+ * text (slice 40).
  *
- * The same `crosshairSummary` string feeds both the tooltip values and the
- * polite live region, so the drawn tooltip and the announcement can never
- * disagree. The tooltip is capped at 320px and clamped inside the plot.
+ * The tooltip and the polite live region read the same `SnapshotBar` fields and
+ * run the same `barQualityStamp` over the same gaps/quality props, so their
+ * values cannot disagree. `crosshairSummary` is the live-region string; the
+ * tooltip renders its own `<dl>` from the same fields rather than reusing that
+ * sentence. The tooltip is capped at 320px and clamped inside the plot.
  */
 
 /** Max tooltip width per DESIGN §13.2. */
@@ -43,7 +45,7 @@ export function ChartCrosshair({ x, y, top, bottom, width, padding }: CrosshairL
   )
 }
 
-/** The one summary string shared by the tooltip and the aria-live region. */
+/** The live-region summary string (the tooltip renders the same fields itself). */
 export function crosshairSummary(
   bar: SnapshotBar,
   gaps: DataGap[],

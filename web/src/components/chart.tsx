@@ -18,7 +18,7 @@ import {
   yForPrice,
   type ChartMetrics,
 } from './chart-plate'
-import { barQualityStamp, numericPrice } from './chart-overlays'
+import { barQualityStamp, clampLabel, numericPrice } from './chart-overlays'
 import { DataQualityBadge } from './data-quality'
 import { FootprintDock } from './footprint-dock'
 import { ProvenanceStamp } from './provenance'
@@ -44,6 +44,11 @@ interface ChartProps {
   /** Server-declared data gaps, drawn as breaks instead of interpolated data. */
   gaps?: DataGap[]
   /**
+   * True when a linked read or the marker cap clipped the overlay list; the
+   * hidden overlay summary then says so instead of implying a complete set.
+   */
+  overlaysTruncated?: boolean
+  /**
    * Test-only render instrumentation forwarded to the memoized plate. Production
    * callers leave it undefined; tests use it to prove the plate does not rebuild
    * on an equal-data poll.
@@ -52,7 +57,8 @@ interface ChartProps {
 }
 
 // Stable empty defaults: a `[]` literal in the parameter list would get a new
-// identity on every render and needlessly invalidate the announcement effect.
+// identity on every render and invalidate the range memo (and, for gaps and
+// reasons, the announcement effect).
 const EMPTY_ZONES: ChartZone[] = []
 const EMPTY_MARKERS: ChartMarker[] = []
 const EMPTY_GAPS: DataGap[] = []
@@ -87,6 +93,211 @@ function signedText(value: string): string {
   return signedDecimal(value)
 }
 
+interface ChartCanvasProps {
+  bars: SnapshotBar[]
+  metrics: ChartMetrics
+  zones: ChartZone[]
+  markers: ChartMarker[]
+  gaps: DataGap[]
+  quality: string
+  qualityReasons: string[]
+  range: { min: number; max: number }
+  slot: number
+  candleWidth: number
+  hatchId: string
+  anchoredEntry: number | null
+  entryText: string | null
+  /** Keyboard/click crosshair. Pointer hover takes precedence while active. */
+  crosshairBarStart?: string
+  /** Incremented by a keyboard/click selection; clears a stale pointer hover. */
+  selectionToken: number
+  onPlateRender?: () => void
+}
+
+/**
+ * The interactive canvas layer: axis labels, the memoized plate, the
+ * crosshair/tooltip, and the pointer hover state. Kept separate and memoized so
+ * a pointer move re-renders only this layer; the chart frame, legend, and data
+ * table in the parent stay identity-stable.
+ */
+const ChartCanvas = memo(function ChartCanvas({
+  bars,
+  metrics,
+  zones,
+  markers,
+  gaps,
+  quality,
+  qualityReasons,
+  range,
+  slot,
+  candleWidth,
+  hatchId,
+  anchoredEntry,
+  entryText,
+  crosshairBarStart,
+  selectionToken,
+  onPlateRender,
+}: ChartCanvasProps) {
+  const [hoverBarStart, setHoverBarStart] = useState<string | undefined>(undefined)
+  // Cache the canvas rect across pointermove events; scroll/resize invalidate it
+  // so pointer-to-bar mapping cannot drift while the page moves underneath.
+  const canvasRectRef = useRef<DOMRect | null>(null)
+
+  // A keyboard/click selection wins over a stale hover, so the tooltip never
+  // shows a different bar than the one the live region just announced.
+  useEffect(() => {
+    setHoverBarStart(undefined)
+  }, [selectionToken])
+
+  useEffect(() => {
+    function invalidate() {
+      canvasRectRef.current = null
+    }
+    window.addEventListener('scroll', invalidate, true)
+    window.addEventListener('resize', invalidate)
+    return () => {
+      window.removeEventListener('scroll', invalidate, true)
+      window.removeEventListener('resize', invalidate)
+    }
+  }, [])
+
+  // Escape dismisses a pointer-opened crosshair even when no bar button has
+  // focus; the bar-level Escape handler covers keyboard semantics.
+  useEffect(() => {
+    if (hoverBarStart === undefined) {
+      return
+    }
+    function handleDocumentKeyDown(event: globalThis.KeyboardEvent) {
+      if (event.key === 'Escape') {
+        setHoverBarStart(undefined)
+      }
+    }
+    document.addEventListener('keydown', handleDocumentKeyDown)
+    return () => document.removeEventListener('keydown', handleDocumentKeyDown)
+  }, [hoverBarStart])
+
+  function handlePointerEnter(event: PointerEvent<HTMLDivElement>) {
+    canvasRectRef.current = event.currentTarget.getBoundingClientRect()
+  }
+
+  function handlePointerLeave() {
+    canvasRectRef.current = null
+    setHoverBarStart(undefined)
+  }
+
+  /**
+   * Pointer hover moves only the crosshair/tooltip and never commits the
+   * selection, so `aria-pressed` and the roving tab stop stay with the
+   * keyboard/click selection and focus survives a mouse pass.
+   */
+  function handlePointerMove(event: PointerEvent<HTMLDivElement>) {
+    const rect = canvasRectRef.current ?? event.currentTarget.getBoundingClientRect()
+    canvasRectRef.current = rect
+    const clientX = event.clientX
+    if (rect.width <= 0 || bars.length === 0 || !Number.isFinite(clientX)) {
+      return
+    }
+    const svgX = ((clientX - rect.left) / rect.width) * WIDTH
+    const rawIndex = Math.floor((svgX - PADDING) / slot)
+    const index = Math.min(Math.max(rawIndex, 0), bars.length - 1)
+    const barStart = bars[index].bar_start
+    if (barStart !== hoverBarStart) {
+      setHoverBarStart(barStart)
+    }
+  }
+
+  const effectiveBarStart = hoverBarStart ?? crosshairBarStart
+  const crosshairBar =
+    effectiveBarStart === undefined
+      ? undefined
+      : (bars.find((bar) => bar.bar_start === effectiveBarStart) ?? undefined)
+  const crosshairIndex =
+    crosshairBar === undefined
+      ? -1
+      : bars.findIndex((bar) => bar.bar_start === crosshairBar.bar_start)
+  const crosshairX = crosshairIndex < 0 ? null : PADDING + slot * crosshairIndex + slot / 2
+
+  return (
+    <div
+      className="chart-canvas"
+      onPointerEnter={handlePointerEnter}
+      onPointerMove={handlePointerMove}
+      onPointerLeave={handlePointerLeave}
+      data-testid="chart-canvas"
+    >
+      <div className="chart-axis-labels" data-testid="chart-axis-labels" aria-hidden="true">
+        <span
+          data-testid="price-label-max"
+          style={{ top: `${(PRICE_TOP / HEIGHT) * 100}%`, transform: 'translateY(-50%)' }}
+        >
+          {range.max.toFixed(2)}
+        </span>
+        <span
+          data-testid="price-label-mid"
+          style={{
+            top: `${((PRICE_TOP + PRICE_HEIGHT / 2) / HEIGHT) * 100}%`,
+            transform: 'translateY(-50%)',
+          }}
+        >
+          {((range.max + range.min) / 2).toFixed(2)}
+        </span>
+        <span
+          data-testid="price-label-min"
+          style={{
+            top: `${((PRICE_TOP + PRICE_HEIGHT) / HEIGHT) * 100}%`,
+            transform: 'translateY(-50%)',
+          }}
+        >
+          {range.min.toFixed(2)}
+        </span>
+      </div>
+      <svg
+        className="chart-svg"
+        viewBox={`0 0 ${WIDTH} ${HEIGHT}`}
+        role="presentation"
+        focusable="false"
+        aria-hidden="true"
+        data-testid="chart-plot"
+      >
+        <ChartPlate
+          bars={bars}
+          metrics={metrics}
+          zones={zones}
+          markers={markers}
+          gaps={gaps}
+          anchoredEntry={anchoredEntry}
+          entryText={entryText}
+          range={range}
+          slot={slot}
+          candleWidth={candleWidth}
+          hatchId={hatchId}
+          onPlateRender={onPlateRender}
+        />
+        {crosshairBar !== undefined && crosshairX !== null && (
+          <ChartCrosshair
+            x={crosshairX}
+            y={yForPrice(numeric(crosshairBar.close), range)}
+            top={PRICE_TOP}
+            bottom={CVD_TOP + CVD_HEIGHT}
+            width={WIDTH}
+            padding={PADDING}
+          />
+        )}
+      </svg>
+      {crosshairBar !== undefined && crosshairX !== null && (
+        <ChartTooltip
+          bar={crosshairBar}
+          gaps={gaps}
+          quality={quality}
+          qualityReasons={qualityReasons}
+          x={crosshairX}
+          width={WIDTH}
+        />
+      )}
+    </div>
+  )
+})
+
 function ChartComponent({
   symbol,
   timeframe,
@@ -100,24 +311,26 @@ function ChartComponent({
   zones = EMPTY_ZONES,
   markers = EMPTY_MARKERS,
   gaps = EMPTY_GAPS,
+  overlaysTruncated = false,
   onPlateRender,
 }: ChartProps) {
   const plotId = useId()
   const tableId = `${plotId}-table`
   const summaryId = `${plotId}-summary`
   const overlaySummaryId = `${plotId}-overlays`
+  const barHelpId = `${plotId}-bar-help`
   const hatchId = `${plotId}-hatch`
   const [internalSelection, setInternalSelection] = useState<string | undefined>(undefined)
   const [crosshairBarStart, setCrosshairBarStart] = useState<string | undefined>(undefined)
+  // Bumped on every keyboard/click selection so the pointer layer can drop a
+  // stale hover before the live region announces the new selection.
+  const [selectionToken, setSelectionToken] = useState(0)
   const [showTable, setShowTable] = useState(false)
   const [announcement, setAnnouncement] = useState('')
   // Only a user-initiated selection warrants a bar announcement. The initial
   // mount and a parent-driven period switch are announced once by the panel's
   // own polite region, so two polite regions never queue back-to-back.
   const hasUserSelectionRef = useRef(false)
-  // Cache the canvas rect across pointermove events instead of reading layout
-  // on every move; pointerenter/pointerleave own the cache lifetime.
-  const canvasRectRef = useRef<DOMRect | null>(null)
   const selected = selectedBarStart ?? internalSelection ?? bars[bars.length - 1]?.bar_start
 
   useEffect(() => {
@@ -136,8 +349,9 @@ function ChartComponent({
     return () => clearTimeout(timer)
   }, [bars, selected, symbol, timeframe, gaps, quality, qualityReasons])
 
-  // Escape must dismiss a pointer-opened crosshair even when no bar button has
-  // focus; the bar-level Escape handler still covers keyboard semantics.
+  // Escape must dismiss a keyboard/click crosshair even when focus has moved
+  // away from the bar buttons (the descriptions promise this); the bar-level
+  // handler still covers the focused-button case.
   useEffect(() => {
     if (crosshairBarStart === undefined) {
       return
@@ -189,15 +403,6 @@ function ChartComponent({
   const slot = (WIDTH - PADDING * 2) / bars.length
   const candleWidth = Math.max(slot * 0.55, 3)
   const selectedBar = bars.find((bar) => bar.bar_start === selected) ?? bars[bars.length - 1]
-  const crosshairBar =
-    crosshairBarStart === undefined
-      ? undefined
-      : (bars.find((bar) => bar.bar_start === crosshairBarStart) ?? undefined)
-  const crosshairIndex =
-    crosshairBar === undefined
-      ? -1
-      : bars.findIndex((bar) => bar.bar_start === crosshairBar.bar_start)
-  const crosshairX = crosshairIndex < 0 ? null : PADDING + slot * crosshairIndex + slot / 2
   const footprint = metrics.footprint.bars.find((bar) => bar.bar_start === selectedBar.bar_start)
 
   function selectBar(barStart: string) {
@@ -206,6 +411,7 @@ function ChartComponent({
     // The crosshair is hidden initially and appears on the first selection or
     // pointer hover; Escape hides it again.
     setCrosshairBarStart(barStart)
+    setSelectionToken((value) => value + 1)
     onSelectBar?.(barStart)
   }
 
@@ -235,36 +441,6 @@ function ChartComponent({
     controls?.[next]?.focus()
   }
 
-  function handlePlotPointerEnter(event: PointerEvent<HTMLDivElement>) {
-    canvasRectRef.current = event.currentTarget.getBoundingClientRect()
-  }
-
-  function handlePlotPointerLeave() {
-    canvasRectRef.current = null
-    setCrosshairBarStart(undefined)
-  }
-
-  /**
-   * Pointer hover moves only the crosshair/tooltip and never commits the
-   * selection, so `aria-pressed` and the roving tab stop stay with the
-   * keyboard/click selection and focus survives a mouse pass.
-   */
-  function handlePlotPointerMove(event: PointerEvent<HTMLDivElement>) {
-    const rect = canvasRectRef.current ?? event.currentTarget.getBoundingClientRect()
-    canvasRectRef.current = rect
-    const clientX = event.clientX
-    if (rect.width <= 0 || bars.length === 0 || !Number.isFinite(clientX)) {
-      return
-    }
-    const svgX = ((clientX - rect.left) / rect.width) * WIDTH
-    const rawIndex = Math.floor((svgX - PADDING) / slot)
-    const index = Math.min(Math.max(rawIndex, 0), bars.length - 1)
-    const barStart = bars[index].bar_start
-    if (barStart !== crosshairBarStart) {
-      setCrosshairBarStart(barStart)
-    }
-  }
-
   return (
     <figure
       className="chart-frame"
@@ -276,7 +452,9 @@ function ChartComponent({
         Candlestick chart with {bars.length} bars. Price range {range.min.toFixed(2)} to{' '}
         {range.max.toFixed(2)}. Volume, CVD, volume profile, and footprint are shown; the data table
         carries the same values.
-        {anchoredEntry !== null && entryText !== null ? ` Entry marker at ${entryText}.` : ''}
+        {anchoredEntry !== null && entryText !== null ? ` Entry marker at ${entryText}.` : ''}{' '}
+        Keyboard: Left and Right move the crosshair, Home and End jump to the first and last bar,
+        Escape clears the crosshair.
       </figcaption>
       {/*
         Bounded text alternative for the overlay values that exist only inside
@@ -288,16 +466,19 @@ function ChartComponent({
         className="visually-hidden"
         data-testid="chart-overlay-summary"
       >
-        {zones.length === 0 && markers.length === 0 && gaps.length === 0 ? (
+        {zones.length === 0 && markers.length === 0 && gaps.length === 0 && !overlaysTruncated ? (
           <p>No server-derived opportunity zones, position markers, or gaps.</p>
         ) : (
           <>
             <p>Chart overlays from the server payload.</p>
+            {overlaysTruncated && (
+              <p>Overlay lists were truncated to the server bound.</p>
+            )}
             {zones.length > 0 && (
               <ul>
                 {zones.map((zone) => (
                   <li key={`overlay-zone-${zone.opportunity_id}`}>
-                    Zone {zone.opportunity_id} {zone.side} state {zone.state}, low {zone.low}, high{' '}
+                    Zone {clampLabel(zone.label)}, state {zone.state}, low {zone.low}, high{' '}
                     {zone.high}, trigger {zone.trigger_price}.
                   </li>
                 ))}
@@ -366,83 +547,24 @@ function ChartComponent({
             <span data-testid="cvd-zero-label">0</span>
             <span>POC {metrics.volume_profile.poc}</span>
           </div>
-          <div
-            className="chart-canvas"
-            onPointerEnter={handlePlotPointerEnter}
-            onPointerMove={handlePlotPointerMove}
-            onPointerLeave={handlePlotPointerLeave}
-            data-testid="chart-canvas"
-          >
-            <div className="chart-axis-labels" data-testid="chart-axis-labels" aria-hidden="true">
-              <span
-                data-testid="price-label-max"
-                style={{ top: `${(PRICE_TOP / HEIGHT) * 100}%`, transform: 'translateY(-50%)' }}
-              >
-                {range.max.toFixed(2)}
-              </span>
-              <span
-                data-testid="price-label-mid"
-                style={{
-                  top: `${((PRICE_TOP + PRICE_HEIGHT / 2) / HEIGHT) * 100}%`,
-                  transform: 'translateY(-50%)',
-                }}
-              >
-                {((range.max + range.min) / 2).toFixed(2)}
-              </span>
-              <span
-                data-testid="price-label-min"
-                style={{
-                  top: `${((PRICE_TOP + PRICE_HEIGHT) / HEIGHT) * 100}%`,
-                  transform: 'translateY(-50%)',
-                }}
-              >
-                {range.min.toFixed(2)}
-              </span>
-            </div>
-            <svg
-              className="chart-svg"
-              viewBox={`0 0 ${WIDTH} ${HEIGHT}`}
-              role="presentation"
-              focusable="false"
-              aria-hidden="true"
-              data-testid="chart-plot"
-            >
-              <ChartPlate
-                bars={bars}
-                metrics={metrics}
-                zones={zones}
-                markers={markers}
-                gaps={gaps}
-                anchoredEntry={anchoredEntry}
-                entryText={entryText}
-                range={range}
-                slot={slot}
-                candleWidth={candleWidth}
-                hatchId={hatchId}
-                onPlateRender={onPlateRender}
-              />
-              {crosshairBar !== undefined && crosshairX !== null && (
-                <ChartCrosshair
-                  x={crosshairX}
-                  y={yForPrice(numeric(crosshairBar.close), range)}
-                  top={PRICE_TOP}
-                  bottom={CVD_TOP + CVD_HEIGHT}
-                  width={WIDTH}
-                  padding={PADDING}
-                />
-              )}
-            </svg>
-            {crosshairBar !== undefined && crosshairX !== null && (
-              <ChartTooltip
-                bar={crosshairBar}
-                gaps={gaps}
-                quality={quality}
-                qualityReasons={qualityReasons}
-                x={crosshairX}
-                width={WIDTH}
-              />
-            )}
-          </div>
+          <ChartCanvas
+            bars={bars}
+            metrics={metrics}
+            zones={zones}
+            markers={markers}
+            gaps={gaps}
+            quality={quality}
+            qualityReasons={qualityReasons}
+            range={range}
+            slot={slot}
+            candleWidth={candleWidth}
+            hatchId={hatchId}
+            anchoredEntry={anchoredEntry}
+            entryText={entryText}
+            crosshairBarStart={crosshairBarStart}
+            selectionToken={selectionToken}
+            onPlateRender={onPlateRender}
+          />
         </div>
 
         <FootprintDock
@@ -452,7 +574,16 @@ function ChartComponent({
         />
       </div>
 
-      <div className="chart-bars" role="group" aria-label="Bar selection">
+      <p id={barHelpId} className="visually-hidden">
+        Use Left and Right to move the crosshair, Home and End to jump to the first and last bar,
+        and Escape to clear the crosshair.
+      </p>
+      <div
+        className="chart-bars"
+        role="group"
+        aria-label="Bar selection"
+        aria-describedby={barHelpId}
+      >
         {bars.map((bar, index) => {
           const label = `${utcLabel(bar.bar_start)} UTC`
           const isSelected = bar.bar_start === selectedBar.bar_start
@@ -516,8 +647,8 @@ function ChartComponent({
                 <th scope="col">Vol</th>
                 <th scope="col">Delta</th>
                 <th scope="col">CVD</th>
-                <th scope="col">Quality</th>
                 <th scope="col">Dir</th>
+                <th scope="col">Quality</th>
               </tr>
             </thead>
             <tbody>
@@ -542,10 +673,10 @@ function ChartComponent({
                   <td className={bar.cvd.startsWith('-') ? 'value-down' : 'value-up'}>
                     {signedText(bar.cvd)}
                   </td>
+                  <td>{numeric(bar.close) >= numeric(bar.open) ? 'up' : 'down'}</td>
                   <td className="mono">
                     {barQualityStamp(bar, gaps, quality, qualityReasons)}
                   </td>
-                  <td>{numeric(bar.close) >= numeric(bar.open) ? 'up' : 'down'}</td>
                 </tr>
               ))}
             </tbody>

@@ -230,22 +230,42 @@ class OpportunityStoreMixin(SqliteConnectionMixin, SqliteAuditMixin):
         return _row_to_opportunity(row) if row is not None else None
 
     def list_opportunities(
-        self, *, state: str | None = None, limit: int = 100, offset: int = 0
+        self,
+        *,
+        state: str | None = None,
+        symbol: str | None = None,
+        report_id: str | None = None,
+        limit: int = 100,
+        offset: int = 0,
     ) -> tuple[OpportunityRecord, ...]:
         connection = self._connect_read_only()
         if connection is None:
             return ()
-        if state is None:
-            query = "SELECT * FROM opportunities ORDER BY created_at DESC LIMIT ? OFFSET ?"
-            params: tuple[object, ...] = (limit, offset)
-        else:
-            query = (
-                "SELECT * FROM opportunities WHERE state = ? "
-                "ORDER BY created_at DESC LIMIT ? OFFSET ?"
+        clauses: list[str] = []
+        params: list[object] = []
+        if state is not None:
+            clauses.append("state = ?")
+            params.append(state)
+        if symbol is not None:
+            clauses.append("symbol = ?")
+            params.append(symbol)
+        if report_id is not None:
+            # ``json_valid`` short-circuits the extraction, so a truncated or
+            # hand-edited payload row is filtered out instead of raising a
+            # malformed-JSON error out of the chart read.
+            clauses.append(
+                "CASE WHEN json_valid(payload_json) "
+                "THEN json_extract(payload_json, '$.source.report_id') END = ?"
             )
-            params = (state, limit, offset)
+            params.append(report_id)
+        where = f" WHERE {' AND '.join(clauses)}" if clauses else ""
+        params.extend((limit, offset))
         try:
-            rows = connection.execute(query, params).fetchall()
+            rows = connection.execute(
+                f"SELECT * FROM opportunities{where} "
+                "ORDER BY created_at DESC, opportunity_id DESC LIMIT ? OFFSET ?",
+                tuple(params),
+            ).fetchall()
         finally:
             connection.close()
         return tuple(_row_to_opportunity(row) for row in rows)

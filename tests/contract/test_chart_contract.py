@@ -102,6 +102,7 @@ def test_available_payload_matches_the_schema_and_its_source_report(tmp_path: Pa
     assert payload.source_report_id == report_id
     assert payload.generated_at == report["generated_at"]
     assert payload.reason is None
+    assert payload.overlays_truncated is False
     assert payload.available_periods[0] == payload.native_period
     assert len(set(payload.available_periods)) == len(payload.available_periods)
 
@@ -128,6 +129,7 @@ def test_missing_payload_has_no_bars_or_metrics_and_a_reason(tmp_path: Path) -> 
     assert payload.generated_at is None
     assert payload.reason
     assert "15m" in payload.reason
+    assert payload.overlays_truncated is False
     assert payload.available_periods == ["4h"]
     assert payload.data_quality == "MISSING"
 
