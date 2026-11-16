@@ -796,18 +796,47 @@ class PaperOmsStoreMixin(SqliteConnectionMixin, SqliteAuditMixin):
         return _row_to_fill(row) if row is not None else None
 
     def list_positions(
-        self, *, state: str | None = None, limit: int | None = 100, offset: int = 0
+        self,
+        *,
+        state: str | None = None,
+        symbol: str | None = None,
+        report_id: str | None = None,
+        limit: int | None = 100,
+        offset: int = 0,
     ) -> tuple[PositionRecord, ...]:
         connection = self._connect_read_only()
         if connection is None:
             return ()
         clauses: list[str] = []
         params: list[object] = []
+        joins = ""
         if state is not None:
-            clauses.append("state = ?")
+            clauses.append("positions.state = ?")
             params.append(state)
+        if symbol is not None:
+            clauses.append("positions.symbol = ?")
+            params.append(symbol)
+        if report_id is not None:
+            # One query with trigger -> opportunity joins; no per-row trigger
+            # read. ``json_valid`` guards both extractions so a corrupt
+            # persisted payload cannot raise.
+            joins = (
+                " JOIN trigger_events ON trigger_events.trigger_id = "
+                "CASE WHEN json_valid(positions.payload_json) "
+                "THEN json_extract(positions.payload_json, '$.source_trigger_id') END"
+                " JOIN opportunities "
+                "ON opportunities.opportunity_id = trigger_events.opportunity_id"
+            )
+            clauses.append(
+                "CASE WHEN json_valid(opportunities.payload_json) "
+                "THEN json_extract(opportunities.payload_json, '$.source.report_id') END = ?"
+            )
+            params.append(report_id)
         where = f" WHERE {' AND '.join(clauses)}" if clauses else ""
-        query = f"SELECT * FROM positions{where} ORDER BY opened_at DESC"
+        query = (
+            f"SELECT positions.* FROM positions{joins}{where} "
+            "ORDER BY positions.opened_at DESC, positions.position_id DESC"
+        )
         # An equity total must be exact: ``limit=None`` reads every open row
         # instead of silently truncating at the default page size (DB-5).
         if limit is not None:

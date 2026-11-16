@@ -274,6 +274,7 @@ export function ReportDetailPage({
         qualityReasons={metrics.quality_reasons}
         selectedBarStart={selected}
         onSelectBar={setSelectedBarStart}
+        gaps={gaps}
       />
 
       <LlmBand

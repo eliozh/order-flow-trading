@@ -1032,6 +1032,15 @@ code {
   min-width: 720px;
 }
 
+/* The wrapper scrolls horizontally. Keep each time/price/number cell on one
+   line so narrow viewports cannot break a value at its hyphens or spaces. */
+.chart-table td,
+.chart-table th,
+.chart-vp-table td,
+.chart-vp-table th {
+  white-space: nowrap;
+}
+
 .chart-vp-table {
   border-top: 1px solid var(--oft-border-subtle);
 }
@@ -2470,5 +2479,175 @@ code {
   .chart-panel * {
     animation: none;
     transition: none;
+  }
+}
+
+/* Slice 40: chart overlays, gap breaks, and the keyboard/pointer crosshair.
+   No animation or transition is introduced; state is never color-only. */
+.chart-zone-band {
+  fill: color-mix(in srgb, var(--oft-status-warn) 8%, transparent);
+}
+
+.chart-zone--triggered .chart-zone-band {
+  fill: color-mix(in srgb, var(--oft-accent) 10%, transparent);
+}
+
+.chart-zone--expired .chart-zone-band {
+  fill: color-mix(in srgb, var(--oft-text-muted) 6%, transparent);
+}
+
+.chart-zone--invalidated .chart-zone-band {
+  fill: color-mix(in srgb, var(--oft-status-danger) 8%, transparent);
+}
+
+.chart-zone-edge {
+  stroke: var(--oft-status-warn);
+  stroke-width: 1;
+}
+
+.chart-zone--triggered .chart-zone-edge {
+  stroke: var(--oft-accent);
+}
+
+.chart-zone--expired .chart-zone-edge {
+  stroke: var(--oft-text-muted);
+}
+
+.chart-zone--invalidated .chart-zone-edge {
+  stroke: var(--oft-status-danger);
+}
+
+.chart-zone-state,
+.chart-zone-label,
+.chart-trigger-label,
+.chart-marker-label,
+.chart-gap-label {
+  font-family: var(--oft-font-mono);
+  font-size: 10px;
+  letter-spacing: 0.04em;
+}
+
+.chart-zone-state {
+  fill: var(--oft-text-primary);
+  font-weight: 700;
+}
+
+.chart-zone-label {
+  fill: var(--oft-text-secondary);
+}
+
+.chart-trigger-line {
+  stroke: var(--oft-status-warn);
+  stroke-width: 1;
+}
+
+.chart-trigger-label {
+  fill: var(--oft-status-warn);
+}
+
+.chart-marker-shape {
+  fill: var(--oft-accent);
+  stroke: var(--oft-accent);
+  stroke-width: 1.5;
+}
+
+.chart-marker--stop .chart-marker-shape {
+  fill: none;
+  stroke: var(--oft-status-danger);
+}
+
+.chart-marker--target .chart-marker-shape {
+  fill: none;
+  stroke: var(--oft-status-ok);
+}
+
+.chart-marker--exit .chart-marker-shape {
+  fill: var(--oft-text-secondary);
+  stroke: var(--oft-text-secondary);
+}
+
+.chart-marker-label {
+  fill: var(--oft-text-secondary);
+}
+
+.chart-gap-band {
+  stroke: var(--oft-status-warn);
+  stroke-width: 1;
+}
+
+.chart-gap-boundary-mark {
+  stroke: var(--oft-status-warn);
+  stroke-width: 1;
+}
+
+.chart-gap-hatch-line {
+  stroke: var(--oft-border-strong);
+}
+
+.chart-gap-label {
+  fill: var(--oft-status-warn);
+}
+
+.chart-crosshair-line {
+  stroke: var(--oft-text-secondary);
+  stroke-width: 1;
+  stroke-dasharray: 2 2;
+  opacity: 0.8;
+}
+
+.chart-crosshair-dot {
+  fill: var(--oft-accent);
+}
+
+.chart-tooltip {
+  position: absolute;
+  top: var(--oft-space-2);
+  left: var(--crosshair-left, 50%);
+  z-index: 2;
+  max-width: min(320px, calc(100% - 16px));
+  transform: translateX(-50%);
+  padding: var(--oft-space-2);
+  border: 1px solid var(--oft-border-strong);
+  background: var(--oft-bg-raised);
+  color: var(--oft-text-primary);
+  font: 11px/1.45 var(--oft-font-mono);
+  pointer-events: none;
+  overflow-wrap: anywhere;
+}
+
+.chart-tooltip-head {
+  margin-bottom: var(--oft-space-1);
+  color: var(--oft-text-secondary);
+}
+
+.chart-tooltip-stamp {
+  margin-bottom: var(--oft-space-1);
+  color: var(--oft-text-muted);
+  font-size: 9px;
+  letter-spacing: 0.08em;
+}
+
+.chart-tooltip-grid {
+  display: grid;
+  grid-template-columns: auto 1fr auto 1fr;
+  gap: 0 var(--oft-space-2);
+  margin: 0;
+}
+
+.chart-tooltip-grid dt {
+  color: var(--oft-text-muted);
+}
+
+.chart-tooltip-grid dd {
+  margin: 0;
+  text-align: right;
+}
+
+@media (max-width: 768px) {
+  .chart-tooltip {
+    left: 50%;
+    width: calc(100% - 16px);
+    max-width: none;
+    font-size: 10px;
   }
 }

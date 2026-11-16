@@ -1,4 +1,5 @@
 import { act, fireEvent, render, screen, waitFor, within } from '@testing-library/react'
+import type { ComponentProps } from 'react'
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
 
 import type { OpportunityEnvelope } from '../../api/opportunities'
@@ -44,6 +45,27 @@ import {
 import { PositionDetailPage } from '../position-detail'
 import { PositionsPage } from '../positions'
 import { resolveRoute } from '../route-match'
+
+// Test-only probe. `Chart` forwards `onPlateRender` to the memoized `ChartPlate`
+// so this file can count genuine plate renders; production never sets it.
+const plateRenderProbe = vi.hoisted(() => ({
+  onRender: undefined as (() => void) | undefined,
+}))
+
+// Render the real route chart, only adding the plate render callback. The
+// wrapper is deliberately not memoized: the real memoized `Chart` still decides
+// whether to render, so a broken memo chain shows up as an extra plate render.
+vi.mock('../../components/chart', async (importOriginal) => {
+  const actual = await importOriginal<typeof import('../../components/chart')>()
+  const { createElement } = await import('react')
+  function ChartWithPlateProbe(props: ComponentProps<typeof actual.Chart>) {
+    return createElement(actual.Chart, {
+      ...props,
+      onPlateRender: plateRenderProbe.onRender,
+    })
+  }
+  return { ...actual, Chart: ChartWithPlateProbe }
+})
 
 async function renderList(
   options: {
@@ -510,6 +532,55 @@ describe('PositionDetailPage', () => {
       '/opportunities/OPP-1',
     )
     expect(screen.getByRole('link', { name: /RPT-1/ })).toHaveAttribute('href', '/reports/RPT-1')
+  })
+
+  it('wires the stop and target markers from the position prices verbatim', async () => {
+    await renderDetail()
+
+    const stop = screen.getByTestId('chart-marker-stop')
+    expect(stop).toHaveAttribute('data-kind', 'stop')
+    expect(stop).toHaveAttribute('data-price', '3118.40')
+    const target = screen.getByTestId('chart-marker-target')
+    expect(target).toHaveAttribute('data-kind', 'target')
+    expect(target).toHaveAttribute('data-price', '3420.00')
+    // An open position has no exit price, so no exit marker is fabricated.
+    expect(screen.queryByTestId('chart-marker-exit')).toBeNull()
+  })
+
+  it('adds an exit marker for a closed position and omits an absent price kind', async () => {
+    await renderDetail({
+      pos: positionFixture({ state: 'CLOSED', exit_price: '3300.00', stop_price: null }),
+    })
+
+    expect(screen.getByTestId('chart-marker-exit')).toHaveAttribute('data-price', '3300.00')
+    // A null stop is omitted, never placed at zero.
+    expect(screen.queryByTestId('chart-marker-stop')).toBeNull()
+    expect(document.querySelector('[data-kind="stop"][data-price="0"]')).toBeNull()
+  })
+
+  it('renders the memoized chart plate once across a poll with equal position data', async () => {
+    let plateRenders = 0
+    plateRenderProbe.onRender = () => {
+      plateRenders += 1
+    }
+    let calls = 0
+    const fetchPositionFn = vi.fn(async () => {
+      calls += 1
+      return positionEnvelope(positionFixture({ version: calls }))
+    })
+    try {
+      await renderDetail({ fetchPositionFn, refreshMs: 20 })
+      await screen.findByTestId('chart-candles')
+      // Mount draws the static plate exactly once.
+      expect(plateRenders).toBe(1)
+
+      await waitFor(() => expect(fetchPositionFn.mock.calls.length).toBeGreaterThanOrEqual(2))
+      // The poll resolves a new-but-equal position. A real plate render would
+      // rebuild the SVG tree; the memoized plate must not be invoked again.
+      expect(plateRenders).toBe(1)
+    } finally {
+      plateRenderProbe.onRender = undefined
+    }
   })
 
   it('degrades the link chain and chart to N/A instead of breaking the page', async () => {

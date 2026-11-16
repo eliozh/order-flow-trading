@@ -1216,8 +1216,21 @@ class StorePort(Protocol):
     def get_opportunity(self, opportunity_id: str) -> OpportunityRecord | None: ...
 
     def list_opportunities(
-        self, *, state: str | None = None, limit: int = 100, offset: int = 0
-    ) -> tuple[OpportunityRecord, ...]: ...
+        self,
+        *,
+        state: str | None = None,
+        symbol: str | None = None,
+        report_id: str | None = None,
+        limit: int = 100,
+        offset: int = 0,
+    ) -> tuple[OpportunityRecord, ...]:
+        """Newest opportunities, optionally scoped in SQL.
+
+        ``symbol`` matches the indexed column. ``report_id`` matches the
+        persisted payload's ``source.report_id`` through a JSON-valid guarded
+        extraction, so the filter never raises on a corrupt payload row.
+        """
+        ...
 
     def list_due_opportunities(
         self, now: str, *, limit: int = 1000
@@ -1340,8 +1353,24 @@ class StorePort(Protocol):
     def get_fill_by_order_id(self, order_id: str) -> FillRecord | None: ...
 
     def list_positions(
-        self, *, state: str | None = None, limit: int | None = 100, offset: int = 0
-    ) -> tuple[PositionRecord, ...]: ...
+        self,
+        *,
+        state: str | None = None,
+        symbol: str | None = None,
+        report_id: str | None = None,
+        limit: int | None = 100,
+        offset: int = 0,
+    ) -> tuple[PositionRecord, ...]:
+        """Newest positions, optionally scoped in SQL.
+
+        ``report_id`` follows the linkage ``positions.payload_json ->
+        source_trigger_id`` -> ``trigger_events.opportunity_id`` ->
+        ``opportunities.payload_json -> source.report_id`` through the trigger
+        -> opportunity join chain in one query. Every ``json_extract`` is
+        guarded by ``json_valid`` so a corrupt payload row cannot raise out of
+        the read.
+        """
+        ...
 
     def count_positions(self, *, state: str | None = None, symbol: str | None = None) -> int: ...
 

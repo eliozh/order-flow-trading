@@ -1,7 +1,10 @@
+import { useMemo } from 'react'
+
 import { fetchKillSwitch, type KillSwitchEnvelope } from '../api/paper'
 import { fetchOpportunity, type OpportunityEnvelope } from '../api/opportunities'
 import { fetchReport, utcLabel, type ReportEnvelope } from '../api/reports'
 import { getTrigger, type TriggerDetailEnvelope } from '../api/triggers'
+import type { ChartMarker } from '../api/charts'
 import {
   dash,
   fetchPosition,
@@ -21,6 +24,7 @@ import {
   type PositionManageEnvelope,
 } from '../api/positions'
 import { Chart } from '../components/chart'
+import { numericPrice } from '../components/chart-overlays'
 import { DataQualityBadge } from '../components/data-quality'
 import { PausedPanel, PausedStamp } from '../components/paused-state'
 import { PositionManagementPanel } from '../components/position-management-panel'
@@ -32,6 +36,38 @@ import { useLiveUpdates } from '../hooks/use-live-updates'
 import { usePositionDetailData } from '../hooks/use-position-detail-data'
 import { usePositionManagement } from '../hooks/use-position-management'
 import { managementBlockedReason } from './position-detail-model'
+
+interface PositionChartPrices {
+  position_id: string
+  stop_price: string | null
+  target_prices: string[]
+  exit_price: string | null
+}
+
+/**
+ * Stop/target/exit markers from the position's own recorded prices. The entry
+ * marker keeps the legacy `entryPrice` path (and its stable test id).
+ */
+function positionChartMarkers(position: PositionChartPrices): ChartMarker[] {
+  const markers: ChartMarker[] = []
+  const add = (kind: ChartMarker['kind'], price: string | null) => {
+    if (price === null || numericPrice(price) === null) {
+      return
+    }
+    markers.push({
+      kind,
+      price,
+      label: `${kind.toUpperCase()} ${price}`,
+      position_id: position.position_id,
+    })
+  }
+  add('stop', position.stop_price)
+  for (const target of position.target_prices) {
+    add('target', target)
+  }
+  add('exit', position.exit_price)
+  return markers
+}
 
 interface PositionDetailPageProps {
   positionId: string
@@ -102,6 +138,24 @@ export function PositionDetailPage({
     onPositionApplied: data.applyManagementPosition,
     onUnknownOutcome: data.revalidate,
   })
+
+  // The 5s poll replaces the position object; key the marker memo on the
+  // primitive price fields so the memoized chart does not rebuild its SVG tree.
+  const pricePosition = data.load.position
+  const pricePositionId = pricePosition?.position_id ?? ''
+  const priceStop = pricePosition?.stop_price ?? null
+  const priceTargetsKey = (pricePosition?.target_prices ?? []).join('|')
+  const priceExit = pricePosition?.exit_price ?? null
+  const chartMarkers = useMemo(
+    () =>
+      positionChartMarkers({
+        position_id: pricePositionId,
+        stop_price: priceStop,
+        target_prices: priceTargetsKey === '' ? [] : priceTargetsKey.split('|'),
+        exit_price: priceExit,
+      }),
+    [pricePositionId, priceStop, priceTargetsKey, priceExit],
+  )
 
   if (data.load.state === 'loading') {
     return (
@@ -362,6 +416,8 @@ export function PositionDetailPage({
             quality={report.data_quality}
             qualityReasons={report.metrics.quality_reasons}
             entryPrice={position.avg_entry_price}
+            markers={chartMarkers}
+            gaps={report.metrics.gaps}
           />
         ) : (
           <div role="note" aria-label="Chart unavailable" style={{ padding: 16 }}>
