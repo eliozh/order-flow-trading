@@ -30,8 +30,8 @@ SECRET_MARKERS = (
 )
 
 
-def _settings(tmp_path: Path) -> Settings:
-    return Settings(env="test", port=8765, data_dir=tmp_path / "data")
+def _settings(tmp_path: Path, **overrides: Any) -> Settings:
+    return Settings(env="test", port=8765, data_dir=tmp_path / "data", **overrides)
 
 
 def _auth(app: Any) -> dict[str, str]:
@@ -44,6 +44,12 @@ def _put(client: TestClient, auth: dict[str, str], step: Any, *, key: str = "onb
         json={"step": step},
         headers={**auth, "Idempotency-Key": key},
     )
+
+
+def _star(client: TestClient, auth: dict[str, str], symbol: str = "BTCUSDT") -> None:
+    """Satisfy step 5's server-side prerequisite with the default fixture."""
+    response = client.post(f"/api/v1/watchlist/{symbol}", headers=auth)
+    assert response.status_code == 200, response.text
 
 
 def _seed_corrupt(app: Any, value_json: str = "not-json") -> None:
@@ -130,7 +136,12 @@ def test_put_step_1_persists_one_row_one_audit_and_resumes_2(tmp_path: Path) -> 
 
 
 def test_put_step_2_after_step_1_resumes_5_and_skips_deferred_steps(tmp_path: Path) -> None:
-    app = create_app(_settings(tmp_path), clock=FixedClock(NOW))
+    # Step 2's server-side prerequisite is a configured provider, so the app is
+    # built with a provider environment key.
+    app = create_app(
+        _settings(tmp_path, openai_api_key="sk-test-onboarding-2"),
+        clock=FixedClock(NOW),
+    )
     auth = _auth(app)
 
     with TestClient(app) as client:
@@ -152,10 +163,14 @@ def test_put_step_2_after_step_1_resumes_5_and_skips_deferred_steps(tmp_path: Pa
 
 
 def test_all_active_steps_complete_keeps_resumed_step_5(tmp_path: Path) -> None:
-    app = create_app(_settings(tmp_path), clock=FixedClock(NOW))
+    app = create_app(
+        _settings(tmp_path, openai_api_key="sk-test-onboarding-all"),
+        clock=FixedClock(NOW),
+    )
     auth = _auth(app)
 
     with TestClient(app) as client:
+        _star(client, auth)
         for index, step in enumerate((1, 2, 5)):
             assert _put(client, auth, step, key=f"k{index}").status_code == 200
         response = client.get("/api/v1/settings/onboarding", headers=auth)
@@ -164,6 +179,71 @@ def test_all_active_steps_complete_keeps_resumed_step_5(tmp_path: Path) -> None:
     assert data["completed_steps"] == [1, 2, 5]
     assert data["resumed_step"] == 5
     assert data["all_complete"] is True
+
+
+def test_step_2_without_a_configured_provider_is_rejected_and_writes_nothing(
+    tmp_path: Path,
+) -> None:
+    app = create_app(_settings(tmp_path), clock=FixedClock(NOW))
+
+    with TestClient(app) as client:
+        response = _put(client, _auth(app), 2, key="no-provider")
+
+    assert response.status_code == 422, response.text
+    error = response.json()["error"]
+    assert error["code"] == "VALIDATION_FAILED"
+    assert error["details"][0]["field"] == "step"
+    assert error["details"][0]["code"] == "step_prerequisite_missing"
+    assert app.state.container.store.list_config() == ()
+    assert app.state.container.store.list_audit_events() == ()
+
+
+def test_step_5_without_a_starred_symbol_is_rejected_and_writes_nothing(
+    tmp_path: Path,
+) -> None:
+    app = create_app(_settings(tmp_path), clock=FixedClock(NOW))
+
+    with TestClient(app) as client:
+        response = _put(client, _auth(app), 5, key="no-star")
+
+    assert response.status_code == 422, response.text
+    error = response.json()["error"]
+    assert error["code"] == "VALIDATION_FAILED"
+    assert error["details"][0]["field"] == "step"
+    assert error["details"][0]["code"] == "step_prerequisite_missing"
+    assert app.state.container.store.list_config() == ()
+    assert app.state.container.store.list_audit_events() == ()
+
+
+def test_failed_prerequisite_releases_the_key_so_the_same_key_can_be_retried(
+    tmp_path: Path,
+) -> None:
+    app = create_app(_settings(tmp_path), clock=FixedClock(NOW))
+    auth = _auth(app)
+
+    with TestClient(app) as client:
+        first = _put(client, auth, 5, key="retry-key")
+        assert first.status_code == 422, first.text
+        # Satisfy the prerequisite, then retry with the SAME key: the failed
+        # reservation must have been released, so this executes (no conflict or
+        # replay).
+        _star(client, auth)
+        second = _put(client, auth, 5, key="retry-key")
+
+    assert second.status_code == 200, second.text
+    body = second.json()
+    assert body["meta"]["idempotent_replay"] is False
+    assert body["data"]["completed_steps"] == [5]
+    progress_rows = [
+        row for row in app.state.container.store.list_config() if row.key == ONBOARDING_KEY
+    ]
+    assert len(progress_rows) == 1
+    progress_audits = [
+        event
+        for event in app.state.container.store.list_audit_events()
+        if event.event_type == "CONFIG_UPDATED"
+    ]
+    assert len(progress_audits) == 1
 
 
 def test_idempotent_replay_returns_stored_envelope_and_writes_nothing(tmp_path: Path) -> None:
@@ -197,6 +277,40 @@ def test_completing_the_same_step_with_a_new_key_is_a_noop(tmp_path: Path) -> No
     assert response.json()["meta"]["idempotent_replay"] is False
     assert len(app.state.container.store.list_config()) == 1
     assert app.state.container.store.list_audit_events() == before_audits
+
+
+def test_recompleting_a_recorded_step_after_its_prerequisite_lapses_is_a_noop(
+    tmp_path: Path,
+) -> None:
+    # Completing an already-recorded step is the documented deterministic no-op
+    # even when the prerequisite has since lapsed: a re-completion persists
+    # nothing, so it must not re-evaluate the prerequisite or write/audit.
+    app = create_app(_settings(tmp_path), clock=FixedClock(NOW))
+    auth = _auth(app)
+
+    with TestClient(app) as client:
+        _star(client, auth)
+        first = _put(client, auth, 5, key="first")
+        assert first.status_code == 200, first.text
+        assert first.json()["data"]["completed_steps"] == [5]
+        row_before = app.state.container.store.get_config(ONBOARDING_KEY)
+        assert row_before is not None
+
+        unstar = client.delete("/api/v1/watchlist/BTCUSDT", headers=auth)
+        assert unstar.status_code == 200, unstar.text
+        # The unstar is its own audited change; only the repeat below must add
+        # nothing.
+        audits_before = app.state.container.store.list_audit_events()
+
+        response = _put(client, auth, 5, key="second")
+
+    assert response.status_code == 200, response.text
+    body = response.json()
+    assert body["data"]["completed_steps"] == [5]
+    assert body["meta"]["idempotent_replay"] is False
+    row_after = app.state.container.store.get_config(ONBOARDING_KEY)
+    assert row_after == row_before
+    assert app.state.container.store.list_audit_events() == audits_before
 
 
 @pytest.mark.parametrize("step", [3, 4])
@@ -235,6 +349,8 @@ def test_out_of_range_and_non_integer_steps_are_validation_failures(
 def test_corrupt_persisted_progress_is_config_invalid_on_read_and_write(
     tmp_path: Path,
 ) -> None:
+    # The persisted document is read and decoded before any prerequisite check,
+    # so a corrupt row fails as CONFIG_INVALID without needing a provider.
     app = create_app(_settings(tmp_path), clock=FixedClock(NOW))
     auth = _auth(app)
     _seed_corrupt(app)
@@ -266,10 +382,14 @@ def test_structured_corrupt_progress_is_config_invalid(tmp_path: Path) -> None:
 
 
 def test_responses_never_contain_or_echo_secret_shaped_values(tmp_path: Path) -> None:
-    app = create_app(_settings(tmp_path), clock=FixedClock(NOW))
+    app = create_app(
+        _settings(tmp_path, openai_api_key="sk-test-onboarding-echo"),
+        clock=FixedClock(NOW),
+    )
     auth = _auth(app)
 
     with TestClient(app) as client:
+        _star(client, auth)
         first = _put(client, auth, 1)
         second = _put(client, auth, 2, key="k2")
         fetched = client.get("/api/v1/settings/onboarding", headers=auth)

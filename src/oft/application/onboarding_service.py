@@ -118,6 +118,15 @@ class OnboardingProgressMixin:
     _store: StorePort
     _clock: ClockPort
 
+    def _secrets(self) -> Any:  # pragma: no cover - supplied by LLMSettingsMixin
+        """The secret reader supplied by ``LLMSettingsMixin`` on the host.
+
+        The MRO puts ``LLMSettingsMixin`` first, so the concrete
+        :class:`SettingsService` never executes this stub; it exists only so
+        the type checker accepts the prerequisite check below.
+        """
+        raise NotImplementedError
+
     def read_onboarding_progress(self) -> OnboardingProgress:
         """Completed first-run steps; a fresh install needs no config row."""
         record = self._store.get_config(ONBOARDING_PROGRESS_KEY)
@@ -130,11 +139,26 @@ class OnboardingProgressMixin:
         """Persist one active step, auditing only a real change.
 
         Deferred steps (3/4) and unknown steps are rejected with
-        ``VALIDATION_FAILED`` before any write. Completing an already-completed
-        step is a deterministic no-op (no row, no audit). A corrupt persisted
-        document fails closed as ``CONFIG_INVALID`` and is never overwritten.
+        ``VALIDATION_FAILED`` before any write. The persisted document is read
+        and decoded first, so a corrupt document fails closed as
+        ``CONFIG_INVALID`` and is never overwritten. Completing an
+        already-completed step is a deterministic no-op (no row, no audit, no
+        prerequisite re-evaluation). Only a step about to be persisted must
+        satisfy its server-side prerequisite (step 2: a configured LLM
+        provider; step 5: at least one starred symbol), so progress cannot
+        claim a state the underlying settings do not support; a failed
+        prerequisite writes nothing.
         """
         normalized = validate_onboarding_step(step)
+        # Read/decode before the prerequisite check so a corrupt document fails
+        # as CONFIG_INVALID (never as a prerequisite refusal), and so a repeat
+        # of an already-recorded step stays the documented no-op even if its
+        # prerequisite has since lapsed.
+        current = self._store.get_config(ONBOARDING_PROGRESS_KEY)
+        completed = () if current is None else _decode_onboarding_progress(current)
+        if normalized in completed:
+            return self.read_onboarding_progress()
+        self._check_step_prerequisites(normalized)
         timestamp = utc_timestamp(self._clock.now())
 
         def _build(
@@ -173,6 +197,48 @@ class OnboardingProgressMixin:
         # Read after the commit so the response reflects the committed row and
         # the server-derived resume point.
         return self.read_onboarding_progress()
+
+    def _check_step_prerequisites(self, step: int) -> None:
+        """Refuse a completion the underlying settings do not support.
+
+        Progress is not a client-declared claim: step 2 needs a configured LLM
+        provider (the same secret metadata the UI reads) and step 5 needs at
+        least one starred symbol. A failure raises before the store is touched,
+        so nothing is written and the idempotency reservation is released by
+        the route helper. Step order is deliberately not enforced.
+        """
+        if step == 2:
+            configured = any(status.configured for status in self._secrets().list_statuses())
+            if not configured:
+                message = (
+                    "step 2 requires at least one configured LLM provider; "
+                    "add a provider key before completing this step"
+                )
+                raise SettingValidationError(
+                    message,
+                    details=[
+                        {
+                            "field": "step",
+                            "code": "step_prerequisite_missing",
+                            "message": message,
+                        }
+                    ],
+                )
+        if step == 5 and self._store.watchlist_snapshot(limit=1).starred_count < 1:
+            message = (
+                "step 5 requires at least one starred watchlist symbol; "
+                "star a symbol before completing this step"
+            )
+            raise SettingValidationError(
+                message,
+                details=[
+                    {
+                        "field": "step",
+                        "code": "step_prerequisite_missing",
+                        "message": message,
+                    }
+                ],
+            )
 
 
 def validate_onboarding_step(value: object) -> int:

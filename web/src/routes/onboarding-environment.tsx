@@ -1,6 +1,15 @@
 import { useCallback, useEffect } from 'react'
 
-import type { ReadinessData, ReadinessEnvelope, ReadyCheck, StatusEnvelope } from '../api/status'
+import { errorMessage } from '../api/errors'
+import { ReadinessError } from '../api/status'
+import type {
+  ReadinessData,
+  ReadinessEnvelope,
+  ReadinessErrorDetail,
+  ReadyCheck,
+  StatusData,
+  StatusEnvelope,
+} from '../api/status'
 import { ReadOnlyField } from '../components/settings-field'
 import { useOnboardingLoad } from './use-onboarding-load'
 
@@ -28,9 +37,65 @@ export interface EnvironmentStepProps {
   announce: (message: string) => void
 }
 
+/**
+ * The two reads are independent: a failing `/ready` (the daemon answers 503
+ * whenever a named check is not ok) must not hide the environment panel, and
+ * the error envelope's per-check details still name what failed.
+ */
 interface EnvironmentData {
-  readiness: ReadinessData
-  status: NonNullable<StatusEnvelope['data']>
+  readiness: ReadinessData | null
+  readinessDetails: readonly ReadinessErrorDetail[]
+  readinessMessage: string | null
+  status: StatusData | null
+}
+
+interface CheckRow {
+  name: string
+  status: ReadyCheck['status']
+  detail: string
+}
+
+function checkStatusFromCode(code: string): ReadyCheck['status'] {
+  return code === 'ok' || code === 'degraded' || code === 'offline' || code === 'unknown'
+    ? code
+    : 'unknown'
+}
+
+function failureRows(details: readonly ReadinessErrorDetail[]): CheckRow[] {
+  return details.map((detail) => ({
+    name: detail.field,
+    status: checkStatusFromCode(detail.code),
+    detail: detail.message,
+  }))
+}
+
+function CheckTable({ rows }: { rows: readonly CheckRow[] }) {
+  return (
+    // eslint-disable-next-line jsx-a11y/no-noninteractive-tabindex -- scrollable table
+    <div className="table-wrap" role="region" aria-label="本机预检结果" tabIndex={0}>
+      <table className="data-table">
+        <caption>命名的预检项及其真实状态</caption>
+        <thead>
+          <tr>
+            <th scope="col">检查</th>
+            <th scope="col">状态</th>
+            <th scope="col">详情</th>
+          </tr>
+        </thead>
+        <tbody>
+          {rows.map((check) => (
+            <tr key={check.name} data-testid={`check-${check.name}`}>
+              <td className="mono">{check.name}</td>
+              <td>
+                <span className={CHECK_CHIP[check.status]}>{CHECK_LABELS[check.status]}</span>
+              </td>
+              <td>{check.detail}</td>
+            </tr>
+          ))}
+        </tbody>
+      </table>
+    </div>
+  )
 }
 
 export function EnvironmentStep({
@@ -43,31 +108,52 @@ export function EnvironmentStep({
 }: EnvironmentStepProps) {
   const loader = useCallback(
     async (signal: AbortSignal): Promise<EnvironmentData> => {
-      const [readiness, status] = await Promise.all([
+      const [readinessResult, statusResult] = await Promise.allSettled([
         fetchReadinessFn(signal),
         fetchStatusFn(signal),
       ])
-      if (!readiness.data || !status.data) {
+      const readiness =
+        readinessResult.status === 'fulfilled' ? (readinessResult.value.data ?? null) : null
+      const status = statusResult.status === 'fulfilled' ? (statusResult.value.data ?? null) : null
+      // Only both reads failing is the generic error: a failing readiness with a
+      // successful status still renders the status panel and the named checks.
+      if (readiness === null && status === null) {
+        if (statusResult.status === 'rejected') {
+          throw statusResult.reason
+        }
+        if (readinessResult.status === 'rejected') {
+          throw readinessResult.reason
+        }
         throw new Error('预检响应为空；未执行任何保存。')
       }
-      return { readiness: readiness.data, status: status.data }
+      let readinessDetails: readonly ReadinessErrorDetail[] = []
+      let readinessMessage: string | null = null
+      if (readinessResult.status === 'rejected') {
+        readinessMessage = errorMessage(readinessResult.reason)
+        if (readinessResult.reason instanceof ReadinessError) {
+          readinessDetails = readinessResult.reason.details
+        }
+      } else if (readinessResult.value.data === null) {
+        readinessMessage = '预检响应为空；未执行任何保存。'
+      }
+      return { readiness, readinessDetails, readinessMessage, status }
     },
     [fetchReadinessFn, fetchStatusFn],
   )
 
   const load = useOnboardingLoad(loader)
   const { state } = load
+  const data = load.data
 
   useEffect(() => {
     if (state === 'ready') {
-      announce('本机预检已加载。')
+      announce(data?.readiness ? '本机预检已加载。' : '环境信息已加载；本机预检不可用。')
     } else if (state === 'error') {
       announce('本机预检不可用。')
     }
-  }, [state, announce])
+  }, [state, announce, data?.readiness])
 
-  const data = load.data
-  const timezone = data?.status.schedule?.timezone ?? 'UTC'
+  const timezone = data?.status?.schedule?.timezone ?? 'UTC'
 
   return (
     <div className="stack">
@@ -93,30 +179,30 @@ export function EnvironmentStep({
           </>
         )}
         {state === 'ready' && data && (
-          // eslint-disable-next-line jsx-a11y/no-noninteractive-tabindex -- scrollable table
-          <div className="table-wrap" role="region" aria-label="本机预检结果" tabIndex={0}>
-            <table className="data-table">
-              <caption>命名的预检项及其真实状态</caption>
-              <thead>
-                <tr>
-                  <th scope="col">检查</th>
-                  <th scope="col">状态</th>
-                  <th scope="col">详情</th>
-                </tr>
-              </thead>
-              <tbody>
-                {data.readiness.checks.map((check) => (
-                  <tr key={check.name} data-testid={`check-${check.name}`}>
-                    <td className="mono">{check.name}</td>
-                    <td>
-                      <span className={CHECK_CHIP[check.status]}>{CHECK_LABELS[check.status]}</span>
-                    </td>
-                    <td>{check.detail}</td>
-                  </tr>
-                ))}
-              </tbody>
-            </table>
-          </div>
+          <>
+            {data.readiness && <CheckTable rows={data.readiness.checks} />}
+            {!data.readiness && data.readinessDetails.length > 0 && (
+              <>
+                <p className="status-message status-message--error" role="alert">
+                  本机预检未通过：{data.readinessMessage ?? '部分检查失败'}。未执行任何保存。
+                </p>
+                <CheckTable rows={failureRows(data.readinessDetails)} />
+              </>
+            )}
+            {!data.readiness && data.readinessDetails.length === 0 && (
+              <>
+                <p className="status-message status-message--error" role="alert">
+                  本机预检不可用：{data.readinessMessage ?? '未知错误'}。环境信息已加载，
+                  未执行任何保存。
+                </p>
+                <div className="settings-actions">
+                  <button type="button" className="control-btn" onClick={load.retry}>
+                    重试
+                  </button>
+                </div>
+              </>
+            )}
+          </>
         )}
       </section>
 
@@ -128,13 +214,13 @@ export function EnvironmentStep({
           <ReadOnlyField
             id="onboarding-data-dir"
             label="数据目录"
-            value={data?.status.data_dir ?? '—'}
+            value={data?.status?.data_dir ?? '—'}
             note="配置、SQLite、回补数据与审计日志均在此目录。"
           />
           <ReadOnlyField
             id="onboarding-bind"
             label="本地绑定"
-            value={data ? `${data.status.host}:${data.status.port}` : '—'}
+            value={data?.status ? `${data.status.host}:${data.status.port}` : '—'}
             note="默认仅绑定 127.0.0.1；无账户体系。"
           />
           <ReadOnlyField
@@ -175,9 +261,7 @@ export function EnvironmentStep({
           >
             {completing ? '保存中…' : '保存并继续'}
           </button>
-          <span className="hint">
-            退出可用 <code>oft init --resume</code> 继续。
-          </span>
+          <span className="hint">退出后重新打开 /onboarding 即可继续。</span>
         </div>
       </section>
     </div>

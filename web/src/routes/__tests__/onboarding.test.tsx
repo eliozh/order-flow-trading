@@ -1,4 +1,4 @@
-import { fireEvent, render, screen, waitFor } from '@testing-library/react'
+import { act, fireEvent, render, screen, waitFor } from '@testing-library/react'
 import { describe, expect, it, vi } from 'vitest'
 
 import type { BudgetEnvelope, BudgetUpdateEnvelope, BudgetUpdatePayload } from '../../api/budget'
@@ -13,10 +13,12 @@ import { completeOnboardingStep, ONBOARDING_STEPS } from '../../api/onboarding'
 import { SettingsApiError } from '../../api/settings'
 import { RequestTimeoutError } from '../../api/request-timeout'
 import type { StatusEnvelope } from '../../api/status'
+import { ReadinessError } from '../../api/status'
 import type { ReadinessEnvelope, ReadyCheck } from '../../api/status'
 import type { ScanSettingsEnvelope } from '../../api/settings'
 import type { StarEnvelope, WatchlistEnvelope, WatchlistRow } from '../../api/watchlist'
 import { OnboardingPage } from '../onboarding'
+import { adjustStarredCount } from '../use-watchlist-draft'
 
 const meta = {
   request_id: 'REQ-TEST',
@@ -396,31 +398,60 @@ describe('OnboardingPage step 1 — environment', () => {
     expect(screen.getByRole('group', { name: '交易环境' })).toHaveTextContent('Live 不在引导中启用')
   })
 
-  it('shows every readiness check as its real state, never a fake success', async () => {
-    renderOnboarding({
-      step: 1,
-      readiness: async () =>
-        readinessEnvelope([
-          { name: 'config', status: 'ok', detail: 'settings loaded' },
-          { name: 'storage.sqlite', status: 'ok', detail: 'integrity ok' },
-          { name: 'storage.parquet', status: 'degraded', detail: 'market layout not initialized' },
-          { name: 'clock', status: 'offline', detail: 'clock unavailable' },
-          { name: 'market_data', status: 'unknown', detail: 'probe skipped' },
-        ]),
-    })
+  it('shows every ready check as its real state with its detail', async () => {
+    renderOnboarding({ step: 1 })
 
     await stepHeading()
     expect(await screen.findByTestId('check-config')).toHaveTextContent('PASS')
-    expect(screen.getByTestId('check-storage.parquet')).toHaveTextContent('DEGRADED')
-    expect(screen.getByTestId('check-storage.parquet')).toHaveTextContent(
-      'market layout not initialized',
-    )
+    expect(screen.getByTestId('check-storage.sqlite')).toHaveTextContent('PASS')
+    expect(screen.getByTestId('check-storage.sqlite')).toHaveTextContent('integrity ok')
+    expect(screen.getByTestId('check-clock')).toHaveTextContent('PASS')
+    expect(document.getElementById('onboarding-data-dir')).toHaveTextContent('/tmp/oft')
+    expect(document.getElementById('onboarding-bind')).toHaveTextContent('127.0.0.1:7611')
+    expect(document.getElementById('onboarding-timezone')).toHaveTextContent('UTC')
+  })
+
+  it('renders named failures from a real 503 readiness error and still shows status', async () => {
+    renderOnboarding({
+      step: 1,
+      readiness: async () => {
+        throw new ReadinessError('One or more readiness checks failed.', 'STORAGE_UNAVAILABLE', [
+          { field: 'storage.parquet', code: 'degraded', message: 'market layout not initialized' },
+          { field: 'clock', code: 'offline', message: 'clock unavailable' },
+        ])
+      },
+    })
+
+    await stepHeading()
+    // The failing checks are named with their real status and detail.
+    const parquet = await screen.findByTestId('check-storage.parquet')
+    expect(parquet).toHaveTextContent('DEGRADED')
+    expect(parquet).toHaveTextContent('market layout not initialized')
     expect(screen.getByTestId('check-clock')).toHaveTextContent('FAIL')
-    const unknown = screen.getByTestId('check-market_data')
-    expect(unknown).toHaveTextContent('UNKNOWN')
-    // UNKNOWN is neutral, not a danger state.
-    expect(unknown.querySelector('.chip--danger')).toBeNull()
-    expect(screen.getByTestId('check-storage.parquet')).not.toHaveTextContent('PASS')
+    expect(screen.getByTestId('check-clock')).toHaveTextContent('clock unavailable')
+    // The independent status read still populated the environment panel.
+    expect(document.getElementById('onboarding-data-dir')).toHaveTextContent('/tmp/oft')
+    expect(document.getElementById('onboarding-bind')).toHaveTextContent('127.0.0.1:7611')
+    expect(document.getElementById('onboarding-timezone')).toHaveTextContent('UTC')
+  })
+
+  it('shows the generic preflight error only when both reads fail', async () => {
+    renderOnboarding({
+      step: 1,
+      readiness: async () => {
+        throw new Error('ready down')
+      },
+      status: async () => {
+        throw new Error('status down')
+      },
+    })
+
+    await stepHeading()
+    const alert = await screen.findByRole('alert')
+    expect(alert).toHaveTextContent('本机预检不可用')
+    expect(screen.queryByTestId('check-config')).toBeNull()
+    expect(document.getElementById('onboarding-data-dir')).toHaveTextContent('—')
+    expect(screen.getByRole('button', { name: '重试' })).toBeInTheDocument()
   })
 
   it('persists completion, announces it, and advances to step 2', async () => {
@@ -1145,6 +1176,191 @@ describe('OnboardingPage step 5 — watchlist, schedule, budget, review', () => 
     // Only the first named cap is rendered, and the omission is disclosed.
     expect(screen.queryByRole('button', { name: /星标 SYM13USDT/ })).toBeNull()
   })
+
+  it('shows the saved result, not the wizard review, when earlier steps are open', async () => {
+    const completeStep = vi.fn(async () =>
+      progressEnvelope(
+        progressData({ completed_steps: [5], resumed_step: 1, all_complete: false }),
+      ),
+    )
+    renderOnboarding({ step: 5, completeStep })
+
+    await stepHeading()
+    await screen.findByTestId('scan-source')
+    fireEvent.click(screen.getByRole('button', { name: '完成引导并查看首次扫描' }))
+
+    const saved = await screen.findByTestId('onboarding-step5-saved')
+    expect(saved).toHaveTextContent('步骤 5 已保存')
+    expect(screen.getByRole('link', { name: /继续步骤 1/ })).toHaveAttribute('href', '/onboarding/1')
+    // The server said the wizard is not complete: no review, no completion claim.
+    expect(screen.queryByTestId('onboarding-review')).toBeNull()
+    expect(screen.queryByText(/引导完成/)).toBeNull()
+    expect(screen.getByTestId('onboarding-live')).toHaveTextContent('步骤 5 已保存')
+    expect(screen.getByTestId('onboarding-live')).not.toHaveTextContent('引导已完成')
+    // Editing stays available so the remaining steps can be completed.
+    expect(screen.getByRole('button', { name: '完成引导并查看首次扫描' })).toBeInTheDocument()
+  })
+
+  it('uses the server starred total even when the star is outside the visible page', async () => {
+    const rows = [watchlistRow('AAAUSDT', false), watchlistRow('BBBUSDT', false)]
+    const completeStep = vi.fn(async () =>
+      progressEnvelope(
+        progressData({ completed_steps: [1, 2, 5], resumed_step: 5, all_complete: true }),
+      ),
+    )
+    renderOnboarding({
+      step: 5,
+      completeStep,
+      watchlist: async () =>
+        watchlistEnvelope(rows, { total: 500, truncated: true, next_scan_count: 1 }),
+    })
+
+    await stepHeading()
+    await screen.findByTestId('scan-source')
+    expect(screen.getByTestId('watchlist-validation')).toHaveTextContent('已星标 1 个')
+
+    fireEvent.click(screen.getByRole('button', { name: '完成引导并查看首次扫描' }))
+
+    await waitFor(() => expect(completeStep).toHaveBeenCalledWith(5, 'test-key'))
+    const review = await screen.findByTestId('onboarding-review')
+    expect(review).toHaveTextContent('1 个已星标')
+  })
+
+  it('adjusts the server starred total by local star toggles', async () => {
+    renderOnboarding({
+      step: 5,
+      watchlist: async () =>
+        watchlistEnvelope([watchlistRow('AAAUSDT', false), watchlistRow('BBBUSDT', false)], {
+          next_scan_count: 1,
+        }),
+    })
+
+    await stepHeading()
+    await screen.findByTestId('scan-source')
+    // The one starred symbol lives outside this page; the page rows say zero.
+    expect(screen.getByTestId('watchlist-validation')).toHaveTextContent('已星标 1 个')
+
+    fireEvent.click(screen.getByRole('button', { name: /星标 AAAUSDT/ }))
+    await waitFor(() =>
+      expect(screen.getByTestId('watchlist-validation')).toHaveTextContent('已星标 2 个'),
+    )
+
+    fireEvent.click(screen.getByRole('button', { name: /取消星标 AAAUSDT/ }))
+    await waitFor(() =>
+      expect(screen.getByTestId('watchlist-validation')).toHaveTextContent('已星标 1 个'),
+    )
+  })
+
+  it('does not double-count a starred symbol after a reload', () => {
+    const rows = [watchlistRow('AAAUSDT', true)]
+    // A fresh server total already includes the star; with no local deltas the
+    // count is the server value, never 2.
+    expect(adjustStarredCount(1, rows, {})).toBe(1)
+    expect(
+      adjustStarredCount(1, rows, {
+        AAAUSDT: { starred: true, starred_at: '2026-11-06T09:00:00.000Z' },
+      }),
+    ).toBe(1)
+  })
+
+  it('removes the stale summary when the last flagged field is corrected', async () => {
+    renderOnboarding({
+      step: 5,
+      watchlist: async () => watchlistEnvelope([watchlistRow('BTCUSDT', true)]),
+    })
+
+    await stepHeading()
+    await screen.findByTestId('scan-source')
+    const daily = screen.getByRole('spinbutton', { name: '日预算（USD）' })
+    fireEvent.change(daily, { target: { value: '' } })
+    fireEvent.click(screen.getByRole('button', { name: '完成引导并查看首次扫描' }))
+
+    const summary = await screen.findByTestId('onboarding-finish-error')
+    expect(summary).toHaveTextContent('日预算')
+
+    fireEvent.change(daily, { target: { value: '10.00' } })
+    await waitFor(() => expect(screen.queryByTestId('onboarding-finish-error')).toBeNull())
+  })
+
+  it('keeps concurrent validation errors when a pending star later resolves', async () => {
+    // An in-flight star must not apply a render-time snapshot of the issues:
+    // the submit below flags the watchlist and the daily budget while the star
+    // request is still pending, and the star's continuation must only clear
+    // its own field, not the still-valid budget error or the summary.
+    let resolveStar: (value: StarEnvelope) => void = () => {}
+    const star = vi.fn(
+      () =>
+        new Promise<StarEnvelope>((resolve) => {
+          resolveStar = resolve
+        }),
+    )
+    renderOnboarding({
+      step: 5,
+      star,
+      watchlist: async () => watchlistEnvelope([watchlistRow('ETHUSDT', false)]),
+    })
+
+    await stepHeading()
+    await screen.findByTestId('scan-source')
+    fireEvent.click(screen.getByRole('button', { name: /星标 ETHUSDT/ }))
+
+    const daily = screen.getByRole('spinbutton', { name: '日预算（USD）' })
+    fireEvent.change(daily, { target: { value: '' } })
+    fireEvent.click(screen.getByRole('button', { name: '完成引导并查看首次扫描' }))
+
+    const summary = await screen.findByTestId('onboarding-finish-error')
+    expect(summary).toHaveTextContent('至少星标 1 个标的')
+    expect(summary).toHaveTextContent('日预算必须是')
+    await waitFor(() => expect(daily).toHaveAttribute('aria-invalid', 'true'))
+
+    await act(async () => {
+      resolveStar({
+        ok: true,
+        data: { symbol: 'ETHUSDT', starred: true, starred_at: '2026-11-06T10:00:00.000Z' },
+        error: null,
+        meta,
+      })
+    })
+
+    // The star's success only clears its own issue; the budget error and the
+    // assertive summary survive because the budget is still invalid.
+    await waitFor(() =>
+      expect(screen.getByRole('button', { name: /取消星标 ETHUSDT/ })).toBeInTheDocument(),
+    )
+    expect(screen.getByRole('alert')).toBeInTheDocument()
+    expect(screen.getByTestId('onboarding-finish-error')).toHaveTextContent('日预算必须是')
+    expect(screen.getByTestId('onboarding-finish-error')).not.toHaveTextContent(
+      '至少星标 1 个标的',
+    )
+    expect(daily).toHaveAttribute('aria-invalid', 'true')
+  })
+
+  it('disables the star controls while a finish is in flight', async () => {
+    let resolveComplete: (value: OnboardingProgressEnvelope) => void = () => {}
+    const completeStep = vi.fn(
+      () =>
+        new Promise<OnboardingProgressEnvelope>((resolve) => {
+          resolveComplete = resolve
+        }),
+    )
+    renderOnboarding({ step: 5, completeStep })
+
+    await stepHeading()
+    await screen.findByTestId('scan-source')
+    const star = screen.getByRole('button', { name: /取消星标 BTCUSDT/ })
+    expect(star).toBeEnabled()
+
+    fireEvent.click(screen.getByRole('button', { name: '完成引导并查看首次扫描' }))
+    await waitFor(() => expect(completeStep).toHaveBeenCalled())
+    await waitFor(() => expect(star).toBeDisabled())
+
+    resolveComplete(
+      progressEnvelope(
+        progressData({ completed_steps: [1, 2, 5], resumed_step: 5, all_complete: true }),
+      ),
+    )
+    await screen.findByTestId('onboarding-review')
+  })
 })
 
 describe('OnboardingPage accessibility and read-only surfaces', () => {
@@ -1163,7 +1379,7 @@ describe('OnboardingPage accessibility and read-only surfaces', () => {
 
     await stepHeading()
     expect(screen.getByRole('note')).toHaveTextContent(
-      '移动端只读：请在桌面端或使用 CLI（oft init --resume）完成引导。',
+      '移动端只读：请在桌面端（宽度 ≥ 769px）打开本页完成引导。',
     )
     expect(screen.getByRole('button', { name: '保存并继续' })).toBeDisabled()
     expect(screen.getByRole('radio', { name: /Paper/ })).toBeDisabled()

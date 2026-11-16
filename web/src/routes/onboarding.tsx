@@ -209,9 +209,11 @@ export function OnboardingPage({
     }
   }, [load.state])
 
-  async function complete(stepNumber: OnboardingStepNumber): Promise<boolean> {
+  async function complete(
+    stepNumber: OnboardingStepNumber,
+  ): Promise<OnboardingProgressData | null> {
     if (inFlight.current) {
-      return false
+      return null
     }
     inFlight.current = true
     setStepError(null)
@@ -228,7 +230,9 @@ export function OnboardingPage({
       if (stepNumber !== 5) {
         navigate(`/onboarding/${envelope.data.resumed_step}`)
       }
-      return true
+      // Hand the server's completion claim back to the step so the step-5
+      // review is never rendered from a local "finish succeeded" flag.
+      return envelope.data
     } catch (error: unknown) {
       const failure = settleOnboardingMutation(error, label, {
         rotate: rotateIdempotencyKeyFn,
@@ -237,7 +241,7 @@ export function OnboardingPage({
       // A fresh object (not just the string) keeps a repeated identical failure
       // observable, so focus re-runs on the second attempt.
       setStepError({ message: failure.message })
-      return false
+      return null
     } finally {
       inFlight.current = false
       setCompleting(null)
@@ -347,7 +351,7 @@ export function OnboardingPage({
 
       {narrow && (
         <p className="readonly-note" role="note" id="onboarding-readonly-note">
-          移动端只读：请在桌面端或使用 CLI（oft init --resume）完成引导。
+          移动端只读：请在桌面端（宽度 ≥ 769px）打开本页完成引导。
         </p>
       )}
 

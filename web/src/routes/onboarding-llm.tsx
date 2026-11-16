@@ -176,7 +176,7 @@ export function LLMStep({
         {state === 'ready' && data && (
           <>
             <p className="status-message" data-testid="llm-provider-summary">
-              {providers.filter((row) => row.configured).length} 个 provider 已验证 ·{' '}
+              {providers.filter((row) => row.configured).length} 个 provider 已配置 ·{' '}
               {providers.filter((row) => !row.configured).length} 个未配置
             </p>
             <div className="stack onboarding-pad">

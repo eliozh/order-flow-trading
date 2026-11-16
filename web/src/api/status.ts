@@ -157,6 +157,20 @@ function isNullableString(value: unknown): value is string | null {
   return value === null || typeof value === 'string'
 }
 
+/** Shape guard for the envelope metadata every success response carries. */
+export function isApiMeta(value: unknown): value is ApiMeta {
+  return (
+    isRecord(value) &&
+    typeof value.request_id === 'string' &&
+    typeof value.generated_at === 'string' &&
+    typeof value.duration_ms === 'number' &&
+    typeof value.provenance === 'string' &&
+    isNullableString(value.data_quality) &&
+    Array.isArray(value.warnings) &&
+    typeof value.idempotent_replay === 'boolean'
+  )
+}
+
 function isReadyCheck(value: unknown): value is ReadyCheck {
   if (!isRecord(value)) {
     return false
@@ -168,6 +182,45 @@ function isReadyCheck(value: unknown): value is ReadyCheck {
       value.status === 'offline' ||
       value.status === 'unknown') &&
     typeof value.detail === 'string'
+  )
+}
+
+/** Shape guard for one universe item; the consumer reads every field. */
+export function isSymbolInfo(value: unknown): value is SymbolInfo {
+  return (
+    isRecord(value) &&
+    typeof value.symbol === 'string' &&
+    typeof value.base_asset === 'string' &&
+    typeof value.quote_asset === 'string' &&
+    typeof value.contract_type === 'string' &&
+    typeof value.tradifi === 'boolean'
+  )
+}
+
+/** Shape guard for ``latest_scan``; every declared field is verified. */
+export function isScanRecordData(value: unknown): value is ScanRecordData {
+  return (
+    isRecord(value) &&
+    typeof value.scan_id === 'string' &&
+    typeof value.symbol === 'string' &&
+    typeof value.period === 'string' &&
+    typeof value.status === 'string' &&
+    typeof value.trigger_source === 'string' &&
+    typeof value.metrics_only === 'boolean' &&
+    typeof value.fixture_path === 'string' &&
+    typeof value.started_at === 'string' &&
+    typeof value.finished_at === 'string' &&
+    typeof value.window_start === 'string' &&
+    typeof value.window_end === 'string' &&
+    typeof value.trade_count === 'number' &&
+    typeof value.buy_volume === 'string' &&
+    typeof value.sell_volume === 'string' &&
+    typeof value.delta === 'string' &&
+    typeof value.cvd === 'string' &&
+    typeof value.data_quality === 'string' &&
+    typeof value.manifest_path === 'string' &&
+    typeof value.parquet_rows === 'number' &&
+    typeof value.created_at === 'string'
   )
 }
 
@@ -192,6 +245,7 @@ export function isStatusData(value: unknown): value is StatusData {
     typeof universe.count === 'number' &&
     typeof universe.tradifi_count === 'number' &&
     Array.isArray(universe.symbols) &&
+    universe.symbols.every(isSymbolInfo) &&
     (schedule === undefined ||
       schedule === null ||
       (isRecord(schedule) &&
@@ -215,19 +269,53 @@ export function isReadinessData(value: unknown): value is ReadinessData {
     typeof value.checked_at === 'string' &&
     Array.isArray(value.checks) &&
     value.checks.every(isReadyCheck) &&
-    (value.latest_scan === null || isRecord(value.latest_scan))
+    (value.latest_scan === null || isScanRecordData(value.latest_scan))
   )
+}
+
+/** One named failing readiness check carried by a non-2xx `/ready` envelope. */
+export interface ReadinessErrorDetail {
+  readonly field: string
+  readonly code: string
+  readonly message: string
 }
 
 /** The daemon answered `/ready` but readiness is not OK (non-2xx envelope). */
 export class ReadinessError extends Error {
   readonly code: string | undefined
+  readonly details: readonly ReadinessErrorDetail[]
 
-  constructor(message: string, code?: string) {
+  constructor(
+    message: string,
+    code?: string,
+    details: readonly ReadinessErrorDetail[] = [],
+  ) {
     super(message)
     this.name = 'ReadinessError'
     this.code = code
+    this.details = details
   }
+}
+
+/** Extract the named check details from an untrusted error envelope. */
+function bodyErrorDetails(
+  body: Record<string, unknown> | null,
+): readonly ReadinessErrorDetail[] {
+  if (!body || !isRecord(body.error) || !Array.isArray(body.error.details)) {
+    return []
+  }
+  const details: ReadinessErrorDetail[] = []
+  for (const item of body.error.details) {
+    if (
+      isRecord(item) &&
+      typeof item.field === 'string' &&
+      typeof item.code === 'string' &&
+      typeof item.message === 'string'
+    ) {
+      details.push({ field: item.field, code: item.code, message: item.message })
+    }
+  }
+  return details
 }
 
 export async function fetchStatus(signal?: AbortSignal): Promise<StatusEnvelope> {
@@ -251,7 +339,11 @@ export async function fetchStatus(signal?: AbortSignal): Promise<StatusEnvelope>
   if (!isStatusData(data)) {
     throw new ApiShapeError('The status response was not in the expected shape.')
   }
-  return body as unknown as StatusEnvelope
+  // Build the envelope explicitly: `meta` is validated, never asserted.
+  if (!isApiMeta(body.meta)) {
+    throw new ApiShapeError('The status response meta was not in the expected shape.')
+  }
+  return { ok: true, data, error: null, meta: body.meta }
 }
 
 export async function fetchHealth(): Promise<HealthEnvelope> {
@@ -282,12 +374,13 @@ export async function fetchReadiness(signal?: AbortSignal): Promise<ReadinessEnv
   const envelope = isRecord(body) ? body : null
   if (!response.ok) {
     // A 503 still proves the daemon answered; surface it as a typed error so
-    // the caller can render NOT_READY instead of OFFLINE.
+    // the caller can render NOT_READY (and its named checks) instead of OFFLINE.
     throw new ReadinessError(
       envelope
         ? bodyErrorMessage(envelope, `Readiness request failed with HTTP ${response.status}`)
         : `Readiness request failed with HTTP ${response.status}`,
       bodyErrorCode(envelope),
+      bodyErrorDetails(envelope),
     )
   }
   if (!envelope) {
@@ -298,10 +391,14 @@ export async function fetchReadiness(signal?: AbortSignal): Promise<ReadinessEnv
     throw new ReadinessError(
       bodyErrorMessage(envelope, 'Readiness check returned an error'),
       bodyErrorCode(envelope),
+      bodyErrorDetails(envelope),
     )
   }
   if (!isReadinessData(data)) {
     throw new ApiShapeError('The readiness response was not in the expected shape.')
   }
-  return envelope as unknown as ReadinessEnvelope
+  if (!isApiMeta(envelope.meta)) {
+    throw new ApiShapeError('The readiness response meta was not in the expected shape.')
+  }
+  return { ok: true, data, error: null, meta: envelope.meta }
 }

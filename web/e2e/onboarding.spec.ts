@@ -26,7 +26,7 @@ const SCREENS_DIR =
   path.resolve(ROOT, '.claude', 'ecc-workflow', 'screens', 'slice-44-e2e')
 
 const HEADING = { level: 1 } as const
-const READ_ONLY_NOTE = '移动端只读：请在桌面端或使用 CLI（oft init --resume）完成引导。'
+const READ_ONLY_NOTE = '移动端只读：请在桌面端（宽度 ≥ 769px）打开本页完成引导。'
 const AXE_TAGS = ['wcag2a', 'wcag2aa', 'wcag21a', 'wcag21aa', 'wcag22aa']
 
 interface BrowserDiagnostics {
@@ -56,7 +56,15 @@ function expectClean(diagnostics: BrowserDiagnostics, allowed: readonly string[]
 }
 
 async function expectNoAxeViolations(page: Page, label: string): Promise<void> {
-  const results = await new AxeBuilder({ page }).withTags(AXE_TAGS).analyze()
+  // `options()` replaces the builder options, so the tag filter and the
+  // explicitly enabled WCAG 2.2 target-size rule (disabled by default in
+  // axe-core) are supplied together rather than chaining `.withTags`.
+  const results = await new AxeBuilder({ page })
+    .options({
+      runOnly: { type: 'tag', values: AXE_TAGS },
+      rules: { 'target-size': { enabled: true } },
+    })
+    .analyze()
   const summary = results.violations.map(
     (violation) =>
       `${violation.id} (${violation.impact ?? 'unknown'}): ${violation.nodes
@@ -64,6 +72,12 @@ async function expectNoAxeViolations(page: Page, label: string): Promise<void> {
         .join(' | ')}`,
   )
   expect(results.violations, `${label} axe violations:\n${summary.join('\n')}`).toEqual([])
+  // Prove the explicitly enabled WCAG 2.2 rule was evaluated, not silently
+  // dropped by the tag filter.
+  const targetSizeRan = [...results.passes, ...results.incomplete, ...results.violations].some(
+    (result) => result.id === 'target-size',
+  )
+  expect(targetSizeRan, `${label}: target-size rule did not run`).toBe(true)
 }
 
 /** Mint a browser session from the daemon's one-time bootstrap file. */
@@ -299,6 +313,30 @@ test('step 5 stays within a 320px viewport and the star control is not glyph-siz
   const box = await star.boundingBox()
   expect(box?.height ?? 0).toBeGreaterThanOrEqual(44)
   expect(box?.width ?? 0).toBeGreaterThan(44)
+
+  expectClean(diagnostics)
+})
+
+test('step 5 shows every failing field link and runs the WCAG 2.2 target-size rule', async ({
+  page,
+}) => {
+  const diagnostics = collectDiagnostics(page)
+  await page.setViewportSize({ width: 1440, height: 900 })
+  await authenticate(page)
+  await page.goto('/onboarding/5')
+  await expect(page.getByRole('heading', HEADING)).toContainText('Watchlist')
+  await expect(page.getByTestId('scan-source')).toBeVisible()
+
+  // Two independent failures at once: nothing is starred and the daily budget
+  // is empty, so the summary renders two field links (the SC 2.5.8 state).
+  await page.locator('#onboarding-budget-daily').fill('')
+  await page.getByRole('button', { name: '完成引导并查看首次扫描' }).click()
+
+  const finishError = page.getByTestId('onboarding-finish-error')
+  await expect(finishError).toBeVisible()
+  await expect(finishError.getByRole('link', { name: /首批标的/ })).toBeVisible()
+  await expect(finishError.getByRole('link', { name: /日预算/ })).toBeVisible()
+  await expectNoAxeViolations(page, 'step 5 multi-issue summary')
 
   expectClean(diagnostics)
 })

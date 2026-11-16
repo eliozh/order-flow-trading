@@ -2743,6 +2743,20 @@ code {
   padding-left: 18px;
 }
 
+/* WCAG 2.2 SC 2.5.8: each field link is its whole list row (no inline prose),
+   so it needs a real 24px target at every width; row spacing keeps adjacent
+   links from sharing the same 24px band. */
+.onboarding-page .onboarding-error-list li + li {
+  margin-top: 4px;
+}
+
+.onboarding-page .onboarding-error-list a {
+  display: inline-flex;
+  align-items: center;
+  min-height: 24px;
+  padding: 2px 0;
+}
+
 .onboarding-page .check {
   display: flex;
   align-items: flex-start;
