@@ -4,6 +4,7 @@ import { isAbortError } from '../api/abort'
 import {
   describeCondition,
   fetchOpportunities,
+  formatOpportunityAge,
   type OpportunityListEnvelope,
   type OpportunityState,
   type OpportunitySummary,
@@ -18,6 +19,8 @@ interface OpportunitiesPageProps {
     signal?: AbortSignal,
   ) => Promise<OpportunityListEnvelope>
   isCompact?: boolean
+  /** Injectable clock so the age column is deterministic under test. */
+  now?: () => Date
 }
 
 interface LedgerState {
@@ -66,6 +69,7 @@ function overallCount(counts: Record<OpportunityState, number>): number {
 export function OpportunitiesPage({
   fetchOpportunitiesFn = fetchOpportunities,
   isCompact,
+  now = () => new Date(),
 }: OpportunitiesPageProps) {
   const [load, setLoad] = useState<LedgerState>({
     state: 'loading',
@@ -75,6 +79,7 @@ export function OpportunitiesPage({
   })
   const [filter, setFilter] = useState<OpportunityState>('OPEN')
   const compact = useCompact(isCompact)
+  const renderedAt = now()
 
   useEffect(() => {
     const controller = new AbortController()
@@ -280,7 +285,9 @@ export function OpportunitiesPage({
                         <th scope="col">Zone</th>
                         <th scope="col">Trigger</th>
                         <th scope="col">Confidence</th>
+                        <th scope="col">Age</th>
                         <th scope="col">Expiry</th>
+                        <th scope="col">Source</th>
                         <th scope="col">State</th>
                       </tr>
                     </thead>
@@ -313,7 +320,35 @@ export function OpportunitiesPage({
                               <span className="mono">{item.confidence}</span>{' '}
                               {band !== null && <span className="chip">{band}</span>}
                             </td>
+                            <td className="mono">
+                              {formatOpportunityAge(item.created_at, renderedAt)}
+                            </td>
                             <td className="mono">{utcLabel(item.expires_at)} UTC</td>
+                            <td>
+                              {item.source.scan_id ? (
+                                <>
+                                  <a
+                                    className="rowlink mono"
+                                    href={`/scans/${encodeURIComponent(item.source.scan_id)}`}
+                                  >
+                                    {item.source.scan_id}
+                                  </a>
+                                  <br />
+                                  {item.source.report_id ? (
+                                    <a
+                                      className="rowlink mono-muted"
+                                      href={`/reports/${encodeURIComponent(item.source.report_id)}`}
+                                    >
+                                      {item.source.report_id}
+                                    </a>
+                                  ) : (
+                                    <span className="mono-muted">N/A</span>
+                                  )}
+                                </>
+                              ) : (
+                                <span className="mono-muted">N/A</span>
+                              )}
+                            </td>
                             <td>
                               <span className={STATE_CHIP[item.state]}>{item.state}</span>
                             </td>

@@ -225,6 +225,38 @@ function stringParam(params: Record<string, unknown>, key: string): string | nul
   return typeof value === 'string' && value.length > 0 ? value : null
 }
 
+/**
+ * Age of a ledger entry against an explicit clock. `< 1h` is whole minutes
+ * (`42m`), `< 24h` is hours plus zero-padded minutes (`2h 04m`), and anything
+ * older is days plus zero-padded hours (`1d 02h`). A missing, unparseable, or
+ * future timestamp renders `N/A` — never `NaN`, a blank, or an invented value.
+ */
+export function formatOpportunityAge(createdAt: string | null | undefined, now: Date): string {
+  if (!createdAt) {
+    return 'N/A'
+  }
+  const createdMs = new Date(createdAt).getTime()
+  const nowMs = now.getTime()
+  if (Number.isNaN(createdMs) || Number.isNaN(nowMs) || createdMs > nowMs) {
+    return 'N/A'
+  }
+  const totalMinutes = Math.floor((nowMs - createdMs) / 60_000)
+  if (totalMinutes < 60) {
+    return `${totalMinutes}m`
+  }
+  const totalHours = Math.floor(totalMinutes / 60)
+  if (totalHours < 24) {
+    return `${totalHours}h ${String(totalMinutes % 60).padStart(2, '0')}m`
+  }
+  const days = Math.floor(totalHours / 24)
+  return `${days}d ${String(totalHours % 24).padStart(2, '0')}h`
+}
+
+/** The existing read-only contract export for one opportunity. */
+export function opportunityExportPath(opportunityId: string): string {
+  return `/api/v1/opportunities/${encodeURIComponent(opportunityId)}/export`
+}
+
 /** A short, deterministic label for a condition. Never derived from narrative. */
 export function describeCondition(condition: OpportunityCondition): string {
   const type = condition.type.replaceAll('_', ' ').toLowerCase()

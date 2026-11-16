@@ -33,6 +33,7 @@ SYMBOLS_SCREENS_DIR="$ROOT/.claude/ecc-workflow/screens/e2e02"
 REPORTS_SCREENS_DIR="$ROOT/.claude/ecc-workflow/screens/e2e08"
 JOURNAL_SCREENS_DIR="$ROOT/.claude/ecc-workflow/screens/slice-30"
 CHART_SCREENS_DIR="$ROOT/.claude/ecc-workflow/screens/e2e40"
+OPPORTUNITIES_SCREENS_DIR="$ROOT/.claude/ecc-workflow/screens/e2e41"
 MARKET_FIXTURE="$ROOT/tests/fixtures/market/btcusdt_agg-trades_sample.csv"
 EXCHANGE_INFO_FIXTURE="$ROOT/tests/fixtures/binance/exchange_info_sample.json"
 ARCHIVE_FIXTURE_DIR="$ROOT/tests/fixtures/archive"
@@ -661,6 +662,9 @@ export OFT_E2E_JOURNAL_SCREENS_DIR="$JOURNAL_SCREENS_DIR"
 # Slice 40: the report whose chart carries server-derived overlays.
 export OFT_E2E_CHART_OVERLAY_REPORT_ID="$BATCH_REPORT_ID"
 export OFT_E2E_CHART_OVERLAY_SCREENS_DIR="$CHART_SCREENS_DIR"
+# Slice 41: the read-only opportunity ledger screenshots (the spec discovers the
+# seeded opportunity through the API; no id export is needed).
+export OFT_E2E_OPPORTUNITIES_SCREENS_DIR="$OPPORTUNITIES_SCREENS_DIR"
 export OFT_E2E_REPORT_API_TOKEN="$REPORTS_TOKEN"
 export OFT_E2E_DATA_DIR="$SYSTEM_DATA_DIR"
 export OFT_E2E_SCAN_ID="$SCAN_ID"
@@ -685,7 +689,7 @@ else
   export OFT_E2E_REPORT_DIR="$REPORTS_SCREENS_DIR/report"
 fi
 
-mkdir -p "$SYSTEM_SCREENS_DIR" "$SYMBOLS_SCREENS_DIR" "$REPORTS_SCREENS_DIR" "$JOURNAL_SCREENS_DIR" "$CHART_SCREENS_DIR"
+mkdir -p "$SYSTEM_SCREENS_DIR" "$SYMBOLS_SCREENS_DIR" "$REPORTS_SCREENS_DIR" "$JOURNAL_SCREENS_DIR" "$CHART_SCREENS_DIR" "$OPPORTUNITIES_SCREENS_DIR"
 echo "system e2e daemon: $SYSTEM_BASE_URL · data: $SYSTEM_DATA_DIR · scan: $SCAN_ID · delta: $SCAN_DELTA"
 echo "symbol e2e daemon: $SYMBOLS_BASE_URL · data: $SYMBOLS_DATA_DIR · seeded from $EXCHANGE_INFO_FIXTURE"
 echo "report e2e daemon: $REPORTS_BASE_URL · data: $REPORTS_DATA_DIR · report: $REPORT_ID"

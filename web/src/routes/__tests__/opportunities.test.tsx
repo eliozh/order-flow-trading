@@ -2,13 +2,15 @@ import { fireEvent, render, screen, within } from '@testing-library/react'
 import { describe, expect, it, vi } from 'vitest'
 
 import type { ApiMeta } from '../../api/status'
-import type {
-  OpportunityCondition,
-  OpportunityData,
-  OpportunityEnvelope,
-  OpportunityListEnvelope,
-  OpportunityState,
-  OpportunitySummary,
+import {
+  formatOpportunityAge,
+  opportunityExportPath,
+  type OpportunityCondition,
+  type OpportunityData,
+  type OpportunityEnvelope,
+  type OpportunityListEnvelope,
+  type OpportunityState,
+  type OpportunitySummary,
 } from '../../api/opportunities'
 import { OpportunityDetailPage } from '../opportunity-detail'
 import { OpportunitiesPage } from '../opportunities'
@@ -191,6 +193,37 @@ async function renderLedger(
   return { ...view, fetchOpportunitiesFn }
 }
 
+describe('formatOpportunityAge', () => {
+  const now = new Date('2026-11-06T12:00:00.000Z')
+
+  it('formats under an hour as whole minutes', () => {
+    expect(formatOpportunityAge('2026-11-06T11:18:00.000Z', now)).toBe('42m')
+    expect(formatOpportunityAge('2026-11-06T11:59:59.000Z', now)).toBe('0m')
+  })
+
+  it('formats hours with zero-padded minutes', () => {
+    expect(formatOpportunityAge('2026-11-06T11:00:00.000Z', now)).toBe('1h 00m')
+    expect(formatOpportunityAge('2026-11-06T09:56:00.000Z', now)).toBe('2h 04m')
+  })
+
+  it('formats days with zero-padded hours', () => {
+    expect(formatOpportunityAge('2026-11-05T12:00:00.000Z', now)).toBe('1d 00h')
+    expect(formatOpportunityAge('2026-11-05T10:00:00.000Z', now)).toBe('1d 02h')
+  })
+
+  it('renders N/A for invalid, missing, and future timestamps', () => {
+    expect(formatOpportunityAge('not-a-date', now)).toBe('N/A')
+    expect(formatOpportunityAge('', now)).toBe('N/A')
+    expect(formatOpportunityAge(null, now)).toBe('N/A')
+    expect(formatOpportunityAge(undefined, now)).toBe('N/A')
+    expect(formatOpportunityAge('2026-11-06T12:00:01.000Z', now)).toBe('N/A')
+  })
+
+  it('encodes the opportunity id in the export path', () => {
+    expect(opportunityExportPath('OPP:1')).toBe('/api/v1/opportunities/OPP%3A1/export')
+  })
+})
+
 describe('OpportunitiesPage filters and counts', () => {
   it('shows loading while the ledger request is pending', () => {
     render(
@@ -283,6 +316,83 @@ describe('OpportunitiesPage filters and counts', () => {
       'href',
       '/opportunities/OPP-OPEN',
     )
+  })
+
+  it('renders the Source and Age columns for a ledger row', async () => {
+    const item = opportunity({
+      opportunity_id: 'OPP-ROW',
+      created_at: '2026-11-06T11:18:00.000Z',
+    })
+    render(
+      <OpportunitiesPage
+        fetchOpportunitiesFn={ledgerFetcher([item])}
+        now={() => new Date('2026-11-06T12:00:00.000Z')}
+      />,
+    )
+    await screen.findByRole('tab', { name: /Open/ })
+
+    expect(screen.getByRole('columnheader', { name: 'Source' })).toBeInTheDocument()
+    expect(screen.getByRole('columnheader', { name: 'Age' })).toBeInTheDocument()
+
+    const row = screen.getByRole('link', { name: 'OPP-ROW' }).closest('tr')
+    if (!row) {
+      throw new Error('missing ledger row')
+    }
+    expect(within(row).getByRole('link', { name: 'SCAN-1' })).toHaveAttribute(
+      'href',
+      '/scans/SCAN-1',
+    )
+    expect(within(row).getByRole('link', { name: 'RPT-1' })).toHaveAttribute(
+      'href',
+      '/reports/RPT-1',
+    )
+    expect(within(row).getByText('42m')).toBeInTheDocument()
+  })
+
+  it('renders N/A when a row has no source scan, never a blank or invented link', async () => {
+    const item = opportunity({
+      opportunity_id: 'OPP-NOSCAN',
+      source: { scan_id: '', report_id: 'RPT-1', decision_id: 'DEC-1' },
+    })
+    render(
+      <OpportunitiesPage
+        fetchOpportunitiesFn={ledgerFetcher([item])}
+        now={() => new Date('2026-11-06T12:00:00.000Z')}
+      />,
+    )
+    await screen.findByRole('tab', { name: /Open/ })
+
+    const row = screen.getByRole('link', { name: 'OPP-NOSCAN' }).closest('tr')
+    if (!row) {
+      throw new Error('missing ledger row')
+    }
+    expect(within(row).getByText('N/A')).toBeInTheDocument()
+    expect(within(row).queryByRole('link', { name: 'RPT-1' })).not.toBeInTheDocument()
+    expect(within(row).queryByRole('link', { name: /^SCAN/ })).not.toBeInTheDocument()
+  })
+
+  it('keeps the scan link and shows N/A when only the source report is missing', async () => {
+    const item = opportunity({
+      opportunity_id: 'OPP-NORPT',
+      source: { scan_id: 'SCAN-9', report_id: '', decision_id: 'DEC-1' },
+    })
+    render(
+      <OpportunitiesPage
+        fetchOpportunitiesFn={ledgerFetcher([item])}
+        now={() => new Date('2026-11-06T12:00:00.000Z')}
+      />,
+    )
+    await screen.findByRole('tab', { name: /Open/ })
+
+    const row = screen.getByRole('link', { name: 'OPP-NORPT' }).closest('tr')
+    if (!row) {
+      throw new Error('missing ledger row')
+    }
+    expect(within(row).getByRole('link', { name: 'SCAN-9' })).toHaveAttribute(
+      'href',
+      '/scans/SCAN-9',
+    )
+    expect(within(row).getByText('N/A')).toBeInTheDocument()
   })
 
   it('announces the active filter and result count in a polite live region', async () => {
@@ -472,6 +582,25 @@ describe('OpportunityDetailPage', () => {
       'href',
       '/opportunities',
     )
+  })
+
+  it('links the read-only JSON export contract snapshot with no state control', async () => {
+    render(
+      <OpportunityDetailPage
+        opportunityId="OPP-1"
+        fetchOpportunityFn={detailById([opportunity()])}
+      />,
+    )
+    await screen.findByRole('heading', { name: 'OPP-1' })
+
+    const link = screen.getByRole('link', { name: 'Export JSON' })
+    expect(link).toHaveAttribute('href', '/api/v1/opportunities/OPP-1/export')
+    expect(link).toHaveAttribute('download')
+    expect(screen.getByText(/read-only contract snapshot/i)).toBeInTheDocument()
+    expect(screen.queryByRole('button')).not.toBeInTheDocument()
+    expect(
+      screen.queryByRole('link', { name: /accept|reject|trigger|cancel/i }),
+    ).not.toBeInTheDocument()
   })
 
   it('renders only links and read-only text, with no accept or reject action', async () => {

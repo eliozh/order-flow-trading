@@ -4,6 +4,7 @@ import {
   conditionThreshold,
   describeCondition,
   fetchOpportunity,
+  opportunityExportPath,
   type OpportunityCondition,
   type OpportunityData,
   type OpportunityEnvelope,
@@ -303,9 +304,23 @@ export function OpportunityDetailPage({
               </dd>
               <dt>Decision</dt>
               <dd className="mono">{opportunity.source.decision_id}</dd>
+              <dt>Export</dt>
+              <dd>
+                <a
+                  className="rowlink"
+                  href={opportunityExportPath(opportunity.opportunity_id)}
+                  download
+                >
+                  Export JSON
+                </a>
+              </dd>
               <dt>State</dt>
               <dd>code-owned · no manual trigger</dd>
             </dl>
+            <p className="panel-foot">
+              Export JSON is the read-only contract snapshot; downloading it never changes ledger
+              state.
+            </p>
           </section>
         </div>
 
