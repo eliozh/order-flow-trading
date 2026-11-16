@@ -104,4 +104,27 @@ describe('resolveRoute', () => {
     expect(resolveRoute('/paper').isJournal).toBe(false)
     expect(resolveRoute('/positions/POS-1').isJournal).toBe(false)
   })
+
+  it('routes the chart panel without a report detail id', () => {
+    const route = resolveRoute('/reports/RPT-1/chart')
+
+    expect(route.isChartPanel).toBe(true)
+    expect(route.chartReportId).toBe('RPT-1')
+    expect(route.reportId).toBeNull()
+  })
+
+  it('decodes the chart report id', () => {
+    const route = resolveRoute('/reports/RPT%2D1/chart')
+
+    expect(route.isChartPanel).toBe(true)
+    expect(route.chartReportId).toBe('RPT-1')
+  })
+
+  it('does not treat a deeper reports path as the chart panel', () => {
+    const route = resolveRoute('/reports/RPT-1/chart/extra')
+
+    expect(route.isChartPanel).toBe(false)
+    expect(route.chartReportId).toBeNull()
+    expect(route.reportId).toBeNull()
+  })
 })

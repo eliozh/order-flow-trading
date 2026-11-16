@@ -216,6 +216,12 @@ export function ReportDetailPage({
           </p>
         </div>
         <div className="report-stamps">
+          <a
+            className="btn sm"
+            href={`/reports/${encodeURIComponent(report.report_id)}/chart`}
+          >
+            Open chart panel
+          </a>
           <ProvenanceStamp kind="CALC" />
           <DataQualityBadge status={report.data_quality} reasons={metrics.quality_reasons} />
         </div>

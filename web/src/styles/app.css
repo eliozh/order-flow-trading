@@ -929,22 +929,22 @@ code {
   stroke-width: 1;
 }
 
+/* Direction carries a non-colour channel (DESIGN §13.2): up bars are filled
+   with a 1px top cap; down bars are an outline only. */
 .vol-up {
-  stroke: var(--oft-market-up);
+  fill: var(--oft-market-up);
+  stroke: none;
+  opacity: 0.65;
 }
 
 .vol-down {
+  fill: none;
   stroke: var(--oft-market-down);
 }
 
-.vol-up {
-  fill: var(--oft-market-up);
-  opacity: 0.65;
-}
-
-.vol-down {
-  fill: var(--oft-market-down);
-  opacity: 0.65;
+.vol-cap {
+  stroke: var(--oft-market-up);
+  stroke-width: 1;
 }
 
 .vp-bin {
@@ -1015,10 +1015,11 @@ code {
 
 .swatch--up {
   background: var(--oft-market-up);
+  border-top: 2px solid var(--oft-market-up);
 }
 
 .swatch--down {
-  background: var(--oft-market-down);
+  border: 1px solid var(--oft-market-down);
 }
 
 .chart-table-wrap {
@@ -2405,5 +2406,69 @@ code {
 @media (max-width: 768px) {
   .budget-threshold-grid {
     grid-template-columns: minmax(0, 1fr);
+  }
+}
+
+/* Slice 39: full-width chart-panel route. Sharp geometry, no motion. */
+.app-main--wide {
+  width: min(1600px, 100%);
+}
+
+.chart-panel {
+  min-width: 0;
+}
+
+.chart-period {
+  display: flex;
+  flex-wrap: wrap;
+  gap: var(--oft-space-2);
+  margin: var(--oft-space-3) 0;
+}
+
+.chart-period-item {
+  display: inline-flex;
+  min-width: 0;
+}
+
+.chart-period .control-btn {
+  min-width: 44px;
+}
+
+.chart-period .control-btn--active {
+  border-color: var(--oft-accent);
+  color: var(--oft-accent);
+}
+
+.chart-period .control-btn[aria-disabled='true'] {
+  border-color: var(--oft-border-subtle);
+  color: var(--oft-text-muted);
+  cursor: not-allowed;
+  opacity: 0.75;
+}
+
+.chart-unavailable {
+  min-width: 0;
+  padding: var(--oft-space-4);
+}
+
+.chart-gaps {
+  margin: var(--oft-space-2) 0 0;
+}
+
+.chart-table tbody tr.chart-row--selected td {
+  background: var(--oft-accent-muted-surface);
+}
+
+@media (max-width: 768px) {
+  .chart-period .control-btn {
+    flex: 1 1 auto;
+  }
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .chart-panel,
+  .chart-panel * {
+    animation: none;
+    transition: none;
   }
 }

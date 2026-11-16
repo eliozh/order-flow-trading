@@ -6,6 +6,7 @@ import type {
   SymbolContract,
   SymbolDetailEnvelope,
 } from '../../api/symbols'
+import type { ReportSummary } from '../../api/reports'
 import type {
   StarEnvelope,
   WatchlistEnvelope,
@@ -80,6 +81,24 @@ function detailEnvelope(contract: SymbolContract): SymbolDetailEnvelope {
     },
     error: null,
     meta,
+  }
+}
+
+function latestReport(): ReportSummary {
+  return {
+    report_id: 'RPT-BTCUSDT-1',
+    scan_id: 'SCAN-1',
+    symbol: 'BTCUSDT',
+    timeframe: '4h',
+    generated_at: '2026-11-06T04:00:00.000Z',
+    data_quality: 'PARTIAL',
+    llm_decision_id: null,
+    narrative_ref: null,
+    llm_stage: 'SKIPPED',
+    llm_tokens: 0,
+    cost_usd: '0',
+    cost_unpriced: false,
+    llm: { configured: false, validation_status: null, opportunity_ids: [] },
   }
 }
 
@@ -249,6 +268,34 @@ describe('SymbolInspectorPage', () => {
     expect(await screen.findByText('COMMODITY')).toBeInTheDocument()
     expect(screen.queryByText('COIN')).not.toBeInTheDocument()
     expect(screen.getByRole('heading', { name: 'Symbol XAUUSDT', level: 1 })).toBeInTheDocument()
+  })
+
+  it('links to the latest report chart when a report exists', async () => {
+    render(
+      <SymbolInspectorPage
+        symbol="BTCUSDT"
+        fetchSymbolFn={async () => detailEnvelope(btc)}
+        fetchLatestReportFn={async () => latestReport()}
+        isCompact={false}
+      />,
+    )
+
+    const link = await screen.findByRole('link', { name: /Open latest report chart/i })
+    expect(link).toHaveAttribute('href', '/reports/RPT-BTCUSDT-1/chart')
+  })
+
+  it('renders no chart link when no report exists yet', async () => {
+    render(
+      <SymbolInspectorPage
+        symbol="BTCUSDT"
+        fetchSymbolFn={async () => detailEnvelope(btc)}
+        fetchLatestReportFn={async () => null}
+        isCompact={false}
+      />,
+    )
+
+    await screen.findByRole('heading', { name: 'Symbol BTCUSDT', level: 1 })
+    expect(screen.queryByRole('link', { name: /Open latest report chart/i })).not.toBeInTheDocument()
   })
 })
 

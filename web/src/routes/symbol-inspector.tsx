@@ -6,11 +6,14 @@ import {
   type SymbolCoverage,
   type SymbolDetailEnvelope,
 } from '../api/symbols'
+import { fetchLatestReportForSymbol } from '../api/charts'
+import type { ReportSummary } from '../api/reports'
 import { useCompact } from '../hooks/use-compact'
 
 interface SymbolInspectorPageProps {
   symbol: string
   fetchSymbolFn?: (symbol: string) => Promise<SymbolDetailEnvelope>
+  fetchLatestReportFn?: (symbol: string, signal?: AbortSignal) => Promise<ReportSummary | null>
   isCompact?: boolean
 }
 
@@ -28,9 +31,11 @@ function valueOrDash(value: string | null): string {
 export function SymbolInspectorPage({
   symbol,
   fetchSymbolFn = fetchSymbol,
+  fetchLatestReportFn = fetchLatestReportForSymbol,
   isCompact,
 }: SymbolInspectorPageProps) {
   const [load, setLoad] = useState<InspectorState>({ state: 'loading' })
+  const [latestReport, setLatestReport] = useState<ReportSummary | null>(null)
   const [attempt, setAttempt] = useState(0)
   const compact = useCompact(isCompact)
   const alertRef = useRef<HTMLParagraphElement>(null)
@@ -39,6 +44,28 @@ export function SymbolInspectorPage({
   useEffect(() => {
     fetcherRef.current = fetchSymbolFn
   }, [fetchSymbolFn])
+
+  useEffect(() => {
+    const controller = new AbortController()
+    let active = true
+    setLatestReport(null)
+    fetchLatestReportFn(symbol, controller.signal)
+      .then((report) => {
+        if (active) {
+          setLatestReport(report)
+        }
+      })
+      .catch(() => {
+        // A missing or failed report read never breaks the inspector.
+        if (active) {
+          setLatestReport(null)
+        }
+      })
+    return () => {
+      active = false
+      controller.abort()
+    }
+  }, [symbol, fetchLatestReportFn])
 
   useEffect(() => {
     let active = true
@@ -139,6 +166,16 @@ export function SymbolInspectorPage({
 
       {load.state === 'ready' && contract && coverage && (
         <>
+          {latestReport !== null && (
+            <p className="action-row">
+              <a
+                className="control-link"
+                href={`/reports/${encodeURIComponent(latestReport.report_id)}/chart`}
+              >
+                Open latest report chart
+              </a>
+            </p>
+          )}
           <section className="panel" aria-labelledby="contract-heading">
             <div className="panel-head">
               <h2 id="contract-heading">Contract specs</h2>
