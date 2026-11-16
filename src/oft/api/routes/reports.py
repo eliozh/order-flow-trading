@@ -2,9 +2,10 @@
 
 from __future__ import annotations
 
-from typing import Any
+import re
+from typing import Any, Literal
 
-from fastapi import APIRouter, Path, Query, Request
+from fastapi import APIRouter, Path, Query, Request, Response
 
 from oft.api.envelope import new_request_id, success_envelope
 from oft.api.errors import ApiError
@@ -12,6 +13,12 @@ from oft.application.chart_service import (
     SUPPORTED_CHART_PERIODS,
     derive_overlays,
     resolve_chart,
+)
+from oft.application.report_export import (
+    provenance_counts,
+    redact_report_payload,
+    render_report_json,
+    render_report_markdown,
 )
 from oft.application.scan_service import report_payload, report_summary
 from oft.ports.store import ReportRecord
@@ -80,6 +87,67 @@ def read_report(
         generated_at=record.generated_at,
         provenance="CALC",
         data_quality=record.data_quality,
+    )
+
+
+@router.get(
+    "/api/v1/reports/{report_id}/export",
+    response_model=None,
+    responses={
+        200: {
+            "description": "Redacted report export attachment.",
+            "content": {
+                "text/markdown": {"schema": {"type": "string"}},
+                "application/json": {"schema": {"type": "object"}},
+            },
+            "headers": {
+                "Content-Disposition": {"schema": {"type": "string"}},
+                "X-OFT-Calc-Blocks": {"schema": {"type": "integer"}},
+                "X-OFT-Llm-Blocks": {"schema": {"type": "integer"}},
+            },
+        },
+        404: {"description": "NOT_FOUND — report does not exist."},
+        422: {"description": "VALIDATION_FAILED — invalid format or report_id."},
+    },
+)
+def export_report(
+    request: Request,
+    report_id: str = Path(min_length=1, max_length=128, pattern=r"^[A-Za-z0-9._:-]+$"),
+    format: Literal["md", "json"] = Query(default="md"),
+) -> Response:
+    """Return one frozen report as a redacted Markdown/JSON attachment.
+
+    The route accepts only ``report_id`` (path) and ``format`` (query); it never
+    accepts a caller filesystem path. Both formats reuse ``report_payload`` so
+    the frozen metrics, provenance, and data-quality stamps cannot drift, then
+    redact secret/prompt keys before rendering.
+    """
+    record = _report_or_404(request, report_id)
+    payload = redact_report_payload(report_payload(record))
+    counts = provenance_counts(payload)
+    safe_id = re.sub(r"[^A-Za-z0-9._-]", "_", report_id)
+    headers = {
+        "Content-Disposition": f'attachment; filename="report-{safe_id}.{format}"',
+        "X-OFT-Calc-Blocks": str(counts["calc"]),
+        "X-OFT-Llm-Blocks": str(counts["llm"]),
+    }
+    if format == "json":
+        envelope = success_envelope(
+            payload,
+            request_id=new_request_id(),
+            generated_at=record.generated_at,
+            provenance="CALC",
+            data_quality=record.data_quality,
+        )
+        return Response(
+            content=render_report_json(envelope),
+            media_type="application/json",
+            headers=headers,
+        )
+    return Response(
+        content=render_report_markdown(payload),
+        media_type="text/markdown",
+        headers=headers,
     )
 
 

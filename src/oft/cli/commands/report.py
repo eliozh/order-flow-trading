@@ -1,22 +1,32 @@
-"""``oft report list|show``: CALC metrics first, then the explicit LLM state."""
+"""``oft report list|show|export``: CALC metrics first, then the explicit LLM state."""
 
 from __future__ import annotations
 
 import json
+import os
+from contextlib import suppress
 from decimal import Decimal, InvalidOperation
-from typing import Annotated, Any
+from pathlib import Path
+from typing import Annotated, Any, NoReturn
 
 import typer
 
+from oft.api.envelope import new_request_id
+from oft.application.report_export import EXPORT_FORMATS
 from oft.cli.api_client import ApiClient, ApiClientError
 from oft.cli.commands.doctor import emit_error, exit_code_for
 from oft.config import ConfigError, load_settings
 
 report_app = typer.Typer(
-    help="CALC report commands (metrics-only; no LLM narrative).",
+    help="Report commands: list and show frozen CALC reports, export them as md/json.",
     no_args_is_help=True,
     add_completion=False,
 )
+
+
+def export_exit_code(code: str) -> int:
+    """Export-only exit mapping: an API validation failure is a usage error (2)."""
+    return 2 if code == "VALIDATION_FAILED" else exit_code_for(code)
 
 
 def _settings_or_exit(json_output: bool) -> Any:
@@ -190,3 +200,118 @@ def report_show(
         typer.echo(json.dumps(envelope, indent=2))
     else:
         typer.echo(render_report_table(data))
+
+
+def _refuse(code: str, message: str, exit_code: int) -> NoReturn:
+    """Emit a typed error on stderr and exit without touching the filesystem."""
+    emit_error(code, message, json_output=False)
+    raise typer.Exit(code=exit_code)
+
+
+def _output_path_problem(path: Path) -> str | None:
+    """Reject traversal and directory-shaped output paths before any write."""
+    if not path.parts:
+        return "the path must name a new file"
+    for part in path.parts:
+        if part == "..":
+            return "path traversal ('..') is not allowed"
+    if path.name in {"", ".", ".."}:
+        return "the path must name a new file, not a directory"
+    return None
+
+
+def _write_export(path: Path, body: bytes, headers: dict[str, str]) -> None:
+    """Create ``path`` exclusively, never overwriting or leaving a partial file."""
+    try:
+        with path.open("xb") as handle:
+            handle.write(body)
+            handle.flush()
+            os.fsync(handle.fileno())
+    except FileExistsError:
+        _refuse(
+            "VALIDATION_FAILED",
+            f"VALIDATION_FAILED: refusing to overwrite existing path {path}; "
+            f"choose a new path. Reference: {new_request_id()}.",
+            2,
+        )
+    except OSError:
+        # The ``with`` block closed the handle; remove anything it created.
+        with suppress(OSError):
+            path.unlink()
+        _refuse(
+            "STORAGE_UNAVAILABLE",
+            f"STORAGE_UNAVAILABLE: could not write export to {path}. "
+            f"Reference: {new_request_id()}.",
+            1,
+        )
+
+    parts = [f"Wrote {path}", f"{len(body)} bytes"]
+    calc_blocks = headers.get("x-oft-calc-blocks")
+    llm_blocks = headers.get("x-oft-llm-blocks")
+    if calc_blocks is not None and llm_blocks is not None:
+        parts.append(f"CALC blocks: {calc_blocks}")
+        parts.append(f"LLM blocks: {llm_blocks}")
+    typer.echo(" · ".join(parts))
+
+
+@report_app.command("export")
+def report_export(
+    report_id: str,
+    format: Annotated[
+        str,
+        typer.Option("--format", help="Export format: md or json."),
+    ] = "md",
+    output: Annotated[
+        Path | None,
+        typer.Option("--output", "-o", help="Write to this new file instead of stdout."),
+    ] = None,
+    stdout: Annotated[
+        bool,
+        typer.Option("--stdout", help="Write only the export body to stdout."),
+    ] = False,
+) -> None:
+    """Export one frozen report as redacted Markdown or JSON."""
+    resolved_format = format.strip().lower()
+    if resolved_format not in EXPORT_FORMATS:
+        _refuse(
+            "VALIDATION_FAILED",
+            f"VALIDATION_FAILED: format must be one of md, json; got {format!r}.",
+            2,
+        )
+    if output is not None and stdout:
+        _refuse(
+            "VALIDATION_FAILED",
+            "VALIDATION_FAILED: --output and --stdout are mutually exclusive; choose one.",
+            2,
+        )
+
+    settings = _settings_or_exit(False)
+    try:
+        body, headers = ApiClient.from_settings(settings).export_report(
+            report_id, format=resolved_format
+        )
+    except ApiClientError as exc:
+        emit_error(exc.code, f"{exc.code}: {exc.message}", json_output=False)
+        raise typer.Exit(code=export_exit_code(exc.code)) from exc
+
+    if output is not None:
+        problem = _output_path_problem(output)
+        if problem is not None:
+            _refuse(
+                "VALIDATION_FAILED",
+                f"VALIDATION_FAILED: refusing to write export to {output}: {problem}. "
+                f"Reference: {new_request_id()}.",
+                2,
+            )
+        if output.is_symlink() or output.exists():
+            _refuse(
+                "VALIDATION_FAILED",
+                f"VALIDATION_FAILED: refusing to overwrite existing path {output}; "
+                f"choose a new path. Reference: {new_request_id()}.",
+                2,
+            )
+        _write_export(output, body, headers)
+        return
+
+    # Default and explicit ``--stdout``: only the export touches stdout.
+    typer.echo(body.decode("utf-8"), nl=False)

@@ -40,6 +40,28 @@ class ApiClient:
         # ``::1`` would make urllib emit an unparseable Host header.
         return cls(_origin(settings.host, settings.port), token, timeout=timeout)
 
+    def _api_client_error(
+        self,
+        exc: urllib.error.HTTPError | urllib.error.URLError | TimeoutError | OSError,
+    ) -> ApiClientError:
+        """Map a transport failure to the typed error both request paths raise."""
+        if isinstance(exc, urllib.error.HTTPError):
+            body = exc.read().decode("utf-8")
+            try:
+                envelope = json.loads(body)
+            except json.JSONDecodeError:
+                return ApiClientError("INTERNAL_ERROR", body, status=exc.code)
+            error = envelope.get("error") or {}
+            return ApiClientError(
+                error.get("code", "INTERNAL_ERROR"),
+                error.get("message", body),
+                status=exc.code,
+            )
+        return ApiClientError(
+            "DAEMON_NOT_RUNNING",
+            f"Local daemon is not reachable at {self._base_url}: {exc}",
+        )
+
     def _request(
         self,
         method: str,
@@ -61,22 +83,9 @@ class ApiClient:
             with urllib.request.urlopen(request, timeout=self._timeout) as response:
                 return cast(dict[str, Any], json.loads(response.read().decode("utf-8")))
         except urllib.error.HTTPError as exc:
-            body = exc.read().decode("utf-8")
-            try:
-                envelope = json.loads(body)
-            except json.JSONDecodeError:
-                raise ApiClientError("INTERNAL_ERROR", body, status=exc.code) from exc
-            error = envelope.get("error") or {}
-            raise ApiClientError(
-                error.get("code", "INTERNAL_ERROR"),
-                error.get("message", body),
-                status=exc.code,
-            ) from exc
+            raise self._api_client_error(exc) from exc
         except (urllib.error.URLError, TimeoutError, OSError) as exc:
-            raise ApiClientError(
-                "DAEMON_NOT_RUNNING",
-                f"Local daemon is not reachable at {self._base_url}: {exc}",
-            ) from exc
+            raise self._api_client_error(exc) from exc
 
     def create_scan(
         self, payload: dict[str, Any], *, idempotency_key: str | None = None
@@ -106,6 +115,29 @@ class ApiClient:
 
     def get_report(self, report_id: str) -> dict[str, Any]:
         return self._request("GET", f"/api/v1/reports/{quote(report_id, safe='')}")
+
+    def export_report(self, report_id: str, *, format: str) -> tuple[bytes, dict[str, str]]:
+        """Fetch a report export; return the raw body plus lowercase headers."""
+        return self._request_bytes(
+            "GET",
+            f"/api/v1/reports/{quote(report_id, safe='')}/export?format={quote(format, safe='')}",
+        )
+
+    def _request_bytes(self, method: str, path: str) -> tuple[bytes, dict[str, str]]:
+        """GET a non-JSON body with the same typed error mapping as ``_request``."""
+        headers = {"Accept": "*/*"}
+        if self._token:
+            headers["Authorization"] = f"Bearer {self._token}"
+        request = urllib.request.Request(f"{self._base_url}{path}", headers=headers, method=method)
+        try:
+            with urllib.request.urlopen(request, timeout=self._timeout) as response:
+                body = response.read()
+                response_headers = {name.lower(): value for name, value in response.headers.items()}
+                return body, response_headers
+        except urllib.error.HTTPError as exc:
+            raise self._api_client_error(exc) from exc
+        except (urllib.error.URLError, TimeoutError, OSError) as exc:
+            raise self._api_client_error(exc) from exc
 
     def create_backfill(self, payload: dict[str, Any]) -> dict[str, Any]:
         return self._request("POST", "/api/v1/backfill", payload)
