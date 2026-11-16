@@ -29,10 +29,22 @@ from oft.adapters.sqlite_schema import _period_parts as _period_parts
 from oft.adapters.sqlite_schema import database_path, initialize_database
 from oft.adapters.sqlite_secrets_store import SecretStoreMixin
 from oft.adapters.sqlite_symbol_store import SymbolStoreMixin
-from oft.config import Settings
-from oft.ports.store import AuditEventDraft, AuditEventRecord
+from oft.config import ConfigError, Settings
+from oft.ports.store import AuditEventDraft, AuditEventRecord, StoreUnavailableError
 
 __all__ = ["SqliteStore", "database_path", "_period_parts"]
+
+# A ``sqlite3.DatabaseError`` is too broad to mean "corrupt": ``OperationalError``
+# covers transient locks, permissions, and disk-full, and ``ProgrammingError`` is
+# a bug. Classify by marker so the operator is pointed at the real remedy.
+_CORRUPTION_MARKERS = ("file is not a database", "malformed", "encrypted")
+_LOCK_MARKERS = ("database is locked", "database is busy", "table is locked")
+_OPEN_OR_PERMISSION_MARKERS = (
+    "unable to open database file",
+    "readonly",
+    "read-only",
+    "disk is full",
+)
 
 
 class SqliteStore(
@@ -61,7 +73,41 @@ class SqliteStore(
         return self._path
 
     def initialize(self) -> None:
-        initialize_database(self._settings)
+        try:
+            initialize_database(self._settings)
+        except sqlite3.IntegrityError:
+            # A migration abort names the offending row/table; callers (and
+            # operators) must keep that actionable type and message.
+            raise
+        except sqlite3.DatabaseError as exc:
+            detail = str(exc).lower()
+            if any(marker in detail for marker in _CORRUPTION_MARKERS):
+                # A corrupt/unreadable file is a typed data failure, never a raw
+                # runner traceback; the message is bounded and names the next step.
+                raise StoreUnavailableError(
+                    f"the local database at {self._path} is unreadable; "
+                    "move or repair it, then run `oft doctor`"
+                ) from exc
+            if isinstance(exc, sqlite3.OperationalError):
+                if any(marker in detail for marker in _LOCK_MARKERS):
+                    # A concurrent writer is not corruption; say so and name the
+                    # process the operator must stop.
+                    raise StoreUnavailableError(
+                        f"the local database at {self._path} is busy: another "
+                        "process (for example `oft serve`) is using it; stop that "
+                        "process and retry"
+                    ) from exc
+                if any(marker in detail for marker in _OPEN_OR_PERMISSION_MARKERS):
+                    # Opening/writing failed: a configuration problem (exit 5),
+                    # not an unreadable database.
+                    raise ConfigError(
+                        f"cannot open or write the local database at {self._path}; "
+                        "check its permissions and free disk space, then run "
+                        "`oft doctor`"
+                    ) from exc
+            # A programming/internal error is a bug, not a data failure: let the
+            # caller's INTERNAL_ERROR fallback report it without raw text.
+            raise
 
     def integrity_check(self) -> bool:
         connection = self._connect_read_only()

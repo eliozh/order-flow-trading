@@ -12,6 +12,7 @@ from oft.cli.commands.budget import budget_app
 from oft.cli.commands.config import config_app
 from oft.cli.commands.daemon import daemon_app
 from oft.cli.commands.doctor import doctor_command, emit_error
+from oft.cli.commands.init import init_command
 from oft.cli.commands.kill import kill_app
 from oft.cli.commands.knowledge import knowledge_app
 from oft.cli.commands.llm import llm_app
@@ -45,6 +46,7 @@ def _root() -> None:
 
 app.command(name="status")(status_command)
 app.command(name="doctor")(doctor_command)
+app.command(name="init")(init_command)
 app.command(name="open")(open_command)
 app.add_typer(scan_app, name="scan")
 app.add_typer(report_app, name="report")
