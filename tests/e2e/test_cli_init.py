@@ -25,6 +25,13 @@ from oft.config import Settings
 
 SENTINEL = "sk-init-SENTINEL-4f2a"
 
+_ANSI_ESCAPE = re.compile(r"\x1b\[[0-9;?]*[ -/]*[@-~]")
+
+
+def _plain(output: str) -> str:
+    """Strip ANSI styling so assertions hold on colored and plain terminals."""
+    return _ANSI_ESCAPE.sub("", output)
+
 
 class _MemoryBackend:
     kind = "encrypted_file"
@@ -197,8 +204,11 @@ def test_key_entry_reads_stdin_without_echo_and_reports_only_the_mask(
 
 def test_init_accepts_no_value_taking_key_flag() -> None:
     # Pin the width: Click/Rich wraps the option column to the terminal, which
-    # would split the literal flag across lines on narrow CI terminals.
-    help_text = CliRunner().invoke(app, ["init", "--help"], env={"COLUMNS": "200"}).stdout
+    # would split the literal flag across lines on narrow CI terminals. Rich
+    # also styles each option fragment separately when color is enabled, so
+    # strip ANSI escapes before matching the literal.
+    raw = CliRunner().invoke(app, ["init", "--help"], env={"COLUMNS": "200"}).stdout
+    help_text = _plain(raw)
 
     assert "--llm-key-stdin" in help_text
     assert re.search(r"--llm-key(?!-stdin)", help_text) is None
