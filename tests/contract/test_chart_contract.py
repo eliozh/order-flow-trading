@@ -2,7 +2,8 @@
 
 from __future__ import annotations
 
-from dataclasses import dataclass
+import json
+from dataclasses import dataclass, replace
 from datetime import date
 from pathlib import Path
 from typing import Any
@@ -127,6 +128,47 @@ def test_missing_payload_has_no_bars_or_metrics_and_a_reason(tmp_path: Path) -> 
     assert "15m" in payload.reason
     assert payload.available_periods == ["4h"]
     assert payload.data_quality == "MISSING"
+
+
+def test_corrupt_frozen_structure_validates_as_a_honest_missing_payload(
+    tmp_path: Path,
+) -> None:
+    """Storage corruption is a valid MISSING payload, never a partial AVAILABLE one."""
+    harness = _harness(tmp_path)
+    corrupt_id = "RPT-CONTRACT-CORRUPT"
+    try:
+        report_id = _scan(harness, "4h", "contract-corrupt")
+        store = harness.app.state.container.store
+        template = store.get_report(report_id)
+        assert template is not None
+        snapshot = json.loads(template.snapshot_json)
+        metrics = json.loads(template.metrics_json)
+        snapshot["bars"] = {"not": "a list"}
+        store.save_report(
+            replace(
+                template,
+                report_id=corrupt_id,
+                snapshot_json=json.dumps(snapshot),
+                metrics_json=json.dumps(metrics),
+            )
+        )
+        body = _chart(harness, corrupt_id).json()
+    finally:
+        harness.client.close()
+
+    payload = ChartPayload.model_validate(body["data"])
+    assert payload.status == "MISSING"
+    assert payload.bars == []
+    assert payload.metrics is None
+    assert payload.gaps == []
+    assert payload.quality_reasons == []
+    assert payload.source_report_id is None
+    assert payload.generated_at is None
+    assert payload.data_quality == "MISSING"
+    assert payload.reason
+    assert "storage corruption" in payload.reason
+    assert corrupt_id in payload.reason
+    assert "snapshot.bars" in payload.reason
 
 
 def test_contract_rejects_unknown_fields(tmp_path: Path) -> None:

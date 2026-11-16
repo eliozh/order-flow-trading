@@ -30,8 +30,6 @@ interface ChartProps {
    * text label. It adds no indicator, pane, or series.
    */
   entryPrice?: string | number | null
-  /** Optional explicit explanation for the MISSING branch. */
-  unavailableReason?: string
 }
 
 const WIDTH = 760
@@ -94,7 +92,6 @@ function ChartComponent({
   selectedBarStart,
   onSelectBar,
   entryPrice = null,
-  unavailableReason,
 }: ChartProps) {
   const plotId = useId()
   const tableId = `${plotId}-table`
@@ -128,7 +125,6 @@ function ChartComponent({
           The market data required for a chart is MISSING. No candles, volume, CVD, volume profile,
           or footprint are drawn from invented values.
         </p>
-        {unavailableReason && <p>{unavailableReason}</p>}
         <p className="panel-foot">
           Run a completed backfill first, then re-run the metrics-only scan.
         </p>
@@ -195,6 +191,7 @@ function ChartComponent({
   return (
     <figure
       className="chart-frame"
+      lang="en"
       aria-label={`${symbol} ${timeframe} chart`}
       aria-describedby={summaryId}
     >

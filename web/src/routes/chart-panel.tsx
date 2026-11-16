@@ -1,4 +1,4 @@
-import { useEffect, useRef, useState } from 'react'
+import { useCallback, useEffect, useRef, useState } from 'react'
 
 import { fetchChart, type ChartData, type ChartEnvelope, type ChartPeriod } from '../api/charts'
 import { isAbortError } from '../api/abort'
@@ -57,7 +57,6 @@ export function ChartPanelPage({
   const loadedReportRef = useRef<string | undefined>(undefined)
   const periodRefs = useRef(new Map<string, HTMLButtonElement>())
   const restoreFocusRef = useRef(false)
-  const alertRef = useRef<HTMLElement | null>(null)
 
   useEffect(() => {
     const controller = new AbortController()
@@ -107,13 +106,15 @@ export function ChartPanelPage({
     periodRefs.current.get(load.chart.requested_period)?.focus()
   }, [load.state, load.chart])
 
-  // A failed switch keeps the head and switch mounted; move focus into the
-  // in-region alert so keyboard users are not dropped onto <body>.
-  useEffect(() => {
-    if (load.state === 'error' && load.chart !== undefined) {
-      alertRef.current?.focus()
+  // A failed load remounts the alert after the busy render. A stable callback
+  // ref focuses it on every mount, so a repeated retry failure can never drop
+  // focus onto <body> even when the load state returns to an Object.is-equal
+  // `{state:'error', chart}` value.
+  const focusAlert = useCallback((node: HTMLElement | null) => {
+    if (node) {
+      node.focus()
     }
-  }, [load.state, load.chart])
+  }, [])
 
   function switchPeriod(next: ChartPeriod) {
     setSelectedBarStart(undefined)
@@ -159,6 +160,7 @@ export function ChartPanelPage({
           className="system-page chart-panel"
           aria-labelledby="chart-heading"
           data-readonly={compact}
+          lang="en"
         >
           <div className="page-head">
             <div>
@@ -166,7 +168,7 @@ export function ChartPanelPage({
               <h1 id="chart-heading">Chart unavailable</h1>
             </div>
           </div>
-          <section className="panel" role="alert">
+          <section className="panel" role="alert" tabIndex={-1} ref={focusAlert}>
             <p>{load.message ?? 'Chart not found.'}</p>
             <p className="action-row">
               <a className="control-link" href={`/reports/${encodeURIComponent(reportId)}`}>
@@ -185,6 +187,7 @@ export function ChartPanelPage({
         className="system-page chart-panel"
         aria-labelledby="chart-heading"
         data-readonly={compact}
+        lang="en"
       >
         <div className="page-head">
           <div>
@@ -202,8 +205,18 @@ export function ChartPanelPage({
   const activePeriod = period ?? chart.native_period
   const options = periodOptions(chart.native_period)
   const available = chart.available_periods
-  const showChart = chart.status === 'AVAILABLE' && chart.metrics !== null
-  const chartDraws = showChart && chart.bars.length > 0 && chart.data_quality !== 'MISSING'
+  // One predicate gates both the drawn chart and the announcement, so the page
+  // never says "Showing" for a payload it refuses to draw (or vice versa).
+  const canDraw =
+    chart.status === 'AVAILABLE' &&
+    chart.metrics !== null &&
+    chart.bars.length > 0 &&
+    chart.data_quality !== 'MISSING'
+  const unavailableReason =
+    chart.reason ??
+    (chart.status === 'AVAILABLE'
+      ? `The published ${chart.requested_period} report has no bars or drawable metrics.`
+      : 'No published bars or metrics exist for this period.')
   const resolvedPeriod = chart.requested_period === activePeriod
   let announcement = ''
   if (busy) {
@@ -213,7 +226,7 @@ export function ChartPanelPage({
   } else if (resolvedPeriod) {
     // Never claim a chart is shown while a stale response is still mounted or
     // when the resolved payload is an explicit MISSING/unavailable series.
-    announcement = chartDraws
+    announcement = canDraw
       ? `Showing ${chart.requested_period} chart for ${chart.symbol}.`
       : `No ${chart.requested_period} chart available; published periods: ${available.join(', ')}.`
   }
@@ -223,6 +236,7 @@ export function ChartPanelPage({
       className="system-page chart-panel"
       aria-labelledby="chart-heading"
       data-readonly={compact}
+      lang="en"
     >
       <div className="page-head">
         <div>
@@ -303,7 +317,7 @@ export function ChartPanelPage({
         {busy ? (
           <p className="status-message">Loading {activePeriod} chart…</p>
         ) : load.state === 'error' ? (
-          <section className="panel" role="alert" tabIndex={-1} ref={alertRef}>
+          <section className="panel" role="alert" tabIndex={-1} ref={focusAlert}>
             <p>{load.message ?? 'Chart not found.'}</p>
             <p className="action-row">
               <button type="button" className="control-btn" onClick={retryChart}>
@@ -317,9 +331,14 @@ export function ChartPanelPage({
               </a>
             </p>
           </section>
-        ) : showChart && chart.metrics !== null ? (
+        ) : canDraw && chart.metrics !== null ? (
           <>
+            {/* The chart section heading keeps the route's h1 -> h2 -> h3
+                (Footprint) order; it is visually hidden because the drawing
+                itself carries no title. */}
+            <h2 className="visually-hidden">Chart</h2>
             <Chart
+              key={chart.requested_period}
               symbol={chart.symbol}
               timeframe={chart.requested_period}
               bars={chart.bars}
@@ -340,7 +359,18 @@ export function ChartPanelPage({
             aria-label={`Chart unavailable for ${chart.requested_period}`}
           >
             <h2>No {chart.requested_period} chart</h2>
-            <p>{chart.reason ?? 'No published bars or metrics exist for this period.'}</p>
+            <p>{unavailableReason}</p>
+            {chart.data_quality === 'MISSING' && (
+              <>
+                <p>
+                  The market data required for a chart is MISSING. No candles, volume, CVD, volume
+                  profile, or footprint are drawn from invented values.
+                </p>
+                <p>
+                  Data quality: {chart.data_quality}. {chart.quality_reasons.join(' ')}
+                </p>
+              </>
+            )}
             <p className="mono-muted">Available periods: {available.join(', ')}</p>
             <p className="panel-foot">
               The chart never draws an invented, upsampled, or interpolated series.

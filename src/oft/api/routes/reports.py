@@ -37,17 +37,13 @@ def list_reports(
         records = store.list_reports(scan_id=scan_id, limit=limit, offset=offset)
         total = store.count_reports(scan_id=scan_id)
     else:
-        # The symbol filter is additive: the newest-first ordering and bounded
-        # pagination match the unscoped list. ``list_reports_for_symbol`` is
-        # re-sorted here so the route never depends on the port's ordering.
-        matches = store.list_reports_for_symbol(symbol)
-        if scan_id is not None:
-            matches = tuple(record for record in matches if record.scan_id == scan_id)
-        ordered = sorted(
-            matches, key=lambda record: (record.generated_at, record.report_id), reverse=True
+        # The symbol filter is additive and SQL-bounded: ordering, scan scoping,
+        # and LIMIT/OFFSET run in the query, so the route never materializes
+        # every frozen report just to slice one page.
+        records = store.list_reports_for_symbol_page(
+            symbol, scan_id=scan_id, limit=limit, offset=offset
         )
-        total = len(ordered)
-        records = tuple(ordered[offset : offset + limit])
+        total = store.count_reports_for_symbol(symbol, scan_id=scan_id)
     items = [report_summary(record) for record in records]
     has_next = offset + len(items) < total
     return success_envelope(

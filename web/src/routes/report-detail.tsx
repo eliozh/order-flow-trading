@@ -216,10 +216,7 @@ export function ReportDetailPage({
           </p>
         </div>
         <div className="report-stamps">
-          <a
-            className="btn sm"
-            href={`/reports/${encodeURIComponent(report.report_id)}/chart`}
-          >
+          <a className="btn sm" href={`/reports/${encodeURIComponent(report.report_id)}/chart`}>
             Open chart panel
           </a>
           <ProvenanceStamp kind="CALC" />

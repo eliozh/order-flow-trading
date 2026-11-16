@@ -217,7 +217,9 @@ afterEach(() => {
 describe('ChartPanelPage available period', () => {
   it('renders the chart, stamps, bar selection, and a table that follows the selection', async () => {
     const fetchChartFn = vi.fn(async (_id: string, period?: string) => useChart(period))
-    const { container } = render(<ChartPanelPage reportId="RPT-BTCUSDT-1" fetchChartFn={fetchChartFn} />)
+    const { container } = render(
+      <ChartPanelPage reportId="RPT-BTCUSDT-1" fetchChartFn={fetchChartFn} />,
+    )
 
     const figure = await screen.findByRole('figure', { name: /BTCUSDT 4h chart/i })
     expect(figure).toBeInTheDocument()
@@ -274,16 +276,14 @@ describe('ChartPanelPage available period', () => {
 
   it('keeps the timeframe group mounted and restores focus and the announcement after a switch', async () => {
     let resolveHourly: ((value: ChartEnvelope) => void) | undefined
-    const fetchChartFn = vi.fn(
-      (_id: string, requested?: string): Promise<ChartEnvelope> => {
-        if (requested === '1h' && !resolveHourly) {
-          return new Promise<ChartEnvelope>((resolve) => {
-            resolveHourly = resolve
-          })
-        }
-        return Promise.resolve(useChart(requested))
-      },
-    )
+    const fetchChartFn = vi.fn((_id: string, requested?: string): Promise<ChartEnvelope> => {
+      if (requested === '1h' && !resolveHourly) {
+        return new Promise<ChartEnvelope>((resolve) => {
+          resolveHourly = resolve
+        })
+      }
+      return Promise.resolve(useChart(requested))
+    })
     render(<ChartPanelPage reportId="RPT-BTCUSDT-1" fetchChartFn={fetchChartFn} />)
 
     await screen.findByRole('figure', { name: /BTCUSDT 4h chart/i })
@@ -319,19 +319,17 @@ describe('ChartPanelPage available period', () => {
   it('keeps the panel mounted and offers a retry when a period switch fails', async () => {
     let rejectHourly: ((reason: Error) => void) | undefined
     let hourlyAttempts = 0
-    const fetchChartFn = vi.fn(
-      (_id: string, requested?: string): Promise<ChartEnvelope> => {
-        if (requested === '1h') {
-          hourlyAttempts += 1
-          if (hourlyAttempts === 1) {
-            return new Promise<ChartEnvelope>((_resolve, reject) => {
-              rejectHourly = reject
-            })
-          }
+    const fetchChartFn = vi.fn((_id: string, requested?: string): Promise<ChartEnvelope> => {
+      if (requested === '1h') {
+        hourlyAttempts += 1
+        if (hourlyAttempts === 1) {
+          return new Promise<ChartEnvelope>((_resolve, reject) => {
+            rejectHourly = reject
+          })
         }
-        return Promise.resolve(useChart(requested))
-      },
-    )
+      }
+      return Promise.resolve(useChart(requested))
+    })
     render(<ChartPanelPage reportId="RPT-BTCUSDT-1" fetchChartFn={fetchChartFn} />)
 
     await screen.findByRole('figure', { name: /BTCUSDT 4h chart/i })
@@ -479,6 +477,184 @@ describe('ChartPanelPage states', () => {
     await screen.findByRole('figure', { name: /BTCUSDT 4h chart/i })
     expect(screen.getByText(/Read-only at this width/)).toBeInTheDocument()
     expect(screen.getByRole('figure').closest('section')).toHaveAttribute('data-readonly', 'true')
+  })
+})
+
+describe('ChartPanelPage review regressions', () => {
+  it('focuses the full-page alert when the initial load fails', async () => {
+    const { container } = render(
+      <ChartPanelPage
+        reportId="RPT-BAD"
+        fetchChartFn={async () => {
+          throw new Error('initial down')
+        }}
+      />,
+    )
+
+    const alert = await screen.findByRole('alert')
+    expect(alert).toHaveTextContent(/initial down/)
+    await waitFor(() => expect(alert).toHaveFocus())
+    expect(document.activeElement).not.toBe(document.body)
+    expect(container.querySelector('section.system-page.chart-panel')).toHaveAttribute('lang', 'en')
+  })
+
+  it('refocuses the in-region alert after every failed retry', async () => {
+    let hourlyAttempts = 0
+    const fetchChartFn = vi.fn(async (_id: string, requested?: string) => {
+      if (requested === '1h') {
+        hourlyAttempts += 1
+        throw new Error(`period failed ${hourlyAttempts}`)
+      }
+      return useChart(requested)
+    })
+    render(<ChartPanelPage reportId="RPT-BTCUSDT-1" fetchChartFn={fetchChartFn} />)
+
+    await screen.findByRole('figure', { name: /BTCUSDT 4h chart/i })
+    const hourly = within(screen.getByRole('group', { name: 'Timeframe' })).getByRole('button', {
+      name: '1h',
+    })
+    hourly.focus()
+    fireEvent.click(hourly)
+
+    const firstAlert = await screen.findByRole('alert')
+    expect(firstAlert).toHaveTextContent(/period failed 1/i)
+    await waitFor(() => expect(firstAlert).toHaveFocus())
+
+    fireEvent.click(within(firstAlert).getByRole('button', { name: /Retry 1h/i }))
+
+    await waitFor(() =>
+      expect(fetchChartFn.mock.calls.filter(([, requested]) => requested === '1h')).toHaveLength(2),
+    )
+    const secondAlert = await screen.findByRole('alert')
+    expect(secondAlert).toHaveTextContent(/period failed 2/i)
+    await waitFor(() => expect(secondAlert).toHaveFocus())
+    expect(document.activeElement).not.toBe(document.body)
+  })
+
+  it('resets bar selection, the table toggle, and the announcement across a period switch', async () => {
+    const fetchChartFn = vi.fn(async (_id: string, requested?: string) => useChart(requested))
+    render(<ChartPanelPage reportId="RPT-BTCUSDT-1" fetchChartFn={fetchChartFn} />)
+
+    await screen.findByRole('figure', { name: /BTCUSDT 4h chart/i })
+    const sharedFourHourBar = within(
+      screen.getByRole('group', { name: 'Bar selection' }),
+    ).getByRole('button', { name: /2026-10-01 00:00/i })
+    fireEvent.click(sharedFourHourBar)
+    expect(sharedFourHourBar).toHaveAttribute('aria-pressed', 'true')
+
+    fireEvent.click(screen.getByRole('button', { name: /View data table/i }))
+    expect(screen.getByRole('button', { name: /View data table/i })).toHaveAttribute(
+      'aria-expanded',
+      'true',
+    )
+
+    fireEvent.click(
+      within(screen.getByRole('group', { name: 'Timeframe' })).getByRole('button', { name: '1h' }),
+    )
+
+    await screen.findByRole('figure', { name: /BTCUSDT 1h chart/i })
+    const oneHourBars = screen.getByRole('group', { name: 'Bar selection' })
+    // The 1h default is its own last bar; the shared 00:00 bar is not selected.
+    expect(within(oneHourBars).getByRole('button', { name: /2026-10-01 01:00/i })).toHaveAttribute(
+      'aria-pressed',
+      'true',
+    )
+    expect(within(oneHourBars).getByRole('button', { name: /2026-10-01 00:00/i })).toHaveAttribute(
+      'aria-pressed',
+      'false',
+    )
+    expect(screen.getByRole('button', { name: /View data table/i })).toHaveAttribute(
+      'aria-expanded',
+      'false',
+    )
+    expect(screen.getByRole('status')).toHaveTextContent(/Showing 1h chart/i)
+  })
+
+  it('shows an explicit unavailable note when AVAILABLE has no drawable bars', async () => {
+    const emptyBars: ChartData = { ...availableChart('4h', FOUR_HOUR_BARS), bars: [] }
+    render(
+      <ChartPanelPage
+        reportId="RPT-BTCUSDT-1"
+        fetchChartFn={async () => chartEnvelope(emptyBars)}
+      />,
+    )
+
+    const note = await screen.findByRole('note', { name: /Chart unavailable for 4h/i })
+    expect(note).toHaveTextContent(/no bars or drawable metrics/i)
+    expect(note).not.toHaveTextContent(/Data quality: MISSING/i)
+    expect(screen.queryByRole('figure')).toBeNull()
+    expect(screen.queryByTestId('chart-plot')).toBeNull()
+    expect(screen.queryByRole('table', { name: 'Chart data table' })).toBeNull()
+    expect(screen.getByRole('status')).toHaveTextContent(/No 4h chart available/i)
+    expect(screen.getByRole('status')).not.toHaveTextContent(/Showing/i)
+  })
+
+  it('keeps the MISSING-quality explanation when an AVAILABLE report has no bars', async () => {
+    const missingMarketData: ChartData = {
+      ...availableChart('4h', FOUR_HOUR_BARS),
+      bars: [],
+      data_quality: 'MISSING',
+      quality_reasons: ['The stored snapshot has no recorded market bars.'],
+    }
+    render(
+      <ChartPanelPage
+        reportId="RPT-BTCUSDT-1"
+        fetchChartFn={async () => chartEnvelope(missingMarketData)}
+      />,
+    )
+
+    const note = await screen.findByRole('note', { name: /Chart unavailable for 4h/i })
+    expect(note).toHaveTextContent(
+      'The market data required for a chart is MISSING. No candles, volume, CVD, volume profile, ' +
+        'or footprint are drawn from invented values.',
+    )
+    expect(note).toHaveTextContent(
+      'Data quality: MISSING. The stored snapshot has no recorded market bars.',
+    )
+    expect(note).toHaveTextContent(/No 4h chart/i)
+    expect(note).toHaveTextContent(/no bars or drawable metrics/i)
+    expect(note).toHaveTextContent(/Available periods: 4h, 1h/i)
+    expect(note).toHaveTextContent(/never draws an invented, upsampled, or interpolated series/i)
+    expect(screen.queryByRole('figure')).toBeNull()
+    expect(screen.queryByTestId('chart-plot')).toBeNull()
+    expect(screen.queryByRole('table', { name: 'Chart data table' })).toBeNull()
+    expect(screen.getByRole('status')).toHaveTextContent(/No 4h chart available/i)
+    expect(screen.getByRole('status')).not.toHaveTextContent(/Showing/i)
+  })
+
+  it('uses one h1 and steps through h2 then h3 without skipping a level', async () => {
+    render(
+      <ChartPanelPage
+        reportId="RPT-BTCUSDT-1"
+        fetchChartFn={async (_id, period) => useChart(period)}
+      />,
+    )
+
+    await screen.findByRole('figure', { name: /BTCUSDT 4h chart/i })
+    const levels = screen.getAllByRole('heading').map((heading) => Number(heading.tagName.slice(1)))
+
+    expect(levels.filter((level) => level === 1)).toHaveLength(1)
+    expect(levels[0]).toBe(1)
+    expect(levels).toContain(2)
+    expect(levels).toContain(3)
+    for (let index = 1; index < levels.length; index += 1) {
+      expect(levels[index] - levels[index - 1]).toBeLessThanOrEqual(1)
+    }
+  })
+
+  it('marks the English route and chart subtree as English in a zh-CN document', async () => {
+    const { container } = render(
+      <ChartPanelPage
+        reportId="RPT-BTCUSDT-1"
+        fetchChartFn={async (_id, period) => useChart(period)}
+      />,
+    )
+
+    await screen.findByRole('figure', { name: /BTCUSDT 4h chart/i })
+    expect(container.querySelector('section.system-page.chart-panel')).toHaveAttribute('lang', 'en')
+    expect(screen.getByRole('figure')).toHaveAttribute('lang', 'en')
+    expect(screen.getByRole('group', { name: 'Timeframe' }).closest('[lang="en"]')).not.toBeNull()
+    expect(screen.getByRole('status').closest('[lang="en"]')).not.toBeNull()
   })
 })
 
