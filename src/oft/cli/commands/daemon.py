@@ -8,13 +8,15 @@ import http.client
 import json
 import os
 import re
+import shlex
 import signal
 import subprocess
 import sys
 import time
+from collections.abc import Sequence
 from datetime import UTC, datetime
 from pathlib import Path
-from typing import Annotated, Any
+from typing import Annotated, Any, Literal
 
 import structlog
 import typer
@@ -188,7 +190,7 @@ def pid_matches(settings: Settings, pid: int) -> bool:
         return False
     try:
         meta = json.loads(pid_meta_path(settings).read_text(encoding="utf-8"))
-    except (OSError, ValueError):
+    except (OSError, ValueError, RecursionError):
         return False
     if not isinstance(meta, dict):
         return False
@@ -370,7 +372,9 @@ def daemon_start(
     if pid is not None and (pid_matches(settings, pid) or process_alive(pid)):
         emit_error(
             "DAEMON_ALREADY_RUNNING",
-            f"daemon already running with pid {pid}",
+            f"daemon already running with pid {pid}; if it is stale or "
+            "unverifiable, `oft daemon stop` clears the pid artifacts without "
+            "signalling it",
             json_output=False,
         )
         raise typer.Exit(code=1)
@@ -761,12 +765,29 @@ def daemon_stop(
     """Signal the daemon to stop; safe when it is already offline."""
     settings = settings_or_exit(json_output)
     pid = read_pid(settings)
-    if pid is None or not pid_matches(settings, pid):
+    if pid is None:
         _emit_not_running(json_output)
         return
-    # Re-check the start-time fence immediately before signalling: the PID may
-    # have been recycled between the check above and ``os.kill`` (TOCTOU), and a
-    # stale PID must never receive SIGTERM.
+    outcome = _reconcile_pid_fence(settings, pid)
+    if outcome == "kept":
+        # The PID is alive and may be our daemon, but the fence is unavailable
+        # (meta not written yet, transient ``ps`` failure, legacy null meta).
+        # Keep the artifacts so a retry can stop it and a concurrent start
+        # cannot launch a second daemon.
+        typer.echo(
+            f"warning: daemon pid {pid} is alive but its pid fence cannot be "
+            "verified right now; pid artifacts kept; retry `oft daemon stop`",
+            err=True,
+        )
+        _emit_not_running(json_output)
+        return
+    if outcome == "cleared":
+        _clear_stale_pid_artifacts(settings, pid)
+        _emit_not_running(json_output)
+        return
+    # ``matched``/``adopted``: re-check the start-time fence immediately before
+    # signalling. The PID may have been recycled between the check above and
+    # ``os.kill`` (TOCTOU), and a stale PID must never receive SIGTERM.
     if not pid_matches(settings, pid):
         _emit_not_running(json_output)
         return
@@ -778,6 +799,15 @@ def daemon_stop(
         _remove_pid_files(settings)
         _emit_not_running(json_output)
         return
+    except PermissionError:
+        # Another owner's process: never retry a blind signal, and keep the
+        # artifacts so a privileged user can still resolve it.
+        emit_error(
+            "INTERNAL_ERROR",
+            f"cannot signal pid {pid}: permission denied",
+            json_output=json_output,
+        )
+        raise typer.Exit(code=1) from None
     _remove_pid_files(settings)
     if json_output:
         typer.echo(json.dumps({"ok": True, "data": {"state": "STOPPED", "pid": pid}}, indent=2))
@@ -860,12 +890,187 @@ _STARTUP_OUTPUT_LIMIT = 500
 _STARTUP_OUTPUT_READ_BYTES = 8192
 # C0/C1 controls (except tab) must never reach a terminal from child output.
 _CONTROL_CHARS = re.compile(r"[\x00-\x08\x0b-\x1f\x7f-\x9f]")
+# Emitted for a child-output line that cannot be parsed/redacted safely.
+_UNPARSEABLE_OUTPUT_LINE = "[UNPARSEABLE OUTPUT LINE]"
 
 
 def _remove_pid_files(settings: Settings) -> None:
     """Remove both PID artifacts on a successful/already-gone stop path."""
     pid_path(settings).unlink(missing_ok=True)
     pid_meta_path(settings).unlink(missing_ok=True)
+
+
+def _read_pid_meta(settings: Settings) -> dict[str, Any] | None:
+    """The parsed PID meta mapping, or ``None`` when absent/corrupt/non-dict."""
+    try:
+        meta = json.loads(pid_meta_path(settings).read_text(encoding="utf-8"))
+    except (OSError, ValueError, RecursionError):
+        return None
+    return meta if isinstance(meta, dict) else None
+
+
+def _process_command(pid: int) -> str | None:
+    """The process command line via ``/proc`` or the portable ``ps`` fallback."""
+    try:
+        raw = Path(f"/proc/{pid}/cmdline").read_bytes()
+    except OSError:
+        raw = b""
+    if raw:
+        command = raw.replace(b"\x00", b" ").decode("utf-8", errors="replace").strip()
+        if command:
+            return command
+    executable = _ps_executable()
+    if executable is None:
+        return None
+    try:
+        completed = subprocess.run(
+            [executable, "-o", "command=", "-p", str(pid)],
+            capture_output=True,
+            text=True,
+            timeout=_PS_TIMEOUT_SECONDS,
+            check=False,
+            env={**os.environ, "LC_ALL": "C"},
+        )
+    except (OSError, subprocess.SubprocessError):
+        return None
+    value = completed.stdout.strip()
+    return value if completed.returncode == 0 and value else None
+
+
+def _looks_like_oft_daemon(pid: int) -> bool:
+    """A strict identity hint for a PID that may be our daemon.
+
+    Only used to keep/adopt an unverifiable PID artifact. Adoption records the
+    live start time so a later stop can pass the fence and signal, so this must
+    stay narrow: the module entrypoint, or an ``oft``/``oft.exe`` executable
+    followed by a literal ``daemon start`` argv. A bare ``oft`` token or a
+    ``daemon start`` substring anywhere is not enough.
+    """
+    command = _process_command(pid)
+    if command is None:
+        return False
+    if "oft.cli.main" in command:
+        return True
+    try:
+        argv = shlex.split(command)
+    except ValueError:
+        return False
+    if len(argv) < 3:
+        return False
+    executable = Path(argv[0]).name.lower() if argv[0] else ""
+    return executable in {"oft", "oft.exe"} and argv[1] == "daemon" and argv[2] == "start"
+
+
+def _same_uid(pid: int) -> bool:
+    """Whether ``pid`` runs as our uid (foreign processes are never adopted).
+
+    Uses ``/proc/<pid>`` ownership on Linux and ``ps -o uid=`` elsewhere. When
+    ownership cannot be read, returns ``False`` so adoption stays conservative
+    (no signal is ever sent to a possibly foreign process). Only a platform
+    without ``os.getuid`` (not POSIX) treats the check as satisfied.
+    """
+    getuid = getattr(os, "getuid", None)
+    if getuid is None:
+        return True
+    try:
+        owner = Path(f"/proc/{pid}").stat().st_uid
+    except OSError:
+        owner = None
+    if owner is None:
+        executable = _ps_executable()
+        if executable is None:
+            return False
+        try:
+            completed = subprocess.run(
+                [executable, "-o", "uid=", "-p", str(pid)],
+                capture_output=True,
+                text=True,
+                timeout=_PS_TIMEOUT_SECONDS,
+                check=False,
+                env={**os.environ, "LC_ALL": "C"},
+            )
+        except (OSError, subprocess.SubprocessError):
+            return False
+        try:
+            owner = int(completed.stdout.strip())
+        except (TypeError, ValueError):
+            return False
+    expected_uid = getuid()
+    if not isinstance(expected_uid, int):
+        return True
+    return owner == expected_uid
+
+
+def _adopt_pid_start_time(settings: Settings, pid: int, current: str) -> bool:
+    """Record the re-read start time for a live legacy (null-fence) daemon.
+
+    Returns ``False`` when the artifact cannot be written; the caller keeps the
+    existing artifacts rather than losing track of a live process.
+    """
+    path = pid_meta_path(settings)
+    try:
+        path.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
+        existing = _read_pid_meta(settings) or {}
+        path.write_text(
+            json.dumps({**existing, "pid": pid, "start_time": current}),
+            encoding="utf-8",
+        )
+        path.chmod(0o600)
+    except (OSError, UnicodeError):
+        return False
+    return True
+
+
+_FenceOutcome = Literal["matched", "adopted", "cleared", "kept"]
+
+
+def _reconcile_pid_fence(settings: Settings, pid: int) -> _FenceOutcome:
+    """Classify a PID artifact and repair only what is positively stale.
+
+    Never signals. ``kept`` means the PID is alive and may be our daemon, but
+    the fence cannot be verified right now; the artifacts stay so a retry can
+    stop it (and so a concurrent ``start`` cannot launch a second daemon).
+    ``adopted`` re-records the current start time for a live legacy null fence,
+    but only when the process is strictly identified as ours and shares our uid;
+    after that the normal pre-signal fence check can authorize a stop.
+    """
+    if pid_matches(settings, pid):
+        return "matched"
+    if not process_alive(pid):
+        _remove_pid_files(settings)
+        return "cleared"
+    meta = _read_pid_meta(settings)
+    expected = meta.get("start_time") if meta is not None else None
+    current = _process_start_time(pid)
+    if current is None:
+        # The fence is unavailable (transient ``ps``/``/proc`` failure): keep a
+        # live PID's artifacts rather than orphaning it and racing a start.
+        return "kept"
+    if isinstance(expected, str) and expected:
+        if current != expected:
+            # Positively recycled: the recorded daemon is gone.
+            _remove_pid_files(settings)
+            return "cleared"
+        # Equal but ``pid_matches`` failed (a race): keep and retry.
+        return "kept"
+    # Missing, null, or unreadable recorded start time (legacy meta).
+    if _looks_like_oft_daemon(pid) and _same_uid(pid):
+        if not _adopt_pid_start_time(settings, pid, current):
+            return "kept"
+        return "adopted" if pid_matches(settings, pid) else "kept"
+    _remove_pid_files(settings)
+    return "cleared"
+
+
+def _clear_stale_pid_artifacts(settings: Settings, pid: int) -> None:
+    """Warn (if the recorded process is alive) and remove stale PID artifacts."""
+    if process_alive(pid):
+        typer.echo(
+            f"warning: cleared stale pid artifacts for pid {pid}; the "
+            "recorded process was not signalled but may still be running",
+            err=True,
+        )
+    _remove_pid_files(settings)
 
 
 def _reap_child(pid: int) -> bool:
@@ -907,6 +1112,9 @@ def _stop_daemon(
     except ProcessLookupError:
         _remove_pid_files(settings)
         return True
+    except PermissionError:
+        # Another owner's process: do not retry or clear its artifacts.
+        return False
     deadline = time.monotonic() + timeout_seconds
     while time.monotonic() < deadline:
         if _reap_child(pid) or not process_alive(pid):
@@ -971,32 +1179,115 @@ def _terminate_child(child: subprocess.Popen[bytes]) -> None:
             child.wait(timeout=_CHILD_TERMINATE_TIMEOUT_SECONDS)
 
 
+def _read_output_tail_bytes(
+    path: Path, *, complete_lines: bool = False
+) -> tuple[bytes | None, bool]:
+    """The last bounded read window of ``path`` and whether it was torn.
+
+    Returns ``(None, False)`` when unreadable, ``(raw, False)`` when usable, and
+    ``(b"", True)`` for a JSON-lines source (``complete_lines``) whose bounded
+    window contains only a partial line. When the window starts mid-file its
+    leading partial line is dropped; a trailing partial line is withheld so it
+    is never emitted raw.
+    """
+    try:
+        with path.open("rb") as handle:
+            handle.seek(0, os.SEEK_END)
+            size = handle.tell()
+            start = max(0, size - _STARTUP_OUTPUT_READ_BYTES)
+            handle.seek(start)
+            raw = handle.read(_STARTUP_OUTPUT_READ_BYTES)
+    except OSError:
+        return None, False
+    if not complete_lines or not raw:
+        return raw, False
+    if start > 0:
+        first_newline = raw.find(b"\n")
+        if first_newline == -1:
+            return b"", True
+        raw = raw[first_newline + 1 :]
+    if raw and not raw.endswith(b"\n"):
+        last_newline = raw.rfind(b"\n")
+        if last_newline == -1:
+            return b"", True
+        raw = raw[: last_newline + 1]
+    return raw, False
+
+
+def _redact_output_tail(raw: bytes, secret_values: Sequence[str], *, json_lines: bool) -> str:
+    """Redact a bounded child-output window line by line.
+
+    For a JSON-lines source (``daemon.log``) an unparseable line is replaced by
+    a fixed marker rather than echoed: JSON-rendered credential fields
+    (``"credentials":"..."``) survive free-text regexes when a record is torn or
+    malformed. A plaintext capture (stderr) keeps JSON-or-free-text redaction,
+    but a JSON-looking partial line is also replaced by the marker. A line whose
+    redaction/render recurses or fails is replaced by the marker too, so raw
+    structured text is never emitted.
+    """
+    from oft.cli.commands.system import redact_record
+
+    decoded = _CONTROL_CHARS.sub("", raw.decode("utf-8", errors="replace"))
+    lines: list[str] = []
+    for line in decoded.splitlines():
+        stripped = line.strip()
+        if not stripped:
+            continue
+        try:
+            parsed = json.loads(line)
+        except (TypeError, ValueError, RecursionError):
+            parsed = None
+        structured = isinstance(parsed, (dict, list))
+        if not structured and (json_lines or stripped.startswith("{")):
+            lines.append(_UNPARSEABLE_OUTPUT_LINE)
+            continue
+        try:
+            if structured:
+                lines.append(json.dumps(redact_record(parsed, secret_values=secret_values)))
+            else:
+                lines.append(str(redact_record(line, secret_values=secret_values)))
+        except (TypeError, ValueError, RecursionError):
+            lines.append(_UNPARSEABLE_OUTPUT_LINE)
+    return "\n".join(lines)
+
+
 def _startup_output_tail(settings: Settings, *, limit: int = _STARTUP_OUTPUT_LIMIT) -> str:
     """A bounded, fully redacted, control-stripped tail of the child's output.
 
     Up to 8 KiB is read and redacted *before* truncation, so a redaction match
     (notably a long configured secret) is seen whole and never emitted as a
-    partial value. The full ``system.py`` redactor is reused (imported lazily to
-    avoid the module import cycle), so headers, cookies, token shapes, and
-    configured secret values are all removed -- not just the subset
-    ``redact_secrets`` covers. Only the last ``limit`` characters are kept.
-    """
-    from oft.cli.commands.system import _configured_secret_values, redact_record
+    partial value. Redaction is per line and JSON-aware (see
+    ``_redact_output_tail``), so structured ``daemon.log`` credential fields are
+    masked too. Only the last ``limit`` characters are kept.
 
-    path = _restart_stderr_path(settings)
-    try:
-        with path.open("rb") as handle:
-            handle.seek(0, os.SEEK_END)
-            size = handle.tell()
-            handle.seek(max(0, size - _STARTUP_OUTPUT_READ_BYTES))
-            raw = handle.read(_STARTUP_OUTPUT_READ_BYTES)
-    except OSError:
-        return f"child output unavailable; see {path}"
-    decoded = _CONTROL_CHARS.sub("", raw.decode("utf-8", errors="replace"))
-    text = str(redact_record(decoded, secret_values=_configured_secret_values(settings))).strip()
-    if not text:
-        return f"no child output; see {path}"
-    return f"{text[-limit:]} (see {path})"
+    uvicorn's own errors are written to stderr, so ``restart-stderr.log`` is
+    preferred. When that capture is absent or empty, the tail of
+    ``<data_dir>/logs/daemon.log`` is used instead, and the message names the
+    file actually read. A window containing only a torn JSON line is withheld
+    and reported as incomplete rather than echoed raw.
+    """
+    from oft.cli.commands.system import _configured_secret_values
+
+    secret_values = _configured_secret_values(settings)
+    stderr_path = _restart_stderr_path(settings)
+    last_read: Path | None = None
+    incomplete_path: Path | None = None
+    for path, json_lines in ((stderr_path, False), (log_path(settings), True)):
+        raw, incomplete = _read_output_tail_bytes(path, complete_lines=json_lines)
+        if raw is None:
+            continue
+        last_read = path
+        if incomplete:
+            incomplete_path = path
+            continue
+        text = _redact_output_tail(raw, secret_values, json_lines=json_lines)
+        if text:
+            return f"{text[-limit:]} (see {path})"
+    if incomplete_path is not None:
+        return f"child output incomplete; see {incomplete_path}"
+    if last_read is not None:
+        return f"no child output; see {last_read}"
+    return f"child output unavailable; see {stderr_path}"
 
 
 def _child_exit_code(child: Any) -> int | None:
@@ -1054,7 +1345,7 @@ def _wait_for_ready(
     """
     deadline = time.monotonic() + timeout_seconds
     while True:
-        if child is not None and child.poll() is not None:
+        if child is not None and _child_exit_code(child) is not None:
             return False
         connection: http.client.HTTPConnection | None = None
         try:
@@ -1120,7 +1411,21 @@ def daemon_restart(
     """
     settings = settings_or_exit(json_output)
     pid = read_pid(settings)
-    if pid is None or not pid_matches(settings, pid):
+    if pid is not None:
+        outcome = _reconcile_pid_fence(settings, pid)
+        if outcome == "kept":
+            emit_error(
+                "DAEMON_NOT_RUNNING",
+                f"daemon pid {pid} is alive but its pid fence cannot be verified "
+                "right now; pid artifacts kept; retry `oft daemon restart` after "
+                "it settles",
+                json_output=json_output,
+            )
+            raise typer.Exit(code=1)
+        if outcome == "cleared":
+            _clear_stale_pid_artifacts(settings, pid)
+            pid = None
+    if pid is None:
         emit_error(
             "DAEMON_NOT_RUNNING",
             "daemon is not running; start it with `oft daemon start`",
@@ -1216,14 +1521,18 @@ def daemon_restart(
     # ready so a child that crashes or hangs during startup is not reported as
     # a successful restart. An early child exit fails the wait immediately.
     if not _wait_for_ready(settings, timeout_seconds=_RESTART_TIMEOUT_SECONDS, child=child):
-        exited = child.poll()
-        _terminate_child(child)
+        exited = _child_exit_code(child)
         if exited is not None:
+            _terminate_child(child)
             cause = f"restarted daemon exited during startup (exit {exited}); "
         else:
+            # The child published a PID and is still alive. A slow startup
+            # catch-up (scheduled scans over the starred universe) can outlive
+            # the readiness budget, so never SIGTERM a healthy process here.
             cause = (
                 f"daemon published pid {new_pid} but was not ready within "
-                f"{_RESTART_TIMEOUT_SECONDS:g}s; "
+                f"{_RESTART_TIMEOUT_SECONDS:g}s; not terminated, may still be "
+                "starting; "
             )
         emit_error(
             "INTERNAL_ERROR",

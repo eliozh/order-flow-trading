@@ -10,12 +10,14 @@ from __future__ import annotations
 
 import http.client
 import json
+import logging
+import logging.config
 import os
 import sqlite3
 import subprocess
 import sys
 import time
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from typing import Any
 
@@ -1900,7 +1902,7 @@ def test_read_started_at_returns_none_for_non_dict_meta(tmp_path: Path, meta: st
     assert system_module._read_started_at(settings) is None
 
 
-def test_run_uvicorn_leaves_log_config_unset_so_root_handlers_apply(
+def test_run_uvicorn_configures_stderr_logging_that_cannot_reach_root_handlers(
     monkeypatch: pytest.MonkeyPatch, tmp_path: Path
 ) -> None:
     settings = _restart_settings(tmp_path)
@@ -1918,12 +1920,83 @@ def test_run_uvicorn_leaves_log_config_unset_so_root_handlers_apply(
 
     _run_uvicorn(settings)
 
-    # uvicorn must not install its own stderr loggers: the app factory configures
-    # the root handlers (stdout + daemon.log), which uvicorn then propagates to.
-    assert captured["log_config"] is None
+    # uvicorn keeps its own stderr handlers with propagation disabled, so its
+    # plaintext records never reach the root handlers that write daemon.log.
+    config = captured["log_config"]
+    assert config is not None
+    assert config["handlers"]["default"]["stream"] == "ext://sys.stderr"
+    # uvicorn 0.54 indexes the ``access`` formatter when ``use_colors`` is a
+    # bool, so the dict must mirror that key even though access_log is off.
+    assert "access" in config["formatters"]
+    for name in ("uvicorn", "uvicorn.error", "uvicorn.access"):
+        assert config["loggers"][name]["propagate"] is False
+    assert captured["access_log"] is False
     assert captured["factory"] is True
     assert captured["host"] == settings.host
     assert captured["port"] == settings.port
+
+
+def test_uvicorn_log_config_cannot_write_plaintext_lines_to_daemon_log(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    import structlog
+
+    from oft.cli.main import _uvicorn_log_config
+    from oft.logging import configure_logging
+
+    settings = _configure_cli(monkeypatch, tmp_path)
+    root = logging.getLogger()
+    saved_handlers = list(root.handlers)
+    saved_level = root.level
+    saved_structlog = structlog.get_config()
+    uvicorn_logger_names = ("uvicorn", "uvicorn.error", "uvicorn.access")
+    saved_uvicorn_loggers = {
+        name: (
+            list(logging.getLogger(name).handlers),
+            logging.getLogger(name).propagate,
+            logging.getLogger(name).level,
+        )
+        for name in uvicorn_logger_names
+    }
+    try:
+        configure_logging(settings)
+        logging.config.dictConfig(_uvicorn_log_config())
+        logging.getLogger("uvicorn.error").error(
+            "Started server process [123] [Errno 98] address already in use"
+        )
+        for handler in list(root.handlers):
+            handler.flush()
+        path = log_path(settings)
+        content = path.read_text(encoding="utf-8") if path.exists() else ""
+        assert "Started server process" not in content
+        assert "address already in use" not in content
+
+        # A JSON-only file means a filtered read drops nothing.
+        record = _record("2026-10-08T12:00:00.000Z", "info", "uvicorn_config_kept")
+        with path.open("a", encoding="utf-8") as handle:
+            handle.write(json.dumps(record) + "\n")
+        result = _invoke("system", "logs", "--level", "info", "--json")
+        assert result.exit_code == 0, result.output
+        payload = json.loads(result.stdout)
+        assert payload["data"]["dropped"] == 0
+        assert payload["meta"]["data_quality"] == "COMPLETE"
+        assert [line["event"] for line in payload["data"]["lines"]] == ["uvicorn_config_kept"]
+    finally:
+        for name in uvicorn_logger_names:
+            logger = logging.getLogger(name)
+            saved = saved_uvicorn_loggers[name]
+            for handler in list(logger.handlers):
+                if handler not in saved[0]:
+                    handler.close()
+            logger.handlers = saved[0]
+            logger.propagate = saved[1]
+            logger.setLevel(saved[2])
+        for handler in list(root.handlers):
+            if handler not in saved_handlers:
+                handler.close()
+        root.handlers = saved_handlers
+        root.setLevel(saved_level)
+        structlog.configure(**saved_structlog)
 
 
 def test_daemon_restart_build_container_config_error_exits_five(
@@ -2091,7 +2164,7 @@ def test_daemon_restart_treats_a_group_pid_as_not_running(
     assert kills == []
 
 
-def test_daemon_restart_readiness_timeout_terminates_the_child_and_exits_one(
+def test_daemon_restart_readiness_timeout_leaves_a_live_child_running_and_exits_one(
     monkeypatch: pytest.MonkeyPatch, tmp_path: Path
 ) -> None:
     settings = _configure_cli(monkeypatch, tmp_path)
@@ -2110,8 +2183,13 @@ def test_daemon_restart_readiness_timeout_terminates_the_child_and_exits_one(
 
     assert result.exit_code == 1, result.output
     message = json.loads(result.stdout)["error"]["message"]
+    assert "pid 60001" in message
     assert "not ready" in message
-    assert terminated == [child]
+    # A slow startup catch-up can outlive the readiness budget: the live child
+    # published a PID, so it must be left running rather than SIGTERMed.
+    assert "not terminated" in message
+    assert "may still be starting" in message
+    assert terminated == []
 
 
 def test_daemon_restart_reports_a_child_that_exited_during_startup(
@@ -2301,3 +2379,973 @@ def test_daemon_restart_counts_all_open_positions_but_reads_only_ten_ids(
     assert "150 open positions remain open" in result.stderr
     assert "POS-0" in result.stderr
     assert "..." in result.stderr
+
+
+# ---------------------------------------------------------------------------
+# Fix round 1 regressions
+# ---------------------------------------------------------------------------
+
+
+def test_daemon_stop_clears_a_positively_mismatched_pid_without_signalling(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    settings = _configure_cli(monkeypatch, tmp_path)
+    pid_path(settings).parent.mkdir(parents=True, exist_ok=True)
+    pid_path(settings).write_text(str(os.getpid()), encoding="utf-8")
+    pid_meta_path(settings).write_text(
+        '{"pid": 1, "start_time": "definitely-not-the-recorded-start-time"}',
+        encoding="utf-8",
+    )
+    # ``process_alive`` probes with ``os.kill(pid, 0)``; stub it true so the
+    # assertion below proves no signal of any kind was sent.
+    monkeypatch.setattr(daemon_module, "process_alive", lambda _pid: True)
+    monkeypatch.setattr(daemon_module, "_process_start_time", lambda _pid: "current-start-time")
+    kills: list[tuple[int, int]] = []
+    monkeypatch.setattr(daemon_module.os, "kill", lambda pid, sig: kills.append((pid, sig)))
+
+    result = _invoke("daemon", "stop", "--json")
+
+    assert result.exit_code == 0, result.output
+    assert json.loads(result.stdout)["data"] == {"state": "NOT_RUNNING"}
+    assert not pid_path(settings).exists()
+    assert not pid_meta_path(settings).exists()
+    assert kills == []
+    assert "not signalled" in result.stderr
+    assert "may still be running" in result.stderr
+
+
+def test_daemon_stop_clears_a_live_unrelated_pid_with_legacy_null_meta(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    settings = _configure_cli(monkeypatch, tmp_path)
+    pid_path(settings).parent.mkdir(parents=True, exist_ok=True)
+    pid_path(settings).write_text(str(os.getpid()), encoding="utf-8")
+    pid_meta_path(settings).write_text('{"pid": 1, "start_time": null}', encoding="utf-8")
+    monkeypatch.setattr(daemon_module, "process_alive", lambda _pid: True)
+    monkeypatch.setattr(daemon_module, "_process_start_time", lambda _pid: "current-start-time")
+    monkeypatch.setattr(daemon_module, "_looks_like_oft_daemon", lambda _pid: False)
+    kills: list[tuple[int, int]] = []
+    monkeypatch.setattr(daemon_module.os, "kill", lambda pid, sig: kills.append((pid, sig)))
+
+    result = _invoke("daemon", "stop", "--json")
+
+    assert result.exit_code == 0, result.output
+    assert json.loads(result.stdout)["data"] == {"state": "NOT_RUNNING"}
+    assert not pid_path(settings).exists()
+    assert not pid_meta_path(settings).exists()
+    assert kills == []
+    assert "not signalled" in result.stderr
+
+
+def test_reconcile_pid_fence_adopts_a_legacy_null_fence_for_an_oft_daemon(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    settings = _restart_settings(tmp_path)
+    pid = os.getpid()
+    pid_path(settings).parent.mkdir(parents=True, exist_ok=True)
+    pid_path(settings).write_text(str(pid), encoding="utf-8")
+    pid_meta_path(settings).write_text(
+        json.dumps(
+            {
+                "pid": pid,
+                "start_time": None,
+                "started_at": "2026-01-01T00:00:00.000Z",
+            }
+        ),
+        encoding="utf-8",
+    )
+    monkeypatch.setattr(daemon_module, "process_alive", lambda _pid: True)
+    monkeypatch.setattr(daemon_module, "_process_start_time", lambda _pid: "current-start-time")
+    monkeypatch.setattr(daemon_module, "_looks_like_oft_daemon", lambda _pid: True)
+    monkeypatch.setattr(daemon_module, "_same_uid", lambda _pid: True)
+
+    assert daemon_module._reconcile_pid_fence(settings, pid) == "adopted"
+    meta = json.loads(pid_meta_path(settings).read_text(encoding="utf-8"))
+    assert meta["start_time"] == "current-start-time"
+    assert meta["pid"] == pid
+    assert meta["started_at"] == "2026-01-01T00:00:00.000Z"
+    assert (pid_meta_path(settings).stat().st_mode & 0o777) == 0o600
+
+
+def test_daemon_stop_adopts_and_stops_a_legacy_null_fence_oft_daemon(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    settings = _configure_cli(monkeypatch, tmp_path)
+    pid = os.getpid()
+    pid_path(settings).parent.mkdir(parents=True, exist_ok=True)
+    pid_path(settings).write_text(str(pid), encoding="utf-8")
+    pid_meta_path(settings).write_text(
+        json.dumps({"pid": pid, "start_time": None}), encoding="utf-8"
+    )
+    monkeypatch.setattr(daemon_module, "process_alive", lambda _pid: True)
+    monkeypatch.setattr(daemon_module, "_process_start_time", lambda _pid: "current-start-time")
+    monkeypatch.setattr(daemon_module, "_looks_like_oft_daemon", lambda _pid: True)
+    monkeypatch.setattr(daemon_module, "_same_uid", lambda _pid: True)
+    kills: list[tuple[int, int]] = []
+    monkeypatch.setattr(daemon_module.os, "kill", lambda pid, sig: kills.append((pid, sig)))
+
+    result = _invoke("daemon", "stop", "--json")
+
+    assert result.exit_code == 0, result.output
+    assert json.loads(result.stdout)["data"] == {"state": "STOPPED", "pid": pid}
+    assert kills == [(pid, daemon_module.signal.SIGTERM)]
+    assert not pid_path(settings).exists()
+    assert not pid_meta_path(settings).exists()
+
+
+def test_daemon_stop_keeps_artifacts_when_a_live_oft_pid_fence_is_unavailable(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    settings = _configure_cli(monkeypatch, tmp_path)
+    pid = os.getpid()
+    pid_path(settings).parent.mkdir(parents=True, exist_ok=True)
+    pid_path(settings).write_text(str(pid), encoding="utf-8")
+    monkeypatch.setattr(daemon_module, "process_alive", lambda _pid: True)
+    monkeypatch.setattr(daemon_module, "_process_start_time", lambda _pid: None)
+    monkeypatch.setattr(daemon_module, "_looks_like_oft_daemon", lambda _pid: True)
+    kills: list[tuple[int, int]] = []
+    monkeypatch.setattr(daemon_module.os, "kill", lambda pid, sig: kills.append((pid, sig)))
+
+    result = _invoke("daemon", "stop", "--json")
+
+    assert result.exit_code == 0, result.output
+    assert json.loads(result.stdout)["data"] == {"state": "NOT_RUNNING"}
+    assert pid_path(settings).exists()
+    assert kills == []
+    assert "pid artifacts kept" in result.stderr
+    assert "retry" in result.stderr.lower()
+
+
+def test_daemon_stop_clears_a_live_pid_that_is_not_an_oft_daemon(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    settings = _configure_cli(monkeypatch, tmp_path)
+    pid_path(settings).parent.mkdir(parents=True, exist_ok=True)
+    pid_path(settings).write_text(str(os.getpid()), encoding="utf-8")
+    monkeypatch.setattr(daemon_module, "process_alive", lambda _pid: True)
+    monkeypatch.setattr(daemon_module, "_process_start_time", lambda _pid: "current-start-time")
+    monkeypatch.setattr(daemon_module, "_looks_like_oft_daemon", lambda _pid: False)
+    kills: list[tuple[int, int]] = []
+    monkeypatch.setattr(daemon_module.os, "kill", lambda pid, sig: kills.append((pid, sig)))
+
+    result = _invoke("daemon", "stop", "--json")
+
+    assert result.exit_code == 0, result.output
+    assert json.loads(result.stdout)["data"] == {"state": "NOT_RUNNING"}
+    assert not pid_path(settings).exists()
+    assert kills == []
+    assert "may still be running" in result.stderr
+
+
+def test_daemon_restart_clears_a_stale_unverifiable_pid_and_reports_not_running(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    settings = _configure_cli(monkeypatch, tmp_path)
+    pid_path(settings).parent.mkdir(parents=True, exist_ok=True)
+    pid_path(settings).write_text(str(os.getpid()), encoding="utf-8")
+    pid_meta_path(settings).write_text(
+        '{"pid": 1, "start_time": "definitely-not-the-recorded-start-time"}',
+        encoding="utf-8",
+    )
+    monkeypatch.setattr(daemon_module, "process_alive", lambda _pid: True)
+    monkeypatch.setattr(daemon_module, "_process_start_time", lambda _pid: "current-start-time")
+    kills: list[tuple[int, int]] = []
+    monkeypatch.setattr(daemon_module.os, "kill", lambda pid, sig: kills.append((pid, sig)))
+
+    result = _invoke("daemon", "restart", "--yes", "--json")
+
+    assert result.exit_code == 1, result.output
+    assert json.loads(result.stdout)["error"]["code"] == "DAEMON_NOT_RUNNING"
+    assert not pid_path(settings).exists()
+    assert not pid_meta_path(settings).exists()
+    assert kills == []
+
+
+def test_daemon_restart_reports_retry_when_a_live_oft_pid_fence_is_unavailable(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    settings = _configure_cli(monkeypatch, tmp_path)
+    pid = os.getpid()
+    pid_path(settings).parent.mkdir(parents=True, exist_ok=True)
+    pid_path(settings).write_text(str(pid), encoding="utf-8")
+    monkeypatch.setattr(daemon_module, "process_alive", lambda _pid: True)
+    monkeypatch.setattr(daemon_module, "_process_start_time", lambda _pid: None)
+    monkeypatch.setattr(daemon_module, "_looks_like_oft_daemon", lambda _pid: True)
+    kills: list[tuple[int, int]] = []
+    monkeypatch.setattr(daemon_module.os, "kill", lambda pid, sig: kills.append((pid, sig)))
+
+    result = _invoke("daemon", "restart", "--yes", "--json")
+
+    assert result.exit_code == 1, result.output
+    payload = json.loads(result.stdout)
+    assert payload["error"]["code"] == "DAEMON_NOT_RUNNING"
+    assert "retry" in payload["error"]["message"].lower()
+    assert pid_path(settings).exists()
+    assert kills == []
+
+
+def test_daemon_start_refuses_while_a_stale_pid_artifact_exists_then_stop_clears_it(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    settings = _configure_cli(monkeypatch, tmp_path)
+    pid_path(settings).parent.mkdir(parents=True, exist_ok=True)
+    pid_path(settings).write_text(str(os.getpid()), encoding="utf-8")
+    pid_meta_path(settings).write_text(
+        '{"pid": 1, "start_time": "definitely-not-the-recorded-start-time"}',
+        encoding="utf-8",
+    )
+    monkeypatch.setattr(daemon_module, "process_alive", lambda _pid: True)
+    monkeypatch.setattr(daemon_module, "_process_start_time", lambda _pid: "current-start-time")
+    kills: list[tuple[int, int]] = []
+    monkeypatch.setattr(daemon_module.os, "kill", lambda pid, sig: kills.append((pid, sig)))
+
+    started = _invoke("daemon", "start")
+
+    assert started.exit_code == 1, started.output
+    assert "already running" in started.stderr
+    # The refusal must point at the recovery command.
+    assert "oft daemon stop" in started.stderr
+    assert pid_path(settings).exists()
+    assert pid_meta_path(settings).exists()
+    assert kills == []
+
+    stopped = _invoke("daemon", "stop", "--json")
+
+    assert stopped.exit_code == 0, stopped.output
+    assert daemon_module.read_pid(settings) is None
+    assert not pid_meta_path(settings).exists()
+    assert kills == []
+
+
+def test_system_logs_rejects_a_huge_relative_since_as_a_validation_error(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    _configure_cli(monkeypatch, tmp_path)
+
+    result = _invoke("system", "logs", "--since", "99999999999999999999d", "--json")
+
+    assert result.exit_code == 2, result.output
+    assert json.loads(result.stdout)["error"]["code"] == "VALIDATION_FAILED"
+    combined = result.stdout + result.stderr
+    assert "Traceback" not in combined
+    assert "OverflowError" not in combined
+
+
+def test_parse_since_enforces_the_relative_window_bound(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    settings = _restart_settings(tmp_path)
+    fixed = datetime(2026, 10, 8, 12, 0, tzinfo=UTC)
+    monkeypatch.setattr(system_module, "_now", lambda _settings: fixed)
+    boundary_days = system_module._MAX_RELATIVE_SINCE_SECONDS // 86400
+
+    assert fixed - system_module._parse_since(f"{boundary_days}d", settings) == timedelta(
+        days=boundary_days
+    )
+    with pytest.raises(ValueError):
+        system_module._parse_since(f"{boundary_days + 1}d", settings)
+
+
+def test_daemon_restart_reports_a_uvicorn_bind_error_from_the_stderr_capture(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    settings = _configure_cli(monkeypatch, tmp_path)
+    write_pid(settings)
+    stderr = daemon_module._restart_stderr_path(settings)
+    stderr.parent.mkdir(parents=True, exist_ok=True)
+    stderr.write_text(
+        "[Errno 98] error while attempting to bind on address "
+        "('127.0.0.1', 7611): address already in use\n",
+        encoding="utf-8",
+    )
+    child = _FakeChild(poll_result=None)
+    monkeypatch.setattr(daemon_module, "_stop_daemon", lambda *args, **kwargs: True)
+    monkeypatch.setattr(daemon_module, "_spawn_detached_daemon", lambda _settings: child)
+    monkeypatch.setattr(daemon_module, "_wait_for_new_pid", lambda *args, **kwargs: 60007)
+    monkeypatch.setattr(daemon_module, "_wait_for_ready", lambda *args, **kwargs: False)
+    monkeypatch.setattr(daemon_module, "_terminate_child", lambda _child: None)
+    try:
+        result = _invoke("daemon", "restart", "--yes", "--json")
+    finally:
+        _cleanup_pid_state(settings)
+
+    assert result.exit_code == 1, result.output
+    message = json.loads(result.stdout)["error"]["message"]
+    assert "address already in use" in message
+    assert "restart-stderr.log" in message
+    assert len(message) < 700
+
+
+@pytest.mark.parametrize("stderr_state", ["absent", "empty"])
+def test_startup_output_tail_falls_back_to_daemon_log_when_stderr_is_unusable(
+    tmp_path: Path, stderr_state: str
+) -> None:
+    settings = _restart_settings(tmp_path)
+    stderr = daemon_module._restart_stderr_path(settings)
+    stderr.parent.mkdir(parents=True, exist_ok=True)
+    if stderr_state == "empty":
+        stderr.write_text("", encoding="utf-8")
+    daemon_log = log_path(settings)
+    daemon_log.parent.mkdir(parents=True, exist_ok=True)
+    # daemon.log is JSON lines; uvicorn's bind failure reaches it as a
+    # structured record (or not at all), never as a bare plaintext line.
+    daemon_log.write_text(
+        json.dumps(
+            {
+                "event": "startup_failed",
+                "message": (
+                    "[Errno 98] error while attempting to bind on address: address already in use"
+                ),
+            }
+        )
+        + "\n",
+        encoding="utf-8",
+    )
+
+    tail = daemon_module._startup_output_tail(settings)
+
+    assert "address already in use" in tail
+    assert "daemon.log" in tail
+    assert "restart-stderr.log" not in tail
+
+
+def test_select_records_treats_recursion_depth_json_as_unparseable() -> None:
+    # Deep enough that the JSON decoder itself raises ``RecursionError``; the
+    # exact threshold depends on the interpreter's C recursion limit.
+    nested = "[" * 20000 + "]" * 20000
+
+    unfiltered = system_module._select_records([nested], since=None, min_level=None)
+    assert unfiltered.matched == 1
+    assert unfiltered.dropped == 0
+    assert unfiltered.records == (nested,)
+
+    filtered = system_module._select_records([nested], since=None, min_level=20)
+    assert filtered.matched == 0
+    assert filtered.dropped == 1
+    assert filtered.records == ()
+
+
+def test_system_logs_drops_a_recursion_depth_json_line_without_a_traceback(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    settings = _configure_cli(monkeypatch, tmp_path)
+    path = log_path(settings)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(
+        "[" * 20000
+        + "]" * 20000
+        + "\n"
+        + json.dumps(_record("2026-10-08T12:00:00.000Z", "info", "kept"))
+        + "\n",
+        encoding="utf-8",
+    )
+
+    result = _invoke("system", "logs", "--level", "info", "--json")
+
+    assert result.exit_code == 0, result.output
+    assert "Traceback" not in result.output
+    assert "RecursionError" not in result.output
+    data = json.loads(result.stdout)["data"]
+    assert data["dropped"] == 1
+    assert [line["event"] for line in data["lines"]] == ["kept"]
+
+
+def test_system_logs_follow_drops_a_recursion_depth_json_line_without_a_traceback(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    settings = _configure_cli(monkeypatch, tmp_path)
+    path = log_path(settings)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(
+        json.dumps(_record("2026-10-08T12:00:00.000Z", "info", "initial_event")) + "\n",
+        encoding="utf-8",
+    )
+    nested = "[" * 20000 + "]" * 20000
+    appended = _record("2026-10-08T12:01:00.000Z", "info", "appended_event")
+    calls = {"count": 0}
+
+    def fake_sleep(_seconds: float) -> None:
+        calls["count"] += 1
+        if calls["count"] == 1:
+            with path.open("a", encoding="utf-8") as handle:
+                handle.write(nested + "\n")
+            return
+        if calls["count"] == 2:
+            with path.open("a", encoding="utf-8") as handle:
+                handle.write(json.dumps(appended) + "\n")
+            return
+        raise KeyboardInterrupt
+
+    monkeypatch.setattr(system_module, "_sleep", fake_sleep)
+
+    result = _invoke("system", "logs", "--follow", "--level", "info")
+
+    assert result.exit_code == 0, result.output
+    assert "Traceback" not in result.output
+    assert "RecursionError" not in result.output
+    assert "initial_event" in result.stdout
+    assert "appended_event" in result.stdout
+
+
+def test_system_logs_follow_withholds_a_partial_initial_record_until_it_completes(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    settings = _configure_cli(monkeypatch, tmp_path)
+    path = log_path(settings)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    # The final record is torn mid-value: the first read must not emit it.
+    path.write_text(
+        '{"timestamp":"2026-10-08T12:00:00.000Z","level":"info",'
+        '"event":"split_event","api_key":"tok-SPLIT-',
+        encoding="utf-8",
+    )
+    calls = {"count": 0}
+
+    def fake_sleep(_seconds: float) -> None:
+        calls["count"] += 1
+        if calls["count"] == 1:
+            with path.open("a", encoding="utf-8") as handle:
+                handle.write('SENTINEL"}\n')
+            return
+        raise KeyboardInterrupt
+
+    monkeypatch.setattr(system_module, "_sleep", fake_sleep)
+
+    result = _invoke("system", "logs", "--follow", "--json")
+
+    assert result.exit_code == 0, result.output
+    # The fragment is never emitted raw (its api_key is not redacted yet) and
+    # the completed record is emitted exactly once, fully redacted.
+    assert "tok-SPLIT-" not in result.stdout
+    assert "SENTINEL" not in result.stdout
+    documents = [json.loads(line) for line in result.stdout.splitlines() if line.strip()]
+    assert [document["event"] for document in documents] == ["split_event"]
+    assert documents[0]["api_key"] == system_module.REDACTED
+
+
+def test_wait_for_ready_treats_a_child_without_poll_as_still_running(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    settings = _restart_settings(tmp_path)
+
+    class RefusedConnection(_FakeHTTPConnection):
+        def request(self, method: str, path: str) -> None:
+            raise ConnectionRefusedError("not up")
+
+    monkeypatch.setattr(daemon_module.http.client, "HTTPConnection", RefusedConnection)
+
+    # An injected child without ``poll`` is the documented test seam: it must
+    # be treated as running rather than raising ``AttributeError``.
+    assert daemon_module._wait_for_ready(settings, timeout_seconds=0.001, child=object()) is False
+
+
+@pytest.mark.parametrize(
+    ("key", "value"),
+    [
+        ("credentials", "user:hunter2-plain"),
+        ("bearer", "opaque-token-xyz"),
+        ("private_key", "opaque-private-material"),
+        ("passphrase", "correct horse battery staple"),
+        ("pwd", "hunter2"),
+        ("passwd", "PLAINTEXT-HUNTER2"),
+        ("access_key", "opaque-access-key"),
+    ],
+)
+def test_redact_record_redacts_credential_field_names(key: str, value: str) -> None:
+    redacted = system_module.redact_record({key: value})
+
+    assert redacted == {key: system_module.REDACTED}
+
+
+def test_redact_record_does_not_redact_author_keys() -> None:
+    record = {"author": "Ada", "author_name": "Ada Lovelace"}
+
+    assert system_module.redact_record(record) == record
+
+
+def test_redact_record_still_keeps_prompt_metadata_after_new_hints() -> None:
+    record = {"prompt_id": "analysis", "prompt_version": 9}
+
+    assert system_module.redact_record(record) == record
+
+
+@pytest.mark.parametrize(
+    "text",
+    [
+        "Authorization=Basic dXNlcjpwYXNz",
+        'Authorization=Digest username="x", response="secret-response-hash"',
+        "Proxy-Authorization=Basic dXNlcjpwYXNz",
+        "proxy-authorization: Basic dXNlcjpwYXNz",
+    ],
+)
+def test_redact_record_redacts_authorization_assignments(text: str) -> None:
+    redacted = system_module.redact_record({"message": text})
+
+    assert "dXNlcjpwYXNz" not in redacted["message"]
+    assert "secret-response-hash" not in redacted["message"]
+    assert "Authorization" in redacted["message"]
+
+
+def test_redact_record_leaves_author_prose_alone() -> None:
+    message = "the author wrote this sentence"
+
+    assert system_module.redact_record({"message": message}) == {"message": message}
+
+
+# ---------------------------------------------------------------------------
+# Fix round 1b regressions
+# ---------------------------------------------------------------------------
+
+
+def _nested_array(depth: int) -> str:
+    return "[" * depth + "]" * depth
+
+
+def test_system_logs_marker_for_a_depth_the_decoder_accepts(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    settings = _configure_cli(monkeypatch, tmp_path)
+    path = log_path(settings)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(_nested_array(2000) + "\n", encoding="utf-8")
+
+    result = _invoke("system", "logs", "--json")
+
+    assert result.exit_code == 0, result.output
+    assert "Traceback" not in result.output
+    assert "RecursionError" not in result.output
+    assert system_module._UNPARSEABLE_RECORD in result.stdout
+    # Never emit the raw structured text that bypassed redaction.
+    assert "[[[[" not in result.stdout
+
+
+def test_system_logs_drops_a_record_whose_nested_field_breaks_redaction(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    settings = _configure_cli(monkeypatch, tmp_path)
+    path = log_path(settings)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    line = (
+        '{"timestamp":"2026-10-08T12:00:00.000Z","level":"info",'
+        '"event":"deep","payload":' + _nested_array(2000) + "}"
+    )
+    path.write_text(line + "\n", encoding="utf-8")
+
+    result = _invoke("system", "logs", "--level", "info", "--json")
+
+    assert result.exit_code == 0, result.output
+    assert "Traceback" not in result.output
+    assert "RecursionError" not in result.output
+    data = json.loads(result.stdout)["data"]
+    assert data["dropped"] == 1
+    assert data["lines"] == []
+
+
+def test_system_logs_follow_uses_the_marker_for_a_depth_the_decoder_accepts(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    settings = _configure_cli(monkeypatch, tmp_path)
+    path = log_path(settings)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(_nested_array(2000) + "\n", encoding="utf-8")
+    appended = _record("2026-10-08T12:01:00.000Z", "info", "appended_event")
+    calls = {"count": 0}
+
+    def fake_sleep(_seconds: float) -> None:
+        calls["count"] += 1
+        if calls["count"] == 1:
+            with path.open("a", encoding="utf-8") as handle:
+                handle.write(json.dumps(appended) + "\n")
+            return
+        raise KeyboardInterrupt
+
+    monkeypatch.setattr(system_module, "_sleep", fake_sleep)
+
+    result = _invoke("system", "logs", "--follow", "--json")
+
+    assert result.exit_code == 0, result.output
+    assert "Traceback" not in result.output
+    assert "RecursionError" not in result.output
+    assert system_module._UNPARSEABLE_RECORD in result.stdout
+    assert "appended_event" in result.stdout
+
+
+@pytest.mark.parametrize("stderr_state", ["absent", "empty"])
+def test_startup_output_tail_redacts_structured_daemon_log_records(
+    tmp_path: Path, stderr_state: str
+) -> None:
+    settings = _restart_settings(tmp_path)
+    stderr = daemon_module._restart_stderr_path(settings)
+    stderr.parent.mkdir(parents=True, exist_ok=True)
+    if stderr_state == "empty":
+        stderr.write_text("", encoding="utf-8")
+    daemon_log = log_path(settings)
+    daemon_log.parent.mkdir(parents=True, exist_ok=True)
+    daemon_log.write_text(
+        json.dumps(
+            {
+                "credentials": "user:hunter2-plain",
+                "bearer": "opaque-token-xyz",
+                "headers": {"authorization": "Basic dXNlcjpwYXNz"},
+            }
+        )
+        + "\n",
+        encoding="utf-8",
+    )
+
+    tail = daemon_module._startup_output_tail(settings)
+
+    assert "hunter2-plain" not in tail
+    assert "opaque-token-xyz" not in tail
+    assert "dXNlcjpwYXNz" not in tail
+    assert "[REDACTED]" in tail
+    assert "daemon.log" in tail
+
+
+def test_startup_output_tail_names_daemon_log_when_both_captures_are_empty(
+    tmp_path: Path,
+) -> None:
+    settings = _restart_settings(tmp_path)
+    stderr = daemon_module._restart_stderr_path(settings)
+    stderr.parent.mkdir(parents=True, exist_ok=True)
+    stderr.write_text("", encoding="utf-8")
+    daemon_log = log_path(settings)
+    daemon_log.parent.mkdir(parents=True, exist_ok=True)
+    daemon_log.write_text("", encoding="utf-8")
+
+    tail = daemon_module._startup_output_tail(settings)
+
+    assert "no child output" in tail
+    assert "daemon.log" in tail
+    assert "restart-stderr.log" not in tail
+
+
+@pytest.mark.parametrize(
+    ("text", "forbidden"),
+    [
+        ("credentials=user:hunter2-plain", "hunter2-plain"),
+        ("credential=user:hunter2-plain", "hunter2-plain"),
+        ("bearer=opaque-token-xyz", "opaque-token-xyz"),
+        ("passphrase=correct-horse-battery", "correct-horse-battery"),
+        ("private_key=opaque-private-material", "opaque-private-material"),
+        ("private-key=opaque-private-material", "opaque-private-material"),
+        ("pwd=hunter2", "hunter2"),
+        ("access_key=opaque-access-key", "opaque-access-key"),
+        ("access-key=opaque-access-key", "opaque-access-key"),
+    ],
+)
+def test_redact_record_redacts_free_text_credential_assignments(text: str, forbidden: str) -> None:
+    redacted = system_module.redact_record({"message": text})
+
+    assert forbidden not in redacted["message"]
+    assert system_module.REDACTED in redacted["message"]
+
+
+@pytest.mark.parametrize(
+    "text",
+    [
+        "{'authorization': 'Basic dXNlcjpwYXNz'}",
+        '{"authorization": "Basic dXNlcjpwYXNz"}',
+        "proxy_authorization='Basic dXNlcjpwYXNz'",
+        "proxy-authorization=Basic dXNlcjpwYXNz",
+    ],
+)
+def test_redact_record_redacts_quoted_and_proxy_authorization_forms(text: str) -> None:
+    redacted = system_module.redact_record({"message": text})
+
+    assert "dXNlcjpwYXNz" not in redacted["message"]
+    assert "Authorization" in redacted["message"]
+
+
+# ---------------------------------------------------------------------------
+# Fix round 1c regressions
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.parametrize(
+    ("text", "forbidden"),
+    [
+        ('{"credentials":"user:hunter2-plain"}', "hunter2-plain"),
+        ('{"password":"hunter2-real"}', "hunter2-real"),
+        ('{"api_key":"ak-SENTINEL"}', "ak-SENTINEL"),
+    ],
+)
+def test_redact_record_redacts_quoted_key_assignments(text: str, forbidden: str) -> None:
+    redacted = system_module.redact_record({"message": text})
+
+    assert forbidden not in redacted["message"]
+    assert system_module.REDACTED in redacted["message"]
+
+
+def test_redact_record_leaves_a_quoted_author_assignment_alone() -> None:
+    text = '{"author":"Ada","author_name":"Ada Lovelace"}'
+
+    assert system_module.redact_record({"message": text}) == {"message": text}
+
+
+def test_system_logs_redacts_quoted_credentials_in_a_retained_text_line(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    settings = _configure_cli(monkeypatch, tmp_path)
+    path = log_path(settings)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    # Not valid JSON (leading prose), so the line is retained as redacted text.
+    path.write_text(
+        'garbage {"credentials":"user:hunter2-plain"}\n',
+        encoding="utf-8",
+    )
+
+    result = _invoke("system", "logs", "--json")
+
+    assert result.exit_code == 0, result.output
+    assert "hunter2-plain" not in result.stdout
+    lines = json.loads(result.stdout)["data"]["lines"]
+    assert len(lines) == 1
+    assert system_module.REDACTED in lines[0]
+
+
+def test_system_logs_follow_redacts_quoted_credentials_in_a_retained_text_line(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    settings = _configure_cli(monkeypatch, tmp_path)
+    path = log_path(settings)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(
+        'garbage {"credentials":"user:hunter2-plain"}\n',
+        encoding="utf-8",
+    )
+    appended = _record("2026-10-08T12:01:00.000Z", "info", "appended_event")
+    calls = {"count": 0}
+
+    def fake_sleep(_seconds: float) -> None:
+        calls["count"] += 1
+        if calls["count"] == 1:
+            with path.open("a", encoding="utf-8") as handle:
+                handle.write(json.dumps(appended) + "\n")
+            return
+        raise KeyboardInterrupt
+
+    monkeypatch.setattr(system_module, "_sleep", fake_sleep)
+
+    result = _invoke("system", "logs", "--follow", "--json")
+
+    assert result.exit_code == 0, result.output
+    assert "hunter2-plain" not in result.stdout
+    assert "appended_event" in result.stdout
+
+
+def test_startup_output_tail_withholds_a_torn_daemon_log_record(tmp_path: Path) -> None:
+    settings = _restart_settings(tmp_path)
+    daemon_log = log_path(settings)
+    daemon_log.parent.mkdir(parents=True, exist_ok=True)
+    daemon_log.write_text(
+        '{"event":"scan","credentials":"opaque-cred","payload":{"x":',
+        encoding="utf-8",
+    )
+
+    tail = daemon_module._startup_output_tail(settings)
+
+    assert "opaque-cred" not in tail
+    assert '{"event"' not in tail
+    assert "incomplete" in tail
+    assert "daemon.log" in tail
+
+
+def test_startup_output_tail_markers_a_malformed_daemon_log_line(tmp_path: Path) -> None:
+    settings = _restart_settings(tmp_path)
+    daemon_log = log_path(settings)
+    daemon_log.parent.mkdir(parents=True, exist_ok=True)
+    daemon_log.write_text('{"password":"hunter2-real"\n', encoding="utf-8")
+
+    tail = daemon_module._startup_output_tail(settings)
+
+    assert "hunter2-real" not in tail
+    assert daemon_module._UNPARSEABLE_OUTPUT_LINE in tail
+    assert "daemon.log" in tail
+
+
+def test_startup_output_tail_withholds_a_torn_oversized_daemon_log_line(
+    tmp_path: Path,
+) -> None:
+    settings = _restart_settings(tmp_path)
+    daemon_log = log_path(settings)
+    daemon_log.parent.mkdir(parents=True, exist_ok=True)
+    daemon_log.write_text(
+        "x" * 40000 + ',"credentials":"opaque-cred"}',
+        encoding="utf-8",
+    )
+
+    tail = daemon_module._startup_output_tail(settings)
+
+    assert "opaque-cred" not in tail
+    assert "incomplete" in tail
+    assert "daemon.log" in tail
+
+
+def test_startup_output_tail_markers_a_json_looking_stderr_partial_line(
+    tmp_path: Path,
+) -> None:
+    settings = _restart_settings(tmp_path)
+    stderr = daemon_module._restart_stderr_path(settings)
+    stderr.parent.mkdir(parents=True, exist_ok=True)
+    stderr.write_text(
+        '{"event":"scan","credentials":"opaque-cred","payload":{"x":',
+        encoding="utf-8",
+    )
+
+    tail = daemon_module._startup_output_tail(settings)
+
+    assert "opaque-cred" not in tail
+    assert daemon_module._UNPARSEABLE_OUTPUT_LINE in tail
+
+
+@pytest.mark.parametrize(
+    ("command", "expected"),
+    [
+        ("python -m oft.cli.main daemon start", True),
+        ("/home/me/bin/oft daemon start", True),
+        ("vim /home/me/oft/README.md", False),
+        ("grep daemon start notes.txt", False),
+        ("oft status", False),
+    ],
+)
+def test_looks_like_oft_daemon_uses_a_strict_identity(
+    monkeypatch: pytest.MonkeyPatch, command: str, expected: bool
+) -> None:
+    monkeypatch.setattr(daemon_module, "_process_command", lambda _pid: command)
+
+    assert daemon_module._looks_like_oft_daemon(123) is expected
+
+
+def test_adopt_pid_start_time_returns_false_on_write_error(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    settings = _restart_settings(tmp_path)
+    pid_meta_path(settings).parent.mkdir(parents=True, exist_ok=True)
+
+    def raise_oserror(self: Path, *args: Any, **kwargs: Any) -> int:
+        raise OSError("read-only")
+
+    monkeypatch.setattr(Path, "write_text", raise_oserror)
+
+    assert daemon_module._adopt_pid_start_time(settings, os.getpid(), "current") is False
+
+
+def test_reconcile_pid_fence_keeps_artifacts_when_adoption_write_fails(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    settings = _restart_settings(tmp_path)
+    pid = os.getpid()
+    pid_path(settings).parent.mkdir(parents=True, exist_ok=True)
+    pid_path(settings).write_text(str(pid), encoding="utf-8")
+    pid_meta_path(settings).write_text(
+        json.dumps({"pid": pid, "start_time": None}), encoding="utf-8"
+    )
+    monkeypatch.setattr(daemon_module, "process_alive", lambda _pid: True)
+    monkeypatch.setattr(daemon_module, "_process_start_time", lambda _pid: "current-start-time")
+    monkeypatch.setattr(daemon_module, "_looks_like_oft_daemon", lambda _pid: True)
+    monkeypatch.setattr(daemon_module, "_same_uid", lambda _pid: True)
+    monkeypatch.setattr(daemon_module, "_adopt_pid_start_time", lambda *args: False)
+
+    assert daemon_module._reconcile_pid_fence(settings, pid) == "kept"
+    assert pid_path(settings).exists()
+
+
+def test_reconcile_pid_fence_keeps_artifacts_when_the_current_start_time_is_unreadable(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    settings = _restart_settings(tmp_path)
+    pid = os.getpid()
+    pid_path(settings).parent.mkdir(parents=True, exist_ok=True)
+    pid_path(settings).write_text(str(pid), encoding="utf-8")
+    pid_meta_path(settings).write_text(
+        json.dumps({"pid": pid, "start_time": "recorded-start-time"}),
+        encoding="utf-8",
+    )
+    monkeypatch.setattr(daemon_module, "process_alive", lambda _pid: True)
+    monkeypatch.setattr(daemon_module, "_process_start_time", lambda _pid: None)
+    monkeypatch.setattr(daemon_module, "_looks_like_oft_daemon", lambda _pid: False)
+
+    assert daemon_module._reconcile_pid_fence(settings, pid) == "kept"
+    assert pid_path(settings).exists()
+    assert pid_meta_path(settings).exists()
+
+
+def test_reconcile_pid_fence_does_not_adopt_a_foreign_uid_daemon(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    settings = _restart_settings(tmp_path)
+    pid = os.getpid()
+    pid_path(settings).parent.mkdir(parents=True, exist_ok=True)
+    pid_path(settings).write_text(str(pid), encoding="utf-8")
+    pid_meta_path(settings).write_text(
+        json.dumps({"pid": pid, "start_time": None}), encoding="utf-8"
+    )
+    monkeypatch.setattr(daemon_module, "process_alive", lambda _pid: True)
+    monkeypatch.setattr(daemon_module, "_process_start_time", lambda _pid: "current-start-time")
+    monkeypatch.setattr(daemon_module, "_looks_like_oft_daemon", lambda _pid: True)
+    monkeypatch.setattr(daemon_module, "_same_uid", lambda _pid: False)
+
+    assert daemon_module._reconcile_pid_fence(settings, pid) == "cleared"
+    assert not pid_path(settings).exists()
+    assert not pid_meta_path(settings).exists()
+
+
+def test_deeply_nested_pid_meta_does_not_raise(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    settings = _configure_cli(monkeypatch, tmp_path)
+    pid_path(settings).parent.mkdir(parents=True, exist_ok=True)
+    pid_path(settings).write_text(str(os.getpid()), encoding="utf-8")
+    pid_meta_path(settings).write_text("[" * 20000 + "]" * 20000, encoding="utf-8")
+    monkeypatch.setattr(daemon_module, "process_alive", lambda _pid: True)
+    monkeypatch.setattr(daemon_module, "_process_start_time", lambda _pid: "current-start-time")
+    monkeypatch.setattr(daemon_module, "_looks_like_oft_daemon", lambda _pid: False)
+
+    assert daemon_module._read_pid_meta(settings) is None
+    assert daemon_module.pid_matches(settings, os.getpid()) is False
+
+    status = _invoke("daemon", "status", "--json")
+    assert status.exit_code == 0, status.output
+    stopped = _invoke("daemon", "stop", "--json")
+    assert stopped.exit_code == 0, stopped.output
+    assert "Traceback" not in status.output + stopped.output
+
+
+def test_stop_daemon_permission_denied_returns_false(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    settings = _restart_settings(tmp_path)
+    _seed_pid_files(settings)
+    monkeypatch.setattr(daemon_module, "pid_matches", lambda *_args, **_kwargs: True)
+
+    def raise_permission(_pid: int, _signal: int) -> None:
+        raise PermissionError("denied")
+
+    monkeypatch.setattr(daemon_module.os, "kill", raise_permission)
+
+    assert daemon_module._stop_daemon(settings, 12345, timeout_seconds=0.001) is False
+    assert pid_path(settings).exists()
+    assert pid_meta_path(settings).exists()
+
+
+def test_daemon_stop_permission_denied_exits_one_with_internal_error(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    settings = _configure_cli(monkeypatch, tmp_path)
+    _seed_pid_files(settings)
+    monkeypatch.setattr(daemon_module, "pid_matches", lambda *_args, **_kwargs: True)
+
+    def raise_permission(_pid: int, _signal: int) -> None:
+        raise PermissionError("denied")
+
+    monkeypatch.setattr(daemon_module.os, "kill", raise_permission)
+
+    result = _invoke("daemon", "stop", "--json")
+
+    assert result.exit_code == 1, result.output
+    payload = json.loads(result.stdout)
+    assert payload["error"]["code"] == "INTERNAL_ERROR"
+    assert "permission denied" in payload["error"]["message"]
+    assert "12345" in payload["error"]["message"]
+    assert "Traceback" not in result.output

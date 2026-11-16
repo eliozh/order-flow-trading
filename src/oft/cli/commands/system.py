@@ -45,6 +45,9 @@ system_app = typer.Typer(
 
 REDACTED = "[REDACTED]"
 PROMPT_REDACTED = "[REDACTED UNTRUSTED PROMPT]"
+# Emitted instead of a record whose redaction would recurse (or fail to render).
+# The raw structured text is never emitted because it bypassed redaction.
+_UNPARSEABLE_RECORD = "[UNPARSEABLE LOG RECORD]"
 
 # Hints are matched against a key normalized to lowercase alphanumerics, so
 # ``api_key``, ``apikey``, ``X-Api-Key``, and ``x-api-key`` all match ``apikey``.
@@ -58,6 +61,13 @@ _SENSITIVE_KEY_HINTS = (
     "setcookie",
     "session",
     "signature",
+    "credential",
+    "bearer",
+    "privatekey",
+    "passphrase",
+    "pwd",
+    "passwd",
+    "accesskey",
 )
 # Metadata keys that legitimately contain a sensitive-looking hint are kept.
 _PROMPT_METADATA_KEYS = frozenset({"promptid", "promptversion"})
@@ -117,13 +127,19 @@ _BEARER_PATTERN = re.compile(r"(?i)\bbearer\s+[A-Za-z0-9._~+/=-]+")
 _COOKIE_PATTERN = re.compile(r"(?i)\b((?:set-)?cookie)\s*:\s*[^\r\n]+")
 # An un-coloned assignment (``cookie=a=1; b=SECRET``) runs to end-of-line too.
 _COOKIE_ASSIGNMENT_PATTERN = re.compile(r"(?i)\bcookie\s*=\s*[^\r\n]+")
-# Any authorization scheme (Basic, Digest, custom), not just Bearer.
-_AUTHORIZATION_PATTERN = re.compile(r"(?i)\bauthorization\s*:\s*[^\r\n]+")
+# Any authorization scheme (Basic, Digest, custom), not just Bearer. ``=`` is
+# accepted because structlog console rendering and ``repr(dict(headers))``
+# produce ``authorization=...``; a closing quote before the separator covers
+# ``{'authorization': '...'}`` / ``"authorization": "..."``; ``proxy-`` and
+# ``proxy_`` are common header prefixes.
+_AUTHORIZATION_PATTERN = re.compile(
+    r"(?i)\b(?:(?:proxy[-_])?authorization)['\"]?\s*[=:]\s*[^\r\n]+"
+)
 # Match a prefixed key too (``my_api_key=...``), not just a bare ``api_key``.
 # Quoted (and backticked) values may contain spaces and are replaced whole,
 # matching ``_SECRET_ASSIGNMENT_PATTERN`` below.
 _API_KEY_PATTERN = re.compile(
-    r"(?i)\b[\w-]*api[_-]?key\s*[=:]\s*(\"[^\"]*\"|'[^']*'|`[^`]*`|[^\s,;]+)"
+    r"(?i)\b[\w-]*api[_-]?key\s*['\"]?\s*[=:]\s*(\"[^\"]*\"|'[^']*'|`[^`]*`|[^\s,;]+)"
 )
 # The left guard is ``(?<![A-Za-z0-9])`` rather than ``\b`` so a key embedded
 # in a longer identifier (``db_password=...``, ``app_signature=...``) still
@@ -131,8 +147,9 @@ _API_KEY_PATTERN = re.compile(
 # (and backticked) values may contain spaces and are replaced whole.
 _SECRET_ASSIGNMENT_PATTERN = re.compile(
     r"(?i)(?<![A-Za-z0-9])"
-    r"(password|passwd|signature|access_token|client_secret|secret|token)"
-    r"\s*[=:]\s*(\"[^\"]*\"|'[^']*'|`[^`]*`|[^\s,;]+)"
+    r"(password|passwd|signature|access_token|client_secret|secret|token|"
+    r"credentials?|bearer|passphrase|private[_-]?key|pwd|access[_-]?key)"
+    r"\s*['\"]?\s*[=:]\s*(\"[^\"]*\"|'[^']*'|`[^`]*`|[^\s,;]+)"
 )
 _TELEGRAM_TOKEN_PATTERN = re.compile(r"\b\d{6,}:[A-Za-z0-9_-]{30,}\b")
 # Joining/variation marks are category ``Mn`` but render as nothing. Ordinary
@@ -188,6 +205,9 @@ _TOKEN_PATTERNS = (
 _LEVELS = {"debug": 10, "info": 20, "warning": 30, "error": 40, "critical": 50}
 _RELATIVE_SINCE = re.compile(r"^(\d+)([smhd])$")
 _RELATIVE_SECONDS = {"s": 1, "m": 60, "h": 3600, "d": 86400}
+# Bound user-controlled relative windows so ``timedelta`` can never overflow
+# and escape the exit-2 validation path as a traceback (100 years).
+_MAX_RELATIVE_SINCE_SECONDS = 100 * 366 * 86400
 _FOLLOW_POLL_SECONDS = 0.2
 
 
@@ -470,6 +490,11 @@ def _parse_since(value: str, settings: Settings) -> datetime:
     match = _RELATIVE_SINCE.match(text.lower())
     if match is not None:
         seconds = int(match.group(1)) * _RELATIVE_SECONDS[match.group(2)]
+        if seconds > _MAX_RELATIVE_SINCE_SECONDS:
+            raise ValueError(
+                f"--since window is too large; the maximum relative window is "
+                f"{_MAX_RELATIVE_SINCE_SECONDS // _RELATIVE_SECONDS['d']}d"
+            )
         return _now(settings) - timedelta(seconds=seconds)
     parsed = _parse_iso(text)
     if parsed is None:
@@ -536,12 +561,21 @@ def _select_records(
             continue
         try:
             parsed = json.loads(text)
-        except (TypeError, ValueError):
+        except (TypeError, ValueError, RecursionError):
+            # A value nested beyond the decoder's recursion limit is as
+            # unparseable as malformed JSON: drop/retain it as text instead of
+            # aborting the command with a traceback.
             parsed = None
         structured = isinstance(parsed, (dict, list))
         record: object = parsed if structured else text
         if not filters_active:
-            selected.append(redact_record(record, secret_values=secret_values))
+            try:
+                redacted = redact_record(record, secret_values=secret_values)
+            except RecursionError:
+                # The decoder accepted this nesting but the redactor cannot
+                # recurse that far. Never emit the raw structured text.
+                redacted = _UNPARSEABLE_RECORD
+            selected.append(redacted)
             matched += 1
             continue
         if not structured:
@@ -561,7 +595,14 @@ def _select_records(
                 continue
             if _LEVELS[level] < min_level:
                 continue
-        selected.append(redact_record(record, secret_values=secret_values))
+        try:
+            redacted = redact_record(record, secret_values=secret_values)
+        except RecursionError:
+            # The record cannot be redacted safely, so it cannot be filtered
+            # and shown: count it as dropped rather than leak raw text.
+            dropped += 1
+            continue
+        selected.append(redacted)
         matched += 1
     return _Selection(records=tuple(selected), matched=matched, dropped=dropped)
 
@@ -577,7 +618,11 @@ def _warn_dropped(dropped: int) -> None:
 
 def _emit_record(record: object, *, json_lines: bool) -> None:
     if json_lines or isinstance(record, (dict, list)):
-        typer.echo(json.dumps(record, sort_keys=True))
+        try:
+            rendered = json.dumps(record, sort_keys=True)
+        except (TypeError, ValueError, RecursionError):
+            rendered = json.dumps(_UNPARSEABLE_RECORD)
+        typer.echo(rendered)
     else:
         typer.echo(str(record))
 
@@ -601,15 +646,34 @@ def _follow_log(
     offset = 0
     try:
         inode = path.stat().st_ino
-        with path.open("r", encoding="utf-8", errors="replace") as handle:
-            selection = _select_records(
-                handle,
-                since=since,
-                min_level=min_level,
-                secret_values=secret_values,
-                max_records=lines,
-            )
-        offset = path.stat().st_size
+
+        def _complete_lines() -> Iterable[str]:
+            """Yield whole lines only, leaving a torn trailing record unread.
+
+            The steady-state loop withholds a partial record; the initial tail
+            must agree so a record is redacted (and emitted) as one unit exactly
+            once, after the writer terminates it.
+            """
+            nonlocal offset
+            with path.open("rb") as handle:
+                while True:
+                    start = handle.tell()
+                    raw_line = handle.readline()
+                    if not raw_line:
+                        return
+                    if not raw_line.endswith(b"\n"):
+                        offset = start
+                        return
+                    offset = handle.tell()
+                    yield raw_line.decode("utf-8", errors="replace")
+
+        selection = _select_records(
+            _complete_lines(),
+            since=since,
+            min_level=min_level,
+            secret_values=secret_values,
+            max_records=lines,
+        )
     except FileNotFoundError:
         inode = None
         offset = 0
