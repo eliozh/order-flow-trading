@@ -35,15 +35,20 @@ class TelegramError(Exception):
     """A typed Telegram failure with a stable, non-secret code.
 
     ``message`` is bounded and deliberately never contains the token, the
-    request URL, or a raw Bot API response body.
+    request URL, or a raw Bot API response body. ``retry_after`` carries the Bot
+    API ``parameters.retry_after`` for a rate limit, sanitized to a non-negative
+    int (or ``None``).
     """
 
-    def __init__(self, code: str, message: str) -> None:
+    def __init__(self, code: str, message: str, *, retry_after: int | None = None) -> None:
         if code not in PORT_ERROR_CODES:
             raise ValueError(f"unknown Telegram error code {code!r}")
         super().__init__(message)
         self.code = code
         self.message = message
+        if isinstance(retry_after, bool) or not isinstance(retry_after, int) or retry_after < 0:
+            retry_after = None
+        self.retry_after = retry_after
 
 
 @dataclass(frozen=True)
@@ -52,6 +57,19 @@ class TelegramIdentity:
 
     user_id: int
     username: str | None = None
+
+
+@dataclass(frozen=True)
+class TelegramUpdatePage:
+    """One ``getUpdates`` page: parseable updates plus the raw max update id.
+
+    ``max_update_id`` covers every raw item with a positive integer
+    ``update_id``, including unparseable/non-text items. The poller uses it to
+    acknowledge dropped updates so Telegram stops replaying them.
+    """
+
+    updates: tuple[TelegramUpdate, ...]
+    max_update_id: int | None = None
 
 
 @dataclass(frozen=True)
@@ -68,7 +86,7 @@ class TelegramPort(Protocol):
 
     def get_updates(
         self, *, offset: int | None = None, timeout_seconds: int = 0
-    ) -> tuple[TelegramUpdate, ...]: ...
+    ) -> TelegramUpdatePage: ...
 
     def send_message(
         self, *, chat_id: int, text: str, reply_to_message_id: int | None = None
@@ -87,4 +105,5 @@ __all__ = [
     "TelegramError",
     "TelegramIdentity",
     "TelegramPort",
+    "TelegramUpdatePage",
 ]

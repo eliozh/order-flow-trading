@@ -62,13 +62,13 @@ class ScriptedBotApiTransport(httpx.BaseTransport):
         self.updates = list(updates or [])
         self.sent: list[dict[str, Any]] = []
         self._next_message_id = sent_message_id_start
-        self._errors: dict[str, list[int]] = {}
+        self._errors: dict[str, list[tuple[int, int | None]]] = {}
         self._lock = threading.Lock()
 
-    def script_error(self, method: str, error_code: int) -> None:
+    def script_error(self, method: str, error_code: int, *, retry_after: int | None = None) -> None:
         """Make the next ``method`` call fail with one Bot API error code."""
         with self._lock:
-            self._errors.setdefault(method, []).append(error_code)
+            self._errors.setdefault(method, []).append((error_code, retry_after))
 
     def handle_request(self, request: httpx.Request) -> httpx.Response:
         body: dict[str, Any] = {}
@@ -87,15 +87,15 @@ class ScriptedBotApiTransport(httpx.BaseTransport):
             )
             pending = self._errors.get(method)
             if pending:
-                error_code = pending.pop(0)
-                return httpx.Response(
-                    error_code,
-                    json={
-                        "ok": False,
-                        "error_code": error_code,
-                        "description": "scripted failure",
-                    },
-                )
+                error_code, retry_after = pending.pop(0)
+                error_body: dict[str, Any] = {
+                    "ok": False,
+                    "error_code": error_code,
+                    "description": "scripted failure",
+                }
+                if retry_after is not None:
+                    error_body["parameters"] = {"retry_after": retry_after}
+                return httpx.Response(error_code, json=error_body)
             if method == "getMe":
                 return httpx.Response(
                     200, json={"ok": True, "result": {"id": 42, "username": "oft_bot"}}

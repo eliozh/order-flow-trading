@@ -22,7 +22,13 @@ from oft.domain.telegram import POLL_OFFSET_KEY, POLLER_HEARTBEAT_KEY
 from oft.domain.time import utc_timestamp
 from oft.ports.clock import ClockPort
 from oft.ports.store import StorePort
-from oft.ports.telegram import TELEGRAM_NOT_CONFIGURED, TelegramError, TelegramPort
+from oft.ports.telegram import (
+    TELEGRAM_NOT_CONFIGURED,
+    TELEGRAM_TOKEN_INVALID,
+    TELEGRAM_UNAUTHORIZED,
+    TelegramError,
+    TelegramPort,
+)
 
 LOGGER = structlog.get_logger(__name__)
 POLL_INTERVAL_SECONDS = 1.0
@@ -32,6 +38,12 @@ SHUTDOWN_JOIN_SECONDS = 5.0
 # a slow re-check and log only on a state change; the runtime still picks up a
 # token rotation without a restart on the next check.
 UNCONFIGURED_BACKOFF_SECONDS = 30.0
+# Permanent configuration failures: no host call succeeds until the operator
+# fixes the token/allowlist, so treat them like "not configured".
+CONFIGURATION_ERROR_CODES = frozenset(
+    {TELEGRAM_NOT_CONFIGURED, TELEGRAM_TOKEN_INVALID, TELEGRAM_UNAUTHORIZED}
+)
+TRANSIENT_BACKOFF_MAX_SECONDS = 60.0
 
 
 class TelegramPoller:
@@ -56,7 +68,8 @@ class TelegramPoller:
         self._stop = threading.Event()
         self._thread: threading.Thread | None = None
         self._wait_override: float | None = None
-        self._unconfigured_logged = False
+        self._last_config_code: str | None = None
+        self._consecutive_failures = 0
 
     @property
     def is_running(self) -> bool:
@@ -73,41 +86,51 @@ class TelegramPoller:
         return value if value > 0 else None
 
     def poll_once(self) -> int:
-        """Poll one batch, enqueue replies, and advance the offset per update."""
+        """Poll one batch, enqueue replies, and advance the offset.
+
+        The offset advances per successfully handled update and, when no
+        handling failure occurred, to ``max_update_id + 1`` so dropped
+        (non-text/unparseable) updates are acknowledged instead of replayed.
+        """
         offset = self.offset()
         try:
             port = self._port_resolver()
-            updates = port.get_updates(offset=offset, timeout_seconds=self._long_poll_timeout)
+            page = port.get_updates(offset=offset, timeout_seconds=self._long_poll_timeout)
         except TelegramError as exc:
-            if exc.code == TELEGRAM_NOT_CONFIGURED:
-                # The default paper/unconfigured install: no token yet. Do not
-                # call the port again for a while, do not log every tick, and do
-                # not write heartbeats (the health check short-circuits too).
+            if exc.code in CONFIGURATION_ERROR_CODES:
+                # Not configured, or a permanently invalid token/unauthorized
+                # state: do not call the port again for a while, do not log
+                # every tick, and do not write heartbeats (health degrades).
                 self._wait_override = UNCONFIGURED_BACKOFF_SECONDS
-                if not self._unconfigured_logged:
+                self._consecutive_failures = 0
+                if self._last_config_code != exc.code:
                     LOGGER.info("telegram_poll_unconfigured", code=exc.code)
-                    self._unconfigured_logged = True
+                    self._last_config_code = exc.code
                 return 0
-            self._wait_override = None
-            self._unconfigured_logged = False
-            # Rate-limited or upstream down: stay alive and try again next tick.
+            self._last_config_code = None
+            self._consecutive_failures += 1
+            self._wait_override = self._transient_backoff()
+            # Rate-limited or upstream down: stay alive and try again later.
             LOGGER.warning("telegram_poll_failed", code=exc.code)
             self._heartbeat()
             return 0
         except Exception:  # noqa: BLE001 - the supervisor thread must survive
-            self._wait_override = None
-            self._unconfigured_logged = False
+            self._last_config_code = None
+            self._consecutive_failures += 1
+            self._wait_override = self._transient_backoff()
             LOGGER.exception("telegram_poll_unexpected_failure")
             self._heartbeat()
             return 0
         processed = 0
-        for update in sorted(updates, key=lambda item: item.update_id):
+        handling_failed = False
+        for update in sorted(page.updates, key=lambda item: item.update_id):
             if offset is not None and update.update_id < offset:
                 continue
             try:
                 self._service.handle_update(update)
             except Exception:  # noqa: BLE001 - do not advance past a failed update
                 LOGGER.exception("telegram_update_handling_failed", update_id=update.update_id)
+                handling_failed = True
                 break
             self._store.set_system_state(
                 POLL_OFFSET_KEY,
@@ -115,10 +138,25 @@ class TelegramPoller:
                 updated_at=utc_timestamp(self._clock.now()),
             )
             processed += 1
+        if not handling_failed and page.max_update_id is not None:
+            candidate = page.max_update_id + 1
+            current = self.offset()
+            if current is None or candidate > current:
+                self._store.set_system_state(
+                    POLL_OFFSET_KEY,
+                    str(candidate),
+                    updated_at=utc_timestamp(self._clock.now()),
+                )
         self._wait_override = None
-        self._unconfigured_logged = False
+        self._last_config_code = None
+        self._consecutive_failures = 0
         self._heartbeat()
         return processed
+
+    def _transient_backoff(self) -> float:
+        base = max(self._poll_interval_seconds, 1.0)
+        factor = 1 << min(self._consecutive_failures, 16)
+        return min(base * factor, TRANSIENT_BACKOFF_MAX_SECONDS)
 
     def _heartbeat(self) -> None:
         now = utc_timestamp(self._clock.now())
@@ -188,6 +226,8 @@ class TelegramRuntime:
         return self._poller
 
     def start(self) -> None:
+        # Retention is handled by the dispatcher's first (and periodic) tick, so
+        # startup has no separate purge path to fail.
         self._scheduler.start()
         self._poller.start()
 

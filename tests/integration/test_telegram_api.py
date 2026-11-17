@@ -192,14 +192,19 @@ def test_mutations_require_an_idempotency_key(tmp_path: Path, backend: MemorySec
 def test_an_invalid_token_surfaces_a_stable_code_and_no_body(
     tmp_path: Path, backend: MemorySecretBackend
 ) -> None:
-    from oft.ports.telegram import TELEGRAM_TOKEN_INVALID, TelegramError, TelegramIdentity
+    from oft.ports.telegram import (
+        TELEGRAM_TOKEN_INVALID,
+        TelegramError,
+        TelegramIdentity,
+        TelegramUpdatePage,
+    )
 
     class _UnauthorizedPort:
         def get_me(self) -> TelegramIdentity:
             raise TelegramError(TELEGRAM_TOKEN_INVALID, "scripted 401")
 
         def get_updates(self, *, offset=None, timeout_seconds=0):  # type: ignore[no-untyped-def]
-            return ()
+            return TelegramUpdatePage(())
 
         def send_message(self, *, chat_id, text, reply_to_message_id=None):  # type: ignore[no-untyped-def]
             raise TelegramError(TELEGRAM_TOKEN_INVALID, "scripted 401")

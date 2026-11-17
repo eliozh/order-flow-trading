@@ -4,11 +4,13 @@ from __future__ import annotations
 
 import json
 import logging
+import sys
 from datetime import UTC, datetime
 from pathlib import Path
 
 import httpx
 import pytest
+import structlog
 
 from oft import bootstrap
 from oft.adapters.sqlite_store import SqliteStore
@@ -329,3 +331,97 @@ def test_build_container_seeds_the_log_redaction_registry(
         assert wired_value not in record.getMessage()
     finally:
         set_redaction_values(())
+
+
+def test_a_stdlib_exception_traceback_is_scrubbed(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """A ``logger.exception`` whose exception text carries the token is scrubbed.
+
+    The stdlib formatter appends ``exc_text`` after the handler filter runs, so
+    only a scrubbing formatter (or a filter-computed ``exc_text``) closes this
+    leak. Both root handlers must emit the redacted traceback.
+    """
+    settings = Settings(
+        env="test",
+        port=8765,
+        data_dir=tmp_path / "data",
+        log_level="INFO",
+    )
+    root = logging.getLogger()
+    original_handlers = root.handlers[:]
+    try:
+        configure_logging(settings)
+        set_redaction_values(())
+        logger = logging.getLogger("oft.test")
+        try:
+            raise RuntimeError(f"cannot reach https://api.telegram.org/bot{SENTINEL}/getMe")
+        except RuntimeError:
+            logger.exception("direct %s", SENTINEL)
+        captured = capsys.readouterr()
+        daemon_log = (settings.data_dir / "logs" / "daemon.log").read_text(encoding="utf-8")
+    finally:
+        root.handlers[:] = original_handlers
+        set_redaction_values(())
+
+    assert "direct [REDACTED]" in daemon_log
+    assert "RuntimeError" in daemon_log
+    assert SENTINEL not in daemon_log
+    assert SENTINEL not in captured.out
+    assert SENTINEL not in captured.err
+
+
+def test_the_filter_scrubs_a_rendered_traceback() -> None:
+    set_redaction_values(())
+    try:
+        try:
+            raise RuntimeError(f"cannot reach https://api.telegram.org/bot{SENTINEL}/getMe")
+        except RuntimeError:
+            record = logging.LogRecord(
+                name="oft.test",
+                level=logging.ERROR,
+                pathname=__file__,
+                lineno=1,
+                msg="failed",
+                args=(),
+                exc_info=sys.exc_info(),
+            )
+        assert RedactingFilter().filter(record) is True
+        rendered = logging.Formatter("%(message)s").format(record)
+    finally:
+        set_redaction_values(())
+
+    assert "RuntimeError" in rendered
+    assert SENTINEL not in rendered
+
+
+def test_a_structlog_exception_is_scrubbed_in_the_daemon_log(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """The processor chain must format ``exc_info`` before redaction runs."""
+    settings = Settings(
+        env="test",
+        port=8765,
+        data_dir=tmp_path / "data",
+        log_level="INFO",
+    )
+    root = logging.getLogger()
+    original_handlers = root.handlers[:]
+    try:
+        configure_logging(settings)
+        set_redaction_values(())
+        logger = structlog.get_logger("oft.structlog.test")
+        try:
+            raise RuntimeError(f"cannot reach https://api.telegram.org/bot{SENTINEL}/getMe")
+        except RuntimeError:
+            logger.exception("structlog failure")
+        captured = capsys.readouterr()
+        daemon_log = (settings.data_dir / "logs" / "daemon.log").read_text(encoding="utf-8")
+    finally:
+        root.handlers[:] = original_handlers
+        set_redaction_values(())
+        structlog.reset_defaults()
+
+    assert "structlog failure" in daemon_log
+    assert SENTINEL not in daemon_log
+    assert SENTINEL not in captured.out

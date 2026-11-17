@@ -240,9 +240,31 @@ def test_get_updates_parses_valid_items_and_skips_malformed() -> None:
         )
     )
 
-    updates = _adapter_transport(transport).get_updates(offset=1)
+    page = _adapter_transport(transport).get_updates(offset=1)
 
-    assert [update.update_id for update in updates] == [1]
+    assert [update.update_id for update in page.updates] == [1]
+    # The dropped non-text/malformed items still acknowledge their raw ids, so
+    # the poller can advance past them instead of re-fetching them forever.
+    assert page.max_update_id == 3
+
+
+def test_a_rate_limited_error_carries_the_retry_after_parameter() -> None:
+    transport = ScriptedBotApiTransport()
+    transport.script_error("sendMessage", 429, retry_after=30)
+
+    with pytest.raises(TelegramError) as caught:
+        _adapter(transport).send_message(chat_id=1001, text="STATUS")
+
+    assert caught.value.code == "TELEGRAM_RATE_LIMITED"
+    assert caught.value.retry_after == 30
+
+
+def test_retry_after_is_sanitized_to_a_non_negative_non_bool_int() -> None:
+    assert TelegramError("TELEGRAM_RATE_LIMITED", "x", retry_after=True).retry_after is None
+    assert TelegramError("TELEGRAM_RATE_LIMITED", "x", retry_after=-5).retry_after is None
+    assert TelegramError("TELEGRAM_RATE_LIMITED", "x", retry_after="30").retry_after is None
+    assert TelegramError("TELEGRAM_RATE_LIMITED", "x", retry_after=30).retry_after == 30
+    assert TelegramError("TELEGRAM_RATE_LIMITED", "x").retry_after is None
 
 
 def _adapter_transport(transport: Any) -> TelegramBotApiAdapter:

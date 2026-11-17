@@ -114,9 +114,11 @@ def test_a_timed_out_join_keeps_the_thread_handle_and_refuses_a_second_poller(
 
     class _BlockingPort(TelegramFake):
         def get_updates(self, *, offset=None, timeout_seconds=0):  # type: ignore[no-untyped-def]
+            from oft.ports.telegram import TelegramUpdatePage
+
             entered.set()
             release.wait(timeout=10)
-            return ()
+            return TelegramUpdatePage(())
 
     poller._port_resolver = _BlockingPort  # noqa: SLF001 - exercise the timeout branch
     monkeypatch.setattr("oft.application.telegram_poller.SHUTDOWN_JOIN_SECONDS", 0.0)

@@ -15,7 +15,7 @@ Security invariants:
 from __future__ import annotations
 
 import threading
-from collections.abc import Callable
+from collections.abc import Callable, Mapping
 from typing import Any
 
 import httpx
@@ -37,6 +37,7 @@ from oft.ports.telegram import (
     SentMessage,
     TelegramError,
     TelegramIdentity,
+    TelegramUpdatePage,
 )
 
 LOGGER = structlog.get_logger(__name__)
@@ -153,7 +154,11 @@ class TelegramBotApiAdapter:
         mapped = _map_error_code(error_code, response.status_code)
         # Only the numeric code is surfaced; the description body is dropped.
         detail = error_code if isinstance(error_code, int) else response.status_code
-        raise TelegramError(mapped, f"the Telegram Bot API rejected {method} (error_code={detail})")
+        raise TelegramError(
+            mapped,
+            f"the Telegram Bot API rejected {method} (error_code={detail})",
+            retry_after=_retry_after(body),
+        )
 
     def get_me(self) -> TelegramIdentity:
         result = self._call("getMe", {})
@@ -172,7 +177,7 @@ class TelegramBotApiAdapter:
 
     def get_updates(
         self, *, offset: int | None = None, timeout_seconds: int = 0
-    ) -> tuple[TelegramUpdate, ...]:
+    ) -> TelegramUpdatePage:
         payload: dict[str, Any] = {"timeout": max(0, timeout_seconds)}
         if offset is not None:
             payload["offset"] = offset
@@ -182,11 +187,17 @@ class TelegramBotApiAdapter:
                 TELEGRAM_UPSTREAM_ERROR, "the Telegram getUpdates result was malformed"
             )
         updates: list[TelegramUpdate] = []
+        max_update_id: int | None = None
         for raw in result:
+            raw_update_id = _raw_update_id(raw)
+            if raw_update_id is not None:
+                max_update_id = (
+                    raw_update_id if max_update_id is None else max(max_update_id, raw_update_id)
+                )
             parsed = parse_update(raw)
             if parsed is not None:
                 updates.append(parsed)
-        return tuple(updates)
+        return TelegramUpdatePage(updates=tuple(updates), max_update_id=max_update_id)
 
     def send_message(
         self, *, chat_id: int, text: str, reply_to_message_id: int | None = None
@@ -219,6 +230,27 @@ def _map_error_code(error_code: object, http_status: int) -> str:
     if code == 409:
         return TELEGRAM_CONFLICT
     return TELEGRAM_UPSTREAM_ERROR
+
+
+def _raw_update_id(raw: object) -> int | None:
+    """The positive integer ``update_id`` of a raw item, else ``None``."""
+    if not isinstance(raw, Mapping):
+        return None
+    update_id = raw.get("update_id")
+    if isinstance(update_id, bool) or not isinstance(update_id, int) or update_id <= 0:
+        return None
+    return update_id
+
+
+def _retry_after(body: Mapping[str, Any]) -> int | None:
+    """The Bot API ``parameters.retry_after`` when it is a non-negative int."""
+    parameters = body.get("parameters")
+    if not isinstance(parameters, Mapping):
+        return None
+    value = parameters.get("retry_after")
+    if isinstance(value, bool) or not isinstance(value, int) or value < 0:
+        return None
+    return value
 
 
 __all__ = ["BOT_API_HOST", "DEFAULT_LONG_POLL_SECONDS", "TelegramBotApiAdapter"]

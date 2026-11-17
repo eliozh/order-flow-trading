@@ -28,19 +28,23 @@ from oft.application.telegram_messages import (
 from oft.config import Settings
 from oft.domain.telegram import (
     HELP_COMMAND,
+    MAX_GLOBAL_REFUSALS_PER_WINDOW,
     MAX_REFUSALS_PER_WINDOW,
     REFUSAL_TEXT,
     REFUSAL_WINDOW_SECONDS,
     STATUS_COMMAND,
+    TELEGRAM_REFUSAL_AUDIT_WINDOW_SECONDS,
     ReceiptState,
     TelegramAllowlist,
     TelegramUpdate,
+    TelegramValidationError,
     is_authorized,
     parse_command,
     reply_event_key,
     sanitize_inbound_text,
     test_event_key,
     truncate_outbound,
+    validate_telegram_token,
 )
 from oft.domain.time import utc_timestamp
 from oft.ports.clock import ClockPort
@@ -132,7 +136,9 @@ class TelegramService:
         port: TelegramPort,
         refusal_window_seconds: int = REFUSAL_WINDOW_SECONDS,
         max_refusals: int = MAX_REFUSALS_PER_WINDOW,
+        max_global_refusals: int = MAX_GLOBAL_REFUSALS_PER_WINDOW,
         max_refusal_chats: int = MAX_REFUSAL_CHATS,
+        refusal_audit_window_seconds: int = TELEGRAM_REFUSAL_AUDIT_WINDOW_SECONDS,
     ) -> None:
         self._settings = settings
         self._store = store
@@ -143,8 +149,15 @@ class TelegramService:
         self._port = port
         self._refusal_window_seconds = refusal_window_seconds
         self._max_refusals = max_refusals
+        self._max_global_refusals = max(1, max_global_refusals)
         self._max_refusal_chats = max(1, max_refusal_chats)
+        self._refusal_audit_window_seconds = max(1, refusal_audit_window_seconds)
         self._refusals: dict[int, list[datetime]] = {}
+        self._global_refusals: list[datetime] = []
+        self._audit_window_started_at: datetime | None = None
+        self._audit_count = 0
+        self._audit_first_update_id: int | None = None
+        self._audit_last_update_id: int | None = None
         self._refusal_lock = threading.Lock()
 
     # -- token and allowlist --------------------------------------------
@@ -194,6 +207,11 @@ class TelegramService:
         elif not token.configured:
             state = "NOT_CONFIGURED"
             detail = "the Telegram bot token is not configured"
+        elif token.source == "env" and self._env_token_is_invalid():
+            # A raw environment value is not validated on write, so an
+            # invalid-shaped token must not report READY.
+            state = "DEGRADED"
+            detail = "the environment Telegram bot token is invalid"
         elif not allowlist.chat_ids:
             state = "NO_ALLOWLIST"
             detail = "no Telegram chat is allowlisted"
@@ -215,6 +233,19 @@ class TelegramService:
 
     # -- inbound ---------------------------------------------------------
 
+    def _env_token_is_invalid(self) -> bool:
+        """Whether the raw environment token fails the shared shape rule."""
+        token = self._settings.telegram_bot_token
+        if token is None:
+            return False
+        getter = getattr(token, "get_secret_value", None)
+        value = getter() if callable(getter) else token
+        try:
+            validate_telegram_token(value)
+        except TelegramValidationError:
+            return True
+        return False
+
     def handle_update(self, update: TelegramUpdate) -> TelegramOutboxRecord | None:
         """Authorize one update, then enqueue at most one reply.
 
@@ -231,9 +262,13 @@ class TelegramService:
         )
         now = self._clock.now()
         if not is_authorized(update.chat_id, update.user_id, authorization):
+            # Every unauthorized update is accounted for -- including those the
+            # budgets drop -- but the append-only audit chain is aggregated per
+            # wall-clock window instead of growing at attacker rate.
+            for draft in self._refusal_audit_drafts(update, now):
+                self._store.append_audit_event(draft)
             if not self._refusal_allowed(update.chat_id, now):
                 return None
-            self._audit_unauthorized(update, now)
             return self._enqueue(
                 event_key=reply_event_key(update.update_id),
                 kind="refusal",
@@ -301,7 +336,22 @@ class TelegramService:
         return record
 
     def _refusal_allowed(self, chat_id: int, now: datetime) -> bool:
+        """Whether to enqueue a refusal receipt for this chat.
+
+        Two bounds apply: a per-chat window (at most ``max_refusals`` receipts)
+        and a global window across all chats. A refusal beyond the global budget
+        is dropped silently, so attacker-chosen chat ids cannot drive unbounded
+        receipt/outbox growth. Audit accounting is separate and lives in
+        :meth:`_refusal_audit_drafts`.
+        """
         with self._refusal_lock:
+            self._global_refusals = [
+                seen
+                for seen in self._global_refusals
+                if (now - seen).total_seconds() < self._refusal_window_seconds
+            ]
+            if len(self._global_refusals) >= self._max_global_refusals:
+                return False
             if chat_id not in self._refusals and len(self._refusals) >= self._max_refusal_chats:
                 # Evict the oldest chat entry; its window will start afresh.
                 self._refusals.pop(next(iter(self._refusals)), None)
@@ -315,21 +365,75 @@ class TelegramService:
                 return False
             history.append(now)
             self._refusals[chat_id] = history
+            self._global_refusals.append(now)
             return True
 
-    def _audit_unauthorized(self, update: TelegramUpdate, now: datetime) -> None:
-        self._store.append_audit_event(
-            AuditEventDraft(
-                event_type=_UNAUTHORIZED_EVENT,
-                actor={"kind": "TELEGRAM", "id": str(update.user_id)},
-                subject={"kind": "TELEGRAM", "id": str(update.chat_id)},
-                payload={
-                    "update_id": update.update_id,
-                    "chat_id": update.chat_id,
-                    "user_id": update.user_id,
-                },
-                created_at=utc_timestamp(now),
-            )
+    def _refusal_audit_drafts(
+        self, update: TelegramUpdate, now: datetime
+    ) -> tuple[AuditEventDraft, ...]:
+        """Aggregate unauthorized updates into at most two rows per window.
+
+        The first refusal of a window is written immediately so any single
+        refusal stays visible. Later refusals only bump an in-memory counter;
+        when the wall-clock window closes, one neutral summary row describes the
+        closing window (when it saw more than one refusal) alongside the new
+        window's immediate row. Accounting happens under ``_refusal_lock`` for
+        every unauthorized update, including those the refusal budgets drop, so
+        attacker volume cannot grow the append-only audit chain without bound.
+        """
+        with self._refusal_lock:
+            started = self._audit_window_started_at
+            if started is None:
+                self._start_audit_window(update, now)
+                return (self._immediate_audit_draft(update, now),)
+            if (now - started).total_seconds() < self._refusal_audit_window_seconds:
+                self._audit_count += 1
+                self._audit_last_update_id = update.update_id
+                return ()
+            drafts: list[AuditEventDraft] = []
+            if self._audit_count > 1:
+                drafts.append(self._aggregate_audit_draft(started, now))
+            self._start_audit_window(update, now)
+            drafts.append(self._immediate_audit_draft(update, now))
+            return tuple(drafts)
+
+    def _start_audit_window(self, update: TelegramUpdate, now: datetime) -> None:
+        self._audit_window_started_at = now
+        self._audit_count = 1
+        self._audit_first_update_id = update.update_id
+        self._audit_last_update_id = update.update_id
+
+    def _immediate_audit_draft(self, update: TelegramUpdate, now: datetime) -> AuditEventDraft:
+        return AuditEventDraft(
+            event_type=_UNAUTHORIZED_EVENT,
+            actor={"kind": "TELEGRAM", "id": str(update.user_id)},
+            subject={"kind": "TELEGRAM", "id": str(update.chat_id)},
+            payload={
+                "count": 1,
+                "first_update_id": update.update_id,
+                "last_update_id": update.update_id,
+                "window_start": utc_timestamp(now),
+                "aggregated": False,
+            },
+            created_at=utc_timestamp(now),
+        )
+
+    def _aggregate_audit_draft(self, started: datetime, now: datetime) -> AuditEventDraft:
+        # A neutral actor/subject: the summary spans many chats/users, so it must
+        # not be attributed to any single one.
+        return AuditEventDraft(
+            event_type=_UNAUTHORIZED_EVENT,
+            actor={"kind": "TELEGRAM", "id": "aggregate"},
+            subject={"kind": "TELEGRAM", "id": "aggregate"},
+            payload={
+                "count": self._audit_count,
+                "first_update_id": self._audit_first_update_id,
+                "last_update_id": self._audit_last_update_id,
+                "window_start": utc_timestamp(started),
+                "window_seconds": self._refusal_audit_window_seconds,
+                "aggregated": True,
+            },
+            created_at=utc_timestamp(now),
         )
 
     # -- operator test send and receipts ---------------------------------

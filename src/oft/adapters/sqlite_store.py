@@ -13,6 +13,7 @@ import sqlite3
 from collections.abc import Callable
 from contextlib import closing
 from dataclasses import replace
+from datetime import datetime, timedelta
 from pathlib import Path
 
 from oft.adapters.sqlite_audit import SqliteAuditMixin
@@ -36,8 +37,10 @@ from oft.domain.telegram import (
     MAX_TELEGRAM_OUTBOX_ATTEMPTS,
     TELEGRAM_ALLOWED_USER_IDS_KEY,
     TELEGRAM_CHAT_IDS_KEY,
+    TELEGRAM_OUTBOX_CLAIM_LEASE_SECONDS,
     ReceiptState,
 )
+from oft.domain.time import utc_timestamp
 from oft.ports.store import (
     AuditEventDraft,
     AuditEventRecord,
@@ -296,16 +299,37 @@ class SqliteStore(
     def claim_due_telegram_outbox(
         self, *, now: str, limit: int = 10
     ) -> tuple[TelegramOutboxRecord, ...]:
+        """Claim due ``queued`` rows and reclaim expired ``sending`` claims.
+
+        Inside one ``BEGIN IMMEDIATE`` transaction, a stale claim (a row still
+        ``sending`` after the lease expired) is requeued as a new attempt, or
+        terminally failed when it is already at the attempt cap. A claimed row's
+        ``next_attempt_at`` becomes the lease expiry, so a crash during the send
+        is recovered on a later tick instead of stranding the reply forever. A
+        send that completed but whose terminal write failed is re-sent after the
+        lease: a rare duplicate is preferred to a permanently lost reply.
+        """
         connection = self._connect()
         try:
             connection.execute("BEGIN IMMEDIATE")
+            connection.execute(
+                """
+                UPDATE telegram_outbox
+                SET attempts = attempts + 1,
+                    state = CASE WHEN attempts + 1 >= ? THEN 'failed' ELSE 'queued' END,
+                    last_error_code = 'TELEGRAM_DELIVERY_FAILED',
+                    next_attempt_at = ?
+                WHERE state = 'sending' AND next_attempt_at <= ?
+                """,
+                (MAX_TELEGRAM_OUTBOX_ATTEMPTS, now, now),
+            )
             rows = connection.execute(
                 """
                 SELECT event_key, kind, chat_id, reply_to_message_id, payload_json,
                        priority, state, attempts, next_attempt_at, message_id,
                        last_error_code, created_at, sent_at
                 FROM telegram_outbox
-                WHERE state IN ('queued','failed')
+                WHERE state = 'queued'
                   AND attempts < ?
                   AND next_attempt_at <= ?
                 ORDER BY priority DESC, next_attempt_at ASC, created_at ASC, rowid ASC
@@ -313,15 +337,16 @@ class SqliteStore(
                 """,
                 (MAX_TELEGRAM_OUTBOX_ATTEMPTS, now, max(1, limit)),
             ).fetchall()
+            lease_until = _shift_timestamp(now, TELEGRAM_OUTBOX_CLAIM_LEASE_SECONDS)
             claimed: list[TelegramOutboxRecord] = []
             for row in rows:
                 event_key = str(row["event_key"])
                 updated = connection.execute(
                     """
-                    UPDATE telegram_outbox SET state = 'sending'
-                    WHERE event_key = ? AND state IN ('queued','failed')
+                    UPDATE telegram_outbox SET state = 'sending', next_attempt_at = ?
+                    WHERE event_key = ? AND state = 'queued'
                     """,
-                    (event_key,),
+                    (lease_until, event_key),
                 )
                 if updated.rowcount == 1:
                     claimed.append(
@@ -379,20 +404,49 @@ class SqliteStore(
         error_code: str,
         next_attempt_at: str,
         final: bool,
+        count_attempt: bool = True,
     ) -> bool:
         with closing(self._connect()) as connection, connection:
             cursor = connection.execute(
                 """
                 UPDATE telegram_outbox
-                SET attempts = attempts + 1,
+                SET attempts = attempts + ?,
                     state = ?,
                     last_error_code = ?,
                     next_attempt_at = ?
                 WHERE event_key = ? AND state = 'sending'
                 """,
-                ("failed" if final else "queued", error_code, next_attempt_at, event_key),
+                (
+                    1 if count_attempt else 0,
+                    "failed" if final else "queued",
+                    error_code,
+                    next_attempt_at,
+                    event_key,
+                ),
             )
         return cursor.rowcount == 1
+
+    def purge_terminal_telegram_outbox(self, *, before: str, limit: int = 1000) -> int:
+        """Delete up to ``limit`` old terminal outbox rows.
+
+        Only ``sent``/``failed`` rows created before ``before`` are eligible, so
+        purge never removes a queued/sending reply. SQLite builds without
+        ``DELETE ... LIMIT`` are supported through a rowid subquery.
+        """
+        with closing(self._connect()) as connection, connection:
+            cursor = connection.execute(
+                """
+                DELETE FROM telegram_outbox
+                WHERE rowid IN (
+                    SELECT rowid FROM telegram_outbox
+                    WHERE state IN ('sent','failed') AND created_at < ?
+                    ORDER BY created_at ASC
+                    LIMIT ?
+                )
+                """,
+                (before, max(1, limit)),
+            )
+        return cursor.rowcount
 
     def list_telegram_receipts(self, limit: int = 50) -> tuple[TelegramOutboxRecord, ...]:
         connection = self._connect_read_only()
@@ -434,6 +488,12 @@ class SqliteStore(
 
 
 _TELEGRAM_OUTBOX_TABLE = "telegram_outbox"
+
+
+def _shift_timestamp(value: str, seconds: int) -> str:
+    """Shift one canonical ISO-8601 UTC timestamp by ``seconds``."""
+    parsed = datetime.fromisoformat(value.replace("Z", "+00:00"))
+    return utc_timestamp(parsed + timedelta(seconds=seconds))
 
 
 def _missing_telegram_outbox(exc: sqlite3.OperationalError) -> bool:

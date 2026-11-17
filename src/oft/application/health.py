@@ -20,6 +20,8 @@ from oft.domain.telegram import (
     POLLER_STALE_SECONDS,
     TELEGRAM_ALLOWED_USER_IDS_KEY,
     TELEGRAM_CHAT_IDS_KEY,
+    TelegramValidationError,
+    validate_telegram_token,
 )
 from oft.domain.time import utc_timestamp
 from oft.ports.clock import ClockPort
@@ -543,6 +545,16 @@ def _telegram_check(
     configured = meta is not None or settings.telegram_bot_token is not None
     if not configured:
         return CheckResult("telegram", "ok", "not configured (optional)")
+    if meta is None and settings.telegram_bot_token is not None:
+        # The environment fallback is raw and never validated on write; an
+        # invalid-shaped token makes every poll fail, so report it as degraded.
+        # The value itself is never echoed.
+        try:
+            validate_telegram_token(settings.telegram_bot_token.get_secret_value())
+        except TelegramValidationError:
+            return CheckResult(
+                "telegram", "degraded", "the environment Telegram bot token is invalid"
+            )
     chat_count = _allowlist_count(store, TELEGRAM_CHAT_IDS_KEY, label="chat allowlist")
     if isinstance(chat_count, CheckResult):
         return chat_count

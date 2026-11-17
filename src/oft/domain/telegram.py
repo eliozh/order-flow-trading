@@ -35,6 +35,19 @@ MAX_TELEGRAM_CHAT_IDS = 10
 MAX_TELEGRAM_ALLOWED_USER_IDS = 20
 REFUSAL_WINDOW_SECONDS = 60
 MAX_REFUSALS_PER_WINDOW = 3
+# A global budget across all chats so attacker-chosen chat ids cannot drive
+# unbounded refusal-receipt/outbox growth inside one window. The append-only
+# audit trail is bounded separately by wall-clock aggregation, below.
+MAX_GLOBAL_REFUSALS_PER_WINDOW = 20
+# Sustained unauthenticated refusals must not grow SQLite without bound. Three
+# independent bounds apply:
+# - the global refusal budget caps refusal receipts/outbox rows per window;
+# - unauthorized audit rows are aggregated to at most two rows per wall-clock
+#   audit window (an immediate row plus a closing summary), so the append-only
+#   ``audit_events`` chain is never deleted but cannot grow at attacker rate;
+# - terminal outbox rows older than the retention are purged hourly by the
+#   dispatcher in bounded batches (see the purge constants below).
+TELEGRAM_REFUSAL_AUDIT_WINDOW_SECONDS = 3600
 
 STATUS_COMMAND = "/status"
 HELP_COMMAND = "/help"
@@ -50,6 +63,25 @@ POLLER_STALE_SECONDS = 60
 # The single retry bound shared by the claim predicate and the terminal
 # decision in the dispatcher, so the two layers cannot drift.
 MAX_TELEGRAM_OUTBOX_ATTEMPTS = 3
+# A row claimed as 'sending' is re-claimed (and re-sent) only after this lease
+# expires, so a crash during the send cannot strand the reply forever. Must
+# exceed the adapter's 35 s HTTP timeout.
+TELEGRAM_OUTBOX_CLAIM_LEASE_SECONDS = 120
+TELEGRAM_OUTBOX_BACKOFF_BASE_SECONDS = 2
+TELEGRAM_OUTBOX_BACKOFF_MAX_SECONDS = 300
+TELEGRAM_RETRY_AFTER_MAX_SECONDS = 3600
+# A non-counted retry (NOT_CONFIGURED / unhelpful RATE_LIMITED) must still
+# terminate: once the row is this old it becomes terminal ``failed`` instead of
+# retrying forever. Until then its delay grows with the row's age.
+TELEGRAM_OUTBOX_DEFER_MAX_SECONDS = 3600
+# Terminal outbox rows older than this are purged periodically (bounded
+# batches, at most once per interval) so a long-running daemon cannot grow the
+# table without bound.
+TELEGRAM_OUTBOX_RETENTION_SECONDS = 7 * 24 * 3600
+TELEGRAM_OUTBOX_PURGE_KEY = "telegram.outbox_purge_at"
+TELEGRAM_OUTBOX_PURGE_INTERVAL_SECONDS = 3600
+TELEGRAM_OUTBOX_PURGE_BATCH = 1000
+TELEGRAM_OUTBOX_PURGE_MAX_BATCHES = 10
 
 TELEGRAM_SUBJECT = "telegram"
 TELEGRAM_TOKEN_NAME = "bot_token"
@@ -251,6 +283,7 @@ __all__ = [
     "DISPATCHER_HEARTBEAT_KEY",
     "HELP_COMMAND",
     "MAX_ARGUMENT_CHARS",
+    "MAX_GLOBAL_REFUSALS_PER_WINDOW",
     "MAX_INBOUND_TEXT",
     "MAX_OUTBOUND_CHARS",
     "MAX_REFUSALS_PER_WINDOW",
@@ -267,6 +300,17 @@ __all__ = [
     "TELEGRAM_BOT_TOKEN_MAX_LENGTH",
     "TELEGRAM_BOT_TOKEN_PATTERN",
     "TELEGRAM_CHAT_IDS_KEY",
+    "TELEGRAM_OUTBOX_BACKOFF_BASE_SECONDS",
+    "TELEGRAM_OUTBOX_BACKOFF_MAX_SECONDS",
+    "TELEGRAM_OUTBOX_CLAIM_LEASE_SECONDS",
+    "TELEGRAM_OUTBOX_DEFER_MAX_SECONDS",
+    "TELEGRAM_OUTBOX_PURGE_BATCH",
+    "TELEGRAM_OUTBOX_PURGE_INTERVAL_SECONDS",
+    "TELEGRAM_OUTBOX_PURGE_KEY",
+    "TELEGRAM_OUTBOX_PURGE_MAX_BATCHES",
+    "TELEGRAM_OUTBOX_RETENTION_SECONDS",
+    "TELEGRAM_REFUSAL_AUDIT_WINDOW_SECONDS",
+    "TELEGRAM_RETRY_AFTER_MAX_SECONDS",
     "TELEGRAM_SUBJECT",
     "TELEGRAM_TOKEN_NAME",
     "ReceiptState",

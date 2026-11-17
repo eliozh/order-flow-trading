@@ -16,6 +16,7 @@ registry never exposes the values; it only replaces them with ``[REDACTED]``.
 
 from __future__ import annotations
 
+import contextlib
 import logging
 import re
 import sys
@@ -120,7 +121,28 @@ class RedactingFilter(logging.Filter):
             # re-introduce the secret (and ``%`` characters stay literal).
             record.msg = scrubbed
             record.args = ()
+        if record.exc_info is not None:
+            try:
+                # The stdlib formatter appends ``exc_text`` after handler
+                # filters run, so scrub it here (and mark it rendered).
+                record.exc_text = _scrub_text(logging.Formatter().formatException(record.exc_info))
+            except Exception:  # noqa: BLE001 - never break logging on a bad record
+                record.exc_text = None
+        if record.stack_info:
+            with contextlib.suppress(Exception):
+                record.stack_info = _scrub_text(record.stack_info)
         return True
+
+
+class _ScrubbingFormatter(logging.Formatter):
+    """Scrub the fully rendered record (message + traceback + stack info).
+
+    Defense in depth for records that bypass the filter (a handler added after
+    configuration, or a formatter that renders ``exc_text`` itself).
+    """
+
+    def format(self, record: logging.LogRecord) -> str:
+        return _scrub_text(super().format(record))
 
 
 def configure_logging(settings: Settings) -> None:
@@ -134,6 +156,11 @@ def configure_logging(settings: Settings) -> None:
     for handler in handlers:
         handler.addFilter(redactor)
     logging.basicConfig(format="%(message)s", handlers=handlers, level=level, force=True)
+    # ``basicConfig`` may install the plain formatter; replace it on the root
+    # handlers with one that scrubs the whole rendered string, including the
+    # traceback the stdlib appends after the filter runs.
+    for handler in logging.getLogger().handlers:
+        handler.setFormatter(_ScrubbingFormatter("%(message)s"))
     # ``httpx`` logs every request URL (which carries the bot token) at INFO.
     # Keep only warnings and above; the handler-level filter scrubs those too.
     logging.getLogger("httpx").setLevel(logging.WARNING)
@@ -143,6 +170,9 @@ def configure_logging(settings: Settings) -> None:
             structlog.contextvars.merge_contextvars,
             structlog.processors.add_log_level,
             structlog.processors.TimeStamper(fmt="iso", utc=True),
+            # Render the exception into the event dict *before* redaction, so
+            # an ``exc_info`` payload is scrubbed like any other value.
+            structlog.processors.format_exc_info,
             redact_secrets,
             structlog.processors.JSONRenderer(),
         ],

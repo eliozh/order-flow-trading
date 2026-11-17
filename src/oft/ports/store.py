@@ -1617,12 +1617,15 @@ class StorePort(Protocol):
     def claim_due_telegram_outbox(
         self, *, now: str, limit: int = 10
     ) -> tuple[TelegramOutboxRecord, ...]:
-        """Atomically move due rows to ``sending`` and return them.
+        """Atomically move due ``queued`` rows to ``sending`` and return them.
 
-        Eligible rows are ``queued``/``failed`` with ``attempts < 3`` and
-        ``next_attempt_at <= now``, ordered by priority then age. Claiming in one
+        Eligible rows are ``queued`` with ``attempts < 3`` and
+        ``next_attempt_at <= now``, ordered by priority then age. A stale
+        ``sending`` row whose claim lease (``next_attempt_at``) has expired is
+        first requeued as a new attempt, or terminally failed at the attempt
+        cap, so a crash during a send cannot strand the reply. Claiming in one
         write transaction means one dispatcher tick cannot send the same row
-        twice.
+        twice, and the claimed row's ``next_attempt_at`` becomes its lease.
         """
         ...
 
@@ -1639,8 +1642,22 @@ class StorePort(Protocol):
         error_code: str,
         next_attempt_at: str,
         final: bool,
+        count_attempt: bool = True,
     ) -> bool:
-        """Increment attempts and either re-queue or terminally fail the row."""
+        """Record one failure and either re-queue or terminally fail the row.
+
+        ``count_attempt=False`` leaves ``attempts`` unchanged, used for
+        rate-limit/not-configured failures that must not consume the bounded
+        retry budget. The row becomes ``queued`` with the error code and the
+        caller-computed ``next_attempt_at``, unless ``final`` is also set -- in
+        which case ``count_attempt=False, final=True`` is valid and explicitly
+        marks the row terminally ``failed`` at its current ``attempts`` (the
+        non-counted retry's own age bound).
+        """
+        ...
+
+    def purge_terminal_telegram_outbox(self, *, before: str, limit: int = 1000) -> int:
+        """Delete up to ``limit`` ``sent``/``failed`` rows created before ``before``."""
         ...
 
     def list_telegram_receipts(self, limit: int = 50) -> tuple[TelegramOutboxRecord, ...]:
