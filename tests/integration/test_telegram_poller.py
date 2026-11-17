@@ -272,7 +272,7 @@ def test_a_status_embedded_in_prose_is_never_executed(tmp_path: Path) -> None:
 
 def test_an_unknown_command_is_ignored(tmp_path: Path) -> None:
     service, store, port, _settings = _service(tmp_path)
-    port.script_updates([make_update(1, text="/approve")])
+    port.script_updates([make_update(1, text="/banana")])
 
     assert _poller(service, store, port).poll_once() == 1
     assert store.list_telegram_receipts() == ()

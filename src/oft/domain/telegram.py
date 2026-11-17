@@ -1,10 +1,10 @@
 """Pure Telegram domain rules: command grammar, sanitization, and DTOs.
 
-The inbound surface is untrusted text. Only a closed token table
-(``/status`` and ``/help``) is executable; everything else is ignored. The
-sanitizer strips C0/C1 controls, zero-width and bidi characters, collapses
-whitespace, and bounds both arguments and outbound messages so no inbound
-payload can grow without limit.
+The inbound surface is untrusted text. Only a closed token table is executable;
+write-like tokens (``/approve`` and friends) are recognized only so they can be
+refused. Everything else is ignored. The sanitizer strips C0/C1 controls,
+zero-width and bidi characters, collapses whitespace, and bounds both arguments
+and outbound messages so no inbound payload can grow without limit.
 
 Nothing here performs I/O, calls a model, or reaches a shell, SQL, or dynamic
 dispatch. The bot token shape is validated here so the service, API, and CLI
@@ -13,6 +13,7 @@ share one rule.
 
 from __future__ import annotations
 
+import hashlib
 import re
 import unicodedata
 from collections.abc import Mapping
@@ -50,9 +51,38 @@ MAX_GLOBAL_REFUSALS_PER_WINDOW = 20
 TELEGRAM_REFUSAL_AUDIT_WINDOW_SECONDS = 3600
 
 STATUS_COMMAND = "/status"
+POSITIONS_COMMAND = "/positions"
+OPPORTUNITIES_COMMAND = "/opportunities"
+REPORT_COMMAND = "/report"
+BUDGET_COMMAND = "/budget"
+WATCHLIST_COMMAND = "/watchlist"
 HELP_COMMAND = "/help"
-COMMANDS: tuple[str, ...] = (STATUS_COMMAND, HELP_COMMAND)
+# The executable closed token table. Only these exact tokens dispatch a handler.
+COMMANDS: tuple[str, ...] = (
+    STATUS_COMMAND,
+    POSITIONS_COMMAND,
+    OPPORTUNITIES_COMMAND,
+    REPORT_COMMAND,
+    BUDGET_COMMAND,
+    WATCHLIST_COMMAND,
+    HELP_COMMAND,
+)
+# Recognized but deliberately not executable: each returns one fixed refusal and
+# has no mutation branch anywhere in the service.
+WRITE_LIKE_COMMANDS: tuple[str, ...] = (
+    "/approve",
+    "/accept",
+    "/reject",
+    "/cancel",
+    "/buy",
+    "/sell",
+    "/close",
+)
 REFUSAL_TEXT = "未授权"
+WRITE_REFUSAL_TEXT = "MVP 只读，请在桌面端或 CLI 操作"
+SYMBOL_ARGUMENT_PATTERN = re.compile(r"^[A-Z0-9]{2,24}$")
+TRUNCATION_MARKER = "…"
+DESKTOP_VIEW_TEXT = "更多内容请在桌面端查看"
 
 TELEGRAM_CHAT_IDS_KEY = "telegram.chat_ids"
 TELEGRAM_ALLOWED_USER_IDS_KEY = "telegram.allowed_user_ids"
@@ -170,9 +200,11 @@ def sanitize_argument(value: object) -> str:
 def parse_command(text: object) -> TelegramCommand | None:
     """Match the sanitized text against the closed command table exactly.
 
-    The first whitespace-delimited token must be one of the two commands, so a
-    ``/status`` embedded in prose never dispatches. An argument longer than
+    The first whitespace-delimited token must be one of the executable commands,
+    so a ``/status`` embedded in prose never dispatches. An argument longer than
     ``MAX_ARGUMENT_CHARS`` makes the whole command overlong and is ignored.
+    Whether arguments are accepted is decided by the caller; only ``/report``
+    accepts one optional symbol.
     """
     cleaned = sanitize_inbound_text(text)
     if not cleaned:
@@ -187,9 +219,60 @@ def parse_command(text: object) -> TelegramCommand | None:
     return TelegramCommand(name=name, argument=sanitize_argument(raw_argument))
 
 
+def parse_write_like_command(text: object) -> str | None:
+    """Return the exact write-like token, or ``None`` when none leads the text.
+
+    Like :func:`parse_command`, only the first whitespace-delimited token counts,
+    so prose that merely mentions ``/approve`` is ignored. A recognized token is
+    answered with the fixed read-only refusal and never dispatched.
+    """
+    cleaned = sanitize_inbound_text(text)
+    if not cleaned:
+        return None
+    token = cleaned.split(" ", 1)[0]
+    return token if token in WRITE_LIKE_COMMANDS else None
+
+
+def normalize_symbol_argument(value: object) -> str | None:
+    """Normalize one optional ``/report`` symbol argument, or refuse it.
+
+    The value is sanitized (controls/zero-width/bidi stripped), uppercased, and
+    must be exactly one token matching ``^[A-Z0-9]{2,24}$``. An empty, multi-token,
+    or markup-bearing value is invalid and never reaches a read.
+    """
+    cleaned = sanitize_inbound_text(value)
+    if not cleaned or " " in cleaned:
+        return None
+    normalized = cleaned.upper()
+    return normalized if SYMBOL_ARGUMENT_PATTERN.fullmatch(normalized) is not None else None
+
+
+def query_reference_id(*parts: object) -> str:
+    """A deterministic, non-secret reference id for one query reply or error."""
+    material = ":".join(str(part) for part in parts)
+    digest = hashlib.sha256(material.encode("utf-8")).hexdigest()[:8].upper()
+    return f"TG-{digest}"
+
+
 def truncate_outbound(text: str) -> str:
     """Bound an outbound message to the Bot API text limit."""
     return text[:MAX_OUTBOUND_CHARS]
+
+
+def budget_outbound(text: str, reference_id: str) -> str:
+    """Bound a reply to one message, naming the desktop view when truncated.
+
+    The ``…`` marker and the reference-id line are always retained and the whole
+    result stays within :data:`MAX_OUTBOUND_CHARS`. The caller enqueues exactly
+    one outbox row; a long render is never split across messages.
+    """
+    if len(text) <= MAX_OUTBOUND_CHARS:
+        return text
+    suffix = f"\n{TRUNCATION_MARKER}\n{DESKTOP_VIEW_TEXT}。\nreference_id: {reference_id}"
+    room = MAX_OUTBOUND_CHARS - len(suffix)
+    if room <= 0:  # pragma: no cover - the suffix is far below the cap
+        return suffix[-MAX_OUTBOUND_CHARS:]
+    return text[:room].rstrip() + suffix
 
 
 def is_authorized(chat_id: int, user_id: int, allowlist: TelegramAllowlist) -> bool:
@@ -279,7 +362,9 @@ def validate_telegram_token(value: object) -> str:
 
 
 __all__ = [
+    "BUDGET_COMMAND",
     "COMMANDS",
+    "DESKTOP_VIEW_TEXT",
     "DISPATCHER_HEARTBEAT_KEY",
     "HELP_COMMAND",
     "MAX_ARGUMENT_CHARS",
@@ -290,12 +375,16 @@ __all__ = [
     "MAX_TELEGRAM_ALLOWED_USER_IDS",
     "MAX_TELEGRAM_CHAT_IDS",
     "MAX_TELEGRAM_OUTBOX_ATTEMPTS",
+    "OPPORTUNITIES_COMMAND",
     "POLLER_HEARTBEAT_KEY",
     "POLLER_STALE_SECONDS",
     "POLL_OFFSET_KEY",
+    "POSITIONS_COMMAND",
     "REFUSAL_TEXT",
     "REFUSAL_WINDOW_SECONDS",
+    "REPORT_COMMAND",
     "STATUS_COMMAND",
+    "SYMBOL_ARGUMENT_PATTERN",
     "TELEGRAM_ALLOWED_USER_IDS_KEY",
     "TELEGRAM_BOT_TOKEN_MAX_LENGTH",
     "TELEGRAM_BOT_TOKEN_PATTERN",
@@ -313,14 +402,22 @@ __all__ = [
     "TELEGRAM_RETRY_AFTER_MAX_SECONDS",
     "TELEGRAM_SUBJECT",
     "TELEGRAM_TOKEN_NAME",
+    "TRUNCATION_MARKER",
+    "WATCHLIST_COMMAND",
+    "WRITE_LIKE_COMMANDS",
+    "WRITE_REFUSAL_TEXT",
     "ReceiptState",
     "TelegramAllowlist",
     "TelegramCommand",
     "TelegramUpdate",
     "TelegramValidationError",
+    "budget_outbound",
     "is_authorized",
+    "normalize_symbol_argument",
     "parse_command",
     "parse_update",
+    "parse_write_like_command",
+    "query_reference_id",
     "reply_event_key",
     "sanitize_argument",
     "sanitize_inbound_text",
