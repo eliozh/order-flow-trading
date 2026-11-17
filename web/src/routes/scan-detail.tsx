@@ -1,6 +1,13 @@
 import { useEffect, useState } from 'react'
 
-import { fetchScan, type ScanData, type ScanEnvelope, type ScanSymbolRow } from '../api/scans'
+import {
+  fetchScan,
+  formatScanCost,
+  telegramDeliveryLabel,
+  type ScanData,
+  type ScanEnvelope,
+  type ScanSymbolRow,
+} from '../api/scans'
 import { DataQualityBadge } from '../components/data-quality'
 import { ProvenanceStamp } from '../components/provenance'
 import { useCompact } from '../hooks/use-compact'
@@ -344,7 +351,7 @@ export function ScanDetailPage({
   const scan = load.scan
   const rows = symbolRows(scan)
   const totalTokens = scan.total_tokens ?? scan.llm_tokens ?? 0
-  const totalCost = scan.total_cost_usd ?? scan.cost_usd ?? '0'
+  const totalCost = formatScanCost(scan.total_cost_usd ?? scan.cost_usd)
   const stageRows = scan.symbols ?? []
   const completedCount = scan.symbols_completed ?? rows.filter((row) => row.stage === 'DONE').length
   const totalCount = scan.symbols_total ?? rows.length
@@ -403,7 +410,7 @@ export function ScanDetailPage({
         <div>
           <dt>Cost</dt>
           <dd className="mono">
-            ${totalCost}
+            {totalCost}
             {scan.cost_unpriced && <span className="mono-muted"> · unpriced</span>}
           </dd>
         </div>
@@ -551,7 +558,7 @@ export function ScanDetailPage({
           <p className="panel-foot">
             Telegram:{' '}
             {scan.delivery?.configured
-              ? 'delivered'
+              ? telegramDeliveryLabel(scan.delivery)
               : (scan.delivery?.reason ?? 'Telegram is not configured in this build.')}
           </p>
           {scan.report_links && scan.report_links.length > 0 && (

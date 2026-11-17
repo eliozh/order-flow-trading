@@ -4,6 +4,8 @@ from __future__ import annotations
 
 from typing import Any
 
+import pytest
+
 
 def _scan_record(**overrides: Any) -> dict[str, Any]:
     record: dict[str, Any] = {
@@ -143,3 +145,46 @@ def test_render_detail_renders_a_batch_once() -> None:
 
     assert output.count("SCAN-BATCH-0001") == 1
     assert "Symbols           " in output
+
+
+@pytest.mark.parametrize(
+    ("delivery", "expected"),
+    [
+        ({"configured": True, "state": "queued"}, "Telegram          queued"),
+        ({"configured": True, "state": "sending"}, "Telegram          queued"),
+        ({"configured": True, "state": "sent"}, "Telegram          sent"),
+        ({"configured": True, "state": "failed"}, "Telegram          failed"),
+        (
+            {"configured": False, "reason": "TELEGRAM_NOT_CONFIGURED"},
+            "Telegram          not configured",
+        ),
+        (None, "Telegram          not configured"),
+    ],
+)
+def test_render_batch_labels_the_telegram_receipt_state(
+    delivery: dict[str, Any] | None, expected: str
+) -> None:
+    # M-2: ``configured`` means "a receipt exists", not "delivered"; only
+    # ``state == sent`` may read as sent, and queued/failed must not.
+    from oft.cli.commands.scan import _render_batch
+
+    payload = _batch_payload()
+    if delivery is None:
+        payload.pop("delivery")
+    else:
+        payload["delivery"] = delivery
+
+    assert expected in _render_batch(payload)
+
+
+def test_scan_history_labels_follow_the_receipt_state() -> None:
+    from oft.cli.commands.scan import _telegram_label
+
+    assert _telegram_label({"configured": False}) == "not configured"
+    assert _telegram_label(None) == "not configured"
+    assert _telegram_label({"configured": True, "state": "queued"}) == "queued"
+    assert _telegram_label({"configured": True, "state": "sending"}) == "queued"
+    assert _telegram_label({"configured": True, "state": "sent"}) == "sent"
+    assert _telegram_label({"configured": True, "state": "failed"}) == "failed"
+    # A configured receipt without a state never claims it was delivered.
+    assert _telegram_label({"configured": True}) == "queued"

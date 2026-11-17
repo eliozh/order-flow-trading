@@ -11,6 +11,7 @@ from __future__ import annotations
 
 import logging
 import sqlite3
+from collections.abc import Sequence
 from contextlib import closing
 from datetime import datetime, timedelta
 
@@ -27,6 +28,8 @@ from oft.ports.store import (
 )
 
 _LOGGER = logging.getLogger(__name__)
+# One report-llm read never asks SQLite for more than this many placeholders.
+_REPORT_LLM_CHUNK = 500
 
 
 class ScanStoreMixin(SqliteConnectionMixin, SqliteAuditMixin):
@@ -300,6 +303,32 @@ class ScanStoreMixin(SqliteConnectionMixin, SqliteAuditMixin):
         finally:
             connection.close()
         return _row_to_report(row) if row is not None else None
+
+    def list_report_llm_json(self, report_ids: Sequence[str]) -> tuple[str, ...]:
+        """The non-empty ``llm_json`` column for the given report ids (chunked)."""
+        unique_ids = tuple(
+            dict.fromkeys(
+                report_id for report_id in report_ids if isinstance(report_id, str) and report_id
+            )
+        )
+        if not unique_ids:
+            return ()
+        connection = self._connect_read_only()
+        if connection is None:
+            return ()
+        values: list[str] = []
+        try:
+            for start in range(0, len(unique_ids), _REPORT_LLM_CHUNK):
+                chunk = unique_ids[start : start + _REPORT_LLM_CHUNK]
+                placeholders = ",".join("?" for _ in chunk)
+                rows = connection.execute(
+                    f"SELECT llm_json FROM reports WHERE report_id IN ({placeholders})",
+                    chunk,
+                ).fetchall()
+                values.extend(row[0] for row in rows if isinstance(row[0], str) and row[0])
+        finally:
+            connection.close()
+        return tuple(values)
 
     def list_reports(
         self, *, scan_id: str | None = None, limit: int = 20, offset: int = 0

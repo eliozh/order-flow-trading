@@ -29,6 +29,49 @@ export interface ReportLink {
 export interface DeliveryState {
   configured: boolean
   reason: string
+  /** Receipt state once a scan summary was enqueued: queued/sending/sent/failed. */
+  state?: string
+  attempts?: number
+  message_id?: number | null
+  last_error_code?: string | null
+  created_at?: string
+  sent_at?: string | null
+}
+
+/**
+ * A Telegram delivery label for the receipt state.
+ *
+ * ``configured`` only means a receipt row exists, so the label must key off
+ * ``state``: a queued or failed receipt is not "delivered".
+ */
+export function telegramDeliveryLabel(delivery?: DeliveryState | null): string {
+  if (!delivery?.configured) {
+    return 'not configured'
+  }
+  if (delivery.state === 'sent') {
+    return 'sent'
+  }
+  if (delivery.state === 'failed') {
+    return 'failed'
+  }
+  return 'queued'
+}
+
+/**
+ * Render a scan cost total exactly once, for both the list and detail surfaces.
+ *
+ * The daemon emits ``"N/A"`` when a stored cost is non-finite or has a hostile
+ * exponent, so that value must render without a ``$`` prefix (never ``$N/A`` or
+ * ``$NaN``). A finite amount keeps the historical ``$`` rendering.
+ */
+export function formatScanCost(value?: string | null): string {
+  if (!value) {
+    return '$0'
+  }
+  if (value === 'N/A') {
+    return 'N/A'
+  }
+  return `$${value}`
 }
 
 export interface ScanData {

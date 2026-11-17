@@ -2,6 +2,8 @@ import { useCallback, useEffect, useRef, useState } from 'react'
 
 import {
   fetchScans,
+  formatScanCost,
+  telegramDeliveryLabel,
   triggerScan,
   type ScanData,
   type ScanEnvelope,
@@ -78,7 +80,7 @@ function displayStage(scan: ScanData): string {
 }
 
 function costLabel(scan: ScanData): string {
-  return `$${scan.total_cost_usd ?? scan.cost_usd ?? '0'}`
+  return formatScanCost(scan.total_cost_usd ?? scan.cost_usd)
 }
 
 function symbolRows(scan: ScanData) {
@@ -416,7 +418,7 @@ export function ScansPage({
                       )}
                       <td>
                         {scan.delivery?.configured ? (
-                          'delivered'
+                          telegramDeliveryLabel(scan.delivery)
                         ) : (
                           <span className="mono-muted">not configured</span>
                         )}

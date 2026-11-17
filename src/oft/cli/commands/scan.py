@@ -88,6 +88,19 @@ def _render_run(data: dict[str, Any]) -> str:
     return "\n".join(lines)
 
 
+def _telegram_label(delivery: object) -> str:
+    """Label the Telegram receipt state; ``configured`` alone does not mean sent."""
+    if not isinstance(delivery, dict) or not delivery.get("configured"):
+        return "not configured"
+    state = delivery.get("state")
+    if state == "sent":
+        return "sent"
+    if state == "failed":
+        return "failed"
+    # ``queued``/``sending`` are the normal state right after enqueue.
+    return "queued"
+
+
 def _render_batch(data: dict[str, Any]) -> str:
     lines = [
         f"Scan              {data.get('scan_id', '-')}",
@@ -113,9 +126,7 @@ def _render_batch(data: dict[str, Any]) -> str:
     delivery = data.get("delivery") or {}
     if isinstance(delivery, dict):
         lines.append("")
-        lines.append(
-            "Telegram          " + ("delivered" if delivery.get("configured") else "not configured")
-        )
+        lines.append("Telegram          " + _telegram_label(delivery))
     return "\n".join(lines)
 
 
@@ -388,7 +399,7 @@ def scan_history(
     typer.echo(f"{'SCAN ID':<34}{'DURATION':<10}{'SYMBOLS':<9}{'STATUS':<10}{'COST':<9}TELEGRAM")
     for item in items:
         delivery = item.get("delivery") or {}
-        telegram = "delivered" if delivery.get("configured") else "not configured"
+        telegram = _telegram_label(delivery)
         typer.echo(
             f"{str(item.get('scan_id', '-')):<34}"
             f"{_format_duration(item.get('started_at'), item.get('finished_at')):<10}"

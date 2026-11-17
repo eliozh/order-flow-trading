@@ -46,6 +46,7 @@ from oft.application.scan_service import (
     ScanRequest,
     ScanService,
 )
+from oft.application.scan_summary import failure_stage
 from oft.application.scheduler import (
     PERIOD_HOURS,
     CatchUpPlan,
@@ -145,18 +146,28 @@ _POSITION_REFUSAL_CODES = frozenset(
 )
 _LOGGER = structlog.get_logger(__name__)
 _TERMINAL_SCAN_STAGES = frozenset({"DONE", "DEGRADED", "FAILED"})
-_FAILED_STAGE_BY_CODE = {
-    "DATA_UNAVAILABLE": "DATA",
-    "METRICS_INCOMPLETE": "METRICS",
-}
 
 
-def _failure_stage(exc: BaseException, code: str) -> str:
-    """The stage that failed, from the scan service or the error code."""
-    stage = getattr(exc, "failed_stage", None)
-    if stage:
-        return str(stage)
-    return _FAILED_STAGE_BY_CODE.get(code) or "REPORT"
+def notify_scan_completion(container: Any, scan_id: str | None) -> None:
+    """Fire the one scan-summary push after a terminal scan finish.
+
+    Telegram is strictly best-effort: a missing notification service, a
+    settings/store failure, or any unexpected error is logged and swallowed so
+    it can never change the scan outcome the runner returns.
+    """
+    if not scan_id:
+        return
+    notifications = getattr(container, "notifications", None)
+    if notifications is None:
+        return
+    try:
+        notifications.notify_scan(scan_id)
+    except Exception as exc:  # noqa: BLE001 - Telegram cannot affect a scan
+        _LOGGER.warning(
+            "telegram_scan_notify_failed",
+            scan_id=scan_id,
+            error_type=type(exc).__name__,
+        )
 
 
 @dataclass(frozen=True)
@@ -571,6 +582,7 @@ class ScheduledScanRunner:
                     message="reclaimed run could not acquire the scan lock",
                     owner=run.lease_owner,
                 )
+                notify_scan_completion(self._container, run.run_id)
             else:
                 # Fresh provisional run: remove it so the next tick can claim
                 # the same window again.
@@ -583,6 +595,10 @@ class ScheduledScanRunner:
             daemon=True,
         )
         beat.start()
+        # The notification summary re-reads persisted rows, so it runs only
+        # after the scan lock is released (below), exactly once for a terminal
+        # path. Set the id only once the run's final status is persisted.
+        notify_run_id: str | None = None
         try:
             symbols = tuple(contract.symbol for contract in self._container.store.list_starred())
             if claim.reclaimed:
@@ -606,6 +622,7 @@ class ScheduledScanRunner:
                 _merged_status(outcome, self._container.store.list_scan_symbols(run.run_id)),
                 owner=run.lease_owner,
             )
+            notify_run_id = run.run_id
             return outcome
         except BaseException as exc:
             self._ledger.finish(
@@ -615,11 +632,14 @@ class ScheduledScanRunner:
                 message=str(exc),
                 owner=run.lease_owner,
             )
+            notify_run_id = run.run_id
             raise
         finally:
             stop.set()
             beat.join(timeout=1)
             self._ledger.release_scan_lock(run.lease_owner)
+            if notify_run_id is not None:
+                notify_scan_completion(self._container, notify_run_id)
 
     def resume(self, run_id: str, *, period: str = "4h") -> ScheduledScanOutcome:
         """Resume a reclaimed run from its ``scan_symbols`` checkpoints."""
@@ -640,6 +660,7 @@ class ScheduledScanRunner:
             daemon=True,
         )
         beat.start()
+        notify_run_id: str | None = None
         try:
             rows = self._container.store.list_scan_symbols(run_id)
             starred = tuple(contract.symbol for contract in self._container.store.list_starred())
@@ -649,6 +670,7 @@ class ScheduledScanRunner:
                 pending = _pending_symbols(run, rows, starred)
                 if not pending:
                     self._ledger.finish(run.run_id, _rows_status(rows), owner=run.lease_owner)
+                    notify_run_id = run.run_id
                     return ScheduledScanOutcome(
                         run=run,
                         claimed=True,
@@ -664,6 +686,7 @@ class ScheduledScanRunner:
                         message="manual scan had no checkpoint to resume",
                         owner=run.lease_owner,
                     )
+                    notify_run_id = run.run_id
                     return ScheduledScanOutcome(run=run, claimed=False, reason="no_checkpoint")
                 pending = starred
                 if not pending:
@@ -674,6 +697,7 @@ class ScheduledScanRunner:
                         message="no checkpoint and no starred symbols to resume",
                         owner=run.lease_owner,
                     )
+                    notify_run_id = run.run_id
                     return ScheduledScanOutcome(run=run, claimed=False, reason="no_checkpoint")
             else:
                 # Pending = starred symbols that have no terminal row. A symbol
@@ -682,6 +706,7 @@ class ScheduledScanRunner:
                 pending = _pending_symbols(run, rows, starred)
                 if not pending:
                     self._ledger.finish(run.run_id, _rows_status(rows), owner=run.lease_owner)
+                    notify_run_id = run.run_id
                     return ScheduledScanOutcome(
                         run=run,
                         claimed=True,
@@ -702,6 +727,7 @@ class ScheduledScanRunner:
                 _merged_status(outcome, self._container.store.list_scan_symbols(run.run_id)),
                 owner=run.lease_owner,
             )
+            notify_run_id = run.run_id
             return outcome
         except BaseException as exc:
             self._ledger.finish(
@@ -711,11 +737,14 @@ class ScheduledScanRunner:
                 message=str(exc),
                 owner=run.lease_owner,
             )
+            notify_run_id = run.run_id
             raise
         finally:
             stop.set()
             beat.join(timeout=1)
             self._ledger.release_scan_lock(run.lease_owner)
+            if notify_run_id is not None:
+                notify_scan_completion(self._container, notify_run_id)
 
     def _heartbeat_loop(self, run_id: str, owner: str, stop: threading.Event) -> None:
         while not stop.wait(HEARTBEAT_SECONDS):
@@ -761,6 +790,7 @@ class ScheduledScanRunner:
             daemon=True,
         )
         beat.start()
+        notify_run_id: str | None = None
         try:
             symbols = tuple(contract.symbol for contract in self._container.store.list_starred())
             if not symbols:
@@ -771,6 +801,7 @@ class ScheduledScanRunner:
                     message="no starred symbols to scan",
                     owner=run.lease_owner,
                 )
+                notify_run_id = run.run_id
                 return ScheduledScanOutcome(
                     run=run,
                     claimed=True,
@@ -793,6 +824,7 @@ class ScheduledScanRunner:
                 _merged_status(outcome, self._container.store.list_scan_symbols(run.run_id)),
                 owner=run.lease_owner,
             )
+            notify_run_id = run.run_id
             return outcome
         except BaseException as exc:
             self._ledger.finish(
@@ -802,11 +834,14 @@ class ScheduledScanRunner:
                 message=str(exc),
                 owner=run.lease_owner,
             )
+            notify_run_id = run.run_id
             raise
         finally:
             stop.set()
             beat.join(timeout=1)
             self._ledger.release_scan_lock(run.lease_owner)
+            if notify_run_id is not None:
+                notify_scan_completion(self._container, notify_run_id)
 
     def _execute(
         self,
@@ -947,7 +982,7 @@ class ScheduledScanRunner:
                     data_quality=None,
                     error_code=exc.code,
                     error_message=exc.message,
-                    failed_stage=_failure_stage(exc, exc.code),
+                    failed_stage=failure_stage(exc, exc.code),
                 )
             except Exception as exc:  # noqa: BLE001 - one symbol never aborts the batch
                 failed.append(symbol)
@@ -959,7 +994,7 @@ class ScheduledScanRunner:
                     data_quality=None,
                     error_code="SCAN_FAILED",
                     error_message=str(exc),
-                    failed_stage=_failure_stage(exc, "SCAN_FAILED"),
+                    failed_stage=failure_stage(exc, "SCAN_FAILED"),
                 )
             else:
                 scans.append(result.scan)
@@ -1884,4 +1919,5 @@ __all__ = [
     "job_summary_payload",
     "latest_jobs_payload",
     "latest_job_summary",
+    "notify_scan_completion",
 ]

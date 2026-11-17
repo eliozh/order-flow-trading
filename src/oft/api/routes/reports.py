@@ -57,6 +57,9 @@ def list_reports(
             symbol, scan_id=scan_id, limit=limit, offset=offset
         )
         total = store.count_reports_for_symbol(symbol, scan_id=scan_id)
+    # Delivery receipts are resolved on detail surfaces only: a list row keeps
+    # the stable unconfigured summary stub instead of a per-row receipt read
+    # (which would be a bounded N+1 for a page of up to 200 reports).
     items = [report_summary(record) for record in records]
     has_next = offset + len(items) < total
     return success_envelope(
@@ -87,7 +90,7 @@ def read_report(
     the payload leaves the daemon, matching the export route.
     """
     record = _report_or_404(request, report_id)
-    payload = report_payload(record)
+    payload = report_payload(record, store=request.app.state.container.store)
     # Derive provenance from the raw payload, then redact stored secret/prompt
     # keys exactly like the export route: a hostile or legacy row must not leak
     # provider keys, raw prompts, or credential header names over HTTP.
@@ -137,7 +140,7 @@ def export_report(
     ``MIXED`` provenance when the payload has an LLM block, else ``CALC``.
     """
     record = _report_or_404(request, report_id)
-    payload = redact_report_payload(report_payload(record))
+    payload = redact_report_payload(report_payload(record, store=request.app.state.container.store))
     counts = provenance_counts(payload)
     safe_id = re.sub(r"[^A-Za-z0-9._-]", "_", report_id)
     headers = {

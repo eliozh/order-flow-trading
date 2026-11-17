@@ -28,6 +28,7 @@ from oft.application.llm_orchestrator import (
     provider_api_key,
     set_default_adapter_factory,
 )
+from oft.application.notifications import NotificationService
 from oft.application.rate_limiter import (
     GlobalRateLimiter,
     StructlogAlertSink,
@@ -164,6 +165,9 @@ class AppContainer:
     # sites and tests working; ``build_container`` always supplies both.
     telegram_port: TelegramPort | None = None
     telegram_service: TelegramService | None = None
+    # Slice 49: the one push path. Default ``None`` keeps existing construction
+    # sites valid; ``build_container`` always supplies it.
+    notifications: NotificationService | None = None
 
     def refresh_llm_settings(self) -> Settings:
         """Re-resolve the persisted LLM overlay and swap the runtime snapshot.
@@ -332,6 +336,12 @@ def build_container(
         settings_service=telegram_settings_service,
         port=telegram_port,
     )
+    notifications = NotificationService(
+        store=store,
+        clock=resolved_clock,
+        channel=telegram_service,
+        settings_service=telegram_settings_service,
+    )
     return AppContainer(
         settings=effective,
         clock=resolved_clock,
@@ -350,6 +360,7 @@ def build_container(
         llm_adapter_signature=_adapter_signature(effective),
         telegram_port=telegram_port,
         telegram_service=telegram_service,
+        notifications=notifications,
     )
 
 

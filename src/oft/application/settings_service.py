@@ -81,6 +81,8 @@ from oft.domain.settings import (
 from oft.domain.telegram import (
     MAX_TELEGRAM_ALLOWED_USER_IDS,
     MAX_TELEGRAM_CHAT_IDS,
+    SCAN_FAILED_ALERT_KEY,
+    SCAN_REPORT_PUSH_KEY,
     TELEGRAM_ALLOWED_USER_IDS_KEY,
     TELEGRAM_CHAT_IDS_KEY,
     TelegramValidationError,
@@ -535,6 +537,30 @@ class SettingsService(LLMSettingsMixin, OnboardingProgressMixin):
         return self.read_scan_settings()
 
     # -- Telegram allowlists ---------------------------------------------
+
+    def read_scan_report_push(self) -> bool:
+        """The ``telegram.scan_report`` toggle; absent means enabled.
+
+        A malformed persisted value raises :class:`ConfigError` so the caller
+        (the notification service) can fail closed instead of guessing.
+        """
+        return self._decode_bool(SCAN_REPORT_PUSH_KEY, default=True)
+
+    def read_failed_scan_alert(self) -> bool:
+        """The ``telegram.scan_failed_alert`` toggle; absent means disabled."""
+        return self._decode_bool(SCAN_FAILED_ALERT_KEY, default=False)
+
+    def _decode_bool(self, key: str, *, default: bool) -> bool:
+        record = self._store.get_config(key)
+        if record is None:
+            return default
+        try:
+            value = json.loads(record.value_json)
+        except (TypeError, ValueError) as exc:
+            raise ConfigError(f"persisted {key} is unreadable") from exc
+        if not isinstance(value, bool):
+            raise ConfigError(f"persisted {key} must be a boolean")
+        return value
 
     def read_telegram_allowlist(self) -> TelegramAllowlistSettings:
         """The two bounded id lists and their newest provenance.

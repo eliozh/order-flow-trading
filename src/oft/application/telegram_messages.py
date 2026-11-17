@@ -20,12 +20,15 @@ from oft.domain.symbols import SymbolContract
 from oft.domain.telegram import (
     BUDGET_COMMAND,
     HELP_COMMAND,
+    MAX_DECIMAL_ADJUSTED_EXPONENT,
+    MAX_SCAN_REPORT_IDS,
     OPPORTUNITIES_COMMAND,
     POSITIONS_COMMAND,
     REPORT_COMMAND,
     STATUS_COMMAND,
     TRUNCATION_MARKER,
     WATCHLIST_COMMAND,
+    truncate_outbound,
 )
 from oft.domain.time import utc_timestamp
 
@@ -51,9 +54,6 @@ _THRESHOLD_KEYS = {"day": "daily_usd", "week": "weekly_usd", "month": "monthly_u
 # combining marks (``Mn``/``Mc``) are dropped per design A10 ("No emoji",
 # avoid combining diacritics). CJK, Latin, digits, and basic punctuation pass.
 _PLAIN_CONTROL_CATEGORIES = frozenset({"Cc", "Cf", "Cs", "Co", "Cn", "So", "Mn", "Mc"})
-# A corrupt stored decimal with an absurd exponent must render ``N/A`` instead
-# of expanding to an unbounded fixed-point string (``1e100000000``).
-_MAX_DECIMAL_ADJUSTED_EXPONENT = 30
 # The ``/status`` concepts advertised by ``/help``. Every key here is a field
 # ``render_status`` can actually produce, so the help copy cannot drift from
 # the reply. The value is the plain Chinese label the help line shows.
@@ -409,6 +409,64 @@ def render_query_error(reason: object, reference_id: str) -> str:
     )
 
 
+def render_scan_summary(payload: Mapping[str, Any]) -> str:
+    """Render one scan-completion push: deterministic, plain text, bounded.
+
+    The first line stamps COMPLETE/PARTIAL/FAILED. Every dynamic value is
+    sanitized to a single line, the report-id list is bounded, and a failure is
+    described by its stage and stable reason code only -- never by an exception
+    message, traceback, narrative, or provider body.
+    """
+    status = _scan_status(payload.get("status"))
+    report_ids = _scan_report_ids(payload.get("report_ids"))
+    lines = [
+        f"SCAN {status}",
+        f"status: {status}",
+        f"scan_id: {_text(payload.get('scan_id'))}",
+        f"trigger: {_text(payload.get('trigger_source'))}",
+        f"period: {_text(payload.get('period'))}",
+        f"symbols: {_count_text(payload.get('symbols_completed'))}/"
+        f"{_count_text(payload.get('symbols_total'))}",
+        f"degraded: {_count_text(payload.get('symbols_degraded'))}",
+        f"failed: {_count_text(payload.get('symbols_failed'))}",
+        f"new_opportunities: {_count_text(payload.get('new_opportunities'))}",
+        f"cost: {_scan_cost(payload.get('cost_usd'), payload.get('cost_unpriced'))}",
+        f"reports: {_count_text(payload.get('reports_total'))}",
+        f"generated_at: {_timestamp(payload.get('generated_at'))}",
+        f"report_ids: {', '.join(report_ids) if report_ids else 'none'}",
+    ]
+    if status == "FAILED":
+        lines.extend(
+            [
+                f"stage: {_text(payload.get('failed_stage'))}",
+                f"reason_code: {_text(payload.get('reason_code'))}",
+            ]
+        )
+    return truncate_outbound("\n".join(lines))
+
+
+def _scan_status(value: object) -> str:
+    status = value.upper() if isinstance(value, str) else ""
+    return status if status in ("COMPLETE", "PARTIAL", "FAILED") else "FAILED"
+
+
+def _scan_report_ids(value: object) -> tuple[str, ...]:
+    report_ids: list[str] = []
+    for item in _sequence(value):
+        cleaned = _single_line(item, limit=128)
+        if cleaned:
+            report_ids.append(cleaned)
+        if len(report_ids) >= MAX_SCAN_REPORT_IDS:
+            break
+    return tuple(report_ids)
+
+
+def _scan_cost(value: object, unpriced: object) -> str:
+    cleaned = _single_line(value, limit=64) if value not in (None, "") else "N/A"
+    suffix = " (unpriced)" if unpriced is True else ""
+    return f"{cleaned} USDT{suffix}"
+
+
 # -- shared formatting ---------------------------------------------------
 
 
@@ -494,7 +552,7 @@ def _decimal_text(value: object, default: str = "N/A") -> str:
 def _plain_decimal(value: Decimal) -> str | None:
     if value == 0:
         return "0"
-    if abs(value.adjusted()) > _MAX_DECIMAL_ADJUSTED_EXPONENT:
+    if abs(value.adjusted()) > MAX_DECIMAL_ADJUSTED_EXPONENT:
         # A corrupt/hostile exponent (for example ``1e100000000``) would expand
         # to an unbounded string; render ``N/A`` instead of burning CPU/memory.
         return None
@@ -594,6 +652,7 @@ __all__ = [
     "render_positions",
     "render_query_error",
     "render_report",
+    "render_scan_summary",
     "render_status",
     "render_test_message",
     "render_watchlist",
