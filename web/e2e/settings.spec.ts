@@ -2149,6 +2149,9 @@ test('prompt list shows the four roles as built-in default v1 at 1440', async ({
     await page.setViewportSize({ width, height: width === 375 ? 812 : 1024 })
     await page.goto('/settings/prompts')
     await expect(page.getByRole('heading', PROMPT_LIST_HEADING)).toBeVisible()
+    // Wait for the populated rows, not the synchronous heading: without this
+    // the per-width audit would scan the loading skeleton instead of the list.
+    await expect(page.getByTestId('prompt-row-analysis')).toBeVisible()
     await runAxeAudit(page, `/settings/prompts @ ${width}`)
   }
   expectClean(diagnostics)
@@ -2244,6 +2247,9 @@ test('prompt editor blocks a missing variable with zero writes and renders hosti
     await page.setViewportSize({ width, height: width === 375 ? 812 : 1024 })
     await page.goto('/settings/prompts/analysis')
     await expect(page.getByRole('heading', PROMPT_EDITOR_HEADING)).toBeVisible()
+    // Wait for the route's loaded content (the active body) before auditing;
+    // the heading renders synchronously while the detail request is pending.
+    await expect(page.locator('#prompt-body')).toHaveValue(activeBody as string)
     await runAxeAudit(page, `/settings/prompts/analysis @ ${width}`)
   }
   expectClean(diagnostics)
@@ -2369,6 +2375,9 @@ test('prompt history renders text-only diffs, activates explicitly, and restores
     await page.setViewportSize({ width, height: width === 375 ? 812 : 1024 })
     await page.goto('/settings/prompts/analysis/history')
     await expect(page.getByRole('heading', PROMPT_HISTORY_HEADING)).toBeVisible()
+    // Wait for the version rows before auditing; the heading renders
+    // synchronously while the history request is still pending.
+    await expect(page.getByTestId('prompt-version-1')).toBeVisible()
     await runAxeAudit(page, `/settings/prompts/analysis/history @ ${width}`)
   }
   expectClean(diagnostics)

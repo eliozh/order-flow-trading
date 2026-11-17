@@ -607,8 +607,12 @@ store.save_report(
 print(missing_id)
 PY
 )"
+# The hostile sentinels are single-sourced here and exported to the browser
+# journey, so the seeded row and the spec cannot drift.
 RAW_PROMPT_SENTINEL="E2E-RAW-PROMPT-SENTINEL-DO-NOT-LEAK-2b7c"
-HOSTILE_REPORT_ID="$(OFT_DATA_DIR="$REPORTS_DATA_DIR" uv run python - "$REPORT_ID" "$RAW_PROMPT_SENTINEL" <<'PY'
+CREDENTIAL_SENTINEL="E2E-CREDENTIAL-SENTINEL-DO-NOT-LEAK-9f3a"
+HOSTILE_REPORT_ID="$(OFT_DATA_DIR="$REPORTS_DATA_DIR" uv run python - \
+  "$REPORT_ID" "$RAW_PROMPT_SENTINEL" "$CREDENTIAL_SENTINEL" <<'PY'
 import json
 import sys
 from dataclasses import replace
@@ -621,16 +625,26 @@ record = store.get_report(sys.argv[1])
 if record is None:
     raise SystemExit(f"report {sys.argv[1]} not found")
 raw_prompt = sys.argv[2]
+credential = sys.argv[3]
 llm = json.loads(record.llm_json) if record.llm_json else {}
 if not isinstance(llm, dict):
     llm = {}
 llm.update(
     {
+        # Render the ENABLED band. A disabled band only prints llm.reason, so
+        # the hostile provenance fields would never reach the DOM and the
+        # journey's leak assertions could not fail.
+        "configured": True,
+        "validation_status": "VALID",
+        "decision_type": "MARKET_ANALYSIS",
+        "provider": "stub",
+        "model": "stub-model",
+        "confidence": 0.72,
         "prompt_id": "analysis",
         "prompt_version": 9,
         "narrative": "E2E hostile narrative stays visible.",
         "usage": {"total_tokens": 42},
-        "api_key": "E2E-CREDENTIAL-SENTINEL-DO-NOT-LEAK-9f3a",
+        "api_key": credential,
         "authorization": f"Bearer {raw_prompt}",
         "x-api-key": raw_prompt,
         "prompt": raw_prompt,
@@ -681,6 +695,8 @@ export OFT_E2E_BATCH_ID="$BATCH_ID"
 export OFT_E2E_BATCH_DEGRADED_ID="$BATCH_DEGRADED_ID"
 export OFT_E2E_MISSING_REPORT_ID="$MISSING_REPORT_ID"
 export OFT_E2E_HOSTILE_REPORT_ID="$HOSTILE_REPORT_ID"
+export OFT_E2E_RAW_PROMPT_SENTINEL="$RAW_PROMPT_SENTINEL"
+export OFT_E2E_CREDENTIAL_SENTINEL="$CREDENTIAL_SENTINEL"
 export OFT_E2E_POSITION_ID="$POSITION_ID"
 export OFT_E2E_JOURNAL_TRADE_ID="$JOURNAL_TRADE_ID"
 export OFT_E2E_JOURNAL_POSITION_ID="$JOURNAL_POSITION_ID"

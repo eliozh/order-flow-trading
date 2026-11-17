@@ -34,9 +34,11 @@ const BATCH_DEGRADED_ID = process.env.OFT_E2E_BATCH_DEGRADED_ID
 const SYMBOL = 'BTCUSDT'
 const MISSING_DATA_SYMBOL = 'XAUUSDT'
 const HOSTILE_SYMBOL = '<img src=x onerror="alert(1)">'
-// Kept in sync with the hostile llm_json seeded by e2e/run-e2e.sh.
-const HOSTILE_RAW_PROMPT_SENTINEL = 'E2E-RAW-PROMPT-SENTINEL-DO-NOT-LEAK-2b7c'
-const HOSTILE_CREDENTIAL_SPELLINGS = ['x-api-key', 'authorization'] as const
+// The sentinel values are seeded and exported once by e2e/run-e2e.sh; read them
+// from the environment so the hostile row and this journey cannot drift.
+const HOSTILE_RAW_PROMPT_SENTINEL = process.env.OFT_E2E_RAW_PROMPT_SENTINEL
+const HOSTILE_CREDENTIAL_SENTINEL = process.env.OFT_E2E_CREDENTIAL_SENTINEL
+const HOSTILE_CREDENTIAL_SPELLINGS = ['x-api-key', 'authorization', 'api_key'] as const
 
 interface SnapshotBar {
   bar_start: string
@@ -79,6 +81,8 @@ interface ReportData {
   llm: {
     configured: boolean
     reason: string
+    validation_status?: string | null
+    decision_type?: string | null
     prompt_id?: string
     narrative?: string
     usage?: { total_tokens?: number }
@@ -631,22 +635,43 @@ test('hostile symbol metadata renders as text and stored prompts and headers nev
   page,
 }) => {
   expect(HOSTILE_REPORT_ID, 'OFT_E2E_HOSTILE_REPORT_ID is required').toBeTruthy()
+  expect(HOSTILE_RAW_PROMPT_SENTINEL, 'OFT_E2E_RAW_PROMPT_SENTINEL is required').toBeTruthy()
+  expect(HOSTILE_CREDENTIAL_SENTINEL, 'OFT_E2E_CREDENTIAL_SENTINEL is required').toBeTruthy()
+  const rawPromptSentinel = HOSTILE_RAW_PROMPT_SENTINEL as string
+  const credentialSentinel = HOSTILE_CREDENTIAL_SENTINEL as string
+
   await authenticate(page)
   await page.goto(reportPath(HOSTILE_REPORT_ID as string))
 
+  // Wait for the ENABLED band (the seeded row sets configured/validation_status/
+  // decision_type). Without this wait the snapshot would capture the loading or
+  // disabled shell, where none of the hostile fields are rendered, so the leak
+  // assertions below could not fail.
+  const llmBand = page.getByRole('region', { name: 'LLM analysis' })
+  await expect(llmBand).toBeVisible()
+  await expect(llmBand).toContainText('analysis v9')
+  await expect(llmBand).toContainText('MARKET_ANALYSIS')
+  await expect(llmBand).toContainText('E2E hostile narrative stays visible.')
+
+  const html = await page.content()
   const report = await fetchReport(page, HOSTILE_REPORT_ID as string)
   expect(report.symbol).toBe(HOSTILE_SYMBOL)
+  // Prove the enabled branch is actually exercised, not assumed.
+  expect(report.llm.configured).toBe(true)
+  expect(report.llm.validation_status).toBe('VALID')
+  expect(report.llm.decision_type).toBe('MARKET_ANALYSIS')
   // Redaction keeps the non-secret LLM evidence.
   expect(report.llm.prompt_id).toBe('analysis')
   expect(report.llm.usage?.total_tokens).toBe(42)
   expect(report.llm.narrative).toBe('E2E hostile narrative stays visible.')
 
   // Neither the rendered page nor the fetched JSON may echo the stored raw
-  // prompts or provider header spellings.
-  const html = await page.content()
-  expect(html).not.toContain(HOSTILE_RAW_PROMPT_SENTINEL)
+  // prompts, the seeded credential value, or any provider header spelling.
   const reportJson = JSON.stringify(report)
-  expect(reportJson).not.toContain(HOSTILE_RAW_PROMPT_SENTINEL)
+  expect(html).not.toContain(rawPromptSentinel)
+  expect(reportJson).not.toContain(rawPromptSentinel)
+  expect(html).not.toContain(credentialSentinel)
+  expect(reportJson).not.toContain(credentialSentinel)
   for (const spelling of HOSTILE_CREDENTIAL_SPELLINGS) {
     expect(html.toLowerCase(), `DOM must not name ${spelling}`).not.toContain(spelling)
     expect(reportJson.toLowerCase(), `report JSON must not name ${spelling}`).not.toContain(
