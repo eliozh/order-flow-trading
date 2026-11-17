@@ -12,11 +12,14 @@ from __future__ import annotations
 import sqlite3
 from collections.abc import Callable
 from contextlib import closing
+from dataclasses import replace
+from datetime import datetime, timedelta
 from pathlib import Path
 
 from oft.adapters.sqlite_audit import SqliteAuditMixin
 from oft.adapters.sqlite_backfill_store import BackfillStoreMixin
 from oft.adapters.sqlite_config_store import ConfigStoreMixin
+from oft.adapters.sqlite_config_store import _row_to_config as _config_row_to_config
 from oft.adapters.sqlite_connections import SqliteConnectionMixin
 from oft.adapters.sqlite_job_store import JobStoreMixin
 from oft.adapters.sqlite_llm_ledger import LLMStoreMixin
@@ -30,7 +33,21 @@ from oft.adapters.sqlite_schema import database_path, initialize_database
 from oft.adapters.sqlite_secrets_store import SecretStoreMixin
 from oft.adapters.sqlite_symbol_store import SymbolStoreMixin
 from oft.config import ConfigError, Settings
-from oft.ports.store import AuditEventDraft, AuditEventRecord, StoreUnavailableError
+from oft.domain.telegram import (
+    MAX_TELEGRAM_OUTBOX_ATTEMPTS,
+    TELEGRAM_ALLOWED_USER_IDS_KEY,
+    TELEGRAM_CHAT_IDS_KEY,
+    TELEGRAM_OUTBOX_CLAIM_LEASE_SECONDS,
+    ReceiptState,
+)
+from oft.domain.time import utc_timestamp
+from oft.ports.store import (
+    AuditEventDraft,
+    AuditEventRecord,
+    ConfigRecord,
+    StoreUnavailableError,
+    TelegramOutboxRecord,
+)
 
 __all__ = ["SqliteStore", "database_path", "_period_parts"]
 
@@ -224,3 +241,302 @@ class SqliteStore(
             raise
         finally:
             connection.close()
+
+    # -- Telegram allowlists and outbox ----------------------------------
+
+    def save_telegram_allowlist_change(
+        self,
+        build: Callable[
+            [ConfigRecord | None, ConfigRecord | None],
+            tuple[ConfigRecord, ConfigRecord, AuditEventDraft] | None,
+        ],
+    ) -> tuple[ConfigRecord | None, ConfigRecord | None, AuditEventRecord | None]:
+        """Read, decide, and write both Telegram allowlist rows atomically."""
+        connection = self._connect()
+        try:
+            connection.execute("BEGIN IMMEDIATE")
+            chat_row = connection.execute(
+                "SELECT key, value_json, updated_at, updated_by FROM config WHERE key = ?",
+                (TELEGRAM_CHAT_IDS_KEY,),
+            ).fetchone()
+            user_row = connection.execute(
+                "SELECT key, value_json, updated_at, updated_by FROM config WHERE key = ?",
+                (TELEGRAM_ALLOWED_USER_IDS_KEY,),
+            ).fetchone()
+            chat_current = _row_to_config(chat_row)
+            user_current = _row_to_config(user_row)
+            outcome = build(chat_current, user_current)
+            if outcome is None:
+                connection.commit()
+                return chat_current, user_current, None
+            chat_record, user_record, audit = outcome
+            self._upsert_config(connection, chat_record)
+            self._upsert_config(connection, user_record)
+            record = self._insert_audit_event(connection, audit)
+            connection.commit()
+            return chat_record, user_record, record
+        except BaseException:
+            connection.rollback()
+            raise
+        finally:
+            connection.close()
+
+    def append_telegram_outbox(self, record: TelegramOutboxRecord) -> bool:
+        with closing(self._connect()) as connection, connection:
+            cursor = connection.execute(
+                """
+                INSERT INTO telegram_outbox (
+                    event_key, kind, chat_id, reply_to_message_id, payload_json,
+                    priority, state, attempts, next_attempt_at, message_id,
+                    last_error_code, created_at, sent_at
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                ON CONFLICT(event_key) DO NOTHING
+                """,
+                _telegram_outbox_values(record),
+            )
+        return cursor.rowcount > 0
+
+    def claim_due_telegram_outbox(
+        self, *, now: str, limit: int = 10
+    ) -> tuple[TelegramOutboxRecord, ...]:
+        """Claim due ``queued`` rows and reclaim expired ``sending`` claims.
+
+        Inside one ``BEGIN IMMEDIATE`` transaction, a stale claim (a row still
+        ``sending`` after the lease expired) is requeued as a new attempt, or
+        terminally failed when it is already at the attempt cap. A claimed row's
+        ``next_attempt_at`` becomes the lease expiry, so a crash during the send
+        is recovered on a later tick instead of stranding the reply forever. A
+        send that completed but whose terminal write failed is re-sent after the
+        lease: a rare duplicate is preferred to a permanently lost reply.
+        """
+        connection = self._connect()
+        try:
+            connection.execute("BEGIN IMMEDIATE")
+            connection.execute(
+                """
+                UPDATE telegram_outbox
+                SET attempts = attempts + 1,
+                    state = CASE WHEN attempts + 1 >= ? THEN 'failed' ELSE 'queued' END,
+                    last_error_code = 'TELEGRAM_DELIVERY_FAILED',
+                    next_attempt_at = ?
+                WHERE state = 'sending' AND next_attempt_at <= ?
+                """,
+                (MAX_TELEGRAM_OUTBOX_ATTEMPTS, now, now),
+            )
+            rows = connection.execute(
+                """
+                SELECT event_key, kind, chat_id, reply_to_message_id, payload_json,
+                       priority, state, attempts, next_attempt_at, message_id,
+                       last_error_code, created_at, sent_at
+                FROM telegram_outbox
+                WHERE state = 'queued'
+                  AND attempts < ?
+                  AND next_attempt_at <= ?
+                ORDER BY priority DESC, next_attempt_at ASC, created_at ASC, rowid ASC
+                LIMIT ?
+                """,
+                (MAX_TELEGRAM_OUTBOX_ATTEMPTS, now, max(1, limit)),
+            ).fetchall()
+            lease_until = _shift_timestamp(now, TELEGRAM_OUTBOX_CLAIM_LEASE_SECONDS)
+            claimed: list[TelegramOutboxRecord] = []
+            for row in rows:
+                event_key = str(row["event_key"])
+                updated = connection.execute(
+                    """
+                    UPDATE telegram_outbox SET state = 'sending', next_attempt_at = ?
+                    WHERE event_key = ? AND state = 'queued'
+                    """,
+                    (lease_until, event_key),
+                )
+                if updated.rowcount == 1:
+                    claimed.append(
+                        replace(
+                            _row_to_telegram_outbox(row),
+                            state=ReceiptState.SENDING,
+                        )
+                    )
+            connection.commit()
+            return tuple(claimed)
+        except BaseException:
+            connection.rollback()
+            raise
+        finally:
+            connection.close()
+
+    def get_telegram_outbox(self, event_key: str) -> TelegramOutboxRecord | None:
+        connection = self._connect_read_only()
+        if connection is None:
+            return None
+        try:
+            row = connection.execute(
+                """
+                SELECT event_key, kind, chat_id, reply_to_message_id, payload_json,
+                       priority, state, attempts, next_attempt_at, message_id,
+                       last_error_code, created_at, sent_at
+                FROM telegram_outbox WHERE event_key = ?
+                """,
+                (event_key,),
+            ).fetchone()
+        except sqlite3.OperationalError as exc:
+            if _missing_telegram_outbox(exc):
+                return None
+            raise
+        finally:
+            connection.close()
+        return _row_to_telegram_outbox(row) if row is not None else None
+
+    def mark_telegram_sent(self, event_key: str, *, message_id: int, sent_at: str) -> bool:
+        with closing(self._connect()) as connection, connection:
+            cursor = connection.execute(
+                """
+                UPDATE telegram_outbox
+                SET state = 'sent', message_id = ?, sent_at = ?, last_error_code = NULL
+                WHERE event_key = ? AND state = 'sending'
+                """,
+                (message_id, sent_at, event_key),
+            )
+        return cursor.rowcount == 1
+
+    def mark_telegram_attempt_failed(
+        self,
+        event_key: str,
+        *,
+        error_code: str,
+        next_attempt_at: str,
+        final: bool,
+        count_attempt: bool = True,
+    ) -> bool:
+        with closing(self._connect()) as connection, connection:
+            cursor = connection.execute(
+                """
+                UPDATE telegram_outbox
+                SET attempts = attempts + ?,
+                    state = ?,
+                    last_error_code = ?,
+                    next_attempt_at = ?
+                WHERE event_key = ? AND state = 'sending'
+                """,
+                (
+                    1 if count_attempt else 0,
+                    "failed" if final else "queued",
+                    error_code,
+                    next_attempt_at,
+                    event_key,
+                ),
+            )
+        return cursor.rowcount == 1
+
+    def purge_terminal_telegram_outbox(self, *, before: str, limit: int = 1000) -> int:
+        """Delete up to ``limit`` old terminal outbox rows.
+
+        Only ``sent``/``failed`` rows created before ``before`` are eligible, so
+        purge never removes a queued/sending reply. SQLite builds without
+        ``DELETE ... LIMIT`` are supported through a rowid subquery.
+        """
+        with closing(self._connect()) as connection, connection:
+            cursor = connection.execute(
+                """
+                DELETE FROM telegram_outbox
+                WHERE rowid IN (
+                    SELECT rowid FROM telegram_outbox
+                    WHERE state IN ('sent','failed') AND created_at < ?
+                    ORDER BY created_at ASC
+                    LIMIT ?
+                )
+                """,
+                (before, max(1, limit)),
+            )
+        return cursor.rowcount
+
+    def list_telegram_receipts(self, limit: int = 50) -> tuple[TelegramOutboxRecord, ...]:
+        connection = self._connect_read_only()
+        if connection is None:
+            return ()
+        try:
+            rows = connection.execute(
+                """
+                SELECT event_key, kind, chat_id, reply_to_message_id, payload_json,
+                       priority, state, attempts, next_attempt_at, message_id,
+                       last_error_code, created_at, sent_at
+                FROM telegram_outbox
+                ORDER BY created_at DESC, rowid DESC
+                LIMIT ?
+                """,
+                (max(1, limit),),
+            ).fetchall()
+        except sqlite3.OperationalError as exc:
+            if _missing_telegram_outbox(exc):
+                return ()
+            raise
+        finally:
+            connection.close()
+        return tuple(_row_to_telegram_outbox(row) for row in rows)
+
+    def count_telegram_receipts(self) -> int:
+        connection = self._connect_read_only()
+        if connection is None:
+            return 0
+        try:
+            row = connection.execute("SELECT COUNT(*) AS total FROM telegram_outbox").fetchone()
+        except sqlite3.OperationalError as exc:
+            if _missing_telegram_outbox(exc):
+                return 0
+            raise
+        finally:
+            connection.close()
+        return int(row["total"]) if row is not None else 0
+
+
+_TELEGRAM_OUTBOX_TABLE = "telegram_outbox"
+
+
+def _shift_timestamp(value: str, seconds: int) -> str:
+    """Shift one canonical ISO-8601 UTC timestamp by ``seconds``."""
+    parsed = datetime.fromisoformat(value.replace("Z", "+00:00"))
+    return utc_timestamp(parsed + timedelta(seconds=seconds))
+
+
+def _missing_telegram_outbox(exc: sqlite3.OperationalError) -> bool:
+    return _TELEGRAM_OUTBOX_TABLE in str(exc).lower() and "no such table" in str(exc).lower()
+
+
+def _row_to_config(row: sqlite3.Row | None) -> ConfigRecord | None:
+    return None if row is None else _config_row_to_config(row)
+
+
+def _telegram_outbox_values(record: TelegramOutboxRecord) -> tuple[object, ...]:
+    return (
+        record.event_key,
+        record.kind,
+        record.chat_id,
+        record.reply_to_message_id,
+        record.payload_json,
+        record.priority,
+        record.state,
+        record.attempts,
+        record.next_attempt_at,
+        record.message_id,
+        record.last_error_code,
+        record.created_at,
+        record.sent_at,
+    )
+
+
+def _row_to_telegram_outbox(row: sqlite3.Row) -> TelegramOutboxRecord:
+    return TelegramOutboxRecord(
+        event_key=str(row["event_key"]),
+        kind=str(row["kind"]),
+        chat_id=int(row["chat_id"]),
+        reply_to_message_id=(
+            None if row["reply_to_message_id"] is None else int(row["reply_to_message_id"])
+        ),
+        payload_json=str(row["payload_json"]),
+        priority=int(row["priority"]),
+        state=ReceiptState(str(row["state"])),
+        attempts=int(row["attempts"]),
+        next_attempt_at=str(row["next_attempt_at"]),
+        message_id=None if row["message_id"] is None else int(row["message_id"]),
+        last_error_code=(None if row["last_error_code"] is None else str(row["last_error_code"])),
+        created_at=str(row["created_at"]),
+        sent_at=None if row["sent_at"] is None else str(row["sent_at"]),
+    )

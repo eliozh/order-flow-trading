@@ -28,6 +28,7 @@ from oft.cli.commands.risk import risk_app
 from oft.cli.commands.scan import scan_app
 from oft.cli.commands.status import status_command
 from oft.cli.commands.system import system_app
+from oft.cli.commands.telegram import telegram_app
 from oft.cli.commands.trigger import trigger_app
 from oft.cli.commands.watchlist import watchlist_app
 from oft.config import ConfigError, Settings, load_settings
@@ -67,6 +68,7 @@ app.add_typer(risk_app, name="risk")
 app.add_typer(config_app, name="config")
 app.add_typer(replay_app, name="replay")
 app.add_typer(system_app, name="system")
+app.add_typer(telegram_app, name="telegram")
 
 _LOOPBACK_HOSTS = frozenset({"127.0.0.1", "localhost", "::1"})
 

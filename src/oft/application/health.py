@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import json
 import shutil
 import socket
 from dataclasses import asdict, dataclass
@@ -14,6 +15,14 @@ from pydantic import BaseModel, ConfigDict
 from oft import __version__
 from oft.config import SECRET_FIELDS, Settings
 from oft.domain.layout import PARTITION_ROOTS
+from oft.domain.telegram import (
+    POLLER_HEARTBEAT_KEY,
+    POLLER_STALE_SECONDS,
+    TELEGRAM_ALLOWED_USER_IDS_KEY,
+    TELEGRAM_CHAT_IDS_KEY,
+    TelegramValidationError,
+    validate_telegram_token,
+)
 from oft.domain.time import utc_timestamp
 from oft.ports.clock import ClockPort
 from oft.ports.market_data import MarketDataPort
@@ -513,6 +522,89 @@ def _stale_triggers_check(
     )
 
 
+def _telegram_check(
+    settings: Settings,
+    store: StorePort,
+    clock: ClockPort,
+    *,
+    daemon_state: str,
+) -> CheckResult:
+    """Report Telegram configuration/poller state without resolving the token.
+
+    Unconfigured Telegram is ``ok`` because the onboarding step is optional.
+    A configured channel with an empty chat or user allowlist, an unreadable
+    persisted allowlist, or a stale/missing poller heartbeat while the daemon is
+    up is ``degraded``. Both lists are required: a chat-only allowlist refuses
+    every sender (fail-closed). Only ``secrets_meta`` metadata and
+    ``system_state``/``config`` rows are read.
+    """
+    try:
+        meta = store.get_secret_meta("telegram", "bot_token")
+    except Exception:  # pragma: no cover - defensive boundary
+        return CheckResult("telegram", "degraded", "telegram secret metadata unreadable")
+    configured = meta is not None or settings.telegram_bot_token is not None
+    if not configured:
+        return CheckResult("telegram", "ok", "not configured (optional)")
+    if meta is None and settings.telegram_bot_token is not None:
+        # The environment fallback is raw and never validated on write; an
+        # invalid-shaped token makes every poll fail, so report it as degraded.
+        # The value itself is never echoed.
+        try:
+            validate_telegram_token(settings.telegram_bot_token.get_secret_value())
+        except TelegramValidationError:
+            return CheckResult(
+                "telegram", "degraded", "the environment Telegram bot token is invalid"
+            )
+    chat_count = _allowlist_count(store, TELEGRAM_CHAT_IDS_KEY, label="chat allowlist")
+    if isinstance(chat_count, CheckResult):
+        return chat_count
+    user_count = _allowlist_count(store, TELEGRAM_ALLOWED_USER_IDS_KEY, label="user allowlist")
+    if isinstance(user_count, CheckResult):
+        return user_count
+    if chat_count == 0:
+        return CheckResult(
+            "telegram",
+            "degraded",
+            "configured but no chat allowlist; the poller will not answer",
+        )
+    if user_count == 0:
+        return CheckResult(
+            "telegram",
+            "degraded",
+            "configured but no user allowlist; a chat-only allowlist refuses every sender",
+        )
+    if daemon_state != "UP":
+        return CheckResult("telegram", "ok", f"configured; {chat_count} chat(s); daemon is offline")
+    raw = store.get_system_state_updated_at(POLLER_HEARTBEAT_KEY)
+    if raw is None:
+        return CheckResult(
+            "telegram", "degraded", "configured but the poller has not reported a heartbeat"
+        )
+    try:
+        heartbeat = datetime.fromisoformat(str(raw).replace("Z", "+00:00"))
+    except (TypeError, ValueError):
+        return CheckResult("telegram", "degraded", "poller heartbeat is unreadable")
+    age = (clock.now().astimezone(UTC) - heartbeat.astimezone(UTC)).total_seconds()
+    if age > POLLER_STALE_SECONDS:
+        return CheckResult("telegram", "degraded", f"stale poller heartbeat ({age:.0f}s old)")
+    return CheckResult("telegram", "ok", f"configured; {chat_count} chat(s); poller {age:.0f}s old")
+
+
+def _allowlist_count(store: StorePort, key: str, *, label: str) -> int | CheckResult:
+    """The bounded allowlist length, or a degraded check for a bad row."""
+    try:
+        record = store.get_config(key)
+    except Exception:  # pragma: no cover - defensive boundary
+        return CheckResult("telegram", "degraded", f"persisted Telegram {label} is unreadable")
+    if record is None:
+        return 0
+    try:
+        value = json.loads(record.value_json)
+    except (TypeError, ValueError):
+        return CheckResult("telegram", "degraded", f"persisted Telegram {label} is unreadable")
+    return len(value) if isinstance(value, list) else 0
+
+
 def _kill_switch_check(settings: Settings, store: StorePort, clock: ClockPort) -> CheckResult:
     """Report the kill-switch state; an active switch blocks new paper orders."""
     from oft.application.kill_switch import KillSwitch
@@ -597,6 +689,7 @@ def build_doctor(
         _stale_triggers_check(store, clock, settings.trigger_stale_after_seconds),
         _kill_switch_check(settings, store, clock),
         _secrets_check(settings),
+        _telegram_check(settings, store, clock, daemon_state=probe.state),
         ingest_check,
         ws_check,
         CheckResult(

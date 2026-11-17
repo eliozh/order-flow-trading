@@ -88,7 +88,7 @@ def test_v1_database_upgrades_to_v2_with_effective_checks(tmp_path: Path) -> Non
     finally:
         connection.close()
 
-    assert versions == set(range(1, 30))
+    assert versions == set(range(1, 31))
 
 
 _V2_BACKFILL = """
@@ -146,7 +146,7 @@ def test_v2_database_gains_the_backfill_heartbeat_column(tmp_path: Path) -> None
 
     assert "updated_at" in columns
     assert updated_at == "2026-11-06T00:00:00.000Z"
-    assert versions == set(range(1, 30))
+    assert versions == set(range(1, 31))
 
 
 def test_v5_checks_indexes_and_foreign_keys(tmp_path: Path) -> None:
@@ -243,7 +243,7 @@ def test_v5_database_migrates_manifest_metrics_columns(tmp_path: Path) -> None:
 
     assert {"metric_version", "input_manifest_hash", "window_start", "window_end"} <= columns
     assert legacy == ("/tmp/legacy.parquet", None, None)
-    assert versions == set(range(1, 30))
+    assert versions == set(range(1, 31))
 
 
 def test_v6_database_migrates_starred_columns(tmp_path: Path) -> None:
@@ -302,7 +302,7 @@ def test_v6_database_migrates_starred_columns(tmp_path: Path) -> None:
 
     assert {"starred", "starred_at"} <= columns
     assert row == ("BTCUSDT", 0, None)
-    assert versions == set(range(1, 30))
+    assert versions == set(range(1, 31))
 
 
 def test_manifest_run_metadata_columns_are_added_idempotently(tmp_path: Path) -> None:
@@ -319,7 +319,7 @@ def test_manifest_run_metadata_columns_are_added_idempotently(tmp_path: Path) ->
         connection.close()
 
     assert {"run_id", "last_n", "recomputed_from", "parent_run_id"} <= columns
-    assert versions == set(range(1, 30))
+    assert versions == set(range(1, 31))
 
 
 _V12_JOB_RUNS = """
@@ -385,7 +385,7 @@ def test_v12_database_gains_the_job_run_scope_symbol_column(tmp_path: Path) -> N
 
     assert "symbol" in columns
     assert symbol is None  # pre-v13 batch rows keep a null (batch) scope
-    assert versions == set(range(1, 30))
+    assert versions == set(range(1, 31))
 
 
 _V13_JOB_RUNS = """
@@ -636,7 +636,7 @@ def test_v9_database_upgrades_to_v10_with_ledgers_and_indexes(tmp_path: Path) ->
     finally:
         connection.close()
 
-    assert versions == set(range(1, 30))
+    assert versions == set(range(1, 31))
     assert "llm_json" in report_columns
     assert {
         "llm_calls",
@@ -792,7 +792,7 @@ def test_v15_prompt_and_llm_rows_upgrade_to_v16_and_seed_only_missing_families(
         "review:system",
     }
     assert tuple(llm_defaults) == ("", 1, "")
-    assert versions == set(range(1, 30))
+    assert versions == set(range(1, 31))
 
 
 def test_prompt_versions_are_immutable_and_have_one_active_row_per_prompt(
@@ -954,7 +954,7 @@ def test_v16_database_gains_budget_periods_settings_and_provider_capabilities(
     assert {"budget_ledger_week", "budget_ledger_month"} <= indexes
     # 2026-11-04 is ISO week 2026-W45.
     assert tuple(backfilled) == ("2026-11-04", "2026-W45", "2026-11", "")
-    assert versions == set(range(1, 30))
+    assert versions == set(range(1, 31))
 
 
 def _v16_budget_connection(settings: Settings) -> sqlite3.Connection:
@@ -1137,7 +1137,7 @@ def test_v18_trigger_events_gain_snapshot_provenance_and_backfill(
     assert tuple(good) == ("HASH-V18", "2026-11-09T10:00:00.000Z", "PARTIAL", 2)
     # A malformed legacy payload is skipped with its defaults, never aborting boot.
     assert tuple(bad) == ("", "", "", 0)
-    assert versions == set(range(1, 30))
+    assert versions == set(range(1, 31))
     skipped = [
         record
         for record in caplog.records
@@ -1205,7 +1205,7 @@ def test_concurrent_initializes_upgrade_v19_idempotently(tmp_path: Path) -> None
     assert tuple(good) == ("HASH-V18", "2026-11-09T10:00:00.000Z", "PARTIAL", 2)
     # Exactly one recorded v19 upgrade; v20 and v21 are recorded on the same boot.
     assert versions == {19}
-    assert highest_version == 29
+    assert highest_version == 30
     assert immutable_triggers == 1
     assert journal_mode.lower() == "wal"
 
@@ -1693,7 +1693,7 @@ def test_populated_v20_database_upgrades_to_v21_preserving_every_row(
     finally:
         connection.close()
 
-    assert to_version == 29
+    assert to_version == 30
     assert {20, 21} <= versions
     # Every populated row survives the rebuild: one row in every table.
     assert counts == {
@@ -2154,7 +2154,7 @@ def test_v21_database_migrates_to_v22_with_the_journal_tables(tmp_path: Path) ->
     finally:
         connection.close()
 
-    assert version == 29
+    assert version == 30
     assert {"trade_logs", "position_events"} <= tables
     assert {
         "trade_logs_closed",
@@ -2395,7 +2395,7 @@ def test_v22_database_migrates_to_v23_preserving_events_and_funding_uniqueness(
     finally:
         connection.close()
 
-    assert version == 29
+    assert version == 30
     assert "funding_accruals" in tables
     assert "reports_symbol_generated" in report_indexes
     assert "position_events_position_at" not in event_indexes
@@ -2460,7 +2460,7 @@ def test_a_stamped_v23_funding_table_without_side_size_is_repaired(tmp_path: Pat
         columns = {str(row[1]) for row in connection.execute("PRAGMA table_info(funding_accruals)")}
         version = connection.execute("SELECT MAX(version) FROM schema_migrations").fetchone()[0]
     assert {"side", "size"} <= columns
-    assert version == 29
+    assert version == 30
 
 
 def test_ensure_funding_accruals_shape_rolls_back_a_failed_repair(
@@ -2572,7 +2572,7 @@ def test_v23_database_reseeds_the_management_family_on_upgrade_to_v24(
     # The operator's active non-v1 version is preserved untouched.
     assert analysis_active == 2
     assert analysis_v2 == "CUSTOM V2"
-    assert versions == set(range(1, 30))
+    assert versions == set(range(1, 31))
 
 
 def _make_v28_secrets_meta(settings: Settings) -> None:
@@ -2713,7 +2713,7 @@ def test_a_real_v28_secrets_meta_migrates_to_v29_preserving_the_row(tmp_path: Pa
         "2026-11-06T10:00:00.000Z",
         "legacy",
     )
-    assert version == 29
+    assert version == 30
 
 
 def test_v27_audit_event_type_index_is_created_and_preserved_on_migration(
@@ -2763,7 +2763,7 @@ def test_v27_audit_event_type_index_is_created_and_preserved_on_migration(
         connection.close()
 
     assert "audit_events_event_type_seq" in indexes
-    assert version == 29
+    assert version == 30
     # The migration is additive: every existing audit row survives.
     assert rows == [("RISK_CAPS_UPDATED", event.seq)]
     assert index_row is not None

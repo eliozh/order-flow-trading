@@ -33,7 +33,7 @@ from oft.domain.prompts import (
 _LOGGER = logging.getLogger(__name__)
 
 
-_SCHEMA_VERSION = 29
+_SCHEMA_VERSION = 30
 # ``PRAGMA journal_mode=WAL`` needs an exclusive lock and does not reliably
 # consult the busy handler, so a concurrent initializer can still see
 # SQLITE_BUSY with the timeout installed. Retry the switch briefly.
@@ -608,6 +608,30 @@ _V28_DDL: tuple[str, ...] = (
 _V29_DDL: tuple[str, ...] = (
     "ALTER TABLE secrets_meta ADD COLUMN backend TEXT NOT NULL DEFAULT 'unknown'",
 )
+# v30: the durable Telegram outbox/receipt table. ``event_key`` is the
+# idempotency key (UNIQUE) so a poller replay is a no-op; the state CHECK is the
+# receipt state machine and attempts/next_attempt_at bound the retries. Additive
+# and idempotent; the fresh schema carries the same statements.
+_TELEGRAM_OUTBOX_DEFINITION = """
+    event_key TEXT NOT NULL UNIQUE,
+    kind TEXT NOT NULL,
+    chat_id INTEGER NOT NULL,
+    reply_to_message_id INTEGER,
+    payload_json TEXT NOT NULL,
+    priority INTEGER NOT NULL DEFAULT 0,
+    state TEXT NOT NULL CHECK (state IN ('queued','sending','sent','failed')),
+    attempts INTEGER NOT NULL DEFAULT 0,
+    next_attempt_at TEXT NOT NULL,
+    message_id INTEGER,
+    last_error_code TEXT,
+    created_at TEXT NOT NULL,
+    sent_at TEXT
+"""
+_V30_DDL: tuple[str, ...] = (
+    f"CREATE TABLE IF NOT EXISTS telegram_outbox ({_TELEGRAM_OUTBOX_DEFINITION});",
+    "CREATE INDEX IF NOT EXISTS telegram_outbox_due "
+    "ON telegram_outbox(state, next_attempt_at, priority);",
+)
 _OPPORTUNITY_CONDITION_INDEX_NAMES = (
     "opportunity_conditions_opportunity",
     "opportunity_conditions_type",
@@ -913,6 +937,8 @@ _SCHEMA_SQL = f"""
     {_V26_DDL[1]}
     {_V28_DDL[0]}
     {_V28_DDL[1]}
+    {_V30_DDL[0]}
+    {_V30_DDL[1]}
 {_OPPORTUNITY_CONDITIONS_DDL}
 {_V22_DDL}
 {_V23_DDL}
@@ -2421,6 +2447,28 @@ def _migrate_v29(connection: sqlite3.Connection) -> None:
         raise
 
 
+def _migrate_v30(connection: sqlite3.Connection) -> None:
+    """Add the Telegram outbox/receipt table (slice 47, v30).
+
+    Additive and idempotent: a populated v29 database keeps every row and gains
+    an empty ``telegram_outbox`` table plus its due-order index. The ``UNIQUE``
+    ``event_key`` constraint already provides the event-key index.
+    The table stores only rendered reply text and the Telegram message id, never
+    the bot token.
+    """
+    if connection.in_transaction:
+        connection.commit()
+    connection.execute("BEGIN IMMEDIATE")
+    try:
+        for statement in _V30_DDL:
+            connection.execute(statement)
+        connection.execute("COMMIT")
+    except Exception:
+        if connection.in_transaction:
+            connection.execute("ROLLBACK")
+        raise
+
+
 def _opportunity_conditions_pk(
     connection: sqlite3.Connection,
 ) -> tuple[str, ...]:
@@ -2590,7 +2638,7 @@ def _enable_wal(connection: sqlite3.Connection) -> None:
 
 
 def initialize_database(settings: Settings) -> None:
-    """Create the data directory and the schema, currently v29.
+    """Create the data directory and the schema, currently v30.
 
     v19 adds the trigger snapshot provenance columns (``snapshot_hash``,
     ``as_of``, ``data_quality``, ``condition_count``) and backfills them from
@@ -2615,7 +2663,9 @@ def initialize_database(settings: Settings) -> None:
     never stored in SQLite. v29 records which secure backend holds each stored
     value so a later read or delete targets that provenance instead of whichever
     backend happens to be selected now; pre-v29 rows read as ``unknown`` and are
-    probed.
+    probed. v30 adds the additive ``telegram_outbox`` table (unique
+    ``event_key``, receipt state machine, bounded attempts) used by the
+    read-only Telegram channel.
     """
     settings.data_dir.mkdir(parents=True, exist_ok=True)
     settings.data_dir.chmod(0o700)
@@ -2691,6 +2741,8 @@ def initialize_database(settings: Settings) -> None:
             _migrate_v28(connection)
         if _schema_version(connection) < 29 or not _migration_recorded(connection, 29):
             _migrate_v29(connection)
+        if _schema_version(connection) < 30 or not _migration_recorded(connection, 30):
+            _migrate_v30(connection)
         _ensure_opportunity_conditions_shape(connection)
         _ensure_funding_accruals_shape(connection)
         with connection:
@@ -2816,6 +2868,10 @@ def initialize_database(settings: Settings) -> None:
             connection.execute(
                 "INSERT OR IGNORE INTO schema_migrations (version, applied_at) VALUES (?, ?)",
                 (29, "2026-11-16T00:00:00.000Z"),
+            )
+            connection.execute(
+                "INSERT OR IGNORE INTO schema_migrations (version, applied_at) VALUES (?, ?)",
+                (30, "2026-11-17T00:00:00.000Z"),
             )
             _seed_prompt_defaults(connection)
             _ensure_reports_symbol_index(connection)

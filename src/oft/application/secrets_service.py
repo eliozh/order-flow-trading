@@ -53,8 +53,14 @@ from oft.domain.llm_settings import (
     validate_api_key,
     validate_provider,
 )
+from oft.domain.telegram import (
+    TELEGRAM_SUBJECT,
+    TELEGRAM_TOKEN_NAME,
+    validate_telegram_token,
+)
 from oft.domain.time import utc_timestamp
 from oft.ports.clock import ClockPort
+from oft.ports.secrets import SecretStoreUnavailable
 from oft.ports.store import (
     AuditEventDraft,
     SecretChangePlan,
@@ -89,22 +95,6 @@ _SECRET_LIFECYCLE_LOCK = threading.RLock()
 _FILE_RW_LOCK = threading.RLock()
 _DECRYPT_CACHE: dict[Path, tuple[tuple[int, int, str], dict[str, str]]] = {}
 _DECRYPT_CACHE_LOCK = threading.Lock()
-
-
-class SecretStoreUnavailable(Exception):
-    """No secure store could accept the key; surfaced as ``CONFIG_INVALID``.
-
-    ``reason`` is a stable, non-secret token for logs and tests
-    (``backend_unavailable``, ``value_missing``, ``decrypt_failed``,
-    ``selected_backend_unavailable``); it never contains a key or master key.
-    """
-
-    code = "CONFIG_INVALID"
-
-    def __init__(self, message: str, *, reason: str = "backend_unavailable") -> None:
-        super().__init__(message)
-        self.message = message
-        self.reason = reason
 
 
 class SecretBackend(Protocol):
@@ -379,7 +369,11 @@ def _selection_reason(settings: Settings) -> str:
 
 @dataclass(frozen=True)
 class SecretStatus:
-    """The only key-shaped data a surface may render."""
+    """The only key-shaped data a surface may render.
+
+    ``last4`` exists for the Telegram masked status; the LLM ``to_contract``
+    shape is deliberately unchanged.
+    """
 
     provider: str
     configured: bool
@@ -388,6 +382,7 @@ class SecretStatus:
     fingerprint: str | None
     updated_at: str | None
     updated_by: str | None
+    last4: str | None = None
 
     def to_contract(self) -> dict[str, Any]:
         return {
@@ -457,6 +452,18 @@ class SecretsService:
     def reference(provider: str) -> str:
         return f"llm.{provider}.{SECRET_NAME}"
 
+    @staticmethod
+    def reference_for(subject: str, name: str) -> str:
+        """The backend reference for one generic ``(subject, name)`` secret.
+
+        An LLM provider pair must address the *same* backend reference as the
+        dedicated ``set_key``/``status``/``delete_key`` methods, otherwise the
+        generic path would orphan the real value while deleting its metadata.
+        """
+        if name == SECRET_NAME and subject in PROVIDERS:
+            return SecretsService.reference(subject)
+        return f"{subject}.{name}"
+
     def _env_key(self, provider: str) -> str | None:
         attribute = PROVIDER_KEY_FIELDS.get(provider)
         if attribute is None:
@@ -465,6 +472,17 @@ class SecretsService:
         getter = getattr(secret, "get_secret_value", None)
         value = getter() if callable(getter) else secret
         return value if isinstance(value, str) and value.strip() else None
+
+    def _env_secret(self, subject: str, name: str) -> str | None:
+        """The environment fallback for one generic secret pair."""
+        if subject == TELEGRAM_SUBJECT and name == TELEGRAM_TOKEN_NAME:
+            secret = getattr(self._settings, "telegram_bot_token", None)
+            getter = getattr(secret, "get_secret_value", None)
+            value = getter() if callable(getter) else secret
+            return value if isinstance(value, str) and value.strip() else None
+        if name == SECRET_NAME and subject in PROVIDERS:
+            return self._env_key(subject)
+        return None
 
     def _available_backends(self) -> tuple[SecretBackend, ...]:
         """Every usable backend, the selected/injected one first, by kind."""
@@ -502,21 +520,22 @@ class SecretsService:
                 return backend
         return None
 
-    def _read_backend(self, backend: SecretBackend, provider: str) -> str | None:
-        reference = self.reference(provider)
+    def _read_backend_ref(
+        self, backend: SecretBackend, reference: str, *, log_key: str
+    ) -> str | None:
         try:
             value = backend.get(reference)
         except SecretStoreUnavailable:
             raise
         except Exception as exc:  # noqa: BLE001 - never include the value
-            LOGGER.error("secret_store_read_failed", provider=provider)
+            LOGGER.error("secret_store_read_failed", provider=log_key)
             raise SecretStoreUnavailable(
                 "the secure secret store is unavailable", reason="backend_unavailable"
             ) from exc
         return value if isinstance(value, str) and value else None
 
-    def _read_backend_best_effort(
-        self, backend: SecretBackend, provider: str, *, context: str
+    def _read_backend_best_effort_ref(
+        self, backend: SecretBackend, reference: str, *, context: str, log_key: str
     ) -> _BackendRead:
         """Read without raising, preserving absent-vs-unreadable.
 
@@ -524,11 +543,14 @@ class SecretsService:
         restoration must be logged instead of silently disappearing.
         """
         try:
-            return _BackendRead(value=self._read_backend(backend, provider), readable=True)
+            return _BackendRead(
+                value=self._read_backend_ref(backend, reference, log_key=log_key),
+                readable=True,
+            )
         except SecretStoreUnavailable as exc:
             LOGGER.error(
                 "secret_backend_best_effort_read_failed",
-                provider=provider,
+                provider=log_key,
                 backend=backend.kind,
                 context=context,
                 reason=exc.reason,
@@ -536,15 +558,20 @@ class SecretsService:
             return _BackendRead(value=None, readable=False)
 
     def _stored_value(self, provider: str) -> str | None:
+        return self._stored_value_ref(self.reference(provider), log_key=provider)
+
+    def _stored_value_ref(self, reference: str, *, log_key: str) -> str | None:
         """The first stored value across every available backend (best effort)."""
         for backend in self._available_backends():
-            read = self._read_backend_best_effort(backend, provider, context="redaction")
+            read = self._read_backend_best_effort_ref(
+                backend, reference, context="redaction", log_key=log_key
+            )
             if read.value is not None:
                 return read.value
         return None
 
-    def _stored_with_backend(
-        self, provider: str, meta: SecretMetaRecord | None
+    def _stored_with_backend_ref(
+        self, reference: str, meta: SecretMetaRecord | None, *, log_key: str
     ) -> tuple[str | None, SecretBackend | None]:
         """Read a stored value by recorded provenance; fail closed.
 
@@ -563,7 +590,7 @@ class SecretsService:
                     "the stored provider key exists but its secret backend is unavailable",
                     reason="backend_unavailable",
                 )
-            value = self._read_backend(backend, provider)
+            value = self._read_backend_ref(backend, reference, log_key=log_key)
             if value is None:
                 raise SecretStoreUnavailable(
                     "the stored provider key exists but its value is missing",
@@ -579,15 +606,12 @@ class SecretsService:
                 reason="backend_unavailable",
             )
         for backend in backends:
-            value = self._read_backend(backend, provider)
+            value = self._read_backend_ref(backend, reference, log_key=log_key)
             if value is not None:
                 return value, backend
         raise SecretStoreUnavailable(
             "the stored provider key exists but its value is missing", reason="value_missing"
         )
-
-    def _stored_or_unavailable(self, provider: str, meta: SecretMetaRecord | None) -> str | None:
-        return self._stored_with_backend(provider, meta)[0]
 
     def _lifecycle_guard(self) -> AbstractContextManager[None]:
         """Serialise a full backend+metadata secret mutation.
@@ -627,56 +651,83 @@ class SecretsService:
 
     def status(self, provider: str) -> SecretStatus:
         name = validate_provider(provider) or ""
-        meta = self._store.get_secret_meta(name, SECRET_NAME)
+        return self._status_for(name, SECRET_NAME, self.reference(name), log_key=name)
+
+    def status_for(self, subject: str, name: str) -> SecretStatus:
+        """Status for one generic ``(subject, name)`` secret (for example
+        ``telegram/bot_token``), exposing only masked metadata."""
+        normalized_subject = (subject or "").strip().lower()
+        normalized_name = (name or "").strip().lower()
+        reference = self.reference_for(normalized_subject, normalized_name)
+        return self._status_for(
+            normalized_subject,
+            normalized_name,
+            reference,
+            log_key=f"{normalized_subject}.{normalized_name}",
+        )
+
+    def _status_for(
+        self,
+        meta_provider: str,
+        meta_name: str,
+        reference: str,
+        *,
+        log_key: str,
+    ) -> SecretStatus:
+        meta = self._store.get_secret_meta(meta_provider, meta_name)
         try:
-            stored, stored_backend = self._stored_with_backend(name, meta)
+            stored, stored_backend = self._stored_with_backend_ref(reference, meta, log_key=log_key)
         except SecretStoreUnavailable as exc:
             LOGGER.error(
                 "secret_store_unavailable",
-                provider=name,
+                provider=log_key,
                 reason=exc.reason,
             )
             return SecretStatus(
-                provider=name,
+                provider=meta_provider,
                 configured=False,
                 key_source="unavailable",
                 masked=None,
                 fingerprint=meta.fingerprint if meta is not None else None,
                 updated_at=meta.updated_at if meta is not None else None,
                 updated_by=meta.updated_by if meta is not None else None,
+                last4=meta.last4 if meta is not None else None,
             )
         if meta is not None and stored is not None:
             key_source = (
                 stored_backend.kind if stored_backend is not None else (meta.backend or "secret")
             )
             return SecretStatus(
-                provider=name,
+                provider=meta_provider,
                 configured=True,
                 key_source=key_source,
                 masked=mask_secret(stored),
                 fingerprint=meta.fingerprint,
                 updated_at=meta.updated_at,
                 updated_by=meta.updated_by,
+                last4=meta.last4,
             )
-        env_key = self._env_key(name)
+        env_key = self._env_secret(meta_provider, meta_name)
         if env_key is not None:
             return SecretStatus(
-                provider=name,
+                provider=meta_provider,
                 configured=True,
                 key_source="env",
                 masked=None,
                 fingerprint=None,
                 updated_at=None,
                 updated_by=None,
+                last4=None,
             )
         return SecretStatus(
-            provider=name,
+            provider=meta_provider,
             configured=False,
             key_source="unset",
             masked=None,
             fingerprint=None,
             updated_at=None,
             updated_by=None,
+            last4=None,
         )
 
     def list_statuses(self) -> tuple[SecretStatus, ...]:
@@ -696,24 +747,54 @@ class SecretsService:
         if name not in PROVIDERS:
             return None
         meta = self._store.get_secret_meta(name, SECRET_NAME)
-        stored = self._stored_or_unavailable(name, meta)
+        stored = self._stored_with_backend_ref(self.reference(name), meta, log_key=name)[0]
         if stored is not None:
             return stored
         return self._env_key(name)
 
-    def redaction_values(self) -> tuple[str, ...]:
+    def resolve_secret(self, subject: str, name: str) -> str | None:
+        """The stored value (preferred) or the environment fallback.
+
+        In-process only: used by the Telegram adapter's per-call token resolver
+        and provider construction. No surface returns the value.
+        """
+        normalized_subject = (subject or "").strip().lower()
+        normalized_name = (name or "").strip().lower()
+        meta = self._store.get_secret_meta(normalized_subject, normalized_name)
+        reference = self.reference_for(normalized_subject, normalized_name)
+        stored = self._stored_with_backend_ref(
+            reference, meta, log_key=f"{normalized_subject}.{normalized_name}"
+        )[0]
+        if stored is not None:
+            return stored
+        return self._env_secret(normalized_subject, normalized_name)
+
+    def redaction_values(self, *, include_providers: bool = True) -> tuple[str, ...]:
         """In-process values provider error text must never contain.
 
         Used only for scrubbing provider-controlled text; never exposed.
+        ``include_providers=False`` resolves only the Telegram token so the
+        composition root can seed log redaction without eagerly reading every
+        provider key (keyring calls / the scrypt KDF) on every CLI command.
         """
         values: list[str] = []
-        for provider in PROVIDERS:
-            stored = self._stored_value(provider)
-            if stored:
-                values.append(stored)
-            env_key = self._env_key(provider)
-            if env_key:
-                values.append(env_key)
+        if include_providers:
+            for provider in PROVIDERS:
+                stored = self._stored_value(provider)
+                if stored:
+                    values.append(stored)
+                env_key = self._env_key(provider)
+                if env_key:
+                    values.append(env_key)
+        telegram_reference = self.reference_for(TELEGRAM_SUBJECT, TELEGRAM_TOKEN_NAME)
+        stored_token = self._stored_value_ref(
+            telegram_reference, log_key=f"{TELEGRAM_SUBJECT}.{TELEGRAM_TOKEN_NAME}"
+        )
+        if stored_token:
+            values.append(stored_token)
+        env_token = self._env_secret(TELEGRAM_SUBJECT, TELEGRAM_TOKEN_NAME)
+        if env_token:
+            values.append(env_token)
         return tuple(values)
 
     # -- writes ----------------------------------------------------------
@@ -721,6 +802,45 @@ class SecretsService:
     def set_key(self, provider: str, value: object, *, actor: str) -> SecretStatus:
         with self._lifecycle_guard():
             return self._set_key_locked(provider, value, actor=actor)
+
+    def set_secret(self, subject: str, name: str, value: object, *, actor: str) -> SecretStatus:
+        """Store or rotate one generic ``(subject, name)`` secret.
+
+        The Telegram bot token is validated against the Bot API shape; any
+        other pair keeps the existing provider-key rule.
+        """
+        normalized_subject = (subject or "").strip().lower()
+        normalized_name = (name or "").strip().lower()
+        if not normalized_subject or not normalized_name:
+            raise LLMSettingsValidationError(
+                "a secret subject and name are required",
+                details=[
+                    {
+                        "field": "subject" if not normalized_subject else "name",
+                        "code": "required",
+                        "message": "a secret subject and name are required",
+                    }
+                ],
+            )
+        if (normalized_subject, normalized_name) == (
+            TELEGRAM_SUBJECT,
+            TELEGRAM_TOKEN_NAME,
+        ):
+            normalized = validate_telegram_token(value)
+        else:
+            normalized = validate_api_key(value)
+        reference = self.reference_for(normalized_subject, normalized_name)
+        log_key = f"{normalized_subject}.{normalized_name}"
+        with self._lifecycle_guard():
+            return self._write_secret(
+                meta_provider=normalized_subject,
+                meta_name=normalized_name,
+                reference=reference,
+                normalized=normalized,
+                actor=actor,
+                subject_id=log_key,
+                log_key=log_key,
+            )
 
     def _set_key_locked(self, provider: str, value: object, *, actor: str) -> SecretStatus:
         name = validate_provider(provider)
@@ -732,14 +852,36 @@ class SecretsService:
                 ],
             )
         normalized = validate_api_key(value)
+        return self._write_secret(
+            meta_provider=name,
+            meta_name=SECRET_NAME,
+            reference=self.reference(name),
+            normalized=normalized,
+            actor=actor,
+            subject_id=f"{name}.{SECRET_NAME}",
+            log_key=name,
+        )
+
+    def _write_secret(
+        self,
+        *,
+        meta_provider: str,
+        meta_name: str,
+        reference: str,
+        normalized: str,
+        actor: str,
+        subject_id: str,
+        log_key: str,
+    ) -> SecretStatus:
         backend = self._require_backend()
-        reference = self.reference(name)
         # The previous value on the backend being written, for a metadata
         # rollback. Best effort but keep absent-vs-unreadable distinct: a
         # rollback must never delete a value it could not read.
-        previous_read = self._read_backend_best_effort(backend, name, context="set_previous")
+        previous_read = self._read_backend_best_effort_ref(
+            backend, reference, context="set_previous", log_key=log_key
+        )
         previous = previous_read.value
-        prior_meta = self._store.get_secret_meta(name, SECRET_NAME)
+        prior_meta = self._store.get_secret_meta(meta_provider, meta_name)
         try:
             backend.set(reference, normalized)
         except SecretStoreUnavailable:
@@ -756,8 +898,8 @@ class SecretsService:
         def _build(current: SecretMetaRecord | None) -> SecretChangePlan:
             event_type = SECRET_ROTATED_EVENT if current is not None else SECRET_ADDED_EVENT
             record = SecretMetaRecord(
-                provider=name,
-                name=SECRET_NAME,
+                provider=meta_provider,
+                name=meta_name,
                 fingerprint=digest,
                 last4=suffix,
                 updated_at=timestamp,
@@ -770,11 +912,11 @@ class SecretsService:
             audit = AuditEventDraft(
                 event_type=event_type,
                 actor={"kind": "USER", "id": actor},
-                subject={"kind": SECRET_SUBJECT_KIND, "id": f"{name}.{SECRET_NAME}"},
+                subject={"kind": SECRET_SUBJECT_KIND, "id": subject_id},
                 # Only non-secret metadata: a hash, provider, and name.
                 payload={
-                    "provider": name,
-                    "name": SECRET_NAME,
+                    "provider": meta_provider,
+                    "name": meta_name,
                     "fingerprint": digest,
                     "source": backend.kind,
                 },
@@ -783,7 +925,7 @@ class SecretsService:
             return SecretChangePlan(record=record, audit=audit)
 
         try:
-            self._store.save_secret_change(name, SECRET_NAME, _build)
+            self._store.save_secret_change(meta_provider, meta_name, _build)
         except BaseException:
             # Never leave the backend ahead of the metadata after a DB failure,
             # but never clobber a value a newer write already installed.
@@ -791,14 +933,14 @@ class SecretsService:
                 current = backend.get(reference)
             except Exception:  # noqa: BLE001 - the original failure wins
                 current = None
-                LOGGER.error("secret_backend_rollback_skipped", provider=name)
+                LOGGER.error("secret_backend_rollback_skipped", provider=log_key)
             if current == normalized:
                 if not previous_read.readable:
                     # The prior value could be absent or unreadable; deleting
                     # here could destroy a key we never saw.
                     LOGGER.error(
                         "secret_backend_rollback_unavailable",
-                        provider=name,
+                        provider=log_key,
                         backend=backend.kind,
                         reason="previous_unreadable",
                     )
@@ -809,19 +951,26 @@ class SecretsService:
                         else:
                             backend.set(reference, previous)
                     except Exception:  # noqa: BLE001 - the original failure wins
-                        LOGGER.error("secret_backend_rollback_failed", provider=name)
+                        LOGGER.error("secret_backend_rollback_failed", provider=log_key)
             raise
         LOGGER.info(
             "secret_stored",
-            provider=name,
+            provider=log_key,
             rotated=previous is not None or not previous_read.readable,
             previous_readable=previous_read.readable,
         )
-        self._purge_superseded_backends(name, current_kind=backend.kind, prior_meta=prior_meta)
-        return self.status(name)
+        self._purge_superseded_backends(
+            reference, log_key=log_key, current_kind=backend.kind, prior_meta=prior_meta
+        )
+        return self._status_for(meta_provider, meta_name, reference, log_key=log_key)
 
     def _purge_superseded_backends(
-        self, provider: str, *, current_kind: str, prior_meta: SecretMetaRecord | None
+        self,
+        reference: str,
+        *,
+        log_key: str,
+        current_kind: str,
+        prior_meta: SecretMetaRecord | None,
     ) -> None:
         """Best-effort delete of a rotated key from every other backend (M-F).
 
@@ -829,7 +978,6 @@ class SecretsService:
         (or vice versa). Cleanup never fails the committed rotation and never
         logs a value.
         """
-        reference = self.reference(provider)
         available = self._available_backends()
         for other in available:
             if other.kind == current_kind:
@@ -839,7 +987,7 @@ class SecretsService:
             except SecretStoreUnavailable as exc:
                 LOGGER.warning(
                     "secret_rotation_residue_unavailable",
-                    provider=provider,
+                    provider=log_key,
                     backend=other.kind,
                     reason=exc.reason,
                 )
@@ -854,7 +1002,7 @@ class SecretsService:
         ):
             LOGGER.warning(
                 "secret_rotation_residue_unavailable",
-                provider=provider,
+                provider=log_key,
                 backend=prior_kind,
                 reason="backend_unavailable",
             )
@@ -862,6 +1010,21 @@ class SecretsService:
     def delete_key(self, provider: str, *, actor: str) -> SecretStatus:
         with self._lifecycle_guard():
             return self._delete_key_locked(provider, actor=actor)
+
+    def delete_secret(self, subject: str, name: str, *, actor: str) -> SecretStatus:
+        """Delete one generic ``(subject, name)`` secret from every backend."""
+        normalized_subject = (subject or "").strip().lower()
+        normalized_name = (name or "").strip().lower()
+        reference = self.reference_for(normalized_subject, normalized_name)
+        log_key = f"{normalized_subject}.{normalized_name}"
+        with self._lifecycle_guard():
+            return self._delete_secret_locked(
+                meta_provider=normalized_subject,
+                meta_name=normalized_name,
+                reference=reference,
+                log_key=log_key,
+                actor=actor,
+            )
 
     def _delete_on(self, backend: SecretBackend, reference: str) -> None:
         try:
@@ -875,8 +1038,24 @@ class SecretsService:
 
     def _delete_key_locked(self, provider: str, *, actor: str) -> SecretStatus:
         name = validate_provider(provider) or ""
-        meta = self._store.get_secret_meta(name, SECRET_NAME)
-        reference = self.reference(name)
+        return self._delete_secret_locked(
+            meta_provider=name,
+            meta_name=SECRET_NAME,
+            reference=self.reference(name),
+            log_key=name,
+            actor=actor,
+        )
+
+    def _delete_secret_locked(
+        self,
+        *,
+        meta_provider: str,
+        meta_name: str,
+        reference: str,
+        log_key: str,
+        actor: str,
+    ) -> SecretStatus:
+        meta = self._store.get_secret_meta(meta_provider, meta_name)
         available = self._available_backends()
         if meta is None:
             # A crash between the backend write and the metadata commit (or a
@@ -884,7 +1063,7 @@ class SecretsService:
             # from every available backend; it is a harmless no-op when absent.
             for backend in available:
                 self._delete_on(backend, reference)
-            return self.status(name)
+            return self._status_for(meta_provider, meta_name, reference, log_key=log_key)
 
         recorded = (meta.backend or UNKNOWN_BACKEND).strip().lower()
         if recorded and recorded != UNKNOWN_BACKEND:
@@ -901,7 +1080,7 @@ class SecretsService:
             # H-B: a legacy ``unknown`` row is only deletable when a readable
             # value is actually found. A false revocation must not be audited
             # while the value may still exist (or the store is unavailable).
-            self._stored_with_backend(name, meta)
+            self._stored_with_backend_ref(reference, meta, log_key=log_key)
             if not available:
                 raise SecretStoreUnavailable(
                     "the stored provider key exists but the secret store is unavailable",
@@ -916,7 +1095,9 @@ class SecretsService:
                 targets.append(backend)
 
         previous_by_kind = {
-            backend.kind: self._read_backend_best_effort(backend, name, context="delete_rollback")
+            backend.kind: self._read_backend_best_effort_ref(
+                backend, reference, context="delete_rollback", log_key=log_key
+            )
             for backend in targets
         }
         for backend in targets:
@@ -930,26 +1111,26 @@ class SecretsService:
             audit = AuditEventDraft(
                 event_type=SECRET_DELETED_EVENT,
                 actor={"kind": "USER", "id": actor},
-                subject={"kind": SECRET_SUBJECT_KIND, "id": f"{name}.{SECRET_NAME}"},
-                payload={"provider": name, "name": SECRET_NAME},
+                subject={"kind": SECRET_SUBJECT_KIND, "id": f"{meta_provider}.{meta_name}"},
+                payload={"provider": meta_provider, "name": meta_name},
                 created_at=timestamp,
             )
             return SecretChangePlan(record=None, audit=audit)
 
         try:
-            self._store.save_secret_change(name, SECRET_NAME, _build)
+            self._store.save_secret_change(meta_provider, meta_name, _build)
         except BaseException:
             # Restore only when the delete is still the newest backend state.
             for backend in targets:
-                current = self._read_backend_best_effort(
-                    backend, name, context="delete_rollback_check"
+                current = self._read_backend_best_effort_ref(
+                    backend, reference, context="delete_rollback_check", log_key=log_key
                 )
                 previous = previous_by_kind.get(backend.kind)
                 if previous is None or not previous.readable:
                     if previous is not None:
                         LOGGER.error(
                             "secret_backend_rollback_unavailable",
-                            provider=name,
+                            provider=log_key,
                             backend=backend.kind,
                             reason="previous_unreadable",
                         )
@@ -958,10 +1139,10 @@ class SecretsService:
                     try:
                         backend.set(reference, previous.value)
                     except Exception:  # noqa: BLE001 - the original failure wins
-                        LOGGER.error("secret_backend_rollback_failed", provider=name)
+                        LOGGER.error("secret_backend_rollback_failed", provider=log_key)
             raise
-        LOGGER.info("secret_deleted", provider=name)
-        return self.status(name)
+        LOGGER.info("secret_deleted", provider=log_key)
+        return self._status_for(meta_provider, meta_name, reference, log_key=log_key)
 
 
 __all__ = [

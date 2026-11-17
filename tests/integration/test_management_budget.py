@@ -123,8 +123,8 @@ def test_a_threshold_crossing_alerts_locally_and_never_hard_stops(tmp_path: Path
     assert audits and audits[-1]["state"] == "WARN"
     assert audits[-1]["period"] == "day"
 
-    # There is no Telegram delivery path in this build: nothing is imported or
-    # recorded, and the local audit is the only alert.
+    # The management job never touches the Telegram path: no Telegram SDK is
+    # imported, and no Telegram alert/delivery audit is written by this job.
     assert "telegram" not in sys.modules
     assert not any(
         "TELEGRAM" in event.event_type.upper()
