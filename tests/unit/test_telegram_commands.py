@@ -6,11 +6,17 @@ import pytest
 
 from oft.domain.settings import SettingValidationError
 from oft.domain.telegram import (
+    BUDGET_COMMAND,
+    COMMANDS,
     HELP_COMMAND,
     MAX_ARGUMENT_CHARS,
     MAX_OUTBOUND_CHARS,
+    OPPORTUNITIES_COMMAND,
+    POSITIONS_COMMAND,
     REFUSAL_TEXT,
+    REPORT_COMMAND,
     STATUS_COMMAND,
+    WATCHLIST_COMMAND,
     TelegramAllowlist,
     TelegramValidationError,
     is_authorized,
@@ -30,11 +36,19 @@ SENTINEL_TOKEN = "123456789:AAFakeSentinelToken_abcdefghijklmnopqrstuv"
 
 
 class TestCommandGrammar:
-    def test_status_and_help_are_the_only_commands(self) -> None:
-        assert parse_command("/status") is not None
-        assert parse_command("/status").name == STATUS_COMMAND  # type: ignore[union-attr]
-        assert parse_command("/help") is not None
-        assert parse_command("/help").name == HELP_COMMAND  # type: ignore[union-attr]
+    def test_the_closed_table_has_the_seven_command_surface(self) -> None:
+        assert COMMANDS == (
+            STATUS_COMMAND,
+            POSITIONS_COMMAND,
+            OPPORTUNITIES_COMMAND,
+            REPORT_COMMAND,
+            BUDGET_COMMAND,
+            WATCHLIST_COMMAND,
+            HELP_COMMAND,
+        )
+        for text in COMMANDS:
+            parsed = parse_command(text)
+            assert parsed is not None and parsed.name == text
 
     @pytest.mark.parametrize(
         "text",

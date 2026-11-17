@@ -17,6 +17,7 @@ from typing import Any, Literal
 
 import structlog
 
+from oft.application import telegram_queries
 from oft.application.secrets_service import SecretsService
 from oft.application.settings_service import SettingsService, TelegramAllowlistSettings
 from oft.application.status import build_status
@@ -27,23 +28,33 @@ from oft.application.telegram_messages import (
 )
 from oft.config import Settings
 from oft.domain.telegram import (
+    BUDGET_COMMAND,
     HELP_COMMAND,
     MAX_GLOBAL_REFUSALS_PER_WINDOW,
     MAX_REFUSALS_PER_WINDOW,
+    OPPORTUNITIES_COMMAND,
+    POSITIONS_COMMAND,
     REFUSAL_TEXT,
     REFUSAL_WINDOW_SECONDS,
+    REPORT_COMMAND,
     STATUS_COMMAND,
     TELEGRAM_REFUSAL_AUDIT_WINDOW_SECONDS,
+    WATCHLIST_COMMAND,
+    WRITE_REFUSAL_TEXT,
     ReceiptState,
     TelegramAllowlist,
+    TelegramCommand,
     TelegramUpdate,
     TelegramValidationError,
+    budget_outbound,
     is_authorized,
+    normalize_symbol_argument,
     parse_command,
+    parse_write_like_command,
+    query_reference_id,
     reply_event_key,
     sanitize_inbound_text,
     test_event_key,
-    truncate_outbound,
     validate_telegram_token,
 )
 from oft.domain.time import utc_timestamp
@@ -250,9 +261,11 @@ class TelegramService:
         """Authorize one update, then enqueue at most one reply.
 
         An unknown chat/user receives the fixed ``未授权`` refusal (rate-limited
-        and audited) and no data. A prose-embedded or unknown command is ignored
-        entirely; only an exact ``/status`` or ``/help`` (with no argument)
-        dispatches.
+        and audited) and no data, before any parse or read-model work. An
+        authorized write-like token (``/approve`` and friends) receives the
+        fixed read-only refusal and has no mutation branch. A prose-embedded or
+        unknown command is ignored entirely; only an exact allowlisted token
+        dispatches, and only ``/report`` accepts one optional symbol argument.
         """
         text = sanitize_inbound_text(update.text)
         allowlist = self.allowlist()
@@ -278,9 +291,39 @@ class TelegramService:
                 priority=10,
                 now=now,
             )
+        if parse_write_like_command(text) is not None:
+            return self._enqueue(
+                event_key=reply_event_key(update.update_id),
+                kind="refusal",
+                chat_id=update.chat_id,
+                reply_to_message_id=update.message_id,
+                text=WRITE_REFUSAL_TEXT,
+                priority=10,
+                now=now,
+            )
         command = parse_command(text)
-        if command is None or command.argument:
+        if command is None:
             return None
+        if command.name != REPORT_COMMAND and command.argument:
+            # Only ``/report`` accepts an argument; every other command ignores
+            # an argument entirely instead of dispatching a partial query.
+            return None
+        reference_id = query_reference_id(update.update_id, command.name)
+        reply = self._render_query(command, reference_id=reference_id)
+        if reply is None:  # pragma: no cover - the parser returns only the table
+            return None
+        return self._enqueue(
+            event_key=reply_event_key(update.update_id),
+            kind="query_reply",
+            chat_id=update.chat_id,
+            reply_to_message_id=update.message_id,
+            text=budget_outbound(reply, reference_id),
+            priority=0,
+            now=now,
+        )
+
+    def _render_query(self, command: TelegramCommand, *, reference_id: str) -> str | None:
+        """Render one allowlisted query over the existing read models."""
         if command.name == STATUS_COMMAND:
             report = build_status(
                 self._settings,
@@ -288,22 +331,51 @@ class TelegramService:
                 self._clock,
                 store=self._store,
             )
-            reply = render_status(report)
-            kind = "query_reply"
-        elif command.name == HELP_COMMAND:
-            reply = render_help()
-            kind = "query_reply"
-        else:  # pragma: no cover - the parser only returns the closed table
-            return None
-        return self._enqueue(
-            event_key=reply_event_key(update.update_id),
-            kind=kind,
-            chat_id=update.chat_id,
-            reply_to_message_id=update.message_id,
-            text=truncate_outbound(reply),
-            priority=0,
-            now=now,
-        )
+            return render_status(report)
+        if command.name == HELP_COMMAND:
+            return render_help()
+        if command.name == POSITIONS_COMMAND:
+            return telegram_queries.render_positions_query(
+                store=self._store,
+                clock=self._clock,
+                settings=self._settings,
+                reference_id=reference_id,
+            )
+        if command.name == OPPORTUNITIES_COMMAND:
+            return telegram_queries.render_opportunities_query(
+                store=self._store,
+                clock=self._clock,
+                reference_id=reference_id,
+            )
+        if command.name == REPORT_COMMAND:
+            if not command.argument:
+                return telegram_queries.render_report_query(
+                    store=self._store,
+                    symbol=None,
+                    reference_id=reference_id,
+                )
+            symbol = normalize_symbol_argument(command.argument)
+            if symbol is None:
+                return telegram_queries.render_invalid_argument_error(reference_id)
+            return telegram_queries.render_report_query(
+                store=self._store,
+                symbol=symbol,
+                reference_id=reference_id,
+            )
+        if command.name == BUDGET_COMMAND:
+            return telegram_queries.render_budget_query(
+                store=self._store,
+                clock=self._clock,
+                settings=self._settings,
+                reference_id=reference_id,
+            )
+        if command.name == WATCHLIST_COMMAND:
+            return telegram_queries.render_watchlist_query(
+                store=self._store,
+                clock=self._clock,
+                reference_id=reference_id,
+            )
+        return None
 
     def _enqueue(
         self,
