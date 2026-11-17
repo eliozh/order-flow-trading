@@ -44,6 +44,7 @@ from oft.api.routes.scans import router as scans_router
 from oft.api.routes.settings import router as settings_router
 from oft.api.routes.symbols import router as symbols_router
 from oft.api.routes.system import router as system_router
+from oft.api.routes.telegram import router as telegram_router
 from oft.api.routes.triggers import router as triggers_router
 from oft.api.routes.watchlist import router as watchlist_router
 from oft.bootstrap import build_container
@@ -268,6 +269,7 @@ def create_app(settings: Settings | None = None, *, clock: ClockPort | None = No
     app.include_router(llm_router)
     app.include_router(budget_router)
     app.include_router(settings_router)
+    app.include_router(telegram_router)
 
     @app.exception_handler(ApiError)
     async def _api_error(_request: Request, exc: ApiError) -> JSONResponse:

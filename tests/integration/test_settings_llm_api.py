@@ -361,7 +361,7 @@ def test_secrets_meta_shape_is_identical_for_a_fresh_and_a_migrated_database(
         "updated_by",
         "backend",
     ]
-    assert version == 29
+    assert version == 30
 
 
 def test_disabling_the_custom_opt_in_with_a_custom_url_is_rejected(

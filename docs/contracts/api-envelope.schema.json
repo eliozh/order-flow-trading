@@ -71,7 +71,8 @@
         "RECONCILIATION_REQUIRED",
         "SCAN_ALREADY_RUNNING",
         "TELEGRAM_NOT_CONFIGURED",
-        "TELEGRAM_DELIVERY_FAILED"
+        "TELEGRAM_DELIVERY_FAILED",
+        "TELEGRAM_TOKEN_INVALID"
       ]
     },
     "errorCategory": {

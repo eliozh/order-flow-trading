@@ -501,6 +501,14 @@
       "retryable": true,
       "summary": "A Telegram message could not be delivered.",
       "userAction": "Check the token/chat/allowlist; retries are recorded with receipts."
+    },
+    {
+      "code": "TELEGRAM_TOKEN_INVALID",
+      "httpStatus": 502,
+      "category": "SYSTEM",
+      "retryable": false,
+      "summary": "The Telegram bot token is invalid.",
+      "userAction": "Rotate the bot token with `oft telegram token set` (stdin) and retry."
     }
   ]
 }

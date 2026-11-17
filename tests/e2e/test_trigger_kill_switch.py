@@ -163,5 +163,7 @@ def test_no_live_credential_or_exchange_path_is_reachable() -> None:
         lowered = (WEB_SRC / name).read_text(encoding="utf-8").lower()
         assert "api_key" not in lowered, name
         assert "api-secret" not in lowered, name
+        # No web Telegram surface exists yet (slice 47 ships the CLI/daemon
+        # path only); the browser must not grow one accidentally.
         assert "telegram" not in lowered, name
         assert "livebroker" not in lowered, name

@@ -392,15 +392,92 @@ def daemon_start(
     management_scheduler = _start_management_scheduler(
         settings, state, container=container, scan_scheduler=scheduler
     )
+    telegram_runtime: Any | None = None
     try:
+        # Started inside the guarded block: if the Telegram runtime fails to
+        # start, the finally below still shuts down the already-started
+        # schedulers instead of leaking them.
+        telegram_runtime = _start_telegram_runtime(container=container)
         _run_uvicorn(settings)
     finally:
+        # The Telegram runtime is stopped first: its poller thread and dispatch
+        # scheduler must not outlive the process or hold the SQLite handle.
+        if telegram_runtime is not None:
+            _shutdown_telegram_runtime(telegram_runtime)
         management_scheduler.shutdown()
         monitor_scheduler.shutdown()
         trigger_scheduler.shutdown()
         settings_sync.shutdown()
         scheduler.shutdown()
         pid_path(settings).unlink(missing_ok=True)
+
+
+def _shutdown_telegram_runtime(runtime: Any) -> None:
+    """Stop and release the Telegram runtime; never skip the other cleanups.
+
+    Both the shutdown and the close are guarded because the daemon ``finally``
+    must still stop the management/monitor/trigger/scan schedulers even if the
+    adapter's transport close fails.
+    """
+    try:
+        runtime.shutdown(wait=False)
+    except Exception:  # noqa: BLE001 - cleanup must continue
+        _LOGGER.warning("telegram_runtime_shutdown_failed")
+    close_runtime = getattr(runtime, "close", None)
+    if callable(close_runtime):
+        try:
+            close_runtime()
+        except Exception:  # noqa: BLE001 - cleanup must continue
+            _LOGGER.warning("telegram_runtime_close_failed")
+
+
+def _start_telegram_runtime(*, container: Any) -> Any:
+    """Start the dedicated Telegram poller thread and 1 s dispatcher scheduler.
+
+    These are deliberately not the scan/trigger/management schedulers: a slow
+    or blocked Telegram call must never delay a scan or trigger tick.
+    """
+    from oft.application.telegram_dispatch import OutboxDispatcher
+    from oft.application.telegram_poller import TelegramPoller, TelegramRuntime
+
+    service = getattr(container, "telegram_service", None)
+    if service is None:
+        return None
+
+    def _port() -> Any:
+        from oft.ports.telegram import TELEGRAM_NOT_CONFIGURED, TelegramError
+
+        resolved = getattr(container, "telegram_port", None)
+        if resolved is None:
+            raise TelegramError(TELEGRAM_NOT_CONFIGURED, "the Telegram channel is not configured")
+        return resolved
+
+    poller = TelegramPoller(
+        service=service,
+        store=container.store,
+        clock=container.clock,
+        port_resolver=_port,
+    )
+    dispatcher = OutboxDispatcher(
+        store=container.store,
+        clock=container.clock,
+        port_resolver=_port,
+    )
+
+    def _close_port() -> None:
+        resolved = getattr(container, "telegram_port", None)
+        close = getattr(resolved, "close", None)
+        if callable(close):
+            close()
+
+    runtime = TelegramRuntime(
+        poller=poller,
+        dispatcher=dispatcher,
+        dispatch_interval_seconds=1,
+        closer=_close_port,
+    )
+    runtime.start()
+    return runtime
 
 
 def _start_scheduler(
@@ -1580,4 +1657,5 @@ __all__ = [
     "settings_or_exit",
     "write_pid",
     "_run_settings_sync",
+    "_start_telegram_runtime",
 ]

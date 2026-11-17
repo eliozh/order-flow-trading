@@ -6,6 +6,13 @@ present, otherwise the configured default (``OFT_SCAN_PERIOD`` or the
 built-in); the source is reported, never guessed. A save writes its row and one
 audit event atomically, and an identical effective value is a deterministic
 no-op. Risk-cap loosening additionally requires an explicit confirmation.
+
+Documented maintainability exception: this module is 800+ lines because the
+slice-47 Telegram allowlist section is tightly coupled to the config/audit
+transaction seam (``save_telegram_allowlist_change``). Extracting it as a mixin
+would only move the same code and duplicate the validation boundary; the
+exception is recorded here per the repository's soft-ceiling standard and
+should be revisited if the section grows further.
 """
 
 from __future__ import annotations
@@ -71,6 +78,13 @@ from oft.domain.settings import (
     scoped_diff,
     validate_scan_period,
 )
+from oft.domain.telegram import (
+    MAX_TELEGRAM_ALLOWED_USER_IDS,
+    MAX_TELEGRAM_CHAT_IDS,
+    TELEGRAM_ALLOWED_USER_IDS_KEY,
+    TELEGRAM_CHAT_IDS_KEY,
+    TelegramValidationError,
+)
 from oft.domain.time import utc_timestamp
 from oft.ports.clock import ClockPort
 from oft.ports.store import AuditEventDraft, ConfigRecord, StorePort
@@ -86,6 +100,8 @@ OVERLAY_MAX_JITTER_SECONDS = min(SCAN_PERIOD_HOURS.values()) * 3600 - 1
 
 RISK_CAPS_UPDATED_EVENT = "RISK_CAPS_UPDATED"
 RISK_SECTION = "risk"
+TELEGRAM_ALLOWLIST_UPDATED = "TELEGRAM_ALLOWLIST_UPDATED"
+TELEGRAM_ALLOWLIST_SECTION = "telegram"
 _LOGGER = logging.getLogger(__name__)
 
 
@@ -161,6 +177,24 @@ class RiskCapsUpdateResult:
     after: RiskCaps
     loosened: tuple[str, ...]
     changed: bool
+
+
+@dataclass(frozen=True)
+class TelegramAllowlistSettings:
+    """The effective Telegram allowlists plus their last change."""
+
+    chat_ids: tuple[int, ...]
+    allowed_user_ids: tuple[int, ...]
+    updated_at: str | None
+    updated_by: str | None
+
+    def to_contract(self) -> dict[str, Any]:
+        return {
+            "chat_ids": list(self.chat_ids),
+            "allowed_user_ids": list(self.allowed_user_ids),
+            "updated_at": self.updated_at,
+            "updated_by": self.updated_by,
+        }
 
 
 class SettingsService(LLMSettingsMixin, OnboardingProgressMixin):
@@ -499,6 +533,193 @@ class SettingsService(LLMSettingsMixin, OnboardingProgressMixin):
         self._store.save_config_change(SCAN_PERIOD_KEY, _build)
         # Read after the commit so the response reflects the committed row.
         return self.read_scan_settings()
+
+    # -- Telegram allowlists ---------------------------------------------
+
+    def read_telegram_allowlist(self) -> TelegramAllowlistSettings:
+        """The two bounded id lists and their newest provenance.
+
+        A missing key reads as an empty list. A malformed persisted value is a
+        typed :class:`ConfigError` (never silently emptied), so an operator
+        cannot lose an allowlist to a corrupt row.
+        """
+        chat_record = self._store.get_config(TELEGRAM_CHAT_IDS_KEY)
+        user_record = self._store.get_config(TELEGRAM_ALLOWED_USER_IDS_KEY)
+        chat_ids = self._decode_allowlist(
+            chat_record,
+            field="chat_ids",
+            maximum=MAX_TELEGRAM_CHAT_IDS,
+            allow_negative=True,
+        )
+        allowed_user_ids = self._decode_allowlist(
+            user_record, field="allowed_user_ids", maximum=MAX_TELEGRAM_ALLOWED_USER_IDS
+        )
+        timestamps = [
+            record.updated_at for record in (chat_record, user_record) if record is not None
+        ]
+        updated_at = max(timestamps) if timestamps else None
+        updated_by = None
+        for record in (chat_record, user_record):
+            if record is not None:
+                updated_by = record.updated_by
+        return TelegramAllowlistSettings(
+            chat_ids=chat_ids,
+            allowed_user_ids=allowed_user_ids,
+            updated_at=updated_at,
+            updated_by=updated_by,
+        )
+
+    def _decode_allowlist(
+        self,
+        record: ConfigRecord | None,
+        *,
+        field: str,
+        maximum: int,
+        allow_negative: bool = False,
+    ) -> tuple[int, ...]:
+        if record is None:
+            return ()
+        try:
+            value = json.loads(record.value_json)
+        except (TypeError, ValueError) as exc:
+            raise ConfigError(f"persisted telegram {field} is unreadable") from exc
+        try:
+            return _normalize_telegram_ids(
+                value, field=field, maximum=maximum, allow_negative=allow_negative
+            )
+        except SettingValidationError as exc:
+            raise ConfigError(f"persisted telegram {field} is invalid: {exc.message}") from exc
+
+    def update_telegram_allowlist(
+        self,
+        chat_ids: object,
+        allowed_user_ids: object,
+        *,
+        actor: str,
+        reason: str = "",
+    ) -> TelegramAllowlistSettings:
+        """Validate and persist both allowlists atomically.
+
+        Both ``config`` rows and exactly one ``TELEGRAM_ALLOWLIST_UPDATED``
+        audit event commit in one ``BEGIN IMMEDIATE`` transaction. An unchanged
+        pair is a deterministic no-op (no row, no audit).
+        """
+        proposed_chats = _normalize_telegram_ids(
+            chat_ids,
+            field="chat_ids",
+            maximum=MAX_TELEGRAM_CHAT_IDS,
+            allow_negative=True,
+        )
+        proposed_users = _normalize_telegram_ids(
+            allowed_user_ids,
+            field="allowed_user_ids",
+            maximum=MAX_TELEGRAM_ALLOWED_USER_IDS,
+        )
+        timestamp = utc_timestamp(self._clock.now())
+
+        def _build(
+            chat_current: ConfigRecord | None,
+            user_current: ConfigRecord | None,
+        ) -> tuple[ConfigRecord, ConfigRecord, AuditEventDraft] | None:
+            before_chats = self._decode_allowlist(
+                chat_current,
+                field="chat_ids",
+                maximum=MAX_TELEGRAM_CHAT_IDS,
+                allow_negative=True,
+            )
+            before_users = self._decode_allowlist(
+                user_current,
+                field="allowed_user_ids",
+                maximum=MAX_TELEGRAM_ALLOWED_USER_IDS,
+            )
+            if before_chats == proposed_chats and before_users == proposed_users:
+                return None
+            chat_record = ConfigRecord(
+                key=TELEGRAM_CHAT_IDS_KEY,
+                value_json=json.dumps(list(proposed_chats)),
+                updated_at=timestamp,
+                updated_by=actor,
+            )
+            user_record = ConfigRecord(
+                key=TELEGRAM_ALLOWED_USER_IDS_KEY,
+                value_json=json.dumps(list(proposed_users)),
+                updated_at=timestamp,
+                updated_by=actor,
+            )
+            audit = AuditEventDraft(
+                event_type=TELEGRAM_ALLOWLIST_UPDATED,
+                actor={"kind": "USER", "id": actor},
+                subject={"kind": "SYSTEM", "id": TELEGRAM_ALLOWLIST_SECTION},
+                payload={
+                    "before": {
+                        "chat_ids": list(before_chats),
+                        "allowed_user_ids": list(before_users),
+                    },
+                    "after": {
+                        "chat_ids": list(proposed_chats),
+                        "allowed_user_ids": list(proposed_users),
+                    },
+                    "reason": reason,
+                },
+                created_at=timestamp,
+            )
+            return chat_record, user_record, audit
+
+        self._store.save_telegram_allowlist_change(_build)
+        return self.read_telegram_allowlist()
+
+
+def _normalize_telegram_ids(
+    value: object, *, field: str, maximum: int, allow_negative: bool = False
+) -> tuple[int, ...]:
+    """Validate one bounded allowlist of nonzero integer ids.
+
+    Chat ids may be negative (Telegram group/supergroup chats); user ids are
+    always positive. Bools (which are ``int`` subclasses), strings, floats, and
+    zero are rejected with a field-scoped detail. The accepted values are sorted
+    and deduplicated so the persisted document is canonical.
+    """
+    kind = "nonzero integer" if allow_negative else "positive integer"
+    if not isinstance(value, (list, tuple)):
+        raise TelegramValidationError(
+            f"{field} must be a list of {kind} ids",
+            details=[
+                {
+                    "field": field,
+                    "code": "not_a_list",
+                    "message": f"{field} must be a list of {kind} ids",
+                }
+            ],
+        )
+    details: list[dict[str, Any]] = []
+    ids: set[int] = set()
+    for item in value:
+        valid = (
+            not isinstance(item, bool)
+            and isinstance(item, int)
+            and (item != 0 if allow_negative else item > 0)
+        )
+        if not valid:
+            details.append(
+                {
+                    "field": field,
+                    "code": "invalid_id",
+                    "message": f"{field} must contain only {kind} ids",
+                }
+            )
+            continue
+        ids.add(item)
+    if len(ids) > maximum:
+        details.append(
+            {
+                "field": field,
+                "code": "too_many",
+                "message": f"{field} must contain at most {maximum} ids",
+            }
+        )
+    if details:
+        raise TelegramValidationError(f"invalid telegram {field}", details=details)
+    return tuple(sorted(ids))
 
 
 def _audit_actor_id(payload_json: str) -> str | None:

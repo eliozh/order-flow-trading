@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import socket
+import sys
 import threading
 import time
 from collections.abc import Iterator
@@ -13,6 +14,10 @@ import uvicorn
 
 from oft.api.app import create_app
 from oft.config import Settings
+
+# ``tests/fakes`` is a shared helper package (scripted transports and secret
+# backends). Make it importable from every test directory.
+sys.path.insert(0, str(Path(__file__).resolve().parent))
 
 
 @pytest.fixture()

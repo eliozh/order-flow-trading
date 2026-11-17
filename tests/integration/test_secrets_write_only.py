@@ -16,9 +16,10 @@ from typing import Any
 import pytest
 from fastapi.testclient import TestClient
 
+from oft.adapters.sqlite_store import SqliteStore
 from oft.api.app import create_app
 from oft.application import secrets_service as secrets_module
-from oft.application.secrets_service import SecretBackend
+from oft.application.secrets_service import SecretBackend, SecretsService
 from oft.clock import FixedClock
 from oft.config import Settings
 
@@ -934,3 +935,40 @@ def test_a_refresh_failure_after_a_committed_key_write_still_returns_200(
     audits = [event.event_type for event in container.store.list_audit_events()]
     assert audits == ["SECRET_ADDED"]
     assert backend.values["llm.openai.api_key"] == SENTINEL
+
+
+def test_a_generic_llm_secret_pair_targets_the_same_backend_reference(
+    tmp_path: Path, backend: MemorySecretBackend
+) -> None:
+    """``(openai, api_key)`` must not orphan the value ``status("openai")`` reads."""
+    settings = _settings(tmp_path)
+    store = SqliteStore(settings)
+    store.initialize()
+    service = SecretsService(store=store, settings=settings, clock=FixedClock(NOW), backend=backend)
+
+    service.set_secret("openai", "api_key", SENTINEL, actor="test")
+
+    assert SecretsService.reference_for("openai", "api_key") == SecretsService.reference("openai")
+    assert backend.values[SecretsService.reference("openai")] == SENTINEL
+    assert service.status("openai").configured is True
+    assert service.resolve_key("openai") == SENTINEL
+
+    service.delete_secret("openai", "api_key", actor="test")
+
+    assert backend.values == {}
+    assert service.resolve_key("openai") is None
+    assert store.get_secret_meta("openai", "api_key") is None
+
+
+def test_a_generic_non_llm_secret_keeps_its_subject_name_reference(
+    tmp_path: Path, backend: MemorySecretBackend
+) -> None:
+    settings = _settings(tmp_path)
+    store = SqliteStore(settings)
+    store.initialize()
+    service = SecretsService(store=store, settings=settings, clock=FixedClock(NOW), backend=backend)
+
+    service.set_secret("telegram", "bot_token", "123456789:" + "A" * 40, actor="test")
+
+    assert SecretsService.reference_for("telegram", "bot_token") == "telegram.bot_token"
+    assert backend.values["telegram.bot_token"].startswith("123456789:")

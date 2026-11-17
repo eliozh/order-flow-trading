@@ -9,6 +9,7 @@ from typing import Any, Literal, Protocol
 from oft.domain.data_quality import DataGap
 from oft.domain.prompts import PromptRole, PromptStatus
 from oft.domain.symbols import SymbolContract
+from oft.domain.telegram import ReceiptState
 
 
 class StoreUnavailableError(Exception):
@@ -604,6 +605,31 @@ class SecretMetaRecord:
     updated_at: str
     updated_by: str
     backend: str = "unknown"
+
+
+@dataclass(frozen=True)
+class TelegramOutboxRecord:
+    """One durable outbound Telegram message and its receipt state.
+
+    ``event_key`` is the idempotency key: the unique constraint makes a
+    duplicate enqueue a no-op, so a poller replay or a crash between enqueue and
+    offset persistence cannot send twice. ``payload_json`` carries only the
+    rendered ``{"text": ...}`` body; the token is never stored here.
+    """
+
+    event_key: str
+    kind: str
+    chat_id: int
+    reply_to_message_id: int | None
+    payload_json: str
+    priority: int = 0
+    state: ReceiptState = ReceiptState.QUEUED
+    attempts: int = 0
+    next_attempt_at: str = ""
+    message_id: int | None = None
+    last_error_code: str | None = None
+    created_at: str = ""
+    sent_at: str | None = None
 
 
 @dataclass(frozen=True)
@@ -1560,6 +1586,68 @@ class StorePort(Protocol):
         row when nothing was written) and the committed audit record, if any.
         """
         ...
+
+    def save_telegram_allowlist_change(
+        self,
+        build: Callable[
+            [ConfigRecord | None, ConfigRecord | None],
+            tuple[ConfigRecord, ConfigRecord, AuditEventDraft] | None,
+        ],
+    ) -> tuple[ConfigRecord | None, ConfigRecord | None, AuditEventRecord | None]:
+        """Read-modify-write both Telegram allowlist rows atomically.
+
+        ``build`` receives the committed ``telegram.chat_ids`` and
+        ``telegram.allowed_user_ids`` rows inside one ``BEGIN IMMEDIATE``
+        transaction and returns both new rows plus exactly one audit draft, or
+        ``None`` for a deterministic no-op. A validation error raised by
+        ``build`` rolls back with no partial write.
+        """
+        ...
+
+    # -- Telegram outbox / receipts --------------------------------------
+
+    def append_telegram_outbox(self, record: TelegramOutboxRecord) -> bool:
+        """Insert one outbox row; a duplicate ``event_key`` is a no-op.
+
+        Returns ``True`` when the row was inserted and ``False`` when the unique
+        constraint already holds the event.
+        """
+        ...
+
+    def claim_due_telegram_outbox(
+        self, *, now: str, limit: int = 10
+    ) -> tuple[TelegramOutboxRecord, ...]:
+        """Atomically move due rows to ``sending`` and return them.
+
+        Eligible rows are ``queued``/``failed`` with ``attempts < 3`` and
+        ``next_attempt_at <= now``, ordered by priority then age. Claiming in one
+        write transaction means one dispatcher tick cannot send the same row
+        twice.
+        """
+        ...
+
+    def get_telegram_outbox(self, event_key: str) -> TelegramOutboxRecord | None: ...
+
+    def mark_telegram_sent(self, event_key: str, *, message_id: int, sent_at: str) -> bool:
+        """Record Bot API acceptance and the ``sent_at`` timestamp."""
+        ...
+
+    def mark_telegram_attempt_failed(
+        self,
+        event_key: str,
+        *,
+        error_code: str,
+        next_attempt_at: str,
+        final: bool,
+    ) -> bool:
+        """Increment attempts and either re-queue or terminally fail the row."""
+        ...
+
+    def list_telegram_receipts(self, limit: int = 50) -> tuple[TelegramOutboxRecord, ...]:
+        """Newest-first bounded receipts (all states)."""
+        ...
+
+    def count_telegram_receipts(self) -> int: ...
 
     # -- Write-only secret metadata --------------------------------------
 

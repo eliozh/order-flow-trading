@@ -109,6 +109,24 @@ ERROR_CATALOG: dict[str, ErrorSpec] = {
     "LLM_PROVIDER_NOT_CONFIGURED": ErrorSpec(
         412, "LLM", False, "No LLM provider/key is configured for this role."
     ),
+    "TELEGRAM_NOT_CONFIGURED": ErrorSpec(
+        412,
+        "SYSTEM",
+        False,
+        "The Telegram bot token/chat is not configured.",
+    ),
+    "TELEGRAM_DELIVERY_FAILED": ErrorSpec(
+        502,
+        "SYSTEM",
+        True,
+        "A Telegram message could not be delivered.",
+    ),
+    "TELEGRAM_TOKEN_INVALID": ErrorSpec(
+        502,
+        "SYSTEM",
+        False,
+        "The Telegram bot token is invalid.",
+    ),
     "LLM_AUTH_FAILED": ErrorSpec(502, "LLM", False, "The LLM provider rejected the API key."),
     "LLM_MODEL_NOT_CONFIGURED": ErrorSpec(
         412, "LLM", False, "No model is configured for this LLM role."

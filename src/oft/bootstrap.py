@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+import logging
 import threading
 from dataclasses import dataclass
 
@@ -19,6 +20,8 @@ from oft.adapters.llm_openai import OpenAIAdapter
 from oft.adapters.llm_stub import LLMStub
 from oft.adapters.parquet_store import ParquetStore
 from oft.adapters.sqlite_store import SqliteStore
+from oft.adapters.telegram_bot_api import TelegramBotApiAdapter
+from oft.adapters.telegram_fake import TelegramFake
 from oft.application.backfill_service import BackfillService
 from oft.application.llm_orchestrator import (
     LLMRuntimeRegistry,
@@ -30,18 +33,21 @@ from oft.application.rate_limiter import (
     StructlogAlertSink,
     WsSubscriptionBudget,
 )
-from oft.application.secrets_service import SecretStoreUnavailable
-from oft.application.settings_service import resolve_effective_llm_settings
+from oft.application.secrets_service import SecretsService, SecretStoreUnavailable
+from oft.application.settings_service import SettingsService, resolve_effective_llm_settings
 from oft.application.status import StatusReport, build_status
 from oft.application.symbol_registry import SymbolRegistry
+from oft.application.telegram_service import TelegramService
 from oft.clock import SystemClock
 from oft.config import ConfigError, Settings, load_settings
 from oft.domain.settings import SettingValidationError
+from oft.logging import set_redaction_values
 from oft.ports.archive import ArchiveSourcePort
 from oft.ports.clock import ClockPort
 from oft.ports.llm import LLMPort
 from oft.ports.market_data import MarketDataPort
 from oft.ports.store import StorePort
+from oft.ports.telegram import TelegramPort
 
 PROVIDER_NAMES: tuple[str, ...] = ("openai", "anthropic", "deepseek", "stub")
 LLM_ROLE_NAMES: tuple[str, ...] = ("ANALYSIS", "ENTRY_RECHECK", "MANAGEMENT", "REVIEW")
@@ -154,6 +160,10 @@ class AppContainer:
     # the requested provider and the effective key/base URLs still match, so a
     # rotation or a provider change rebuilds without a restart.
     llm_adapter_signature: str | None = None
+    # Slice 47: the Telegram port/service. Defaults keep existing construction
+    # sites and tests working; ``build_container`` always supplies both.
+    telegram_port: TelegramPort | None = None
+    telegram_service: TelegramService | None = None
 
     def refresh_llm_settings(self) -> Settings:
         """Re-resolve the persisted LLM overlay and swap the runtime snapshot.
@@ -286,10 +296,46 @@ def build_container(
         message = getattr(exc, "message", None) or str(exc)
         raise ConfigError(message) from exc
     llm_runtime = LLMRuntimeRegistry(clock=resolved_clock, settings=effective)
+    market_data = FixtureMarketData(fixtures_dir=resolved.fixtures_dir)
+    # Telegram: the fake in tests (deterministic, network-free) and a lazy Bot
+    # API adapter otherwise. The adapter resolves the token per call from the
+    # pristine secret service, so a missing token never blocks startup and a
+    # rotation applies without a restart.
+    telegram_secrets = SecretsService(store=store, settings=llm_base_settings, clock=resolved_clock)
+    # Value-based log redaction: a stored/env Telegram token outside the
+    # canonical shape must still be scrubbed from stdlib records. Resolve only
+    # the Telegram token here: eagerly reading every provider key on each CLI
+    # command would hit the OS keyring / the scrypt KDF. A store failure must
+    # never block startup; the unbounded token-shape scrub still catches a
+    # canonical token without the registry, and a runtime rotation is picked up
+    # on the next container build.
+    try:
+        set_redaction_values(telegram_secrets.redaction_values(include_providers=False))
+    except Exception:  # noqa: BLE001 - best-effort defense in depth
+        logging.getLogger(__name__).warning("telegram_redaction_values_unavailable")
+    telegram_settings_service = SettingsService(
+        store=store, clock=resolved_clock, settings=llm_base_settings
+    )
+    telegram_port: TelegramPort
+    if resolved.env == "test":
+        telegram_port = TelegramFake()
+    else:
+        telegram_port = TelegramBotApiAdapter(
+            token_resolver=lambda: telegram_secrets.resolve_secret("telegram", "bot_token")
+        )
+    telegram_service = TelegramService(
+        settings=effective,
+        store=store,
+        clock=resolved_clock,
+        market_data=market_data,
+        secrets=telegram_secrets,
+        settings_service=telegram_settings_service,
+        port=telegram_port,
+    )
     return AppContainer(
         settings=effective,
         clock=resolved_clock,
-        market_data=FixtureMarketData(fixtures_dir=resolved.fixtures_dir),
+        market_data=market_data,
         store=store,
         parquet=parquet,
         symbol_registry=symbol_registry,
@@ -302,6 +348,8 @@ def build_container(
         llm_provider=llm_provider,
         llm_base_settings=llm_base_settings,
         llm_adapter_signature=_adapter_signature(effective),
+        telegram_port=telegram_port,
+        telegram_service=telegram_service,
     )
 
 
