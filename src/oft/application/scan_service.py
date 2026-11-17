@@ -30,6 +30,7 @@ from oft.application.analysis_service import AnalysisService
 from oft.application.freshness import check_live_source
 from oft.application.llm_orchestrator import LLMRuntimeRegistry, provider_configured
 from oft.application.metric_service import MetricInputs, MetricRequest, MetricService
+from oft.application.notifications import delivery_contract, not_configured_delivery
 from oft.application.resampling_service import BarResampleRequest, ResamplingService
 from oft.config import Settings
 from oft.domain.metrics.footprint import (
@@ -943,8 +944,13 @@ def _report_window_policy(report: ReportRecord, snapshot: dict[str, Any]) -> Any
     return None
 
 
-def report_payload(report: ReportRecord) -> dict[str, object]:
-    """Render one stored report for the API and CLI (identical sections)."""
+def report_payload(report: ReportRecord, *, store: StorePort | None = None) -> dict[str, object]:
+    """Render one stored report for the API and CLI (identical sections).
+
+    With a ``store``, ``delivery`` becomes the scan-summary receipt when one was
+    enqueued (a child scan falls back to its batch id); without one it is the
+    exact unconfigured stub, so offline/unit callers keep the legacy shape.
+    """
     snapshot = json.loads(report.snapshot_json)
     llm = _llm_state(report)
     tokens, cost_usd, cost_unpriced = _llm_totals(llm)
@@ -963,17 +969,14 @@ def report_payload(report: ReportRecord) -> dict[str, object]:
         "cost_usd": cost_usd,
         "cost_unpriced": cost_unpriced,
         "window_policy": _report_window_policy(report, snapshot),
-        "delivery": {
-            "configured": False,
-            "reason": "TELEGRAM_NOT_CONFIGURED: Telegram delivery is not configured in this build.",
-        },
+        "delivery": _report_delivery(report, store),
         "metrics_manifest": _public_manifest_entries(json.loads(report.metrics_manifest_json)),
         "snapshot": snapshot,
         "metrics": json.loads(report.metrics_json),
     }
 
 
-def report_summary(report: ReportRecord) -> dict[str, object]:
+def report_summary(report: ReportRecord, *, store: StorePort | None = None) -> dict[str, object]:
     """Compact report row used by ``GET /api/v1/reports`` and the scans payload."""
     llm = _llm_state(report)
     tokens, cost_usd, cost_unpriced = _llm_totals(llm)
@@ -995,7 +998,24 @@ def report_summary(report: ReportRecord) -> dict[str, object]:
             "validation_status": llm.get("validation_status"),
             "opportunity_ids": llm.get("opportunity_ids", []),
         },
+        "delivery": _report_delivery(report, store),
     }
+
+
+def _report_delivery(report: ReportRecord, store: StorePort | None) -> dict[str, Any]:
+    """Resolve the report's scan-summary receipt, falling back to its batch id."""
+    if store is None:
+        return not_configured_delivery()
+    fallback = report.scan_id
+    getter = getattr(store, "get_scan", None)
+    if callable(getter):
+        try:
+            record = getter(report.scan_id)
+        except Exception:  # noqa: BLE001 - a receipt lookup never breaks a report
+            record = None
+        if record is not None and record.batch_id:
+            fallback = record.batch_id
+    return delivery_contract(store, report.scan_id, fallback_scan_id=fallback)
 
 
 __all__ = [

@@ -367,6 +367,38 @@ describe('ScansPage', () => {
     fireEvent.click(screen.getByRole('button', { name: /run scan now/i }))
     await waitFor(() => expect(triggerScanFn).toHaveBeenCalledWith('8h'))
   })
+
+  it('labels queued, sent, and failed Telegram receipts without claiming delivery', async () => {
+    // M-2: a receipt existing is not delivery; only ``state === sent`` is sent.
+    render(
+      <ScansPage
+        fetchScansFn={async () =>
+          listEnvelope([
+            scan({
+              scan_id: 'SCAN-QUEUED',
+              delivery: { configured: true, reason: 'pending', state: 'queued' },
+            }),
+            scan({
+              scan_id: 'SCAN-SENT',
+              delivery: { configured: true, reason: 'ok', state: 'sent' },
+            }),
+            scan({
+              scan_id: 'SCAN-FAILED',
+              delivery: { configured: true, reason: 'failed', state: 'failed' },
+            }),
+          ])
+        }
+        fetchStatusFn={async () => statusEnvelope()}
+      />,
+    )
+
+    const table = await screen.findByRole('table', { name: /Scan history/i })
+    const rows = within(table).getAllByRole('row')
+    expect(within(rows[1]).getByText('queued')).toBeInTheDocument()
+    expect(within(rows[2]).getByText('sent')).toBeInTheDocument()
+    expect(within(rows[3]).getByText('failed')).toBeInTheDocument()
+    expect(within(table).queryByText('delivered')).not.toBeInTheDocument()
+  })
 })
 
 describe('ScanDetailPage', () => {
@@ -449,6 +481,34 @@ describe('ScanDetailPage', () => {
     )
     expect(screen.getByText(/Telegram is not configured/i)).toBeInTheDocument()
     expect(screen.queryByText(/%/)).not.toBeInTheDocument()
+  })
+
+  it('labels the Telegram receipt by state, not by the configured flag', async () => {
+    // M-2: queued/failed receipts must not read as delivered.
+    for (const [state, label] of [
+      ['queued', 'queued'],
+      ['sent', 'sent'],
+      ['failed', 'failed'],
+    ] as const) {
+      const { unmount } = render(
+        <ScanDetailPage
+          scanId={`SCAN-${state}`}
+          fetchScanFn={async () =>
+            detailEnvelope(
+              scan({
+                scan_id: `SCAN-${state}`,
+                symbols: detail.symbols,
+                delivery: { configured: true, reason: state, state },
+              }),
+            )
+          }
+        />,
+      )
+      const telegram = await screen.findByText(/Telegram:/)
+      expect(telegram).toHaveTextContent(`Telegram: ${label}`)
+      expect(screen.queryByText(/delivered/i)).not.toBeInTheDocument()
+      unmount()
+    }
   })
 
   it('stays read-only in compact mode', async () => {

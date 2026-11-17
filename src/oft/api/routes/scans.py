@@ -7,7 +7,6 @@ import json
 import threading
 from contextlib import suppress
 from datetime import timedelta
-from decimal import Decimal, InvalidOperation
 from pathlib import Path
 from typing import Any
 
@@ -20,7 +19,8 @@ from oft.api.envelope import new_request_id, success_envelope
 from oft.api.errors import ApiError
 from oft.api.schemas.report import ScanCreateRequest
 from oft.application.fixture_scan import get_scan, run_fixture_scan
-from oft.application.jobs import JobLedger, ScheduledScanRunner
+from oft.application.jobs import JobLedger, ScheduledScanRunner, notify_scan_completion
+from oft.application.notifications import delivery_contract
 from oft.application.scan_service import (
     TERMINAL_STAGES,
     ScanAlreadyRunning,
@@ -31,6 +31,7 @@ from oft.application.scan_service import (
     public_scan_payload,
     report_summary,
 )
+from oft.application.scan_summary import failure_stage, scan_cost_totals
 from oft.config import Environment
 from oft.domain.time import utc_timestamp
 from oft.ports.store import IdempotencyRecord, ScanRecord, ScanSymbolRecord
@@ -43,18 +44,6 @@ _IDEMPOTENCY_TTL = timedelta(hours=24)
 _IDEMPOTENCY_LEASE = timedelta(seconds=30)
 _SCAN_HEARTBEAT_SECONDS = 10.0
 _IDEMPOTENCY_HEARTBEAT = timedelta(seconds=10)
-_FAILED_STAGE_BY_CODE = {
-    "DATA_UNAVAILABLE": "DATA",
-    "METRICS_INCOMPLETE": "METRICS",
-}
-
-
-def _failure_stage(exc: BaseException, code: str) -> str:
-    """The stage that failed, from the scan service or the error code."""
-    stage = getattr(exc, "failed_stage", None)
-    if stage:
-        return str(stage)
-    return _FAILED_STAGE_BY_CODE.get(code) or "REPORT"
 
 
 def _validated_fixture_path(raw: str, fixtures_dir: Path) -> str:
@@ -178,13 +167,6 @@ def _scan_error_details(exc: ScanError) -> list[dict[str, Any]] | None:
     ]
 
 
-def _delivery() -> dict[str, object]:
-    return {
-        "configured": False,
-        "reason": "TELEGRAM_NOT_CONFIGURED: Telegram delivery is not configured in this build.",
-    }
-
-
 def _report_links(rows: tuple[ScanSymbolRecord, ...]) -> list[dict[str, str]]:
     links: list[dict[str, str]] = []
     for row in rows:
@@ -277,31 +259,6 @@ def _symbol_row(row: ScanSymbolRecord) -> dict[str, object]:
     }
 
 
-def _cost_totals(rows: tuple[ScanSymbolRecord, ...]) -> tuple[Decimal, bool]:
-    """Aggregate child costs; an unparseable amount is surfaced as unpriced.
-
-    A failure row carries no LLM usage, so its default ``cost_unpriced`` must
-    not mark the whole batch unpriced. Only configured-LLM rows participate in
-    the unpriced flag.
-    """
-    cost = Decimal("0")
-    unpriced = False
-    for row in rows:
-        try:
-            cost += Decimal(row.cost_usd)
-        except (InvalidOperation, TypeError, ValueError):
-            unpriced = True
-            logger.warning(
-                "scan_cost_unparseable",
-                symbol=row.symbol,
-                cost_usd=row.cost_usd,
-            )
-            continue
-        if row.llm_status is not None:
-            unpriced = unpriced or row.cost_unpriced
-    return cost, unpriced
-
-
 def _batch_status(rows: tuple[ScanSymbolRecord, ...], *, running: bool) -> str:
     if running and any(row.stage not in TERMINAL_STAGES for row in rows):
         return "RUNNING"
@@ -379,7 +336,7 @@ def _batch_scan_payload(
     degraded = sum(1 for row in rows if row.stage == "DEGRADED")
     failed = sum(1 for row in rows if row.stage == "FAILED")
     tokens = sum(row.llm_tokens for row in rows)
-    cost, unpriced = _cost_totals(rows)
+    cost, unpriced = scan_cost_totals(rows)
     window_starts = [child.window_start for child in children if child.window_start]
     window_ends = [child.window_end for child in children if child.window_end]
     report_ids = [row.report_id for row in rows if row.report_id]
@@ -410,7 +367,7 @@ def _batch_scan_payload(
         "symbols": [_symbol_row(row) for row in rows],
         "report_links": _report_links(rows),
         "report_ids": report_ids,
-        "delivery": _delivery(),
+        "delivery": delivery_contract(container.store, run.run_id),
     }
 
 
@@ -426,7 +383,7 @@ def _scan_detail_payload(container: Any, record: ScanRecord) -> dict[str, object
     cost_unpriced = record.cost_unpriced
     if rows:
         total_tokens = sum(row.llm_tokens for row in rows)
-        cost, cost_unpriced = _cost_totals(rows)
+        cost, cost_unpriced = scan_cost_totals(rows)
         total_cost = format(cost, "f")
         symbols = [_symbol_row(row) for row in rows]
     else:
@@ -473,7 +430,7 @@ def _scan_detail_payload(container: Any, record: ScanRecord) -> dict[str, object
                 if record.report_id
                 else []
             ),
-            "delivery": _delivery(),
+            "delivery": delivery_contract(container.store, record.batch_id or record.scan_id),
         }
     )
     return payload
@@ -592,13 +549,14 @@ def _run_metrics_scan(request: Request, payload: ScanCreateRequest) -> dict[str,
                 finished_at=utc_timestamp(container.clock.now()),
                 error_code=exc.code,
                 error_message=exc.message,
-                failed_stage=_failure_stage(exc, exc.code),
+                failed_stage=failure_stage(exc, exc.code),
                 report_id=None,
                 data_quality=None,
                 cost_usd="0",
                 cost_unpriced=False,
             )
         )
+        notify_scan_completion(container, scan_id)
         raise ApiError(exc.code, exc.message, details=_scan_error_details(exc)) from exc
     except BaseException as exc:
         ledger.finish(
@@ -618,13 +576,14 @@ def _run_metrics_scan(request: Request, payload: ScanCreateRequest) -> dict[str,
                 finished_at=utc_timestamp(container.clock.now()),
                 error_code="SCAN_FAILED",
                 error_message=str(exc),
-                failed_stage=_failure_stage(exc, "SCAN_FAILED"),
+                failed_stage=failure_stage(exc, "SCAN_FAILED"),
                 report_id=None,
                 data_quality=None,
                 cost_usd="0",
                 cost_unpriced=False,
             )
         )
+        notify_scan_completion(container, scan_id)
         raise
     else:
         container.store.upsert_scan_symbol(
@@ -648,6 +607,7 @@ def _run_metrics_scan(request: Request, payload: ScanCreateRequest) -> dict[str,
             )
         )
         ledger.finish(claim.run.run_id, "DONE", owner=claim.run.lease_owner)
+        notify_scan_completion(container, scan_id)
     finally:
         heartbeat_stop.set()
         heartbeat.join(timeout=1)
@@ -656,7 +616,7 @@ def _run_metrics_scan(request: Request, payload: ScanCreateRequest) -> dict[str,
     return success_envelope(
         {
             "scan": public_scan_payload(run.scan),
-            "report": report_summary(run.report),
+            "report": report_summary(run.report, store=container.store),
             "report_id": run.report.report_id,
             "symbols": detail["symbols"],
             "report_links": detail["report_links"],

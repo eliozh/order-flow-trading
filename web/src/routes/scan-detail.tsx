@@ -1,6 +1,12 @@
 import { useEffect, useState } from 'react'
 
-import { fetchScan, type ScanData, type ScanEnvelope, type ScanSymbolRow } from '../api/scans'
+import {
+  fetchScan,
+  telegramDeliveryLabel,
+  type ScanData,
+  type ScanEnvelope,
+  type ScanSymbolRow,
+} from '../api/scans'
 import { DataQualityBadge } from '../components/data-quality'
 import { ProvenanceStamp } from '../components/provenance'
 import { useCompact } from '../hooks/use-compact'
@@ -551,7 +557,7 @@ export function ScanDetailPage({
           <p className="panel-foot">
             Telegram:{' '}
             {scan.delivery?.configured
-              ? 'delivered'
+              ? telegramDeliveryLabel(scan.delivery)
               : (scan.delivery?.reason ?? 'Telegram is not configured in this build.')}
           </p>
           {scan.report_links && scan.report_links.length > 0 && (

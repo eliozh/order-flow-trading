@@ -2,6 +2,7 @@ import { useCallback, useEffect, useRef, useState } from 'react'
 
 import {
   fetchScans,
+  telegramDeliveryLabel,
   triggerScan,
   type ScanData,
   type ScanEnvelope,
@@ -416,7 +417,7 @@ export function ScansPage({
                       )}
                       <td>
                         {scan.delivery?.configured ? (
-                          'delivered'
+                          telegramDeliveryLabel(scan.delivery)
                         ) : (
                           <span className="mono-muted">not configured</span>
                         )}

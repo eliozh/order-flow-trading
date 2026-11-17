@@ -116,7 +116,7 @@ def render_report_query(*, store: StorePort, symbol: str | None, reference_id: s
     try:
         record, ambiguous = _latest_report(store, symbol)
         if record is not None:
-            return messages.render_report(report_payload(record))
+            return messages.render_report(report_payload(record, store=store))
         if ambiguous:
             return messages.REPORT_AMBIGUOUS_TEXT
         if symbol is not None:

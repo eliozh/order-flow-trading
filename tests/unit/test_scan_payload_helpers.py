@@ -6,12 +6,12 @@ from decimal import Decimal
 
 from oft.api.routes.scans import (
     _batch_data_quality,
-    _cost_totals,
     _symbol_row,
     _symbol_stage_flags,
 )
 from oft.api.schemas.report import ScanCreateRequest
 from oft.application.scan_service import report_summary
+from oft.application.scan_summary import scan_cost_totals
 from oft.ports.store import ReportRecord, ScanRecord, ScanSymbolRecord
 
 
@@ -126,14 +126,14 @@ def test_unconfigured_failure_does_not_mark_the_batch_unpriced() -> None:
         ),
     )
 
-    cost, unpriced = _cost_totals(rows)
+    cost, unpriced = scan_cost_totals(rows)
 
     assert cost == Decimal("0.25")
     assert unpriced is False
 
 
 def test_unparseable_cost_is_surfaced_as_unpriced() -> None:
-    cost, unpriced = _cost_totals((_row("BTCUSDT", cost_usd="not-a-number"),))
+    cost, unpriced = scan_cost_totals((_row("BTCUSDT", cost_usd="not-a-number"),))
 
     assert cost == Decimal("0")
     assert unpriced is True

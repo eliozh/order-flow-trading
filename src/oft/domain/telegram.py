@@ -86,6 +86,16 @@ DESKTOP_VIEW_TEXT = "更多内容请在桌面端查看"
 
 TELEGRAM_CHAT_IDS_KEY = "telegram.chat_ids"
 TELEGRAM_ALLOWED_USER_IDS_KEY = "telegram.allowed_user_ids"
+# Read-only push toggles for this slice (the settings screen lands in slice 53).
+# Scan summaries are enabled by default; the zero-report failure alert is an
+# explicit opt-in so a broken scan does not page an operator by default.
+SCAN_REPORT_PUSH_KEY = "telegram.scan_report"
+SCAN_FAILED_ALERT_KEY = "telegram.scan_failed_alert"
+# A scan summary lists at most this many report ids so the message stays short.
+MAX_SCAN_REPORT_IDS = 10
+# A corrupt/legacy decimal (for example ``1e100000000``) would expand to an
+# unbounded string; values with a larger adjusted exponent render as ``N/A``.
+MAX_DECIMAL_ADJUSTED_EXPONENT = 30
 POLL_OFFSET_KEY = "telegram.poll_offset"
 POLLER_HEARTBEAT_KEY = "telegram.poller_heartbeat"
 DISPATCHER_HEARTBEAT_KEY = "telegram.dispatcher_heartbeat"
@@ -368,10 +378,12 @@ __all__ = [
     "DISPATCHER_HEARTBEAT_KEY",
     "HELP_COMMAND",
     "MAX_ARGUMENT_CHARS",
+    "MAX_DECIMAL_ADJUSTED_EXPONENT",
     "MAX_GLOBAL_REFUSALS_PER_WINDOW",
     "MAX_INBOUND_TEXT",
     "MAX_OUTBOUND_CHARS",
     "MAX_REFUSALS_PER_WINDOW",
+    "MAX_SCAN_REPORT_IDS",
     "MAX_TELEGRAM_ALLOWED_USER_IDS",
     "MAX_TELEGRAM_CHAT_IDS",
     "MAX_TELEGRAM_OUTBOX_ATTEMPTS",
@@ -383,6 +395,8 @@ __all__ = [
     "REFUSAL_TEXT",
     "REFUSAL_WINDOW_SECONDS",
     "REPORT_COMMAND",
+    "SCAN_FAILED_ALERT_KEY",
+    "SCAN_REPORT_PUSH_KEY",
     "STATUS_COMMAND",
     "SYMBOL_ARGUMENT_PATTERN",
     "TELEGRAM_ALLOWED_USER_IDS_KEY",
