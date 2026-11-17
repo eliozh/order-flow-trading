@@ -17,8 +17,15 @@ from oft.application.paper_account import PaperAccountService
 from oft.bootstrap import build_container
 from oft.clock import FixedClock
 from oft.config import Settings
+from oft.domain.budget_periods import period_parts
 from oft.domain.symbols import SymbolContract
-from oft.ports.store import ReportRecord, ScanRecord
+from oft.ports.store import (
+    BudgetRecord,
+    LLMCallRecord,
+    ReportRecord,
+    ScanRecord,
+    StorePort,
+)
 
 NOW = datetime(2026, 11, 17, 9, 30, tzinfo=UTC)
 NOW_TEXT = "2026-11-17T09:30:00.000Z"
@@ -238,9 +245,74 @@ def _seed(settings: Settings) -> None:
         store.set_starred(symbol, True, starred_at=NOW_TEXT)
 
 
+def _llm_call(call_id: str, created_at: str) -> LLMCallRecord:
+    return LLMCallRecord(
+        call_id=call_id,
+        role="ANALYSIS",
+        provider="openai",
+        model="m",
+        prompt_id="analysis",
+        prompt_version=1,
+        prompt_hash="ph",
+        input_hash="ih",
+        attempt=1,
+        request_id="req",
+        status="OK",
+        raw_output_hash="rh",
+        usage_json="{}",
+        latency_ms=1,
+        created_at=created_at,
+    )
+
+
+def _seed_budget_ledger(store: StorePort, at: str) -> None:
+    """Seed one distinct, nonzero row that counts in exactly one window.
+
+    Each row's foreign key is inserted first, and its other two period keys
+    point at a disjoint 1999 bucket so a wrong or missing period mapping in
+    either renderer cannot still compare equal.
+    """
+    day, week, month = period_parts(at)
+    rows = (
+        ("CALL-DAY", "1.10", day, "1999-W01", "1999-01"),
+        ("CALL-WEEK", "2.20", "1999-01-01", week, "1999-01"),
+        ("CALL-MONTH", "3.30", "1999-01-01", "1999-W01", month),
+    )
+    for call_id, cost, period_day, period_week, period_month in rows:
+        store.save_llm_call(_llm_call(call_id, at))
+        assert store.save_budget_record(
+            BudgetRecord(
+                record_id=f"BUD-{call_id}",
+                call_id=call_id,
+                decision_id=None,
+                occurred_at=at,
+                provider="openai",
+                model="m",
+                cost_usd=cost,
+                price_version="v",
+                unpriced=False,
+                budget_state="OK",
+                period_day=period_day,
+                payload_json="{}",
+                period_week=period_week,
+                period_month=period_month,
+                role="ANALYSIS",
+            )
+        )
+
+
 def _rendered_value(text: str, key: str) -> str:
     prefix = f"{key}: "
     line = next(line for line in text.splitlines() if line.startswith(prefix))
+    return line.removeprefix(prefix).removesuffix(" USDT")
+
+
+def _period_spend(text: str, label: str) -> str:
+    """The first ``spend_usd`` line after the ``DAY``/``WEEK``/``MONTH`` label."""
+    lines = text.splitlines()
+    prefix = "spend_usd: "
+    start = lines.index(label)
+    line = next(line for line in lines[start + 1 :] if line.startswith(prefix))
     return line.removeprefix(prefix).removesuffix(" USDT")
 
 
@@ -328,6 +400,7 @@ def test_budget_render_parity_with_the_api(tmp_path: Path) -> None:
     settings = _settings(tmp_path)
     _seed(settings)
     container = build_container(settings, clock=FixedClock(NOW))
+    _seed_budget_ledger(container.store, NOW_TEXT)
     text = telegram_queries.render_budget_query(
         store=container.store,
         clock=container.clock,
@@ -347,10 +420,13 @@ def test_budget_render_parity_with_the_api(tmp_path: Path) -> None:
     assert _rendered_value(text, "daily_usd") == _num(thresholds["daily_usd"])
     assert _rendered_value(text, "weekly_usd") == _num(thresholds["weekly_usd"])
     assert _rendered_value(text, "monthly_usd") == _num(thresholds["monthly_usd"])
-    for period in ("day", "week", "month"):
-        assert Decimal(_rendered_value(text, "spend_usd")) == Decimal(
-            data["periods"][period]["spend_usd"]
-        )
+    # Each period block is parsed individually; three rows, three distinct spends.
+    assert text.count("spend_usd: ") == 3
+    for label, period in (("DAY", "day"), ("WEEK", "week"), ("MONTH", "month")):
+        rendered = Decimal(_period_spend(text, label))
+        expected = Decimal(data["periods"][period]["spend_usd"])
+        assert rendered == expected, (label, rendered, expected)
+        assert rendered > 0
 
 
 def test_watchlist_render_parity_with_the_api(tmp_path: Path) -> None:

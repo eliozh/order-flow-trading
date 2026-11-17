@@ -104,17 +104,24 @@ def render_opportunities_query(*, store: StorePort, clock: ClockPort, reference_
 def render_report_query(*, store: StorePort, symbol: str | None, reference_id: str) -> str:
     """Render the latest stored report for ``symbol`` (or the only symbol).
 
-    With no symbol, the latest overall report is used only when every stored
-    report belongs to one symbol (``count_reports == count_reports_for_symbol``);
-    otherwise a mixed report history has no unambiguous "latest," so the exact
-    empty copy is returned. The stored narrative is rendered as untrusted text;
-    no provider is resolved and no analysis is re-run.
+    Three empty states are distinguished from store reads only. With no
+    symbol, the latest overall report is used only when every stored report
+    belongs to one symbol (``count_reports == count_reports_for_symbol``); a
+    mixed history has no unambiguous "latest," so the ambiguous copy tells the
+    operator to name a symbol, and a genuinely empty table keeps the exact
+    empty copy. An explicit symbol with no stored report gets the symbol-scoped
+    empty copy. The stored narrative is rendered as untrusted text; no provider
+    is resolved and no analysis is re-run.
     """
     try:
-        record = _latest_report(store, symbol)
-        if record is None:
-            return messages.REPORT_EMPTY_TEXT
-        return messages.render_report(report_payload(record))
+        record, ambiguous = _latest_report(store, symbol)
+        if record is not None:
+            return messages.render_report(report_payload(record))
+        if ambiguous:
+            return messages.REPORT_AMBIGUOUS_TEXT
+        if symbol is not None:
+            return messages.REPORT_SYMBOL_EMPTY_TEXT
+        return messages.REPORT_EMPTY_TEXT
     except QUERY_READ_ERRORS as exc:
         return _unavailable(exc, reference_id)
     except Exception as exc:  # noqa: BLE001 - poison-message liveness guard
@@ -169,18 +176,24 @@ def render_invalid_argument_error(reference_id: str) -> str:
     return messages.render_query_error(messages.QUERY_ERROR_INVALID_ARGUMENT, reference_id)
 
 
-def _latest_report(store: StorePort, symbol: str | None) -> ReportRecord | None:
+def _latest_report(store: StorePort, symbol: str | None) -> tuple[ReportRecord | None, bool]:
+    """Return the report to render plus whether a no-symbol read was ambiguous.
+
+    The ambiguity flag is set only when the latest overall report exists but
+    its symbol does not cover the whole stored history, so the caller can
+    choose a distinct copy instead of claiming "no report".
+    """
     if symbol is not None:
         page = store.list_reports_for_symbol_page(symbol, limit=1)
-        return page[0] if page else None
+        return (page[0] if page else None), False
     latest = store.list_reports(limit=1)
     if not latest:
-        return None
+        return None, False
     candidate = latest[0]
     total = store.count_reports()
     if total > 0 and total == store.count_reports_for_symbol(candidate.symbol):
-        return candidate
-    return None
+        return candidate, False
+    return None, True
 
 
 def _degraded_budget(thresholds: BudgetThresholds) -> dict[str, Any]:

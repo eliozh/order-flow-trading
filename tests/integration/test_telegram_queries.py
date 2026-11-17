@@ -24,7 +24,9 @@ from oft.application.telegram_dispatch import OutboxDispatcher
 from oft.application.telegram_messages import (
     OPPORTUNITIES_EMPTY_TEXT,
     POSITIONS_EMPTY_TEXT,
+    REPORT_AMBIGUOUS_TEXT,
     REPORT_EMPTY_TEXT,
+    REPORT_SYMBOL_EMPTY_TEXT,
     WATCHLIST_EMPTY_TEXT,
 )
 from oft.application.telegram_poller import TelegramPoller
@@ -33,7 +35,7 @@ from oft.clock import FixedClock
 from oft.config import Settings
 from oft.domain.symbols import SymbolContract
 from oft.domain.telegram import COMMANDS, TelegramUpdate
-from oft.ports.store import ReportRecord, ScanRecord
+from oft.ports.store import ReportRecord, ScanRecord, StoreUnavailableError
 
 NOW = datetime(2026, 11, 17, 9, 30, tzinfo=UTC)
 NOW_TEXT = "2026-11-17T09:30:00.000Z"
@@ -430,6 +432,8 @@ class _ReadSpyStore:
             "list_budget_records_for_period",
             "list_symbols",
             "list_starred",
+            "latest_scan",
+            "get_config",
         }
     )
 
@@ -585,21 +589,31 @@ def test_report_with_no_symbol_resolves_when_only_one_symbol_has_reports(
     assert "report_id: RPT-1" in text
 
 
-def test_report_with_no_symbol_is_empty_when_several_symbols_have_reports(
+def test_report_with_no_symbol_is_ambiguous_when_several_symbols_have_reports(
     tmp_path: Path,
 ) -> None:
     service, store, _settings, _port = _service(tmp_path)
     _seed_report(store, report_id="RPT-BTC", symbol="BTCUSDT")
     _seed_report(store, report_id="RPT-ETH", symbol="ETHUSDT")
 
+    assert _ask(service, "/report") == REPORT_AMBIGUOUS_TEXT
+
+
+def test_report_with_no_symbol_and_no_reports_uses_the_exact_empty_copy(
+    tmp_path: Path,
+) -> None:
+    service, _store, _settings, _port = _service(tmp_path)
+
     assert _ask(service, "/report") == REPORT_EMPTY_TEXT
 
 
-def test_report_for_an_unknown_symbol_uses_the_exact_empty_copy(tmp_path: Path) -> None:
+def test_report_for_an_unknown_symbol_uses_the_symbol_scoped_empty_copy(
+    tmp_path: Path,
+) -> None:
     service, store, _settings, _port = _service(tmp_path)
     _seed_report(store)
 
-    assert _ask(service, "/report DOGEUSDT") == REPORT_EMPTY_TEXT
+    assert _ask(service, "/report DOGEUSDT") == REPORT_SYMBOL_EMPTY_TEXT
 
 
 def test_report_with_an_invalid_argument_returns_an_error_and_reference(
@@ -764,6 +778,61 @@ def test_an_authorized_query_does_read_the_model(tmp_path: Path) -> None:
 
     assert _ask(service, "/positions") == POSITIONS_EMPTY_TEXT
     assert "list_positions" in spy.read_calls
+
+
+class _FailingReadStore:
+    """Forward every store call but fail one read model with a typed error."""
+
+    def __init__(self, inner: SqliteStore, method: str) -> None:
+        self._inner = inner
+        self._method = method
+
+    def __getattr__(self, name: str) -> Any:
+        if name == self._method:
+
+            def _fail(*_args: Any, **_kwargs: Any) -> Any:
+                raise StoreUnavailableError("store unavailable")
+
+            return _fail
+        return getattr(self._inner, name)
+
+
+@pytest.mark.parametrize(
+    ("command", "failing_method"),
+    [
+        ("/positions", "list_positions"),
+        ("/opportunities", "list_opportunities"),
+        ("/watchlist", "list_symbols"),
+        ("/budget", "get_budget_settings"),
+    ],
+)
+def test_a_typed_read_failure_returns_the_error_copy_and_advances_the_offset(
+    tmp_path: Path, command: str, failing_method: str
+) -> None:
+    service, store, _settings, port = _service(tmp_path)
+    service._store = _FailingReadStore(store, failing_method)  # noqa: SLF001
+    port.script_updates([make_update(1, chat_id=1001, user_id=2002, text=command)])
+    poller = TelegramPoller(
+        service=service,
+        store=store,
+        clock=FixedClock(NOW),
+        port_resolver=lambda: port,
+        long_poll_timeout=0,
+        poll_interval_seconds=0.01,
+    )
+
+    assert poller.poll_once() == 1
+
+    receipt = store.list_telegram_receipts()[0]
+    text = json.loads(receipt.payload_json)["text"]
+    assert text.splitlines()[0] == "查询失败：数据不可用。请重试或查看桌面端。"
+    assert text.splitlines()[1].startswith("reference_id: TG-")
+    assert "store unavailable" not in text
+    assert "StoreUnavailableError" not in text
+    assert "Traceback" not in text
+    # The poison update was acknowledged, so the next poll does not replay it.
+    assert store.get_system_state("telegram.poll_offset") == "2"
+    assert poller.poll_once() == 0
 
 
 class _LongRender:

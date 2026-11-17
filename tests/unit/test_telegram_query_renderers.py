@@ -325,6 +325,18 @@ class TestPositionRender:
         )
         assert "mark_state: STALE" in text
 
+    def test_an_absurd_stored_mark_is_missing_not_fresh(self) -> None:
+        text = messages.render_positions(
+            (_position(mark="1e100000000"),), now=NOW_TEXT, stale_seconds=60
+        )
+
+        assert "mark: N/A" in text
+        assert "mark_state: MISSING" in text
+        assert "mark_reason: 无记录的标记价格" in text
+        assert "upnl: N/A" in text
+        assert "FRESH" not in text
+        assert "100000000" not in text
+
 
 class TestOpportunityRender:
     def _row(self, opportunity_id: str, state: str, created_at: str) -> dict[str, Any]:

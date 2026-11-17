@@ -32,6 +32,8 @@ from oft.domain.time import utc_timestamp
 POSITIONS_EMPTY_TEXT = "没有未平仓持仓。"
 OPPORTUNITIES_EMPTY_TEXT = "当前没有开放或触发的机会。"
 REPORT_EMPTY_TEXT = "还没有报告，先运行一次扫描。"
+REPORT_AMBIGUOUS_TEXT = "存在多个品种的报告，请使用 /report SYMBOL。"
+REPORT_SYMBOL_EMPTY_TEXT = "该品种没有报告。"
 WATCHLIST_EMPTY_TEXT = "还没有星标品种。"
 QUERY_ERROR_INVALID_ARGUMENT = "参数无效"
 QUERY_ERROR_UNAVAILABLE = "数据不可用"
@@ -157,6 +159,10 @@ def _position_block(
     stale_seconds: int,
 ) -> list[str]:
     mark = _decimal_or_none(_resolved_mark(payload))
+    if mark is not None and _plain_decimal(mark) is None:
+        # A corrupt/absurd stored decimal cannot be rendered, so it is a
+        # missing observation rather than a FRESH mark with ``N/A``.
+        mark = None
     as_of = _resolved_mark_as_of(payload)
     state = _mark_state(mark, as_of, now_dt=now_dt, stale_seconds=stale_seconds)
     entry = _decimal_or_none(payload.get("avg_entry_price") or payload.get("entry_price"))
@@ -577,7 +583,9 @@ __all__ = [
     "QUERY_ERROR_INVALID_ARGUMENT",
     "QUERY_ERROR_UNAVAILABLE",
     "READ_ONLY_NOTICE",
+    "REPORT_AMBIGUOUS_TEXT",
     "REPORT_EMPTY_TEXT",
+    "REPORT_SYMBOL_EMPTY_TEXT",
     "STATUS_HELP_FIELDS",
     "WATCHLIST_EMPTY_TEXT",
     "render_budget",
