@@ -153,12 +153,26 @@ def test_an_identical_replay_is_reported_and_writes_nothing(
 
 
 def test_there_is_no_token_reveal_endpoint(tmp_path: Path, backend: MemorySecretBackend) -> None:
+    token_path = "/api/v1/settings/telegram/token"
     app = _app(tmp_path)
-    with TestClient(app) as client:
-        response = client.get("/api/v1/settings/telegram/token", headers=_auth(app))
+    auth = _auth(app)
 
-    assert response.status_code == 404
-    assert response.json()["error"]["code"] == "NOT_FOUND"
+    # No documented operation on the token path may answer GET. The optional SPA
+    # catch-all is a GET on "/{full_path:path}", not on the token path itself.
+    operations = set(app.openapi()["paths"].get(token_path, {}))
+    assert {"put", "delete"} <= operations, operations
+    assert "get" not in operations
+
+    with TestClient(app) as client:
+        assert _put_token(client, auth, SENTINEL, "token-1").status_code == 200
+        response = client.get(token_path, headers=auth)
+
+    # 404 (SPA catch-all or route miss) and 405 (method mismatch, no built SPA)
+    # both prove the read route is absent; the test must not depend on web/dist.
+    assert response.status_code in {404, 405}, response.text
+    assert SENTINEL not in response.text
+    expected_code = {404: "NOT_FOUND", 405: "METHOD_NOT_ALLOWED"}[response.status_code]
+    assert response.json()["error"]["code"] == expected_code
 
 
 def test_the_status_transitions_are_deterministic(
