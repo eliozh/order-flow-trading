@@ -18,6 +18,8 @@ from dataclasses import dataclass, replace
 from decimal import Decimal
 from typing import Any
 
+import structlog
+
 from oft.application.budget_ledger import BudgetEntry, BudgetLedger
 from oft.application.execution_gateway import AuthContext, ExecutionGateway, GatewayError
 from oft.application.kill_switch import KillSwitch, KillSwitchActive, record_audit
@@ -42,6 +44,11 @@ from oft.application.prompt_service import (
     PromptService,
     RenderedPrompt,
     secret_values_from_settings,
+)
+from oft.application.telegram_events import (
+    NotificationSink,
+    build_entry_recheck_event,
+    entry_alert_decision,
 )
 from oft.application.trigger_service import TriggerNotFound
 from oft.config import Settings
@@ -80,6 +87,8 @@ from oft.ports.store import (
 
 ENTRY_PROMPT_ID = "entry_recheck"
 ENTRY_PROMPT_VERSION = 1
+
+_LOGGER = structlog.get_logger(__name__)
 
 # The only states in which a human may still act on the trigger. Everything
 # else (ACCEPTED/REJECTED/BLOCKED/EXPIRED) is terminal for this slice. The
@@ -219,12 +228,14 @@ class EntryService:
         settings: Any,
         kill_switch: KillSwitch,
         runtime: LLMRuntimeRegistry | None = None,
+        notifications: NotificationSink | None = None,
     ) -> None:
         self._store = store
         self._clock = clock
         self._provider = provider
         self._settings = settings
         self._kill_switch = kill_switch
+        self._notifications = notifications
         self._budget = BudgetLedger(store=store, settings=settings)
         self._orchestrator = (
             LLMOrchestrator(
@@ -504,6 +515,9 @@ class EntryService:
             payload=audit_payload,
             at=now,
         )
+        # Strictly after the trigger commit: the alert mirrors a durable row and
+        # an enqueue failure can never roll the re-check back.
+        self._notify_entry_recheck(card, generated_at=now)
         return card
 
     def get_persisted_entry_decision(self, trigger_id: str) -> dict[str, Any]:
@@ -642,7 +656,53 @@ class EntryService:
         card["reasons"] = persisted_reasons
         card["human_action"] = trigger_payload.get("human_action")
         card["persisted"] = True
+        # A reused decision is the same logical event: the (trigger, decision)
+        # dedupe key makes this a no-op once the first alert was enqueued.
+        self._notify_entry_recheck(card, generated_at=utc_timestamp(self._clock.now()))
         return card
+
+    def _notify_entry_recheck(self, card: dict[str, Any], *, generated_at: str) -> None:
+        """Enqueue the one "awaiting human action" push for an ENTER decision.
+
+        Only a RECHECKED card whose decision is directional (ENTER_LONG/SHORT,
+        normalized to ENTER) notifies. NO_ENTRY and rejected re-checks are
+        covered by the opportunity INVALIDATED push, not by an entry alert.
+        """
+        if self._notifications is None:
+            return
+        if card.get("status") != "RECHECKED":
+            return
+        llm = card.get("llm")
+        if not isinstance(llm, Mapping):
+            return
+        if entry_alert_decision(llm.get("decision")) != "ENTER":
+            return
+        trigger = card.get("trigger")
+        trigger_payload = trigger if isinstance(trigger, Mapping) else {}
+        confidence = llm.get("confidence")
+        try:
+            self._notifications.enqueue_event(
+                build_entry_recheck_event(
+                    trigger_id=str(card.get("trigger_id") or ""),
+                    opportunity_id=str(trigger_payload.get("opportunity_id") or ""),
+                    symbol=str(trigger_payload.get("symbol") or ""),
+                    side=str(trigger_payload.get("side") or ""),
+                    decision_id=str(card.get("decision_id") or ""),
+                    decision=str(llm.get("decision") or ""),
+                    confidence=(
+                        float(confidence)
+                        if isinstance(confidence, (int, float)) and not isinstance(confidence, bool)
+                        else None
+                    ),
+                    generated_at=generated_at,
+                )
+            )
+        except Exception as exc:  # noqa: BLE001 - a push never breaks the re-check
+            _LOGGER.warning(
+                "entry_recheck_alert_enqueue_failed",
+                trigger_id=card.get("trigger_id"),
+                error_type=type(exc).__name__,
+            )
 
     def _decision_provenance(self, decision_id: str | None) -> dict[str, Any] | None:
         """The structured provenance of a persisted decision row, or ``None``."""
@@ -1397,7 +1457,9 @@ class EntryService:
         from oft.application.opportunity_service import OpportunityService
         from oft.domain.opportunities import OpportunityTransitionError
 
-        service = OpportunityService(store=self._store, clock=self._clock)
+        service = OpportunityService(
+            store=self._store, clock=self._clock, notifications=self._notifications
+        )
         try:
             service.invalidate(opportunity_id, reason=reason)
         except OpportunityTransitionError:

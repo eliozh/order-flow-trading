@@ -5,6 +5,16 @@ emoji. The first line states the event; timestamps are ISO-8601 UTC and every
 number carries a unit. Values come from the same read models the Web and CLI
 render, so a Telegram reply cannot drift from them. No renderer performs I/O or
 calls a model; callers pass already-read payloads.
+
+Documented maintainability exception: this module is 888 lines, just over the
+800-line soft ceiling, because the slice-50 alert renderers (triggered,
+invalidated, entry re-check, and coalesced bursts) share the sanitizer,
+decimal/unit formatting, and outbound truncation primitives defined here. Extracting them
+would either import those private helpers across modules or duplicate the
+sanitization boundary security depends on, so the renderers stay next to the
+primitives they must use. Revisit if the alert surface grows further: extract a
+``telegram_alert_messages.py`` that imports the shared primitives without
+copying them.
 """
 
 from __future__ import annotations
@@ -13,14 +23,14 @@ import unicodedata
 from collections.abc import Mapping, Sequence
 from datetime import UTC, datetime
 from decimal import Decimal, InvalidOperation
-from typing import Any
+from typing import Any, Protocol
 
-from oft.application.status import StatusReport
 from oft.domain.symbols import SymbolContract
 from oft.domain.telegram import (
     BUDGET_COMMAND,
     HELP_COMMAND,
     MAX_DECIMAL_ADJUSTED_EXPONENT,
+    MAX_OPPORTUNITY_ALERT_ITEMS,
     MAX_SCAN_REPORT_IDS,
     OPPORTUNITIES_COMMAND,
     POSITIONS_COMMAND,
@@ -41,6 +51,9 @@ WATCHLIST_EMPTY_TEXT = "还没有星标品种。"
 QUERY_ERROR_INVALID_ARGUMENT = "参数无效"
 QUERY_ERROR_UNAVAILABLE = "数据不可用"
 READ_ONLY_NOTICE = "MVP 只读：不支持任何写入或审批操作。"
+# The one instruction an entry re-check alert may carry: the human acts on the
+# desktop or CLI. The push itself never renders an approval shortcut.
+ENTRY_RECHECK_INSTRUCTION = "请在桌面端或 CLI 处理。"
 NARRATIVE_EXCERPT_CHARS = 600
 NO_MARK_REASON = "无记录的标记价格"
 UNMEASURED_PNL_REASON = "标记或入场价格不可用"
@@ -90,8 +103,84 @@ def render_help() -> str:
     )
 
 
-def render_status(report: StatusReport) -> str:
-    """Render the shared status report as deterministic ``key: value`` lines."""
+class _StatusLastScanLike(Protocol):
+    """The last-scan fields :func:`render_status` reads."""
+
+    @property
+    def scan_id(self) -> str: ...
+    @property
+    def symbol(self) -> str: ...
+    @property
+    def status(self) -> str: ...
+    @property
+    def delta(self) -> str: ...
+    @property
+    def cvd(self) -> str: ...
+    @property
+    def finished_at(self) -> str: ...
+
+
+class _StatusScheduleLike(Protocol):
+    """The schedule fields :func:`render_status` reads."""
+
+    @property
+    def period(self) -> str: ...
+    @property
+    def next_run_at(self) -> str: ...
+
+
+class _StatusUniverseLike(Protocol):
+    """The universe summary fields :func:`render_status` reads."""
+
+    @property
+    def count(self) -> int: ...
+    @property
+    def tradifi_count(self) -> int: ...
+
+
+class _StatusDaemonLike(Protocol):
+    """The daemon probe field :func:`render_status` reads."""
+
+    @property
+    def state(self) -> str: ...
+
+
+class StatusReportLike(Protocol):
+    """The status report surface :func:`render_status` dereferences.
+
+    Typed structurally here instead of importing ``oft.application.status``:
+    that module reaches the ingestion supervisor and an adapter, and the
+    import-linter "Execution path never imports adapters" contract must hold.
+    A local protocol keeps attribute-level mypy checking without the edge.
+    """
+
+    @property
+    def env(self) -> str: ...
+    @property
+    def version(self) -> str: ...
+    @property
+    def host(self) -> str: ...
+    @property
+    def port(self) -> int: ...
+    @property
+    def generated_at(self) -> str: ...
+    @property
+    def daemon(self) -> _StatusDaemonLike: ...
+    @property
+    def universe(self) -> _StatusUniverseLike: ...
+    @property
+    def schedule(self) -> _StatusScheduleLike | None: ...
+    @property
+    def last_scan(self) -> _StatusLastScanLike | None: ...
+
+
+def render_status(report: StatusReportLike) -> str:
+    """Render the shared status report as deterministic ``key: value`` lines.
+
+    The report is typed by the local :class:`StatusReportLike` protocol so this
+    pure renderer does not import the status service: that edge would pull the
+    ingestion supervisor and an adapter into the execution path's import graph.
+    """
     lines = [
         "STATUS",
         f"env: {report.env}",
@@ -467,6 +556,141 @@ def _scan_cost(value: object, unpriced: object) -> str:
     return f"{cleaned} USDT{suffix}"
 
 
+def render_trigger_alert(payload: Mapping[str, Any]) -> str:
+    """Render one TRIGGERED opportunity push: plain text, bounded, no narrative.
+
+    The payload is already an allowlist built by the event builder; here every
+    dynamic value is still sanitized to a single line so stored/hostile text
+    cannot inject a structured field. Signal-bearing numbers carry a unit.
+    """
+    lines = [
+        f"机会触发 · {_symbol_text(payload.get('symbol'))} · "
+        f"{_text(payload.get('side'))} · 置信度 {_decimal_text(payload.get('confidence'))}",
+        f"opportunity: {_text(payload.get('opportunity_id'))}",
+        "state: TRIGGERED",
+        f"zone: {_decimal_text(payload.get('zone_low'))} - "
+        f"{_decimal_text(payload.get('zone_high'))} USDT",
+    ]
+    for raw in _sequence(payload.get("trigger_levels")):
+        level = _mapping(raw)
+        unit = _condition_unit(level.get("type"))
+        lines.append(
+            f"trigger: {_text(level.get('condition_id'))} {_text(level.get('type'))} "
+            f"observed {_level_text(level.get('observed_value'), unit)} "
+            f"threshold {_level_text(level.get('threshold'), unit)}"
+        )
+    for raw in _sequence(payload.get("invalidation_levels")):
+        level = _mapping(raw)
+        unit = _condition_unit(level.get("type"))
+        lines.append(
+            f"invalidation: {_text(level.get('condition_id'))} "
+            f"{_text(level.get('type'))} {_level_text(level.get('level'), unit)}"
+        )
+    lines.extend(
+        [
+            f"trigger_id: {_text(payload.get('trigger_id'))}",
+            f"triggered_at: {_timestamp(payload.get('triggered_at'))}",
+            f"state_version: {_count_text(payload.get('state_version'))}",
+            OPPORTUNITIES_COMMAND,
+        ]
+    )
+    return truncate_outbound("\n".join(lines))
+
+
+def render_invalidation_alert(payload: Mapping[str, Any]) -> str:
+    """Render one INVALIDATED opportunity push with its stable reason code.
+
+    The free-text note is deliberately absent; a reader gets the machine reason
+    code and the ledger pointer, never operator prose or a path.
+    """
+    lines = [
+        f"机会失效 · {_symbol_text(payload.get('symbol'))} · {_text(payload.get('side'))}",
+        f"reason_code: {_text(payload.get('reason_code'))}",
+        "state: INVALIDATED",
+        f"opportunity: {_text(payload.get('opportunity_id'))}",
+        f"invalidated_at: {_timestamp(payload.get('invalidated_at'))}",
+        f"state_version: {_count_text(payload.get('state_version'))}",
+        OPPORTUNITIES_COMMAND,
+    ]
+    return truncate_outbound("\n".join(lines))
+
+
+def render_entry_recheck_alert(payload: Mapping[str, Any]) -> str:
+    """Render one entry re-check awaiting a human, read-only by construction.
+
+    Only the decision identity, confidence, and the desktop/CLI instruction are
+    rendered. No rationale, provider text, approval URL, or command token can
+    appear: none is in the payload, and the instruction is this module's
+    constant — a payload-supplied ``instruction`` is deliberately ignored so a
+    future caller cannot turn the alert into an approval surface.
+    """
+    lines = [
+        f"入场复核 · {_symbol_text(payload.get('symbol'))} · "
+        f"{_text(payload.get('side'))} · 置信度 {_decimal_text(payload.get('confidence'))}",
+        f"decision: {_text(payload.get('decision'))}",
+        f"decision_id: {_text(payload.get('decision_id'))}",
+        f"trigger_id: {_text(payload.get('trigger_id'))}",
+        f"opportunity: {_text(payload.get('opportunity_id'))}",
+        ENTRY_RECHECK_INSTRUCTION,
+        OPPORTUNITIES_COMMAND,
+    ]
+    return truncate_outbound("\n".join(lines))
+
+
+def render_opportunity_burst(payload: Mapping[str, Any]) -> str:
+    """Render a coalesced multi-trigger push with a bounded item list.
+
+    At most ``MAX_OPPORTUNITY_ALERT_ITEMS`` items are shown; the rest become an
+    explicit count plus the ``/opportunities`` pointer so the reader can see the
+    true scale without an unbounded message.
+    """
+    count = payload.get("count")
+    total = count if isinstance(count, int) and not isinstance(count, bool) and count >= 0 else 0
+    items = _sequence(payload.get("items"))[:MAX_OPPORTUNITY_ALERT_ITEMS]
+    lines = [f"机会触发 {_count_text(count)} 个"]
+    for raw in items:
+        item = _mapping(raw)
+        lines.append(
+            f"- {_symbol_text(item.get('symbol'))} {_text(item.get('side'))} "
+            f"confidence {_decimal_text(item.get('confidence'))} "
+            f"opportunity_id {_text(item.get('opportunity_id'))}"
+        )
+    remaining = payload.get("remaining")
+    if isinstance(remaining, bool) or not isinstance(remaining, int):
+        remaining = max(0, total - len(items))
+    if remaining > 0:
+        lines.append(f"另有 {remaining} 个")
+    lines.append("请使用 /opportunities 查看")
+    return truncate_outbound("\n".join(lines))
+
+
+def _condition_unit(value: object) -> str:
+    """The display unit for one condition type (empty when it has none).
+
+    Price/delta/CVD/OI/liquidation/volume conditions are quoted in USDT;
+    funding and footprint imbalance are ratios; session/time conditions carry a
+    categorical value and therefore no unit.
+    """
+    condition_type = value.upper() if isinstance(value, str) else ""
+    if condition_type.startswith(("PRICE_", "DELTA_", "CVD_", "OI_", "LIQUIDATION_", "VOLUME_")):
+        return "USDT"
+    if condition_type.startswith(("FUNDING_", "FOOTPRINT_")):
+        return "ratio"
+    return ""
+
+
+def _level_text(value: object, unit: str) -> str:
+    if not unit:
+        return _text(value)
+    rendered = _decimal_text(value)
+    if rendered != "N/A":
+        return f"{rendered} {unit}"
+    # A zone threshold is recorded as a range (for example
+    # ``69900.00-70100.00``): keep the recorded plain text rather than a bare
+    # ``N/A`` that would hide the level the reader is deciding on.
+    return _text(value)
+
+
 # -- shared formatting ---------------------------------------------------
 
 
@@ -635,6 +859,7 @@ def _unrealized_pnl(
 
 
 __all__ = [
+    "ENTRY_RECHECK_INSTRUCTION",
     "NARRATIVE_EXCERPT_CHARS",
     "OPPORTUNITIES_EMPTY_TEXT",
     "POSITIONS_EMPTY_TEXT",
@@ -647,13 +872,17 @@ __all__ = [
     "STATUS_HELP_FIELDS",
     "WATCHLIST_EMPTY_TEXT",
     "render_budget",
+    "render_entry_recheck_alert",
     "render_help",
+    "render_invalidation_alert",
     "render_opportunities",
+    "render_opportunity_burst",
     "render_positions",
     "render_query_error",
     "render_report",
     "render_scan_summary",
     "render_status",
     "render_test_message",
+    "render_trigger_alert",
     "render_watchlist",
 ]

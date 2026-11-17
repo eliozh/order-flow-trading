@@ -585,6 +585,7 @@ def _start_trigger_scheduler(
         store=container.store,
         clock=container.clock,
         stale_after_seconds=settings.trigger_stale_after_seconds,
+        notifications=container.notifications,
     )
     runner = TriggerJobRunner(
         service=service,

@@ -53,6 +53,7 @@ def _trigger_service(request: Request) -> TriggerService:
         store=container.store,
         clock=container.clock,
         stale_after_seconds=container.settings.trigger_stale_after_seconds,
+        notifications=container.notifications,
     )
 
 
@@ -86,6 +87,7 @@ def _entry_service(request: Request, trigger_id: str) -> EntryService:
         settings=container.settings,
         kill_switch=kill_switch,
         runtime=container.llm_runtime,
+        notifications=container.notifications,
     )
 
 

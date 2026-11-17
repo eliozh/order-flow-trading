@@ -12,6 +12,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+from collections.abc import Sequence
 from dataclasses import dataclass, replace
 from datetime import UTC, datetime
 from decimal import Decimal
@@ -24,6 +25,12 @@ from oft.application.opportunity_service import (
     OpportunityNotFound,
     OpportunityService,
     _to_domain,
+)
+from oft.application.telegram_events import (
+    NotificationEvent,
+    NotificationSink,
+    build_opportunity_burst_event,
+    build_opportunity_triggered_event,
 )
 from oft.application.trigger_snapshot import (
     ReportSnapshotProvider,
@@ -128,13 +135,17 @@ class TriggerService:
         provider: TriggerSnapshotProvider | None = None,
         stale_after_seconds: int = DEFAULT_STALE_AFTER_SECONDS,
         batch_cap: int = DEFAULT_BATCH_CAP,
+        notifications: NotificationSink | None = None,
     ) -> None:
         self._store = store
         self._clock = clock
-        self._opportunities = OpportunityService(store=store, clock=clock)
+        self._opportunities = OpportunityService(
+            store=store, clock=clock, notifications=notifications
+        )
         self._provider = provider or ReportSnapshotProvider(store=store)
         self._stale_after_seconds = stale_after_seconds
         self._batch_cap = batch_cap
+        self._notifications = notifications
 
     # -- manual path -----------------------------------------------------
 
@@ -271,6 +282,7 @@ class TriggerService:
         snapshots: dict[tuple[str, str], TriggerSnapshot | None] = {}
         evaluated = triggered = skipped = stale = unavailable = 0
         trigger_ids: list[str] = []
+        created_runs: list[TriggerRun] = []
         for record in records:
             try:
                 opportunity = _to_domain(record)
@@ -296,6 +308,7 @@ class TriggerService:
                 frozen,
                 now=at,
                 stale_after_seconds=self._stale_after_seconds,
+                notify=False,
             )
             evaluated += 1
             if run.evaluation.stale:
@@ -310,8 +323,10 @@ class TriggerService:
             if run.created:
                 triggered += 1
                 trigger_ids.append(run.trigger.trigger_id)
+                created_runs.append(run)
             else:
                 skipped += 1
+        self._notify_batch(created_runs)
         return TriggerBatchOutcome(
             open=len(records),
             evaluated=evaluated,
@@ -364,6 +379,7 @@ class TriggerService:
         *,
         now: str,
         stale_after_seconds: int,
+        notify: bool = True,
     ) -> TriggerRun:
         evaluation = evaluate_trigger(
             opportunity.trigger_conditions,
@@ -447,6 +463,17 @@ class TriggerService:
                 },
                 at=now,
             )
+            if notify:
+                # Only a committed insert is a durable transition; this runs
+                # strictly after the trigger/opportunity transaction committed.
+                self._safe_notify(
+                    build_opportunity_triggered_event(
+                        updated,
+                        trigger_id=trigger_id,
+                        triggered_at=now,
+                        results=evaluation.results,
+                    )
+                )
             return TriggerRun(
                 trigger=record, evaluation=evaluation, opportunity=updated, created=True
             )
@@ -477,6 +504,48 @@ class TriggerService:
             opportunity=self._reload(opportunity),
             created=False,
         )
+
+    def _notify_batch(self, runs: Sequence[TriggerRun]) -> None:
+        """One push for one new transition, or one coalesced burst for several.
+
+        Coalescing happens only after the batch committed every transition, so
+        the alert count reflects durable rows. Building and enqueueing are
+        contained: a notification failure never affects the committed ledger.
+        """
+        if self._notifications is None or not runs:
+            return
+        try:
+            events = [
+                build_opportunity_triggered_event(
+                    run.opportunity,
+                    trigger_id=run.trigger.trigger_id,
+                    triggered_at=run.trigger.triggered_at,
+                    results=run.evaluation.results,
+                )
+                for run in runs
+                if run.trigger is not None
+            ]
+            if len(events) == 1:
+                self._notifications.enqueue_event(events[0])
+            elif events:
+                self._notifications.enqueue_event(build_opportunity_burst_event(events))
+        except Exception as exc:  # noqa: BLE001 - never break the tick
+            _LOGGER.warning(
+                "trigger_alert_batch_failed",
+                error_type=type(exc).__name__,
+            )
+
+    def _safe_notify(self, event: NotificationEvent) -> None:
+        if self._notifications is None:
+            return
+        try:
+            self._notifications.enqueue_event(event)
+        except Exception as exc:  # noqa: BLE001 - a push never breaks a trigger
+            _LOGGER.warning(
+                "trigger_alert_enqueue_failed",
+                event_type=event.event_type,
+                error_type=type(exc).__name__,
+            )
 
     def _reload(self, opportunity: Opportunity) -> Opportunity:
         try:

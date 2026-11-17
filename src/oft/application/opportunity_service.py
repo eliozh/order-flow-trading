@@ -43,6 +43,10 @@ from oft.application.condition_context import (
 from oft.application.condition_context import (
     session_state as _session_state,
 )
+from oft.application.telegram_events import (
+    NotificationSink,
+    build_opportunity_invalidated_event,
+)
 from oft.domain.conditions import (
     ConditionEvaluation,
     ConditionParamsError,
@@ -84,9 +88,16 @@ class OpportunityConflictError(Exception):
 
 
 class OpportunityService:
-    def __init__(self, *, store: StorePort, clock: ClockPort) -> None:
+    def __init__(
+        self,
+        *,
+        store: StorePort,
+        clock: ClockPort,
+        notifications: NotificationSink | None = None,
+    ) -> None:
         self._store = store
         self._clock = clock
+        self._notifications = notifications
 
     # -- reads -----------------------------------------------------------
 
@@ -327,7 +338,27 @@ class OpportunityService:
         )
         if not self._store.transition_opportunity(record, event):
             raise OpportunityTransitionError("the opportunity is no longer OPEN")
+        if target is OpportunityState.INVALIDATED:
+            # Only INVALIDATED is pushed; EXPIRED is routine and not an action
+            # item. This runs after the compare-and-set committed.
+            self._notify_invalidated(updated, reason_code=reason_code, at=resolved_at)
         return updated
+
+    def _notify_invalidated(self, opportunity: Opportunity, *, reason_code: str, at: str) -> None:
+        if self._notifications is None:
+            return
+        try:
+            self._notifications.enqueue_event(
+                build_opportunity_invalidated_event(
+                    opportunity, reason_code=reason_code, invalidated_at=at
+                )
+            )
+        except Exception as exc:  # noqa: BLE001 - a push never breaks the ledger
+            _LOGGER.warning(
+                "opportunity_alert_enqueue_failed",
+                opportunity_id=opportunity.opportunity_id,
+                error_type=type(exc).__name__,
+            )
 
     # -- display-only evaluation (side-effect free) ----------------------
 

@@ -79,12 +79,14 @@ from oft.domain.settings import (
     validate_scan_period,
 )
 from oft.domain.telegram import (
+    ENTRY_RECHECK_ALERT_KEY,
     MAX_TELEGRAM_ALLOWED_USER_IDS,
     MAX_TELEGRAM_CHAT_IDS,
     SCAN_FAILED_ALERT_KEY,
     SCAN_REPORT_PUSH_KEY,
     TELEGRAM_ALLOWED_USER_IDS_KEY,
     TELEGRAM_CHAT_IDS_KEY,
+    TRIGGER_ALERT_KEY,
     TelegramValidationError,
 )
 from oft.domain.time import utc_timestamp
@@ -549,6 +551,19 @@ class SettingsService(LLMSettingsMixin, OnboardingProgressMixin):
     def read_failed_scan_alert(self) -> bool:
         """The ``telegram.scan_failed_alert`` toggle; absent means disabled."""
         return self._decode_bool(SCAN_FAILED_ALERT_KEY, default=False)
+
+    def read_trigger_alert(self) -> bool:
+        """The ``telegram.trigger_alert`` toggle; absent means enabled.
+
+        Covers both TRIGGERED and INVALIDATED pushes. A malformed persisted
+        value raises :class:`ConfigError` so the notification service fails
+        closed rather than guessing.
+        """
+        return self._decode_bool(TRIGGER_ALERT_KEY, default=True)
+
+    def read_entry_recheck_alert(self) -> bool:
+        """The ``telegram.entry_recheck_alert`` toggle; absent means enabled."""
+        return self._decode_bool(ENTRY_RECHECK_ALERT_KEY, default=True)
 
     def _decode_bool(self, key: str, *, default: bool) -> bool:
         record = self._store.get_config(key)

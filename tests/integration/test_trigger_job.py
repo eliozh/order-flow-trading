@@ -859,7 +859,9 @@ def test_daemon_start_reaps_stale_trigger_runs_and_logs_the_count(
     )
     assert claim.claimed is True
     settings = Settings(env="test", port=8765, data_dir=tmp_path / "data")
-    container = SimpleNamespace(store=store, clock=FixedClock(NOW), settings=settings)
+    container = SimpleNamespace(
+        store=store, clock=FixedClock(NOW), settings=settings, notifications=None
+    )
 
     scheduler = daemon_module._start_trigger_scheduler(settings, container=container)
 
