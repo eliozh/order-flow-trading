@@ -47,8 +47,9 @@ ENTRY_SUBJECT_KIND = "TRIGGER"
 BURST_SUBJECT_KIND = "OPPORTUNITY_BURST"
 _OPPORTUNITY_ALERT_STATE_TRIGGERED = "TRIGGERED"
 _OPPORTUNITY_ALERT_STATE_INVALIDATED = "INVALIDATED"
-# The five keys an invalidation condition may carry a level in; the first
-# present one is the displayed level.
+# The single-level keys an invalidation condition may carry; the first present
+# one is the displayed level. Zone-shaped params are joined separately, and a
+# TIME_WINDOW renders its validity window instead.
 _LEVEL_KEYS = ("price", "price_low", "price_high", "threshold", "value")
 # Entry decisions are directional in the ledger; the phone alert reports the
 # action ("ENTER") while the direction is already named by ``side``.
@@ -340,7 +341,23 @@ def build_opportunity_burst_event(events: Sequence[NotificationEvent]) -> Notifi
 
 
 def _condition_level(condition: Condition) -> str | None:
-    """The first present level parameter of one invalidation condition."""
+    """The displayed level of one invalidation condition, or ``None``.
+
+    A zone-shaped condition carries both bounds and fires beyond either side, so
+    joining them keeps the alert honest. A ``TIME_WINDOW`` invalidation has no
+    numeric level: its validity window is the level. Every other type keeps the
+    first present single-level parameter.
+    """
+    if condition.type == "TIME_WINDOW":
+        start = condition.window_start
+        end = condition.window_end
+        if start and end:
+            return f"{start} - {end}"
+        return None
+    low = condition.params.get("price_low")
+    high = condition.params.get("price_high")
+    if low not in (None, "") and high not in (None, ""):
+        return f"{low}-{high}"
     for key in _LEVEL_KEYS:
         value = condition.params.get(key)
         if value not in (None, ""):

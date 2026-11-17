@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import sqlite3
 import threading
 from datetime import UTC, datetime
 from decimal import Decimal
@@ -21,6 +22,7 @@ from oft.application.telegram_dispatch import OutboxDispatcher
 from oft.application.trigger_service import TriggerService
 from oft.clock import FixedClock
 from oft.config import Settings
+from oft.domain.opportunities import OpportunityContractError
 from oft.domain.telegram import MAX_OPPORTUNITY_ALERT_ITEMS, TRIGGER_ALERT_KEY
 from oft.domain.time import utc_timestamp
 from oft.domain.trigger import TriggerSnapshot
@@ -381,3 +383,49 @@ def test_the_dispatcher_sends_each_transition_exactly_once_via_the_fake_transpor
         "机会触发 · ETHUSDT · LONG · 置信度 0.72",
     }
     assert all(receipt.state == "sent" for receipt in store.list_telegram_receipts())
+
+
+def test_a_raising_alert_builder_leaves_the_trigger_and_opportunity_committed(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    settings = _settings(tmp_path)
+    store = _store(tmp_path)
+    opportunity_id = _insert_opportunity(store)
+
+    def _boom(*_args: Any, **_kwargs: Any) -> Any:
+        raise AttributeError("builder failed")
+
+    monkeypatch.setattr("oft.application.trigger_service.build_opportunity_triggered_event", _boom)
+    service = _trigger_service(store, settings, notifications=_notifications(store, settings))
+
+    # Containment: a builder/renderer failure never escapes after the ledger
+    # commit, so the manual evaluate route cannot turn a durable trigger into a
+    # 500.
+    run = service.evaluate(opportunity_id)
+
+    assert run.created is True
+    stored = OpportunityService(store=store, clock=FixedClock(NOW)).show(opportunity_id)
+    assert stored.state.value == "TRIGGERED"
+    assert len(store.list_trigger_events()) == 1
+    assert store.list_telegram_receipts() == ()
+
+
+def test_a_non_mapping_condition_params_row_fails_closed_at_read(tmp_path: Path) -> None:
+    settings = _settings(tmp_path)
+    store = _store(tmp_path)
+    opportunity_id = _insert_opportunity(store)
+    record = store.get_opportunity(opportunity_id)
+    assert record is not None
+    payload = json.loads(record.payload_json)
+    payload["invalidation_conditions"][0]["params"] = [["price", "68000"]]
+    with sqlite3.connect(settings.data_dir / "oft.db") as connection:
+        connection.execute(
+            "UPDATE opportunities SET payload_json = ? WHERE opportunity_id = ?",
+            (json.dumps(payload, sort_keys=True), opportunity_id),
+        )
+        connection.commit()
+
+    with pytest.raises(OpportunityContractError) as excinfo:
+        OpportunityService(store=store, clock=FixedClock(NOW)).show(opportunity_id)
+
+    assert "params" in str(excinfo.value)

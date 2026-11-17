@@ -667,13 +667,17 @@ def render_opportunity_burst(payload: Mapping[str, Any]) -> str:
 def _condition_unit(value: object) -> str:
     """The display unit for one condition type (empty when it has none).
 
-    Price/delta/CVD/OI/liquidation/volume conditions are quoted in USDT;
-    funding and footprint imbalance are ratios; session/time conditions carry a
-    categorical value and therefore no unit.
+    Only price and liquidation notional are quoted in USDT. An ``OI_DELTA_*``
+    condition is evaluated as a percent change (``(last-first)/first*100``).
+    ``DELTA_*``, ``CVD_*``, and ``VOLUME_*`` are base-asset quantities from the
+    resampled bars (not quote volume), so they carry no fabricated unit; funding
+    and footprint imbalance are ratios. Everything else is categorical.
     """
     condition_type = value.upper() if isinstance(value, str) else ""
-    if condition_type.startswith(("PRICE_", "DELTA_", "CVD_", "OI_", "LIQUIDATION_", "VOLUME_")):
+    if condition_type.startswith(("PRICE_", "LIQUIDATION_")):
         return "USDT"
+    if condition_type.startswith("OI_DELTA_"):
+        return "%"
     if condition_type.startswith(("FUNDING_", "FOOTPRINT_")):
         return "ratio"
     return ""

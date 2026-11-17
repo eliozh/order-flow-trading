@@ -7,7 +7,7 @@ condition IDs, and persists the contract envelope plus append-only history.
 from __future__ import annotations
 
 import json
-from collections.abc import Collection, Sequence
+from collections.abc import Collection, Mapping, Sequence
 from decimal import Decimal, InvalidOperation
 from typing import Any
 
@@ -637,11 +637,19 @@ def _opportunity_from_contract(payload: dict[str, Any]) -> Opportunity:
 
 
 def _condition_from_contract(payload: dict[str, Any]) -> Condition:
+    params = payload["params"]
+    if not isinstance(params, Mapping):
+        # Persisted JSON is untrusted. A non-object params value would reach
+        # every ``params.get(...)`` consumer (including alert rendering) and
+        # raise there, after the read/write already committed; fail closed here.
+        raise OpportunityContractError(
+            f"condition {payload.get('condition_id')} params must be a JSON object"
+        )
     return Condition(
         condition_id=payload["condition_id"],
         draft_id=payload.get("draft_id", ""),
         type=payload["type"],
-        params=payload["params"],
+        params=params,
         window_start=payload["window"]["start"],
         window_end=payload["window"]["end"],
         required_data=tuple(payload["required_data"]),

@@ -12,7 +12,7 @@ from __future__ import annotations
 
 import hashlib
 import json
-from collections.abc import Sequence
+from collections.abc import Callable, Sequence
 from dataclasses import dataclass, replace
 from datetime import UTC, datetime
 from decimal import Decimal
@@ -466,8 +466,10 @@ class TriggerService:
             if notify:
                 # Only a committed insert is a durable transition; this runs
                 # strictly after the trigger/opportunity transaction committed.
+                # Building and enqueueing share one guard: a renderer failure
+                # must never escape after the ledger commit.
                 self._safe_notify(
-                    build_opportunity_triggered_event(
+                    lambda: build_opportunity_triggered_event(
                         updated,
                         trigger_id=trigger_id,
                         triggered_at=now,
@@ -535,15 +537,22 @@ class TriggerService:
                 error_type=type(exc).__name__,
             )
 
-    def _safe_notify(self, event: NotificationEvent) -> None:
+    def _safe_notify(self, build: Callable[[], NotificationEvent]) -> None:
+        """Build and enqueue one event inside a single containment guard.
+
+        Both steps run after the ledger commit, so a builder/renderer exception
+        must never escape into the trigger path. The toggle is still checked by
+        ``NotificationService.enqueue_event``; building first is acceptable
+        because the guard contains every failure.
+        """
         if self._notifications is None:
             return
         try:
+            event = build()
             self._notifications.enqueue_event(event)
         except Exception as exc:  # noqa: BLE001 - a push never breaks a trigger
             _LOGGER.warning(
                 "trigger_alert_enqueue_failed",
-                event_type=event.event_type,
                 error_type=type(exc).__name__,
             )
 

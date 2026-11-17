@@ -269,7 +269,9 @@ class EntryService:
 
     # -- re-check --------------------------------------------------------
 
-    def recheck(self, trigger_id: str, *, refresh: bool = False) -> dict[str, Any]:
+    def recheck(
+        self, trigger_id: str, *, refresh: bool = False, notify: bool = True
+    ) -> dict[str, Any]:
         trigger = self._trigger(trigger_id)
         payload: dict[str, Any] = json.loads(trigger.payload_json)
         status = str(payload.get("status"))
@@ -516,8 +518,12 @@ class EntryService:
             at=now,
         )
         # Strictly after the trigger commit: the alert mirrors a durable row and
-        # an enqueue failure can never roll the re-check back.
-        self._notify_entry_recheck(card, generated_at=now)
+        # an enqueue failure can never roll the re-check back. ``notify=False``
+        # is used when the caller performs the action the alert would request
+        # (``accept`` bootstraps its first decision here), so no false
+        # "awaiting human action" push is queued.
+        if notify:
+            self._notify_entry_recheck(card, generated_at=now)
         return card
 
     def get_persisted_entry_decision(self, trigger_id: str) -> dict[str, Any]:
@@ -610,6 +616,11 @@ class EntryService:
         PARTIAL whenever that read is not COMPLETE, carries any named reason, or
         the RISK stage itself is not COMPLETE (stale inputs, a gate error, or no
         verdict). Its reasons are propagated verbatim.
+
+        This is a pure read: it never enqueues an alert. The "awaiting human
+        action" push is enqueued only where the decision becomes durable (the
+        fresh re-check path), so re-reading a still-RECHECKED trigger can never
+        re-send it after outbox retention.
         """
         envelope = persisted.get("decision")
         if not isinstance(envelope, dict):
@@ -656,9 +667,6 @@ class EntryService:
         card["reasons"] = persisted_reasons
         card["human_action"] = trigger_payload.get("human_action")
         card["persisted"] = True
-        # A reused decision is the same logical event: the (trigger, decision)
-        # dedupe key makes this a no-op once the first alert was enqueued.
-        self._notify_entry_recheck(card, generated_at=utc_timestamp(self._clock.now()))
         return card
 
     def _notify_entry_recheck(self, card: dict[str, Any], *, generated_at: str) -> None:
@@ -770,7 +778,7 @@ class EntryService:
             now = utc_timestamp(self._clock.now())
             return self._adopt_entry(trigger, early_entry, now=now, actor_id=actor_id)
         if payload.get("entry_decision_id") is None:
-            card = self.recheck(trigger_id)
+            card = self.recheck(trigger_id, notify=False)
             trigger = self._trigger(trigger_id)
             payload = json.loads(trigger.payload_json)
             status = str(payload.get("status"))

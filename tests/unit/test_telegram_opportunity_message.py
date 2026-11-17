@@ -37,11 +37,13 @@ from oft.domain.opportunities import (
     transition,
 )
 from oft.domain.telegram import MAX_OPPORTUNITY_ALERT_ITEMS, MAX_OUTBOUND_CHARS
-from oft.domain.trigger import ConditionResult
+from oft.domain.trigger import ConditionResult, TriggerSnapshot, evaluate_trigger
 
 NOW = "2026-11-17T09:30:00.000Z"
 LATER = "2026-11-17T10:00:00.000Z"
 WINDOW = {"start": "2026-11-01T00:00:00.000Z", "end": "2026-12-01T00:00:00.000Z"}
+BAR_ONE = "2026-11-05T00:00:00.000Z"
+BAR_TWO = "2026-11-05T00:05:00.000Z"
 SECRET = "SECRET_PROMPT_TEXT provider-raw-body sk-abcdef0123456789"
 
 
@@ -64,6 +66,7 @@ def _condition(
 
 def _open_opportunity(
     *,
+    opportunity_id: str = "OPP-1",
     symbol: str = "BTCUSDT",
     side: str = "LONG",
     confidence: float = 0.72,
@@ -71,7 +74,7 @@ def _open_opportunity(
     invalidation_conditions: tuple[Condition, ...] | None = None,
 ) -> Opportunity:
     return new_opportunity(
-        opportunity_id="OPP-1",
+        opportunity_id=opportunity_id,
         symbol=symbol,
         side=side,
         zone_low=Decimal("69000"),
@@ -124,6 +127,24 @@ def _result() -> ConditionResult:
         evaluable=True,
         note="",
     )
+
+
+def _resampled_snapshot(**overrides: object) -> TriggerSnapshot:
+    """A real snapshot with the bars the OI-delta/volume evaluators read."""
+    base: dict[str, object] = {
+        "symbol": "BTCUSDT",
+        "as_of": NOW,
+        "last_price": Decimal("70000.00"),
+        "previous_price": Decimal("69900.00"),
+        "tick_size": Decimal("0.10"),
+        "bar_timestamps": (BAR_ONE, BAR_TWO),
+        "oi_series": (Decimal("100"), Decimal("103.5")),
+        "volume_series": (Decimal("10"), Decimal("20")),
+        "data_quality": "COMPLETE",
+        "snapshot_id": "SNAP-1",
+    }
+    base.update(overrides)
+    return TriggerSnapshot(**base)  # type: ignore[arg-type]
 
 
 def _triggered_event(opportunity: Opportunity | None = None) -> Any:
@@ -186,6 +207,51 @@ def test_triggered_render_first_line_zone_and_trigger_levels_with_usdt_units() -
         "state_version: 2",
         "/opportunities",
     ]
+
+
+def test_triggered_render_units_follow_the_evaluated_condition_family() -> None:
+    oi_delta = _condition("C-OI", "OI_DELTA_ABOVE", {"threshold": "2", "lookback_bars": 2})
+    volume = _condition("C-VOL", "VOLUME_ABOVE", {"threshold": "25", "lookback_bars": 2})
+    evaluation = evaluate_trigger(
+        (oi_delta, volume),
+        _resampled_snapshot(),
+        now=NOW,
+        snapshot_id="SNAP-1",
+    )
+    event = build_opportunity_triggered_event(
+        _triggered(),
+        trigger_id="TRG-1",
+        triggered_at=NOW,
+        results=evaluation.results,
+    )
+
+    lines = event.text.splitlines()
+    oi_line = next(line for line in lines if "OI_DELTA_ABOVE" in line)
+    volume_line = next(line for line in lines if "VOLUME_ABOVE" in line)
+    # OI delta is recorded as a percent change: never a fabricated USDT.
+    assert oi_line == "trigger: C-OI OI_DELTA_ABOVE observed 3.5 % threshold 2 %"
+    # Volume is base-asset quantity: no invented quote unit.
+    assert volume_line == "trigger: C-VOL VOLUME_ABOVE observed 30 threshold 25"
+    assert "USDT" not in oi_line
+    assert "USDT" not in volume_line
+
+
+def test_triggered_render_keeps_zone_bounds_and_time_window_invalidation() -> None:
+    invalidation = (
+        _condition("I-ZONE", "PRICE_OUTSIDE_ZONE", {"price_low": "69000", "price_high": "71000"}),
+        _condition("I-TIME", "TIME_WINDOW", {"original_type": "TIME_EXPIRED"}),
+    )
+    event = _triggered_event(_triggered(invalidation_conditions=invalidation))
+
+    levels = {item["condition_id"]: item["level"] for item in event.payload["invalidation_levels"]}
+    assert levels["I-ZONE"] == "69000-71000"
+    assert levels["I-TIME"] == f"{WINDOW['start']} - {WINDOW['end']}"
+    lines = event.text.splitlines()
+    assert "invalidation: I-ZONE PRICE_OUTSIDE_ZONE 69000-71000" in lines
+    time_line = next(line for line in lines if "I-TIME" in line)
+    assert "N/A" not in time_line
+    assert WINDOW["start"] in time_line
+    assert WINDOW["end"] in time_line
 
 
 def test_invalidated_render_includes_reason_code_and_state_version() -> None:
@@ -270,10 +336,18 @@ def test_entry_render_includes_decision_id_confidence_and_is_read_only() -> None
 def test_burst_render_is_bounded_to_max_items_with_remaining_count() -> None:
     events = [
         _triggered_event(
-            _triggered(symbol=f"SYM{index}USDT", confidence=round(0.9 - index / 100, 2))
+            _triggered(
+                opportunity_id=f"OPP-{index}",
+                symbol=f"SYM{index}USDT",
+                confidence=round(0.9 - index / 100, 2),
+            )
         )
         for index in range(MAX_OPPORTUNITY_ALERT_ITEMS + 2)
     ]
+    # Every transition carries a distinct key, so the determinism assertion
+    # below cannot pass for an implementation that ignores which transitions
+    # occurred (identical keys sort and join the same either way).
+    assert len({event.dedupe_key for event in events}) == len(events)
 
     burst = build_opportunity_burst_event(events)
 
@@ -282,6 +356,10 @@ def test_burst_render_is_bounded_to_max_items_with_remaining_count() -> None:
     # Deterministic from the sorted per-transition keys.
     again = build_opportunity_burst_event(list(reversed(events)))
     assert burst.dedupe_key == again.dedupe_key
+    # Changing one transition's key changes the digest.
+    changed = list(events)
+    changed[0] = _triggered_event(_triggered(opportunity_id="OPP-DIFFERENT", symbol="SYMX"))
+    assert build_opportunity_burst_event(changed).dedupe_key != burst.dedupe_key
     assert burst.payload["count"] == MAX_OPPORTUNITY_ALERT_ITEMS + 2
     assert len(burst.payload["items"]) == MAX_OPPORTUNITY_ALERT_ITEMS
     assert burst.payload["remaining"] == 2
