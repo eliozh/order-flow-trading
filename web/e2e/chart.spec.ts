@@ -1,7 +1,7 @@
 import fs from 'node:fs'
 import path from 'node:path'
 
-import AxeBuilder from '@axe-core/playwright'
+import { runAxeAudit } from './a11y'
 import { expect, test, type Page } from '@playwright/test'
 
 /**
@@ -632,22 +632,18 @@ test('axe reports no WCAG 2.2 A/AA violations at 1440, 768, and 375', async ({ p
         await expect(page.getByRole('note', { name: /Chart unavailable for 1h/i })).toBeVisible()
       } else {
         await expect(page.getByRole('figure', { name: /BTCUSDT 4h chart/i })).toBeVisible()
+        // Expand the accessible data alternative so the audit covers the two
+        // tables (and their focusable scroll region), not only the chart.
+        const toggle = page.getByRole('button', { name: /View data table/i })
+        await toggle.click()
+        await expect(toggle).toHaveAttribute('aria-expanded', 'true')
+        await expect(page.getByRole('table', { name: /chart data table/i })).toBeVisible()
+        await expect(page.getByRole('table', { name: 'Volume profile data table' })).toBeVisible()
       }
 
-      const results = await new AxeBuilder({ page })
-        .include('#app-main')
-        .withTags(['wcag2a', 'wcag2aa', 'wcag21a', 'wcag21aa', 'wcag22a', 'wcag22aa'])
-        .analyze()
-      const summary = results.violations.map(
-        (violation) =>
-          `${violation.id} (${violation.impact ?? 'unknown'}): ${violation.nodes
-            .map((node) => node.target.join(' '))
-            .join(' | ')}`,
-      )
-      expect(
-        results.violations,
-        `${period ?? 'native'} @ ${viewport.width}px axe violations:\n${summary.join('\n')}`,
-      ).toEqual([])
+      await runAxeAudit(page, `${period ?? 'native'} @ ${viewport.width}px`, {
+        include: '#app-main',
+      })
     }
   }
 })
@@ -1172,20 +1168,17 @@ test('axe reports no WCAG 2.2 A/AA violations on the overlay report at all width
     await expect(page.locator('[data-testid="chart-zones"]')).toBeVisible()
     await expect(page.locator('[data-testid="chart-markers"]')).toBeVisible()
 
-    const results = await new AxeBuilder({ page })
-      .include('#app-main')
-      .withTags(['wcag2a', 'wcag2aa', 'wcag21a', 'wcag21aa', 'wcag22a', 'wcag22aa'])
-      .analyze()
-    const summary = results.violations.map(
-      (violation) =>
-        `${violation.id} (${violation.impact ?? 'unknown'}): ${violation.nodes
-          .map((node) => node.target.join(' '))
-          .join(' | ')}`,
-    )
-    expect(
-      results.violations,
-      `overlay report @ ${viewport.width}px axe violations:\n${summary.join('\n')}`,
-    ).toEqual([])
+    // Open the data tables first so the audit covers the accessible alternative
+    // (tables, scroll region, selected row state) alongside the overlays.
+    const toggle = page.getByRole('button', { name: /View data table/i })
+    await toggle.click()
+    await expect(toggle).toHaveAttribute('aria-expanded', 'true')
+    await expect(page.getByRole('table', { name: /chart data table/i })).toBeVisible()
+    await expect(page.getByRole('table', { name: 'Volume profile data table' })).toBeVisible()
+
+    await runAxeAudit(page, `overlay report @ ${viewport.width}px`, {
+      include: '#app-main',
+    })
     expectClean(diagnostics)
   }
 })

@@ -83,13 +83,17 @@ def read_report(
 
     Provenance is derived from the same ``provenance_counts`` the export uses,
     so the detail view and the export agree (``MIXED`` when an LLM block is
-    present, otherwise ``CALC``).
+    present, otherwise ``CALC``). Stored secret/prompt keys are redacted before
+    the payload leaves the daemon, matching the export route.
     """
     record = _report_or_404(request, report_id)
     payload = report_payload(record)
+    # Derive provenance from the raw payload, then redact stored secret/prompt
+    # keys exactly like the export route: a hostile or legacy row must not leak
+    # provider keys, raw prompts, or credential header names over HTTP.
     counts = provenance_counts(payload)
     return success_envelope(
-        payload,
+        redact_report_payload(payload),
         request_id=new_request_id(),
         generated_at=record.generated_at,
         provenance="MIXED" if counts["llm"] > 0 else "CALC",

@@ -1,7 +1,7 @@
 import fs from 'node:fs'
 import path from 'node:path'
 
-import AxeBuilder from '@axe-core/playwright'
+import { runAxeAudit } from './a11y'
 import { expect, test, type APIRequestContext, type Page } from '@playwright/test'
 
 /**
@@ -334,21 +334,7 @@ test.describe('slice 38 watchlist star journeys', () => {
           page.locator('#app-main').getByRole('heading', { level: 1, name: 'Watchlist' }),
         ).toBeVisible()
         await expect(page.getByText(/^Loading symbol/)).toHaveCount(0)
-        // Scope to the route content: unrelated shell chrome is not this slice.
-        const results = await new AxeBuilder({ page })
-          .include('#app-main')
-          .withTags(['wcag2a', 'wcag2aa', 'wcag21a', 'wcag21aa', 'wcag22a', 'wcag22aa'])
-          .analyze()
-        const summary = results.violations.map(
-          (violation) =>
-            `${violation.id} (${violation.impact ?? 'unknown'}): ${violation.nodes
-              .map((node) => node.target.join(' '))
-              .join(' | ')}`,
-        )
-        expect(
-          results.violations,
-          `${pathname} @ ${viewport.width}px axe violations:\n${summary.join('\n')}`,
-        ).toEqual([])
+        await runAxeAudit(page, `${pathname} @ ${viewport.width}px`, { include: '#app-main' })
       }
     }
   })

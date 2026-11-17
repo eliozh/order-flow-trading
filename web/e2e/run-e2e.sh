@@ -4,7 +4,8 @@
 # journal journeys, the slice-33 read-only navigation-shell journey, the
 # slice-38 watchlist journey, the slice-39 chart panel journey, and the
 # slice-41 opportunity ledger journeys against real daemons, then the trailing
-# settings and llm-settings runners.
+# settings, llm-settings, and onboarding runners (each owns its own daemon and
+# port, so they are not projects in `playwright.config.ts`).
 #
 # Starts `oft serve` three times with temporary OFT_DATA_DIRs:
 #   - 127.0.0.1:7622 for the walking-skeleton /system journey;
@@ -606,7 +607,13 @@ store.save_report(
 print(missing_id)
 PY
 )"
-HOSTILE_REPORT_ID="$(OFT_DATA_DIR="$REPORTS_DATA_DIR" uv run python - "$REPORT_ID" <<'PY'
+# The hostile sentinels are single-sourced here and exported to the browser
+# journey, so the seeded row and the spec cannot drift.
+RAW_PROMPT_SENTINEL="E2E-RAW-PROMPT-SENTINEL-DO-NOT-LEAK-2b7c"
+CREDENTIAL_SENTINEL="E2E-CREDENTIAL-SENTINEL-DO-NOT-LEAK-9f3a"
+HOSTILE_REPORT_ID="$(OFT_DATA_DIR="$REPORTS_DATA_DIR" uv run python - \
+  "$REPORT_ID" "$RAW_PROMPT_SENTINEL" "$CREDENTIAL_SENTINEL" <<'PY'
+import json
 import sys
 from dataclasses import replace
 
@@ -617,9 +624,42 @@ store = SqliteStore(load_settings())
 record = store.get_report(sys.argv[1])
 if record is None:
     raise SystemExit(f"report {sys.argv[1]} not found")
+raw_prompt = sys.argv[2]
+credential = sys.argv[3]
+llm = json.loads(record.llm_json) if record.llm_json else {}
+if not isinstance(llm, dict):
+    llm = {}
+llm.update(
+    {
+        # Render the ENABLED band. A disabled band only prints llm.reason, so
+        # the hostile provenance fields would never reach the DOM and the
+        # journey's leak assertions could not fail.
+        "configured": True,
+        "validation_status": "VALID",
+        "decision_type": "MARKET_ANALYSIS",
+        "provider": "stub",
+        "model": "stub-model",
+        "confidence": 0.72,
+        "prompt_id": "analysis",
+        "prompt_version": 9,
+        "narrative": "E2E hostile narrative stays visible.",
+        "usage": {"total_tokens": 42},
+        "api_key": credential,
+        "authorization": f"Bearer {raw_prompt}",
+        "x-api-key": raw_prompt,
+        "prompt": raw_prompt,
+        "system_prompt": raw_prompt,
+        "user_prompt": raw_prompt,
+    }
+)
 hostile_id = "RPT-FIXTURE-HOSTILE"
 store.save_report(
-    replace(record, report_id=hostile_id, symbol='<img src=x onerror="alert(1)">')
+    replace(
+        record,
+        report_id=hostile_id,
+        symbol='<img src=x onerror="alert(1)">',
+        llm_json=json.dumps(llm),
+    )
 )
 print(hostile_id)
 PY
@@ -655,6 +695,8 @@ export OFT_E2E_BATCH_ID="$BATCH_ID"
 export OFT_E2E_BATCH_DEGRADED_ID="$BATCH_DEGRADED_ID"
 export OFT_E2E_MISSING_REPORT_ID="$MISSING_REPORT_ID"
 export OFT_E2E_HOSTILE_REPORT_ID="$HOSTILE_REPORT_ID"
+export OFT_E2E_RAW_PROMPT_SENTINEL="$RAW_PROMPT_SENTINEL"
+export OFT_E2E_CREDENTIAL_SENTINEL="$CREDENTIAL_SENTINEL"
 export OFT_E2E_POSITION_ID="$POSITION_ID"
 export OFT_E2E_JOURNAL_TRADE_ID="$JOURNAL_TRADE_ID"
 export OFT_E2E_JOURNAL_POSITION_ID="$JOURNAL_POSITION_ID"
@@ -711,3 +753,9 @@ bash "$SCRIPT_DIR/run-settings-e2e.sh"
 # fake provider, so it owns its own daemon/runner as well. Its exit code
 # propagates through `set -e`.
 bash "$SCRIPT_DIR/run-llm-settings-e2e.sh"
+
+# Slice 44: `/onboarding` needs its own daemon (temporary OFT_DATA, a
+# throwaway OFT_MASTER_KEY, and the fail keyring backend) and therefore its own
+# runner. Running it here keeps `npm --prefix web run test:e2e` / CI gating the
+# onboarding journeys; its exit code propagates through `set -e`.
+bash "$SCRIPT_DIR/run-onboarding-e2e.sh"

@@ -80,6 +80,27 @@ async function expectNoAxeViolations(page: Page, label: string): Promise<void> {
   expect(targetSizeRan, `${label}: target-size rule did not run`).toBe(true)
 }
 
+/** The largest transition/animation duration in milliseconds (``s`` or ``ms``). */
+function largestDurationMs(value: string): number {
+  const parts = value
+    .split(',')
+    .map((part) => part.trim())
+    .filter((part) => part.length > 0)
+  if (parts.length === 0) {
+    return Number.NaN
+  }
+  return Math.max(
+    ...parts.map((part) => {
+      const match = /^(-?(?:\d+\.?\d*|\.\d+)(?:e[+-]?\d+)?)(ms|s)$/i.exec(part)
+      if (match === null) {
+        return Number.NaN
+      }
+      const amount = Number.parseFloat(match[1] as string)
+      return (match[2] as string).toLowerCase() === 's' ? amount * 1000 : amount
+    }),
+  )
+}
+
 /** Mint a browser session from the daemon's one-time bootstrap file. */
 async function authenticate(page: Page): Promise<void> {
   if (!BOOTSTRAP_FILE) {
@@ -456,7 +477,7 @@ test('finish review shows effective settings, focuses the result, and links to /
   expectClean(diagnostics)
 })
 
-test('step 1 is accessible at 1440/768 and at 320px reflow; 375 coarse is read-only', async ({
+test('step 1 is accessible at 1440/768/375 fine pointers and at 320px reflow; 375 coarse is read-only', async ({
   page,
   browser,
 }) => {
@@ -468,6 +489,7 @@ test('step 1 is accessible at 1440/768 and at 320px reflow; 375 coarse is read-o
   for (const viewport of [
     { width: 1440, height: 900 },
     { width: 768, height: 1024 },
+    { width: 375, height: 812 },
     { width: 320, height: 640 },
   ]) {
     await page.setViewportSize({ width: viewport.width, height: viewport.height })
@@ -552,4 +574,55 @@ test('step 1 is accessible at 1440/768 and at 320px reflow; 375 coarse is read-o
   } finally {
     await context.close()
   }
+})
+
+test('reduced motion clamps the step-1 controls to the 0.01ms floor and the wizard adds no ambient motion', async ({
+  page,
+}) => {
+  const diagnostics = collectDiagnostics(page)
+  await authenticate(page)
+  await page.goto('/onboarding/1')
+  await expect(page.getByRole('heading', HEADING)).toContainText('环境与本地绑定')
+
+  // Only the step-1 controls are inspected; this URL renders no result surface.
+  const targets = [
+    page.getByTestId('onboarding-nav-1'),
+    page.getByTestId('onboarding-next'),
+    page.locator('section.onboarding-page'),
+  ]
+  const read = () =>
+    Promise.all(
+      targets.map((target) =>
+        target.evaluate((element) => {
+          const style = getComputedStyle(element)
+          return { transition: style.transitionDuration, animation: style.animationDuration }
+        }),
+      ),
+    )
+
+  // Without the preference the wizard introduces no motion at all.
+  await page.emulateMedia({ reducedMotion: 'no-preference' })
+  const normal = await read()
+  for (const [index, value] of normal.entries()) {
+    for (const [kind, raw] of Object.entries(value)) {
+      const duration = largestDurationMs(raw as string)
+      expect(Number.isFinite(duration), `target ${index} ${kind} is parseable`).toBe(true)
+      expect(duration, `target ${index} normal ${kind}`).toBe(0)
+    }
+  }
+
+  // Under reduce the defensive CSS floor applies: > 0 proves the rule matched,
+  // and <= 0.01 keeps the A12 #20 imperceptible-duration requirement.
+  await page.emulateMedia({ reducedMotion: 'reduce' })
+  const reduced = await read()
+  for (const [index, value] of reduced.entries()) {
+    for (const [kind, raw] of Object.entries(value)) {
+      const duration = largestDurationMs(raw as string)
+      expect(Number.isFinite(duration), `target ${index} ${kind} is parseable`).toBe(true)
+      expect(duration, `target ${index} reduced ${kind}`).toBeGreaterThan(0)
+      expect(duration, `target ${index} reduced ${kind}`).toBeLessThanOrEqual(0.01)
+    }
+  }
+
+  expectClean(diagnostics)
 })

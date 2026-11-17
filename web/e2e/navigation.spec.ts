@@ -2,7 +2,7 @@ import fs from 'node:fs'
 import path from 'node:path'
 
 import { expect, test, type Page } from '@playwright/test'
-import AxeBuilder from '@axe-core/playwright'
+import { runAxeAudit } from './a11y'
 
 /**
  * Critical read-only journey for slice 33: the persistent navigation shell.
@@ -233,33 +233,29 @@ test.describe('navigation shell reachability', () => {
   }
 })
 
-test('reports no new axe violations on the six audited routes at 1440', async ({ page }) => {
-  test.setTimeout(120_000)
-  await page.setViewportSize({ width: 1440, height: 900 })
+test('reports no new axe violations on the six audited routes at 1440, 768, and 375', async ({
+  page,
+}) => {
+  test.setTimeout(360_000)
   await authenticate(page)
 
-  for (const route of AXE_AUDIT_ROUTES) {
-    await page.goto(route.path)
-    await page.waitForLoadState('networkidle')
-    await expect(
-      page
-        .locator('#app-main')
-        .getByRole('heading', { level: 1, name: route.heading, exact: true }),
-      `page identity on ${route.path}`,
-    ).toBeVisible()
+  for (const viewport of VIEWPORTS) {
+    await page.setViewportSize({ width: viewport.width, height: viewport.height })
+    for (const route of AXE_AUDIT_ROUTES) {
+      await page.goto(route.path)
+      await page.waitForLoadState('networkidle')
+      await expect(
+        page
+          .locator('#app-main')
+          .getByRole('heading', { level: 1, name: route.heading, exact: true }),
+        `page identity on ${route.path} at ${viewport.name}`,
+      ).toBeVisible()
 
-    const results = await new AxeBuilder({ page })
-      .withTags(['wcag2a', 'wcag2aa', 'wcag21a', 'wcag21aa'])
-      .analyze()
-    const allowed = AXE_BASELINE[route.path] ?? []
-    const violations = results.violations.filter((violation) => !allowed.includes(violation.id))
-    const summary = violations.map(
-      (violation) =>
-        `${violation.id} (${violation.impact ?? 'unknown'}): ${violation.nodes
-          .map((node) => node.target.join(' '))
-          .join(' | ')}`,
-    )
-    expect(violations, `${route.path} axe violations:\n${summary.join('\n')}`).toEqual([])
+      // Reuse the reviewed baseline; never tolerate an unnamed violation.
+      await runAxeAudit(page, `${route.path} @ ${viewport.name}`, {
+        allow: AXE_BASELINE[route.path] ?? [],
+      })
+    }
   }
 })
 

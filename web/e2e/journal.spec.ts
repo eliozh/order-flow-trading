@@ -171,7 +171,7 @@ test.beforeAll(async ({ request }) => {
 test('lists the closed trade with stats, definitions, filters, OPEN rows, and a server export', async ({
   page,
 }) => {
-  test.setTimeout(60_000)
+  test.setTimeout(90_000)
   const diagnostics = collectDiagnostics(page)
   const stats = statsRequests(page)
   await page.setViewportSize({ width: 1440, height: 900 })
@@ -289,7 +289,6 @@ test('lists the closed trade with stats, definitions, filters, OPEN rows, and a 
   await region.focus()
   await expect(region).toBeFocused()
 
-  const statsBeforePause = stats.length
   const pause = page.getByRole('button', { name: '暂停实时更新' })
   await pause.focus()
   await expect(pause).toBeFocused()
@@ -297,8 +296,14 @@ test('lists the closed trade with stats, definitions, filters, OPEN rows, and a 
   await expect(page.getByTestId('statusbar-paused')).toHaveText('PAUSED')
   await expect(page.getByTestId('journal-paused-stamp')).toHaveText('PAUSED')
   await expect(page.getByTestId('journal-paused')).toBeVisible()
-  await page.waitForTimeout(600)
-  expect(stats.length).toBe(statsBeforePause)
+  // Let any request issued just before the pause land in the baseline.
+  await page.waitForTimeout(1_000)
+  const statsBeforePause = stats.length
+  // The journal polls every 15s (JOURNAL_REFRESH_MS). A 16s window is longer
+  // than one poll interval, so a no-op pause would add at least one stats
+  // request here; with the freeze in place the count cannot move.
+  await page.waitForTimeout(16_000)
+  expect(stats.length, 'paused journal must not poll journal stats').toBe(statsBeforePause)
 
   await page.getByRole('button', { name: '继续实时更新' }).click()
   await expect(page.getByTestId('statusbar-paused')).toHaveCount(0)

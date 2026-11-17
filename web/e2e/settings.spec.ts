@@ -2,7 +2,7 @@ import { execFileSync } from 'node:child_process'
 import fs from 'node:fs'
 import path from 'node:path'
 
-import AxeBuilder from '@axe-core/playwright'
+import { AXE_TAGS, runAxeAudit } from './a11y'
 import { expect, test, type Page } from '@playwright/test'
 
 /**
@@ -692,6 +692,7 @@ test('is read-only only on phone-width touch and keeps fine-pointer zoom editabl
     readonly: false,
     name: 'settings-scan-1440.png',
   })
+  await runAxeAudit(page, '/settings/scan @ 1440')
   await expectScanViewport(page, {
     width: 720,
     height: 900,
@@ -715,12 +716,14 @@ test('is read-only only on phone-width touch and keeps fine-pointer zoom editabl
       readonly: true,
       name: 'settings-scan-375.png',
     })
+    await runAxeAudit(touchPage, '/settings/scan @ 375')
     await expectScanViewport(touchPage, {
       width: 768,
       height: 1024,
       readonly: false,
       name: 'settings-scan-768.png',
     })
+    await runAxeAudit(touchPage, '/settings/scan @ 768')
   } finally {
     await touchContext.close()
   }
@@ -1014,9 +1017,7 @@ test('renders the risk screen at 375/768/1440 and reports no axe violations', as
   await expect(page.getByRole('heading', RISK_HEADING)).toBeVisible()
   await page.waitForLoadState('networkidle')
 
-  const results = await new AxeBuilder({ page })
-    .withTags(['wcag2a', 'wcag2aa', 'wcag21a', 'wcag21aa'])
-    .analyze()
+  const results = await runAxeAudit(page, '/settings/risk @ 1440')
   const summary = results.violations.map(
     (violation) =>
       `${violation.id} (${violation.impact ?? 'unknown'}): ${violation.nodes
@@ -1031,7 +1032,7 @@ test('renders the risk screen at 375/768/1440 and reports no axe violations', as
     JSON.stringify(
       {
         url: '/settings/risk',
-        tags: ['wcag2a', 'wcag2aa', 'wcag21a', 'wcag21aa'],
+        tags: [...AXE_TAGS],
         violationCount: results.violations.length,
         violations: results.violations.map((violation) => ({
           id: violation.id,
@@ -1066,12 +1067,14 @@ test('renders the risk screen at 375/768/1440 and reports no axe violations', as
       readonly: true,
       name: 'settings-risk-375.png',
     })
+    await runAxeAudit(touchPage, '/settings/risk @ 375')
     await expectRiskViewport(touchPage, {
       width: 768,
       height: 1024,
       readonly: false,
       name: 'settings-risk-768.png',
     })
+    await runAxeAudit(touchPage, '/settings/risk @ 768')
   } finally {
     await touchContext.close()
   }
@@ -1179,15 +1182,7 @@ test('LLM settings keep the provider key write-only and mask it everywhere', asy
     })
   }
 
-  const axe = await new AxeBuilder({ page })
-    .withTags(['wcag2a', 'wcag2aa', 'wcag21a', 'wcag21aa'])
-    .analyze()
-  expect(
-    axe.violations,
-    JSON.stringify(
-      axe.violations.map((item) => ({ id: item.id, target: item.nodes.map((n) => n.target) })),
-    ),
-  ).toEqual([])
+  await runAxeAudit(page, '/settings/llm @ 375')
 
   // Remove the test key so the journey leaves the daemon and either secret
   // backend clean (it is a temporary data dir, but a keyring backend is global).
@@ -1949,50 +1944,49 @@ test('LLM settings are read-only at 375 with the desktop/CLI note and editable a
   expectClean(touchDiagnostics)
 })
 
-test('LLM settings report no axe WCAG 2.1 A/AA violations', async ({ page }) => {
-  test.setTimeout(120_000)
+test('LLM settings report no axe WCAG 2.2 A/AA violations at 1440, 768, and 375', async ({
+  page,
+}) => {
+  test.setTimeout(180_000)
   const diagnostics = collectDiagnostics(page)
   fs.mkdirSync(SCREENS_DIR, { recursive: true })
-  await page.setViewportSize({ width: 1440, height: 900 })
   await authenticate(page)
   await page.goto('/settings/llm')
   await expect(page.getByRole('heading', LLM_HEADING)).toBeVisible()
   await expect(page.getByTestId('llm-key-input-anthropic')).toBeVisible()
   await page.waitForLoadState('networkidle')
 
-  const tags = ['wcag2a', 'wcag2aa', 'wcag21a', 'wcag21aa']
-  const results = await new AxeBuilder({ page }).withTags(tags).analyze()
-  const summary = results.violations.map(
-    (violation) =>
-      `${violation.id} (${violation.impact ?? 'unknown'}): ${violation.nodes
-        .map((node) => node.target.join(' '))
-        .join(' | ')}`,
-  )
+  for (const width of [1440, 768, 375] as const) {
+    await page.setViewportSize({ width, height: width === 375 ? 812 : 1024 })
+    await page.goto('/settings/llm')
+    await expect(page.getByRole('heading', LLM_HEADING)).toBeVisible()
+    await page.waitForLoadState('networkidle')
+    const results = await runAxeAudit(page, `/settings/llm @ ${width}`)
+    if (width === 1440) {
+      fs.writeFileSync(
+        path.join(SCREENS_DIR, 'settings-llm-axe.json'),
+        JSON.stringify(
+          {
+            url: '/settings/llm',
+            tags: [...AXE_TAGS],
+            violationCount: results.violations.length,
+            violations: results.violations.map((violation) => ({
+              id: violation.id,
+              impact: violation.impact ?? null,
+              targets: violation.nodes.map((node) => node.target.join(' ')),
+            })),
+          },
+          null,
+          2,
+        ),
+      )
+      await page.screenshot({
+        path: path.join(SCREENS_DIR, 'settings-llm-axe-1440.png'),
+        fullPage: true,
+      })
+    }
+  }
 
-  fs.writeFileSync(
-    path.join(SCREENS_DIR, 'settings-llm-axe.json'),
-    JSON.stringify(
-      {
-        url: '/settings/llm',
-        tags,
-        violationCount: results.violations.length,
-        violations: results.violations.map((violation) => ({
-          id: violation.id,
-          impact: violation.impact ?? null,
-          targets: violation.nodes.map((node) => node.target.join(' ')),
-        })),
-      },
-      null,
-      2,
-    ),
-  )
-
-  await page.screenshot({
-    path: path.join(SCREENS_DIR, 'settings-llm-axe-1440.png'),
-    fullPage: true,
-  })
-
-  expect(results.violations, `settings/llm axe violations:\n${summary.join('\n')}`).toEqual([])
   expectClean(diagnostics)
 })
 
@@ -2109,18 +2103,6 @@ async function postPromptVersion(
   })
 }
 
-async function expectAxeClean(page: Page, label: string): Promise<void> {
-  const tags = ['wcag2a', 'wcag2aa', 'wcag21a', 'wcag21aa']
-  const results = await new AxeBuilder({ page }).withTags(tags).analyze()
-  const summary = results.violations.map(
-    (violation) =>
-      `${violation.id} (${violation.impact ?? 'unknown'}): ${violation.nodes
-        .map((node) => node.target.join(' '))
-        .join(' | ')}`,
-  )
-  expect(results.violations, `${label} axe violations:\n${summary.join('\n')}`).toEqual([])
-}
-
 test('prompt list shows the four roles as built-in default v1 at 1440', async ({ page }) => {
   test.setTimeout(60_000)
   const diagnostics = collectDiagnostics(page)
@@ -2157,12 +2139,21 @@ test('prompt list shows the four roles as built-in default v1 at 1440', async ({
     )
   }
 
-  await expectAxeClean(page, '/settings/prompts')
+  await runAxeAudit(page, '/settings/prompts @ 1440')
   fs.mkdirSync(SCREENS_DIR, { recursive: true })
   await page.screenshot({
     path: path.join(SCREENS_DIR, 'settings-prompts-list-1440.png'),
     fullPage: true,
   })
+  for (const width of [768, 375] as const) {
+    await page.setViewportSize({ width, height: width === 375 ? 812 : 1024 })
+    await page.goto('/settings/prompts')
+    await expect(page.getByRole('heading', PROMPT_LIST_HEADING)).toBeVisible()
+    // Wait for the populated rows, not the synchronous heading: without this
+    // the per-width audit would scan the loading skeleton instead of the list.
+    await expect(page.getByTestId('prompt-row-analysis')).toBeVisible()
+    await runAxeAudit(page, `/settings/prompts @ ${width}`)
+  }
   expectClean(diagnostics)
 })
 
@@ -2246,12 +2237,21 @@ test('prompt editor blocks a missing variable with zero writes and renders hosti
   await expect(page.locator('#prompt-body')).toHaveValue(activeBody as string)
   await expect(page.locator('#prompt-body')).not.toBeEditable()
 
-  await expectAxeClean(page, '/settings/prompts/analysis')
+  await runAxeAudit(page, '/settings/prompts/analysis @ 1440')
   fs.mkdirSync(SCREENS_DIR, { recursive: true })
   await page.screenshot({
     path: path.join(SCREENS_DIR, 'settings-prompt-editor-1440.png'),
     fullPage: true,
   })
+  for (const width of [768, 375] as const) {
+    await page.setViewportSize({ width, height: width === 375 ? 812 : 1024 })
+    await page.goto('/settings/prompts/analysis')
+    await expect(page.getByRole('heading', PROMPT_EDITOR_HEADING)).toBeVisible()
+    // Wait for the route's loaded content (the active body) before auditing;
+    // the heading renders synchronously while the detail request is pending.
+    await expect(page.locator('#prompt-body')).toHaveValue(activeBody as string)
+    await runAxeAudit(page, `/settings/prompts/analysis @ ${width}`)
+  }
   expectClean(diagnostics)
 })
 
@@ -2365,12 +2365,21 @@ test('prompt history renders text-only diffs, activates explicitly, and restores
   // History stays complete: every earlier version is still present.
   expect(final.versions.length).toBe(versionsBefore + 1)
 
-  await expectAxeClean(page, '/settings/prompts/analysis/history')
+  await runAxeAudit(page, '/settings/prompts/analysis/history @ 1440')
   fs.mkdirSync(SCREENS_DIR, { recursive: true })
   await page.screenshot({
     path: path.join(SCREENS_DIR, 'settings-prompt-history-1440.png'),
     fullPage: true,
   })
+  for (const width of [768, 375] as const) {
+    await page.setViewportSize({ width, height: width === 375 ? 812 : 1024 })
+    await page.goto('/settings/prompts/analysis/history')
+    await expect(page.getByRole('heading', PROMPT_HISTORY_HEADING)).toBeVisible()
+    // Wait for the version rows before auditing; the heading renders
+    // synchronously while the history request is still pending.
+    await expect(page.getByTestId('prompt-version-1')).toBeVisible()
+    await runAxeAudit(page, `/settings/prompts/analysis/history @ ${width}`)
+  }
   expectClean(diagnostics)
 })
 
@@ -3120,8 +3129,7 @@ test('budget screen renders at 375/768/1440, is read-only at 375, and has no axe
     name: 'settings-budget-1440.png',
   })
 
-  const tags = ['wcag2a', 'wcag2aa', 'wcag21a', 'wcag21aa']
-  const results = await new AxeBuilder({ page }).withTags(tags).analyze()
+  const results = await runAxeAudit(page, '/settings/budget @ 1440')
   const desktopSummary = results.violations.map(
     (violation) =>
       `1440 ${violation.id} (${violation.impact ?? 'unknown'}): ${violation.nodes
@@ -3133,7 +3141,7 @@ test('budget screen renders at 375/768/1440, is read-only at 375, and has no axe
     JSON.stringify(
       {
         url: '/settings/budget (1440)',
-        tags,
+        tags: [...AXE_TAGS],
         violationCount: results.violations.length,
         violations: results.violations.map((violation) => ({
           id: violation.id,
@@ -3164,7 +3172,7 @@ test('budget screen renders at 375/768/1440, is read-only at 375, and has no axe
       readonly: true,
       name: 'settings-budget-375.png',
     })
-    const mobileResults = await new AxeBuilder({ page: touchPage }).withTags(tags).analyze()
+    const mobileResults = await runAxeAudit(touchPage, '/settings/budget @ 375')
     mobileSummary = mobileResults.violations.map(
       (violation) =>
         `375 ${violation.id} (${violation.impact ?? 'unknown'}): ${violation.nodes
@@ -3176,7 +3184,7 @@ test('budget screen renders at 375/768/1440, is read-only at 375, and has no axe
       JSON.stringify(
         {
           url: '/settings/budget (375 coarse pointer)',
-          tags,
+          tags: [...AXE_TAGS],
           violationCount: mobileResults.violations.length,
           violations: mobileResults.violations.map((violation) => ({
             id: violation.id,
@@ -3194,7 +3202,7 @@ test('budget screen renders at 375/768/1440, is read-only at 375, and has no axe
       readonly: false,
       name: 'settings-budget-768.png',
     })
-    const tabletResults = await new AxeBuilder({ page: touchPage }).withTags(tags).analyze()
+    const tabletResults = await runAxeAudit(touchPage, '/settings/budget @ 768')
     tabletSummary = tabletResults.violations.map(
       (violation) =>
         `768 ${violation.id} (${violation.impact ?? 'unknown'}): ${violation.nodes
@@ -3206,7 +3214,7 @@ test('budget screen renders at 375/768/1440, is read-only at 375, and has no axe
       JSON.stringify(
         {
           url: '/settings/budget (768 editable)',
-          tags,
+          tags: [...AXE_TAGS],
           violationCount: tabletResults.violations.length,
           violations: tabletResults.violations.map((violation) => ({
             id: violation.id,
