@@ -12,8 +12,10 @@ from fastapi.testclient import TestClient
 from jsonschema import Draft202012Validator
 from referencing import Registry, Resource
 from referencing.jsonschema import DRAFT202012
+from typer.testing import CliRunner
 
 from oft.api.app import create_app
+from oft.cli.main import app as cli_app
 from oft.clock import FixedClock
 from oft.config import Settings
 
@@ -378,3 +380,22 @@ def test_llm_settings_payloads_validate_and_never_include_a_key(
     serialized = json.dumps([response.json() for response in responses]).lower()
     for marker in ("api_key", "secret_value", "password"):
         assert marker not in serialized
+
+
+def test_cli_config_envelopes_validate_the_shared_api_envelope(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    validator: Draft202012Validator,
+) -> None:
+    """``oft config show|set --json`` emits the same contract as the API."""
+    monkeypatch.setenv("OFT_ENV", "test")
+    monkeypatch.setenv("OFT_PORT", "8765")
+    monkeypatch.setenv("OFT_DATA", str(tmp_path / "data"))
+    runner = CliRunner()
+
+    shown = runner.invoke(cli_app, ["config", "show", "--json"])
+    saved = runner.invoke(cli_app, ["config", "set", "scan.period", "8h", "--json"])
+
+    for result in (shown, saved):
+        assert result.exit_code == 0, result.output
+        _validate(validator, json.loads(result.stdout))

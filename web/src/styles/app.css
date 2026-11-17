@@ -2769,3 +2769,15 @@ code {
   display: block;
   color: var(--oft-text-muted);
 }
+
+/* Slice 46: the wizard introduces no ambient motion, but a stepper/result
+   animation is reduced to an imperceptible duration for users who ask for
+   reduced motion (matching the chart panel). */
+@media (prefers-reduced-motion: reduce) {
+  .onboarding-page,
+  .onboarding-page * {
+    animation-duration: 0.01ms !important;
+    animation-iteration-count: 1 !important;
+    transition-duration: 0.01ms !important;
+  }
+}

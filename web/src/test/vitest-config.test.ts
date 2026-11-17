@@ -17,7 +17,10 @@ describe('vitest configuration', () => {
     // The onboarding journey owns its daemon and generated config via
     // `e2e/run-onboarding-e2e.sh`; the aggregate runner starts no 7654 daemon.
     const source = readFileSync(new URL('../../playwright.config.ts', import.meta.url), 'utf8')
-    expect(source).not.toMatch(/onboarding/i)
+    // Match code, not prose: strip comments first so documentation may name a
+    // dedicated runner without tripping the structural guard.
+    const code = source.replace(/\/\*[\s\S]*?\*\//g, '').replace(/(^|[^:])\/\/.*$/gm, '$1')
+    expect(code).not.toMatch(/onboarding/i)
   })
 
   it('rewrites the Host header on every dev proxy (loopback allowlist)', () => {

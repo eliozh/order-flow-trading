@@ -33,6 +33,10 @@ const BATCH_ID = process.env.OFT_E2E_BATCH_ID
 const BATCH_DEGRADED_ID = process.env.OFT_E2E_BATCH_DEGRADED_ID
 const SYMBOL = 'BTCUSDT'
 const MISSING_DATA_SYMBOL = 'XAUUSDT'
+const HOSTILE_SYMBOL = '<img src=x onerror="alert(1)">'
+// Kept in sync with the hostile llm_json seeded by e2e/run-e2e.sh.
+const HOSTILE_RAW_PROMPT_SENTINEL = 'E2E-RAW-PROMPT-SENTINEL-DO-NOT-LEAK-2b7c'
+const HOSTILE_CREDENTIAL_SPELLINGS = ['x-api-key', 'authorization'] as const
 
 interface SnapshotBar {
   bar_start: string
@@ -72,7 +76,13 @@ interface ReportData {
   data_quality: string
   llm_decision_id: string | null
   narrative_ref: string | null
-  llm: { configured: boolean; reason: string }
+  llm: {
+    configured: boolean
+    reason: string
+    prompt_id?: string
+    narrative?: string
+    usage?: { total_tokens?: number }
+  }
   metrics_manifest: unknown[]
   snapshot: { bars: SnapshotBar[]; data_quality: string }
   metrics: {
@@ -617,16 +627,35 @@ test('renders an explanation instead of a chart for a real MISSING report', asyn
   expectClean(diagnostics)
 })
 
-test('hostile symbol metadata is rendered as text, never as markup', async ({ page }) => {
+test('hostile symbol metadata renders as text and stored prompts and headers never reach the DOM', async ({
+  page,
+}) => {
   expect(HOSTILE_REPORT_ID, 'OFT_E2E_HOSTILE_REPORT_ID is required').toBeTruthy()
-  const hostile = '<img src=x onerror="alert(1)">'
   await authenticate(page)
   await page.goto(reportPath(HOSTILE_REPORT_ID as string))
 
   const report = await fetchReport(page, HOSTILE_REPORT_ID as string)
-  expect(report.symbol).toBe(hostile)
+  expect(report.symbol).toBe(HOSTILE_SYMBOL)
+  // Redaction keeps the non-secret LLM evidence.
+  expect(report.llm.prompt_id).toBe('analysis')
+  expect(report.llm.usage?.total_tokens).toBe(42)
+  expect(report.llm.narrative).toBe('E2E hostile narrative stays visible.')
 
-  await expect(page.getByText(hostile).first()).toBeVisible()
+  // Neither the rendered page nor the fetched JSON may echo the stored raw
+  // prompts or provider header spellings.
+  const html = await page.content()
+  expect(html).not.toContain(HOSTILE_RAW_PROMPT_SENTINEL)
+  const reportJson = JSON.stringify(report)
+  expect(reportJson).not.toContain(HOSTILE_RAW_PROMPT_SENTINEL)
+  for (const spelling of HOSTILE_CREDENTIAL_SPELLINGS) {
+    expect(html.toLowerCase(), `DOM must not name ${spelling}`).not.toContain(spelling)
+    expect(reportJson.toLowerCase(), `report JSON must not name ${spelling}`).not.toContain(
+      spelling,
+    )
+  }
+
+  // The non-secret content still renders as literal text.
+  await expect(page.getByText(HOSTILE_SYMBOL).first()).toBeVisible()
   await expect(page.locator('main img')).toHaveCount(0)
   expect(await page.evaluate(() => document.querySelectorAll('main script').length)).toBe(0)
 })

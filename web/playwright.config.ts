@@ -22,6 +22,13 @@ const reportDir = process.env.OFT_E2E_REPORT_DIR ?? `${screensDir}/report`
  * journey (star/unstar mutations on the symbols daemon). Run them with:
  *
  *   npm --prefix web run test:e2e
+ *
+ * The settings, LLM-settings, and first-run wizard suites own dedicated
+ * daemons and runners (`run-settings-e2e.sh`, `run-llm-settings-e2e.sh`, and
+ * the dedicated wizard runner). They are intentionally not projects here: this
+ * config targets the three shared daemons above, so adding those specs would
+ * run them against the wrong data directory. `run-e2e.sh` invokes all three
+ * trailing runners.
  */
 export default defineConfig({
   testDir: './e2e',
