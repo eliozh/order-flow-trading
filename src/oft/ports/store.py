@@ -837,6 +837,17 @@ class StorePort(Protocol):
 
     def get_report(self, report_id: str) -> ReportRecord | None: ...
 
+    def list_report_llm_json(self, report_ids: Sequence[str]) -> tuple[str, ...]:
+        """The non-empty ``llm_json`` values for the given report ids.
+
+        One bounded batch read: ids are de-duplicated and queried in chunks of
+        at most 500 using parameterized placeholders, selecting only the
+        ``llm_json`` column (never the frozen snapshot/metrics documents). Used
+        by notification summaries so a scan's opportunity count does not issue
+        one full-report read per report.
+        """
+        ...
+
     def list_reports(
         self, *, scan_id: str | None = None, limit: int = 20, offset: int = 0
     ) -> tuple[ReportRecord, ...]: ...

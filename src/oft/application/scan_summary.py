@@ -94,6 +94,23 @@ def scan_cost_totals(rows: Sequence[ScanSymbolRecord]) -> tuple[Decimal, bool]:
     return cost, unpriced
 
 
+def format_cost_total(cost: Decimal) -> str:
+    """Render a cost total with the hostile-exponent guard.
+
+    ``1e100000000`` would materialize a ~100 MB fixed-point string, so a
+    non-finite or unbounded-exponent total is rendered as ``N/A`` up front.
+    Every surface (scan API and Telegram push) uses this one formatter, so the
+    ``NaN`` sentinel from :func:`scan_cost_totals` can never leak as text.
+    """
+    if not cost.is_finite():
+        return "N/A"
+    if cost == 0:
+        return "0"
+    if abs(cost.adjusted()) > MAX_DECIMAL_ADJUSTED_EXPONENT:
+        return "N/A"
+    return format(cost, "f")
+
+
 def derive_scan_status(rows: Sequence[ScanSymbolRecord], run_status: object) -> str | None:
     """Merge the run status with terminal row stages: FAILED > PARTIAL > COMPLETE.
 
@@ -125,6 +142,7 @@ def derive_scan_status(rows: Sequence[ScanSymbolRecord], run_status: object) -> 
 __all__ = [
     "derive_scan_status",
     "failure_stage",
+    "format_cost_total",
     "scan_cost_totals",
     "stage_for_error_code",
 ]

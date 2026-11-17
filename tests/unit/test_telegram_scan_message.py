@@ -328,6 +328,14 @@ class _FakeStore:
     def get_report(self, report_id: str) -> object:
         return self.reports.get(report_id)
 
+    def list_report_llm_json(self, report_ids: object) -> tuple[str, ...]:
+        values: list[str] = []
+        for report_id in report_ids:  # type: ignore[union-attr]
+            report = self.reports.get(report_id)
+            if report is not None and isinstance(report.llm_json, str) and report.llm_json:
+                values.append(report.llm_json)
+        return tuple(values)
+
     def get_job_run(self, scan_id: str) -> object:
         return self.run
 
@@ -391,6 +399,9 @@ class _QuietStore:
 
     def get_job_run(self, scan_id: str) -> object | None:
         return self.run
+
+    def list_report_llm_json(self, report_ids: object) -> tuple[str, ...]:
+        return ()
 
     def append_telegram_outbox(self, record: TelegramOutboxRecord) -> bool:
         self.appended.append(record)
@@ -636,3 +647,110 @@ def test_a_duplicate_event_returns_the_existing_row_not_a_fabricated_one() -> No
 
     assert record is existing
     assert record.state == ReceiptState.SENT
+
+
+def _channel_with(chat_ids: tuple[object, ...]) -> object:
+    return SimpleNamespace(
+        status_state=lambda: SimpleNamespace(state="READY"),
+        allowlist=lambda: SimpleNamespace(chat_ids=chat_ids),
+    )
+
+
+def test_pushes_target_the_private_chat_not_an_allowlisted_group() -> None:
+    # Pushes have no per-sender ``is_authorized`` check, so a group id (negative)
+    # must never be selected even when it sorts before the private chat.
+    store = _FakeStore()
+    record = _service(store, channel=_channel_with((-1001234567890, 1001))).notify_scan("SCAN-1")
+
+    assert record is not None
+    assert record.chat_id == 1001
+
+
+def test_pushes_fail_closed_when_only_a_group_is_allowlisted() -> None:
+    store = _FakeStore()
+    assert _service(store, channel=_channel_with((-1001234567890,))).notify_scan("SCAN-1") is None
+    assert store.appended == []
+
+
+def test_pushes_fail_closed_on_ambiguous_multiple_private_chats() -> None:
+    store = _FakeStore()
+    assert _service(store, channel=_channel_with((1001, 1002))).notify_scan("SCAN-1") is None
+    assert store.appended == []
+
+
+def test_notify_scan_short_circuits_before_reading_rows_when_not_ready() -> None:
+    class _WatchedStore(_QuietStore):
+        def __init__(self) -> None:
+            super().__init__()
+            self.reads: list[str] = []
+
+        def list_scan_symbols(self, scan_id: str) -> tuple[ScanSymbolRecord, ...]:
+            self.reads.append("list_scan_symbols")
+            return ()
+
+        def get_job_run(self, scan_id: str) -> object | None:
+            self.reads.append("get_job_run")
+            return None
+
+        def list_report_llm_json(self, report_ids: object) -> tuple[str, ...]:
+            self.reads.append("list_report_llm_json")
+            return ()
+
+    not_ready = SimpleNamespace(
+        status_state=lambda: SimpleNamespace(state="NOT_CONFIGURED"),
+        allowlist=lambda: SimpleNamespace(chat_ids=(1001,)),
+    )
+    store = _WatchedStore()
+
+    assert _service(store, channel=not_ready).notify_scan("SCAN-1") is None
+    # The readiness gate returns before any row/report read.
+    assert store.reads == []
+
+
+def test_opportunity_count_uses_one_bounded_llm_read_without_get_report() -> None:
+    class _BatchReadStore:
+        def __init__(self) -> None:
+            self.rows = (
+                _row("BTCUSDT", report_id="RPT-1"),
+                _row("ETHUSDT", report_id="RPT-2"),
+            )
+            self.run = SimpleNamespace(
+                status="DONE",
+                trigger_source="MANUAL",
+                period="4h",
+                finished_at="2026-11-17T08:05:00.000Z",
+                error_code=None,
+            )
+            self.appended: list[TelegramOutboxRecord] = []
+            self.batch_reads: list[tuple[str, ...]] = []
+
+        def list_scan_symbols(self, scan_id: str) -> tuple[ScanSymbolRecord, ...]:
+            return self.rows
+
+        def list_report_llm_json(self, report_ids: object) -> tuple[str, ...]:
+            self.batch_reads.append(tuple(report_ids))  # type: ignore[arg-type]
+            return (
+                '{"opportunity_ids": ["OPP-1", "OPP-2"]}',
+                '{"opportunity_ids": ["OPP-2", "OPP-3"]}',
+            )
+
+        def get_report(self, report_id: str) -> object:
+            raise AssertionError("get_report must not be called (N+1)")
+
+        def get_job_run(self, scan_id: str) -> object:
+            return self.run
+
+        def get_scan(self, scan_id: str) -> None:
+            return None
+
+        def append_telegram_outbox(self, record: TelegramOutboxRecord) -> bool:
+            self.appended.append(record)
+            return True
+
+    store = _BatchReadStore()
+    record = _service(store).notify_scan("SCAN-1")
+
+    assert record is not None
+    assert "new_opportunities: 3" in json.loads(record.payload_json)["text"]
+    assert len(store.batch_reads) == 1
+    assert store.batch_reads[0] == ("RPT-1", "RPT-2")

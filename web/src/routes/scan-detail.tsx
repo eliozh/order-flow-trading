@@ -2,6 +2,7 @@ import { useEffect, useState } from 'react'
 
 import {
   fetchScan,
+  formatScanCost,
   telegramDeliveryLabel,
   type ScanData,
   type ScanEnvelope,
@@ -350,7 +351,7 @@ export function ScanDetailPage({
   const scan = load.scan
   const rows = symbolRows(scan)
   const totalTokens = scan.total_tokens ?? scan.llm_tokens ?? 0
-  const totalCost = scan.total_cost_usd ?? scan.cost_usd ?? '0'
+  const totalCost = formatScanCost(scan.total_cost_usd ?? scan.cost_usd)
   const stageRows = scan.symbols ?? []
   const completedCount = scan.symbols_completed ?? rows.filter((row) => row.stage === 'DONE').length
   const totalCount = scan.symbols_total ?? rows.length
@@ -409,7 +410,7 @@ export function ScanDetailPage({
         <div>
           <dt>Cost</dt>
           <dd className="mono">
-            ${totalCost}
+            {totalCost}
             {scan.cost_unpriced && <span className="mono-muted"> · unpriced</span>}
           </dd>
         </div>

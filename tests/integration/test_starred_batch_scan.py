@@ -1121,3 +1121,99 @@ def test_a_batch_freezes_one_effective_snapshot_across_symbols(
     assert seen[0]["effective"] is seen[1]["effective"]
     assert seen[1]["effective"].llm_provider == "stub"
     assert container.settings.llm_provider is None
+
+
+def test_hostile_stored_cost_renders_na_in_the_scan_list_and_detail(tmp_path: Path) -> None:
+    settings = _seed(tmp_path)
+    container = build_container(settings, initialize=True)
+    ledger = JobLedger(store=container.store, clock=FixedClock(NOW))
+    run_id = "SCAN-HOSTILE-COST"
+    claim = ledger.claim(
+        "scan",
+        utc_timestamp(WINDOW),
+        trigger_source="MANUAL",
+        owner="hostile-owner",
+        run_id=run_id,
+    )
+    assert claim.claimed
+    container.store.save_scan(
+        _child_scan(
+            run_id,
+            "BTCUSDT",
+            batch_id=run_id,
+            created_at="2026-11-07T08:00:00.000Z",
+        )
+    )
+    container.store.upsert_scan_symbol(
+        ScanSymbolRecord(
+            scan_id=run_id,
+            symbol="BTCUSDT",
+            stage="DONE",
+            started_at=utc_timestamp(NOW),
+            finished_at=utc_timestamp(NOW),
+            error_code=None,
+            report_id="RPT-HOSTILE",
+            data_quality="COMPLETE",
+            llm_status="VALID",
+            cost_usd="1e100000000",
+            cost_unpriced=True,
+        )
+    )
+
+    harness = _harness(settings)
+    try:
+        listed = harness.client.get("/api/v1/scans", headers=harness.auth)
+        detail = harness.client.get(f"/api/v1/scans/{run_id}", headers=harness.auth)
+    finally:
+        harness.client.close()
+
+    assert listed.status_code == 200, listed.text
+    assert detail.status_code == 200, detail.text
+    item = next(row for row in listed.json()["data"]["items"] if row["scan_id"] == run_id)
+    assert item["total_cost_usd"] == "N/A"
+    assert item["cost_unpriced"] is True
+    assert detail.json()["data"]["total_cost_usd"] == "N/A"
+    assert detail.json()["data"]["cost_unpriced"] is True
+    # The hostile sentinel must never leak as the literal string "NaN".
+    assert '"NaN"' not in listed.text
+    assert '"NaN"' not in detail.text
+
+
+def test_manual_scan_notifies_only_after_releasing_the_scan_lock(
+    tmp_path: Path, monkeypatch: Any
+) -> None:
+    settings = _seed(tmp_path)
+    container = build_container(settings, initialize=True)
+    observed: list[Any] = []
+
+    def _record(container_ref: Any, scan_id: str) -> None:
+        observed.append((scan_id, container_ref.store.get_job_lock("scan")))
+
+    monkeypatch.setattr(scans_module, "notify_scan_completion", _record)
+    request = SimpleNamespace(app=SimpleNamespace(state=SimpleNamespace(container=container)))
+    payload = ScanCreateRequest(symbol="BTCUSDT", period="4h", provider="stub")
+
+    scans_module._run_metrics_scan(request, payload)  # type: ignore[arg-type]
+
+    assert len(observed) == 1
+    assert observed[0][0]
+    assert observed[0][1] is None
+
+
+def test_scheduled_run_notifies_only_after_releasing_the_scan_lock(
+    tmp_path: Path, monkeypatch: Any
+) -> None:
+    settings = _seed(tmp_path)
+    container = build_container(settings, initialize=True)
+    observed: list[Any] = []
+
+    def _record(container_ref: Any, scan_id: str) -> None:
+        observed.append(container_ref.store.get_job_lock("scan"))
+
+    monkeypatch.setattr(jobs_module, "notify_scan_completion", _record)
+
+    outcome = ScheduledScanRunner(container=container).run_window(WINDOW, period="4h")
+
+    assert outcome.claimed is True
+    assert observed
+    assert all(lock is None for lock in observed)

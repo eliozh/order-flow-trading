@@ -361,7 +361,7 @@ def test_a_failed_scan_without_reports_pushes_only_when_the_alert_is_enabled(
     try:
         harness.configure()
         _set_config(harness.container, SCAN_FAILED_ALERT_KEY, True)
-        response = harness.post_scan({**SCAN_PAYLOAD, "symbol": "FTTUSDT"})
+        response = harness.post_scan({**SCAN_PAYLOAD, "symbol": "FTTUSDT", "period": "1h"})
         receipts = harness.container.store.list_telegram_receipts()
     finally:
         harness.close()
@@ -374,6 +374,9 @@ def test_a_failed_scan_without_reports_pushes_only_when_the_alert_is_enabled(
     assert "stage: DATA" in text
     assert "reason_code: DATA_UNAVAILABLE" in text
     assert "report_ids: none" in text
+    # The failed-scan receipt carries the requested period, not the default 4h.
+    assert "period: 1h" in text
+    assert "period: 4h" not in text
     assert SENTINEL not in text
 
 

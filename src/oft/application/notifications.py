@@ -1,11 +1,17 @@
 """The one write path for Telegram push notifications.
 
 Pushes reuse the slice-47 outbox/receipt machinery: readiness is derived from the
-existing channel state (never a network probe), exactly one allowlisted chat is
-targeted, and the outbox's unique ``event_key`` makes duplicate completions an
-idempotent no-op. Every settings, render, or store failure is caught and logged
-here, so a Telegram problem can never change a scan, report, position, or audit
-outcome.
+existing channel state (never a network probe), the outbox's unique ``event_key``
+makes duplicate completions an idempotent no-op, and every settings, render, or
+store failure is caught and logged here, so a Telegram problem can never change
+a scan, report, position, or audit outcome.
+
+Automatic pushes are **private-chat-only**. A push is enqueued without a user
+action, so it has no per-sender ``is_authorized`` check: targeting a group or
+supergroup would expose scan data to every member of that chat. Targeting
+therefore selects a push chat only when the allowlist contains exactly one
+positive (private) chat id, and fails closed (no push) when it contains none or
+several. A negative group/supergroup id is never a push target.
 
 Dependency direction stays acyclic: this module imports the pure event/render
 helpers and the ports, never ``scan_service``, ``jobs``, or the API layer.
@@ -15,13 +21,13 @@ from __future__ import annotations
 
 import json
 from collections.abc import Callable, Mapping, Sequence
-from decimal import Decimal
 from typing import TYPE_CHECKING, Any, Protocol
 
 import structlog
 
 from oft.application.scan_summary import (
     derive_scan_status,
+    format_cost_total,
     scan_cost_totals,
     stage_for_error_code,
 )
@@ -32,7 +38,7 @@ from oft.application.telegram_events import (
     scan_summary_dedupe_key,
 )
 from oft.application.telegram_messages import render_scan_summary
-from oft.domain.telegram import MAX_DECIMAL_ADJUSTED_EXPONENT, MAX_SCAN_REPORT_IDS, ReceiptState
+from oft.domain.telegram import MAX_SCAN_REPORT_IDS, ReceiptState
 from oft.domain.time import utc_timestamp
 from oft.ports.clock import ClockPort
 from oft.ports.store import (
@@ -176,12 +182,20 @@ class NotificationService:
     def notify_scan(self, scan_id: str) -> TelegramOutboxRecord | None:
         """Enqueue the one summary for a completed scan, recomputed from rows.
 
-        The summary is rebuilt from persisted state on every call, so a resume,
+        Readiness is checked before any row or report read, so an unconfigured,
+        untargetable, or fully toggled-off install pays no summary cost. The
+        summary is rebuilt from persisted state on every call, so a resume,
         retry, or second completion computes the same dedupe key and the store's
         unique constraint makes the send single-shot. Every settings, store, and
         render failure is caught here, so this never raises into a scan path.
         """
         try:
+            if not self._channel_ready():
+                return None
+            if self._target_chat() is None:
+                return None
+            if not self._push_enabled():
+                return None
             summary = self._scan_summary(scan_id)
             if summary is None:
                 return None
@@ -200,14 +214,34 @@ class NotificationService:
         return self._channel.status_state().state == "READY"
 
     def _target_chat(self) -> int | None:
-        chat_ids = tuple(
+        """The one private-chat push target, or ``None`` when unsafe.
+
+        Only positive (private) integer ids are eligible: a negative id is a
+        group/supergroup, whose members would all see a push with no per-user
+        authorization check. Exactly one eligible id is required; zero or
+        several fail closed and record one counts-only warning.
+        """
+        allowlist = self._channel.allowlist()
+        all_ids = tuple(allowlist.chat_ids)
+        private_ids = tuple(
             chat_id
-            for chat_id in self._channel.allowlist().chat_ids
-            if isinstance(chat_id, int) and not isinstance(chat_id, bool)
+            for chat_id in all_ids
+            if isinstance(chat_id, int) and not isinstance(chat_id, bool) and chat_id > 0
         )
-        if not chat_ids:
-            return None
-        return min(chat_ids)
+        if len(private_ids) == 1:
+            return private_ids[0]
+        LOGGER.warning(
+            "telegram_push_target_unsafe",
+            allowlist_count=len(all_ids),
+            private_count=len(private_ids),
+        )
+        return None
+
+    def _push_enabled(self) -> bool:
+        """Whether either scan push toggle is on (a cheap pre-read gate)."""
+        return self._read_toggle(_SCAN_REPORT_TOGGLE) or self._read_toggle(
+            _SCAN_FAILED_ALERT_TOGGLE
+        )
 
     def _event_enabled(self, event_type: str, payload: Mapping[str, Any]) -> bool:
         if event_type != SCAN_SUMMARY_EVENT_TYPE:
@@ -251,7 +285,7 @@ class NotificationService:
             return None
         all_report_ids = tuple(sorted({row.report_id for row in rows if row.report_id}))
         cost, unpriced = scan_cost_totals(rows)
-        cost_text = _bounded_cost(cost)
+        cost_text = format_cost_total(cost)
         if cost_text == "N/A":
             unpriced = True
         trigger_source, period = _scan_context(self._store, scan_id, run)
@@ -351,32 +385,22 @@ def _job_run(store: StorePort, scan_id: str) -> JobRunRecord | None:
         return None
 
 
-def _bounded_cost(cost: Decimal) -> str:
-    """Render the total cost with the renderer's hostile-exponent guard.
-
-    ``1e100000000`` would materialize a ~100 MB string before the renderer's
-    length clamp; reject it up front and let the caller mark the total unpriced.
-    """
-    if cost == 0:
-        return "0"
-    if not cost.is_finite():
-        return "N/A"
-    if abs(cost.adjusted()) > MAX_DECIMAL_ADJUSTED_EXPONENT:
-        return "N/A"
-    return format(cost, "f")
-
-
 def _new_opportunities(store: StorePort, report_ids: Sequence[str]) -> int:
+    """Count distinct opportunity ids across the scan's reports in one read.
+
+    ``list_report_llm_json`` reads only the ``llm_json`` column for the given
+    ids (chunked and parameterized), so this is one bounded batch read instead
+    of N full ``get_report`` queries. Malformed entries are skipped, exactly as
+    before; a store failure is contained by :meth:`notify_scan`.
+    """
+    if not report_ids:
+        return 0
     seen: set[str] = set()
-    for report_id in report_ids:
-        try:
-            report = store.get_report(report_id)
-        except Exception:  # noqa: BLE001 - one unreadable report is skipped
-            continue
-        if report is None or not isinstance(report.llm_json, str) or not report.llm_json:
+    for raw in store.list_report_llm_json(tuple(report_ids)):
+        if not isinstance(raw, str) or not raw:
             continue
         try:
-            value = json.loads(report.llm_json)
+            value = json.loads(raw)
         except (TypeError, ValueError):
             continue
         if not isinstance(value, Mapping):

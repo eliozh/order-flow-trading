@@ -595,6 +595,10 @@ class ScheduledScanRunner:
             daemon=True,
         )
         beat.start()
+        # The notification summary re-reads persisted rows, so it runs only
+        # after the scan lock is released (below), exactly once for a terminal
+        # path. Set the id only once the run's final status is persisted.
+        notify_run_id: str | None = None
         try:
             symbols = tuple(contract.symbol for contract in self._container.store.list_starred())
             if claim.reclaimed:
@@ -618,7 +622,7 @@ class ScheduledScanRunner:
                 _merged_status(outcome, self._container.store.list_scan_symbols(run.run_id)),
                 owner=run.lease_owner,
             )
-            notify_scan_completion(self._container, run.run_id)
+            notify_run_id = run.run_id
             return outcome
         except BaseException as exc:
             self._ledger.finish(
@@ -628,12 +632,14 @@ class ScheduledScanRunner:
                 message=str(exc),
                 owner=run.lease_owner,
             )
-            notify_scan_completion(self._container, run.run_id)
+            notify_run_id = run.run_id
             raise
         finally:
             stop.set()
             beat.join(timeout=1)
             self._ledger.release_scan_lock(run.lease_owner)
+            if notify_run_id is not None:
+                notify_scan_completion(self._container, notify_run_id)
 
     def resume(self, run_id: str, *, period: str = "4h") -> ScheduledScanOutcome:
         """Resume a reclaimed run from its ``scan_symbols`` checkpoints."""
@@ -654,6 +660,7 @@ class ScheduledScanRunner:
             daemon=True,
         )
         beat.start()
+        notify_run_id: str | None = None
         try:
             rows = self._container.store.list_scan_symbols(run_id)
             starred = tuple(contract.symbol for contract in self._container.store.list_starred())
@@ -663,7 +670,7 @@ class ScheduledScanRunner:
                 pending = _pending_symbols(run, rows, starred)
                 if not pending:
                     self._ledger.finish(run.run_id, _rows_status(rows), owner=run.lease_owner)
-                    notify_scan_completion(self._container, run.run_id)
+                    notify_run_id = run.run_id
                     return ScheduledScanOutcome(
                         run=run,
                         claimed=True,
@@ -679,7 +686,7 @@ class ScheduledScanRunner:
                         message="manual scan had no checkpoint to resume",
                         owner=run.lease_owner,
                     )
-                    notify_scan_completion(self._container, run.run_id)
+                    notify_run_id = run.run_id
                     return ScheduledScanOutcome(run=run, claimed=False, reason="no_checkpoint")
                 pending = starred
                 if not pending:
@@ -690,7 +697,7 @@ class ScheduledScanRunner:
                         message="no checkpoint and no starred symbols to resume",
                         owner=run.lease_owner,
                     )
-                    notify_scan_completion(self._container, run.run_id)
+                    notify_run_id = run.run_id
                     return ScheduledScanOutcome(run=run, claimed=False, reason="no_checkpoint")
             else:
                 # Pending = starred symbols that have no terminal row. A symbol
@@ -699,7 +706,7 @@ class ScheduledScanRunner:
                 pending = _pending_symbols(run, rows, starred)
                 if not pending:
                     self._ledger.finish(run.run_id, _rows_status(rows), owner=run.lease_owner)
-                    notify_scan_completion(self._container, run.run_id)
+                    notify_run_id = run.run_id
                     return ScheduledScanOutcome(
                         run=run,
                         claimed=True,
@@ -720,7 +727,7 @@ class ScheduledScanRunner:
                 _merged_status(outcome, self._container.store.list_scan_symbols(run.run_id)),
                 owner=run.lease_owner,
             )
-            notify_scan_completion(self._container, run.run_id)
+            notify_run_id = run.run_id
             return outcome
         except BaseException as exc:
             self._ledger.finish(
@@ -730,12 +737,14 @@ class ScheduledScanRunner:
                 message=str(exc),
                 owner=run.lease_owner,
             )
-            notify_scan_completion(self._container, run.run_id)
+            notify_run_id = run.run_id
             raise
         finally:
             stop.set()
             beat.join(timeout=1)
             self._ledger.release_scan_lock(run.lease_owner)
+            if notify_run_id is not None:
+                notify_scan_completion(self._container, notify_run_id)
 
     def _heartbeat_loop(self, run_id: str, owner: str, stop: threading.Event) -> None:
         while not stop.wait(HEARTBEAT_SECONDS):
@@ -781,6 +790,7 @@ class ScheduledScanRunner:
             daemon=True,
         )
         beat.start()
+        notify_run_id: str | None = None
         try:
             symbols = tuple(contract.symbol for contract in self._container.store.list_starred())
             if not symbols:
@@ -791,7 +801,7 @@ class ScheduledScanRunner:
                     message="no starred symbols to scan",
                     owner=run.lease_owner,
                 )
-                notify_scan_completion(self._container, run.run_id)
+                notify_run_id = run.run_id
                 return ScheduledScanOutcome(
                     run=run,
                     claimed=True,
@@ -814,7 +824,7 @@ class ScheduledScanRunner:
                 _merged_status(outcome, self._container.store.list_scan_symbols(run.run_id)),
                 owner=run.lease_owner,
             )
-            notify_scan_completion(self._container, run.run_id)
+            notify_run_id = run.run_id
             return outcome
         except BaseException as exc:
             self._ledger.finish(
@@ -824,12 +834,14 @@ class ScheduledScanRunner:
                 message=str(exc),
                 owner=run.lease_owner,
             )
-            notify_scan_completion(self._container, run.run_id)
+            notify_run_id = run.run_id
             raise
         finally:
             stop.set()
             beat.join(timeout=1)
             self._ledger.release_scan_lock(run.lease_owner)
+            if notify_run_id is not None:
+                notify_scan_completion(self._container, notify_run_id)
 
     def _execute(
         self,

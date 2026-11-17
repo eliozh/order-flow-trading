@@ -368,6 +368,27 @@ describe('ScansPage', () => {
     await waitFor(() => expect(triggerScanFn).toHaveBeenCalledWith('8h'))
   })
 
+  it('renders an unbounded cost as N/A instead of $NaN', async () => {
+    render(
+      <ScansPage
+        fetchScansFn={async () =>
+          listEnvelope([
+            scan({
+              scan_id: 'SCAN-COST-UNBOUNDED',
+              total_cost_usd: 'N/A',
+              cost_unpriced: true,
+            }),
+          ])
+        }
+        fetchStatusFn={async () => statusEnvelope()}
+      />,
+    )
+
+    expect(await screen.findByText('N/A')).toBeInTheDocument()
+    expect(screen.queryByText('$N/A')).not.toBeInTheDocument()
+    expect(screen.queryByText('$NaN')).not.toBeInTheDocument()
+  })
+
   it('labels queued, sent, and failed Telegram receipts without claiming delivery', async () => {
     // M-2: a receipt existing is not delivery; only ``state === sent`` is sent.
     render(
@@ -523,6 +544,24 @@ describe('ScanDetailPage', () => {
     expect(await screen.findByRole('heading', { name: detail.scan_id })).toBeInTheDocument()
     const page = container.querySelector('section[aria-labelledby="scan-heading"]')
     expect(page).toHaveAttribute('data-readonly', 'true')
+  })
+
+  it('renders an unbounded total cost as N/A without a dollar sign', async () => {
+    const unbounded = scan({
+      total_cost_usd: 'N/A',
+      cost_unpriced: true,
+      symbols: detail.symbols,
+    })
+    render(
+      <ScanDetailPage
+        scanId={unbounded.scan_id}
+        fetchScanFn={async () => detailEnvelope(unbounded)}
+      />,
+    )
+
+    expect(await screen.findByText('N/A')).toBeInTheDocument()
+    expect(screen.queryByText('$N/A')).not.toBeInTheDocument()
+    expect(screen.queryByText('$NaN')).not.toBeInTheDocument()
   })
 
   it('refetches while RUNNING and stops once the scan is terminal', async () => {

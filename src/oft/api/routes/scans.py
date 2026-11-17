@@ -7,6 +7,7 @@ import json
 import threading
 from contextlib import suppress
 from datetime import timedelta
+from decimal import Decimal, DecimalException
 from pathlib import Path
 from typing import Any
 
@@ -31,7 +32,7 @@ from oft.application.scan_service import (
     public_scan_payload,
     report_summary,
 )
-from oft.application.scan_summary import failure_stage, scan_cost_totals
+from oft.application.scan_summary import failure_stage, format_cost_total, scan_cost_totals
 from oft.config import Environment
 from oft.domain.time import utc_timestamp
 from oft.ports.store import IdempotencyRecord, ScanRecord, ScanSymbolRecord
@@ -321,6 +322,20 @@ def _aggregate_llm_status(rows: tuple[ScanSymbolRecord, ...]) -> str | None:
     return None
 
 
+def _stored_cost_text(raw: str) -> str:
+    """Bound a stored scalar cost through the shared formatter.
+
+    The no-rows fallback has no ``scan_symbols`` rows to aggregate, so it parses
+    the persisted ``ScanRecord.cost_usd`` and feeds it through the same guard.
+    An unparseable stored amount is rendered as ``N/A`` (and the caller marks
+    the total unpriced) instead of leaking a corrupt string.
+    """
+    try:
+        return format_cost_total(Decimal(raw))
+    except (DecimalException, TypeError, ValueError):
+        return "N/A"
+
+
 def _batch_scan_payload(
     container: Any,
     run: Any,
@@ -337,6 +352,9 @@ def _batch_scan_payload(
     failed = sum(1 for row in rows if row.stage == "FAILED")
     tokens = sum(row.llm_tokens for row in rows)
     cost, unpriced = scan_cost_totals(rows)
+    cost_text = format_cost_total(cost)
+    if cost_text == "N/A":
+        unpriced = True
     window_starts = [child.window_start for child in children if child.window_start]
     window_ends = [child.window_end for child in children if child.window_end]
     report_ids = [row.report_id for row in rows if row.report_id]
@@ -360,7 +378,7 @@ def _batch_scan_payload(
         "symbols_degraded": degraded,
         "symbols_failed": failed,
         "total_tokens": tokens,
-        "total_cost_usd": format(cost, "f"),
+        "total_cost_usd": cost_text,
         "cost_unpriced": unpriced,
         "llm_status": _aggregate_llm_status(rows),
         "report_id": report_ids[0] if report_ids else None,
@@ -379,12 +397,13 @@ def _scan_detail_payload(container: Any, record: ScanRecord) -> dict[str, object
         return payload
     rows = container.store.list_scan_symbols(record.batch_id or record.scan_id)
     total_tokens = record.llm_tokens
-    total_cost = record.cost_usd
-    cost_unpriced = record.cost_unpriced
+    total_cost = _stored_cost_text(record.cost_usd)
+    cost_unpriced = record.cost_unpriced or total_cost == "N/A"
     if rows:
         total_tokens = sum(row.llm_tokens for row in rows)
-        cost, cost_unpriced = scan_cost_totals(rows)
-        total_cost = format(cost, "f")
+        cost, aggregated_unpriced = scan_cost_totals(rows)
+        total_cost = format_cost_total(cost)
+        cost_unpriced = aggregated_unpriced or total_cost == "N/A"
         symbols = [_symbol_row(row) for row in rows]
     else:
         symbols = [
@@ -472,6 +491,7 @@ def _run_metrics_scan(request: Request, payload: ScanCreateRequest) -> dict[str,
         metrics_only=payload.metrics_only,
         provider=payload.provider,
         symbol=payload.symbol,
+        period=payload.period,
     )
     if not claim.claimed:
         conflict = ScanAlreadyRunning(running_scan_id=claim.run_id)
@@ -514,6 +534,10 @@ def _run_metrics_scan(request: Request, payload: ScanCreateRequest) -> dict[str,
 
     heartbeat = threading.Thread(target=_heartbeat, daemon=True)
     heartbeat.start()
+    # Notification work runs only after the scan lock is released, exactly once
+    # for a terminal path. The summary re-reads persisted rows, so it must not
+    # extend the critical section or hold the lock while rendering/enqueueing.
+    notify_run_id: str | None = None
     try:
         # Resolve the persisted LLM overlay once before the scan reads the
         # provider name/model, and freeze that snapshot for every stage so a
@@ -556,7 +580,7 @@ def _run_metrics_scan(request: Request, payload: ScanCreateRequest) -> dict[str,
                 cost_unpriced=False,
             )
         )
-        notify_scan_completion(container, scan_id)
+        notify_run_id = scan_id
         raise ApiError(exc.code, exc.message, details=_scan_error_details(exc)) from exc
     except BaseException as exc:
         ledger.finish(
@@ -583,7 +607,7 @@ def _run_metrics_scan(request: Request, payload: ScanCreateRequest) -> dict[str,
                 cost_unpriced=False,
             )
         )
-        notify_scan_completion(container, scan_id)
+        notify_run_id = scan_id
         raise
     else:
         container.store.upsert_scan_symbol(
@@ -607,11 +631,13 @@ def _run_metrics_scan(request: Request, payload: ScanCreateRequest) -> dict[str,
             )
         )
         ledger.finish(claim.run.run_id, "DONE", owner=claim.run.lease_owner)
-        notify_scan_completion(container, scan_id)
+        notify_run_id = scan_id
     finally:
         heartbeat_stop.set()
         heartbeat.join(timeout=1)
         ledger.release_scan_lock(claim.run.lease_owner)
+        if notify_run_id is not None:
+            notify_scan_completion(container, notify_run_id)
     detail = _scan_detail_payload(container, run.scan)
     return success_envelope(
         {

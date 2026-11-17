@@ -57,6 +57,23 @@ export function telegramDeliveryLabel(delivery?: DeliveryState | null): string {
   return 'queued'
 }
 
+/**
+ * Render a scan cost total exactly once, for both the list and detail surfaces.
+ *
+ * The daemon emits ``"N/A"`` when a stored cost is non-finite or has a hostile
+ * exponent, so that value must render without a ``$`` prefix (never ``$N/A`` or
+ * ``$NaN``). A finite amount keeps the historical ``$`` rendering.
+ */
+export function formatScanCost(value?: string | null): string {
+  if (!value) {
+    return '$0'
+  }
+  if (value === 'N/A') {
+    return 'N/A'
+  }
+  return `$${value}`
+}
+
 export interface ScanData {
   scan_id: string
   symbol?: string

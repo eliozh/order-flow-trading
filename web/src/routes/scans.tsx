@@ -2,6 +2,7 @@ import { useCallback, useEffect, useRef, useState } from 'react'
 
 import {
   fetchScans,
+  formatScanCost,
   telegramDeliveryLabel,
   triggerScan,
   type ScanData,
@@ -79,7 +80,7 @@ function displayStage(scan: ScanData): string {
 }
 
 function costLabel(scan: ScanData): string {
-  return `$${scan.total_cost_usd ?? scan.cost_usd ?? '0'}`
+  return formatScanCost(scan.total_cost_usd ?? scan.cost_usd)
 }
 
 function symbolRows(scan: ScanData) {
