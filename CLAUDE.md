@@ -38,6 +38,25 @@ npm --prefix web run typecheck
 npm --prefix web run build
 ```
 
+## Browser automation
+
+For ad-hoc browser verification of the running web shell (UI smoke test,
+screenshot, click-path), use the `agent-browser` CLI rather than a one-off
+script. Before driving it, load the version-matched guide:
+`agent-browser skills get core`.
+
+- Start each task with its own session (`agent-browser session id --scope
+  worktree --prefix task`) and pass `--session <name>` on every command; the
+  default session is shared machine-wide.
+- Point it at the running dev server, e.g. `agent-browser open
+  http://127.0.0.1:<dev-port> --session <name>`, then `snapshot -i` for `@eN`
+  refs, and re-snapshot after the page changes.
+- Keep screenshots and recordings out of the repo (`/tmp/...`), and
+  `agent-browser close --session <name>` when done.
+- This is for manual exploration only. Committed E2E coverage stays in
+  Playwright (`web/playwright.config.ts`, wired into CI) — do not replace
+  Playwright tests with agent-browser runs.
+
 ## Notes
 
 - Settings come from `OFT_*` environment variables (see `.env.example`); safe
