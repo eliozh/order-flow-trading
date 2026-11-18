@@ -6,15 +6,15 @@ number carries a unit. Values come from the same read models the Web and CLI
 render, so a Telegram reply cannot drift from them. No renderer performs I/O or
 calls a model; callers pass already-read payloads.
 
-Documented maintainability exception: this module is 888 lines, just over the
-800-line soft ceiling, because the slice-50 alert renderers (triggered,
-invalidated, entry re-check, and coalesced bursts) share the sanitizer,
-decimal/unit formatting, and outbound truncation primitives defined here. Extracting them
-would either import those private helpers across modules or duplicate the
-sanitization boundary security depends on, so the renderers stay next to the
-primitives they must use. Revisit if the alert surface grows further: extract a
-``telegram_alert_messages.py`` that imports the shared primitives without
-copying them.
+Documented maintainability exception: this module is over the 800-line soft
+ceiling because every alert renderer (triggered, invalidated, entry re-check,
+coalesced bursts, position management, risk, and degradation) shares the
+sanitizer, decimal/unit formatting, and outbound truncation primitives defined
+here. Extracting them would either import those private helpers across modules
+or duplicate the sanitization boundary security depends on, so the renderers
+stay next to the primitives they must use. Revisit if the alert surface grows
+further: extract a ``telegram_alert_messages.py`` that imports the shared
+primitives without copying them.
 """
 
 from __future__ import annotations
@@ -664,6 +664,77 @@ def render_opportunity_burst(payload: Mapping[str, Any]) -> str:
     return truncate_outbound("\n".join(lines))
 
 
+def render_position_management_alert(payload: Mapping[str, Any]) -> str:
+    """Render one executed/blocked management outcome, read-only by construction.
+
+    The payload is already an allowlist; every dynamic value is sanitized to a
+    single line. The message names the final size and price, the status, and the
+    stable reason code. It deliberately carries no approval URL, command token,
+    callback data, or inline keyboard: none is in the payload, and the closing
+    notice is this module's constant.
+    """
+    lines = [
+        f"持仓管理 · {_symbol_text(payload.get('symbol'))} · {_text(payload.get('action'))}",
+        f"position: {_text(payload.get('position_id'))}",
+        f"action: {_text(payload.get('action'))}",
+        f"status: {_text(payload.get('status'))}",
+        f"size: {_decimal_text(payload.get('size'))}",
+        f"price: {_usd_text(_decimal_or_none(payload.get('price')))}",
+        f"reason_code: {_text(payload.get('reason_code'))}",
+        f"decision_id: {_text(payload.get('decision_id'))}",
+        f"occurred_at: {_timestamp(payload.get('occurred_at'))}",
+        READ_ONLY_NOTICE,
+    ]
+    return truncate_outbound("\n".join(lines))
+
+
+def render_risk_alert(payload: Mapping[str, Any]) -> str:
+    """Render one daily-loss/leverage/notional risk alert, bounded and read-only."""
+    kind = _text(payload.get("kind"))
+    state = _text(payload.get("state"))
+    unit = _text(payload.get("unit"), default="") if payload.get("unit") else ""
+    lines = [
+        f"风险告警 · {kind} · {state}",
+        f"kind: {kind}",
+        f"state: {state}",
+        f"subject: {_text(payload.get('subject'))}",
+        f"binding_cap: {_text(payload.get('binding_cap'))}",
+        f"observed: {_unit_value(payload.get('observed'), unit)}",
+        f"threshold: {_unit_value(payload.get('threshold'), unit)}",
+        f"period: {_text(payload.get('period'))}",
+        f"reason_code: {_text(payload.get('reason_code'))}",
+        f"occurred_at: {_timestamp(payload.get('occurred_at'))}",
+        READ_ONLY_NOTICE,
+    ]
+    return truncate_outbound("\n".join(lines))
+
+
+_DEGRADATION_LABELS = {"DEGRADED": "系统降级", "RECOVERED": "系统恢复"}
+
+
+def render_degradation_alert(payload: Mapping[str, Any]) -> str:
+    """Render one DEGRADED/RECOVERED system alert (market data, WS, provider)."""
+    state = payload.get("state")
+    label = _DEGRADATION_LABELS.get(state, "系统状态") if isinstance(state, str) else "系统状态"
+    lines = [
+        f"{label} · {_text(payload.get('subject'))}",
+        f"state: {_text(state)}",
+        f"reason_code: {_text(payload.get('reason_code'))}",
+        f"occurred_at: {_timestamp(payload.get('occurred_at'))}",
+    ]
+    return truncate_outbound("\n".join(lines))
+
+
+def _unit_value(value: object, unit: str) -> str:
+    """One observed/threshold value with its unit; missing values stay ``N/A``."""
+    if value is None or value == "":
+        return "N/A"
+    rendered = _decimal_text(value, default="")
+    if not rendered:
+        return _text(value)
+    return f"{rendered} {unit}".strip()
+
+
 def _condition_unit(value: object) -> str:
     """The display unit for one condition type (empty when it has none).
 
@@ -876,14 +947,17 @@ __all__ = [
     "STATUS_HELP_FIELDS",
     "WATCHLIST_EMPTY_TEXT",
     "render_budget",
+    "render_degradation_alert",
     "render_entry_recheck_alert",
     "render_help",
     "render_invalidation_alert",
     "render_opportunities",
     "render_opportunity_burst",
+    "render_position_management_alert",
     "render_positions",
     "render_query_error",
     "render_report",
+    "render_risk_alert",
     "render_scan_summary",
     "render_status",
     "render_test_message",

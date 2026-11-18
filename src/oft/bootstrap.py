@@ -31,8 +31,8 @@ from oft.application.llm_orchestrator import (
 from oft.application.notifications import NotificationService
 from oft.application.rate_limiter import (
     GlobalRateLimiter,
-    StructlogAlertSink,
     WsSubscriptionBudget,
+    build_alert_sink,
 )
 from oft.application.secrets_service import SecretsService, SecretStoreUnavailable
 from oft.application.settings_service import SettingsService, resolve_effective_llm_settings
@@ -259,7 +259,6 @@ def build_container(
     store = SqliteStore(resolved)
     parquet = ParquetStore(resolved)
     resolved_clock = clock or SystemClock()
-    rate_limiter = GlobalRateLimiter(clock=resolved_clock, alert_sink=StructlogAlertSink())
     ws_budget = WsSubscriptionBudget()
     symbol_registry = SymbolRegistry(store, clock=resolved_clock)
     if resolved.archive_fixture_dir is not None:
@@ -272,14 +271,6 @@ def build_container(
         )
     else:
         archive = HttpsArchiveSource()
-    backfill = BackfillService(
-        settings=resolved,
-        archive=archive,
-        parquet=parquet,
-        store=store,
-        clock=resolved_clock,
-        rate_limiter=rate_limiter,
-    )
     if initialize:
         resolved.data_dir.mkdir(parents=True, exist_ok=True, mode=0o700)
         # ``exist_ok=True`` does not tighten a pre-created directory.
@@ -341,6 +332,24 @@ def build_container(
         clock=resolved_clock,
         channel=telegram_service,
         settings_service=telegram_settings_service,
+    )
+    # Compose the shared limiter after ``notifications`` exists so a 429/418
+    # cooldown mirrors the existing structlog alert into Telegram. The store is
+    # passed on the writer path only: a diagnostics container must not create
+    # or touch the data directory, and only the daemon/API needs the cooldown
+    # epoch to survive a restart.
+    rate_limiter = GlobalRateLimiter(
+        clock=resolved_clock,
+        alert_sink=build_alert_sink(notifications, clock=resolved_clock),
+        store=store if initialize else None,
+    )
+    backfill = BackfillService(
+        settings=resolved,
+        archive=archive,
+        parquet=parquet,
+        store=store,
+        clock=resolved_clock,
+        rate_limiter=rate_limiter,
     )
     return AppContainer(
         settings=effective,

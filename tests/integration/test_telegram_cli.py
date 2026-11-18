@@ -11,6 +11,7 @@ from typer.testing import CliRunner
 
 from fakes.telegram import MemorySecretBackend
 from oft.application import secrets_service as secrets_module
+from oft.application.health import DaemonProbe
 from oft.cli.main import app
 
 SENTINEL = "123456789:AAFakeSentinelToken_abcdefghijklmnopqrstuv"
@@ -128,6 +129,31 @@ def test_an_invalid_token_is_a_validation_error(configured: Any) -> None:
 
     assert result.exit_code == 2
     assert "bot_token" in result.output
+
+
+def test_watchdog_requires_the_one_shot_flag(configured: Any) -> None:
+    result = _invoke("telegram", "watchdog")
+
+    assert result.exit_code == 2
+    assert "--once" in result.output
+
+
+def test_watchdog_once_never_prints_the_token(configured: Any, monkeypatch: Any) -> None:
+    token = _invoke("telegram", "token", "set", "--stdin", input_text=SENTINEL + "\n")
+    assert token.exit_code == 0, token.output
+    monkeypatch.setattr(
+        "oft.cli.commands.telegram.probe_daemon",
+        lambda settings, timeout=0.25: DaemonProbe(state="OFFLINE", detail="no listener"),
+    )
+
+    result = _invoke("telegram", "watchdog", "--once", "--json")
+
+    assert result.exit_code == 0, result.output
+    payload = _payload(result.stdout)
+    assert payload["data"]["daemon_state"] == "OFFLINE"
+    # No allowlisted private chat is configured, so no send happens.
+    assert payload["data"]["action"] == "NONE"
+    assert SENTINEL not in result.stdout
     assert "not-a-token" not in result.stdout
 
 

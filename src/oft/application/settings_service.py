@@ -82,6 +82,8 @@ from oft.domain.telegram import (
     ENTRY_RECHECK_ALERT_KEY,
     MAX_TELEGRAM_ALLOWED_USER_IDS,
     MAX_TELEGRAM_CHAT_IDS,
+    POSITION_PUSH_KEY,
+    RISK_PUSH_KEY,
     SCAN_FAILED_ALERT_KEY,
     SCAN_REPORT_PUSH_KEY,
     TELEGRAM_ALLOWED_USER_IDS_KEY,
@@ -564,6 +566,22 @@ class SettingsService(LLMSettingsMixin, OnboardingProgressMixin):
     def read_entry_recheck_alert(self) -> bool:
         """The ``telegram.entry_recheck_alert`` toggle; absent means enabled."""
         return self._decode_bool(ENTRY_RECHECK_ALERT_KEY, default=True)
+
+    def read_position_push(self) -> bool:
+        """The ``telegram.position`` toggle; absent means enabled.
+
+        Position-management executed/blocked outcomes are enabled by default;
+        the toggle is read-only until the settings screen lands in slice 53.
+        """
+        return self._decode_bool(POSITION_PUSH_KEY, default=True)
+
+    def read_risk_push(self) -> bool:
+        """The ``telegram.risk`` toggle; absent means enabled.
+
+        Daily-loss/leverage/notional and data/provider degradation alerts share
+        this toggle. It is read-only until slice 53.
+        """
+        return self._decode_bool(RISK_PUSH_KEY, default=True)
 
     def _decode_bool(self, key: str, *, default: bool) -> bool:
         record = self._store.get_config(key)

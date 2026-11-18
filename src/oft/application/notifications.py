@@ -32,19 +32,27 @@ from oft.application.scan_summary import (
     stage_for_error_code,
 )
 from oft.application.telegram_events import (
+    DEGRADATION_EVENT_TYPE,
+    DEGRADATION_STATES,
     ENTRY_RECHECK_EVENT_TYPE,
     OPPORTUNITY_INVALIDATED_EVENT_TYPE,
     OPPORTUNITY_TRIGGERED_BURST_EVENT_TYPE,
     OPPORTUNITY_TRIGGERED_EVENT_TYPE,
+    POSITION_MANAGEMENT_EVENT_TYPE,
+    RISK_ALERT_EVENT_TYPE,
     SCAN_SUMMARY_EVENT_TYPE,
     ScanSummary,
+    build_degradation_event,
     build_scan_summary_event,
     scan_summary_dedupe_key,
 )
 from oft.application.telegram_messages import (
+    render_degradation_alert,
     render_entry_recheck_alert,
     render_invalidation_alert,
     render_opportunity_burst,
+    render_position_management_alert,
+    render_risk_alert,
     render_scan_summary,
     render_trigger_alert,
 )
@@ -78,12 +86,23 @@ _SCAN_REPORT_TOGGLE = "scan_report"
 _SCAN_FAILED_ALERT_TOGGLE = "scan_failed_alert"
 _TRIGGER_ALERT_TOGGLE = "trigger_alert"
 _ENTRY_RECHECK_ALERT_TOGGLE = "entry_recheck_alert"
+_POSITION_PUSH_TOGGLE = "position"
+_RISK_PUSH_TOGGLE = "risk"
+# The durable marker prefix for one cooldown/dedupe key; the value is the last
+# alerted period so a restart or a repeated tick is a no-op.
+ALERT_COOLDOWN_STATE_PREFIX = "telegram.alert_cooldown."
+# The last DEGRADED/RECOVERED state per subject, persisted so a daemon restart
+# inside one episode neither re-emits DEGRADED nor drops the one RECOVERED.
+DEGRADATION_STATE_PREFIX = "telegram.degradation_state."
 _RENDERERS: dict[str, Callable[[Mapping[str, Any]], str]] = {
     SCAN_SUMMARY_EVENT_TYPE: render_scan_summary,
     OPPORTUNITY_TRIGGERED_EVENT_TYPE: render_trigger_alert,
     OPPORTUNITY_INVALIDATED_EVENT_TYPE: render_invalidation_alert,
     OPPORTUNITY_TRIGGERED_BURST_EVENT_TYPE: render_opportunity_burst,
     ENTRY_RECHECK_EVENT_TYPE: render_entry_recheck_alert,
+    POSITION_MANAGEMENT_EVENT_TYPE: render_position_management_alert,
+    RISK_ALERT_EVENT_TYPE: render_risk_alert,
+    DEGRADATION_EVENT_TYPE: render_degradation_alert,
 }
 
 
@@ -105,6 +124,10 @@ class NotificationSettings(Protocol):
     def read_trigger_alert(self) -> bool: ...
 
     def read_entry_recheck_alert(self) -> bool: ...
+
+    def read_position_push(self) -> bool: ...
+
+    def read_risk_push(self) -> bool: ...
 
 
 class NotificationService:
@@ -199,6 +222,89 @@ class NotificationService:
             text=event.text,
         )
 
+    def enqueue_cooled(
+        self, event: NotificationEvent, *, cooldown_key: str, period: str
+    ) -> TelegramOutboxRecord | None:
+        """Enqueue at most once per ``cooldown_key`` and ``period``.
+
+        The marker is persisted in ``system_state``, so a repeated tick, a
+        process restart, or a second caller cannot re-alert within the same
+        period. A new period alerts again. An unreadable marker fails closed
+        (no message) and a failed enqueue leaves no marker, so a later tick can
+        retry. No exception escapes: a push never breaks its caller.
+        """
+        marker = alert_cooldown_state_key(cooldown_key)
+        try:
+            if self._store.get_system_state(marker) == period:
+                return None
+        except Exception as exc:  # noqa: BLE001 - fail closed on an unreadable marker
+            LOGGER.warning(
+                "telegram_alert_cooldown_unreadable",
+                cooldown_key=cooldown_key,
+                error_type=type(exc).__name__,
+            )
+            return None
+        record = self.enqueue_event(event)
+        if record is None:
+            return None
+        try:
+            self._store.set_system_state(
+                marker, period, updated_at=utc_timestamp(self._clock.now())
+            )
+        except Exception as exc:  # noqa: BLE001 - the outbox key still dedupes
+            LOGGER.warning(
+                "telegram_alert_cooldown_unwritable",
+                cooldown_key=cooldown_key,
+                error_type=type(exc).__name__,
+            )
+        return record
+
+    def enqueue_degradation_transition(
+        self, *, subject: str, state: str, reason_code: str, occurred_at: str
+    ) -> TelegramOutboxRecord | None:
+        """Enqueue one DEGRADED/RECOVERED transition per durable episode.
+
+        The last state for the subject is persisted in ``system_state``, so a
+        process restart mid-episode re-observing STALE does not enqueue another
+        DEGRADED, and the subsequent recovery still enqueues exactly one
+        RECOVERED. A failed enqueue leaves no marker, so a later transition can
+        retry. No exception escapes.
+        """
+        if state not in DEGRADATION_STATES:
+            return None
+        marker = degradation_state_key(subject)
+        try:
+            previous = self._store.get_system_state(marker)
+        except Exception as exc:  # noqa: BLE001 - fail closed on unreadable state
+            LOGGER.warning(
+                "telegram_degradation_state_unreadable",
+                subject=subject,
+                error_type=type(exc).__name__,
+            )
+            return None
+        if previous == state:
+            return None
+        record = self.enqueue_event(
+            build_degradation_event(
+                subject=subject,
+                state=state,
+                reason_code=reason_code,
+                occurred_at=occurred_at,
+                episode=occurred_at,
+            )
+        )
+        if record is None:
+            return None
+        try:
+            self._store.set_system_state(marker, state, updated_at=utc_timestamp(self._clock.now()))
+        except Exception as exc:  # noqa: BLE001 - the outbox key still dedupes
+            LOGGER.warning(
+                "telegram_degradation_state_unwritable",
+                subject=subject,
+                error_type=type(exc).__name__,
+            )
+        return record
+
     def notify_scan(self, scan_id: str) -> TelegramOutboxRecord | None:
         """Enqueue the one summary for a completed scan, recomputed from rows.
 
@@ -274,6 +380,10 @@ class NotificationService:
             return self._read_toggle(_TRIGGER_ALERT_TOGGLE)
         if event_type == ENTRY_RECHECK_EVENT_TYPE:
             return self._read_toggle(_ENTRY_RECHECK_ALERT_TOGGLE)
+        if event_type == POSITION_MANAGEMENT_EVENT_TYPE:
+            return self._read_toggle(_POSITION_PUSH_TOGGLE)
+        if event_type in (RISK_ALERT_EVENT_TYPE, DEGRADATION_EVENT_TYPE):
+            return self._read_toggle(_RISK_PUSH_TOGGLE)
         if event_type != SCAN_SUMMARY_EVENT_TYPE:
             return False
         report_ids = payload.get("report_ids") or ()
@@ -293,6 +403,10 @@ class NotificationService:
                 return bool(self._settings_service.read_trigger_alert())
             if toggle == _ENTRY_RECHECK_ALERT_TOGGLE:
                 return bool(self._settings_service.read_entry_recheck_alert())
+            if toggle == _POSITION_PUSH_TOGGLE:
+                return bool(self._settings_service.read_position_push())
+            if toggle == _RISK_PUSH_TOGGLE:
+                return bool(self._settings_service.read_risk_push())
             return False
         except Exception as exc:  # noqa: BLE001 - fail closed on an unreadable toggle
             LOGGER.warning(
@@ -359,6 +473,39 @@ class NotificationService:
             failed_stage=failed_stage,
             reason_code=reason_code,
             generated_at=generated_at,
+        )
+
+
+def alert_cooldown_state_key(cooldown_key: str) -> str:
+    """The persisted ``system_state`` key for one alert cooldown marker."""
+    return f"{ALERT_COOLDOWN_STATE_PREFIX}{cooldown_key}"
+
+
+def degradation_state_key(subject: str) -> str:
+    """The persisted ``system_state`` key for one subject's last degradation state."""
+    return f"{DEGRADATION_STATE_PREFIX}{subject}"
+
+
+class NotificationFreshnessSink:
+    """Map a freshness transition to one DEGRADED/RECOVERED degradation push.
+
+    ``FreshnessGuard`` calls this only on a state transition. The service
+    persists the last state per subject, so a restart mid-episode re-observing
+    STALE does not re-emit DEGRADED, and a recovery still emits exactly once.
+    """
+
+    def __init__(self, notifications: NotificationService) -> None:
+        self._notifications = notifications
+
+    def record_transition(
+        self, *, stream: str, state: str, occurred_at: str, reason: str | None
+    ) -> TelegramOutboxRecord | None:
+        reason_code = "MARKET_DATA_STALE" if state == "DEGRADED" else "MARKET_DATA_RECOVERED"
+        return self._notifications.enqueue_degradation_transition(
+            subject=stream,
+            state=state,
+            reason_code=reason_code,
+            occurred_at=occurred_at,
         )
 
 
@@ -481,13 +628,18 @@ def _safe_batch(store: StorePort, scan_id: str) -> tuple[ScanRecord, ...]:
 
 
 __all__ = [
+    "ALERT_COOLDOWN_STATE_PREFIX",
+    "DEGRADATION_STATE_PREFIX",
     "DELIVERED_REASON",
     "DELIVERY_FAILED_REASON",
     "DELIVERY_PENDING_REASON",
     "NotificationChannel",
+    "NotificationFreshnessSink",
     "NotificationService",
     "NotificationSettings",
     "TELEGRAM_NOT_CONFIGURED_REASON",
+    "alert_cooldown_state_key",
+    "degradation_state_key",
     "delivery_contract",
     "not_configured_delivery",
 ]

@@ -56,6 +56,7 @@ def _service(request: Request) -> PositionService:
         store=container.store,
         clock=container.clock,
         settings=container.settings,
+        notifications=container.notifications,
     )
 
 
@@ -71,6 +72,7 @@ def _management_service(request: Request, provider: str | None) -> ManagementSer
         settings=container.settings,
         kill_switch=kill_switch,
         runtime=container.llm_runtime,
+        notifications=container.notifications,
     )
 
 

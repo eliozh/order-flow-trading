@@ -15,8 +15,10 @@ from typing import Annotated, Any, cast
 import typer
 
 from oft.api.envelope import new_request_id, success_envelope
+from oft.application.health import probe_daemon
 from oft.application.secrets_service import SecretStoreUnavailable
 from oft.application.telegram_service import TelegramService, receipt_contract
+from oft.application.telegram_watchdog import resolve_private_chat, run_watchdog_once
 from oft.bootstrap import build_container
 from oft.cli.commands.doctor import emit_error, exit_code_for
 from oft.config import ConfigError, load_settings
@@ -159,6 +161,47 @@ def status_command(
             ]
         )
     )
+
+
+@telegram_app.command("watchdog")
+def watchdog_command(
+    once: Annotated[
+        bool, typer.Option("--once", help="Run one probe and exit (the only mode).")
+    ] = False,
+    json_output: Annotated[bool, typer.Option("--json", help="Emit JSON.")] = False,
+) -> None:
+    """One-shot host check for a dead daemon (for cron/systemd ``OnFailure=``).
+
+    This is not a long-running process and is not started by ``daemon start``.
+    It sends at most one alert and one recovery per outage and never prints the
+    bot token.
+    """
+    if not once:
+        emit_error(
+            "VALIDATION_FAILED",
+            "watchdog is one-shot only; pass --once",
+            json_output=json_output,
+        )
+        raise typer.Exit(code=2)
+    settings = _settings_or_exit(json_output)
+    # The watchdog persists its outage epoch, so it must own an initialized
+    # store even when it is the first command to touch the data directory.
+    container = _container_or_exit(settings, json_output=json_output, initialize=True)
+    service = _service(container)
+    allowlist = _call_or_exit(service.allowlist, json_output=json_output)
+    result = run_watchdog_once(
+        store=container.store,
+        clock=container.clock,
+        probe=lambda: probe_daemon(settings),
+        port=container.telegram_port,
+        chat_id=resolve_private_chat(allowlist.chat_ids),
+    )
+    if json_output:
+        _emit_json(result.to_contract())
+        return
+    typer.echo(f"daemon {result.daemon_state} · {result.action}")
+    if result.detail:
+        typer.echo(f"detail {result.detail}")
 
 
 @telegram_app.command("test")

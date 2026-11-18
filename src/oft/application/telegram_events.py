@@ -15,13 +15,17 @@ from __future__ import annotations
 import hashlib
 from collections.abc import Sequence
 from dataclasses import dataclass
+from decimal import Decimal
 from typing import Any, Protocol
 
 from oft.application.scan_summary import stage_for_error_code
 from oft.application.telegram_messages import (
+    render_degradation_alert,
     render_entry_recheck_alert,
     render_invalidation_alert,
     render_opportunity_burst,
+    render_position_management_alert,
+    render_risk_alert,
     render_scan_summary,
     render_trigger_alert,
 )
@@ -38,13 +42,26 @@ OPPORTUNITY_TRIGGERED_EVENT_TYPE = "opportunity_triggered"
 OPPORTUNITY_INVALIDATED_EVENT_TYPE = "opportunity_invalidated"
 OPPORTUNITY_TRIGGERED_BURST_EVENT_TYPE = "opportunity_triggered_burst"
 ENTRY_RECHECK_EVENT_TYPE = "entry_recheck"
+POSITION_MANAGEMENT_EVENT_TYPE = "position_management"
+RISK_ALERT_EVENT_TYPE = "risk_alert"
+DEGRADATION_EVENT_TYPE = "degradation"
 # A trigger/burst is more urgent than a routine scan summary; an entry re-check
-# awaiting a human action is the most urgent of all.
+# awaiting a human action is the most urgent of all. Position/risk events move
+# money or explain a block, so they outrank routine summaries.
 OPPORTUNITY_ALERT_PRIORITY = 20
 ENTRY_RECHECK_PRIORITY = 30
+POSITION_ALERT_PRIORITY = 40
+RISK_ALERT_PRIORITY = 40
+DEGRADATION_PRIORITY = 25
 OPPORTUNITY_SUBJECT_KIND = "OPPORTUNITY"
 ENTRY_SUBJECT_KIND = "TRIGGER"
 BURST_SUBJECT_KIND = "OPPORTUNITY_BURST"
+POSITION_SUBJECT_KIND = "POSITION"
+RISK_SUBJECT_KIND = "RISK"
+DEGRADATION_SUBJECT_KIND = "SYSTEM"
+RISK_ALERT_KINDS: tuple[str, ...] = ("DAILY_LOSS", "MAX_LEVERAGE", "MAX_NOTIONAL")
+DEGRADATION_STATES: tuple[str, ...] = ("DEGRADED", "RECOVERED")
+DAILY_LOSS_APPROACH_RATIO = Decimal("0.8")
 _OPPORTUNITY_ALERT_STATE_TRIGGERED = "TRIGGERED"
 _OPPORTUNITY_ALERT_STATE_INVALIDATED = "INVALIDATED"
 # The single-level keys an invalidation condition may carry; the first present
@@ -73,7 +90,7 @@ class NotificationEvent:
 
 
 class NotificationSink(Protocol):
-    """The one write a service needs from the notification layer.
+    """The writes a service needs from the notification layer.
 
     Services depend on this narrow structural surface instead of the concrete
     ``NotificationService`` so a notification failure can never couple back into
@@ -81,6 +98,10 @@ class NotificationSink(Protocol):
     """
 
     def enqueue_event(self, event: NotificationEvent) -> object | None: ...
+
+    def enqueue_cooled(
+        self, event: NotificationEvent, *, cooldown_key: str, period: str
+    ) -> object | None: ...
 
 
 @dataclass(frozen=True)
@@ -302,6 +323,183 @@ def build_entry_recheck_event(
     )
 
 
+def position_alert_dedupe_key(decision_id: str, status: str, action: str) -> str:
+    """One durable key per management outcome; a replay is an outbox no-op."""
+    return f"position:{decision_id}:{status}:{action}"
+
+
+def build_position_management_event(
+    *,
+    position_id: str,
+    symbol: str,
+    action: str,
+    status: str,
+    size: object,
+    price: object,
+    reason_code: str,
+    decision_id: str,
+    occurred_at: str,
+) -> NotificationEvent:
+    """Build one executed/blocked management outcome from an explicit allowlist.
+
+    Only the position identity, the action/status, the final size and price, the
+    stable reason code, and the decision id are copied. No order id, approval
+    URL, callback data, or keyboard surface is present, so a push can never
+    become a Telegram action.
+    """
+    resolved_action = str(action)
+    resolved_status = str(status)
+    payload: dict[str, Any] = {
+        "position_id": position_id,
+        "symbol": symbol,
+        "action": resolved_action,
+        "status": resolved_status,
+        "size": None if size is None else str(size),
+        "price": None if price is None else str(price),
+        "reason_code": reason_code,
+        "decision_id": decision_id,
+        "occurred_at": occurred_at,
+    }
+    return NotificationEvent(
+        event_type=POSITION_MANAGEMENT_EVENT_TYPE,
+        subject={"kind": POSITION_SUBJECT_KIND, "id": position_id},
+        dedupe_key=position_alert_dedupe_key(decision_id, resolved_status, resolved_action),
+        priority=POSITION_ALERT_PRIORITY,
+        payload=payload,
+        text=render_position_management_alert(payload),
+    )
+
+
+def risk_alert_kind_for_cap(binding_cap: object) -> str | None:
+    """Map a risk-gate binding cap to one alert kind, or ``None``."""
+    value = str(binding_cap) if binding_cap is not None else ""
+    return value if value in RISK_ALERT_KINDS else None
+
+
+def daily_loss_alert_state(*, daily_loss: Decimal | None, limit: Decimal | None) -> str | None:
+    """APPROACH/BREACH for the existing daily-loss cap, or ``None``.
+
+    This only compares the already-measured loss with the already-configured
+    cap; it does not evaluate or change the risk rule.
+    """
+    if daily_loss is None or limit is None or limit <= 0:
+        return None
+    ratio = daily_loss / limit
+    if ratio >= 1:
+        return "BREACH"
+    if ratio >= DAILY_LOSS_APPROACH_RATIO:
+        return "APPROACH"
+    return None
+
+
+def risk_alert_dedupe_key(kind: str, subject: str, period: str, state: str) -> str:
+    """One key per kind+subject+period+state crossing."""
+    return f"risk:{kind}:{subject}:{period}:{state}"
+
+
+def build_risk_alert_event(
+    *,
+    kind: str,
+    subject: str,
+    binding_cap: str,
+    state: str,
+    observed: object,
+    threshold: object,
+    unit: str,
+    period: str,
+    reason_code: str,
+    occurred_at: str,
+) -> NotificationEvent:
+    """Build one daily-loss/leverage/notional alert from gate-provided values."""
+    payload: dict[str, Any] = {
+        "kind": kind,
+        "subject": subject,
+        "binding_cap": binding_cap,
+        "state": state,
+        "observed": None if observed is None else str(observed),
+        "threshold": None if threshold is None else str(threshold),
+        "unit": unit,
+        "period": period,
+        "reason_code": reason_code,
+        "occurred_at": occurred_at,
+    }
+    return NotificationEvent(
+        event_type=RISK_ALERT_EVENT_TYPE,
+        subject={"kind": RISK_SUBJECT_KIND, "id": f"{kind}:{subject}"},
+        dedupe_key=risk_alert_dedupe_key(kind, subject, period, state),
+        priority=RISK_ALERT_PRIORITY,
+        payload=payload,
+        text=render_risk_alert(payload),
+    )
+
+
+def enqueue_risk_alert(
+    sink: NotificationSink,
+    *,
+    kind: str,
+    subject: str,
+    binding_cap: str,
+    state: str,
+    observed: object,
+    threshold: object,
+    unit: str,
+    period: str,
+    reason_code: str,
+    occurred_at: str,
+) -> object | None:
+    """Build and enqueue one risk alert through the durable cooldown path.
+
+    The cooldown marker reuses the event's dedupe key, which includes the
+    severity state. An APPROACH and a later BREACH in the same period therefore
+    each alert once, while an identical repeat (including after a restart) is a
+    durable no-op. This is the single helper both the entry and management
+    paths call, so their alert shape cannot drift.
+    """
+    event = build_risk_alert_event(
+        kind=kind,
+        subject=subject,
+        binding_cap=binding_cap,
+        state=state,
+        observed=observed,
+        threshold=threshold,
+        unit=unit,
+        period=period,
+        reason_code=reason_code,
+        occurred_at=occurred_at,
+    )
+    return sink.enqueue_cooled(event, cooldown_key=event.dedupe_key, period=period)
+
+
+def degradation_dedupe_key(subject: str, state: str, episode: str) -> str:
+    """One key per subject+state+episode transition."""
+    return f"degraded:{subject}:{state}:{episode}"
+
+
+def build_degradation_event(
+    *,
+    subject: str,
+    state: str,
+    reason_code: str,
+    occurred_at: str,
+    episode: str,
+) -> NotificationEvent:
+    """Build one DEGRADED/RECOVERED system transition event."""
+    payload: dict[str, Any] = {
+        "subject": subject,
+        "state": state,
+        "reason_code": reason_code,
+        "occurred_at": occurred_at,
+    }
+    return NotificationEvent(
+        event_type=DEGRADATION_EVENT_TYPE,
+        subject={"kind": DEGRADATION_SUBJECT_KIND, "id": subject},
+        dedupe_key=degradation_dedupe_key(subject, state, episode),
+        priority=DEGRADATION_PRIORITY,
+        payload=payload,
+        text=render_degradation_alert(payload),
+    )
+
+
 def build_opportunity_burst_event(events: Sequence[NotificationEvent]) -> NotificationEvent:
     """Coalesce several TRIGGERED transitions into one bounded push.
 
@@ -372,6 +570,10 @@ def _non_negative(value: object) -> int:
 
 
 __all__ = [
+    "DAILY_LOSS_APPROACH_RATIO",
+    "DEGRADATION_EVENT_TYPE",
+    "DEGRADATION_PRIORITY",
+    "DEGRADATION_STATES",
     "ENTRY_RECHECK_EVENT_TYPE",
     "ENTRY_RECHECK_PRIORITY",
     "MAX_OPPORTUNITY_ALERT_ITEMS",
@@ -380,6 +582,11 @@ __all__ = [
     "OPPORTUNITY_INVALIDATED_EVENT_TYPE",
     "OPPORTUNITY_TRIGGERED_BURST_EVENT_TYPE",
     "OPPORTUNITY_TRIGGERED_EVENT_TYPE",
+    "POSITION_ALERT_PRIORITY",
+    "POSITION_MANAGEMENT_EVENT_TYPE",
+    "RISK_ALERT_EVENT_TYPE",
+    "RISK_ALERT_KINDS",
+    "RISK_ALERT_PRIORITY",
     "SCAN_STATUSES",
     "SCAN_SUBJECT_KIND",
     "SCAN_SUMMARY_EVENT_TYPE",
@@ -387,14 +594,23 @@ __all__ = [
     "NotificationEvent",
     "NotificationSink",
     "ScanSummary",
+    "build_degradation_event",
     "build_entry_recheck_event",
     "build_opportunity_burst_event",
     "build_opportunity_invalidated_event",
     "build_opportunity_triggered_event",
+    "build_position_management_event",
+    "build_risk_alert_event",
     "build_scan_summary_event",
+    "daily_loss_alert_state",
+    "degradation_dedupe_key",
+    "enqueue_risk_alert",
     "entry_alert_decision",
     "opportunity_state_version",
     "opportunity_transition_dedupe_key",
+    "position_alert_dedupe_key",
+    "risk_alert_dedupe_key",
+    "risk_alert_kind_for_cap",
     "scan_summary_dedupe_key",
     "scan_summary_subject",
     "stage_for_error_code",
