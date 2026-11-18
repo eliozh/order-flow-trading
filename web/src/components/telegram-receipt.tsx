@@ -76,7 +76,7 @@ export function TelegramTestReceipt({ receipt }: { receipt: TelegramReceipt | nu
           <dd>
             <TelegramReceiptStateChip state={receipt.state} />
           </dd>
-          <dt>Message ID</dt>
+          <dt lang="en">Message ID</dt>
           <dd className="mono">{receipt.message_id ?? '—'}</dd>
           <dt>送达时间</dt>
           <dd className="mono">{receipt.sent_at ?? '—'}</dd>
@@ -102,7 +102,7 @@ export function TelegramReceiptTable({ receipts }: { receipts: TelegramReceipt[]
     <div className="table-wrap" role="region" aria-label="Telegram 投递回执" tabIndex={0}>
       <table className="data-table" data-testid="telegram-receipts">
         <caption>Telegram 投递回执（最新在前，最多 6 条）</caption>
-        <thead>
+        <thead lang="en">
           <tr>
             <th scope="col">MESSAGE ID</th>
             <th scope="col">EVENT</th>

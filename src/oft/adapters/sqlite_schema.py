@@ -631,6 +631,15 @@ _V30_DDL: tuple[str, ...] = (
     f"CREATE TABLE IF NOT EXISTS telegram_outbox ({_TELEGRAM_OUTBOX_DEFINITION});",
     "CREATE INDEX IF NOT EXISTS telegram_outbox_due "
     "ON telegram_outbox(state, next_attempt_at, priority);",
+    # Per-chat claim ordering: the claim query correlates an earlier same-chat
+    # pending row for every candidate, so this composite index turns that
+    # per-row scan into an index seek.
+    "CREATE INDEX IF NOT EXISTS telegram_outbox_chat_due "
+    "ON telegram_outbox(state, chat_id, created_at);",
+)
+_TELEGRAM_OUTBOX_CHAT_INDEX_DDL = (
+    "CREATE INDEX IF NOT EXISTS telegram_outbox_chat_due "
+    "ON telegram_outbox(state, chat_id, created_at)"
 )
 _OPPORTUNITY_CONDITION_INDEX_NAMES = (
     "opportunity_conditions_opportunity",
@@ -2469,6 +2478,28 @@ def _migrate_v30(connection: sqlite3.Connection) -> None:
         raise
 
 
+def _ensure_telegram_outbox_chat_index(connection: sqlite3.Connection) -> None:
+    """Re-apply the per-chat claim index to a v30 database that predates it.
+
+    The v30 table was stamped before the claim query grew its correlated
+    per-chat ordering predicate. ``CREATE INDEX IF NOT EXISTS`` makes this an
+    idempotent repair that runs on every boot; a fresh database already has the
+    same index from ``_V30_DDL``.
+    """
+    if not _table_exists(connection, "telegram_outbox"):
+        return
+    if connection.in_transaction:
+        connection.commit()
+    connection.execute("BEGIN IMMEDIATE")
+    try:
+        connection.execute(_TELEGRAM_OUTBOX_CHAT_INDEX_DDL)
+        connection.execute("COMMIT")
+    except Exception:
+        if connection.in_transaction:
+            connection.execute("ROLLBACK")
+        raise
+
+
 def _opportunity_conditions_pk(
     connection: sqlite3.Connection,
 ) -> tuple[str, ...]:
@@ -2665,7 +2696,9 @@ def initialize_database(settings: Settings) -> None:
     backend happens to be selected now; pre-v29 rows read as ``unknown`` and are
     probed. v30 adds the additive ``telegram_outbox`` table (unique
     ``event_key``, receipt state machine, bounded attempts) used by the
-    read-only Telegram channel.
+    read-only Telegram channel, plus the due-order and per-chat claim indexes
+    (``state, chat_id, created_at``) so per-chat ordering is an index seek
+    rather than a per-row scan of the pending queue.
     """
     settings.data_dir.mkdir(parents=True, exist_ok=True)
     settings.data_dir.chmod(0o700)
@@ -2743,6 +2776,7 @@ def initialize_database(settings: Settings) -> None:
             _migrate_v29(connection)
         if _schema_version(connection) < 30 or not _migration_recorded(connection, 30):
             _migrate_v30(connection)
+        _ensure_telegram_outbox_chat_index(connection)
         _ensure_opportunity_conditions_shape(connection)
         _ensure_funding_accruals_shape(connection)
         with connection:

@@ -8,7 +8,7 @@ import structlog
 from pydantic import BaseModel, ConfigDict, Field
 
 from oft import __version__
-from oft.application.health import DaemonProbe
+from oft.application.health import DaemonProbe, telegram_observability
 from oft.config import ConfigError, Settings
 from oft.domain.symbols import SymbolUniverseSummary, summarize_universe
 from oft.domain.time import utc_timestamp
@@ -77,6 +77,55 @@ class ScheduleStatus(BaseModel):
     next_run_at: str
 
 
+class TelegramChatStatus(BaseModel):
+    """Per-chat receipt totals; ids are allowlisted, never message text."""
+
+    model_config = ConfigDict(frozen=True)
+
+    chat_id: int
+    queued: int = 0
+    sending: int = 0
+    sent: int = 0
+    failed: int = 0
+    last_error_code: str | None = None
+
+
+class TelegramReceiptSummary(BaseModel):
+    """One bounded recent receipt (no payload text, no raw Bot API body)."""
+
+    model_config = ConfigDict(frozen=True)
+
+    event_key: str
+    kind: str
+    chat_id: int
+    state: str
+    attempts: int
+    message_id: int | None = None
+    last_error_code: str | None = None
+    created_at: str
+    sent_at: str | None = None
+
+
+class TelegramStatus(BaseModel):
+    """Stable Telegram delivery state for `/api/v1/status` and `/system`."""
+
+    model_config = ConfigDict(frozen=True)
+
+    configured: bool
+    chat_count: int
+    allowed_user_count: int
+    poller_state: str
+    last_poll_at: str | None = None
+    last_send_at: str | None = None
+    failing_receipts: int = 0
+    receipts: dict[str, int] = Field(default_factory=dict)
+    per_chat: tuple[TelegramChatStatus, ...] = ()
+    recent_receipts: tuple[TelegramReceiptSummary, ...] = ()
+    overflow_code: str | None = None
+    last_error_code: str | None = None
+    daemon_state: str = "UP"
+
+
 class StatusReport(BaseModel):
     """Daemon-independent system status."""
 
@@ -95,6 +144,20 @@ class StatusReport(BaseModel):
     last_scan: LastScanSummary | None = None
     market_data: MarketDataStatus | None = None
     schedule: ScheduleStatus | None = None
+    telegram: TelegramStatus | None = None
+
+
+def _telegram_status(
+    settings: Settings, store: StorePort | None, clock: ClockPort
+) -> TelegramStatus | None:
+    if store is None:
+        return None
+    summary = telegram_observability(settings, store, clock)
+    try:
+        return TelegramStatus(**summary)
+    except Exception as exc:  # noqa: BLE001 - status never fails over diagnostics
+        _LOGGER.warning("telegram_status_unavailable", error_type=type(exc).__name__)
+        return None
 
 
 def _last_scan(store: StorePort | None) -> LastScanSummary | None:
@@ -207,4 +270,5 @@ def build_status(
         last_scan=_last_scan(store),
         market_data=market_data_status or _market_data_status(settings),
         schedule=_schedule_status(settings, clock, store),
+        telegram=_telegram_status(settings, store, clock),
     )

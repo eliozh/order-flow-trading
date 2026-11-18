@@ -223,7 +223,10 @@ class TelegramBotApiAdapter:
 def _map_error_code(error_code: object, http_status: int) -> str:
     """Map the numeric Bot API/HTTP failure to one stable port code."""
     code = error_code if isinstance(error_code, int) else http_status
-    if code == 401:
+    # 404 is Telegram's "Not Found" for a bot path: the token was revoked or the
+    # bot no longer exists, so it is a permanently invalid token (never a
+    # transient upstream failure).
+    if code in (401, 404):
         return TELEGRAM_TOKEN_INVALID
     if code == 429:
         return TELEGRAM_RATE_LIMITED

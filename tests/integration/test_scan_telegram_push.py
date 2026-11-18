@@ -290,6 +290,7 @@ def test_a_dispatch_failure_records_a_failed_receipt_but_not_a_failed_scan(
             store=harness.container.store,
             clock=clock,
             port_resolver=lambda: failing,
+            jitter=lambda: 0.0,
         )
         assert dispatcher.dispatch_once() == 0
         clock.advance(2)

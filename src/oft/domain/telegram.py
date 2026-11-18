@@ -114,6 +114,20 @@ MAX_DECIMAL_ADJUSTED_EXPONENT = 30
 POLL_OFFSET_KEY = "telegram.poll_offset"
 POLLER_HEARTBEAT_KEY = "telegram.poller_heartbeat"
 DISPATCHER_HEARTBEAT_KEY = "telegram.dispatcher_heartbeat"
+# The poller's stable enum state plus its last bounded reason code. The
+# heartbeat is only written after a *successful* poll, so health can tell "last
+# poll worked" apart from "the loop is retrying"; the state key always carries
+# one of the POLLER_STATE_* enum values and the raw port code lives only in
+# POLLER_LAST_ERROR_KEY.
+POLLER_STATE_KEY = "telegram.poller_state"
+POLLER_LAST_ERROR_KEY = "telegram.poller_last_error"
+POLLER_STATE_RUNNING = "RUNNING"
+POLLER_STATE_DEGRADED = "DEGRADED"
+POLLER_STATE_CONFLICT = "CONFLICT"
+POLLER_STATE_UNKNOWN = "UNKNOWN"
+# The dispatcher records the last accepted send so diagnostics do not have to
+# scan the outbox (which is bounded and eventually purged).
+TELEGRAM_LAST_SEND_AT_KEY = "telegram.last_send_at"
 POLLER_STALE_SECONDS = 60
 # The single retry bound shared by the claim predicate and the terminal
 # decision in the dispatcher, so the two layers cannot drift.
@@ -129,6 +143,17 @@ TELEGRAM_RETRY_AFTER_MAX_SECONDS = 3600
 # terminate: once the row is this old it becomes terminal ``failed`` instead of
 # retrying forever. Until then its delay grows with the row's age.
 TELEGRAM_OUTBOX_DEFER_MAX_SECONDS = 3600
+# A sustained burst must not grow SQLite without bound. Non-terminal rows are
+# capped globally and per chat; an overflow is rejected and recorded under
+# :data:`TELEGRAM_OUTBOX_OVERFLOW_KEY` with the stable
+# :data:`TELEGRAM_QUEUE_FULL` code, so `/system`, `oft doctor`, and the receipt
+# surface can report it. A duplicate `event_key` remains a silent no-op.
+TELEGRAM_OUTBOX_MAX_PENDING = 1000
+TELEGRAM_OUTBOX_MAX_PENDING_PER_CHAT = 100
+TELEGRAM_OUTBOX_OVERFLOW_KEY = "telegram.outbox_overflow"
+TELEGRAM_QUEUE_FULL = "TELEGRAM_QUEUE_FULL"
+# A local per-chat token bucket defers a burst without counting an attempt.
+TELEGRAM_LOCAL_RATE_LIMITED = "TELEGRAM_LOCAL_RATE_LIMITED"
 # Terminal outbox rows older than this are purged periodically (bounded
 # batches, at most once per interval) so a long-running daemon cannot grow the
 # table without bound.
@@ -407,7 +432,13 @@ __all__ = [
     "MAX_TELEGRAM_OUTBOX_ATTEMPTS",
     "OPPORTUNITIES_COMMAND",
     "POLLER_HEARTBEAT_KEY",
+    "POLLER_LAST_ERROR_KEY",
     "POLLER_STALE_SECONDS",
+    "POLLER_STATE_KEY",
+    "POLLER_STATE_CONFLICT",
+    "POLLER_STATE_DEGRADED",
+    "POLLER_STATE_RUNNING",
+    "POLLER_STATE_UNKNOWN",
     "POLL_OFFSET_KEY",
     "POSITIONS_COMMAND",
     "POSITION_PUSH_KEY",
@@ -427,15 +458,21 @@ __all__ = [
     "TELEGRAM_OUTBOX_BACKOFF_BASE_SECONDS",
     "TELEGRAM_OUTBOX_BACKOFF_MAX_SECONDS",
     "TELEGRAM_OUTBOX_CLAIM_LEASE_SECONDS",
+    "TELEGRAM_LOCAL_RATE_LIMITED",
     "TELEGRAM_OUTBOX_DEFER_MAX_SECONDS",
+    "TELEGRAM_OUTBOX_MAX_PENDING",
+    "TELEGRAM_OUTBOX_MAX_PENDING_PER_CHAT",
+    "TELEGRAM_OUTBOX_OVERFLOW_KEY",
     "TELEGRAM_OUTBOX_PURGE_BATCH",
     "TELEGRAM_OUTBOX_PURGE_INTERVAL_SECONDS",
     "TELEGRAM_OUTBOX_PURGE_KEY",
     "TELEGRAM_OUTBOX_PURGE_MAX_BATCHES",
     "TELEGRAM_OUTBOX_RETENTION_SECONDS",
     "TELEGRAM_REFUSAL_AUDIT_WINDOW_SECONDS",
+    "TELEGRAM_QUEUE_FULL",
     "TELEGRAM_RETRY_AFTER_MAX_SECONDS",
     "TELEGRAM_SUBJECT",
+    "TELEGRAM_LAST_SEND_AT_KEY",
     "TELEGRAM_TOKEN_NAME",
     "TRUNCATION_MARKER",
     "WATCHLIST_COMMAND",

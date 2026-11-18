@@ -653,6 +653,16 @@ code {
   font-size: 13px;
 }
 
+/* Telegram compact cells carry unbreakable stable codes and event keys. */
+.scan-grid--telegram > div {
+  min-width: 0;
+}
+
+.scan-grid--telegram dt,
+.scan-grid--telegram dd {
+  overflow-wrap: anywhere;
+}
+
 .value-up {
   color: var(--oft-market-up);
 }

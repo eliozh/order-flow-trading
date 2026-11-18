@@ -16,16 +16,31 @@ from collections.abc import Callable
 
 import structlog
 
-from oft.application.telegram_dispatch import OutboxDispatcher, TelegramDispatchScheduler
+from oft.application.telegram_dispatch import (
+    OutboxDispatcher,
+    TelegramDispatchScheduler,
+    retry_after_delay_seconds,
+)
 from oft.application.telegram_service import TelegramService
-from oft.domain.telegram import POLL_OFFSET_KEY, POLLER_HEARTBEAT_KEY
+from oft.domain.telegram import (
+    POLL_OFFSET_KEY,
+    POLLER_HEARTBEAT_KEY,
+    POLLER_LAST_ERROR_KEY,
+    POLLER_STATE_CONFLICT,
+    POLLER_STATE_DEGRADED,
+    POLLER_STATE_KEY,
+    POLLER_STATE_RUNNING,
+)
 from oft.domain.time import utc_timestamp
 from oft.ports.clock import ClockPort
 from oft.ports.store import StorePort
 from oft.ports.telegram import (
+    TELEGRAM_CONFLICT,
     TELEGRAM_NOT_CONFIGURED,
+    TELEGRAM_RATE_LIMITED,
     TELEGRAM_TOKEN_INVALID,
     TELEGRAM_UNAUTHORIZED,
+    TELEGRAM_UPSTREAM_ERROR,
     TelegramError,
     TelegramPort,
 )
@@ -70,6 +85,8 @@ class TelegramPoller:
         self._wait_override: float | None = None
         self._last_config_code: str | None = None
         self._consecutive_failures = 0
+        self._last_poller_state: str | None = None
+        self._last_poller_error: str | None = None
 
     @property
     def is_running(self) -> bool:
@@ -103,23 +120,40 @@ class TelegramPoller:
                 # every tick, and do not write heartbeats (health degrades).
                 self._wait_override = UNCONFIGURED_BACKOFF_SECONDS
                 self._consecutive_failures = 0
+                # Persist the enum state only; the raw port code lives in
+                # POLLER_LAST_ERROR_KEY so health never matches magic strings.
+                self._record_state(POLLER_STATE_DEGRADED, exc.code)
                 if self._last_config_code != exc.code:
                     LOGGER.info("telegram_poll_unconfigured", code=exc.code)
                     self._last_config_code = exc.code
                 return 0
             self._last_config_code = None
             self._consecutive_failures += 1
-            self._wait_override = self._transient_backoff()
+            wait_seconds = self._transient_backoff()
+            if exc.code == TELEGRAM_RATE_LIMITED and exc.retry_after is not None:
+                # The Bot API's retry_after is a floor, exactly as the
+                # dispatcher treats a send-side 429, but it is bounded by the
+                # shared cap so a huge value cannot park the loop for hours.
+                wait_seconds = max(wait_seconds, float(retry_after_delay_seconds(exc.retry_after)))
+            self._wait_override = wait_seconds
+            if exc.code == TELEGRAM_CONFLICT:
+                # Another long-poller owns this bot token. Back off with the same
+                # bounded schedule; a 409 is not retried in a tight loop.
+                previous = self._last_poller_state
+                self._record_state(POLLER_STATE_CONFLICT, exc.code)
+                if previous != POLLER_STATE_CONFLICT:
+                    LOGGER.warning("telegram_poll_conflict", code=exc.code)
+                return 0
             # Rate-limited or upstream down: stay alive and try again later.
+            self._record_state(POLLER_STATE_DEGRADED, exc.code)
             LOGGER.warning("telegram_poll_failed", code=exc.code)
-            self._heartbeat()
             return 0
         except Exception:  # noqa: BLE001 - the supervisor thread must survive
             self._last_config_code = None
             self._consecutive_failures += 1
             self._wait_override = self._transient_backoff()
+            self._record_state(POLLER_STATE_DEGRADED, TELEGRAM_UPSTREAM_ERROR)
             LOGGER.exception("telegram_poll_unexpected_failure")
-            self._heartbeat()
             return 0
         processed = 0
         handling_failed = False
@@ -150,6 +184,7 @@ class TelegramPoller:
         self._wait_override = None
         self._last_config_code = None
         self._consecutive_failures = 0
+        self._record_state(POLLER_STATE_RUNNING, None)
         self._heartbeat()
         return processed
 
@@ -162,6 +197,28 @@ class TelegramPoller:
         now = utc_timestamp(self._clock.now())
         self._store.set_system_state(POLLER_HEARTBEAT_KEY, now, updated_at=now)
 
+    def _record_state(self, state: str, error: str | None) -> None:
+        """Persist the stable poller state and last reason, only on a change.
+
+        ``state`` is always one of the ``POLLER_STATE_*`` enum values; a raw
+        port code (``TELEGRAM_TOKEN_INVALID`` and friends) is stored only in
+        ``POLLER_LAST_ERROR_KEY`` so diagnostics never have to match magic
+        strings. The heartbeat is written solely after a successful poll; this
+        state key is what tells ``/system`` and ``oft doctor`` that the loop is
+        retrying (``DEGRADED``/``CONFLICT``) rather than healthy.
+        """
+        if state == self._last_poller_state and error == self._last_poller_error:
+            return
+        try:
+            now = utc_timestamp(self._clock.now())
+            self._store.set_system_state(POLLER_STATE_KEY, state, updated_at=now)
+            self._store.set_system_state(POLLER_LAST_ERROR_KEY, error or "", updated_at=now)
+        except Exception:  # noqa: BLE001 - diagnostics must not kill the loop
+            LOGGER.warning("telegram_poller_state_write_failed")
+            return
+        self._last_poller_state = state
+        self._last_poller_error = error
+
     def start(self) -> None:
         if self.is_running:
             LOGGER.warning("telegram_poller_already_running")
@@ -172,6 +229,9 @@ class TelegramPoller:
 
     def _run(self) -> None:
         while not self._stop.is_set():
+            # Guard the poll separately so an escaped store failure neither
+            # kills the supervisor thread nor skips the wait below (which
+            # would spin the loop).
             try:
                 self.poll_once()
             except Exception:  # noqa: BLE001 - never exit the supervisor loop
@@ -181,7 +241,12 @@ class TelegramPoller:
                 if self._wait_override is not None
                 else self._poll_interval_seconds
             )
-            self._stop.wait(wait_seconds)
+            # Keep the wait inside the guarded block: an unexpected wait
+            # error must never kill the supervisor thread.
+            try:
+                self._stop.wait(wait_seconds)
+            except Exception:  # noqa: BLE001 - an unexpected wait error must not kill the loop
+                LOGGER.exception("telegram_poller_wait_failed")
 
     def shutdown(self, *, wait: bool = True) -> None:
         self._stop.set()

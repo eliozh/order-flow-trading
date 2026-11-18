@@ -23,6 +23,43 @@ export interface ScheduleData {
   next_run_at: string
 }
 
+export interface TelegramChatStatusData {
+  chat_id: number
+  queued: number
+  sending: number
+  sent: number
+  failed: number
+  last_error_code: string | null
+}
+
+export interface TelegramReceiptData {
+  event_key: string
+  kind: string
+  chat_id: number
+  state: string
+  attempts: number
+  message_id: number | null
+  last_error_code: string | null
+  created_at: string
+  sent_at: string | null
+}
+
+export interface TelegramStatusData {
+  configured: boolean
+  chat_count: number
+  allowed_user_count: number
+  poller_state: string
+  last_poll_at: string | null
+  last_send_at: string | null
+  failing_receipts: number
+  receipts: Record<string, number>
+  per_chat: TelegramChatStatusData[]
+  recent_receipts: TelegramReceiptData[]
+  overflow_code: string | null
+  last_error_code: string | null
+  daemon_state: string
+}
+
 export interface StatusData {
   status: 'ok'
   env: string
@@ -34,6 +71,7 @@ export interface StatusData {
   generated_at: string
   universe: UniverseSummary
   schedule?: ScheduleData | null
+  telegram?: TelegramStatusData | null
 }
 
 export interface ApiError {
@@ -224,6 +262,61 @@ export function isScanRecordData(value: unknown): value is ScanRecordData {
   )
 }
 
+/** Shape guard for one per-chat Telegram receipt summary. */
+export function isTelegramChatStatusData(value: unknown): value is TelegramChatStatusData {
+  return (
+    isRecord(value) &&
+    typeof value.chat_id === 'number' &&
+    typeof value.queued === 'number' &&
+    typeof value.sending === 'number' &&
+    typeof value.sent === 'number' &&
+    typeof value.failed === 'number' &&
+    isNullableString(value.last_error_code)
+  )
+}
+
+/** Shape guard for one bounded recent Telegram receipt (no payload text). */
+export function isTelegramReceiptData(value: unknown): value is TelegramReceiptData {
+  return (
+    isRecord(value) &&
+    typeof value.event_key === 'string' &&
+    typeof value.kind === 'string' &&
+    typeof value.chat_id === 'number' &&
+    typeof value.state === 'string' &&
+    typeof value.attempts === 'number' &&
+    (value.message_id === null || typeof value.message_id === 'number') &&
+    isNullableString(value.last_error_code) &&
+    typeof value.created_at === 'string' &&
+    isNullableString(value.sent_at)
+  )
+}
+
+/** Shape guard for the stable Telegram delivery document. */
+export function isTelegramStatusData(value: unknown): value is TelegramStatusData {
+  return (
+    isRecord(value) &&
+    typeof value.configured === 'boolean' &&
+    typeof value.chat_count === 'number' &&
+    typeof value.allowed_user_count === 'number' &&
+    typeof value.poller_state === 'string' &&
+    isNullableString(value.last_poll_at) &&
+    isNullableString(value.last_send_at) &&
+    typeof value.failing_receipts === 'number' &&
+    isRecord(value.receipts) &&
+    typeof value.receipts.queued === 'number' &&
+    typeof value.receipts.sending === 'number' &&
+    typeof value.receipts.sent === 'number' &&
+    typeof value.receipts.failed === 'number' &&
+    Array.isArray(value.per_chat) &&
+    value.per_chat.every(isTelegramChatStatusData) &&
+    Array.isArray(value.recent_receipts) &&
+    value.recent_receipts.every(isTelegramReceiptData) &&
+    isNullableString(value.overflow_code) &&
+    isNullableString(value.last_error_code) &&
+    typeof value.daemon_state === 'string'
+  )
+}
+
 /** Shape guard for `StatusData`; a contract drift becomes a typed load error. */
 export function isStatusData(value: unknown): value is StatusData {
   if (!isRecord(value) || !isRecord(value.universe)) {
@@ -246,6 +339,9 @@ export function isStatusData(value: unknown): value is StatusData {
     typeof universe.tradifi_count === 'number' &&
     Array.isArray(universe.symbols) &&
     universe.symbols.every(isSymbolInfo) &&
+    (value.telegram === undefined ||
+      value.telegram === null ||
+      isTelegramStatusData(value.telegram)) &&
     (schedule === undefined ||
       schedule === null ||
       (isRecord(schedule) &&
@@ -285,11 +381,7 @@ export class ReadinessError extends Error {
   readonly code: string | undefined
   readonly details: readonly ReadinessErrorDetail[]
 
-  constructor(
-    message: string,
-    code?: string,
-    details: readonly ReadinessErrorDetail[] = [],
-  ) {
+  constructor(message: string, code?: string, details: readonly ReadinessErrorDetail[] = []) {
     super(message)
     this.name = 'ReadinessError'
     this.code = code
@@ -298,9 +390,7 @@ export class ReadinessError extends Error {
 }
 
 /** Extract the named check details from an untrusted error envelope. */
-function bodyErrorDetails(
-  body: Record<string, unknown> | null,
-): readonly ReadinessErrorDetail[] {
+function bodyErrorDetails(body: Record<string, unknown> | null): readonly ReadinessErrorDetail[] {
   if (!body || !isRecord(body.error) || !Array.isArray(body.error.details)) {
     return []
   }

@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import time
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from typing import Any
@@ -22,9 +23,13 @@ from oft.config import Settings
 from oft.domain.telegram import (
     MAX_GLOBAL_REFUSALS_PER_WINDOW,
     POLLER_HEARTBEAT_KEY,
+    POLLER_LAST_ERROR_KEY,
+    POLLER_STATE_DEGRADED,
+    POLLER_STATE_KEY,
     REFUSAL_TEXT,
     TELEGRAM_CHAT_IDS_KEY,
     TELEGRAM_REFUSAL_AUDIT_WINDOW_SECONDS,
+    TELEGRAM_RETRY_AFTER_MAX_SECONDS,
     parse_update,
 )
 from oft.ports.clock import ClockPort
@@ -376,6 +381,8 @@ def test_a_not_configured_port_backs_off_logs_once_and_skips_heartbeats(
     assert recorder.warning_calls == []
     assert poller._wait_override == poller_module.UNCONFIGURED_BACKOFF_SECONDS  # noqa: SLF001
     assert store.get_system_state("telegram.poller_heartbeat") is None
+    assert store.get_system_state(POLLER_STATE_KEY) == POLLER_STATE_DEGRADED
+    assert store.get_system_state(POLLER_LAST_ERROR_KEY) == TELEGRAM_NOT_CONFIGURED
 
 
 def test_an_invalid_token_backs_off_logs_once_and_skips_heartbeats(
@@ -458,6 +465,162 @@ def test_repeated_transient_failures_back_off_exponentially(tmp_path: Path) -> N
 
     assert first == 2.0
     assert second == 4.0
+
+
+def test_a_huge_retry_after_is_capped_and_shutdown_wakes_the_wait(tmp_path: Path) -> None:
+    from oft.ports.telegram import TELEGRAM_RATE_LIMITED, TelegramError
+
+    service, store, _port, _settings = _service(tmp_path)
+
+    class _RateLimited:
+        def get_me(self):  # type: ignore[no-untyped-def]
+            raise TelegramError(TELEGRAM_RATE_LIMITED, "slow down", retry_after=10_000)
+
+        def get_updates(self, *, offset=None, timeout_seconds=0):  # type: ignore[no-untyped-def]
+            raise TelegramError(TELEGRAM_RATE_LIMITED, "slow down", retry_after=10_000)
+
+        def send_message(self, *, chat_id, text, reply_to_message_id=None):  # type: ignore[no-untyped-def]
+            raise TelegramError(TELEGRAM_RATE_LIMITED, "slow down", retry_after=10_000)
+
+    poller = TelegramPoller(
+        service=service,
+        store=store,
+        clock=FixedClock(NOW),
+        port_resolver=_RateLimited,
+        long_poll_timeout=0,
+        poll_interval_seconds=0.01,
+    )
+
+    assert poller.poll_once() == 0
+    # The server's retry_after is bounded: a huge value cannot park the loop for
+    # hours, and shutdown must be able to wake the wait immediately.
+    assert poller._wait_override == float(TELEGRAM_RETRY_AFTER_MAX_SECONDS)  # noqa: SLF001
+
+    poller.start()
+    try:
+        deadline = time.monotonic() + 5.0
+        while time.monotonic() < deadline:
+            if poller.is_running and store.get_system_state(POLLER_STATE_KEY) == (
+                POLLER_STATE_DEGRADED
+            ):
+                break
+            time.sleep(0.01)
+        assert poller.is_running is True
+        assert poller._thread is not None and poller._thread.is_alive()  # noqa: SLF001
+    finally:
+        poller.shutdown(wait=True)
+
+    assert poller.is_running is False
+
+
+def test_an_escaped_poll_failure_still_waits_once_per_tick(
+    tmp_path: Path, monkeypatch: Any
+) -> None:
+    from oft.application import telegram_poller as poller_module
+
+    class _Recorder:
+        def __init__(self) -> None:
+            self.exception_calls: list[str] = []
+
+        def info(self, event: str, **kwargs: Any) -> None:
+            pass
+
+        def warning(self, event: str, **kwargs: Any) -> None:
+            pass
+
+        def exception(self, event: str, **kwargs: Any) -> None:
+            self.exception_calls.append(event)
+
+    class _FakeStop:
+        """Stop event that ends the loop after ``iterations`` unfinished ticks."""
+
+        def __init__(self, iterations: int) -> None:
+            self._remaining = iterations
+            self.waits: list[float] = []
+
+        def is_set(self) -> bool:
+            if self._remaining > 0:
+                self._remaining -= 1
+                return False
+            return True
+
+        def wait(self, seconds: float) -> bool:
+            self.waits.append(seconds)
+            return False
+
+    service, store, port, _settings = _service(tmp_path)
+    poller = _poller(service, store, port)
+    fake_stop = _FakeStop(iterations=3)
+    poller._stop = fake_stop  # type: ignore[assignment]  # noqa: SLF001
+    poll_calls: list[int] = []
+
+    def _always_raises() -> int:
+        poll_calls.append(1)
+        raise RuntimeError("escaped store failure")
+
+    poller.poll_once = _always_raises  # type: ignore[method-assign]
+    recorder = _Recorder()
+    monkeypatch.setattr(poller_module, "LOGGER", recorder)
+
+    poller._run()  # noqa: SLF001 - returns as soon as the fake stop is set
+
+    # Exactly one wait per loop iteration: an escaped poll failure must not
+    # skip the wait and spin the supervisor thread at full CPU.
+    assert len(poll_calls) == 3
+    assert fake_stop.waits == [0.01, 0.01, 0.01]
+    assert recorder.exception_calls == ["telegram_poller_tick_failed"] * 3
+
+
+def test_a_wait_failure_does_not_kill_the_supervisor_loop(tmp_path: Path, monkeypatch: Any) -> None:
+    from oft.application import telegram_poller as poller_module
+
+    class _Recorder:
+        def __init__(self) -> None:
+            self.exception_calls: list[str] = []
+
+        def info(self, event: str, **kwargs: Any) -> None:
+            pass
+
+        def warning(self, event: str, **kwargs: Any) -> None:
+            pass
+
+        def exception(self, event: str, **kwargs: Any) -> None:
+            self.exception_calls.append(event)
+
+    class _FakeStop:
+        def __init__(self, iterations: int) -> None:
+            self._remaining = iterations
+            self.waits: list[float] = []
+
+        def is_set(self) -> bool:
+            if self._remaining > 0:
+                self._remaining -= 1
+                return False
+            return True
+
+        def wait(self, seconds: float) -> bool:
+            self.waits.append(seconds)
+            raise RuntimeError("wait exploded")
+
+    service, store, port, _settings = _service(tmp_path)
+    poller = _poller(service, store, port)
+    fake_stop = _FakeStop(iterations=2)
+    poller._stop = fake_stop  # type: ignore[assignment]  # noqa: SLF001
+    poll_calls: list[int] = []
+
+    def _counts() -> int:
+        poll_calls.append(1)
+        return 0
+
+    poller.poll_once = _counts  # type: ignore[method-assign]
+    recorder = _Recorder()
+    monkeypatch.setattr(poller_module, "LOGGER", recorder)
+
+    poller._run()  # noqa: SLF001 - the guarded wait keeps the loop alive
+
+    assert len(poll_calls) == 2
+    assert fake_stop.waits == [0.01, 0.01]
+    assert recorder.exception_calls == ["telegram_poller_wait_failed"] * 2
 
 
 def test_a_handling_failure_does_not_advance_the_offset(tmp_path: Path) -> None:

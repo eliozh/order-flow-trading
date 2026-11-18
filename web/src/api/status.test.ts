@@ -1,6 +1,15 @@
 import { afterEach, describe, expect, it, vi } from 'vitest'
 
-import { ApiShapeError, fetchReadiness, fetchStatus, ReadinessError } from './status'
+import {
+  ApiShapeError,
+  fetchReadiness,
+  fetchStatus,
+  isStatusData,
+  isTelegramChatStatusData,
+  isTelegramReceiptData,
+  isTelegramStatusData,
+  ReadinessError,
+} from './status'
 import { READ_TIMEOUT_MS } from './request-timeout'
 
 const notReadyEnvelope = {
@@ -126,6 +135,108 @@ function statusBody(overrides: Record<string, unknown> = {}): Record<string, unk
     meta: validMeta,
   }
 }
+
+const validTelegram = {
+  configured: true,
+  chat_count: 2,
+  allowed_user_count: 1,
+  poller_state: 'RUNNING',
+  last_poll_at: '2026-11-17T09:30:00.000Z',
+  last_send_at: null,
+  failing_receipts: 0,
+  receipts: { queued: 0, sending: 0, sent: 1, failed: 0 },
+  per_chat: [{ chat_id: 1001, queued: 0, sending: 0, sent: 1, failed: 0, last_error_code: null }],
+  recent_receipts: [
+    {
+      event_key: 'scan:1:report',
+      kind: 'scan_report',
+      chat_id: 1001,
+      state: 'sent',
+      attempts: 0,
+      message_id: 900,
+      last_error_code: null,
+      created_at: '2026-11-17T09:30:00.000Z',
+      sent_at: '2026-11-17T09:30:00.000Z',
+    },
+  ],
+  overflow_code: null,
+  last_error_code: null,
+  daemon_state: 'UP',
+}
+
+function statusData(): Record<string, unknown> {
+  const body = statusBody()
+  return body.data as Record<string, unknown>
+}
+
+describe('Telegram status shape guards', () => {
+  afterEach(() => {
+    vi.unstubAllGlobals()
+  })
+
+  it('accepts a valid Telegram document on the status contract', () => {
+    expect(isTelegramStatusData(validTelegram)).toBe(true)
+    expect(isStatusData({ ...statusData(), telegram: validTelegram })).toBe(true)
+    expect(isTelegramChatStatusData(validTelegram.per_chat[0])).toBe(true)
+    expect(isTelegramReceiptData(validTelegram.recent_receipts[0])).toBe(true)
+  })
+
+  it('accepts an absent or null telegram document for backward compatibility', () => {
+    expect(isStatusData(statusData())).toBe(true)
+    expect(isStatusData({ ...statusData(), telegram: null })).toBe(true)
+  })
+
+  it('rejects a malformed per_chat entry', () => {
+    const malformed = {
+      ...validTelegram,
+      per_chat: [{ chat_id: '1001', queued: 0, sending: 0, sent: 1, failed: 0 }],
+    }
+    expect(isTelegramStatusData(malformed)).toBe(false)
+    expect(isStatusData({ ...statusData(), telegram: malformed })).toBe(false)
+  })
+
+  it('rejects non-numeric receipt totals', () => {
+    const malformed = {
+      ...validTelegram,
+      receipts: { queued: '0', sending: 0, sent: 1, failed: 0 },
+    }
+    expect(isTelegramStatusData(malformed)).toBe(false)
+  })
+
+  it('rejects a receipts document missing any required counter', () => {
+    for (const key of ['queued', 'sending', 'sent', 'failed']) {
+      const receipts = { ...validTelegram.receipts } as Record<string, unknown>
+      delete receipts[key]
+      const malformed = { ...validTelegram, receipts }
+      expect(isTelegramStatusData(malformed)).toBe(false)
+      expect(isStatusData({ ...statusData(), telegram: malformed })).toBe(false)
+    }
+  })
+
+  it('rejects a malformed recent receipt entry', () => {
+    const malformed = {
+      ...validTelegram,
+      recent_receipts: [{ event_key: 'scan:1:report', chat_id: 1001 }],
+    }
+    expect(isTelegramStatusData(malformed)).toBe(false)
+    expect(isStatusData({ ...statusData(), telegram: malformed })).toBe(false)
+  })
+
+  it('rejects a malformed Telegram document through the fetch boundary', async () => {
+    stubFetch(statusBody({ telegram: { configured: true } }), 200)
+
+    await expect(fetchStatus()).rejects.toBeInstanceOf(ApiShapeError)
+  })
+
+  it('constructs the Telegram document through the fetch boundary', async () => {
+    stubFetch(statusBody({ telegram: validTelegram }), 200)
+
+    const envelope = await fetchStatus()
+
+    expect(envelope.data?.telegram?.per_chat[0].chat_id).toBe(1001)
+    expect(envelope.data?.telegram?.recent_receipts).toHaveLength(1)
+  })
+})
 
 describe('fetchReadiness', () => {
   afterEach(() => {
