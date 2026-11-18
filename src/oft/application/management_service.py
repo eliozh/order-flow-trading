@@ -77,6 +77,13 @@ from oft.application.prompt_service import (
     RenderedPrompt,
     secret_values_from_settings,
 )
+from oft.application.telegram_events import (
+    NotificationSink,
+    build_position_management_event,
+    daily_loss_alert_state,
+    enqueue_risk_alert,
+    risk_alert_kind_for_cap,
+)
 from oft.config import Settings
 from oft.domain.management import (
     ManagementSizingError,
@@ -93,6 +100,7 @@ from oft.domain.risk import (
     ManagementClassification,
     ManagementStatus,
     RiskCaps,
+    RiskVerdict,
     StopChange,
     Verdict,
     add_risk_quantity,
@@ -461,6 +469,7 @@ class ManagementService:
         runtime: LLMRuntimeRegistry | None = None,
         funding_settlement_enabled: bool = True,
         risk_breach_enabled: bool = True,
+        notifications: NotificationSink | None = None,
     ) -> None:
         self._store = store
         self._clock = clock
@@ -469,6 +478,7 @@ class ManagementService:
         self._kill_switch = kill_switch
         self._funding_settlement_enabled = funding_settlement_enabled
         self._risk_breach_enabled = risk_breach_enabled
+        self._notifications = notifications
         self._budget = BudgetLedger(store=store, settings=settings)
         self._orchestrator = (
             LLMOrchestrator(
@@ -482,7 +492,9 @@ class ManagementService:
             if provider is not None
             else None
         )
-        self._positions = PositionService(store=store, clock=clock, settings=settings)
+        self._positions = PositionService(
+            store=store, clock=clock, settings=settings, notifications=notifications
+        )
         self._paper = PaperAccountService(settings=settings, store=store, clock=clock)
         self._secrets = secret_values_from_settings(settings)
         self._prompts = PromptService(store=store, clock=clock, secret_values=self._secrets)
@@ -553,6 +565,9 @@ class ManagementService:
                 conditions.append(ManagementCondition.RISK_BREACH)
             elif not measured.measured and measured.degraded_reason:
                 risk_unmeasured = measured.degraded_reason
+            # Alert from the same measured context (never a fresh measurement)
+            # so a breach or approach on a day with no ADD is still reported.
+            self._notify_daily_loss(daily_loss=measured.daily_loss, equity=measured.equity, now=now)
         reason = "due: " + ", ".join(item.value for item in conditions)
         if risk_unmeasured is not None:
             reason += f"; risk_unmeasured: {risk_unmeasured}"
@@ -1278,6 +1293,10 @@ class ManagementService:
                 "DATA_UNAVAILABLE", "the daily loss is unmeasured; the add is refused"
             )
         equity, open_positions, stale_inputs = self._gate_inputs()
+        alert_period = context.now[:10]
+        # Reuse the measured daily loss and the configured cap; this compares
+        # them for the alert only and changes no risk rule.
+        self._notify_daily_loss(daily_loss=daily_loss, equity=equity, now=context.now)
         stop_price = position.stop_price
         requested_quantity = (
             None
@@ -1315,6 +1334,50 @@ class ManagementService:
         # Otherwise a tightened leverage cap could be bypassed by a MAX_NOTIONAL
         # or PER_TRADE_RISK quantity clamp that happens to bind first.
         over_leverage = position.leverage > caps.max_leverage
+        effective_cap = BindingCap.MAX_LEVERAGE if over_leverage else pre_verdict.binding_cap
+        risk_kind = risk_alert_kind_for_cap(effective_cap.value)
+        blocked = over_leverage or pre_verdict.verdict is Verdict.BLOCK
+        # A MAX_NOTIONAL cap normally binds as a size clamp (REDUCE), so alert
+        # on that crossing too: otherwise the kind is unreachable. A clamped
+        # MAX_LEVERAGE add is reported by its EXECUTED outcome, not a risk push.
+        # DAILY_LOSS was already alerted from the measured loss above.
+        clamped = (
+            requested_quantity is not None
+            and pre_verdict.allowed_quantity is not None
+            and pre_verdict.allowed_quantity < requested_quantity
+        )
+        if risk_kind == "MAX_LEVERAGE" and blocked:
+            self._notify_risk_alert(
+                kind=risk_kind,
+                subject=position.symbol,
+                binding_cap=effective_cap.value,
+                state="BLOCKED",
+                observed=position.leverage,
+                threshold=caps.max_leverage,
+                unit="x",
+                period=alert_period,
+                reason_code="RISK_BLOCKED",
+                occurred_at=context.now,
+            )
+        elif risk_kind == "MAX_NOTIONAL" and (blocked or clamped):
+            observed = self._requested_add_notional(
+                requested_quantity=requested_quantity,
+                verdict=pre_verdict,
+                mark=context.mark,
+            )
+            if observed is not None:
+                self._notify_risk_alert(
+                    kind=risk_kind,
+                    subject=position.symbol,
+                    binding_cap=effective_cap.value,
+                    state="BLOCKED" if blocked else "REDUCED",
+                    observed=observed,
+                    threshold=equity * Decimal(str(caps.max_notional_pct)) / Decimal("100"),
+                    unit="USDT",
+                    period=alert_period,
+                    reason_code="RISK_BLOCKED" if blocked else "RISK_REDUCED",
+                    occurred_at=context.now,
+                )
         if pre_verdict.verdict is Verdict.BLOCK or over_leverage:
             binding_cap = BindingCap.MAX_LEVERAGE if over_leverage else pre_verdict.binding_cap
             risk_payload = dict(evaluated.payload)
@@ -1775,7 +1838,7 @@ class ManagementService:
         idempotent_replay: bool = False,
     ) -> ManagementResult:
         account = self._paper.summary()
-        return ManagementResult(
+        result = ManagementResult(
             position_id=context.position.position_id,
             decision_id=decision_id,
             action=ManagementAction(action),
@@ -1798,6 +1861,137 @@ class ManagementService:
             },
             idempotent_replay=idempotent_replay,
         )
+        self._notify_management(result, context=context)
+        return result
+
+    def _notify_management(self, result: ManagementResult, *, context: ManagementMark) -> None:
+        """Enqueue one executed/blocked outcome; a push never breaks the ledger.
+
+        Only EXECUTED and BLOCKED outcomes push: a HOLD/no-action carries no
+        position change. The dedupe key is the decision id, so a retry or a
+        replay cannot enqueue a second message.
+        """
+        if self._notifications is None:
+            return
+        if result.status not in (ManagementStatus.EXECUTED, ManagementStatus.BLOCKED):
+            return
+        fill = result.fill or {}
+        order = result.order or {}
+        size = fill.get("quantity")
+        price = fill.get("price")
+        if size is None:
+            size = order.get("quantity")
+        if price is None:
+            price = order.get("price")
+        try:
+            self._notifications.enqueue_event(
+                build_position_management_event(
+                    position_id=result.position_id,
+                    symbol=context.position.symbol,
+                    action=result.action.value,
+                    status=result.status.value,
+                    size=size,
+                    price=price,
+                    reason_code=result.reason_code,
+                    decision_id=result.decision_id,
+                    occurred_at=context.now,
+                )
+            )
+        except Exception as exc:  # noqa: BLE001 - a push never breaks management
+            _LOGGER.warning(
+                "management_position_alert_failed",
+                decision_id=result.decision_id,
+                error_type=type(exc).__name__,
+            )
+
+    def _notify_risk_alert(
+        self,
+        *,
+        kind: str,
+        subject: str,
+        binding_cap: str,
+        state: str,
+        observed: Decimal | float | None,
+        threshold: Decimal | float | None,
+        unit: str,
+        period: str,
+        reason_code: str,
+        occurred_at: str,
+    ) -> None:
+        """Enqueue one risk alert, deduped per kind+subject+period+state."""
+        if self._notifications is None:
+            return
+        try:
+            enqueue_risk_alert(
+                self._notifications,
+                kind=kind,
+                subject=subject,
+                binding_cap=binding_cap,
+                state=state,
+                observed=observed,
+                threshold=threshold,
+                unit=unit,
+                period=period,
+                reason_code=reason_code,
+                occurred_at=occurred_at,
+            )
+        except Exception as exc:  # noqa: BLE001 - a push never breaks management
+            _LOGGER.warning(
+                "management_risk_alert_failed",
+                kind=kind,
+                error_type=type(exc).__name__,
+            )
+
+    def _notify_daily_loss(self, *, daily_loss: Decimal | None, equity: Decimal, now: str) -> None:
+        """Alert on the measured daily-loss approach/breach once per state/day.
+
+        The value comes from the caller's existing measurement; this method does
+        not re-measure or re-apply the risk rule. It is called from the ADD gate
+        and from the due-condition evaluation so a breach on a day with no ADD
+        still alerts.
+        """
+        if self._notifications is None or daily_loss is None:
+            return
+        try:
+            caps, _source = effective_caps(self._settings, self._store)
+        except RiskCapsError as exc:
+            # The alert path fails closed like the breach gate: no fabricated
+            # caps, no alert, but one bounded sibling warning for the operator.
+            _LOGGER.warning("management_risk_caps_unavailable", error=exc.message)
+            return
+        except Exception as exc:  # noqa: BLE001 - a push never breaks management
+            _LOGGER.warning("management_risk_caps_unavailable", error_type=type(exc).__name__)
+            return
+        limit = equity * Decimal(str(caps.daily_loss_pct)) / Decimal("100")
+        state = daily_loss_alert_state(daily_loss=daily_loss, limit=limit)
+        if state is None:
+            return
+        self._notify_risk_alert(
+            kind="DAILY_LOSS",
+            subject="ACCOUNT",
+            binding_cap=BindingCap.DAILY_LOSS.value,
+            state=state,
+            observed=daily_loss,
+            threshold=limit,
+            unit="USDT",
+            period=now[:10],
+            reason_code=f"DAILY_LOSS_{state}",
+            occurred_at=now,
+        )
+
+    @staticmethod
+    def _requested_add_notional(
+        *,
+        requested_quantity: Decimal | None,
+        verdict: RiskVerdict,
+        mark: Decimal,
+    ) -> Decimal | None:
+        """The requested add exposure from gate values; never fabricated."""
+        if requested_quantity is not None:
+            return requested_quantity * mark
+        if verdict.requested_quantity is not None:
+            return verdict.requested_quantity * mark
+        return verdict.allowed_notional_usd
 
     # -- idempotent replay -----------------------------------------------
 

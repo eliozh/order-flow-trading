@@ -105,6 +105,15 @@ def _text(record: Any) -> str:
     return json.loads(record.payload_json)["text"]
 
 
+def _entry_receipts(container: Any) -> list[Any]:
+    """Only entry re-check rows; a risk-reduction push is a separate kind."""
+    return [
+        receipt
+        for receipt in container.store.list_telegram_receipts()
+        if receipt.kind == "entry_recheck"
+    ]
+
+
 def test_a_fresh_recheck_enqueues_one_alert_with_decision_and_confidence(
     tmp_path: Path,
 ) -> None:
@@ -114,7 +123,7 @@ def test_a_fresh_recheck_enqueues_one_alert_with_decision_and_confidence(
 
     assert card["status"] == "RECHECKED"
     assert card["llm"]["decision"] == "ENTER_LONG"
-    receipts = container.store.list_telegram_receipts()
+    receipts = _entry_receipts(container)
     assert len(receipts) == 1
     receipt = receipts[0]
     assert receipt.event_key == f"entry:{trigger_id}:{card['decision_id']}"
@@ -134,7 +143,7 @@ def test_reusing_the_persisted_decision_does_not_send_twice(tmp_path: Path) -> N
 
     assert first["decision_id"] == second["decision_id"]
     assert second["persisted"] is True
-    assert len(container.store.list_telegram_receipts()) == 1
+    assert len(_entry_receipts(container)) == 1
 
 
 def test_the_persisted_read_path_never_enqueues_an_outbox_row(
@@ -160,7 +169,7 @@ def test_the_persisted_read_path_never_enqueues_an_outbox_row(
 
     assert card["persisted"] is True
     assert appends == []
-    assert len(container.store.list_telegram_receipts()) == 1
+    assert len(_entry_receipts(container)) == 1
 
 
 def test_the_entry_alert_says_desktop_or_cli_and_has_no_approval_shortcut(
@@ -170,7 +179,7 @@ def test_the_entry_alert_says_desktop_or_cli_and_has_no_approval_shortcut(
 
     service.recheck(trigger_id)
 
-    text = _text(container.store.list_telegram_receipts()[0])
+    text = _text(_entry_receipts(container)[0])
     assert "请在桌面端或 CLI 处理。" in text.splitlines()
     for forbidden in ("/approve", "/accept", "/reject", "http://", "https://"):
         assert forbidden not in text
@@ -193,7 +202,7 @@ def test_a_disabled_entry_toggle_suppresses_with_no_orphan_row(tmp_path: Path) -
 
     service.recheck(trigger_id)
 
-    assert container.store.list_telegram_receipts() == ()
+    assert _entry_receipts(container) == []
 
 
 def test_an_enqueue_failure_leaves_the_fresh_decision_and_trigger_committed(

@@ -207,6 +207,21 @@ def _build_limited_clients(container: Any) -> tuple[Any, Any]:
     )
 
 
+def _build_freshness_guard(container: Any) -> Any:
+    """Build the daemon's freshness guard with the Telegram degradation sink.
+
+    The sink is only wired when the container has a notification service;
+    ``FreshnessGuard`` itself still logs every transition, so a missing push
+    target never hides the structured-log alert.
+    """
+    from oft.application.freshness import FreshnessGuard
+    from oft.application.notifications import NotificationFreshnessSink
+
+    notifications = getattr(container, "notifications", None)
+    alert_sink = NotificationFreshnessSink(notifications) if notifications is not None else None
+    return FreshnessGuard(clock=container.clock, alert_sink=alert_sink)
+
+
 def _run_live_ingestion(
     settings: Settings,
     replay_file: Path | None,
@@ -268,6 +283,7 @@ def _run_live_ingestion(
             recovery=recovery_client,
             symbols=symbol_list,
             symbol_provider=symbol_provider,
+            freshness=_build_freshness_guard(container),
         )
 
         def _run_ws_thread() -> None:

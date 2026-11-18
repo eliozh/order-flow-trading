@@ -46,6 +46,10 @@ from oft.application.paper_broker import (
     recorded_entry_notional_usd,
 )
 from oft.application.payloads import decode_payload_json
+from oft.application.telegram_events import (
+    NotificationSink,
+    build_position_management_event,
+)
 from oft.config import Settings
 from oft.domain.oms import OrderType, Position, deterministic_id
 from oft.domain.pnl import (
@@ -632,10 +636,18 @@ def _observation_rank(observation: _MarkObservation) -> tuple[bool, datetime, in
 
 
 class PositionService:
-    def __init__(self, *, store: StorePort, clock: ClockPort, settings: Settings) -> None:
+    def __init__(
+        self,
+        *,
+        store: StorePort,
+        clock: ClockPort,
+        settings: Settings,
+        notifications: NotificationSink | None = None,
+    ) -> None:
         self._store = store
         self._clock = clock
         self._settings = settings
+        self._notifications = notifications
         self._broker = PaperBroker(settings=settings, store=store, clock=clock)
         self._paper = PaperAccountService(settings=settings, store=store, clock=clock)
         self._kill_switch = KillSwitch(settings=settings, store=store, clock=clock)
@@ -1424,6 +1436,7 @@ class PositionService:
 
         observation = self._resolve_mark(position, payload, now_dt)
         if observation is None:
+            self._notify_stale(position_id=position_id, symbol=position.symbol, now=now)
             return PositionMonitorResult(
                 position_id=position_id,
                 status=NO_ACTION,
@@ -1432,6 +1445,7 @@ class PositionService:
                 funding=funding,
             )
         if self._is_stale(now, observation.as_of):
+            self._notify_stale(position_id=position_id, symbol=position.symbol, now=now)
             return PositionMonitorResult(
                 position_id=position_id,
                 status=NO_ACTION,
@@ -2313,7 +2327,11 @@ class PositionService:
         probe = self._exit_intent(position, ids, None)
         existing = self._store.get_order_by_idempotency(ids.idempotency_key)
         if existing is not None:
-            return self._replay_existing(position, existing, probe)
+            replayed = self._replay_existing(position, existing, probe)
+            self._notify_close(
+                replayed, symbol=position.symbol, decision_id=ids.decision_id, now=now
+            )
+            return replayed
         context = self._trade_log_context(
             position,
             payload,
@@ -2340,7 +2358,9 @@ class PositionService:
             now=now,
         )
         result = self._submit_close(intent, ids, mark, mark_as_of)
-        return self._closed_result(position, result, funding=funding)
+        closed = self._closed_result(position, result, funding=funding)
+        self._notify_close(closed, symbol=position.symbol, decision_id=ids.decision_id, now=now)
+        return closed
 
     def _persist_mark(
         self,
@@ -2490,6 +2510,76 @@ class PositionService:
             idempotent_replay=False,
             funding=funding,
         )
+
+    def _notify_stale(self, *, position_id: str, symbol: str, now: str) -> None:
+        """Push one read-only DATA_STALE event per position per UTC day.
+
+        The marker is durable (``enqueue_cooled``), so repeated monitor ticks
+        cannot become a message storm and a restart does not re-alert. The
+        event carries no order or action affordance.
+        """
+        if self._notifications is None:
+            return
+        period = now[:10]
+        try:
+            self._notifications.enqueue_cooled(
+                build_position_management_event(
+                    position_id=position_id,
+                    symbol=symbol,
+                    action="MONITOR",
+                    status="DEGRADED",
+                    size=None,
+                    price=None,
+                    reason_code=DATA_STALE,
+                    decision_id=f"monitor:{position_id}:{period}",
+                    occurred_at=now,
+                ),
+                cooldown_key=f"position:stale:{position_id}",
+                period=period,
+            )
+        except Exception as exc:  # noqa: BLE001 - a push never breaks the monitor
+            _LOGGER.warning("position_stale_alert_failed for %s: %s", position_id, exc)
+
+    def _notify_close(
+        self,
+        result: PositionMonitorResult,
+        *,
+        symbol: str,
+        decision_id: str,
+        now: str,
+    ) -> None:
+        """Push one executed protective-exit event, deduped by decision id.
+
+        An idempotent replay carries the same decision id, so the outbox key is
+        unchanged and no second message is enqueued. A failure is logged and
+        swallowed: the ledger transaction has already committed.
+        """
+        if self._notifications is None:
+            return
+        fill = result.fill or {}
+        order = result.order or {}
+        size = fill.get("quantity")
+        price = fill.get("price")
+        if size is None:
+            size = order.get("quantity")
+        if price is None:
+            price = order.get("price")
+        try:
+            self._notifications.enqueue_event(
+                build_position_management_event(
+                    position_id=result.position_id,
+                    symbol=symbol,
+                    action=result.action or "FULL_CLOSE",
+                    status="EXECUTED",
+                    size=size,
+                    price=price,
+                    reason_code=result.reason_code,
+                    decision_id=decision_id,
+                    occurred_at=now,
+                )
+            )
+        except Exception as exc:  # noqa: BLE001 - a push never breaks the close
+            _LOGGER.warning("position_close_alert_failed for %s: %s", result.position_id, exc)
 
     def _persist_decision(
         self,

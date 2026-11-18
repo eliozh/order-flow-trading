@@ -622,7 +622,10 @@ def _start_position_monitor_scheduler(
         _LOGGER.warning("position_monitor_stale_runs_reaped", count=reaped)
     ledger = JobLedger(store=container.store, clock=container.clock)
     service = PositionService(
-        store=container.store, clock=container.clock, settings=container.settings
+        store=container.store,
+        clock=container.clock,
+        settings=container.settings,
+        notifications=container.notifications,
     )
     runner = PositionMonitorRunner(
         service,
@@ -696,6 +699,7 @@ def _start_management_scheduler(
             runtime=container.llm_runtime,
             funding_settlement_enabled=settings.management_funding_settlement_enabled,
             risk_breach_enabled=settings.management_risk_breach_enabled,
+            notifications=container.notifications,
         )
 
     service = _build_service()

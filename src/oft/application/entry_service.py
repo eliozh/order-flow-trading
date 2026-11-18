@@ -48,7 +48,9 @@ from oft.application.prompt_service import (
 from oft.application.telegram_events import (
     NotificationSink,
     build_entry_recheck_event,
+    enqueue_risk_alert,
     entry_alert_decision,
+    risk_alert_kind_for_cap,
 )
 from oft.application.trigger_service import TriggerNotFound
 from oft.config import Settings
@@ -669,6 +671,92 @@ class EntryService:
         card["persisted"] = True
         return card
 
+    def _notify_risk_alert(
+        self,
+        *,
+        verdict: RiskVerdict,
+        symbol: str,
+        equity: Decimal,
+        caps: RiskCaps,
+        requested_leverage: float,
+        requested_notional: Decimal | None,
+        daily_loss_usd: Decimal | None,
+        now: str,
+    ) -> None:
+        """Mirror an existing risk-gate cap outcome into a durable risk alert.
+
+        The gate verdict is not recomputed: the binding cap and verdict come
+        straight from ``evaluate_risk``. A blocked cap and a ``MAX_NOTIONAL``
+        clamp both alert once per kind+symbol+period+state.
+
+        The daily-loss branch is unreachable in this slice because no
+        realized-PnL source exists and the entry path passes
+        ``daily_loss_usd=None``; the value is never fabricated. Management owns
+        the measured daily-loss alerts.
+        """
+        if self._notifications is None:
+            return
+        kind = risk_alert_kind_for_cap(verdict.binding_cap.value)
+        if kind is None:
+            return
+        blocked = verdict.verdict.value == "BLOCK"
+        # A notional cap usually binds as a REDUCE (size clamp), so alert on
+        # that crossing too. A leverage REDUCE stays in the decision card only.
+        if not blocked and kind != "MAX_NOTIONAL":
+            return
+        state = "BLOCKED" if blocked else "REDUCED"
+        if kind == "MAX_LEVERAGE":
+            observed: Decimal | float | None = requested_leverage
+            threshold: Decimal | float | None = caps.max_leverage
+            unit = "x"
+        elif kind == "MAX_NOTIONAL":
+            # The key evidence is the requested exposure the gate rejected or
+            # clamped, derived from the gate's own requested quantity x mark.
+            observed = self._observed_entry_notional(verdict, requested_notional)
+            if observed is None:
+                return
+            threshold = equity * Decimal(str(caps.max_notional_pct)) / Decimal("100")
+            unit = "USDT"
+        else:
+            if daily_loss_usd is None:
+                return
+            observed = daily_loss_usd
+            threshold = equity * Decimal(str(caps.daily_loss_pct)) / Decimal("100")
+            unit = "USDT"
+        period = now[:10]
+        try:
+            enqueue_risk_alert(
+                self._notifications,
+                kind=kind,
+                subject=str(symbol),
+                binding_cap=verdict.binding_cap.value,
+                state=state,
+                observed=observed,
+                threshold=threshold,
+                unit=unit,
+                period=period,
+                reason_code="RISK_BLOCKED" if blocked else "RISK_REDUCED",
+                occurred_at=now,
+            )
+        except Exception as exc:  # noqa: BLE001 - a push never breaks the entry path
+            _LOGGER.warning(
+                "entry_risk_alert_failed",
+                kind=kind,
+                error_type=type(exc).__name__,
+            )
+
+    @staticmethod
+    def _observed_entry_notional(
+        verdict: RiskVerdict, requested_notional: Decimal | None
+    ) -> Decimal | None:
+        """The requested notional from the gate's own values (no new risk rule)."""
+        requested_quantity = verdict.requested_quantity
+        if requested_quantity is not None and verdict.entry_price > 0:
+            return requested_quantity * verdict.entry_price
+        if requested_notional is not None:
+            return requested_notional
+        return verdict.allowed_notional_usd
+
     def _notify_entry_recheck(self, card: dict[str, Any], *, generated_at: str) -> None:
         """Enqueue the one "awaiting human action" push for an ENTER decision.
 
@@ -1169,6 +1257,17 @@ class EntryService:
         except (KeyError, TypeError, ValueError, ArithmeticError) as exc:
             # A malformed persisted intent must not surface as an unhandled 500.
             raise EntryRejected("ORDER_REJECTED", f"the entry intent is invalid: {exc}") from exc
+
+        self._notify_risk_alert(
+            verdict=verdict,
+            symbol=trigger_payload["symbol"],
+            equity=equity,
+            caps=caps,
+            requested_leverage=leverage,
+            requested_notional=notional,
+            daily_loss_usd=daily_loss_usd,
+            now=now,
+        )
 
         risk_verdict_id = f"RISK-{_digest(seed)}"
         requested_payload = {

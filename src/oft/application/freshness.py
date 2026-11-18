@@ -12,7 +12,7 @@ from collections.abc import Mapping
 from dataclasses import dataclass
 from datetime import datetime, timedelta
 from enum import StrEnum
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, Protocol
 
 import structlog
 
@@ -142,6 +142,23 @@ class FreshnessStamp:
         return "STALE" if self.stale else "COMPLETE"
 
 
+class FreshnessAlertSink(Protocol):
+    """The one transition write an optional alert adapter needs.
+
+    The guard calls this on a STALE/FRESH edge, and once on the first
+    observation of a stream after startup: a recovery that happened while the
+    daemon was down left the durable marker at DEGRADED, so that first fresh
+    evaluation must be able to transition it (the notification layer no-ops
+    when there is no prior marker). A repeated evaluation cannot produce a
+    message storm. Implementations must not raise into the guard; the guard
+    also contains a failure defensively.
+    """
+
+    def record_transition(
+        self, *, stream: str, state: str, occurred_at: str, reason: str | None
+    ) -> object | None: ...
+
+
 @dataclass
 class _Entry:
     observed_at: datetime
@@ -158,6 +175,7 @@ class FreshnessGuard:
         *,
         clock: ClockPort,
         budgets: Mapping[str, FreshnessBudget] | None = None,
+        alert_sink: FreshnessAlertSink | None = None,
     ) -> None:
         self._clock = clock
         merged = dict(DEFAULT_BUDGETS)
@@ -165,6 +183,7 @@ class FreshnessGuard:
             merged.update(budgets)
         self._budgets = merged
         self._entries: dict[str, _Entry] = {}
+        self._alert_sink = alert_sink
         self._logger = structlog.get_logger(__name__)
 
     def _budget(self, stream: str) -> FreshnessBudget:
@@ -178,14 +197,25 @@ class FreshnessGuard:
         closes_at: datetime | None = None,
         expected_at: datetime | None = None,
     ) -> FreshnessStamp:
-        """Record fresh data; the deadline is based on close/expected time."""
+        """Record fresh data; the deadline is based on close/expected time.
+
+        The first observation of a stream after startup is marked so the next
+        fresh ``evaluate()`` attempts one RECOVERED transition. That is what
+        clears a durable DEGRADED marker when the outage recovered while the
+        daemon was down; the notification layer ignores it on a clean install.
+        """
         budget = self._budget(stream)
         anchor = closes_at or expected_at or observed_at
         previous = self._entries.get(stream)
         entry = _Entry(
             observed_at=observed_at,
             deadline=anchor + timedelta(seconds=budget.seconds),
-            pending_fresh_log=bool(previous is not None and previous.logged_stale),
+            # The live loop records every accepted event and evaluates only on
+            # the flush/connect boundary, so this must stay latched across
+            # consecutive records until a fresh ``evaluate()`` consumes it.
+            pending_fresh_log=(
+                previous is None or previous.logged_stale or previous.pending_fresh_log
+            ),
         )
         self._entries[stream] = entry
         return self._stamp(stream, entry, self._clock.now())
@@ -212,6 +242,9 @@ class FreshnessGuard:
                     budget_seconds=stamp.budget_seconds,
                     reason=stamp.reason,
                 )
+                self._alert_transition(
+                    stream=stream, state="DEGRADED", instant=instant, reason=stamp.reason
+                )
             elif not stamp.stale and entry.logged_stale:
                 entry.logged_stale = False
                 entry.pending_fresh_log = False
@@ -221,6 +254,9 @@ class FreshnessGuard:
                     data_quality=stamp.data_quality,
                     age_seconds=stamp.age_seconds,
                 )
+                self._alert_transition(
+                    stream=stream, state="RECOVERED", instant=instant, reason=None
+                )
             elif not stamp.stale and entry.pending_fresh_log:
                 entry.pending_fresh_log = False
                 self._logger.info(
@@ -229,8 +265,32 @@ class FreshnessGuard:
                     data_quality=stamp.data_quality,
                     age_seconds=stamp.age_seconds,
                 )
+                self._alert_transition(
+                    stream=stream, state="RECOVERED", instant=instant, reason=None
+                )
             stamps.append(stamp)
         return tuple(stamps)
+
+    def _alert_transition(
+        self, *, stream: str, state: str, instant: datetime, reason: str | None
+    ) -> None:
+        """Notify the optional alert adapter, never letting it break the guard."""
+        if self._alert_sink is None:
+            return
+        try:
+            self._alert_sink.record_transition(
+                stream=stream,
+                state=state,
+                occurred_at=utc_timestamp(instant),
+                reason=reason,
+            )
+        except Exception as exc:  # noqa: BLE001 - a push never breaks freshness
+            self._logger.warning(
+                "freshness_alert_enqueue_failed",
+                stream=stream,
+                state=state,
+                error_type=type(exc).__name__,
+            )
 
     def is_stale(self, stream: str, now: datetime | None = None) -> bool:
         stamp = self.stamp(stream, now)
@@ -435,6 +495,7 @@ __all__ = [
     "ClockSkew",
     "ClockSkewDetector",
     "ClockSkewStatus",
+    "FreshnessAlertSink",
     "FreshnessBudget",
     "FreshnessGuard",
     "FreshnessStamp",

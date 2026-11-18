@@ -95,6 +95,11 @@ SCAN_FAILED_ALERT_KEY = "telegram.scan_failed_alert"
 # are time-sensitive and the ledger is unaffected when delivery fails.
 TRIGGER_ALERT_KEY = "telegram.trigger_alert"
 ENTRY_RECHECK_ALERT_KEY = "telegram.entry_recheck_alert"
+# Position-management and risk/degradation pushes are enabled by default: both
+# are time-sensitive and delivery failure never changes the ledger. Both are
+# read-only toggles until the settings screen lands in slice 53.
+POSITION_PUSH_KEY = "telegram.position"
+RISK_PUSH_KEY = "telegram.risk"
 # A scan summary lists at most this many report ids so the message stays short.
 MAX_SCAN_REPORT_IDS = 10
 # A burst push lists at most this many opportunities, then a remaining count.
@@ -400,9 +405,11 @@ __all__ = [
     "POLLER_STALE_SECONDS",
     "POLL_OFFSET_KEY",
     "POSITIONS_COMMAND",
+    "POSITION_PUSH_KEY",
     "REFUSAL_TEXT",
     "REFUSAL_WINDOW_SECONDS",
     "REPORT_COMMAND",
+    "RISK_PUSH_KEY",
     "SCAN_FAILED_ALERT_KEY",
     "SCAN_REPORT_PUSH_KEY",
     "STATUS_COMMAND",

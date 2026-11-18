@@ -11,6 +11,7 @@ from typer.testing import CliRunner
 
 from fakes.telegram import MemorySecretBackend
 from oft.application import secrets_service as secrets_module
+from oft.application.health import DaemonProbe
 from oft.cli.main import app
 
 SENTINEL = "123456789:AAFakeSentinelToken_abcdefghijklmnopqrstuv"
@@ -128,7 +129,157 @@ def test_an_invalid_token_is_a_validation_error(configured: Any) -> None:
 
     assert result.exit_code == 2
     assert "bot_token" in result.output
-    assert "not-a-token" not in result.stdout
+
+
+def test_watchdog_requires_the_one_shot_flag(configured: Any) -> None:
+    result = _invoke("telegram", "watchdog")
+
+    assert result.exit_code == 2
+    assert "--once" in result.output
+
+
+def test_watchdog_once_never_prints_the_token(configured: Any, monkeypatch: Any) -> None:
+    token = _invoke("telegram", "token", "set", "--stdin", input_text=SENTINEL + "\n")
+    assert token.exit_code == 0, token.output
+    monkeypatch.setattr(
+        "oft.cli.commands.telegram.probe_daemon",
+        lambda settings, timeout=0.25: DaemonProbe(state="OFFLINE", detail="no listener"),
+    )
+
+    result = _invoke("telegram", "watchdog", "--once", "--json")
+
+    assert result.exit_code == 0, result.output
+    payload = _payload(result.stdout)
+    assert payload["data"]["daemon_state"] == "OFFLINE"
+    # No allowlisted private chat is configured, so no send happens.
+    assert payload["data"]["action"] == "NONE"
+    assert SENTINEL not in result.stdout
+
+
+def _configure_private_watchdog(monkeypatch: Any) -> None:
+    assert _invoke("telegram", "token", "set", "--stdin", input_text=SENTINEL + "\n").exit_code == 0
+    assert _invoke("telegram", "allowlist", "add", "--chat-id", "1001").exit_code == 0
+    monkeypatch.setattr(
+        "oft.cli.commands.telegram.probe_daemon",
+        lambda settings, timeout=0.25: DaemonProbe(state="OFFLINE", detail="no listener"),
+    )
+
+
+def _record_sends(monkeypatch: Any) -> list[dict[str, Any]]:
+    from oft.adapters.telegram_fake import TelegramFake
+
+    sent: list[dict[str, Any]] = []
+    real_send = TelegramFake.send_message
+
+    def _recording(self: Any, **kwargs: Any) -> Any:
+        sent.append(dict(kwargs))
+        return real_send(self, **kwargs)
+
+    monkeypatch.setattr(TelegramFake, "send_message", _recording)
+    return sent
+
+
+def test_watchdog_alerts_once_on_an_allowlisted_private_chat(
+    configured: Any, monkeypatch: Any
+) -> None:
+    _configure_private_watchdog(monkeypatch)
+    sent = _record_sends(monkeypatch)
+
+    first = _invoke("telegram", "watchdog", "--once", "--json")
+    second = _invoke("telegram", "watchdog", "--once", "--json")
+
+    assert first.exit_code == 0, first.output
+    assert _payload(first.stdout)["data"]["action"] == "ALERT_SENT"
+    assert _payload(first.stdout)["data"]["daemon_state"] == "OFFLINE"
+    assert second.exit_code == 0, second.output
+    assert _payload(second.stdout)["data"]["action"] == "NONE"
+    assert len(sent) == 1
+    assert sent[0]["chat_id"] == 1001
+    assert SENTINEL not in sent[0]["text"]
+    assert SENTINEL not in first.stdout
+
+
+def test_watchdog_group_only_allowlist_is_a_quiet_noop(configured: Any, monkeypatch: Any) -> None:
+    assert _invoke("telegram", "token", "set", "--stdin", input_text=SENTINEL + "\n").exit_code == 0
+    assert _invoke("telegram", "allowlist", "add", "--chat-id=-100200").exit_code == 0
+    monkeypatch.setattr(
+        "oft.cli.commands.telegram.probe_daemon",
+        lambda settings, timeout=0.25: DaemonProbe(state="OFFLINE", detail="no listener"),
+    )
+    sent = _record_sends(monkeypatch)
+
+    result = _invoke("telegram", "watchdog", "--once", "--json")
+
+    assert result.exit_code == 0, result.output
+    assert _payload(result.stdout)["data"]["action"] == "NONE"
+    assert sent == []
+    assert SENTINEL not in result.stdout
+
+
+def test_watchdog_reports_a_failed_send_as_a_nonzero_exit(
+    configured: Any, monkeypatch: Any
+) -> None:
+    from oft.adapters.telegram_fake import TelegramFake
+    from oft.ports.telegram import TELEGRAM_UPSTREAM_ERROR, TelegramError
+
+    _configure_private_watchdog(monkeypatch)
+
+    def _fail(self: Any, *, chat_id: int, text: str, reply_to_message_id: Any = None) -> Any:
+        raise TelegramError(TELEGRAM_UPSTREAM_ERROR, "scripted send failure")
+
+    monkeypatch.setattr(TelegramFake, "send_message", _fail)
+
+    text_result = _invoke("telegram", "watchdog", "--once")
+    assert text_result.exit_code == 1, text_result.output
+    assert "ALERT_FAILED" in text_result.output
+    assert "error:" in text_result.output
+    assert SENTINEL not in text_result.output
+
+    json_result = _invoke("telegram", "watchdog", "--once", "--json")
+    assert json_result.exit_code == 1, json_result.output
+    assert _payload(json_result.stdout)["error"]["code"] == "TELEGRAM_DELIVERY_FAILED"
+    assert SENTINEL not in json_result.stdout
+
+
+def test_watchdog_reports_an_unreadable_state_as_a_nonzero_exit(
+    configured: Any, monkeypatch: Any
+) -> None:
+    from oft.adapters.sqlite_store import SqliteStore
+
+    real_get = SqliteStore.get_system_state
+
+    def _raise_for_watchdog(self: Any, key: str) -> Any:
+        if key == "telegram.watchdog_state":
+            raise RuntimeError("state unavailable")
+        return real_get(self, key)
+
+    monkeypatch.setattr(SqliteStore, "get_system_state", _raise_for_watchdog)
+
+    text_result = _invoke("telegram", "watchdog", "--once")
+    assert text_result.exit_code == 1, text_result.output
+    assert "UNKNOWN" in text_result.output
+    assert "error:" in text_result.output
+
+    json_result = _invoke("telegram", "watchdog", "--once", "--json")
+    assert json_result.exit_code == 1, json_result.output
+    assert _payload(json_result.stdout)["error"]["code"] == "DATA_UNAVAILABLE"
+
+
+def test_watchdog_reports_an_unavailable_lock_as_a_nonzero_exit(
+    configured: Any, monkeypatch: Any
+) -> None:
+    _memory, data_dir = configured
+    _configure_private_watchdog(monkeypatch)
+    sent = _record_sends(monkeypatch)
+    # A directory at the lock path makes ``open(path, "a+")`` raise an OSError.
+    (data_dir / "telegram-watchdog.lock").mkdir(parents=True, exist_ok=True)
+
+    result = _invoke("telegram", "watchdog", "--once", "--json")
+
+    assert result.exit_code == 1, result.output
+    assert _payload(result.stdout)["error"]["code"] == "DATA_UNAVAILABLE"
+    assert "Traceback" not in result.output
+    assert sent == []
 
 
 def test_test_send_without_a_token_reports_not_configured(configured: Any) -> None:
