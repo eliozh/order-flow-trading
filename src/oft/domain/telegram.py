@@ -86,9 +86,10 @@ DESKTOP_VIEW_TEXT = "更多内容请在桌面端查看"
 
 TELEGRAM_CHAT_IDS_KEY = "telegram.chat_ids"
 TELEGRAM_ALLOWED_USER_IDS_KEY = "telegram.allowed_user_ids"
-# Read-only push toggles for this slice (the settings screen lands in slice 53).
-# Scan summaries are enabled by default; the zero-report failure alert is an
-# explicit opt-in so a broken scan does not page an operator by default.
+# Push toggles owned by the settings service and written by F10f / the
+# ``oft telegram toggles`` command. Scan summaries are enabled by default; the
+# zero-report failure alert is an explicit opt-in so a broken scan does not page
+# an operator by default.
 SCAN_REPORT_PUSH_KEY = "telegram.scan_report"
 SCAN_FAILED_ALERT_KEY = "telegram.scan_failed_alert"
 # Opportunity lifecycle and entry re-check pushes are enabled by default: both
@@ -96,12 +97,12 @@ SCAN_FAILED_ALERT_KEY = "telegram.scan_failed_alert"
 TRIGGER_ALERT_KEY = "telegram.trigger_alert"
 ENTRY_RECHECK_ALERT_KEY = "telegram.entry_recheck_alert"
 # Position-management and risk/degradation pushes are enabled by default: both
-# are time-sensitive and delivery failure never changes the ledger. Both are
-# read-only toggles until the settings screen lands in slice 53.
+# are time-sensitive and delivery failure never changes the ledger. They are
+# operator-writable through the F10f settings screen and CLI.
 POSITION_PUSH_KEY = "telegram.position"
 RISK_PUSH_KEY = "telegram.risk"
 # Budget-threshold pushes are enabled by default: they are time-sensitive and
-# alert-only (a call is never stopped). Read-only until slice 53.
+# alert-only (a call is never stopped). Operator-writable since F10f.
 BUDGET_PUSH_KEY = "telegram.budget"
 # A scan summary lists at most this many report ids so the message stays short.
 MAX_SCAN_REPORT_IDS = 10

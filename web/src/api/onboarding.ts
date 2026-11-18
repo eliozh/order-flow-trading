@@ -27,6 +27,8 @@ export interface OnboardingStepMeta {
   title: string
   deferred: boolean
   deferred_milestone: number | null
+  /** Optional steps are real but never block ``all_complete``. */
+  optional: boolean
 }
 
 export interface OnboardingStepData extends OnboardingStepMeta {
@@ -50,7 +52,7 @@ export type OnboardingProgressEnvelope = ApiEnvelope<OnboardingProgressData>
  * canonical titles (used only as a pre-load fallback). The rendered nav and
  * headings come from the server's `progress.steps[].title`.
  *
- * Steps 3/4 are deferred and can never be completed in this slice.
+ * Step 3 (Binance) is deferred; step 4 (Telegram) is a real optional step.
  */
 export const ONBOARDING_STEPS = [
   {
@@ -59,16 +61,39 @@ export const ONBOARDING_STEPS = [
     title: '环境与本地绑定',
     deferred: false,
     deferred_milestone: null,
+    optional: false,
   },
-  { step: 2, id: 'llm', title: 'LLM providers', deferred: false, deferred_milestone: null },
-  { step: 3, id: 'binance', title: 'Binance 密钥与权限', deferred: true, deferred_milestone: 5 },
-  { step: 4, id: 'telegram', title: 'Telegram 只读通道', deferred: true, deferred_milestone: 6 },
+  {
+    step: 2,
+    id: 'llm',
+    title: 'LLM providers',
+    deferred: false,
+    deferred_milestone: null,
+    optional: false,
+  },
+  {
+    step: 3,
+    id: 'binance',
+    title: 'Binance 密钥与权限',
+    deferred: true,
+    deferred_milestone: 5,
+    optional: false,
+  },
+  {
+    step: 4,
+    id: 'telegram',
+    title: 'Telegram 只读通道',
+    deferred: false,
+    deferred_milestone: null,
+    optional: true,
+  },
   {
     step: 5,
     id: 'watchlist',
     title: 'Watchlist、周期与预算',
     deferred: false,
     deferred_milestone: null,
+    optional: false,
   },
 ] as const satisfies readonly OnboardingStepMeta[]
 
@@ -130,6 +155,7 @@ function isStep(value: unknown): value is OnboardingStepData {
     typeof value.title !== 'string' ||
     value.title.length === 0 ||
     value.deferred !== DEFERRED_ONBOARDING_STEPS.has(value.step) ||
+    value.optional !== canonical.optional ||
     typeof value.completed !== 'boolean'
   ) {
     return false

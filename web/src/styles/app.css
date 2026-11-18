@@ -497,6 +497,14 @@ code {
   cursor: pointer;
 }
 
+/* Allowlist chip removal: compact on desktop, but the ≤768px `.control-btn`
+   rule below raises it to the 44px touch target (DESIGN A3). */
+.allowlist-remove {
+  min-height: 24px;
+  padding: 0 6px;
+  font-size: 11px;
+}
+
 .control-link {
   color: var(--oft-accent);
   font-size: 12px;

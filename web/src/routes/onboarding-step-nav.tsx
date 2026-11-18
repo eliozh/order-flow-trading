@@ -35,6 +35,9 @@ export function StepNav({ progress, activeStep }: StepNavProps) {
               {step.deferred && (
                 <span className="chip chip--muted">Milestone {step.deferred_milestone}</span>
               )}
+              {step.optional && !step.deferred && (
+                <span className="chip chip--muted">optional</span>
+              )}
               {step.completed && (
                 <span className="onboarding-complete">
                   <span className="ok" aria-hidden="true">

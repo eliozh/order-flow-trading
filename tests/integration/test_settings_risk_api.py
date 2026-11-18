@@ -564,6 +564,7 @@ def test_legacy_cross_field_row_is_readable_and_repairable_via_api(tmp_path: Pat
     assert [section["section"] for section in sections.json()["data"]["sections"]] == [
         "scan",
         "risk",
+        "telegram",
     ]
     assert risk.status_code == 200, risk.text
     assert risk.json()["data"]["caps"]["daily_loss_pct"] == 0.5

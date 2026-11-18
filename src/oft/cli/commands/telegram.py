@@ -52,8 +52,14 @@ allowlist_app = typer.Typer(
     no_args_is_help=True,
     add_completion=False,
 )
+toggles_app = typer.Typer(
+    help="Per-event push toggles (scan report, trigger, entry re-check, position, risk, budget).",
+    no_args_is_help=True,
+    add_completion=False,
+)
 telegram_app.add_typer(token_app, name="token")
 telegram_app.add_typer(allowlist_app, name="allowlist")
+telegram_app.add_typer(toggles_app, name="toggles")
 
 
 def _settings_or_exit(json_output: bool) -> Any:
@@ -456,4 +462,112 @@ def allowlist_remove_command(
     )
 
 
-__all__ = ["allowlist_app", "telegram_app", "token_app"]
+@toggles_app.command("show")
+def toggles_show_command(
+    json_output: Annotated[bool, typer.Option("--json", help="Emit JSON.")] = False,
+) -> None:
+    """Show the six push toggles and their provenance."""
+    settings = _settings_or_exit(json_output)
+    service = _service(_container_or_exit(settings, json_output=json_output))
+    state = _call_or_exit(service.settings_state, json_output=json_output)
+    payload = state.to_contract()
+    if json_output:
+        _emit_json(payload)
+        return
+    lines = [
+        f"{name:<16}{'on' if enabled else 'off'}" for name, enabled in payload["toggles"].items()
+    ]
+    lines.append(f"source          {payload['source']}")
+    lines.append(f"updated_at      {payload['updated_at'] or '-'}")
+    typer.echo("\n".join(lines))
+
+
+@toggles_app.command("set")
+def toggles_set_command(
+    scan_report: Annotated[
+        bool | None,
+        typer.Option("--scan-report/--no-scan-report", help="Scan-completion summary."),
+    ] = None,
+    trigger: Annotated[
+        bool | None,
+        typer.Option("--trigger/--no-trigger", help="Opportunity triggered/invalidated alerts."),
+    ] = None,
+    entry_recheck: Annotated[
+        bool | None,
+        typer.Option(
+            "--entry-recheck/--no-entry-recheck", help="Entry re-check awaiting-human alerts."
+        ),
+    ] = None,
+    position: Annotated[
+        bool | None,
+        typer.Option("--position/--no-position", help="Position management executed/blocked."),
+    ] = None,
+    risk: Annotated[
+        bool | None,
+        typer.Option("--risk/--no-risk", help="Risk and degradation alerts."),
+    ] = None,
+    budget: Annotated[
+        bool | None,
+        typer.Option("--budget/--no-budget", help="Budget threshold alerts."),
+    ] = None,
+    chat_id: Annotated[
+        list[int] | None,
+        typer.Option("--chat-id", help="Replace the chat allowlist (repeatable)."),
+    ] = None,
+    user_id: Annotated[
+        list[int] | None,
+        typer.Option("--user-id", help="Replace the user allowlist (repeatable)."),
+    ] = None,
+    json_output: Annotated[bool, typer.Option("--json", help="Emit JSON.")] = False,
+) -> None:
+    """Update one or more toggles (and optionally the allowlists) atomically.
+
+    At least one chat id is required while any toggle is enabled; an all-off
+    state with no chats is allowed.
+    """
+    toggles = {
+        name: value
+        for name, value in (
+            ("scan_report", scan_report),
+            ("trigger", trigger),
+            ("entry_recheck", entry_recheck),
+            ("position", position),
+            ("risk", risk),
+            ("budget", budget),
+        )
+        if value is not None
+    }
+    if not toggles and chat_id is None and user_id is None:
+        emit_error(
+            "VALIDATION_FAILED",
+            "provide at least one toggle or allowlist selector",
+            json_output=json_output,
+        )
+        raise typer.Exit(code=2)
+    settings = _settings_or_exit(json_output)
+    service = _service(_container_or_exit(settings, json_output=json_output, initialize=True))
+    try:
+        state = service.update_settings(
+            chat_ids=None if chat_id is None else list(chat_id),
+            allowed_user_ids=None if user_id is None else list(user_id),
+            toggles=toggles or None,
+            actor="cli",
+        )
+    except SettingValidationError as exc:
+        emit_error("VALIDATION_FAILED", exc.message, json_output=json_output, details=exc.details)
+        raise typer.Exit(code=2) from exc
+    except (ConfigError, SecretStoreUnavailable) as exc:
+        _exit_config_invalid(exc, json_output)
+    payload = state.to_contract()
+    if json_output:
+        _emit_json(payload)
+        return
+    typer.echo(
+        "telegram toggles updated · "
+        + ", ".join(
+            f"{name}={'on' if enabled else 'off'}" for name, enabled in payload["toggles"].items()
+        )
+    )
+
+
+__all__ = ["allowlist_app", "telegram_app", "toggles_app", "token_app"]

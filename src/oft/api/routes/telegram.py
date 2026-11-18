@@ -17,8 +17,11 @@ from oft.api.schemas.telegram import (
     TelegramAllowlistUpdate,
     TelegramReceiptData,
     TelegramReceiptsData,
+    TelegramSettingsData,
+    TelegramSettingsUpdate,
     TelegramStatusData,
     TelegramTestRequest,
+    TelegramTogglesData,
     TelegramTokenDelete,
     TelegramTokenStatusData,
     TelegramTokenUpdate,
@@ -62,6 +65,87 @@ def _map_telegram_error(exc: TelegramError) -> ApiError:
 
 def _token_payload(status: TelegramTokenStatus) -> dict[str, Any]:
     return status.to_contract()
+
+
+def _settings_payload(service: TelegramService, receipt_limit: int = 6) -> dict[str, Any]:
+    """The aggregate payload; the token is represented by its mask only."""
+    settings = service.settings_state()
+    records = service.receipts(limit=receipt_limit)
+    latest_test = service.latest_test_receipt()
+    return {
+        "token": _token_payload(service.token_status()),
+        "chat_ids": list(settings.chat_ids),
+        "allowed_user_ids": list(settings.allowed_user_ids),
+        "toggles": TelegramTogglesData(**settings.toggles).model_dump(),
+        "source": settings.source.value,
+        "updated_at": settings.updated_at,
+        "updated_by": settings.updated_by,
+        "receipts": [receipt_contract(record) for record in records],
+        "receipt_total": service.receipt_count(),
+        "latest_test_receipt": (receipt_contract(latest_test) if latest_test is not None else None),
+    }
+
+
+@router.get(
+    "/api/v1/settings/telegram",
+    response_model=Envelope[TelegramSettingsData],
+    responses=ERROR_RESPONSES,
+)
+def get_telegram_settings(request: Request) -> dict[str, Any]:
+    """Token mask, allowlists, six toggles, provenance, and recent receipts."""
+    data = _settings_payload(_service(request), receipt_limit=6)
+    return success_envelope(
+        data,
+        request_id=new_request_id(),
+        provenance="CALC",
+        data_quality="COMPLETE",
+    )
+
+
+@router.put(
+    "/api/v1/settings/telegram",
+    response_model=Envelope[TelegramSettingsData],
+    responses=ERROR_RESPONSES,
+    openapi_extra=mutation_openapi(),
+)
+def update_telegram_settings(
+    payload: TelegramSettingsUpdate,
+    request: Request,
+    idempotency_key: str | None = Header(default=None, alias="Idempotency-Key"),
+) -> Any:
+    """Validate and persist a partial Telegram settings patch atomically.
+
+    Exactly one ``TELEGRAM_SETTINGS_UPDATED`` audit event is written for a real
+    change; an unchanged patch writes nothing. If any toggle is enabled, at
+    least one chat id is required (``chat_required_for_pushes``); an all-off
+    state with no chats is allowed. The response is the same aggregate shape as
+    the read, and never includes the token value.
+    """
+    toggles_patch = (
+        payload.toggles.model_dump(exclude_unset=True) if payload.toggles is not None else None
+    )
+
+    def _mutate() -> dict[str, Any]:
+        service = _service(request)
+        try:
+            service.update_settings(
+                chat_ids=payload.chat_ids,
+                allowed_user_ids=payload.allowed_user_ids,
+                toggles=toggles_patch,
+                actor="web",
+                reason=payload.reason,
+            )
+        except SettingValidationError as exc:
+            raise ApiError("VALIDATION_FAILED", exc.message, details=exc.details) from exc
+        return _settings_payload(service)
+
+    return idempotent_mutation(
+        request,
+        presented_key=idempotency_key,
+        payload=payload,
+        status=200,
+        mutate=_mutate,
+    )
 
 
 @router.get(

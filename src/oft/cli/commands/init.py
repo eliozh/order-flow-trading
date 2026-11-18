@@ -2,15 +2,28 @@
 
 The command runs with the daemon down and drives the same application services
 as the Web wizard: :mod:`oft.application.onboarding_service` owns the step
-identities and progress document, :class:`SettingsService` persists scan/LLM
-settings, :class:`SecretsService` stores provider keys write-only, and
-:class:`BudgetService` owns thresholds. No step definition is duplicated here,
-and no Binance, Telegram, or Live configuration is offered: steps 3 and 4 are
-explicitly deferred to Milestones 5 and 6.
+identities and progress document, :class:`SettingsService` persists scan/LLM/
+Telegram settings, :class:`SecretsService` stores provider keys and the bot
+token write-only, and :class:`BudgetService` owns thresholds. No step definition
+is duplicated here. Step 3 (Binance) stays deferred to its milestone; step 4
+(Telegram) is a real **optional** step that can be configured interactively or
+through flags, and skipping it leaves pushes disabled without blocking a Paper
+finish.
 
-Secrets are never accepted on argv. A key is read from stdin with no echo (a
-TTY uses ``getpass``; a pipe reads one line) and is only ever rendered as the
-service's fixed mask.
+Secrets are never accepted on argv. A provider key or bot token is read from
+stdin with no echo (a TTY uses ``getpass``; a pipe reads one line) and is only
+ever rendered as the service's fixed mask.
+
+The Telegram prompts, flag parsing, and non-interactive plan live in
+:mod:`oft.cli.commands.init_telegram`.
+
+Documented maintainability exception: this module remains above 800 lines
+because the interactive wizard's step orchestration, prompt seams, validation
+helpers, and error mapping share one entry point and one control flow; the
+Telegram half has already been extracted. Splitting further would only move the
+same code and duplicate the CLI error boundary. The exception is recorded here
+per the repository's soft-ceiling standard and should be revisited if the
+wizard grows another step.
 """
 
 from __future__ import annotations
@@ -18,7 +31,7 @@ from __future__ import annotations
 import getpass
 import re
 import sys
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from typing import Annotated
 
 import typer
@@ -43,6 +56,15 @@ from oft.application.settings_service import SettingsService
 from oft.application.symbol_registry import SymbolRegistry, SymbolRegistryError
 from oft.bootstrap import AppContainer, build_container
 from oft.cli.commands.doctor import emit_error
+from oft.cli.commands.init_telegram import (
+    TelegramOptions,
+    TelegramPlan,
+    apply_telegram_plan,
+    plan_telegram,
+    print_telegram_line,
+    read_telegram_token,
+    step_telegram_interactive,
+)
 from oft.config import ConfigError, Environment, Settings, load_settings
 from oft.domain.events import strip_control_characters
 from oft.domain.llm_settings import MAX_API_KEY_LENGTH, PROVIDERS, validate_provider
@@ -50,7 +72,8 @@ from oft.domain.settings import SettingValidationError, validate_scan_period
 from oft.domain.time import utc_timestamp
 from oft.ports.store import StoreUnavailableError
 
-# Steps 3 (Binance) and 4 (Telegram) are deferred by the shared definition.
+# Step 3 (Binance) is deferred by the shared definition; step 4 (Telegram) is
+# active and optional, so it can still be configured after the required steps.
 _DEFERRED_STEPS = {step.step: step.deferred_milestone for step in ONBOARDING_STEPS if step.deferred}
 _STEP_TITLES = {step.step: step.title for step in ONBOARDING_STEPS}
 _BUDGET_FIELDS = ("daily_usd", "weekly_usd", "monthly_usd")
@@ -90,6 +113,7 @@ class _InitOptions:
     budget_daily: str | None = None
     budget_weekly: str | None = None
     budget_monthly: str | None = None
+    telegram: TelegramOptions = field(default_factory=TelegramOptions)
 
 
 @dataclass(frozen=True)
@@ -102,6 +126,7 @@ class _NonInteractivePlan:
     symbols: tuple[str, ...]
     period: str | None
     budget: dict[str, str] | None
+    telegram: TelegramPlan = field(default_factory=TelegramPlan)
 
 
 # -- small seams (monkeypatched by tests) ------------------------------------
@@ -140,6 +165,11 @@ def _read_secret_key() -> str:
     return value
 
 
+def _read_telegram_token() -> str:
+    """Read the bot token from stdin without echo; never from argv."""
+    return read_telegram_token(stdin_is_tty=_stdin_is_tty)
+
+
 # -- rendering ---------------------------------------------------------------
 
 
@@ -173,14 +203,9 @@ def _print_providers(secrets: SecretsService) -> None:
 
 def _print_deferred_steps() -> None:
     binance = _DEFERRED_STEPS[3]
-    telegram = _DEFERRED_STEPS[4]
     typer.echo(
         f"3/5 {_STEP_TITLES[3]}: deferred to Milestone {binance}; "
         "init never prompts for Binance tokens."
-    )
-    typer.echo(
-        f"4/5 {_STEP_TITLES[4]}: deferred to Milestone {telegram}; "
-        "init never prompts for a bot token or chat id."
     )
 
 
@@ -498,13 +523,18 @@ def _run_interactive(
     options: _InitOptions,
 ) -> None:
     progress = service.read_onboarding_progress()
-    if progress.all_complete:
+    completed = set(progress.completed_steps)
+    incomplete = tuple(step for step in ACTIVE_ONBOARDING_STEPS if step not in completed)
+    # ``all_complete`` ignores the optional step 4, so only an empty ACTIVE
+    # incomplete set is terminal: a run after the required steps must still be
+    # able to configure (or re-prompt for) the optional Telegram step.
+    if not incomplete:
         _print_deferred_steps()
+        print_telegram_line(container.telegram_service)
         _print_summary(container, service, secrets, budget_service, settings)
         return
     if options.resume:
         typer.echo(f"Resuming at step {progress.resumed_step}/5; completed steps are persisted.")
-    completed = set(progress.completed_steps)
     for step in ACTIVE_ONBOARDING_STEPS:
         if step in completed:
             continue
@@ -513,6 +543,13 @@ def _run_interactive(
             service.complete_onboarding_step(1, actor="cli")
         elif step == 2:
             _step_llm_interactive(service, secrets)
+        elif step == 4:
+            step_telegram_interactive(
+                container.telegram_service,
+                service,
+                prompt_text=_prompt_text,
+                read_token=_read_telegram_token,
+            )
         elif step == 5:
             _step_watchlist_interactive(container, service, budget_service)
     _print_deferred_steps()
@@ -550,6 +587,13 @@ def _plan_non_interactive(
         elif not secrets.status(provider).configured and not options.llm_key_stdin:
             missing.append("--llm-key-stdin")
 
+    telegram_plan, telegram_missing = plan_telegram(
+        incomplete=incomplete,
+        options=options.telegram,
+        token_configured=secrets.status_for("telegram", "bot_token").configured,
+    )
+    missing.extend(telegram_missing)
+
     if 5 in incomplete:
         has_star = container.store.watchlist_snapshot(limit=1).starred_count >= 1
         if options.watchlist is None and not has_star:
@@ -575,6 +619,7 @@ def _plan_non_interactive(
         symbols=symbols,
         period=period,
         budget=budget,
+        telegram=telegram_plan,
     )
 
 
@@ -587,8 +632,14 @@ def _run_non_interactive(
     options: _InitOptions,
 ) -> None:
     progress = service.read_onboarding_progress()
-    if progress.all_complete:
+    completed = set(progress.completed_steps)
+    incomplete = tuple(step for step in ACTIVE_ONBOARDING_STEPS if step not in completed)
+    # ``all_complete`` ignores optional step 4: when only step 4 is left, fall
+    # through so explicit Telegram flags are applied rather than silently
+    # dropped, and an omitted flag set still skips (without completing) it.
+    if not incomplete:
         _print_deferred_steps()
+        print_telegram_line(container.telegram_service)
         _print_summary(container, service, secrets, budget_service, settings)
         return
 
@@ -598,6 +649,8 @@ def _run_non_interactive(
     _print_environment(settings)
     _print_providers(secrets)
     _print_deferred_steps()
+    skip_telegram = 4 in plan.incomplete and not plan.telegram.configure
+    print_telegram_line(container.telegram_service, skipped=skip_telegram)
     _print_watchlist_state(container, service, budget_service)
 
     # Validation finished above; now apply prerequisites, then progress.
@@ -610,12 +663,21 @@ def _run_non_interactive(
             secrets.set_key(provider, key, actor="cli")
             typer.echo(f"  {provider} key stored {_key_label(secrets.status(provider))}")
         _ensure_active_provider(service, secrets, provider)
+    apply_telegram_plan(
+        container.telegram_service,
+        plan.telegram,
+        read_token=_read_telegram_token,
+    )
     if 5 in plan.incomplete:
         for symbol in plan.symbols:
             container.symbol_registry.set_star_with_audit(symbol, True, actor="cli")
         _apply_scan_period(service, plan.period)
         _apply_budget(budget_service, plan.budget, now=utc_timestamp(container.clock.now()))
     for step in plan.incomplete:
+        if step == 4 and not plan.telegram.configure:
+            # Omission of every Telegram flag skips the optional step; it must
+            # never be marked complete without a token and a chat.
+            continue
         service.complete_onboarding_step(step, actor="cli")
     _print_summary(container, service, secrets, budget_service, settings)
 
@@ -633,6 +695,9 @@ def _supplied_non_interactive_flags(options: _InitOptions) -> list[str]:
         ("--budget-daily", options.budget_daily is not None),
         ("--budget-weekly", options.budget_weekly is not None),
         ("--budget-monthly", options.budget_monthly is not None),
+        ("--telegram-token-stdin", options.telegram.token_stdin),
+        ("--telegram-chat-id", bool(options.telegram.chat_ids)),
+        ("--telegram-user-id", bool(options.telegram.user_ids)),
     )
     return [flag for flag, supplied in candidates if supplied]
 
@@ -756,8 +821,29 @@ def init_command(
         str | None,
         typer.Option("--budget-monthly", help="Monthly USD threshold; --non-interactive only."),
     ] = None,
+    telegram_token_stdin: Annotated[
+        bool,
+        typer.Option(
+            "--telegram-token-stdin",
+            help=(
+                "Read the optional Telegram bot token from stdin; never accepted on "
+                "argv. Requires at least one --telegram-chat-id."
+            ),
+        ),
+    ] = False,
+    telegram_chat_id: Annotated[
+        list[int] | None,
+        typer.Option(
+            "--telegram-chat-id",
+            help="Telegram chat id to allow (repeatable; requires --telegram-token-stdin).",
+        ),
+    ] = None,
+    telegram_user_id: Annotated[
+        list[int] | None,
+        typer.Option("--telegram-user-id", help="Telegram user id to allow (repeatable)."),
+    ] = None,
 ) -> None:
-    """Paper-only first-run onboarding; steps 3 and 4 are deferred."""
+    """Paper-only first-run onboarding; step 3 is deferred, step 4 is optional."""
     options = _InitOptions(
         resume=resume,
         non_interactive=non_interactive,
@@ -768,6 +854,11 @@ def init_command(
         budget_daily=budget_daily,
         budget_weekly=budget_weekly,
         budget_monthly=budget_monthly,
+        telegram=TelegramOptions(
+            token_stdin=telegram_token_stdin,
+            chat_ids=tuple(telegram_chat_id or ()),
+            user_ids=tuple(telegram_user_id or ()),
+        ),
     )
     try:
         _run(options)

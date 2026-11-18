@@ -19,7 +19,11 @@ import structlog
 
 from oft.application import telegram_queries
 from oft.application.secrets_service import SecretsService
-from oft.application.settings_service import SettingsService, TelegramAllowlistSettings
+from oft.application.settings_service import (
+    SettingsService,
+    TelegramAllowlistSettings,
+    TelegramSettings,
+)
 from oft.application.status import build_status
 from oft.application.telegram_messages import (
     render_help,
@@ -193,6 +197,44 @@ class TelegramService:
 
     def allowlist(self) -> TelegramAllowlistSettings:
         return self._settings_service.read_telegram_allowlist()
+
+    def settings_state(self) -> TelegramSettings:
+        """The allowlists, six push toggles, and their provenance (no token)."""
+        return self._settings_service.read_telegram_settings()
+
+    def update_settings(
+        self,
+        *,
+        chat_ids: object = None,
+        allowed_user_ids: object = None,
+        toggles: object = None,
+        actor: str,
+        reason: str = "",
+    ) -> TelegramSettings:
+        """Delegate a partial Telegram settings patch to the shared service."""
+        changes: dict[str, object] = {}
+        if chat_ids is not None:
+            changes["chat_ids"] = chat_ids
+        if allowed_user_ids is not None:
+            changes["allowed_user_ids"] = allowed_user_ids
+        if toggles is not None:
+            changes["toggles"] = toggles
+        return self._settings_service.update_telegram_settings(
+            **changes,
+            actor=actor,
+            reason=reason,
+        )
+
+    def latest_test_receipt(self) -> TelegramOutboxRecord | None:
+        """The newest test receipt, or ``None``.
+
+        Bounded to the newest 100 rows; receipts are small and a test send is an
+        explicit operator action, so no dedicated query is warranted.
+        """
+        for record in self.receipts(limit=100):
+            if record.kind == "test":
+                return record
+        return None
 
     def update_allowlist(
         self,

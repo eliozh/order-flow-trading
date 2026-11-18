@@ -8,11 +8,12 @@ audit event atomically, and an identical effective value is a deterministic
 no-op. Risk-cap loosening additionally requires an explicit confirmation.
 
 Documented maintainability exception: this module is 800+ lines because the
-slice-47 Telegram allowlist section is tightly coupled to the config/audit
-transaction seam (``save_telegram_allowlist_change``). Extracting it as a mixin
-would only move the same code and duplicate the validation boundary; the
-exception is recorded here per the repository's soft-ceiling standard and
-should be revisited if the section grows further.
+slice-47 Telegram allowlist section and the slice-53 Telegram settings section
+are tightly coupled to the config/audit transaction seam
+(``save_telegram_allowlist_change`` / ``save_telegram_settings_change``).
+Extracting them as mixins would only move the same code and duplicate the
+validation boundary; the exception is recorded here per the repository's
+soft-ceiling standard and should be revisited if the section grows further.
 """
 
 from __future__ import annotations
@@ -39,6 +40,7 @@ from oft.application.onboarding_service import (
     DEFERRED_ONBOARDING_STEPS,
     ONBOARDING_PROGRESS_KEY,
     ONBOARDING_STEPS,
+    REQUIRED_ONBOARDING_STEPS,
     OnboardingProgress,
     OnboardingProgressMixin,
     OnboardingStep,
@@ -108,7 +110,29 @@ OVERLAY_MAX_JITTER_SECONDS = min(SCAN_PERIOD_HOURS.values()) * 3600 - 1
 RISK_CAPS_UPDATED_EVENT = "RISK_CAPS_UPDATED"
 RISK_SECTION = "risk"
 TELEGRAM_ALLOWLIST_UPDATED = "TELEGRAM_ALLOWLIST_UPDATED"
+TELEGRAM_SETTINGS_UPDATED = "TELEGRAM_SETTINGS_UPDATED"
 TELEGRAM_ALLOWLIST_SECTION = "telegram"
+# The aggregate settings section and the allowlist audit subject are the same
+# domain concept; alias it so the ids cannot drift.
+TELEGRAM_SECTION = TELEGRAM_ALLOWLIST_SECTION
+# The six operator-facing push toggles and the config key each persists.
+TELEGRAM_PUSH_TOGGLES: tuple[tuple[str, str, bool], ...] = (
+    ("scan_report", SCAN_REPORT_PUSH_KEY, True),
+    ("trigger", TRIGGER_ALERT_KEY, True),
+    ("entry_recheck", ENTRY_RECHECK_ALERT_KEY, True),
+    ("position", POSITION_PUSH_KEY, True),
+    ("risk", RISK_PUSH_KEY, True),
+    ("budget", BUDGET_PUSH_KEY, True),
+)
+TELEGRAM_PUSH_TOGGLE_NAMES: tuple[str, ...] = tuple(
+    name for name, _key, _default in TELEGRAM_PUSH_TOGGLES
+)
+TELEGRAM_SETTINGS_KEYS: tuple[str, ...] = (
+    TELEGRAM_CHAT_IDS_KEY,
+    TELEGRAM_ALLOWED_USER_IDS_KEY,
+    *(key for _name, key, _default in TELEGRAM_PUSH_TOGGLES),
+)
+_UNSET: Any = object()
 _LOGGER = logging.getLogger(__name__)
 
 
@@ -204,6 +228,28 @@ class TelegramAllowlistSettings:
         }
 
 
+@dataclass(frozen=True)
+class TelegramSettings:
+    """The effective Telegram push configuration (never the token)."""
+
+    chat_ids: tuple[int, ...]
+    allowed_user_ids: tuple[int, ...]
+    toggles: dict[str, bool]
+    source: SettingSource
+    updated_at: str | None
+    updated_by: str | None
+
+    def to_contract(self) -> dict[str, Any]:
+        return {
+            "chat_ids": list(self.chat_ids),
+            "allowed_user_ids": list(self.allowed_user_ids),
+            "toggles": dict(self.toggles),
+            "source": self.source.value,
+            "updated_at": self.updated_at,
+            "updated_by": self.updated_by,
+        }
+
+
 class SettingsService(LLMSettingsMixin, OnboardingProgressMixin):
     """Read sections and persist a validated setting with one audit event.
 
@@ -286,6 +332,7 @@ class SettingsService(LLMSettingsMixin, OnboardingProgressMixin):
         """
         scan = self.read_scan_settings()
         risk = self.read_risk_summary()
+        telegram = self.read_telegram_settings()
         return [
             {
                 "section": "scan",
@@ -298,6 +345,12 @@ class SettingsService(LLMSettingsMixin, OnboardingProgressMixin):
                 "source": risk.source.value,
                 "last_changed": risk.updated_at,
                 "keys": list(CAP_FIELDS),
+            },
+            {
+                "section": TELEGRAM_SECTION,
+                "source": telegram.source.value,
+                "last_changed": telegram.updated_at,
+                "keys": list(TELEGRAM_SETTINGS_KEYS),
             },
         ]
 
@@ -572,7 +625,8 @@ class SettingsService(LLMSettingsMixin, OnboardingProgressMixin):
         """The ``telegram.position`` toggle; absent means enabled.
 
         Position-management executed/blocked outcomes are enabled by default;
-        the toggle is read-only until the settings screen lands in slice 53.
+        the F10f Telegram settings screen and ``oft telegram toggles`` write
+        this toggle.
         """
         return self._decode_bool(POSITION_PUSH_KEY, default=True)
 
@@ -580,20 +634,24 @@ class SettingsService(LLMSettingsMixin, OnboardingProgressMixin):
         """The ``telegram.risk`` toggle; absent means enabled.
 
         Daily-loss/leverage/notional and data/provider degradation alerts share
-        this toggle. It is read-only until slice 53.
+        this toggle. The F10f screen and ``oft telegram toggles`` write it.
         """
         return self._decode_bool(RISK_PUSH_KEY, default=True)
 
     def read_budget_push(self) -> bool:
         """The ``telegram.budget`` toggle; absent means enabled.
 
-        Budget-threshold alerts are time-sensitive and read-only until slice 53.
-        They never stop a call, so a delivery failure only loses the push.
+        Budget-threshold alerts are time-sensitive; the F10f screen and
+        ``oft telegram toggles`` write this toggle. They never stop a call, so a
+        delivery failure only loses the push.
         """
         return self._decode_bool(BUDGET_PUSH_KEY, default=True)
 
     def _decode_bool(self, key: str, *, default: bool) -> bool:
-        record = self._store.get_config(key)
+        return self._decode_bool_record(self._store.get_config(key), key, default=default)
+
+    @staticmethod
+    def _decode_bool_record(record: ConfigRecord | None, key: str, *, default: bool) -> bool:
         if record is None:
             return default
         try:
@@ -603,6 +661,176 @@ class SettingsService(LLMSettingsMixin, OnboardingProgressMixin):
         if not isinstance(value, bool):
             raise ConfigError(f"persisted {key} must be a boolean")
         return value
+
+    def read_telegram_settings(self) -> TelegramSettings:
+        """The allowlists, six push toggles, and their newest provenance.
+
+        ``source`` is ``default`` only when none of the managed Telegram settings
+        rows exists (poll offsets/heartbeats are runtime state, not settings). A
+        malformed persisted toggle fails closed as :class:`ConfigError`, exactly
+        like the individual enqueue-time reads.
+        """
+        allowlist = self.read_telegram_allowlist()
+        toggles = {
+            name: self._decode_bool(key, default=default)
+            for name, key, default in TELEGRAM_PUSH_TOGGLES
+        }
+        records = [
+            record
+            for record in (self._store.get_config(key) for key in TELEGRAM_SETTINGS_KEYS)
+            if record is not None
+        ]
+        if not records:
+            return TelegramSettings(
+                chat_ids=allowlist.chat_ids,
+                allowed_user_ids=allowlist.allowed_user_ids,
+                toggles=toggles,
+                source=SettingSource.DEFAULT,
+                updated_at=None,
+                updated_by=None,
+            )
+        latest = max(records, key=lambda record: record.updated_at)
+        return TelegramSettings(
+            chat_ids=allowlist.chat_ids,
+            allowed_user_ids=allowlist.allowed_user_ids,
+            toggles=toggles,
+            source=SettingSource.USER,
+            updated_at=latest.updated_at,
+            updated_by=latest.updated_by,
+        )
+
+    def update_telegram_settings(
+        self,
+        *,
+        chat_ids: object = _UNSET,
+        allowed_user_ids: object = _UNSET,
+        toggles: object = _UNSET,
+        actor: str,
+        reason: str = "",
+    ) -> TelegramSettings:
+        """Validate and persist a partial Telegram settings patch atomically.
+
+        Every changed config row and exactly one ``TELEGRAM_SETTINGS_UPDATED``
+        audit event commit in one ``BEGIN IMMEDIATE`` transaction. An unchanged
+        patch is a deterministic no-op (no row, no audit). If any toggle is
+        enabled the proposed chat list must be non-empty; an all-off state with
+        no chats is allowed.
+        """
+        proposed_chats: tuple[int, ...] | None = None
+        if chat_ids is not _UNSET:
+            proposed_chats = _normalize_telegram_ids(
+                chat_ids,
+                field="chat_ids",
+                maximum=MAX_TELEGRAM_CHAT_IDS,
+                allow_negative=True,
+            )
+        proposed_users: tuple[int, ...] | None = None
+        if allowed_user_ids is not _UNSET:
+            proposed_users = _normalize_telegram_ids(
+                allowed_user_ids,
+                field="allowed_user_ids",
+                maximum=MAX_TELEGRAM_ALLOWED_USER_IDS,
+            )
+        toggle_patch: dict[str, bool] | None = None
+        if toggles is not _UNSET:
+            toggle_patch = _normalize_telegram_toggles(toggles)
+        if proposed_chats is None and proposed_users is None and not toggle_patch:
+            message = "no Telegram setting was provided to set"
+            raise SettingValidationError(
+                message,
+                details=[{"field": None, "code": "empty", "message": message}],
+            )
+        timestamp = utc_timestamp(self._clock.now())
+
+        def _build(
+            rows: Mapping[str, ConfigRecord | None],
+        ) -> tuple[list[ConfigRecord], AuditEventDraft] | None:
+            before_chats = self._decode_allowlist(
+                rows[TELEGRAM_CHAT_IDS_KEY],
+                field="chat_ids",
+                maximum=MAX_TELEGRAM_CHAT_IDS,
+                allow_negative=True,
+            )
+            before_users = self._decode_allowlist(
+                rows[TELEGRAM_ALLOWED_USER_IDS_KEY],
+                field="allowed_user_ids",
+                maximum=MAX_TELEGRAM_ALLOWED_USER_IDS,
+            )
+            before_toggles = {
+                name: self._decode_bool_record(rows[key], key, default=default)
+                for name, key, default in TELEGRAM_PUSH_TOGGLES
+            }
+            after_chats = before_chats if proposed_chats is None else proposed_chats
+            after_users = before_users if proposed_users is None else proposed_users
+            after_toggles = {**before_toggles, **(toggle_patch or {})}
+            if any(after_toggles.values()) and not after_chats:
+                message = (
+                    "at least one Telegram chat id is required while any push toggle is enabled"
+                )
+                raise TelegramValidationError(
+                    message,
+                    details=[
+                        {
+                            "field": "chat_ids",
+                            "code": "chat_required_for_pushes",
+                            "message": message,
+                        }
+                    ],
+                )
+            records: list[ConfigRecord] = []
+            if after_chats != before_chats:
+                records.append(
+                    ConfigRecord(
+                        key=TELEGRAM_CHAT_IDS_KEY,
+                        value_json=json.dumps(list(after_chats)),
+                        updated_at=timestamp,
+                        updated_by=actor,
+                    )
+                )
+            if after_users != before_users:
+                records.append(
+                    ConfigRecord(
+                        key=TELEGRAM_ALLOWED_USER_IDS_KEY,
+                        value_json=json.dumps(list(after_users)),
+                        updated_at=timestamp,
+                        updated_by=actor,
+                    )
+                )
+            for name, key, _default in TELEGRAM_PUSH_TOGGLES:
+                if after_toggles[name] != before_toggles[name]:
+                    records.append(
+                        ConfigRecord(
+                            key=key,
+                            value_json=json.dumps(after_toggles[name]),
+                            updated_at=timestamp,
+                            updated_by=actor,
+                        )
+                    )
+            if not records:
+                return None
+            audit = AuditEventDraft(
+                event_type=TELEGRAM_SETTINGS_UPDATED,
+                actor={"kind": "USER", "id": actor},
+                subject={"kind": "SYSTEM", "id": TELEGRAM_ALLOWLIST_SECTION},
+                payload={
+                    "before": {
+                        "chat_ids": list(before_chats),
+                        "allowed_user_ids": list(before_users),
+                        "toggles": before_toggles,
+                    },
+                    "after": {
+                        "chat_ids": list(after_chats),
+                        "allowed_user_ids": list(after_users),
+                        "toggles": after_toggles,
+                    },
+                    "reason": reason,
+                },
+                created_at=timestamp,
+            )
+            return records, audit
+
+        self._store.save_telegram_settings_change(TELEGRAM_SETTINGS_KEYS, _build)
+        return self.read_telegram_settings()
 
     def read_telegram_allowlist(self) -> TelegramAllowlistSettings:
         """The two bounded id lists and their newest provenance.
@@ -737,7 +965,7 @@ class SettingsService(LLMSettingsMixin, OnboardingProgressMixin):
         return self.read_telegram_allowlist()
 
 
-def _normalize_telegram_ids(
+def normalize_telegram_ids(
     value: object, *, field: str, maximum: int, allow_negative: bool = False
 ) -> tuple[int, ...]:
     """Validate one bounded allowlist of nonzero integer ids.
@@ -746,6 +974,9 @@ def _normalize_telegram_ids(
     always positive. Bools (which are ``int`` subclasses), strings, floats, and
     zero are rejected with a field-scoped detail. The accepted values are sorted
     and deduplicated so the persisted document is canonical.
+
+    This is the single allowlist validator; the API, the CLI parser, and every
+    write path reuse it so the rules cannot drift.
     """
     kind = "nonzero integer" if allow_negative else "positive integer"
     if not isinstance(value, (list, tuple)):
@@ -788,6 +1019,45 @@ def _normalize_telegram_ids(
     if details:
         raise TelegramValidationError(f"invalid telegram {field}", details=details)
     return tuple(sorted(ids))
+
+
+# Backwards-compatible private alias; new callers should use the public name.
+_normalize_telegram_ids = normalize_telegram_ids
+
+
+def _normalize_telegram_toggles(value: object) -> dict[str, bool]:
+    """Validate a partial toggle patch; unknown names and non-bools are rejected."""
+    if not isinstance(value, Mapping):
+        message = "toggles must be an object of boolean switches"
+        raise TelegramValidationError(
+            message,
+            details=[{"field": "toggles", "code": "not_an_object", "message": message}],
+        )
+    unknown = sorted(set(value) - set(TELEGRAM_PUSH_TOGGLE_NAMES))
+    if unknown:
+        raise TelegramValidationError(
+            "unknown Telegram toggle(s): " + ", ".join(str(name) for name in unknown),
+            details=[
+                {
+                    "field": "toggles",
+                    "code": "unknown_toggle",
+                    "message": f"unknown Telegram toggle {name}",
+                }
+                for name in unknown
+            ],
+        )
+    details = [
+        {
+            "field": "toggles",
+            "code": "invalid_toggle",
+            "message": f"{name} must be a boolean",
+        }
+        for name, enabled in value.items()
+        if not isinstance(enabled, bool)
+    ]
+    if details:
+        raise TelegramValidationError("invalid Telegram toggles", details=details)
+    return {str(name): bool(enabled) for name, enabled in value.items()}
 
 
 def _audit_actor_id(payload_json: str) -> str | None:
@@ -916,8 +1186,13 @@ __all__ = [
     "ONBOARDING_PROGRESS_KEY",
     "ONBOARDING_STEPS",
     "OVERLAY_MAX_JITTER_SECONDS",
+    "REQUIRED_ONBOARDING_STEPS",
     "RISK_CAPS_UPDATED_EVENT",
     "RISK_SECTION",
+    "TELEGRAM_PUSH_TOGGLES",
+    "TELEGRAM_PUSH_TOGGLE_NAMES",
+    "TELEGRAM_SETTINGS_KEYS",
+    "TELEGRAM_SETTINGS_UPDATED",
     "LLMSettings",
     "OnboardingProgress",
     "OnboardingStep",
@@ -929,6 +1204,7 @@ __all__ = [
     "ScanSettings",
     "SettingsService",
     "TIMEZONE",
+    "TelegramSettings",
     "resolve_effective_llm_settings",
     "resolve_schedule_state_overlay",
     "validate_onboarding_step",

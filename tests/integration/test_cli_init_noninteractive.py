@@ -247,7 +247,7 @@ def test_an_overlong_stdin_key_exits_2_without_writes(
     assert container.symbol_registry.list_starred() == ()
 
 
-def test_deferred_steps_are_explicit_and_do_not_block_a_paper_finish(
+def test_deferred_binance_and_optional_telegram_are_explicit_but_do_not_block(
     monkeypatch: pytest.MonkeyPatch, tmp_path: Path
 ) -> None:
     _configure(monkeypatch, tmp_path)
@@ -256,7 +256,10 @@ def test_deferred_steps_are_explicit_and_do_not_block_a_paper_finish(
 
     assert result.exit_code == 0, result.output
     assert "Milestone 5" in result.stdout
-    assert "Milestone 6" in result.stdout
+    # Step 4 is optional: omitting every Telegram flag skips it and states that
+    # pushes stay disabled without recording a completion.
+    assert "Telegram" in result.stdout
+    assert "禁用" in result.stdout
     assert "Environment: test." in result.stdout
     assert "Live is not offered" in result.stdout
 

@@ -86,13 +86,17 @@ def test_fresh_install_reports_step_1_paper_and_requires_no_config(tmp_path: Pat
         "title": "环境与本地绑定",
         "deferred": False,
         "deferred_milestone": None,
+        "optional": False,
         "completed": False,
     }
     assert data["steps"][2]["id"] == "binance"
     assert data["steps"][2]["deferred"] is True
     assert data["steps"][2]["deferred_milestone"] == 5
+    assert data["steps"][2]["optional"] is False
     assert data["steps"][3]["id"] == "telegram"
-    assert data["steps"][3]["deferred_milestone"] == 6
+    assert data["steps"][3]["deferred"] is False
+    assert data["steps"][3]["deferred_milestone"] is None
+    assert data["steps"][3]["optional"] is True
     assert envelope["meta"]["provenance"] == "CALC"
     assert envelope["meta"]["data_quality"] == "COMPLETE"
     assert app.state.container.store.list_config() == ()
@@ -135,7 +139,7 @@ def test_put_step_1_persists_one_row_one_audit_and_resumes_2(tmp_path: Path) -> 
         assert fetched["resumed_step"] == 2
 
 
-def test_put_step_2_after_step_1_resumes_5_and_skips_deferred_steps(tmp_path: Path) -> None:
+def test_put_step_2_after_step_1_resumes_the_optional_telegram_step(tmp_path: Path) -> None:
     # Step 2's server-side prerequisite is a configured provider, so the app is
     # built with a provider environment key.
     app = create_app(
@@ -151,18 +155,25 @@ def test_put_step_2_after_step_1_resumes_5_and_skips_deferred_steps(tmp_path: Pa
         data = response.json()["data"]
 
     assert data["completed_steps"] == [1, 2]
-    assert data["resumed_step"] == 5
+    # The optional Telegram step is the first incomplete active step, so the
+    # wizard resumes there; Binance stays deferred.
+    assert data["resumed_step"] == 4
+    assert data["all_complete"] is False
     steps = {step["step"]: step for step in data["steps"]}
     assert steps[3]["deferred"] is True
     assert steps[3]["deferred_milestone"] == 5
     assert steps[3]["completed"] is False
-    assert steps[4]["deferred"] is True
-    assert steps[4]["deferred_milestone"] == 6
+    assert steps[4]["deferred"] is False
+    assert steps[4]["deferred_milestone"] is None
+    assert steps[4]["optional"] is True
+    assert steps[4]["completed"] is False
     assert steps[5]["deferred"] is False
     assert steps[5]["completed"] is False
 
 
-def test_all_active_steps_complete_keeps_resumed_step_5(tmp_path: Path) -> None:
+def test_all_required_steps_complete_is_complete_but_resumes_at_the_optional_step(
+    tmp_path: Path,
+) -> None:
     app = create_app(
         _settings(tmp_path, openai_api_key="sk-test-onboarding-all"),
         clock=FixedClock(NOW),
@@ -177,7 +188,9 @@ def test_all_active_steps_complete_keeps_resumed_step_5(tmp_path: Path) -> None:
 
     data = response.json()["data"]
     assert data["completed_steps"] == [1, 2, 5]
-    assert data["resumed_step"] == 5
+    # An incomplete optional step never blocks the finish, but it is still the
+    # first incomplete active step and therefore the resume point.
+    assert data["resumed_step"] == 4
     assert data["all_complete"] is True
 
 
@@ -313,8 +326,8 @@ def test_recompleting_a_recorded_step_after_its_prerequisite_lapses_is_a_noop(
     assert app.state.container.store.list_audit_events() == audits_before
 
 
-@pytest.mark.parametrize("step", [3, 4])
-def test_deferred_steps_are_rejected_and_write_nothing(tmp_path: Path, step: int) -> None:
+@pytest.mark.parametrize("step", [3])
+def test_deferred_step_is_rejected_and_writes_nothing(tmp_path: Path, step: int) -> None:
     app = create_app(_settings(tmp_path), clock=FixedClock(NOW))
 
     with TestClient(app) as client:

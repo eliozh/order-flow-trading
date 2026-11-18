@@ -23,6 +23,16 @@ import type {
 } from '../api/settings'
 import { fetchReadiness, fetchStatus } from '../api/status'
 import type { ReadinessEnvelope, StatusEnvelope } from '../api/status'
+import {
+  fetchTelegramSettings,
+  sendTelegramTest,
+  setTelegramToken,
+  type TelegramReceiptEnvelope,
+  type TelegramSettingsEnvelope,
+  type TelegramSettingsPatch,
+  type TelegramTokenEnvelope,
+  updateTelegramSettings,
+} from '../api/telegram'
 import { fetchWatchlist, setStar } from '../api/watchlist'
 import type { StarEnvelope, WatchlistEnvelope } from '../api/watchlist'
 import { useSettingsReadonly } from '../components/settings-field'
@@ -33,6 +43,7 @@ import {
   LLMStep,
   StepNav,
   StepNavButtons,
+  TelegramStep,
   WatchlistStep,
 } from './onboarding-step'
 
@@ -40,7 +51,7 @@ const STEP_SUBTITLES: Record<OnboardingStepNumber, string> = {
   1: '数据目录、时区、Paper/Live 与本地绑定。Paper 已选中并锁定；Live 不在引导中启用。',
   2: '添加 OpenAI / Anthropic / DeepSeek 密钥。密钥写入后只显示掩码；至少一个 provider 才能继续。',
   3: 'Binance 密钥与权限读取属于 Milestone 5；本步骤在引导中不保存任何内容。',
-  4: 'Telegram 只读通道属于 Milestone 6；本步骤在引导中不保存任何内容。',
+  4: '可选的 Telegram 只读通道：token 只写，配置 chat 后可发送测试。跳过不会保存任何内容，推送保持禁用。',
   5: '选择首批标的、扫描周期与预算阈值；完成后的复盘显示生效值与下一步。',
 }
 
@@ -80,6 +91,18 @@ export interface OnboardingPageProps {
     idempotencyKey: string,
     signal?: AbortSignal,
   ) => Promise<BudgetUpdateEnvelope>
+  fetchTelegramSettingsFn?: (signal?: AbortSignal) => Promise<TelegramSettingsEnvelope>
+  updateTelegramSettingsFn?: (
+    patch: TelegramSettingsPatch,
+    idempotencyKey: string,
+    signal?: AbortSignal,
+  ) => Promise<TelegramSettingsEnvelope>
+  setTelegramTokenFn?: (
+    token: string,
+    idempotencyKey: string,
+    signal?: AbortSignal,
+  ) => Promise<TelegramTokenEnvelope>
+  testTelegramFn?: (idempotencyKey: string, chatId?: number) => Promise<TelegramReceiptEnvelope>
 }
 
 interface StepError {
@@ -115,7 +138,8 @@ interface ProgressLoad {
  *
  * The shell owns progress, resume, step completion, and focus; each step reads
  * and writes its own settings through the existing services. Step 3 (Binance)
- * and step 4 (Telegram) are deferred and can never be completed here.
+ * is deferred; step 4 (Telegram) is a real optional step (skipping it never
+ * blocks the finish but leaves pushes disabled).
  */
 export function OnboardingPage({
   step = null,
@@ -136,6 +160,10 @@ export function OnboardingPage({
   updateScanPeriodFn = updateScanPeriod,
   fetchBudgetFn = fetchBudget,
   updateBudgetThresholdsFn = updateBudgetThresholds,
+  fetchTelegramSettingsFn = fetchTelegramSettings,
+  updateTelegramSettingsFn = updateTelegramSettings,
+  setTelegramTokenFn = setTelegramToken,
+  testTelegramFn = sendTelegramTest,
 }: OnboardingPageProps) {
   // Only a phone-width coarse-pointer surface is read-only, so a zoomed desktop
   // at 320-360 CSS px keeps the wizard operable (SC 1.4.4/1.4.10).
@@ -296,10 +324,17 @@ export function OnboardingPage({
         )
       case 4:
         return (
-          <DeferredStep
-            step={4}
-            title={title}
-            milestone={stepMeta?.deferred_milestone ?? 6}
+          <TelegramStep
+            fetchSettingsFn={fetchTelegramSettingsFn}
+            updateSettingsFn={updateTelegramSettingsFn}
+            setTokenFn={setTelegramTokenFn}
+            testFn={testTelegramFn}
+            idempotencyKeyFn={idempotencyKeyFn}
+            clearIdempotencyKeyFn={clearIdempotencyKeyFn}
+            rotateIdempotencyKeyFn={rotateIdempotencyKeyFn}
+            announce={setAnnouncement}
+            onComplete={() => void complete(4)}
+            completing={completing === 4}
             narrow={narrow}
           />
         )
