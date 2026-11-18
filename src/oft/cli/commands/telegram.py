@@ -18,7 +18,11 @@ from oft.api.envelope import new_request_id, success_envelope
 from oft.application.health import probe_daemon
 from oft.application.secrets_service import SecretStoreUnavailable
 from oft.application.telegram_service import TelegramService, receipt_contract
-from oft.application.telegram_watchdog import resolve_private_chat, run_watchdog_once
+from oft.application.telegram_watchdog import (
+    WatchdogResult,
+    resolve_private_chat,
+    run_watchdog_once,
+)
 from oft.bootstrap import build_container
 from oft.cli.commands.doctor import emit_error, exit_code_for
 from oft.config import ConfigError, load_settings
@@ -134,6 +138,29 @@ def _read_token_from_stdin() -> str:
     return sys.stdin.readline()
 
 
+_WATCHDOG_FAILED_ACTIONS = frozenset({"ALERT_FAILED", "RECOVERY_FAILED"})
+
+
+def _watchdog_failure(result: WatchdogResult) -> tuple[str, str] | None:
+    """Map a watchdog outcome to ``(error_code, bounded message)``, or ``None``.
+
+    A failed send or an unreadable persisted state is a real failure for cron
+    and systemd ``OnFailure=``; only ``NONE``/``ALERT_SENT``/``RECOVERY_SENT``
+    are success. The message is built from the result only, never a secret.
+    """
+    if result.action in _WATCHDOG_FAILED_ACTIONS:
+        code = "TELEGRAM_DELIVERY_FAILED"
+        message = f"watchdog {result.daemon_state}: {result.action}"
+    elif result.daemon_state == "UNKNOWN":
+        code = "DATA_UNAVAILABLE"
+        message = "watchdog daemon state is UNKNOWN"
+    else:
+        return None
+    if result.detail:
+        message = f"{message}: {result.detail}"
+    return code, message
+
+
 @telegram_app.command("status")
 def status_command(
     json_output: Annotated[bool, typer.Option("--json", help="Emit JSON.")] = False,
@@ -195,13 +222,23 @@ def watchdog_command(
         probe=lambda: probe_daemon(settings),
         port=container.telegram_port,
         chat_id=resolve_private_chat(allowlist.chat_ids),
+        lock_path=settings.data_dir / "telegram-watchdog.lock",
     )
+    failure = _watchdog_failure(result)
     if json_output:
+        if failure is not None:
+            code, message = failure
+            emit_error(code, message, json_output=True)
+            raise typer.Exit(code=exit_code_for(code))
         _emit_json(result.to_contract())
         return
     typer.echo(f"daemon {result.daemon_state} · {result.action}")
     if result.detail:
         typer.echo(f"detail {result.detail}")
+    if failure is not None:
+        code, message = failure
+        emit_error(code, message, json_output=False)
+        raise typer.Exit(code=exit_code_for(code))
 
 
 @telegram_app.command("test")

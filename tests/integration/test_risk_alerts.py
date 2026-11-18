@@ -48,6 +48,21 @@ class _MutableClock:
         self.instant += delta
 
 
+class _WarningRecorder:
+    """An order-independent stand-in for a structlog logger.
+
+    Another test may have run ``configure_logging`` and cached a stdlib logger
+    (``cache_logger_on_first_use``), which makes ``capture_logs`` order
+    dependent; patching the module logger avoids that.
+    """
+
+    def __init__(self) -> None:
+        self.warnings: list[tuple[str, dict[str, Any]]] = []
+
+    def warning(self, event: str, **fields: Any) -> None:
+        self.warnings.append((event, fields))
+
+
 def _setup(tmp_path: Path, *, clock: _MutableClock) -> dict[str, Any]:
     settings = Settings(
         env="test",
@@ -266,6 +281,77 @@ def test_daily_loss_approach_then_breach_alerts_once_per_state(tmp_path: Path) -
         now=NOW_TEXT,
     )
     assert len(_risk_receipts(container)) == 2
+
+
+def test_daily_loss_alert_caps_error_is_logged_and_the_window_is_unchanged(
+    tmp_path: Path, monkeypatch: Any
+) -> None:
+    from oft.application import management_service as management_module
+
+    clock = _MutableClock(NOW)
+    setup = _setup(tmp_path, clock=clock)
+    container = setup["container"]
+    service = setup["service"]
+    position_id = setup["position"]["position_id"]
+    recorder = _WarningRecorder()
+    monkeypatch.setattr(management_module, "_LOGGER", recorder)
+    # Isolate the daily-loss alert path from the sibling breach check.
+    monkeypatch.setattr(ManagementService, "_risk_breach", lambda self, context: False)
+    container.store.set_system_state("risk_caps", "{not-json", updated_at=NOW_TEXT)
+
+    due = service.due_conditions(
+        position_id,
+        window_start=NOW_TEXT,
+        window_end="2026-10-08T00:05:00.000Z",
+        now=NOW_TEXT,
+    )
+
+    assert due.due is True
+    assert "CADENCE" in due.reason
+    warnings = [
+        fields for event, fields in recorder.warnings if event == "management_risk_caps_unavailable"
+    ]
+    assert len(warnings) == 1
+    assert isinstance(warnings[0]["error"], str) and warnings[0]["error"]
+    assert _risk_receipts(container) == []
+
+
+def test_daily_loss_alert_store_error_is_contained_and_logged(
+    tmp_path: Path, monkeypatch: Any
+) -> None:
+    from oft.application import management_service as management_module
+
+    clock = _MutableClock(NOW)
+    setup = _setup(tmp_path, clock=clock)
+    container = setup["container"]
+    service = setup["service"]
+    position_id = setup["position"]["position_id"]
+    recorder = _WarningRecorder()
+    monkeypatch.setattr(management_module, "_LOGGER", recorder)
+    monkeypatch.setattr(ManagementService, "_risk_breach", lambda self, context: False)
+
+    def _broken(*args: Any, **kwargs: Any) -> Any:
+        raise sqlite3.OperationalError("database is locked")
+
+    monkeypatch.setattr("oft.application.management_service.effective_caps", _broken)
+
+    due = service.due_conditions(
+        position_id,
+        window_start=NOW_TEXT,
+        window_end="2026-10-08T00:05:00.000Z",
+        now=NOW_TEXT,
+    )
+
+    assert due.due is True
+    assert "CADENCE" in due.reason
+    warnings = [
+        fields for event, fields in recorder.warnings if event == "management_risk_caps_unavailable"
+    ]
+    assert len(warnings) == 1
+    assert warnings[0]["error_type"] == "OperationalError"
+    assert "error" not in warnings[0]
+    assert "database is locked" not in str(warnings[0])
+    assert _risk_receipts(container) == []
 
 
 def test_a_clamped_add_alerts_the_notional_cap_once(tmp_path: Path) -> None:

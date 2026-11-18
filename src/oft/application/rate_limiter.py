@@ -258,7 +258,9 @@ class GlobalRateLimiter:
 
         A still-active epoch keeps ``_cooldown_alerted`` true, so the eventual
         expiry emits exactly one RECOVERED. An already-expired epoch is kept
-        until the first check observes it, which emits that recovery.
+        until the first check observes it, which emits that recovery. A truthy
+        but unparseable epoch is never silently treated as "no episode": it is
+        logged with bounded context and cleared so the next write starts clean.
         """
         if self._store is None:
             return
@@ -269,13 +271,29 @@ class GlobalRateLimiter:
                 "rate_limit_cooldown_unreadable", error_type=type(exc).__name__
             )
             return
-        restored = _parse_instant(raw) if raw else None
+        if not raw:
+            return
+        restored = _parse_instant(raw) if isinstance(raw, str) else None
         if restored is None:
+            # Never log the raw row: it is bounded to its type and size only.
+            structlog.get_logger(__name__).warning(
+                "rate_limit_cooldown_unparseable",
+                value_type=type(raw).__name__,
+                value_length=len(raw) if isinstance(raw, str) else None,
+            )
+            self._persist_cooldown(None)
             return
         self._cooldown_until = restored
         self._cooldown_alerted = True
 
     def _persist_cooldown(self, until: str | None) -> None:
+        """Upsert the durable epoch; callers hold ``_lock`` by design.
+
+        The write is a synchronous local SQLite upsert, which is cheap, and
+        keeping it under the same lock as the in-memory mutation serializes it
+        with the recovery clear, so a stale clear can never blank a newer
+        epoch. The alert sink itself is still called outside ``_lock``.
+        """
         if self._store is None:
             return
         try:
@@ -423,8 +441,10 @@ class GlobalRateLimiter:
         with self._lock:
             decision, alert = self._note_status_locked(status, endpoint=endpoint, now=now)
         if alert is not None:
-            # The durable epoch is written under the state lock (so a recovery
-            # can never blank a newer epoch); only the sink runs outside it, so
+            # The durable epoch is written under the state lock by design (see
+            # ``_persist_cooldown``): the local SQLite upsert is cheap and
+            # serializing it with the recovery clear prevents a newer epoch
+            # being blanked. Only the sink call below runs outside the lock, so
             # a slow Telegram/outbox path cannot serialize traffic acquisition.
             sequence, alert_payload = alert
             self._emit_ordered(sequence, "binance.rate_limit", alert_payload)
@@ -436,10 +456,14 @@ class GlobalRateLimiter:
         instant = now or self._now()
         if self._cooldown_until is not None and instant < self._cooldown_until:
             if status == 418:
-                upgraded = max(
-                    self._cooldown_until, instant + timedelta(seconds=COOLDOWN_418_SECONDS)
-                )
-                self._cooldown_until = upgraded
+                previous = self._cooldown_until
+                upgraded = max(previous, instant + timedelta(seconds=COOLDOWN_418_SECONDS))
+                if upgraded > previous:
+                    self._cooldown_until = upgraded
+                    # H1: persist the upgraded 418 ban. Without this a restart
+                    # restores the shorter 429 expiry, resumes traffic inside
+                    # the ban, and emits RECOVERED too early.
+                    self._persist_cooldown(utc_timestamp(upgraded))
             return (
                 RateLimitDecision(
                     allowed=False,
@@ -458,8 +482,10 @@ class GlobalRateLimiter:
             "endpoint": endpoint,
             "until": utc_timestamp(self._cooldown_until),
         }
-        # Persisted while the state lock is held: a concurrent recovery clear is
-        # serialized behind this epoch, so it can never blank the newer marker.
+        # Persisted while the state lock is held: the local SQLite upsert is
+        # cheap, and serializing it with the recovery clear is what prevents a
+        # newer epoch from being blanked by a stale clear. The sink call stays
+        # outside the lock (see ``note_status``).
         self._persist_cooldown(str(payload["until"]))
         return (
             RateLimitDecision(

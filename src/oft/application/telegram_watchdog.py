@@ -10,8 +10,12 @@ are no-ops. The bot token is never read, printed, or stored here.
 
 from __future__ import annotations
 
-from collections.abc import Callable, Sequence
+import contextlib
+import threading
+from collections.abc import Callable, Iterator, Sequence
 from dataclasses import dataclass
+from pathlib import Path
+from types import ModuleType
 
 import structlog
 
@@ -29,6 +33,24 @@ _UP_STATE = "UP"
 _MAX_DETAIL_CHARS = 200
 _ALERT_ACTION = "ALERT_SENT"
 _RECOVERY_ACTION = "RECOVERY_SENT"
+
+
+def _load_fcntl() -> ModuleType | None:
+    """``fcntl`` where available (POSIX); ``None`` on Windows."""
+    try:
+        import fcntl
+    except ImportError:  # pragma: no cover - Windows-only fallback
+        return None
+    return fcntl
+
+
+_FCNTL = _load_fcntl()
+# The Windows fallback serializes overlapping runs within this process only.
+_PROCESS_LOCK = threading.Lock()
+
+
+class _LockUnavailableError(RuntimeError):
+    """A bounded lock-setup failure; the message is an error type name."""
 
 
 @dataclass(frozen=True)
@@ -62,6 +84,43 @@ def resolve_private_chat(chat_ids: Sequence[int]) -> int | None:
     return private[0] if len(private) == 1 else None
 
 
+@contextlib.contextmanager
+def _exclusive_lock(path: Path) -> Iterator[None]:
+    """Hold an exclusive lock for the whole watchdog run.
+
+    Where ``fcntl`` is available this is an inter-process advisory lock on a
+    zero-byte rendezvous file: no token, state, or detail is ever written to
+    it. On Windows (no ``fcntl``) a process-wide :class:`threading.Lock`
+    serializes overlapping runs in this process only, matching the
+    single-user desktop fallback used by the secret store.
+
+    A setup failure (a non-directory parent, an unopenable lock file, a failed
+    ``flock``) raises :class:`_LockUnavailableError` with an error-type name so
+    the caller can fail closed with a bounded result instead of a traceback.
+    """
+    try:
+        path.parent.mkdir(parents=True, exist_ok=True)
+    except OSError as exc:
+        raise _LockUnavailableError(type(exc).__name__) from exc
+    if _FCNTL is None:
+        with _PROCESS_LOCK:
+            yield
+        return
+    with contextlib.ExitStack() as stack:
+        try:
+            handle = stack.enter_context(open(path, "a+", encoding="utf-8"))
+        except OSError as exc:
+            raise _LockUnavailableError(type(exc).__name__) from exc
+        try:
+            _FCNTL.flock(handle.fileno(), _FCNTL.LOCK_EX)
+        except OSError as exc:
+            raise _LockUnavailableError(type(exc).__name__) from exc
+        try:
+            yield
+        finally:
+            _FCNTL.flock(handle.fileno(), _FCNTL.LOCK_UN)
+
+
 def run_watchdog_once(
     *,
     store: StorePort,
@@ -69,8 +128,44 @@ def run_watchdog_once(
     probe: Callable[[], DaemonProbe],
     port: TelegramPort,
     chat_id: int | None,
+    lock_path: Path | None = None,
 ) -> WatchdogResult:
-    """Probe once, then send at most one alert and one recovery per episode."""
+    """Probe once, then send at most one alert and one recovery per episode.
+
+    When ``lock_path`` is supplied the whole probe-send-persist run holds an
+    exclusive lock, so two overlapping cron/systemd runs cannot both observe
+    the pre-alert state and send duplicate alerts. It is an inter-process
+    advisory lock where ``fcntl`` exists and an in-process lock otherwise. If
+    the lock cannot be acquired, the run fails closed as ``UNKNOWN`` with a
+    bounded detail (never a traceback).
+    """
+    if lock_path is None:
+        return _run_watchdog_locked(
+            store=store, clock=clock, probe=probe, port=port, chat_id=chat_id
+        )
+    try:
+        with _exclusive_lock(lock_path):
+            return _run_watchdog_locked(
+                store=store, clock=clock, probe=probe, port=port, chat_id=chat_id
+            )
+    except _LockUnavailableError as exc:
+        LOGGER.warning("telegram_watchdog_lock_unavailable", error_type=str(exc))
+        return WatchdogResult(
+            daemon_state="UNKNOWN",
+            action="NONE",
+            detail="the watchdog lock is unavailable",
+        )
+
+
+def _run_watchdog_locked(
+    *,
+    store: StorePort,
+    clock: ClockPort,
+    probe: Callable[[], DaemonProbe],
+    port: TelegramPort,
+    chat_id: int | None,
+) -> WatchdogResult:
+    """The serialized critical section: read, probe, send, then persist."""
     try:
         persisted = store.get_system_state(WATCHDOG_STATE_KEY)
     except Exception as exc:  # noqa: BLE001 - fail closed on unreadable state

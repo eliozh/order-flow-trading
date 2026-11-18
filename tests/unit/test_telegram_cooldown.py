@@ -169,6 +169,24 @@ def test_a_store_failure_is_swallowed_at_the_alert_boundary() -> None:
     )
 
 
+class _WarningRecorder:
+    """An order-independent stand-in for a structlog logger.
+
+    Another test may have run ``configure_logging`` and cached a stdlib logger
+    (``cache_logger_on_first_use``), which makes ``capture_logs`` order
+    dependent; patching the module logger avoids that.
+    """
+
+    def __init__(self) -> None:
+        self.warnings: list[tuple[str, dict[str, Any]]] = []
+
+    def warning(self, event: str, **fields: Any) -> None:
+        self.warnings.append((event, fields))
+
+    def info(self, event: str, **fields: Any) -> None:
+        self.warnings.append((event, fields))
+
+
 class _RecordingFreshnessSink:
     def __init__(self) -> None:
         self.transitions: list[dict[str, Any]] = []
@@ -302,14 +320,41 @@ def test_approach_then_breach_each_alert_once_in_one_period() -> None:
     assert repeated is None
     assert approach.dedupe_key != breach.dedupe_key
     assert len(store.outbox) == 2
-    assert (
-        store.state["telegram.alert_cooldown.risk:DAILY_LOSS:ACCOUNT:2026-11-17:APPROACH"]
-        == "2026-11-17"
-    )
-    assert (
-        store.state["telegram.alert_cooldown.risk:DAILY_LOSS:ACCOUNT:2026-11-17:BREACH"]
-        == "2026-11-17"
-    )
+    assert store.state["telegram.alert_cooldown.risk:DAILY_LOSS:ACCOUNT:APPROACH"] == "2026-11-17"
+    assert store.state["telegram.alert_cooldown.risk:DAILY_LOSS:ACCOUNT:BREACH"] == "2026-11-17"
+
+
+def _risk_kwargs(period: str) -> dict[str, Any]:
+    return {
+        "kind": "DAILY_LOSS",
+        "subject": "ACCOUNT",
+        "binding_cap": "DAILY_LOSS",
+        "state": "BREACH",
+        "observed": "120",
+        "threshold": "100",
+        "unit": "USDT",
+        "period": period,
+        "reason_code": "DAILY_LOSS_BREACH",
+        "occurred_at": NOW_TEXT,
+    }
+
+
+def test_two_periods_do_not_grow_cooldown_rows_but_alert_once_each() -> None:
+    store = _DurableStore()
+    service = _service(store)
+
+    first = enqueue_risk_alert(service, **_risk_kwargs("2026-11-17"))
+    repeated = enqueue_risk_alert(service, **_risk_kwargs("2026-11-17"))
+    next_day = enqueue_risk_alert(service, **_risk_kwargs("2026-11-18"))
+
+    assert first is not None
+    assert repeated is None
+    assert next_day is not None
+    assert len(store.outbox) == 2
+    # One stable cooldown row per kind+subject+state, however many periods alert.
+    cooldown_rows = [key for key in store.state if key.startswith("telegram.alert_cooldown.")]
+    assert cooldown_rows == ["telegram.alert_cooldown.risk:DAILY_LOSS:ACCOUNT:BREACH"]
+    assert store.state[cooldown_rows[0]] == "2026-11-18"
 
 
 def test_degradation_state_survives_a_restart_mid_episode() -> None:
@@ -328,9 +373,408 @@ def test_degradation_state_survives_a_restart_mid_episode() -> None:
     restarted_guard.record("WS:BTCUSDT", NOW - timedelta(seconds=120))
     restarted_guard.evaluate(now=NOW)
     assert len(store.outbox) == 1
-    assert store.state["telegram.degradation_state.WS:BTCUSDT"] == "DEGRADED"
+    assert store.state["telegram.degradation_state.WS:BTCUSDT"] == "DEGRADED:1"
 
     restarted_guard.record("WS:BTCUSDT", NOW)
     restarted_guard.evaluate(now=NOW + timedelta(seconds=1))
     assert len(store.outbox) == 2
-    assert store.state["telegram.degradation_state.WS:BTCUSDT"] == "RECOVERED"
+    assert store.state["telegram.degradation_state.WS:BTCUSDT"] == "RECOVERED:2"
+
+
+def _degradation_keys(store: _DurableStore) -> list[str]:
+    return sorted(record.event_key for record in store.outbox.values())
+
+
+def test_first_fresh_observation_after_restart_recovers_then_a_new_outage_degrades() -> None:
+    store = _DurableStore()
+    clock = FixedClock(NOW)
+
+    first = NotificationFreshnessSink(_service(store))
+    guard = FreshnessGuard(clock=clock, alert_sink=first)
+    guard.record("WS:BTCUSDT", NOW - timedelta(seconds=120))
+    guard.evaluate(now=NOW)
+    assert _degradation_keys(store) == ["degraded:WS:BTCUSDT:DEGRADED:1"]
+
+    # The outage recovered while the daemon was down, so the restarted guard's
+    # first observation is fresh and must transition the stale marker once.
+    restarted = NotificationFreshnessSink(_service(store))
+    restarted_guard = FreshnessGuard(clock=clock, alert_sink=restarted)
+    restarted_guard.record("WS:BTCUSDT", NOW)
+    restarted_guard.evaluate(now=NOW)
+    restarted_guard.evaluate(now=NOW)
+    assert _degradation_keys(store) == [
+        "degraded:WS:BTCUSDT:DEGRADED:1",
+        "degraded:WS:BTCUSDT:RECOVERED:2",
+    ]
+    assert store.state["telegram.degradation_state.WS:BTCUSDT"] == "RECOVERED:2"
+
+    # A later, genuinely new outage emits exactly one new DEGRADED.
+    restarted_guard.record("WS:BTCUSDT", NOW - timedelta(seconds=120))
+    restarted_guard.evaluate(now=NOW)
+    restarted_guard.evaluate(now=NOW)
+    assert _degradation_keys(store) == [
+        "degraded:WS:BTCUSDT:DEGRADED:1",
+        "degraded:WS:BTCUSDT:DEGRADED:3",
+        "degraded:WS:BTCUSDT:RECOVERED:2",
+    ]
+    assert store.state["telegram.degradation_state.WS:BTCUSDT"] == "DEGRADED:3"
+
+
+def test_several_fresh_records_before_evaluate_attempt_one_recovery() -> None:
+    store = _DurableStore()
+    clock = FixedClock(NOW)
+
+    first = NotificationFreshnessSink(_service(store))
+    guard = FreshnessGuard(clock=clock, alert_sink=first)
+    guard.record("WS:BTCUSDT", NOW - timedelta(seconds=120))
+    guard.evaluate(now=NOW)
+    assert _degradation_keys(store) == ["degraded:WS:BTCUSDT:DEGRADED:1"]
+
+    # The live loop records one event at a time and evaluates only on the
+    # flush/connect boundary, so several fresh records precede the first
+    # evaluate after a restart. The startup recovery must survive them.
+    restarted = NotificationFreshnessSink(_service(store))
+    restarted_guard = FreshnessGuard(clock=clock, alert_sink=restarted)
+    restarted_guard.record("WS:BTCUSDT", NOW)
+    restarted_guard.record("WS:BTCUSDT", NOW + timedelta(seconds=1))
+    restarted_guard.evaluate(now=NOW + timedelta(seconds=1))
+    restarted_guard.evaluate(now=NOW + timedelta(seconds=2))
+
+    assert _degradation_keys(store) == [
+        "degraded:WS:BTCUSDT:DEGRADED:1",
+        "degraded:WS:BTCUSDT:RECOVERED:2",
+    ]
+    assert store.state["telegram.degradation_state.WS:BTCUSDT"] == "RECOVERED:2"
+
+
+def test_first_fresh_observation_on_a_clean_install_emits_nothing(monkeypatch: Any) -> None:
+    import oft.application.notifications as notifications_module
+
+    recorder = _WarningRecorder()
+    monkeypatch.setattr(notifications_module, "LOGGER", recorder)
+    store = _DurableStore()
+    guard = FreshnessGuard(
+        clock=FixedClock(NOW),
+        alert_sink=NotificationFreshnessSink(_service(store)),
+    )
+
+    guard.record("WS:BTCUSDT", NOW)
+    guard.record("WS:BTCUSDT", NOW)
+    guard.evaluate(now=NOW)
+
+    assert store.outbox == {}
+    assert "telegram.degradation_state.WS:BTCUSDT" not in store.state
+    # A clean install is not a lost marker: nothing may claim a recovery.
+    assert [
+        event for event, _ in recorder.warnings if event == "telegram_degradation_marker_lost"
+    ] == []
+
+
+def test_a_failed_degradation_marker_write_does_not_reemit_after_restart(
+    monkeypatch: Any,
+) -> None:
+    import oft.application.notifications as notifications_module
+
+    class _FailOnceMarkerStore(_DurableStore):
+        def __init__(self) -> None:
+            super().__init__()
+            self.fail_marker_writes = 1
+
+        def set_system_state(self, key: str, value: str, *, updated_at: str) -> None:
+            if key.startswith("telegram.degradation_state.") and self.fail_marker_writes:
+                self.fail_marker_writes -= 1
+                raise RuntimeError("degradation state unavailable")
+            super().set_system_state(key, value, updated_at=updated_at)
+
+    recorder = _WarningRecorder()
+    monkeypatch.setattr(notifications_module, "LOGGER", recorder)
+    store = _FailOnceMarkerStore()
+    sink = NotificationFreshnessSink(_service(store))
+    first = sink.record_transition(
+        stream="WS:BTCUSDT", state="DEGRADED", occurred_at=NOW_TEXT, reason=None
+    )
+    assert first is not None
+    assert len(store.outbox) == 1
+    assert "telegram.degradation_state.WS:BTCUSDT" not in store.state
+    assert [event for event, _ in recorder.warnings] == ["telegram_degradation_state_unwritable"]
+
+    # A restart re-observes the same transition at a new instant. The marker is
+    # unchanged, so the recomputed episode key is identical and the outbox
+    # dedupes while the duplicate path retries (and heals) the marker write.
+    restarted = NotificationFreshnessSink(_service(store))
+    again = restarted.record_transition(
+        stream="WS:BTCUSDT",
+        state="DEGRADED",
+        occurred_at="2026-11-17T09:31:00.000Z",
+        reason=None,
+    )
+    assert again is not None
+    assert len(store.outbox) == 1
+    assert store.state["telegram.degradation_state.WS:BTCUSDT"] == "DEGRADED:1"
+
+    recovered = restarted.record_transition(
+        stream="WS:BTCUSDT", state="RECOVERED", occurred_at=NOW_TEXT, reason=None
+    )
+    later_outage = restarted.record_transition(
+        stream="WS:BTCUSDT", state="DEGRADED", occurred_at=NOW_TEXT, reason=None
+    )
+    assert recovered is not None
+    assert later_outage is not None
+    assert len(store.outbox) == 3
+    assert _degradation_keys(store) == [
+        "degraded:WS:BTCUSDT:DEGRADED:1",
+        "degraded:WS:BTCUSDT:DEGRADED:3",
+        "degraded:WS:BTCUSDT:RECOVERED:2",
+    ]
+
+
+class _ScriptedMarkerStore(_DurableStore):
+    """Fails the first degradation-marker write for each scripted state."""
+
+    def __init__(self, *, fail_on: tuple[str, ...]) -> None:
+        super().__init__()
+        self.fail_on = set(fail_on)
+
+    def set_system_state(self, key: str, value: str, *, updated_at: str) -> None:
+        if key.startswith("telegram.degradation_state."):
+            marker_state = value.partition(":")[0]
+            if marker_state in self.fail_on:
+                self.fail_on.discard(marker_state)
+                raise RuntimeError("degradation state unavailable")
+        super().set_system_state(key, value, updated_at=updated_at)
+
+
+def _marker_lost_warnings(recorder: _WarningRecorder) -> list[dict[str, Any]]:
+    return [
+        fields for event, fields in recorder.warnings if event == "telegram_degradation_marker_lost"
+    ]
+
+
+def test_a_failed_degraded_marker_write_still_emits_the_recovery_and_next_outage(
+    monkeypatch: Any,
+) -> None:
+    import oft.application.notifications as notifications_module
+
+    recorder = _WarningRecorder()
+    monkeypatch.setattr(notifications_module, "LOGGER", recorder)
+    store = _ScriptedMarkerStore(fail_on=("DEGRADED",))
+    sink = NotificationFreshnessSink(_service(store))
+
+    assert (
+        sink.record_transition(
+            stream="WS:BTCUSDT", state="DEGRADED", occurred_at=NOW_TEXT, reason=None
+        )
+        is not None
+    )
+    assert "telegram.degradation_state.WS:BTCUSDT" not in store.state
+
+    # The DEGRADED marker was lost, but the outbox still records the outage, so
+    # this recovery is a real transition and must not be dropped as a clean install.
+    assert (
+        sink.record_transition(
+            stream="WS:BTCUSDT", state="RECOVERED", occurred_at=NOW_TEXT, reason=None
+        )
+        is not None
+    )
+    assert store.state["telegram.degradation_state.WS:BTCUSDT"] == "RECOVERED:1"
+
+    # The next genuine outage is a new episode, not a duplicate of DEGRADED:1.
+    assert (
+        sink.record_transition(
+            stream="WS:BTCUSDT", state="DEGRADED", occurred_at=NOW_TEXT, reason=None
+        )
+        is not None
+    )
+    assert store.state["telegram.degradation_state.WS:BTCUSDT"] == "DEGRADED:2"
+    assert _degradation_keys(store) == [
+        "degraded:WS:BTCUSDT:DEGRADED:1",
+        "degraded:WS:BTCUSDT:DEGRADED:2",
+        "degraded:WS:BTCUSDT:RECOVERED:1",
+    ]
+    assert len(_marker_lost_warnings(recorder)) == 1
+
+
+def test_a_failed_recovered_marker_write_still_emits_the_next_outage(
+    monkeypatch: Any,
+) -> None:
+    import oft.application.notifications as notifications_module
+
+    recorder = _WarningRecorder()
+    monkeypatch.setattr(notifications_module, "LOGGER", recorder)
+    store = _ScriptedMarkerStore(fail_on=("RECOVERED",))
+    sink = NotificationFreshnessSink(_service(store))
+
+    assert (
+        sink.record_transition(
+            stream="WS:BTCUSDT", state="DEGRADED", occurred_at=NOW_TEXT, reason=None
+        )
+        is not None
+    )
+    assert store.state["telegram.degradation_state.WS:BTCUSDT"] == "DEGRADED:1"
+
+    assert (
+        sink.record_transition(
+            stream="WS:BTCUSDT", state="RECOVERED", occurred_at=NOW_TEXT, reason=None
+        )
+        is not None
+    )
+    # The RECOVERED row is durable, but its marker write failed.
+    assert store.state["telegram.degradation_state.WS:BTCUSDT"] == "DEGRADED:1"
+
+    # The next genuine outage must not be mistaken for a restart re-observation.
+    assert (
+        sink.record_transition(
+            stream="WS:BTCUSDT", state="DEGRADED", occurred_at=NOW_TEXT, reason=None
+        )
+        is not None
+    )
+    assert store.state["telegram.degradation_state.WS:BTCUSDT"] == "DEGRADED:3"
+    assert _degradation_keys(store) == [
+        "degraded:WS:BTCUSDT:DEGRADED:1",
+        "degraded:WS:BTCUSDT:DEGRADED:3",
+        "degraded:WS:BTCUSDT:RECOVERED:2",
+    ]
+
+    # Once healed, a same-state re-observation stays silent (restart semantics).
+    assert (
+        sink.record_transition(
+            stream="WS:BTCUSDT", state="DEGRADED", occurred_at=NOW_TEXT, reason=None
+        )
+        is None
+    )
+    assert len(_marker_lost_warnings(recorder)) == 1
+
+
+def test_lost_degraded_and_recovered_markers_still_emit_the_next_outage(
+    monkeypatch: Any,
+) -> None:
+    import oft.application.notifications as notifications_module
+
+    recorder = _WarningRecorder()
+    monkeypatch.setattr(notifications_module, "LOGGER", recorder)
+    store = _ScriptedMarkerStore(fail_on=("DEGRADED", "RECOVERED"))
+    sink = NotificationFreshnessSink(_service(store))
+
+    assert (
+        sink.record_transition(
+            stream="WS:BTCUSDT", state="DEGRADED", occurred_at=NOW_TEXT, reason=None
+        )
+        is not None
+    )
+    assert "telegram.degradation_state.WS:BTCUSDT" not in store.state
+
+    assert (
+        sink.record_transition(
+            stream="WS:BTCUSDT", state="RECOVERED", occurred_at=NOW_TEXT, reason=None
+        )
+        is not None
+    )
+    assert "telegram.degradation_state.WS:BTCUSDT" not in store.state
+
+    # Both marker writes were lost. The queued RECOVERED proves the previous
+    # episode ended, so this outage is genuinely new: it must be DEGRADED:2,
+    # not a dedupe against the still-queued DEGRADED:1.
+    assert (
+        sink.record_transition(
+            stream="WS:BTCUSDT", state="DEGRADED", occurred_at=NOW_TEXT, reason=None
+        )
+        is not None
+    )
+    assert store.state["telegram.degradation_state.WS:BTCUSDT"] == "DEGRADED:2"
+    assert _degradation_keys(store) == [
+        "degraded:WS:BTCUSDT:DEGRADED:1",
+        "degraded:WS:BTCUSDT:DEGRADED:2",
+        "degraded:WS:BTCUSDT:RECOVERED:1",
+    ]
+    assert len(_marker_lost_warnings(recorder)) == 2
+
+
+class _UnreadableOutboxStore(_DurableStore):
+    """A store whose outbox probe always raises."""
+
+    def get_telegram_outbox(self, event_key: str) -> Any:
+        raise RuntimeError("outbox unavailable")
+
+
+def test_an_unreadable_outbox_probe_enqueues_the_recovery_and_warns_once(
+    monkeypatch: Any,
+) -> None:
+    import oft.application.notifications as notifications_module
+
+    recorder = _WarningRecorder()
+    monkeypatch.setattr(notifications_module, "LOGGER", recorder)
+    store = _UnreadableOutboxStore()
+    sink = NotificationFreshnessSink(_service(store))
+
+    record = sink.record_transition(
+        stream="WS:BTCUSDT", state="RECOVERED", occurred_at=NOW_TEXT, reason=None
+    )
+
+    # An unreadable probe is "unknown", not "absent": the recovery must still
+    # be enqueued rather than silently dropped as a clean install.
+    assert record is not None
+    assert _degradation_keys(store) == ["degraded:WS:BTCUSDT:RECOVERED:1"]
+    assert store.state["telegram.degradation_state.WS:BTCUSDT"] == "RECOVERED:1"
+    assert len(_marker_lost_warnings(recorder)) == 1
+    probe_warnings = [
+        fields for event, fields in recorder.warnings if event == "telegram_outbox_probe_unreadable"
+    ]
+    assert len(probe_warnings) == 1
+    assert probe_warnings[0]["error_type"] == "RuntimeError"
+
+
+class _DuplicateWithUnreadableProbeStore(_DurableStore):
+    """A duplicate insert whose follow-up probe cannot be read."""
+
+    def append_telegram_outbox(self, record: Any) -> bool:
+        return False
+
+    def get_telegram_outbox(self, event_key: str) -> Any:
+        raise RuntimeError("outbox unavailable")
+
+
+def test_a_duplicate_insert_with_an_unreadable_probe_still_returns_none(
+    monkeypatch: Any,
+) -> None:
+    import oft.application.notifications as notifications_module
+
+    recorder = _WarningRecorder()
+    monkeypatch.setattr(notifications_module, "LOGGER", recorder)
+    store = _DuplicateWithUnreadableProbeStore()
+
+    assert _service(store).enqueue_event(_risk_event()) is None
+    probe_warnings = [
+        fields for event, fields in recorder.warnings if event == "telegram_outbox_probe_unreadable"
+    ]
+    assert len(probe_warnings) == 1
+    assert probe_warnings[0]["error_type"] == "RuntimeError"
+    assert [
+        event for event, _ in recorder.warnings if event == "telegram_notification_enqueue_failed"
+    ] == []
+
+
+class _RaisingFreshnessSink:
+    def record_transition(
+        self, *, stream: str, state: str, occurred_at: str, reason: str | None
+    ) -> None:
+        raise RuntimeError("freshness sink unavailable")
+
+
+def test_a_raising_freshness_sink_is_contained_and_evaluate_still_returns_stamps(
+    monkeypatch: Any,
+) -> None:
+    guard = FreshnessGuard(clock=FixedClock(NOW), alert_sink=_RaisingFreshnessSink())
+    recorder = _WarningRecorder()
+    monkeypatch.setattr(guard, "_logger", recorder)
+    guard.record("WS:BTCUSDT", NOW)
+
+    stamps = guard.evaluate(now=NOW)
+
+    assert len(stamps) == 1
+    assert stamps[0].status.value == "FRESH"
+    failures = [
+        fields for event, fields in recorder.warnings if event == "freshness_alert_enqueue_failed"
+    ]
+    assert len(failures) == 1
+    assert failures[0]["state"] == "RECOVERED"
+    assert failures[0]["error_type"] == "RuntimeError"

@@ -288,6 +288,39 @@ def test_a_stale_monitor_tick_pushes_one_degraded_message(tmp_path: Path) -> Non
     assert "reason_code: DATA_STALE" in text.splitlines()
 
 
+def test_a_position_enqueue_failure_never_changes_the_monitor_outcome(
+    tmp_path: Path, monkeypatch: Any
+) -> None:
+    container = _configured_container(tmp_path)
+    position_id = _open_long(container, "ALERTFAIL")
+    set_position_mark(container, position_id, "69000", as_of=MONITOR_NOW_TEXT)
+    service = PositionService(
+        store=container.store,
+        clock=FixedClock(MONITOR_NOW),
+        settings=container.settings,
+        notifications=container.notifications,
+    )
+    orders_before = container.store.count_orders()
+
+    def _boom(self: SqliteStore, record: object) -> bool:
+        raise RuntimeError("outbox unavailable")
+
+    monkeypatch.setattr(SqliteStore, "append_telegram_outbox", _boom)
+
+    result = service.monitor(position_id)
+
+    # The close still committed exactly as it would with a working push; only
+    # the notification was lost, and no receipt row exists.
+    assert result.status == "CLOSED"
+    assert result.reason_code == "STOP_TOUCH"
+    assert result.order is not None
+    assert _position_receipts(container) == []
+    position = container.store.get_position(position_id)
+    assert position is not None and position.state == "CLOSED"
+    assert container.store.count_orders() == orders_before + 1
+    assert container.store.get_trade_log_for_position(position_id) is not None
+
+
 def test_the_api_management_site_enqueues_a_position_message(
     tmp_path: Path, monkeypatch: Any
 ) -> None:

@@ -1954,7 +1954,13 @@ class ManagementService:
             return
         try:
             caps, _source = effective_caps(self._settings, self._store)
-        except RiskCapsError:
+        except RiskCapsError as exc:
+            # The alert path fails closed like the breach gate: no fabricated
+            # caps, no alert, but one bounded sibling warning for the operator.
+            _LOGGER.warning("management_risk_caps_unavailable", error=exc.message)
+            return
+        except Exception as exc:  # noqa: BLE001 - a push never breaks management
+            _LOGGER.warning("management_risk_caps_unavailable", error_type=type(exc).__name__)
             return
         limit = equity * Decimal(str(caps.daily_loss_pct)) / Decimal("100")
         state = daily_loss_alert_state(daily_loss=daily_loss, limit=limit)

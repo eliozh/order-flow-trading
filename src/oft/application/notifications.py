@@ -44,6 +44,7 @@ from oft.application.telegram_events import (
     ScanSummary,
     build_degradation_event,
     build_scan_summary_event,
+    degradation_dedupe_key,
     scan_summary_dedupe_key,
 )
 from oft.application.telegram_messages import (
@@ -91,8 +92,9 @@ _RISK_PUSH_TOGGLE = "risk"
 # The durable marker prefix for one cooldown/dedupe key; the value is the last
 # alerted period so a restart or a repeated tick is a no-op.
 ALERT_COOLDOWN_STATE_PREFIX = "telegram.alert_cooldown."
-# The last DEGRADED/RECOVERED state per subject, persisted so a daemon restart
-# inside one episode neither re-emits DEGRADED nor drops the one RECOVERED.
+# The last DEGRADED/RECOVERED state per subject, persisted as
+# ``"STATE:sequence"`` so a daemon restart inside one episode neither re-emits
+# DEGRADED nor drops the one RECOVERED, while a later episode is distinct.
 DEGRADATION_STATE_PREFIX = "telegram.degradation_state."
 _RENDERERS: dict[str, Callable[[Mapping[str, Any]], str]] = {
     SCAN_SUMMARY_EVENT_TYPE: render_scan_summary,
@@ -104,6 +106,15 @@ _RENDERERS: dict[str, Callable[[Mapping[str, Any]], str]] = {
     RISK_ALERT_EVENT_TYPE: render_risk_alert,
     DEGRADATION_EVENT_TYPE: render_degradation_alert,
 }
+
+
+class _OutboxProbeUnknown:
+    """Sentinel: the outbox probe failed, so row existence is unknown."""
+
+    __slots__ = ()
+
+
+_OUTBOX_PROBE_UNKNOWN = _OutboxProbeUnknown()
 
 
 class NotificationChannel(Protocol):
@@ -201,7 +212,10 @@ class NotificationService:
                 sent_at=None,
             )
             if not self._store.append_telegram_outbox(record):
-                return self._existing_outbox(dedupe_key)
+                existing = self._existing_outbox(dedupe_key)
+                # An unreadable probe is "unknown", not a row: this path still
+                # reports a duplicate as ``None`` and never leaks the sentinel.
+                return existing if isinstance(existing, TelegramOutboxRecord) else None
             return record
         except Exception as exc:  # noqa: BLE001 - a push never breaks its caller
             LOGGER.warning(
@@ -264,17 +278,32 @@ class NotificationService:
     ) -> TelegramOutboxRecord | None:
         """Enqueue one DEGRADED/RECOVERED transition per durable episode.
 
-        The last state for the subject is persisted in ``system_state``, so a
-        process restart mid-episode re-observing STALE does not enqueue another
-        DEGRADED, and the subsequent recovery still enqueues exactly one
-        RECOVERED. A failed enqueue leaves no marker, so a later transition can
-        retry. No exception escapes.
+        The last state *and an advancing episode sequence* are persisted in
+        ``system_state`` as ``"STATE:sequence"``. That gives the outbox key two
+        required properties at once:
+
+        * A restart mid-episode re-observing the same state does not enqueue
+          another DEGRADED.
+        * A retry of the same transition (including after a failed marker
+          write) recomputes the same episode token, so the outbox unique key
+          dedupes it instead of emitting a duplicate.
+        * A genuinely new episode after RECOVERED gets the next sequence and
+          therefore a distinct key, so the next outage is not silently dropped.
+        * A lost marker (a failed write in either direction) is recognized from
+          the outbox record of the episode and healed, so a recovery is never
+          mistaken for a clean install and a new outage is never mistaken for a
+          restart re-observation.
+
+        A RECOVERED with no marker and no queued DEGRADED in the outbox is a
+        clean install and enqueues nothing; there is nothing to recover from.
+        A failed enqueue leaves no marker, so a later transition can retry. No
+        exception escapes.
         """
         if state not in DEGRADATION_STATES:
             return None
         marker = degradation_state_key(subject)
         try:
-            previous = self._store.get_system_state(marker)
+            previous_raw = self._store.get_system_state(marker)
         except Exception as exc:  # noqa: BLE001 - fail closed on unreadable state
             LOGGER.warning(
                 "telegram_degradation_state_unreadable",
@@ -282,22 +311,76 @@ class NotificationService:
                 error_type=type(exc).__name__,
             )
             return None
-        if previous == state:
-            return None
+        previous_state, previous_sequence = parse_degradation_marker(previous_raw)
+        sequence = previous_sequence + 1
+        marker_lost = False
+        # Probe boundary: terminal outbox rows live only 7 days
+        # (TELEGRAM_OUTBOX_RETENTION_SECONDS), so an episode whose marker writes
+        # both fail beyond that window is a documented limitation of this heal.
+        if previous_state == state:
+            # Same state as the marker: either a restart/repeat re-observation
+            # (a no-op) or a lost marker after the opposite transition was
+            # already enqueued. The outbox is the durable transition record, so
+            # probe the opposite state at the next sequence to tell them apart.
+            opposite = "RECOVERED" if state == "DEGRADED" else "DEGRADED"
+            if (
+                self._existing_outbox(degradation_dedupe_key(subject, opposite, str(sequence)))
+                is not None
+            ):
+                marker_lost = True
+                sequence += 1
+            else:
+                return None
+        elif state == "RECOVERED" and previous_state is None:
+            # No marker: either a clean install (nothing to recover from) or a
+            # lost DEGRADED marker. Only a queued DEGRADED means an outage
+            # actually happened, so the all-clear is not silently dropped.
+            if self._existing_outbox(degradation_dedupe_key(subject, "DEGRADED", "1")) is not None:
+                marker_lost = True
+            else:
+                return None
+        elif (
+            state == "DEGRADED"
+            and previous_state is None
+            and self._existing_outbox(degradation_dedupe_key(subject, "RECOVERED", "1")) is not None
+        ):
+            # Lost DEGRADED marker: a queued RECOVERED means the previous episode
+            # ended and this is a genuinely new outage, not a first observation.
+            marker_lost = True
+            sequence += 1
+        if marker_lost:
+            LOGGER.warning(
+                "telegram_degradation_marker_lost",
+                subject=subject,
+                marker_state=previous_state,
+                observed_state=state,
+                sequence=sequence,
+            )
         record = self.enqueue_event(
             build_degradation_event(
                 subject=subject,
                 state=state,
                 reason_code=reason_code,
                 occurred_at=occurred_at,
-                episode=occurred_at,
+                # The builder's key is subject+state+episode, so the sequence
+                # alone is the durable episode token; the marker stores the
+                # state alongside it for parsing.
+                episode=str(sequence),
             )
         )
         if record is None:
             return None
         try:
-            self._store.set_system_state(marker, state, updated_at=utc_timestamp(self._clock.now()))
+            self._store.set_system_state(
+                marker, f"{state}:{sequence}", updated_at=utc_timestamp(self._clock.now())
+            )
         except Exception as exc:  # noqa: BLE001 - the outbox key still dedupes
+            # The marker stays at the previous episode while this transition is
+            # already durable in the outbox. It heals on the next transition for
+            # the subject: a same-state retry recomputes the same outbox key and
+            # dedupes while rewriting the marker, and an opposite-state
+            # transition is recognized as a lost marker by probing the outbox
+            # for the queued episode (above). So neither direction is dropped.
             LOGGER.warning(
                 "telegram_degradation_state_unwritable",
                 subject=subject,
@@ -416,12 +499,24 @@ class NotificationService:
             )
             return False
 
-    def _existing_outbox(self, event_key: str) -> TelegramOutboxRecord | None:
-        """The stored row for ``event_key`` after a duplicate insert (or ``None``)."""
+    def _existing_outbox(self, event_key: str) -> TelegramOutboxRecord | None | _OutboxProbeUnknown:
+        """The stored row for ``event_key`` after a duplicate insert.
+
+        ``None`` means the store reports no row. ``_OUTBOX_PROBE_UNKNOWN``
+        means the read itself failed, which is not evidence of absence: the
+        degradation heal treats it as a possible hit so the transition is
+        enqueued (at-least-once) instead of silently dropped.
+        """
         try:
-            return self._store.get_telegram_outbox(event_key)
-        except Exception:  # noqa: BLE001 - a duplicate is still a no-op
-            return None
+            record = self._store.get_telegram_outbox(event_key)
+        except Exception as exc:  # noqa: BLE001 - reported once, then degraded
+            LOGGER.warning(
+                "telegram_outbox_probe_unreadable",
+                event_key=event_key,
+                error_type=type(exc).__name__,
+            )
+            return _OUTBOX_PROBE_UNKNOWN
+        return record if isinstance(record, TelegramOutboxRecord) else None
 
     # -- bounded summary loader ------------------------------------------
 
@@ -486,12 +581,34 @@ def degradation_state_key(subject: str) -> str:
     return f"{DEGRADATION_STATE_PREFIX}{subject}"
 
 
+def parse_degradation_marker(value: str | None) -> tuple[str | None, int]:
+    """Parse a persisted marker into ``(state, sequence)``.
+
+    The current format is ``"STATE:sequence"``. Legacy plain ``"DEGRADED"`` or
+    ``"RECOVERED"`` values parse with sequence 0 so an upgrade keeps its prior
+    episode; any other value has no state and no sequence.
+    """
+    if not isinstance(value, str) or not value:
+        return None, 0
+    state, _, sequence_text = value.partition(":")
+    if state not in DEGRADATION_STATES:
+        return None, 0
+    try:
+        sequence = int(sequence_text) if sequence_text else 0
+    except ValueError:
+        sequence = 0
+    return state, max(0, sequence)
+
+
 class NotificationFreshnessSink:
     """Map a freshness transition to one DEGRADED/RECOVERED degradation push.
 
-    ``FreshnessGuard`` calls this only on a state transition. The service
-    persists the last state per subject, so a restart mid-episode re-observing
-    STALE does not re-emit DEGRADED, and a recovery still emits exactly once.
+    ``FreshnessGuard`` calls this on a state transition and once on the first
+    observation of a stream after startup (so a recovery that happened while
+    the daemon was down still clears a stale DEGRADED marker). The service
+    persists state plus an advancing episode sequence per subject, so a restart
+    mid-episode re-observing STALE does not re-emit DEGRADED, and a recovery
+    still emits exactly once.
     """
 
     def __init__(self, notifications: NotificationService) -> None:
@@ -642,4 +759,5 @@ __all__ = [
     "degradation_state_key",
     "delivery_contract",
     "not_configured_delivery",
+    "parse_degradation_marker",
 ]

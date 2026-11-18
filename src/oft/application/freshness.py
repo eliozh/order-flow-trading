@@ -145,9 +145,13 @@ class FreshnessStamp:
 class FreshnessAlertSink(Protocol):
     """The one transition write an optional alert adapter needs.
 
-    The guard calls this only on a STALE/FRESH edge, so a repeated evaluation
-    cannot produce a message storm. Implementations must not raise into the
-    guard; the guard also contains a failure defensively.
+    The guard calls this on a STALE/FRESH edge, and once on the first
+    observation of a stream after startup: a recovery that happened while the
+    daemon was down left the durable marker at DEGRADED, so that first fresh
+    evaluation must be able to transition it (the notification layer no-ops
+    when there is no prior marker). A repeated evaluation cannot produce a
+    message storm. Implementations must not raise into the guard; the guard
+    also contains a failure defensively.
     """
 
     def record_transition(
@@ -193,14 +197,25 @@ class FreshnessGuard:
         closes_at: datetime | None = None,
         expected_at: datetime | None = None,
     ) -> FreshnessStamp:
-        """Record fresh data; the deadline is based on close/expected time."""
+        """Record fresh data; the deadline is based on close/expected time.
+
+        The first observation of a stream after startup is marked so the next
+        fresh ``evaluate()`` attempts one RECOVERED transition. That is what
+        clears a durable DEGRADED marker when the outage recovered while the
+        daemon was down; the notification layer ignores it on a clean install.
+        """
         budget = self._budget(stream)
         anchor = closes_at or expected_at or observed_at
         previous = self._entries.get(stream)
         entry = _Entry(
             observed_at=observed_at,
             deadline=anchor + timedelta(seconds=budget.seconds),
-            pending_fresh_log=bool(previous is not None and previous.logged_stale),
+            # The live loop records every accepted event and evaluates only on
+            # the flush/connect boundary, so this must stay latched across
+            # consecutive records until a fresh ``evaluate()`` consumes it.
+            pending_fresh_log=(
+                previous is None or previous.logged_stale or previous.pending_fresh_log
+            ),
         )
         self._entries[stream] = entry
         return self._stamp(stream, entry, self._clock.now())

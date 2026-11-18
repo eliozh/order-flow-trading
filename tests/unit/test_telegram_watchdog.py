@@ -2,7 +2,11 @@
 
 from __future__ import annotations
 
+import threading
+from collections.abc import Iterator
+from contextlib import contextmanager
 from datetime import UTC, datetime
+from pathlib import Path
 from typing import Any
 
 from oft.adapters.telegram_fake import TelegramFake
@@ -141,3 +145,132 @@ def test_private_chat_resolution_is_fail_closed() -> None:
     assert resolve_private_chat((1001, 1002)) is None
     assert resolve_private_chat(()) is None
     assert resolve_private_chat((1001, -100200)) == 1001
+
+
+def test_overlapping_runs_serialize_the_probe_and_send(tmp_path: Path, monkeypatch: Any) -> None:
+    import oft.application.telegram_watchdog as watchdog_module
+
+    store = _Store()
+    port = TelegramFake()
+    lock_path = tmp_path / "telegram-watchdog.lock"
+    first_probe_entered = threading.Event()
+    release_first = threading.Event()
+    probes: list[str] = []
+    actions: list[str] = []
+
+    def probe() -> DaemonProbe:
+        probes.append("probe")
+        if len(probes) == 1:
+            first_probe_entered.set()
+            assert release_first.wait(5)
+        return DaemonProbe(state="OFFLINE", detail="test probe")
+
+    real_lock = watchdog_module._exclusive_lock
+    second_attempt = threading.Event()
+    attempts: list[int] = []
+
+    @contextmanager
+    def tracking_lock(path: Path) -> Iterator[None]:
+        attempts.append(1)
+        if len(attempts) == 2:
+            second_attempt.set()
+        with real_lock(path):
+            yield
+
+    monkeypatch.setattr(watchdog_module, "_exclusive_lock", tracking_lock)
+
+    def run() -> None:
+        actions.append(
+            run_watchdog_once(
+                store=store,  # type: ignore[arg-type]
+                clock=FixedClock(NOW),
+                probe=probe,
+                port=port,
+                chat_id=CHAT_ID,
+                lock_path=lock_path,
+            ).action
+        )
+
+    first = threading.Thread(target=run)
+    first.start()
+    assert first_probe_entered.wait(2)
+
+    # The first run holds the exclusive lock and is still inside its probe, so
+    # the second run cannot probe or send until the first one finishes.
+    second = threading.Thread(target=run)
+    second.start()
+    assert second_attempt.wait(2)
+    assert probes == ["probe"]
+    assert port.sent == []
+
+    release_first.set()
+    first.join(timeout=5)
+    second.join(timeout=5)
+
+    assert not first.is_alive() and not second.is_alive()
+    assert len(probes) == 2
+    assert sorted(actions) == ["ALERT_SENT", "NONE"]
+    assert len(port.sent) == 1
+    # The lock file is a zero-byte sentinel and never carries a secret.
+    assert lock_path.exists()
+    assert lock_path.read_bytes() == b""
+
+
+def test_an_unavailable_lock_is_a_bounded_unknown_result(tmp_path: Path) -> None:
+    store = _Store()
+    port = TelegramFake()
+    blocker = tmp_path / "lock-parent"
+    blocker.write_text("not a directory")
+
+    result = run_watchdog_once(
+        store=store,  # type: ignore[arg-type]
+        clock=FixedClock(NOW),
+        probe=lambda: DaemonProbe(state="OFFLINE", detail="test probe"),
+        port=port,
+        chat_id=CHAT_ID,
+        lock_path=blocker / "telegram-watchdog.lock",
+    )
+
+    assert result.daemon_state == "UNKNOWN"
+    assert result.action == "NONE"
+    assert "lock" in (result.detail or "")
+    assert port.sent == []
+
+
+def test_the_windows_fallback_serializes_in_process(tmp_path: Path, monkeypatch: Any) -> None:
+    import oft.application.telegram_watchdog as watchdog_module
+
+    monkeypatch.setattr(watchdog_module, "_FCNTL", None)
+    lock_path = tmp_path / "telegram-watchdog.lock"
+    entered = threading.Event()
+    release = threading.Event()
+    second_started = threading.Event()
+    second_done = threading.Event()
+    order: list[str] = []
+
+    def hold() -> None:
+        with watchdog_module._exclusive_lock(lock_path):
+            order.append("first")
+            entered.set()
+            assert release.wait(5)
+
+    def wait() -> None:
+        second_started.set()
+        with watchdog_module._exclusive_lock(lock_path):
+            order.append("second")
+        second_done.set()
+
+    first = threading.Thread(target=hold)
+    first.start()
+    assert entered.wait(2)
+    second = threading.Thread(target=wait)
+    second.start()
+    assert second_started.wait(2)
+    # The fallback holds a process-wide lock, so the second run cannot enter.
+    assert not second_done.wait(0.2)
+    assert order == ["first"]
+    release.set()
+    first.join(timeout=5)
+    second.join(timeout=5)
+    assert not first.is_alive() and not second.is_alive()
+    assert order == ["first", "second"]

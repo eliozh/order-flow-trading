@@ -12,6 +12,7 @@ from typing import Any
 from structlog.testing import capture_logs
 
 from oft.application.rate_limiter import (
+    COOLDOWN_418_SECONDS,
     COOLDOWN_429_SECONDS,
     RATE_LIMIT_COOLDOWN_STATE_KEY,
     CompositeAlertSink,
@@ -203,6 +204,80 @@ def test_the_cooldown_epoch_survives_a_restart() -> None:
 
     assert [event.payload["state"] for event in notifications.events] == ["RECOVERED"]
     assert store.state["telegram.rate_limit.cooldown_until"] == ""
+
+
+def test_a_418_upgrade_during_a_429_cooldown_survives_a_restart() -> None:
+    store = _StateStore()
+    clock = _MutableClock(NOW)
+    first = GlobalRateLimiter(clock=clock, store=store)  # type: ignore[arg-type]
+    first.note_status(429, endpoint="/fapi/v1/aggTrades")
+    original_until = first.cooldown_until
+    assert original_until == NOW + timedelta(seconds=COOLDOWN_429_SECONDS)
+
+    # A 418 inside the 429 cooldown upgrades the ban; that epoch must be
+    # persisted, not only held in memory.
+    first.note_status(418, endpoint="/fapi/v1/aggTrades")
+    upgraded = first.cooldown_until
+    assert upgraded == NOW + timedelta(seconds=COOLDOWN_418_SECONDS)
+    assert upgraded is not None and original_until is not None and upgraded > original_until
+
+    notifications = _RecordingNotifications()
+    restarted = GlobalRateLimiter(
+        clock=clock,
+        alert_sink=_sink(notifications),
+        store=store,  # type: ignore[arg-type]
+    )
+    assert restarted.cooldown_until == upgraded
+    # Past the original 429 expiry but still inside the upgraded 418 ban.
+    clock.instant = original_until + timedelta(seconds=1)
+    assert restarted.in_cooldown() is True
+    assert notifications.events == []
+
+
+def test_a_malformed_persisted_epoch_is_logged_and_cleared(monkeypatch: Any) -> None:
+    import oft.application.rate_limiter as rate_limiter_module
+
+    class _Recorder:
+        def __init__(self) -> None:
+            self.warnings: list[tuple[str, dict[str, Any]]] = []
+
+        def warning(self, event: str, **fields: Any) -> None:
+            self.warnings.append((event, fields))
+
+    recorder = _Recorder()
+    # Order-independent: another test may have cached the module logger after
+    # ``configure_logging``, which would make ``capture_logs`` miss the event.
+    monkeypatch.setattr(rate_limiter_module.structlog, "get_logger", lambda *_: recorder)
+    store = _StateStore()
+    store.state[RATE_LIMIT_COOLDOWN_STATE_KEY] = "not-an-instant"
+
+    limiter = GlobalRateLimiter(clock=FixedClock(NOW), store=store)  # type: ignore[arg-type]
+
+    assert limiter.cooldown_until is None
+    assert store.state[RATE_LIMIT_COOLDOWN_STATE_KEY] == ""
+    warnings = [
+        fields for event, fields in recorder.warnings if event == "rate_limit_cooldown_unparseable"
+    ]
+    assert len(warnings) == 1
+    assert "not-an-instant" not in str(warnings[0])
+
+
+def test_a_fresh_418_enqueues_rate_limited_418_with_a_120s_cooldown() -> None:
+    notifications = _RecordingNotifications()
+    limiter = GlobalRateLimiter(clock=FixedClock(NOW), alert_sink=_sink(notifications))
+
+    decision = limiter.note_status(418, endpoint="/fapi/v1/aggTrades")
+
+    assert decision is not None
+    assert decision.reason == "COOLDOWN"
+    assert decision.retry_after_seconds == COOLDOWN_418_SECONDS
+    assert limiter.in_cooldown() is True
+    assert limiter.cooldown_until == NOW + timedelta(seconds=COOLDOWN_418_SECONDS)
+    assert len(notifications.events) == 1
+    event = notifications.events[0]
+    assert event.payload["state"] == "DEGRADED"
+    assert event.payload["reason_code"] == "RATE_LIMITED_418"
+    assert event.payload["subject"] == "provider:binance"
 
 
 class _BlockingClearStore(_StateStore):

@@ -397,6 +397,16 @@ def risk_alert_dedupe_key(kind: str, subject: str, period: str, state: str) -> s
     return f"risk:{kind}:{subject}:{period}:{state}"
 
 
+def risk_alert_cooldown_key(kind: str, subject: str, state: str) -> str:
+    """The stable cooldown key for one kind+subject+state crossing.
+
+    The alerted period is stored as the marker *value* by ``enqueue_cooled``,
+    not encoded in the key, so the number of durable ``system_state`` rows
+    stays bounded by the alert vocabulary instead of growing every period.
+    """
+    return f"risk:{kind}:{subject}:{state}"
+
+
 def build_risk_alert_event(
     *,
     kind: str,
@@ -449,11 +459,13 @@ def enqueue_risk_alert(
 ) -> object | None:
     """Build and enqueue one risk alert through the durable cooldown path.
 
-    The cooldown marker reuses the event's dedupe key, which includes the
-    severity state. An APPROACH and a later BREACH in the same period therefore
-    each alert once, while an identical repeat (including after a restart) is a
-    durable no-op. This is the single helper both the entry and management
-    paths call, so their alert shape cannot drift.
+    The cooldown key is the stable ``kind+subject+state`` and the alerted
+    ``period`` is its stored value. An APPROACH and a later BREACH therefore
+    each alert once in the same period, a new period alerts again, and an
+    identical repeat (including after a restart) is a durable no-op. The
+    outbox ``dedupe_key`` keeps the period because it is the message identity.
+    This is the single helper both the entry and management paths call, so
+    their alert shape cannot drift.
     """
     event = build_risk_alert_event(
         kind=kind,
@@ -467,7 +479,9 @@ def enqueue_risk_alert(
         reason_code=reason_code,
         occurred_at=occurred_at,
     )
-    return sink.enqueue_cooled(event, cooldown_key=event.dedupe_key, period=period)
+    return sink.enqueue_cooled(
+        event, cooldown_key=risk_alert_cooldown_key(kind, subject, state), period=period
+    )
 
 
 def degradation_dedupe_key(subject: str, state: str, episode: str) -> str:
@@ -609,6 +623,7 @@ __all__ = [
     "opportunity_state_version",
     "opportunity_transition_dedupe_key",
     "position_alert_dedupe_key",
+    "risk_alert_cooldown_key",
     "risk_alert_dedupe_key",
     "risk_alert_kind_for_cap",
     "scan_summary_dedupe_key",
