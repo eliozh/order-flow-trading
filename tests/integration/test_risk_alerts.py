@@ -4,10 +4,13 @@ from __future__ import annotations
 
 import json
 import sqlite3
+from collections.abc import Iterator
 from datetime import UTC, date, datetime, timedelta
 from decimal import Decimal
 from pathlib import Path
 from typing import Any
+
+import pytest
 
 from oft.adapters.llm_stub import LLMStub
 from oft.application.entry_service import EntryService
@@ -35,6 +38,29 @@ END = date(2026, 10, 7)
 NOW = datetime(2026, 10, 8, tzinfo=UTC)
 NOW_TEXT = "2026-10-08T00:00:00.000Z"
 SENTINEL = "123456789:AAFakeSentinelToken_abcdefghijklmnopqrstuv"
+
+
+@pytest.fixture(autouse=True)
+def _hermetic_secret_store(monkeypatch: pytest.MonkeyPatch) -> Iterator[None]:
+    """Force the encrypted-file store so every test is hermetic in CI.
+
+    CI has no OS keyring, so a container built without a master key raises
+    ``SecretStoreUnavailable``. The keyring backend is forced to ``fail`` (in
+    the environment and in-process, in case another test already probed a
+    desktop backend) and a per-test ``OFT_MASTER_KEY`` selects the encrypted
+    file, matching ``tests/e2e/test_secret_leak_regression.py``.
+    """
+    import keyring
+    from keyring.backends.fail import Keyring as FailKeyring
+
+    monkeypatch.setenv("PYTHON_KEYRING_BACKEND", "keyring.backends.fail.Keyring")
+    monkeypatch.setenv("OFT_MASTER_KEY", "per-test-master-key-0123456789abcdef")
+    previous = keyring.get_keyring()
+    keyring.set_keyring(FailKeyring())
+    try:
+        yield
+    finally:
+        keyring.set_keyring(previous)
 
 
 class _MutableClock:
