@@ -24,7 +24,6 @@ from telegram_channel_support import (
     SENTINEL_TOKEN,
     Channel,
     build_channel,
-    load_read_model,
     load_updates,
     seed_read_models,
 )
@@ -50,6 +49,7 @@ from oft.application.telegram_poller import TelegramPoller
 from oft.application.telegram_watchdog import run_watchdog_once
 from oft.clock import FixedClock
 from oft.config import Settings
+from oft.domain.budget_periods import period_parts
 from oft.domain.opportunities import (
     Condition,
     Opportunity,
@@ -57,13 +57,20 @@ from oft.domain.opportunities import (
     StateHistoryEntry,
 )
 from oft.domain.telegram import (
+    COMMANDS,
     REFUSAL_TEXT,
     SCAN_FAILED_ALERT_KEY,
+    WRITE_LIKE_COMMANDS,
     WRITE_REFUSAL_TEXT,
     parse_update,
 )
 from oft.domain.trigger import ConditionResult
-from oft.ports.store import ConfigRecord
+from oft.ports.store import (
+    BudgetRecord,
+    BudgetSettingsRecord,
+    ConfigRecord,
+    LLMCallRecord,
+)
 
 NOW_INSTANT = datetime(2026, 11, 17, 9, 30, tzinfo=UTC)
 CONTROL_EXEMPT = frozenset({"\n", "\t"})
@@ -207,6 +214,10 @@ COMMAND_UNITS = {
 
 def test_every_f11_command_has_one_durable_sent_receipt(channel: Channel) -> None:
     commands = load_updates()["commands"]
+    # The fixture must cover the canonical closed command table; report_latest
+    # and report_symbol both map to /report, so the first token set equals it.
+    assert {item["update"]["message"]["text"].split()[0] for item in commands} == set(COMMANDS)
+    assert {item["name"] for item in commands} >= {"report_latest", "report_symbol"}
     updates = [item["update"] for item in commands]
     channel.port.script_updates(updates)
 
@@ -242,6 +253,8 @@ def test_every_f11_command_has_one_durable_sent_receipt(channel: Channel) -> Non
 
 def test_every_write_like_token_only_enqueues_the_fixed_refusal(channel: Channel) -> None:
     items = load_updates()["write_like"]
+    # The fixture must exercise the full recognized-but-not-executable set.
+    assert {item["update"]["message"]["text"] for item in items} == set(WRITE_LIKE_COMMANDS)
     updates = [item["update"] for item in items]
     channel.port.script_updates(updates)
 
@@ -739,17 +752,71 @@ def test_watchdog_alert_and_recovery_use_the_fake_port(channel: Channel, tmp_pat
 
 
 def test_the_seeded_read_models_render_the_documented_units(channel: Channel) -> None:
-    budget = load_read_model("budget")
+    # Seed NON-default thresholds and one non-zero ledger row: a regression in
+    # either the settings read or the ledger rollup then fails this test. The
+    # renderer normalizes trailing zeros, so "11.00" renders as "11".
+    channel.store.save_budget_settings(
+        BudgetSettingsRecord(
+            daily_usd="11.00",
+            weekly_usd="55.00",
+            monthly_usd="165.00",
+            warn_pct=75,
+            updated_at=NOW,
+        )
+    )
+    day, week, month = period_parts(NOW)
+    # budget_ledger.call_id is a foreign key to llm_calls, so the billed call
+    # row is seeded first.
+    channel.store.save_llm_call(
+        LLMCallRecord(
+            call_id="CALL-TG-SEEDED",
+            role="ANALYSIS",
+            provider="stub",
+            model="fixture",
+            prompt_id="analysis",
+            prompt_version=1,
+            prompt_hash="ph",
+            input_hash="ih",
+            attempt=1,
+            request_id="REQ-TG-SEEDED",
+            status="OK",
+            raw_output_hash="rh",
+            usage_json="{}",
+            latency_ms=1,
+            created_at=NOW,
+        )
+    )
+    assert channel.store.save_budget_record(
+        BudgetRecord(
+            record_id="BUD-TG-SEEDED",
+            call_id="CALL-TG-SEEDED",
+            decision_id=None,
+            occurred_at=NOW,
+            provider="stub",
+            model="fixture",
+            cost_usd="4.20",
+            price_version="stub/v1",
+            unpriced=False,
+            budget_state="OK",
+            period_day=day,
+            payload_json='{"seeded": true}',
+            period_week=week,
+            period_month=month,
+            role="analysis",
+        )
+    )
+
     command = load_updates()["commands"][5]["update"]
     channel.port.script_updates([command])
     assert _poller(channel).poll_once() == 1
     assert _dispatcher(channel).dispatch_once() == 1
     receipt = _receipts(channel)[f"update:{command['update_id']}:reply"]
     text = _text(receipt)
-    thresholds = budget["thresholds"]
-    assert f"daily_usd: {thresholds['daily_usd']} USDT" in text
-    assert f"weekly_usd: {thresholds['weekly_usd']} USDT" in text
-    assert f"monthly_usd: {thresholds['monthly_usd']} USDT" in text
-    assert "warn_pct: 80 %" in text
+    assert "daily_usd: 11 USDT" in text
+    assert "weekly_usd: 55 USDT" in text
+    assert "monthly_usd: 165 USDT" in text
+    assert "warn_pct: 75 %" in text
+    assert "spend_usd: 4.2 USDT" in text
+    assert "call_count: 1" in text
     assert receipt.attempts == 0
     assert receipt.message_id is not None

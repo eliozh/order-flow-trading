@@ -8,6 +8,7 @@ read models from the committed fixtures so every command renders real data.
 
 from __future__ import annotations
 
+import contextlib
 import json
 import sqlite3
 import uuid
@@ -145,7 +146,7 @@ def _seed_scan(store: SqliteStore) -> None:
 def _seed_position(settings: Settings, store: SqliteStore) -> None:
     payload = load_read_model("position")
     PaperAccountService(settings=settings, store=store, clock=FixedClock(_now())).ensure()
-    with sqlite3.connect(settings.data_dir / "oft.db") as connection:
+    with contextlib.closing(sqlite3.connect(settings.data_dir / "oft.db")) as connection:
         connection.execute(
             "INSERT OR REPLACE INTO positions "
             "(position_id, account_id, environment, symbol, state, opened_at, payload_json) "
@@ -165,7 +166,7 @@ def _seed_position(settings: Settings, store: SqliteStore) -> None:
 
 def _seed_opportunity(settings: Settings) -> None:
     payload = load_read_model("opportunity")
-    with sqlite3.connect(settings.data_dir / "oft.db") as connection:
+    with contextlib.closing(sqlite3.connect(settings.data_dir / "oft.db")) as connection:
         connection.execute(
             "INSERT OR REPLACE INTO opportunities "
             "(opportunity_id, symbol, state, created_at, updated_at, payload_json, expires_at) "

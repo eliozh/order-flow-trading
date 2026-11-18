@@ -21,7 +21,7 @@ Machine-checkable boundaries for the local API, LLM decisions, market data, and 
 | [`api-envelope.schema.json`](api-envelope.schema.json) | Request/response envelope, error object, SSE event | REST API, CLI, SPA |
 | [`telegram-status.schema.json`](telegram-status.schema.json) | Deterministic Telegram channel state (`NOT_CONFIGURED`/`NO_ALLOWLIST`/`READY`/`DEGRADED`) | `GET /api/v1/telegram/status`, CLI `oft telegram status` |
 | [`telegram-receipt.schema.json`](telegram-receipt.schema.json) | One durable Telegram outbox receipt; public and internal `last_error_code` values | `GET /api/v1/telegram/receipts`, settings aggregate, `/system` |
-| [`telegram-settings.schema.json`](telegram-settings.schema.json) | F10f aggregate: masked token, allowlists, six push toggles, provenance, receipts | `GET/PUT /api/v1/settings/telegram`, `oft telegram toggles` |
+| [`telegram-settings.schema.json`](telegram-settings.schema.json) | F10f aggregate: masked token, allowlists, six push toggles, provenance, receipts | `GET/PUT /api/v1/settings/telegram` |
 | [`telegram-message.schema.json`](telegram-message.schema.json) | Outbound message shape: first-line event (+symbol), units, ISO-8601 UTC, no controls/emoji/ASCII art | Renderer contract tests, channel journey |
 | [`error-catalog.json`](error-catalog.json) | Stable error codes, HTTP status, category, retryability, user action | API, CLI, tests |
 | [`error-catalog.schema.json`](error-catalog.schema.json) | Validates the error catalog structure | CI, contract tests |

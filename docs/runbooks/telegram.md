@@ -69,8 +69,9 @@ OnFailure=oft-telegram-watchdog.service
 Safe behavior:
 
 - The watchdog never prints, returns, or persists the bot token.
-- An unconfigured channel or no single private chat target is a no-op
-  (`NONE`), not a crash.
+- No single private chat target is a no-op (`NONE`), not a crash. A missing or
+  invalid token while a private chat target exists surfaces as `ALERT_FAILED`
+  (exit 1) instead of a silent `NONE`.
 - A failed alert/recovery or an unreadable daemon state exits non-zero so
   systemd records the failure.
 - `--once` is mandatory; omitting it is a validation error (exit 2).

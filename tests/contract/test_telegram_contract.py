@@ -413,6 +413,21 @@ def _has_ascii_art(text: str) -> bool:
 def test_the_committed_failure_shapes_map_to_their_stable_codes() -> None:
     fixtures = _load_fixture("failures/bot_api.json")["failures"]
 
+    # The fixture must cover every required failure category, so deleting a
+    # shape cannot silently narrow the contract.
+    statuses = {fixture.get("http_status") for fixture in fixtures}
+    assert {401, 409, 429} <= statuses
+    assert any(status in {500, 502, 503, 504} for status in statuses)
+    assert any(fixture.get("transport") == "timeout" for fixture in fixtures)
+    assert {fixture["expected_code"] for fixture in fixtures} == {
+        "TELEGRAM_TOKEN_INVALID",
+        "TELEGRAM_CONFLICT",
+        "TELEGRAM_RATE_LIMITED",
+        "TELEGRAM_UPSTREAM_ERROR",
+    }
+    rate_limited = next(fixture for fixture in fixtures if fixture.get("http_status") == 429)
+    assert rate_limited["retry_after"] == 30
+
     for fixture in fixtures:
         if fixture.get("transport") == "timeout":
             transport: Any = _TimeoutTransport()

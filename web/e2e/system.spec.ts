@@ -544,6 +544,25 @@ test('renders the receipt card and a persistent alert for failing pushes', async
   await expect(receiptTable).toContainText('4821')
   await expect(receiptTable).toContainText('SENT')
   await expect(receiptTable).toContainText('FAILED')
+
+  // Audit the populated failing card at every breakpoint. The
+  // ``definition-list`` allowance is the documented pre-existing stat-grid
+  // violation on this route; every other rule still gates it.
+  for (const viewport of [
+    { width: 375, height: 812 },
+    { width: 768, height: 1024 },
+    { width: 1440, height: 900 },
+  ] as const) {
+    await page.setViewportSize({ width: viewport.width, height: viewport.height })
+    await page.goto('/system')
+    await waitForLoadedSystem(page)
+
+    await expect(page.getByRole('alert')).toContainText('Telegram pushes failing')
+    await expect(page.getByRole('heading', { name: 'Telegram delivery receipts' })).toBeVisible()
+    await runAxeAudit(page, `/system failing receipts @ ${viewport.width}`, {
+      allow: ['definition-list'],
+    })
+  }
 })
 
 test('at 375 and 768 the failing Telegram card has no page-level horizontal scroll', async ({

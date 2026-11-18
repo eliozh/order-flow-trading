@@ -82,7 +82,7 @@ REQUIRED_DETERMINISTIC_MODULES = (
 )
 NOW = datetime(2026, 11, 6, 12, 0, 0, tzinfo=UTC)
 
-_WALL_CLOCK_MODULES = {"datetime", "date", "time"}
+_WALL_CLOCK_MODULES = {"datetime", "date", "time", "asyncio", "threading"}
 _WALL_CLOCK_ATTRIBUTES = {
     "now",
     "utcnow",
@@ -95,7 +95,21 @@ _WALL_CLOCK_ATTRIBUTES = {
     "perf_counter_ns",
     "clock_gettime",
     "clock_gettime_ns",
+    "sleep",
 }
+
+# The two long-running workers accept their ``sleep`` as an injected
+# constructor argument (``ingestion_supervisor``) or a default parameter
+# (``llm_orchestrator``). Their stdlib ``time.sleep`` is the intentional default
+# for production wiring; only ``sleep`` is exempt in exactly these modules and
+# every other wall-clock call stays gated. The required-module scan below has no
+# exemption at all.
+_INJECTED_SLEEP_DEFAULT_MODULES = frozenset(
+    {
+        "src/oft/application/ingestion_supervisor.py",
+        "src/oft/application/llm_orchestrator.py",
+    }
+)
 
 
 def _dotted(node: ast.AST) -> str | None:
@@ -243,15 +257,48 @@ def test_wall_clock_detector_recognizes_import_aliases_and_chains() -> None:
     }
 
 
+def test_wall_clock_detector_flags_sleep_including_asyncio_and_imported_names() -> None:
+    tree = ast.parse(
+        "import asyncio\n"
+        "import time\n"
+        "from time import sleep\n"
+        "time.sleep(1)\n"
+        "asyncio.sleep(0)\n"
+        "sleep(0.5)\n"
+    )
+
+    found = {expression for _, expression in _wall_clock_calls(tree)}
+    assert found == {"sleep()"}
+
+
+def test_wall_clock_detector_does_not_flag_an_injected_sleep_callable() -> None:
+    # The long-running workers take ``sleep`` as an injected callable, so a
+    # ``self._sleep`` call is scheduling, not a direct wall-clock read.
+    tree = ast.parse(
+        "class Worker:\n"
+        "    def __init__(self, sleep):\n"
+        "        self._sleep = sleep\n"
+        "    def run(self):\n"
+        "        self._sleep(1)\n"
+    )
+
+    assert _wall_clock_calls(tree) == []
+
+
 def test_domain_and_application_never_call_the_wall_clock() -> None:
     violations: list[str] = []
     checked = 0
     for package in DETERMINISTIC_PACKAGES:
         for path in sorted((SRC / package).rglob("*.py")):
             checked += 1
+            relative = str(path.relative_to(ROOT))
             tree = ast.parse(path.read_text(encoding="utf-8"), filename=str(path))
             for line, expression in _wall_clock_calls(tree):
-                violations.append(f"{path.relative_to(ROOT)}:{line}: {expression}")
+                if relative in _INJECTED_SLEEP_DEFAULT_MODULES and expression.startswith("sleep"):
+                    # The one intentional stdlib sleep default of a long-running
+                    # worker; every other wall-clock call is still a violation.
+                    continue
+                violations.append(f"{relative}:{line}: {expression}")
 
     assert checked > 0
     assert not violations, "wall-clock calls must move behind ClockPort:\n" + "\n".join(violations)

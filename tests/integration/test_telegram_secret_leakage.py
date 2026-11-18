@@ -111,12 +111,18 @@ def _api_surfaces(client: TestClient, auth: dict[str, str]) -> list[tuple[str, s
         ("/api/v1/telegram/receipts", client.get("/api/v1/telegram/receipts", headers=auth)),
         ("/api/v1/settings/telegram", client.get("/api/v1/settings/telegram", headers=auth)),
         ("/api/v1/status", client.get("/api/v1/status", headers=auth)),
-        ("/", client.get("/")),
     ]
     surfaces: list[tuple[str, str]] = []
     for name, response in responses:
-        assert response.status_code in (200, 401), (name, response.status_code)
+        # Every bearer-authenticated read must stay authorized: a 401 would
+        # replace the scanned body with the auth-error page and make the scan
+        # vacuous.
+        assert response.status_code == 200, (name, response.status_code)
         surfaces.append((name, response.text))
+    # The unauthenticated root may legitimately be served or refused.
+    root = client.get("/")
+    assert root.status_code in (200, 401), ("/", root.status_code)
+    surfaces.append(("/", root.text))
     return surfaces
 
 
@@ -159,25 +165,33 @@ def test_no_sentinel_reaches_db_api_cli_logs_audit_receipts_or_messages(
     assert llm_status.key_source == "encrypted_file"
 
     try:
-        # Configure and drive the real API path.
+        # Configure and drive the real API path. The mutating responses are
+        # scanned too: a token or key echoed back by a PUT/POST must not pass.
+        api_surfaces: list[tuple[str, str]] = []
         token = client.put(
             "/api/v1/settings/telegram/token",
             json={"bot_token": BOT_TOKEN},
             headers={**auth, "Idempotency-Key": "leak-token"},
         )
         assert token.status_code == 200, token.text
+        _assert_clean("token PUT response", token.text)
+        api_surfaces.append(("token PUT response", token.text))
         allowlist = client.put(
             "/api/v1/settings/telegram/allowlist",
             json={"chat_ids": [1001], "allowed_user_ids": [2002]},
             headers={**auth, "Idempotency-Key": "leak-allowlist"},
         )
         assert allowlist.status_code == 200, allowlist.text
+        _assert_clean("allowlist PUT response", allowlist.text)
+        api_surfaces.append(("allowlist PUT response", allowlist.text))
         test_send = client.post(
             "/api/v1/telegram/test",
             json={},
             headers={**auth, "Idempotency-Key": "leak-test"},
         )
         assert test_send.status_code == 200, test_send.text
+        _assert_clean("telegram test POST response", test_send.text)
+        api_surfaces.append(("telegram test POST response", test_send.text))
 
         dispatcher = OutboxDispatcher(
             store=container.store,
@@ -240,7 +254,7 @@ def test_no_sentinel_reaches_db_api_cli_logs_audit_receipts_or_messages(
         _assert_clean("adapter error message", str(caught.value))
 
         cli_surfaces = _cli_surfaces(settings.data_dir, monkeypatch)
-        api_surfaces = _api_surfaces(client, auth)
+        api_surfaces.extend(_api_surfaces(client, auth))
     finally:
         client.close()
 
