@@ -244,6 +244,14 @@ def test_day_week_and_month_each_alert_once_per_crossing(tmp_path: Path) -> None
         ]
     )
 
+    # Cross 100% in every window; each EXCEEDED window alerts exactly once.
+    exceeded = _record(container.store, ledger, "CALL-PERIODS-3", "2.00")
+    assert exceeded.record.budget_state == "EXCEEDED"
+    keys = _keys(container)
+    for period, period_key in (("day", day), ("week", week), ("month", month)):
+        assert keys.count(f"budget:{period}:EXCEEDED:{period_key}") == 1
+    assert len(keys) == 6
+
 
 def test_a_new_day_period_alerts_again_with_one_bounded_cooldown_row(tmp_path: Path) -> None:
     container, settings = _container(tmp_path)
@@ -349,8 +357,13 @@ def test_a_disabled_budget_toggle_writes_no_row_and_no_cooldown_marker(tmp_path:
     )
     ledger = _ledger(container, settings)
 
-    _record(container.store, ledger, "CALL-TOGGLED-OFF", "8.50")
+    entry = _record(container.store, ledger, "CALL-TOGGLED-OFF", "8.50")
 
+    # The crossing did happen; the disabled toggle is what suppresses the push.
+    assert entry.record.budget_state == "WARN"
+    records = container.store.list_budget_records()
+    assert len(records) == 1
+    assert records[0].budget_state == "WARN"
     assert _receipts(container) == []
     assert container.store.get_system_state(f"{COOLDOWN_PREFIX}budget:day:WARN") is None
 

@@ -217,6 +217,7 @@ def test_command(
         store=container.store,
         clock=container.clock,
         runtime=container.llm_runtime,
+        notifications=container.notifications,
     )
     try:
         record = service.run(provider, role=resolved_role)
