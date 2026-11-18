@@ -57,6 +57,14 @@ script. Before driving it, load the version-matched guide:
   Playwright (`web/playwright.config.ts`, wired into CI) — do not replace
   Playwright tests with agent-browser runs.
 
+## Pull requests
+
+- Write the PR description as plain Markdown. Never wrap the whole body in a
+  triple-backtick fence: an unclosed fence makes GitHub read the body as code,
+  so `Closes #N` keywords are ignored and the issue is never linked or closed.
+- Pass the body with `gh pr create --body-file <path>` (or a heredoc), and
+  check that fences are balanced before submitting.
+
 ## Notes
 
 - Settings come from `OFT_*` environment variables (see `.env.example`); safe
