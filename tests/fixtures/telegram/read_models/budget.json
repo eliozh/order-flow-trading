@@ -1,0 +1,39 @@
+{
+  "schema_version": "1.0.0",
+  "record_id": "BUD-TG-1",
+  "call_id": "CALL-TG-1",
+  "decision_id": "DEC-TG-1",
+  "occurred_at": "2026-11-17T09:30:00.000Z",
+  "provider": "stub",
+  "model": "fixture",
+  "usage": {
+    "input_tokens": 0,
+    "output_tokens": 0,
+    "cache_read_tokens": 0,
+    "cache_write_tokens": 0,
+    "reasoning_tokens": 0,
+    "total_tokens": 0
+  },
+  "unit_prices": {
+    "input_per_mtok": "0",
+    "output_per_mtok": "0",
+    "cache_read_per_mtok": "0",
+    "cache_write_per_mtok": "0",
+    "currency": "USD"
+  },
+  "cost_usd": "0",
+  "price_version": "stub/v1",
+  "unpriced": true,
+  "period": {
+    "day": "2026-11-17",
+    "week": "2026-W47",
+    "month": "2026-11"
+  },
+  "thresholds": {
+    "daily_usd": "10",
+    "weekly_usd": "50",
+    "monthly_usd": "150",
+    "warn_pct": 80
+  },
+  "budget_state": "OK"
+}

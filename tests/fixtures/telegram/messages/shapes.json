@@ -1,0 +1,173 @@
+{
+  "description": "Message-shape fixtures validated against telegram-message.schema.json. Timestamps are ISO-8601 UTC; units are explicit; every text is plain (no controls, emoji, or ASCII art).",
+  "messages": [
+    {
+      "event": "STATUS",
+      "first_line": "STATUS",
+      "symbol": null,
+      "text": "STATUS\nenv: test\nversion: 0.1.0\nhost: 127.0.0.1\nport: 8765\ndaemon: UP\nsymbols: 4\ntradifi_symbols: 1\ngenerated_at: 2026-11-17T09:30:00.000Z",
+      "timestamps": ["2026-11-17T09:30:00.000Z"],
+      "units": [],
+      "has_control_characters": false,
+      "has_emoji": false,
+      "has_ascii_art": false
+    },
+    {
+      "event": "HELP",
+      "first_line": "HELP",
+      "symbol": null,
+      "text": "HELP\n/status - 环境、守护进程、品种、下一次扫描、最近扫描\n/positions - 未平仓持仓\n/opportunities - 开放与已触发的机会\n/report [symbol] - 最新报告摘要\n/budget - 日/周/月支出与阈值\n/watchlist - 星标品种分组\n/help - 命令列表\nMVP 只读：不支持任何写入或审批操作。",
+      "timestamps": [],
+      "units": [],
+      "has_control_characters": false,
+      "has_emoji": false,
+      "has_ascii_art": false
+    },
+    {
+      "event": "POSITIONS",
+      "first_line": "POSITIONS",
+      "symbol": null,
+      "text": "POSITIONS\ncount: 1\ngenerated_at: 2026-11-17T09:30:00.000Z\n\nposition: POS-TG-1\nsymbol: BTCUSDT\nside: LONG\nsize: 0.01\nentry: 70000 USDT\nmark: 71000 USDT\nmark_as_of: 2026-11-17T09:30:00.000Z\nmark_state: FRESH\nupnl: 10 USDT\nstop: 69000 USDT",
+      "timestamps": ["2026-11-17T09:30:00.000Z"],
+      "units": ["USDT"],
+      "has_control_characters": false,
+      "has_emoji": false,
+      "has_ascii_art": false
+    },
+    {
+      "event": "OPPORTUNITIES",
+      "first_line": "OPPORTUNITIES",
+      "symbol": null,
+      "text": "OPPORTUNITIES\ncount: 1\ngenerated_at: 2026-11-17T09:30:00.000Z\n\nopportunity: OPP-TG-1\nsymbol: BTCUSDT\nside: LONG\nstate: OPEN\nconfidence: 0.72\nzone: 69000 - 70000 USDT\ncreated_at: 2026-11-17T09:30:00.000Z",
+      "timestamps": [
+        "2026-11-17T09:30:00.000Z",
+        "2026-11-17T09:30:00.000Z"
+      ],
+      "units": ["USDT"],
+      "has_control_characters": false,
+      "has_emoji": false,
+      "has_ascii_art": false
+    },
+    {
+      "event": "REPORT",
+      "first_line": "REPORT",
+      "symbol": "BTCUSDT",
+      "text": "REPORT\nreport_id: RPT-TG-1\nsymbol: BTCUSDT\ntimeframe: 4h\ngenerated_at: 2026-11-17T09:30:00.000Z\ndata_quality: COMPLETE\n\nCALC\ncvd_change: 12.5\ndelta: 3\npoc: 70000\nvah: 71000\nval: 69000\nopen_interest_delta: 1.2\nfunding_rate: 0.0001\nliquidation_coverage: SINCE_DEPLOYMENT\nliquidation_note: No historical USD-M liquidation backfill exists.\n\nLLM\nllm: VALID\nnarrative: Range high retest with positive delta.",
+      "timestamps": ["2026-11-17T09:30:00.000Z"],
+      "units": [],
+      "has_control_characters": false,
+      "has_emoji": false,
+      "has_ascii_art": false
+    },
+    {
+      "event": "BUDGET",
+      "first_line": "BUDGET",
+      "symbol": null,
+      "text": "BUDGET\nusage_quality: COMPLETE\nbudget_state: OK\n\nTHRESHOLDS\ndaily_usd: 10 USDT\nweekly_usd: 50 USDT\nmonthly_usd: 150 USDT\nwarn_pct: 80 %\n\nUSAGE\nspend_usd: N/A\nstate: USAGE_UNAVAILABLE",
+      "timestamps": [],
+      "units": ["USDT", "%"],
+      "has_control_characters": false,
+      "has_emoji": false,
+      "has_ascii_art": false
+    },
+    {
+      "event": "WATCHLIST",
+      "first_line": "WATCHLIST",
+      "symbol": null,
+      "text": "WATCHLIST\nscope: starred\ncount: 2\n\nCRYPTO\ncount: 1\nsymbols: BTCUSDT\n\nTRADFI\ncount: 1\nsymbols: XAUUSDT",
+      "timestamps": [],
+      "units": [],
+      "has_control_characters": false,
+      "has_emoji": false,
+      "has_ascii_art": false
+    },
+    {
+      "event": "SCAN COMPLETE",
+      "first_line": "SCAN COMPLETE",
+      "symbol": null,
+      "text": "SCAN COMPLETE\nstatus: COMPLETE\nscan_id: SCAN-TG-1\ntrigger: MANUAL\nperiod: 4h\nsymbols: 1/1\ndegraded: 0\nfailed: 0\nnew_opportunities: 1\ncost: 0.10 USDT\nreports: 1\ngenerated_at: 2026-11-17T09:30:00.000Z\nreport_ids: RPT-TG-1",
+      "timestamps": ["2026-11-17T09:30:00.000Z"],
+      "units": ["USDT"],
+      "has_control_characters": false,
+      "has_emoji": false,
+      "has_ascii_art": false
+    },
+    {
+      "event": "opportunity_triggered",
+      "first_line": "机会触发 · BTCUSDT · LONG · 置信度 0.72",
+      "symbol": "BTCUSDT",
+      "text": "机会触发 · BTCUSDT · LONG · 置信度 0.72\nopportunity: OPP-TG-1\nstate: TRIGGERED\nzone: 69000 - 70000 USDT\ntrigger_id: TRG-TG-1\ntriggered_at: 2026-11-17T09:30:00.000Z\nstate_version: 2\n/opportunities",
+      "timestamps": ["2026-11-17T09:30:00.000Z"],
+      "units": ["USDT"],
+      "has_control_characters": false,
+      "has_emoji": false,
+      "has_ascii_art": false
+    },
+    {
+      "event": "entry_recheck",
+      "first_line": "入场复核 · BTCUSDT · LONG · 置信度 0.72",
+      "symbol": "BTCUSDT",
+      "text": "入场复核 · BTCUSDT · LONG · 置信度 0.72\ndecision: ENTER\ndecision_id: DEC-TG-1\ntrigger_id: TRG-TG-1\nopportunity: OPP-TG-1\n请在桌面端或 CLI 处理。\n/opportunities",
+      "timestamps": [],
+      "units": [],
+      "has_control_characters": false,
+      "has_emoji": false,
+      "has_ascii_art": false
+    },
+    {
+      "event": "position_management",
+      "first_line": "持仓管理 · BTCUSDT · PARTIAL_CLOSE",
+      "symbol": "BTCUSDT",
+      "text": "持仓管理 · BTCUSDT · PARTIAL_CLOSE\nposition: POS-TG-1\naction: PARTIAL_CLOSE\nstatus: EXECUTED\nsize: 0.005\nprice: 70500 USDT\nreason_code: PARTIAL_CLOSE\ndecision_id: DEC-TG-1\noccurred_at: 2026-11-17T09:30:00.000Z\nMVP 只读：不支持任何写入或审批操作。",
+      "timestamps": ["2026-11-17T09:30:00.000Z"],
+      "units": ["USDT"],
+      "has_control_characters": false,
+      "has_emoji": false,
+      "has_ascii_art": false
+    },
+    {
+      "event": "risk_alert",
+      "first_line": "风险告警 · DAILY_LOSS · BREACH",
+      "symbol": null,
+      "text": "风险告警 · DAILY_LOSS · BREACH\nkind: DAILY_LOSS\nstate: BREACH\nsubject: ACCOUNT\nbinding_cap: DAILY_LOSS\nobserved: 320 USDT\nthreshold: 300 USDT\nperiod: 2026-11-17\nreason_code: DAILY_LOSS_BREACH\noccurred_at: 2026-11-17T09:30:00.000Z\nMVP 只读：不支持任何写入或审批操作。",
+      "timestamps": ["2026-11-17T09:30:00.000Z"],
+      "units": ["USDT"],
+      "has_control_characters": false,
+      "has_emoji": false,
+      "has_ascii_art": false
+    },
+    {
+      "event": "budget_threshold",
+      "first_line": "预算告警 · DAY · WARN",
+      "symbol": null,
+      "text": "预算告警 · DAY · WARN\nperiod: day\nperiod_key: 2026-11-17\nspend_usd: 8 USDT\nthreshold_usd: 10 USDT\npercentage: 80 %\nstate: WARN\nunpriced_count: 0\noccurred_at: 2026-11-17T09:30:00.000Z\n达到 80% 与 100% 阈值时经 Telegram 告警；不会停止调用。",
+      "timestamps": ["2026-11-17T09:30:00.000Z"],
+      "units": ["USDT", "%"],
+      "has_control_characters": false,
+      "has_emoji": false,
+      "has_ascii_art": false
+    },
+    {
+      "event": "degradation",
+      "first_line": "系统降级 · MARKET_DATA",
+      "symbol": null,
+      "text": "系统降级 · MARKET_DATA\nstate: DEGRADED\nreason_code: WS_DISCONNECTED\noccurred_at: 2026-11-17T09:30:00.000Z",
+      "timestamps": ["2026-11-17T09:30:00.000Z"],
+      "units": [],
+      "has_control_characters": false,
+      "has_emoji": false,
+      "has_ascii_art": false
+    },
+    {
+      "event": "AUTH_REFUSAL",
+      "first_line": "未授权",
+      "symbol": null,
+      "text": "未授权",
+      "timestamps": [],
+      "units": [],
+      "has_control_characters": false,
+      "has_emoji": false,
+      "has_ascii_art": false
+    }
+  ]
+}

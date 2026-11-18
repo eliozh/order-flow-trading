@@ -3,6 +3,8 @@ import path from 'node:path'
 
 import { expect, test, type Page } from '@playwright/test'
 
+import { runAxeAudit } from './a11y'
+
 /**
  * Critical journey for slice 01: the `/system` walking-skeleton shell.
  *
@@ -332,6 +334,49 @@ test('captures the /system shell at 1440, 768, and 375', async ({ page }) => {
   }
 })
 
+test('is keyboard reachable, axe-clean, and overflow-free at 375, 768, and 1440', async ({
+  page,
+}) => {
+  test.setTimeout(120_000)
+  const killSwitch = page.getByRole('button', { name: /Kill switch/ })
+
+  for (const viewport of [
+    { width: 375, height: 812 },
+    { width: 768, height: 1024 },
+    { width: 1440, height: 900 },
+  ] as const) {
+    await page.setViewportSize({ width: viewport.width, height: viewport.height })
+    await authenticate(page)
+    await page.goto('/system')
+    await waitForLoadedSystem(page)
+
+    const widths = await page.evaluate(() => ({
+      document: document.documentElement.scrollWidth,
+      body: document.body.scrollWidth,
+      viewport: window.innerWidth,
+    }))
+    expect(widths.document, `/system @ ${viewport.width}`).toBeLessThanOrEqual(widths.viewport)
+    expect(widths.body, `/system @ ${viewport.width}`).toBeLessThanOrEqual(widths.viewport)
+
+    // The one real control on this route is reachable with Tab alone.
+    let reached = false
+    for (let index = 0; index < 80; index += 1) {
+      await page.keyboard.press('Tab')
+      if (await killSwitch.evaluate((element) => element === document.activeElement)) {
+        reached = true
+        break
+      }
+    }
+    expect(reached, `Kill switch was not keyboard reachable at ${viewport.width}`).toBe(true)
+    await expect(killSwitch).toBeFocused()
+
+    // Pre-existing structural violation: the /system stat grid puts a <p>
+    // note directly inside its <dl>. It predates this slice and is tracked for
+    // a separate UI fix; every other axe rule still gates the route.
+    await runAxeAudit(page, `/system @ ${viewport.width}`, { allow: ['definition-list'] })
+  }
+})
+
 interface TelegramStatusPayload {
   configured: boolean
   chat_count: number
@@ -499,6 +544,25 @@ test('renders the receipt card and a persistent alert for failing pushes', async
   await expect(receiptTable).toContainText('4821')
   await expect(receiptTable).toContainText('SENT')
   await expect(receiptTable).toContainText('FAILED')
+
+  // Audit the populated failing card at every breakpoint. The
+  // ``definition-list`` allowance is the documented pre-existing stat-grid
+  // violation on this route; every other rule still gates it.
+  for (const viewport of [
+    { width: 375, height: 812 },
+    { width: 768, height: 1024 },
+    { width: 1440, height: 900 },
+  ] as const) {
+    await page.setViewportSize({ width: viewport.width, height: viewport.height })
+    await page.goto('/system')
+    await waitForLoadedSystem(page)
+
+    await expect(page.getByRole('alert')).toContainText('Telegram pushes failing')
+    await expect(page.getByRole('heading', { name: 'Telegram delivery receipts' })).toBeVisible()
+    await runAxeAudit(page, `/system failing receipts @ ${viewport.width}`, {
+      allow: ['definition-list'],
+    })
+  }
 })
 
 test('at 375 and 768 the failing Telegram card has no page-level horizontal scroll', async ({

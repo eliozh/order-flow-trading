@@ -1,0 +1,54 @@
+{
+  "report_id": "RPT-TG-1",
+  "scan_id": "SCAN-TG-1",
+  "symbol": "BTCUSDT",
+  "timeframe": "4h",
+  "generated_at": "2026-11-17T09:30:00.000Z",
+  "data_quality": "COMPLETE",
+  "narrative_ref": "inline:DEC-TG-1",
+  "snapshot": {
+    "data_quality": "COMPLETE",
+    "quality_reasons": [],
+    "orderflow": {}
+  },
+  "metrics": {
+    "cvd": {
+      "summary": {
+        "cvd_change": "12.5"
+      },
+      "points": [
+        {
+          "delta": "3"
+        }
+      ]
+    },
+    "volume_profile": {
+      "poc": "70000",
+      "vah": "71000",
+      "val": "69000"
+    },
+    "open_interest": {
+      "delta_over_window": "1.2",
+      "points": [
+        {}
+      ]
+    },
+    "funding": {
+      "current_rate": "0.0001",
+      "history": [
+        {}
+      ]
+    },
+    "liquidations": {
+      "coverage": "SINCE_DEPLOYMENT",
+      "limitations": [
+        "No historical USD-M liquidation backfill exists."
+      ]
+    }
+  },
+  "llm": {
+    "configured": true,
+    "validation_status": "VALID",
+    "narrative": "Range high retest with positive delta."
+  }
+}

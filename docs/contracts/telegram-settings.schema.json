@@ -1,0 +1,118 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://schemas.oft.local/v1/telegram-settings.schema.json",
+  "title": "Telegram settings aggregate",
+  "description": "The F10f settings payload: the masked token, both bounded allowlists, the six push toggles, provenance, and recent receipts. The token value is never present.",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "token",
+    "chat_ids",
+    "allowed_user_ids",
+    "toggles",
+    "source",
+    "updated_at",
+    "updated_by",
+    "receipts",
+    "receipt_total",
+    "latest_test_receipt"
+  ],
+  "properties": {
+    "token": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["configured", "masked", "last4", "source", "updated_at"],
+      "properties": {
+        "configured": { "type": "boolean" },
+        "masked": {
+          "anyOf": [
+            {
+              "type": "string",
+              "pattern": "^\\*{4}[A-Za-z0-9_-]{0,4}$"
+            },
+            { "type": "null" }
+          ]
+        },
+        "last4": {
+          "anyOf": [
+            { "type": "string", "maxLength": 4 },
+            { "type": "null" }
+          ]
+        },
+        "source": {
+          "type": "string",
+          "enum": ["env", "keyring", "encrypted_file", "stored", "unset", "unavailable"]
+        },
+        "updated_at": {
+          "anyOf": [
+            { "$ref": "./common.schema.json#/$defs/timestamp" },
+            { "type": "null" }
+          ]
+        }
+      }
+    },
+    "chat_ids": {
+      "type": "array",
+      "maxItems": 10,
+      "items": {
+        "anyOf": [
+          { "type": "integer", "minimum": 1 },
+          { "type": "integer", "maximum": -1 }
+        ]
+      }
+    },
+    "allowed_user_ids": {
+      "type": "array",
+      "maxItems": 20,
+      "items": { "type": "integer", "minimum": 1 }
+    },
+    "toggles": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "scan_report",
+        "trigger",
+        "entry_recheck",
+        "position",
+        "risk",
+        "budget"
+      ],
+      "properties": {
+        "scan_report": { "type": "boolean" },
+        "trigger": { "type": "boolean" },
+        "entry_recheck": { "type": "boolean" },
+        "position": { "type": "boolean" },
+        "risk": { "type": "boolean" },
+        "budget": { "type": "boolean" }
+      }
+    },
+    "source": {
+      "type": "string",
+      "enum": ["default", "user"]
+    },
+    "updated_at": {
+      "anyOf": [
+        { "$ref": "./common.schema.json#/$defs/timestamp" },
+        { "type": "null" }
+      ]
+    },
+    "updated_by": {
+      "anyOf": [{ "type": "string" }, { "type": "null" }]
+    },
+    "receipts": {
+      "type": "array",
+      "maxItems": 100,
+      "items": { "$ref": "./telegram-receipt.schema.json" }
+    },
+    "receipt_total": {
+      "type": "integer",
+      "minimum": 0
+    },
+    "latest_test_receipt": {
+      "anyOf": [
+        { "$ref": "./telegram-receipt.schema.json" },
+        { "type": "null" }
+      ]
+    }
+  }
+}

@@ -1,0 +1,55 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://schemas.oft.local/v1/telegram-message.schema.json",
+  "title": "Telegram outbound message shape",
+  "description": "One observed outbound message: the event label, its first line, the full plain text, the ISO-8601 UTC timestamps it contains, and the units it renders. The text is plain UTF-8 with no C0/C1 controls (tab and newline excepted), no emoji, and no ASCII art. The first line states the event; when `symbol` is set the first line names it.",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "event",
+    "first_line",
+    "symbol",
+    "text",
+    "timestamps",
+    "units",
+    "has_control_characters",
+    "has_emoji",
+    "has_ascii_art"
+  ],
+  "properties": {
+    "event": {
+      "type": "string",
+      "minLength": 1,
+      "maxLength": 64
+    },
+    "first_line": {
+      "type": "string",
+      "minLength": 1,
+      "maxLength": 200,
+      "pattern": "^[^\\n\\r\\x00-\\x1F\\x7F\\x80-\\x9F]+$"
+    },
+    "symbol": {
+      "anyOf": [
+        { "$ref": "./common.schema.json#/$defs/symbol" },
+        { "type": "null" }
+      ]
+    },
+    "text": {
+      "type": "string",
+      "minLength": 1,
+      "maxLength": 4096,
+      "pattern": "^[^\\x00-\\x08\\x0B\\x0C\\x0D\\x0E-\\x1F\\x7F\\x80-\\x9F]*$"
+    },
+    "timestamps": {
+      "type": "array",
+      "items": { "$ref": "./common.schema.json#/$defs/timestamp" }
+    },
+    "units": {
+      "type": "array",
+      "items": { "type": "string", "enum": ["USDT", "%"] }
+    },
+    "has_control_characters": { "const": false },
+    "has_emoji": { "const": false },
+    "has_ascii_art": { "const": false }
+  }
+}

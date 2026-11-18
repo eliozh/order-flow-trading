@@ -1,0 +1,75 @@
+{
+  "description": "Bot API failure shapes for the adapter contract; no network is involved. A 'transport' entry replaces the HTTP response with that transport failure.",
+  "failures": [
+    {
+      "name": "unauthorized_401",
+      "method": "getMe",
+      "http_status": 401,
+      "body": {
+        "ok": false,
+        "error_code": 401,
+        "description": "Unauthorized"
+      },
+      "expected_code": "TELEGRAM_TOKEN_INVALID",
+      "retry_after": null
+    },
+    {
+      "name": "conflict_409",
+      "method": "getUpdates",
+      "http_status": 409,
+      "body": {
+        "ok": false,
+        "error_code": 409,
+        "description": "Conflict: terminated by other getUpdates request"
+      },
+      "expected_code": "TELEGRAM_CONFLICT",
+      "retry_after": null
+    },
+    {
+      "name": "rate_limited_429",
+      "method": "sendMessage",
+      "http_status": 429,
+      "body": {
+        "ok": false,
+        "error_code": 429,
+        "description": "Too Many Requests: retry after 30",
+        "parameters": {
+          "retry_after": 30
+        }
+      },
+      "expected_code": "TELEGRAM_RATE_LIMITED",
+      "retry_after": 30
+    },
+    {
+      "name": "server_error_500",
+      "method": "sendMessage",
+      "http_status": 500,
+      "body": {
+        "ok": false,
+        "error_code": 500,
+        "description": "Internal Server Error"
+      },
+      "expected_code": "TELEGRAM_UPSTREAM_ERROR",
+      "retry_after": null
+    },
+    {
+      "name": "bad_gateway_502",
+      "method": "sendMessage",
+      "http_status": 502,
+      "body": {
+        "ok": false,
+        "error_code": 502,
+        "description": "Bad Gateway"
+      },
+      "expected_code": "TELEGRAM_UPSTREAM_ERROR",
+      "retry_after": null
+    },
+    {
+      "name": "timeout",
+      "method": "sendMessage",
+      "transport": "timeout",
+      "expected_code": "TELEGRAM_UPSTREAM_ERROR",
+      "retry_after": null
+    }
+  ]
+}
