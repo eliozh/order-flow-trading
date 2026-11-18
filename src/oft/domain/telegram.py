@@ -100,6 +100,9 @@ ENTRY_RECHECK_ALERT_KEY = "telegram.entry_recheck_alert"
 # read-only toggles until the settings screen lands in slice 53.
 POSITION_PUSH_KEY = "telegram.position"
 RISK_PUSH_KEY = "telegram.risk"
+# Budget-threshold pushes are enabled by default: they are time-sensitive and
+# alert-only (a call is never stopped). Read-only until slice 53.
+BUDGET_PUSH_KEY = "telegram.budget"
 # A scan summary lists at most this many report ids so the message stays short.
 MAX_SCAN_REPORT_IDS = 10
 # A burst push lists at most this many opportunities, then a remaining count.
@@ -384,6 +387,7 @@ def validate_telegram_token(value: object) -> str:
 
 __all__ = [
     "BUDGET_COMMAND",
+    "BUDGET_PUSH_KEY",
     "COMMANDS",
     "DESKTOP_VIEW_TEXT",
     "DISPATCHER_HEARTBEAT_KEY",

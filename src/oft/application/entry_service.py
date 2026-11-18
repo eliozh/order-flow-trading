@@ -238,7 +238,7 @@ class EntryService:
         self._settings = settings
         self._kill_switch = kill_switch
         self._notifications = notifications
-        self._budget = BudgetLedger(store=store, settings=settings)
+        self._budget = BudgetLedger(store=store, settings=settings, notifications=notifications)
         self._orchestrator = (
             LLMOrchestrator(
                 store=store,

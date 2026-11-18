@@ -13,6 +13,7 @@ from oft.application.settings_service import SettingsService
 from oft.clock import FixedClock
 from oft.config import ConfigError, Settings
 from oft.domain.telegram import (
+    BUDGET_PUSH_KEY,
     ENTRY_RECHECK_ALERT_KEY,
     SCAN_FAILED_ALERT_KEY,
     SCAN_REPORT_PUSH_KEY,
@@ -48,6 +49,13 @@ def test_absent_toggles_read_their_documented_defaults(tmp_path: Path) -> None:
     assert service.read_failed_scan_alert() is False
     assert service.read_trigger_alert() is True
     assert service.read_entry_recheck_alert() is True
+    assert service.read_position_push() is True
+    assert service.read_risk_push() is True
+    assert service.read_budget_push() is True
+
+
+def test_budget_push_key_is_registered() -> None:
+    assert BUDGET_PUSH_KEY == "telegram.budget"
 
 
 def test_persisted_toggles_are_honoured(tmp_path: Path) -> None:
@@ -56,18 +64,26 @@ def test_persisted_toggles_are_honoured(tmp_path: Path) -> None:
     _set_raw(store, SCAN_FAILED_ALERT_KEY, json.dumps(True))
     _set_raw(store, TRIGGER_ALERT_KEY, json.dumps(False))
     _set_raw(store, ENTRY_RECHECK_ALERT_KEY, json.dumps(False))
+    _set_raw(store, BUDGET_PUSH_KEY, json.dumps(False))
 
     assert service.read_scan_report_push() is False
     assert service.read_failed_scan_alert() is True
     assert service.read_trigger_alert() is False
     assert service.read_entry_recheck_alert() is False
+    assert service.read_budget_push() is False
 
 
-@pytest.mark.parametrize("reader", ["read_trigger_alert", "read_entry_recheck_alert"])
+@pytest.mark.parametrize(
+    "reader", ["read_trigger_alert", "read_entry_recheck_alert", "read_budget_push"]
+)
 def test_an_unreadable_lifecycle_toggle_raises_config_error(tmp_path: Path, reader: str) -> None:
     store, service = _service(tmp_path)
-    key = TRIGGER_ALERT_KEY if reader == "read_trigger_alert" else ENTRY_RECHECK_ALERT_KEY
-    _set_raw(store, key, '"not-a-boolean"')
+    keys = {
+        "read_trigger_alert": TRIGGER_ALERT_KEY,
+        "read_entry_recheck_alert": ENTRY_RECHECK_ALERT_KEY,
+        "read_budget_push": BUDGET_PUSH_KEY,
+    }
+    _set_raw(store, keys[reader], '"not-a-boolean"')
 
     with pytest.raises(ConfigError):
         getattr(service, reader)()

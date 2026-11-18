@@ -79,6 +79,7 @@ from oft.domain.settings import (
     validate_scan_period,
 )
 from oft.domain.telegram import (
+    BUDGET_PUSH_KEY,
     ENTRY_RECHECK_ALERT_KEY,
     MAX_TELEGRAM_ALLOWED_USER_IDS,
     MAX_TELEGRAM_CHAT_IDS,
@@ -582,6 +583,14 @@ class SettingsService(LLMSettingsMixin, OnboardingProgressMixin):
         this toggle. It is read-only until slice 53.
         """
         return self._decode_bool(RISK_PUSH_KEY, default=True)
+
+    def read_budget_push(self) -> bool:
+        """The ``telegram.budget`` toggle; absent means enabled.
+
+        Budget-threshold alerts are time-sensitive and read-only until slice 53.
+        They never stop a call, so a delivery failure only loses the push.
+        """
+        return self._decode_bool(BUDGET_PUSH_KEY, default=True)
 
     def _decode_bool(self, key: str, *, default: bool) -> bool:
         record = self._store.get_config(key)

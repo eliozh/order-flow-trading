@@ -32,6 +32,7 @@ from oft.application.llm_orchestrator import LLMRuntimeRegistry, provider_config
 from oft.application.metric_service import MetricInputs, MetricRequest, MetricService
 from oft.application.notifications import delivery_contract, not_configured_delivery
 from oft.application.resampling_service import BarResampleRequest, ResamplingService
+from oft.application.telegram_events import NotificationSink
 from oft.config import Settings
 from oft.domain.metrics.footprint import (
     DEFAULT_IMBALANCE_THRESHOLD,
@@ -123,6 +124,9 @@ class ScanContainer(Protocol):
 
     @property
     def llm_runtime(self) -> LLMRuntimeRegistry | None: ...
+
+    @property
+    def notifications(self) -> NotificationSink | None: ...
 
     def provider_for(
         self, requested: str | None = None, *, effective: Settings | None = None
@@ -820,6 +824,7 @@ class ScanService:
                 provider=provider,
                 settings=effective,
                 runtime=container.llm_runtime,
+                notifications=container.notifications,
             )
             outcome = service.analyze(
                 symbol=request.symbol,

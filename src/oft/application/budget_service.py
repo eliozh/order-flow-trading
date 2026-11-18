@@ -1,15 +1,29 @@
 """Per-call budget accounting with day/week/month states (ADR-0005, D6).
 
 Thresholds alert (``OK`` -> ``WARN`` -> ``EXCEEDED``) and are recorded locally;
-they never block a call and never raise on ``EXCEEDED``. There is no outbound
-notification here (Telegram is Milestone 5).
+they never block a call and never raise on ``EXCEEDED``. A crossing additionally
+enqueues one read-only Telegram push derived from the same durable
+``BUDGET_THRESHOLD`` audit draft, after the ledger row (and, on the billed path,
+the call) transaction has committed. The push is best-effort and alert-only: it
+never changes a ledger row, a threshold, or the call outcome. Delivery is
+at-most-once - a crash between the commit and the outbox enqueue loses that
+crossing's alert, because there is no reconciliation pass from the durable audit
+rows.
+
+Documented maintainability exception: this module sits just over the 800-line
+soft ceiling because it owns the whole budget write model - thresholds, the
+per-call ledger, the durable threshold-audit drafts, and their best-effort alert
+hand-off. The alert wiring stays next to the drafts it must forward verbatim (so
+there is no second spend calculation); extracting it would split that invariant
+across modules. Deferred: move the threshold-draft and alert hand-off into a
+dedicated ``budget_alerts`` module when this write model next changes.
 """
 
 from __future__ import annotations
 
 import json
 import threading
-from collections.abc import Mapping
+from collections.abc import Mapping, Sequence
 from dataclasses import dataclass
 from decimal import Decimal
 from typing import Any
@@ -32,6 +46,7 @@ from oft.application.budget_read_model import (
     state_for,
     thresholds_from_record,
 )
+from oft.application.telegram_events import BudgetAlertSink
 from oft.config import Settings
 from oft.domain.budget_periods import budget_record_id, period_parts
 from oft.domain.pricing import (
@@ -97,12 +112,15 @@ class BudgetService:
         store: StorePort,
         settings: Settings | None = None,
         price_table: PriceTable | None = None,
+        notifications: BudgetAlertSink | None = None,
     ) -> None:
         self._store = store
         self._settings = settings
         # Loaded lazily on the first priced call (M11): a corrupt operator price
         # table degrades one scan instead of escaping a service constructor.
         self._price_table = price_table
+        # Best-effort threshold push; ``None`` keeps the ledger fully local.
+        self._notifications = notifications
 
     def _table(self) -> PriceTable:
         if self._price_table is None:
@@ -432,13 +450,14 @@ class BudgetService:
                 role=role,
             )
             inserted = self._store.save_budget_record(record)
+            drafts: list[AuditEventDraft] = []
             if inserted:
                 if not result.usage_reported:
                     self._emit_usage_missing(record=record, occurred_at=occurred_at)
                 if invalid_table:
                     self._emit_price_table_invalid(record=record, occurred_at=occurred_at)
                 if crossing:
-                    self._emit_threshold_audit(
+                    drafts = self._emit_threshold_audit(
                         record=record,
                         states=states,
                         spends=spends,
@@ -446,7 +465,10 @@ class BudgetService:
                         occurred_at=occurred_at,
                         crossing=crossing,
                     )
-            return BudgetEntry(record=record, payload=payload)
+        # The ledger row and its audit are committed; notify outside the ledger
+        # mutex so outbox/system_state writes cannot lengthen the hot-path lock.
+        self._notify_budget_thresholds(drafts)
+        return BudgetEntry(record=record, payload=payload)
 
     def record_billed_call(
         self,
@@ -506,6 +528,8 @@ class BudgetService:
             role=call.role,
         )
 
+        captured_audits: list[AuditEventDraft] = []
+
         def compute(
             prior: dict[str, dict[str, Any]],
         ) -> tuple[str, list[AuditEventDraft]]:
@@ -522,9 +546,15 @@ class BudgetService:
                 if crossing
                 else []
             )
+            # Capture the exact drafts the transaction will commit so the push
+            # runs only after the write succeeds and carries the same values.
+            captured_audits[:] = audits
             return budget_state, audits
 
         stored_call, stored_budget = self._store.save_call_and_budget(call, draft, compute)
+        # The transaction committed the call, ledger row, and audit; a push
+        # failure from here on can no longer change any of them.
+        self._notify_budget_thresholds(captured_audits)
         entry_payload = _loads_payload(stored_budget.payload_json, fallback=payload)
         if not result.usage_reported:
             self._emit_usage_missing(record=stored_budget, occurred_at=occurred_at)
@@ -641,17 +671,50 @@ class BudgetService:
         thresholds: BudgetThresholds,
         occurred_at: str,
         crossing: list[str],
-    ) -> None:
-        for draft in self._threshold_drafts(
+    ) -> list[AuditEventDraft]:
+        drafts = self._threshold_drafts(
             record=record,
             states=states,
             spends=spends,
             thresholds=thresholds,
             occurred_at=occurred_at,
             crossing=crossing,
-        ):
+        )
+        for draft in drafts:
             self._store.append_audit_event(draft)
             LOGGER.warning("budget_threshold", **draft.payload)
+        return drafts
+
+    def _notify_budget_thresholds(self, drafts: Sequence[AuditEventDraft]) -> None:
+        """Push one alert per durable threshold audit draft, best-effort.
+
+        The payload values are the audit event's own (spend, threshold, state,
+        and window); nothing is re-summed and no threshold is changed. Each
+        draft is notified independently, so a failing sink for one period cannot
+        skip the remaining periods; every failure is contained here. Delivery is
+        at-most-once: the audit has already committed, and a crash before the
+        outbox enqueue is not reconciled.
+        """
+        if self._notifications is None or not drafts:
+            return
+        for draft in drafts:
+            payload = draft.payload
+            try:
+                self._notifications.enqueue_budget_threshold(
+                    period=str(payload["period"]),
+                    period_key=str(payload["period_key"]),
+                    spend_usd=str(payload["spend_usd"]),
+                    threshold_usd=str(payload["threshold_usd"]),
+                    state=str(payload["state"]),
+                    occurred_at=draft.created_at,
+                )
+            except Exception as exc:  # noqa: BLE001 - one draft never breaks the ledger
+                LOGGER.warning(
+                    "budget_threshold_alert_failed",
+                    period=str(payload.get("period")),
+                    state=str(payload.get("state")),
+                    error_type=type(exc).__name__,
+                )
 
     # -- rollups ---------------------------------------------------------
 
@@ -762,6 +825,7 @@ def _empty_unpriced() -> PricedCall:
 
 
 __all__ = [
+    "BudgetAlertSink",
     "BudgetConfigError",
     "BudgetService",
     "BudgetThresholds",
