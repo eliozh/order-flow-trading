@@ -21,8 +21,23 @@ npm --prefix web run dev
 uv run oft status
 uv run oft status --json
 
+# Telegram (read-only; the token is accepted only on stdin)
+uv run oft telegram status
+uv run oft telegram test
+uv run oft telegram receipts
+printf '%s\n' "$OFT_TELEGRAM_BOT_TOKEN" | uv run oft telegram token set --stdin
+uv run oft telegram token delete
+uv run oft telegram allowlist show
+uv run oft telegram allowlist add --chat-id 1001 --user-id 2002
+uv run oft telegram allowlist remove --chat-id 1001
+uv run oft telegram toggles show
+uv run oft telegram toggles set --no-scan-report --trigger
+uv run oft telegram watchdog --once
+
 # Test
 uv run pytest
+uv run pytest tests/e2e/test_telegram_channel.py
+uv run pytest tests/integration/test_telegram_secret_leakage.py
 npm --prefix web run test
 
 # Lint
@@ -71,4 +86,11 @@ script. Before driving it, load the version-matched guide:
   defaults are paper environment, loopback binding, and no credentials.
 - The walking skeleton has one fixture-backed symbol universe
   (`src/oft/fixtures/symbol-universe.json`) shared by the API and CLI.
-- No exchange, LLM, Telegram, or order code exists yet.
+- There is no live exchange connection or order code. Telegram exists as a
+  read-only channel: seven bot commands (`/status`, `/positions`,
+  `/opportunities`, `/report [SYMBOL]`, `/budget`, `/watchlist`, `/help`) plus
+  read-only pushes. Write-like tokens are refused, the bot token is stdin-only
+  and masked on every surface, and `OFT_ENV=test` selects the deterministic
+  network-free `TelegramFake`.
+- `oft telegram watchdog --once` is the one-shot host check for cron/systemd
+  `OnFailure=`; see `docs/runbooks/telegram.md`.

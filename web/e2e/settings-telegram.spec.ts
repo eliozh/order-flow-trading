@@ -35,6 +35,56 @@ interface Diagnostics {
   pageErrors: string[]
 }
 
+async function activeTestId(page: Page): Promise<string | null> {
+  return page.evaluate(() => document.activeElement?.getAttribute('data-testid') ?? null)
+}
+
+/** Move the keyboard focus to one test id using Tab only. */
+async function tabTo(page: Page, testId: string, maxTabs = 80): Promise<void> {
+  for (let index = 0; index < maxTabs; index += 1) {
+    if ((await activeTestId(page)) === testId) {
+      return
+    }
+    await page.keyboard.press('Tab')
+  }
+  expect(await activeTestId(page), `Tab never reached ${testId}`).toBe(testId)
+}
+
+/** Assert the focused control carries a visible focus indicator. */
+async function expectVisibleFocus(page: Page, testId: string): Promise<void> {
+  const locator = page.getByTestId(testId)
+  await expect(locator).toBeFocused()
+  const focus = await locator.evaluate((element) => {
+    const style = getComputedStyle(element)
+    return {
+      focusVisible: element.matches(':focus-visible'),
+      outline: `${style.outlineStyle} ${style.outlineWidth}`,
+      shadow: style.boxShadow,
+    }
+  })
+  expect(focus.focusVisible).toBe(true)
+  expect(focus.outline !== 'none 0px' || focus.shadow !== 'none').toBe(true)
+}
+
+/** Assert no page-level horizontal scroll at the current viewport. */
+async function expectNoHorizontalScroll(page: Page): Promise<void> {
+  const widths = await page.evaluate(() => ({
+    document: document.documentElement.scrollWidth,
+    body: document.body.scrollWidth,
+    viewport: window.innerWidth,
+  }))
+  expect(widths.document).toBeLessThanOrEqual(widths.viewport)
+  expect(widths.body).toBeLessThanOrEqual(widths.viewport)
+}
+
+async function expectTokenAbsentEverywhere(page: Page): Promise<void> {
+  expect(await page.content()).not.toContain(SENTINEL)
+  const storage = await page.evaluate(() =>
+    Object.values(sessionStorage).concat(Object.values(localStorage)),
+  )
+  expect(JSON.stringify(storage)).not.toContain(SENTINEL)
+}
+
 function collect(page: Page): Diagnostics {
   const diagnostics: Diagnostics = { consoleErrors: [], pageErrors: [] }
   page.on('console', (message) => {
@@ -263,5 +313,73 @@ test('deleting the token disables pushes and reports honestly', async ({ page })
 
   // The receipt history is retained; deleting the token does not fabricate one.
   await expect(page.getByTestId('telegram-receipts')).toBeVisible()
+  expectClean(diagnostics)
+})
+
+test('passes axe with no horizontal scroll at 375, 768, and 1440', async ({ page }) => {
+  test.setTimeout(120_000)
+  const diagnostics = collect(page)
+  for (const viewport of [
+    { width: 375, height: 812 },
+    { width: 768, height: 1024 },
+    { width: 1440, height: 900 },
+  ] as const) {
+    await page.setViewportSize({ width: viewport.width, height: viewport.height })
+    await authenticate(page)
+    await page.goto('/settings/telegram')
+    await expect(page.getByRole('heading', HEADING)).toBeVisible()
+    // The coarse-pointer 375px read-only branch is asserted separately below
+    // with a mobile context; this matrix proves responsive overflow and axe.
+    await expectNoHorizontalScroll(page)
+    await runAxeAudit(page, `/settings/telegram @ ${viewport.width}`)
+  }
+  expectClean(diagnostics)
+})
+
+test('completes the form with the keyboard only and never persists the token', async ({ page }) => {
+  test.setTimeout(120_000)
+  const diagnostics = collect(page)
+  await page.setViewportSize({ width: 1440, height: 900 })
+  await authenticate(page)
+  await page.goto('/settings/telegram')
+  await expect(page.getByRole('heading', HEADING)).toBeVisible()
+
+  // Tab to the write-only token field; Enter submits without a pointer.
+  await tabTo(page, 'telegram-token-input')
+  await expectVisibleFocus(page, 'telegram-token-input')
+  await page.keyboard.type(SENTINEL)
+  await page.keyboard.press('Enter')
+  await expect(page.getByTestId('telegram-token-mask')).toHaveText('****stuv')
+  await expect(page.getByTestId('telegram-token-input')).toHaveValue('')
+  await expectTokenAbsentEverywhere(page)
+
+  // Tab through both allowlist add fields, then the toggle and save button.
+  await tabTo(page, 'telegram-chat-input')
+  await expectVisibleFocus(page, 'telegram-chat-input')
+  await page.keyboard.type('1001')
+  await tabTo(page, 'telegram-chat-add')
+  await page.keyboard.press('Enter')
+  await tabTo(page, 'telegram-user-input')
+  await page.keyboard.type('2002')
+  await tabTo(page, 'telegram-user-add')
+  await page.keyboard.press('Enter')
+
+  await tabTo(page, 'telegram-toggle-scan_report')
+  await expectVisibleFocus(page, 'telegram-toggle-scan_report')
+  const before = await page.getByTestId('telegram-toggle-scan_report').isChecked()
+  await page.keyboard.press('Space')
+  await expect(page.getByTestId('telegram-toggle-scan_report')).toBeChecked({ checked: !before })
+
+  await tabTo(page, 'telegram-save')
+  await expectVisibleFocus(page, 'telegram-save')
+  await page.keyboard.press('Enter')
+  await expect(page.getByTestId('telegram-save-status')).toContainText('已保存')
+  await expect(page.getByTestId('telegram-receipts')).toBeVisible()
+
+  // A reload renders the mask, never the value, in the DOM or in storage.
+  await page.reload()
+  await expect(page.getByRole('heading', HEADING)).toBeVisible()
+  await expect(page.getByTestId('telegram-token-mask')).toHaveText('****stuv')
+  await expectTokenAbsentEverywhere(page)
   expectClean(diagnostics)
 })

@@ -286,10 +286,40 @@ def test_archive_fixture_checksums_verify_except_the_deliberate_corrupt_sample()
     assert verified >= 7
 
 
+# Telegram fixtures are split by role: the read models and message shapes map
+# to a contract, while the raw Bot API updates, failure cases, and report
+# renderer payload are exercised by tests/contract/test_telegram_contract.py.
+TELEGRAM_SCHEMA_FIXTURES = {
+    "read_models/position.json": "position.schema.json",
+    "read_models/opportunity.json": "opportunity.schema.json",
+    "read_models/budget.json": "budget-record.schema.json",
+    "messages/shapes.json": "telegram-message.schema.json",
+}
+TELEGRAM_BEHAVIOR_FIXTURES = {
+    "updates.json",
+    "failures/bot_api.json",
+    "read_models/report.json",
+}
+
+
 def test_every_json_fixture_has_a_known_schema_mapping() -> None:
     unmapped: list[str] = []
+    telegram_root = FIXTURES / "telegram"
     for path in _json_fixture_paths():
         name = path.name
+        if telegram_root in path.parents:
+            key = path.relative_to(telegram_root).as_posix()
+            schema = TELEGRAM_SCHEMA_FIXTURES.get(key)
+            if schema is not None:
+                document = _load(path)
+                if key == "messages/shapes.json":
+                    for message in document["messages"]:
+                        validate(schema, message)
+                else:
+                    validate(schema, document)
+            else:
+                assert key in TELEGRAM_BEHAVIOR_FIXTURES, key
+            continue
         if path.parent.name == "binance":
             continue  # external exchangeInfo shape, validated above
         if path.parent.name == "llm":

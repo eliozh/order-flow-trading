@@ -63,6 +63,40 @@ uv run oft scan status <scan-id> --json
 is up and falls back to the same application service for local fixture runs.
 The fixture's golden delta is `1.50` (buy `4.25`, sell `2.75`).
 
+## Telegram channel (read-only)
+
+The optional Telegram bot is a read-only notification and query surface. It
+accepts exactly seven executable commands:
+
+```
+/status  /positions  /opportunities  /report [SYMBOL]  /budget  /watchlist  /help
+```
+
+Write-like tokens (`/approve`, `/accept`, `/reject`, `/cancel`, `/buy`, `/sell`,
+`/close`) are recognized only to return the fixed read-only refusal. Prose that
+merely mentions a command is ignored, and only an explicitly allowlisted chat
+**and** user may query.
+
+```bash
+# The token is accepted only on stdin: no argv, no reveal command.
+printf '%s\n' "$TELEGRAM_BOT_TOKEN" | uv run oft telegram token set --stdin
+uv run oft telegram status
+uv run oft telegram allowlist show
+uv run oft telegram allowlist add --chat-id 1001 --user-id 2002
+uv run oft telegram toggles show
+uv run oft telegram toggles set --no-scan-report --trigger
+uv run oft telegram test
+uv run oft telegram receipts --limit 20
+uv run oft telegram watchdog --once   # one-shot cron/systemd check
+```
+
+`status`, `allowlist`, `toggles`, `receipts`, and `watchdog` never print the
+token; only the fixed mask and last four characters are rendered. With
+`OFT_ENV=test` the composition root selects the deterministic in-process
+`TelegramFake`, so these commands and the test suite never touch
+`api.telegram.org`. See [`docs/runbooks/telegram.md`](docs/runbooks/telegram.md)
+for the cron/systemd watchdog examples.
+
 ## Run the web shell
 
 ```bash

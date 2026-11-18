@@ -1,0 +1,83 @@
+{
+  "schema_version": "1.0.0",
+  "opportunity_id": "OPP-TG-1",
+  "symbol": "BTCUSDT",
+  "side": "LONG",
+  "state": "OPEN",
+  "created_at": "2026-11-17T09:30:00.000Z",
+  "updated_at": "2026-11-17T09:30:00.000Z",
+  "zone": {
+    "low": "69000",
+    "high": "70000"
+  },
+  "entry_preference": "LIMIT",
+  "trigger_conditions": [],
+  "invalidation_conditions": [],
+  "expires_at": "2026-11-18T00:00:00.000Z",
+  "thesis": "Range high retest with positive delta.",
+  "confidence": 0.72,
+  "risk_request": {
+    "entry_price": "70000",
+    "stop_price": "69000",
+    "quantity": null,
+    "risk_pct": 0.1,
+    "leverage": 2.0,
+    "notional_usd": "100"
+  },
+  "source": {
+    "scan_id": "SCAN-TG-1",
+    "report_id": "RPT-TG-1",
+    "decision_id": "DEC-TG-1"
+  },
+  "provenance": {
+    "llm": {
+      "provider": "stub",
+      "model": "fixture",
+      "model_snapshot": null,
+      "prompt_id": "analysis",
+      "prompt_version": 1,
+      "prompt_hash": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+      "knowledge_artifact_hash": null,
+      "input_hash": "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+      "schema_version": "1.0.0",
+      "temperature": 0.0,
+      "seed": null,
+      "request_id": "REQ-TG-1",
+      "latency_ms": 0,
+      "usage": {
+        "input_tokens": 0,
+        "output_tokens": 0,
+        "cache_read_tokens": 0,
+        "cache_write_tokens": 0,
+        "reasoning_tokens": 0,
+        "total_tokens": 0
+      },
+      "cost": {
+        "amount_usd": "0",
+        "currency": "USD",
+        "price_version": "stub/v1",
+        "unpriced": true
+      },
+      "recorded_at": "2026-11-17T09:30:00.000Z"
+    },
+    "calc_snapshot_id": "SNAP-TG-1",
+    "calc_snapshot_hash": "cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc",
+    "calc_metric_version": "orderflow_metrics.v1.0000000000000000"
+  },
+  "data_quality": {
+    "status": "COMPLETE",
+    "reasons": [],
+    "gaps": [],
+    "last_event_at": "2026-11-17T09:30:00.000Z",
+    "coverage_start": "2026-11-17T09:30:00.000Z"
+  },
+  "state_history": [
+    {
+      "from_state": null,
+      "to_state": "OPEN",
+      "at": "2026-11-17T09:30:00.000Z",
+      "reason_code": "CREATED",
+      "note": ""
+    }
+  ]
+}

@@ -1,0 +1,38 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://schemas.oft.local/v1/telegram-status.schema.json",
+  "title": "Telegram channel status",
+  "description": "The deterministic channel state returned by GET /api/v1/telegram/status. It is computed from stored settings only; no network probe is involved.",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "state",
+    "token_configured",
+    "chat_count",
+    "allowed_user_count",
+    "detail"
+  ],
+  "properties": {
+    "state": {
+      "type": "string",
+      "enum": ["NOT_CONFIGURED", "NO_ALLOWLIST", "READY", "DEGRADED"]
+    },
+    "token_configured": {
+      "type": "boolean"
+    },
+    "chat_count": {
+      "type": "integer",
+      "minimum": 0,
+      "maximum": 10
+    },
+    "allowed_user_count": {
+      "type": "integer",
+      "minimum": 0,
+      "maximum": 20
+    },
+    "detail": {
+      "type": "string",
+      "maxLength": 200
+    }
+  }
+}

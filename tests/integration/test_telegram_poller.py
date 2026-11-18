@@ -267,6 +267,34 @@ def test_refusal_audit_windows_aggregate_at_most_two_rows(tmp_path: Path) -> Non
     assert immediates[-1]["last_update_id"] == 6
 
 
+def test_a_single_refusal_then_window_expiry_writes_no_aggregate(tmp_path: Path) -> None:
+    clock = _MutableClock(NOW)
+    service, store, _port, _settings = _service(tmp_path, clock=clock)
+
+    service.handle_update(parse_update(make_update(1, chat_id=9991)))
+    clock.advance(TELEGRAM_REFUSAL_AUDIT_WINDOW_SECONDS + 1)
+    service.handle_update(parse_update(make_update(2, chat_id=9992)))
+
+    audits = [
+        event
+        for event in store.list_audit_events_ascending()
+        if event.event_type == "TELEGRAM_UNAUTHORIZED"
+    ]
+    payloads = [json.loads(event.payload_json)["payload"] for event in audits]
+    # A closed window that saw exactly one refusal has nothing to aggregate, so
+    # only the two immediate rows are written.
+    assert len(payloads) == 2
+    assert all(payload["aggregated"] is False for payload in payloads)
+    assert [payload["count"] for payload in payloads] == [1, 1]
+    assert [payload["last_update_id"] for payload in payloads] == [1, 2]
+
+    # The refusal receipts themselves are unchanged by the audit accounting.
+    receipts = store.list_telegram_receipts()
+    assert len(receipts) == 2
+    assert all(receipt.kind == "refusal" for receipt in receipts)
+    assert all(json.loads(receipt.payload_json)["text"] == REFUSAL_TEXT for receipt in receipts)
+
+
 def test_a_status_embedded_in_prose_is_never_executed(tmp_path: Path) -> None:
     service, store, port, _settings = _service(tmp_path)
     port.script_updates([make_update(1, text="please run /status now")])

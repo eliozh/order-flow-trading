@@ -1,0 +1,100 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://schemas.oft.local/v1/telegram-receipt.schema.json",
+  "title": "Telegram outbox receipt",
+  "description": "One durable outbox/receipt row. The rendered message text is deliberately absent. `last_error_code` carries both the three public API codes and the internal delivery/state codes; only the public codes appear in the API error envelope.",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "event_key",
+    "kind",
+    "chat_id",
+    "reply_to_message_id",
+    "state",
+    "attempts",
+    "message_id",
+    "last_error_code",
+    "next_attempt_at",
+    "created_at",
+    "sent_at"
+  ],
+  "properties": {
+    "event_key": {
+      "type": "string",
+      "minLength": 1,
+      "maxLength": 256,
+      "pattern": "^[A-Za-z0-9][A-Za-z0-9._:-]*$"
+    },
+    "kind": {
+      "type": "string",
+      "enum": [
+        "query_reply",
+        "refusal",
+        "test",
+        "scan_summary",
+        "opportunity_triggered",
+        "opportunity_invalidated",
+        "opportunity_triggered_burst",
+        "entry_recheck",
+        "position_management",
+        "risk_alert",
+        "budget_threshold",
+        "degradation"
+      ]
+    },
+    "chat_id": {
+      "description": "Signed Telegram chat id; group/supergroup ids are negative.",
+      "anyOf": [
+        { "type": "integer", "minimum": 1 },
+        { "type": "integer", "maximum": -1 }
+      ]
+    },
+    "reply_to_message_id": {
+      "anyOf": [{ "type": "integer", "minimum": 1 }, { "type": "null" }]
+    },
+    "state": {
+      "type": "string",
+      "enum": ["queued", "sending", "sent", "failed"]
+    },
+    "attempts": {
+      "type": "integer",
+      "minimum": 0,
+      "maximum": 3
+    },
+    "message_id": {
+      "anyOf": [{ "type": "integer", "minimum": 1 }, { "type": "null" }]
+    },
+    "last_error_code": {
+      "description": "Public boundary codes plus internal delivery/state codes. TELEGRAM_QUEUE_FULL and TELEGRAM_LOCAL_RATE_LIMITED are internal state only and are never shipped as envelope errors.",
+      "anyOf": [
+        {
+          "type": "string",
+          "enum": [
+            "TELEGRAM_NOT_CONFIGURED",
+            "TELEGRAM_DELIVERY_FAILED",
+            "TELEGRAM_TOKEN_INVALID",
+            "TELEGRAM_UPSTREAM_ERROR",
+            "TELEGRAM_RATE_LIMITED",
+            "TELEGRAM_CONFLICT",
+            "TELEGRAM_UNAUTHORIZED",
+            "TELEGRAM_QUEUE_FULL",
+            "TELEGRAM_LOCAL_RATE_LIMITED"
+          ]
+        },
+        { "type": "null" }
+      ]
+    },
+    "next_attempt_at": {
+      "$ref": "./common.schema.json#/$defs/timestamp"
+    },
+    "created_at": {
+      "$ref": "./common.schema.json#/$defs/timestamp"
+    },
+    "sent_at": {
+      "anyOf": [
+        { "$ref": "./common.schema.json#/$defs/timestamp" },
+        { "type": "null" }
+      ]
+    }
+  }
+}

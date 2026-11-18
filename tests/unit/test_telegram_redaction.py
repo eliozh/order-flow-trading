@@ -105,6 +105,27 @@ def test_redaction_values_include_the_stored_and_environment_token(tmp_path: Pat
     assert set(service.redaction_values()) >= {SENTINEL, OTHER}
 
 
+def test_redaction_values_include_stored_and_environment_provider_keys(tmp_path: Path) -> None:
+    backend = MemoryBackend()
+    store = _store(tmp_path)
+    settings = Settings(
+        env="test",
+        port=8765,
+        data_dir=tmp_path / "data",
+        deepseek_api_key="sk-env-provider-key-0123456789",
+    )
+    service = SecretsService(store=store, settings=settings, clock=FixedClock(NOW), backend=backend)
+    service.set_key("deepseek", "sk-stored-provider-key-0123456789", actor="test")
+
+    values = service.redaction_values()
+
+    assert "sk-stored-provider-key-0123456789" in values
+    assert "sk-env-provider-key-0123456789" in values
+    without_providers = service.redaction_values(include_providers=False)
+    assert "sk-stored-provider-key-0123456789" not in without_providers
+    assert "sk-env-provider-key-0123456789" not in without_providers
+
+
 def test_the_token_status_never_contains_the_value(tmp_path: Path) -> None:
     backend = MemoryBackend()
     store = _store(tmp_path)

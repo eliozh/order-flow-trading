@@ -63,6 +63,18 @@ REQUIRED_DETERMINISTIC_MODULES = (
     "application/prompt_service.py",
     "application/opportunity_service.py",
     "application/status.py",
+    # Slice 55: every Telegram command, push, poll, dispatch, and watchdog
+    # module takes its instant from ClockPort; the token bucket and backoff
+    # schedules are pure functions of that injected instant.
+    "domain/telegram.py",
+    "application/telegram_service.py",
+    "application/telegram_dispatch.py",
+    "application/telegram_events.py",
+    "application/telegram_messages.py",
+    "application/telegram_queries.py",
+    "application/telegram_poller.py",
+    "application/telegram_watchdog.py",
+    "application/notifications.py",
     "replay/harness.py",
     "replay/llm_source.py",
     "replay/paper_loop.py",
