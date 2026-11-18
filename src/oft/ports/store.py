@@ -1615,6 +1615,24 @@ class StorePort(Protocol):
         """
         ...
 
+    def save_telegram_settings_change(
+        self,
+        keys: Sequence[str],
+        build: Callable[
+            [dict[str, ConfigRecord | None]],
+            tuple[Sequence[ConfigRecord], AuditEventDraft] | None,
+        ],
+    ) -> tuple[dict[str, ConfigRecord | None], AuditEventRecord | None]:
+        """Read-modify-write the managed Telegram settings rows atomically.
+
+        ``build`` receives every requested ``config`` row (``None`` when absent)
+        inside one ``BEGIN IMMEDIATE`` transaction and returns the rows to upsert
+        plus exactly one audit draft, or ``None`` for a deterministic no-op. The
+        commit is all-or-nothing: a validation error raised by ``build`` rolls
+        back with no partial write.
+        """
+        ...
+
     # -- Telegram outbox / receipts --------------------------------------
 
     def append_telegram_outbox(self, record: TelegramOutboxRecord) -> bool:

@@ -112,7 +112,7 @@ def test_fresh_interactive_run_walks_steps_and_persists_progress(
     settings, _ = _configure(monkeypatch, tmp_path)
     _as_tty(monkeypatch)
 
-    result = CliRunner().invoke(app, ["init"], input="BTCUSDT\n\n\n")
+    result = CliRunner().invoke(app, ["init"], input="\nBTCUSDT\n\n\n")
 
     assert result.exit_code == 0, result.output
     assert "1/5 " in result.stdout
@@ -120,7 +120,10 @@ def test_fresh_interactive_run_walks_steps_and_persists_progress(
     assert "2/5 LLM providers" in result.stdout
     assert "environment     test" in result.stdout
     assert "Milestone 5" in result.output
-    assert "Milestone 6" in result.output
+    # Telegram step 4 is optional; a blank opt-in leaves pushes disabled and
+    # never completes the step.
+    assert "Telegram" in result.stdout
+    assert "禁用" in result.stdout
     assert _progress(settings) == [1, 2, 5]
     # Existing values are reported with their provenance, never guessed.
     assert "source" in result.stdout.lower()
@@ -134,14 +137,14 @@ def test_resume_starts_at_the_first_incomplete_step(
     service.complete_onboarding_step(1, actor="cli")
     _as_tty(monkeypatch)
 
-    result = CliRunner().invoke(app, ["init", "--resume"], input="BTCUSDT\n\n\n")
+    result = CliRunner().invoke(app, ["init", "--resume"], input="\nBTCUSDT\n\n\n")
 
     assert result.exit_code == 0, result.output
     assert "Resuming at step 2" in result.stdout
     assert _progress(settings) == [1, 2, 5]
 
 
-def test_resume_with_all_active_steps_complete_prints_the_review(
+def test_resume_with_required_steps_complete_prompts_the_optional_step(
     monkeypatch: pytest.MonkeyPatch, tmp_path: Path
 ) -> None:
     settings, _ = _configure(monkeypatch, tmp_path)
@@ -151,9 +154,13 @@ def test_resume_with_all_active_steps_complete_prints_the_review(
         service.complete_onboarding_step(step, actor="cli")
     _as_tty(monkeypatch)
 
-    result = CliRunner().invoke(app, ["init", "--resume"])
+    # The optional step is resumable after the required steps finish; a blank
+    # answer skips it without completing it and the review still prints.
+    result = CliRunner().invoke(app, ["init", "--resume"], input="\n")
 
     assert result.exit_code == 0, result.output
+    assert "Resuming at step 4/5" in result.stdout
+    assert "Configure Telegram now?" in result.stdout
     assert "Completed steps: 1, 2, 5" in result.stdout
     assert "Environment: test." in result.stdout
     assert "Live is not offered" in result.stdout
@@ -176,7 +183,7 @@ def test_key_entry_reads_stdin_without_echo_and_reports_only_the_mask(
 
     # The provider prompt comes from stdin; the key comes from getpass, which
     # never echoes and never reads the visible input stream.
-    result = runner.invoke(app, ["init"], input="openai\nBTCUSDT\n\n\n")
+    result = runner.invoke(app, ["init"], input="openai\n\nBTCUSDT\n\n\n")
 
     assert result.exit_code == 0, result.output
     assert prompts and "input hidden" in prompts[0]
@@ -295,7 +302,7 @@ def test_crossed_interactive_budget_exits_2_before_step_5_writes(
 
     # A key is already configured, so the first two prompts are the watchlist,
     # scan period, and budget; daily > weekly crosses the ordering rule.
-    result = CliRunner().invoke(app, ["init"], input="BTCUSDT\n8h\n30 10 150\n")
+    result = CliRunner().invoke(app, ["init"], input="\nBTCUSDT\n8h\n30 10 150\n")
 
     assert result.exit_code == 2, result.output
     assert _progress(settings) == [1, 2]
@@ -313,7 +320,7 @@ def test_malformed_interactive_budget_exits_2_before_step_5_writes(
     settings, _ = _configure(monkeypatch, tmp_path)
     _as_tty(monkeypatch)
 
-    result = CliRunner().invoke(app, ["init"], input="BTCUSDT\n\n10 20\n")
+    result = CliRunner().invoke(app, ["init"], input="\nBTCUSDT\n\n10 20\n")
 
     assert result.exit_code == 2, result.output
     assert _progress(settings) == [1, 2]

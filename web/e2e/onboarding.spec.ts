@@ -261,16 +261,16 @@ test('LLM key save shows only the server mask and never the typed value', async 
   await expect(missingProvider).toHaveCount(0)
   await expect(finishStepTwo).not.toHaveAttribute('aria-disabled', 'true')
 
-  // The configured provider unblocks finishing step 2; deferred steps are
-  // skipped and the resumed step is 5.
+  // The configured provider unblocks finishing step 2; the optional Telegram
+  // step 4 is now the first incomplete active step.
   await finishStepTwo.click()
-  await page.waitForURL('**/onboarding/5')
-  await expect(page.getByRole('heading', HEADING)).toContainText('Watchlist')
+  await page.waitForURL('**/onboarding/4')
+  await expect(page.getByRole('heading', HEADING)).toContainText('Telegram')
 
   expectClean(diagnostics)
 })
 
-test('Binance and Telegram are deferred to Milestones 5 and 6 without inputs', async ({ page }) => {
+test('Binance stays deferred and Telegram is a real optional step', async ({ page }) => {
   const diagnostics = collectDiagnostics(page)
   await page.setViewportSize({ width: 1440, height: 900 })
   await authenticate(page)
@@ -282,12 +282,22 @@ test('Binance and Telegram are deferred to Milestones 5 and 6 without inputs', a
   await expect(page.getByRole('textbox')).toHaveCount(0)
   await expect(page.getByRole('button', { name: /保存/ })).toHaveCount(0)
 
+  // Step 4 is real, optional, and uses the same aggregate service as
+  // `/settings/telegram`. A fresh install shows the unconfigured consequence.
   await page.goto('/onboarding/4')
   await expect(page.getByRole('heading', HEADING)).toContainText('Telegram')
-  await expect(page.getByTestId('deferred-step-4')).toContainText('Milestone 6')
-  await expect(page.getByTestId('deferred-step-4')).toContainText('不会保存任何内容')
-  await expect(page.getByRole('textbox')).toHaveCount(0)
-  await expect(page.getByRole('button', { name: /保存/ })).toHaveCount(0)
+  await expect(page.getByTestId('onboarding-telegram')).toBeVisible()
+  await expect(page.getByTestId('onboarding-telegram-empty')).toContainText('未配置')
+  await expect(page.getByTestId('onboarding-telegram-empty')).toContainText('推送保持禁用')
+  await expect(page.getByTestId('onboarding-telegram-token')).toBeVisible()
+  await expect(page.getByTestId('onboarding-telegram-test')).toBeDisabled()
+  await expect(page.getByTestId('onboarding-telegram-test-reason')).toContainText('未配置 token')
+  await expect(page.getByTestId('onboarding-telegram-skip')).toHaveAttribute(
+    'href',
+    '/onboarding/5',
+  )
+  await expect(page.getByTestId('deferred-step-4')).toHaveCount(0)
+  await expect(page.getByText(/Milestone 6/)).toHaveCount(0)
 
   expectClean(diagnostics)
 })
@@ -564,6 +574,10 @@ test('step 1 is accessible at 1440/768/375 fine pointers and at 320px reflow; 37
     await mobile.goto('/onboarding/2')
     await expect(mobile.getByTestId('llm-key-input-openai')).toBeDisabled()
     await expect(mobile.getByRole('button', { name: '保存并继续' })).toBeDisabled()
+    await mobile.goto('/onboarding/4')
+    await expect(mobile.getByTestId('onboarding-telegram-token')).toBeDisabled()
+    await expect(mobile.getByTestId('onboarding-telegram-finish')).toBeDisabled()
+    await expect(mobile.getByTestId('onboarding-telegram-skip')).toBeVisible()
     await mobile.goto('/onboarding/5')
     await expect(mobile.getByTestId('scan-source')).toBeVisible()
     await expect(mobile.getByRole('button', { name: /^星标 / }).first()).toBeDisabled()

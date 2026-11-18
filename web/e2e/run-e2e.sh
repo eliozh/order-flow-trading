@@ -759,3 +759,9 @@ bash "$SCRIPT_DIR/run-llm-settings-e2e.sh"
 # runner. Running it here keeps `npm --prefix web run test:e2e` / CI gating the
 # onboarding journeys; its exit code propagates through `set -e`.
 bash "$SCRIPT_DIR/run-onboarding-e2e.sh"
+
+# Slice 53: `/settings/telegram` also needs its own daemon (temporary OFT_DATA,
+# a throwaway OFT_MASTER_KEY, and the fail keyring backend) so the encrypted-file
+# token store is available headlessly, mirroring slice 44. Its exit code
+# propagates through `set -e`.
+bash "$SCRIPT_DIR/run-telegram-settings-e2e.sh"

@@ -1,10 +1,12 @@
-"""Paper-only onboarding progress (slice 44, F01).
+"""Paper-only onboarding progress (slice 44, F01; slice 53 optional step 4).
 
 Completed first-run steps are persisted under one config key
 (``onboarding.progress``) as ``{"completed_steps": [ascending ints]}``. No secret,
 token, or free-form request text can enter the row: the only persisted value is
-the step integer. Steps 3 (Binance) and 4 (Telegram) are deferred to Milestones
-5 and 6 and can never be completed here.
+the step integer. Step 3 (Binance) stays deferred to Milestone 5; step 4
+(Telegram) is a real **optional** step: it is resumable and can be completed
+through the same services, but leaving it incomplete never makes the wizard
+``all_complete`` false.
 
 The logic lives in a mixin so :class:`oft.application.settings_service.SettingsService`
 keeps its public surface (and its established ``LLMSettingsMixin`` precedent)
@@ -37,26 +39,34 @@ ONBOARDING_PROGRESS_KEY = "onboarding.progress"
 
 @dataclass(frozen=True)
 class OnboardingStep:
-    """One first-run step and whether this slice can persist it."""
+    """One first-run step and whether this slice can persist it.
+
+    ``optional`` steps are real and resumable but never block ``all_complete``.
+    """
 
     step: int
     id: OnboardingStepId
     title: str
     deferred: bool
     deferred_milestone: int | None
+    optional: bool = False
 
 
-# The five F01 steps. Steps 3 (Binance) and 4 (Telegram) are visibly deferred
-# to their milestones and can never be completed or persisted here.
+# The five F01 steps. Step 3 (Binance) is visibly deferred to its milestone.
+# Step 4 (Telegram) is active and optional: it can be completed with a token and
+# a chat, but skipping it leaves pushes disabled without blocking a Paper finish.
 ONBOARDING_STEPS: tuple[OnboardingStep, ...] = (
     OnboardingStep(1, "environment", "环境与本地绑定", False, None),
     OnboardingStep(2, "llm", "LLM providers", False, None),
     OnboardingStep(3, "binance", "Binance 密钥与权限", True, 5),
-    OnboardingStep(4, "telegram", "Telegram 只读通道", True, 6),
+    OnboardingStep(4, "telegram", "Telegram 只读通道", False, None, optional=True),
     OnboardingStep(5, "watchlist", "Watchlist、周期与预算", False, None),
 )
 ACTIVE_ONBOARDING_STEPS: tuple[int, ...] = tuple(
     step.step for step in ONBOARDING_STEPS if not step.deferred
+)
+REQUIRED_ONBOARDING_STEPS: tuple[int, ...] = tuple(
+    step.step for step in ONBOARDING_STEPS if not step.deferred and not step.optional
 )
 DEFERRED_ONBOARDING_STEPS: tuple[int, ...] = tuple(
     step.step for step in ONBOARDING_STEPS if step.deferred
@@ -92,6 +102,7 @@ class OnboardingProgress:
                     "title": step.title,
                     "deferred": step.deferred,
                     "deferred_milestone": step.deferred_milestone,
+                    "optional": step.optional,
                     "completed": step.step in completed,
                 }
                 for step in self.steps
@@ -127,6 +138,10 @@ class OnboardingProgressMixin:
         """
         raise NotImplementedError
 
+    def read_telegram_allowlist(self) -> Any:  # pragma: no cover - host supplies it
+        """The Telegram allowlist reader supplied by :class:`SettingsService`."""
+        raise NotImplementedError
+
     def read_onboarding_progress(self) -> OnboardingProgress:
         """Completed first-run steps; a fresh install needs no config row."""
         record = self._store.get_config(ONBOARDING_PROGRESS_KEY)
@@ -138,16 +153,17 @@ class OnboardingProgressMixin:
     def complete_onboarding_step(self, step: object, *, actor: str) -> OnboardingProgress:
         """Persist one active step, auditing only a real change.
 
-        Deferred steps (3/4) and unknown steps are rejected with
+        Deferred step 3 and unknown steps are rejected with
         ``VALIDATION_FAILED`` before any write. The persisted document is read
         and decoded first, so a corrupt document fails closed as
         ``CONFIG_INVALID`` and is never overwritten. Completing an
         already-completed step is a deterministic no-op (no row, no audit, no
         prerequisite re-evaluation). Only a step about to be persisted must
         satisfy its server-side prerequisite (step 2: a configured LLM
-        provider; step 5: at least one starred symbol), so progress cannot
-        claim a state the underlying settings do not support; a failed
-        prerequisite writes nothing.
+        provider; step 4: a configured bot token and at least one chat id;
+        step 5: at least one starred symbol), so progress cannot claim a state
+        the underlying settings do not support; a failed prerequisite writes
+        nothing.
         """
         normalized = validate_onboarding_step(step)
         # Read/decode before the prerequisite check so a corrupt document fails
@@ -224,6 +240,24 @@ class OnboardingProgressMixin:
                         }
                     ],
                 )
+        if step == 4:
+            configured = self._secrets().status_for("telegram", "bot_token").configured
+            allowlist = self.read_telegram_allowlist()
+            if not configured or not allowlist.chat_ids:
+                message = (
+                    "step 4 requires a configured Telegram bot token and at least "
+                    "one chat id; configure Telegram before completing this step"
+                )
+                raise SettingValidationError(
+                    message,
+                    details=[
+                        {
+                            "field": "step",
+                            "code": "step_prerequisite_missing",
+                            "message": message,
+                        }
+                    ],
+                )
         if step == 5 and self._store.watchlist_snapshot(limit=1).starred_count < 1:
             message = (
                 "step 5 requires at least one starred watchlist symbol; "
@@ -244,9 +278,9 @@ class OnboardingProgressMixin:
 def validate_onboarding_step(value: object) -> int:
     """Return a persistable step or raise a field-scoped validation error.
 
-    Only steps 1, 2, and 5 are configurable in this slice. Steps 3 and 4 are
-    deferred to Milestones 5 and 6 and must never be persisted; treating them
-    as ordinary validation failures keeps the progress document honest.
+    Steps 1, 2, 4, and 5 are configurable; step 4 is optional. Step 3 (Binance)
+    is deferred to Milestone 5 and must never be persisted, so treating it as an
+    ordinary validation failure keeps the progress document honest.
     """
     if isinstance(value, bool) or not isinstance(value, int):
         message = "onboarding step must be an integer 1..5"
@@ -264,7 +298,7 @@ def validate_onboarding_step(value: object) -> int:
         milestone = _ONBOARDING_STEP_MILESTONES[value]
         message = (
             f"onboarding step {value} is deferred to Milestone {milestone}; "
-            "only steps 1, 2 and 5 are configurable in this slice"
+            "only steps 1, 2, 4 and 5 are configurable in this slice"
         )
         raise SettingValidationError(
             message,
@@ -276,9 +310,10 @@ def validate_onboarding_step(value: object) -> int:
 def _decode_onboarding_progress(record: ConfigRecord) -> tuple[int, ...]:
     """Decode ``{"completed_steps": [...]}``; never guess a corrupt document.
 
-    A persisted deferred step (3/4) is dropped rather than rejected: this service
+    A persisted deferred step (3) is dropped rather than rejected: this service
     can never write one, so a hand-seeded row must not resume or complete a
     deferred step. Every other malformed shape fails closed as ``CONFIG_INVALID``.
+    Step 4 is active (optional) and is kept.
     """
     try:
         value = json.loads(record.value_json)
@@ -309,7 +344,9 @@ def _build_onboarding_progress(
 ) -> OnboardingProgress:
     completed_set = set(completed)
     incomplete = [step for step in ACTIVE_ONBOARDING_STEPS if step not in completed_set]
-    all_complete = not incomplete
+    # An incomplete optional step never blocks the finish, but it is still the
+    # first incomplete active step and therefore the resume point.
+    all_complete = all(step in completed_set for step in REQUIRED_ONBOARDING_STEPS)
     # All active steps complete still resumes at 5 (the last active step) so a
     # resumed wizard lands on the review rather than a deferred step.
     resumed_step = incomplete[0] if incomplete else ONBOARDING_STEPS[-1].step
@@ -328,6 +365,7 @@ __all__ = [
     "DEFERRED_ONBOARDING_STEPS",
     "ONBOARDING_PROGRESS_KEY",
     "ONBOARDING_STEPS",
+    "REQUIRED_ONBOARDING_STEPS",
     "OnboardingProgress",
     "OnboardingProgressMixin",
     "OnboardingStep",

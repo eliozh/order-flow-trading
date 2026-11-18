@@ -204,7 +204,7 @@ class PromptSettingsData(BaseModel):
 
 
 class OnboardingProgressUpdate(BaseModel):
-    """One step completion; the service still rejects the deferred 3/4."""
+    """One step completion; the service still rejects deferred step 3."""
 
     model_config = ConfigDict(extra="forbid")
 
@@ -219,6 +219,7 @@ class OnboardingStepData(BaseModel):
     title: str
     deferred: bool
     deferred_milestone: int | None = None
+    optional: bool = False
     completed: bool
 
     @model_validator(mode="after")

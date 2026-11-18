@@ -30,6 +30,10 @@ const SECTION_COPY: Record<string, { title: string; description: string }> = {
     title: '风险上限',
     description: '单笔风险、持仓数、日亏损、杠杆与名义上限；收紧直存，放宽需确认。',
   },
+  telegram: {
+    title: 'Telegram',
+    description: 'bot token（只写）、chat/allowlist、推送开关、测试发送与投递回执。',
+  },
 }
 
 /** `/settings`: the section index. Values are not shown here, only provenance. */

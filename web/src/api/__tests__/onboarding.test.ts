@@ -63,21 +63,31 @@ describe('fetchOnboardingProgress', () => {
         title: '环境与本地绑定',
         deferred: false,
         deferred_milestone: null,
+        optional: false,
       },
-      { step: 2, id: 'llm', title: 'LLM providers', deferred: false, deferred_milestone: null },
+      {
+        step: 2,
+        id: 'llm',
+        title: 'LLM providers',
+        deferred: false,
+        deferred_milestone: null,
+        optional: false,
+      },
       {
         step: 3,
         id: 'binance',
         title: 'Binance 密钥与权限',
         deferred: true,
         deferred_milestone: 5,
+        optional: false,
       },
       {
         step: 4,
         id: 'telegram',
         title: 'Telegram 只读通道',
-        deferred: true,
-        deferred_milestone: 6,
+        deferred: false,
+        deferred_milestone: null,
+        optional: true,
       },
       {
         step: 5,
@@ -85,23 +95,26 @@ describe('fetchOnboardingProgress', () => {
         title: 'Watchlist、周期与预算',
         deferred: false,
         deferred_milestone: null,
+        optional: false,
       },
     ]
     expect(
-      serverSteps.map(({ step, id, title, deferred, deferred_milestone }) => ({
+      serverSteps.map(({ step, id, title, deferred, deferred_milestone, optional }) => ({
         step,
         id,
         title,
         deferred,
         deferred_milestone,
+        optional,
       })),
     ).toEqual(
-      ONBOARDING_STEPS.map(({ step, id, title, deferred, deferred_milestone }) => ({
+      ONBOARDING_STEPS.map(({ step, id, title, deferred, deferred_milestone, optional }) => ({
         step,
         id,
         title,
         deferred,
         deferred_milestone,
+        optional,
       })),
     )
   })

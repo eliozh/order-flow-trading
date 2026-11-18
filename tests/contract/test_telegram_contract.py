@@ -188,6 +188,17 @@ def test_the_api_responses_validate_against_the_envelope_schema(
     auth = {"Authorization": f"Bearer {app.state.api_token}"}
 
     with TestClient(app) as client:
+        # The added settings reads/writes are asserted as success responses too,
+        # so an error envelope cannot pass schema validation unnoticed.
+        get_settings = client.get("/api/v1/settings/telegram", headers=auth)
+        assert get_settings.status_code == 200, get_settings.text
+        put_settings = client.put(
+            "/api/v1/settings/telegram",
+            json={"chat_ids": [1001], "allowed_user_ids": [2002]},
+            headers={**auth, "Idempotency-Key": "c-settings"},
+        )
+        assert put_settings.status_code == 200, put_settings.text
+
         responses = [
             client.get("/api/v1/telegram/status", headers=auth),
             client.get("/api/v1/telegram/receipts", headers=auth),
@@ -201,6 +212,8 @@ def test_the_api_responses_validate_against_the_envelope_schema(
                 json={"chat_ids": [1001], "allowed_user_ids": []},
                 headers={**auth, "Idempotency-Key": "c-allow"},
             ),
+            get_settings,
+            put_settings,
             client.post(
                 "/api/v1/telegram/test",
                 json={},

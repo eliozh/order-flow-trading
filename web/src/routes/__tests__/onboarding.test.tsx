@@ -16,6 +16,13 @@ import type { StatusEnvelope } from '../../api/status'
 import { ReadinessError } from '../../api/status'
 import type { ReadinessEnvelope, ReadyCheck } from '../../api/status'
 import type { ScanSettingsEnvelope } from '../../api/settings'
+import type {
+  TelegramReceiptEnvelope,
+  TelegramSettingsData,
+  TelegramSettingsEnvelope,
+  TelegramSettingsPatch,
+  TelegramTokenEnvelope,
+} from '../../api/telegram'
 import type { StarEnvelope, WatchlistEnvelope, WatchlistRow } from '../../api/watchlist'
 import { OnboardingPage } from '../onboarding'
 import { adjustStarredCount } from '../use-watchlist-draft'
@@ -299,6 +306,77 @@ function budgetUpdateEnvelope(): BudgetUpdateEnvelope {
   }
 }
 
+function telegramSettings(overrides: Partial<TelegramSettingsData> = {}): TelegramSettingsData {
+  return {
+    token: {
+      configured: false,
+      masked: null,
+      last4: null,
+      source: 'unset',
+      updated_at: null,
+    },
+    chat_ids: [],
+    allowed_user_ids: [],
+    toggles: {
+      scan_report: true,
+      trigger: true,
+      entry_recheck: true,
+      position: true,
+      risk: true,
+      budget: true,
+    },
+    source: 'default',
+    updated_at: null,
+    updated_by: null,
+    receipts: [],
+    receipt_total: 0,
+    latest_test_receipt: null,
+    ...overrides,
+  }
+}
+
+function telegramEnvelope(overrides: Partial<TelegramSettingsData> = {}): TelegramSettingsEnvelope {
+  return { ok: true, data: telegramSettings(overrides), error: null, meta }
+}
+
+function telegramConfigured(): TelegramSettingsEnvelope {
+  return telegramEnvelope({
+    token: {
+      configured: true,
+      masked: '****9f2a',
+      last4: '9f2a',
+      source: 'stored',
+      updated_at: '2026-11-06T10:00:00.000Z',
+    },
+    chat_ids: [1001],
+    allowed_user_ids: [2002],
+    source: 'user',
+    updated_at: '2026-11-06T10:00:00.000Z',
+    updated_by: 'web',
+  })
+}
+
+function telegramReceipt(kind = 'test'): TelegramReceiptEnvelope {
+  return {
+    ok: true,
+    data: {
+      event_key: `test:1001:${kind}`,
+      kind,
+      chat_id: 1001,
+      reply_to_message_id: null,
+      state: 'queued',
+      attempts: 0,
+      message_id: null,
+      last_error_code: null,
+      next_attempt_at: '2026-11-06T10:00:00.000Z',
+      created_at: '2026-11-06T10:00:00.000Z',
+      sent_at: null,
+    },
+    error: null,
+    meta,
+  }
+}
+
 interface RenderOptions {
   step?: OnboardingStepNumber | null
   isNarrow?: boolean
@@ -323,6 +401,10 @@ interface RenderOptions {
   updateScan?: (period: string, key: string) => Promise<ScanSettingsEnvelope>
   budget?: () => Promise<BudgetEnvelope>
   updateBudget?: (payload: BudgetUpdatePayload, key: string) => Promise<BudgetUpdateEnvelope>
+  telegram?: () => Promise<TelegramSettingsEnvelope>
+  updateTelegram?: (patch: TelegramSettingsPatch, key: string) => Promise<TelegramSettingsEnvelope>
+  setTelegramToken?: (token: string, key: string) => Promise<TelegramTokenEnvelope>
+  testTelegram?: (key: string, chatId?: number) => Promise<TelegramReceiptEnvelope>
 }
 
 function renderOnboarding(options: RenderOptions = {}) {
@@ -372,6 +454,24 @@ function renderOnboarding(options: RenderOptions = {}) {
       updateScanPeriodFn={updateScan}
       fetchBudgetFn={options.budget ?? (async () => budgetEnvelope())}
       updateBudgetThresholdsFn={updateBudget}
+      fetchTelegramSettingsFn={options.telegram ?? (async () => telegramEnvelope())}
+      updateTelegramSettingsFn={options.updateTelegram ?? (async () => telegramConfigured())}
+      setTelegramTokenFn={
+        options.setTelegramToken ??
+        (async () => ({
+          ok: true,
+          data: {
+            configured: true,
+            masked: '****9f2a',
+            last4: '9f2a',
+            source: 'stored',
+            updated_at: '2026-11-06T10:00:00.000Z',
+          },
+          error: null,
+          meta,
+        }))
+      }
+      testTelegramFn={options.testTelegram ?? (async () => telegramReceipt())}
     />,
   )
   return { ...result, navigate, completeStep, updateScan, updateBudget }
@@ -578,7 +678,8 @@ describe('OnboardingPage step nav (DESIGN A2.3)', () => {
     expect(screen.getByTestId('onboarding-nav-1')).toHaveTextContent('已完成')
     expect(screen.getByTestId('onboarding-nav-2')).toHaveTextContent('✓')
     expect(nav).toHaveTextContent('Milestone 5')
-    expect(nav).toHaveTextContent('Milestone 6')
+    expect(nav).not.toHaveTextContent('Milestone 6')
+    expect(nav).toHaveTextContent('Telegram 只读通道')
   })
 
   it('provides explicit previous/next links for keyboard navigation', async () => {
@@ -764,7 +865,7 @@ describe('OnboardingPage step 2 — LLM providers', () => {
   })
 })
 
-describe('OnboardingPage deferred steps', () => {
+describe('OnboardingPage deferred and optional steps', () => {
   it('shows Binance as Milestone 5 without inputs or a saved claim', async () => {
     renderOnboarding({ step: 3 })
 
@@ -778,16 +879,253 @@ describe('OnboardingPage deferred steps', () => {
     expect(screen.getByRole('link', { name: /继续/ })).toHaveAttribute('href', '/onboarding/5')
   })
 
-  it('shows Telegram as Milestone 6 without inputs or a saved claim', async () => {
+  it('renders Telegram as a real optional step with an empty consequence', async () => {
     renderOnboarding({ step: 4 })
 
     const heading = await stepHeading()
     expect(heading).toHaveTextContent('Telegram')
-    expect(screen.getAllByText(/Milestone 6/).length).toBeGreaterThan(0)
-    expect(screen.getByTestId('deferred-step-4')).toHaveTextContent('不会保存任何内容')
-    expect(screen.queryByRole('textbox')).toBeNull()
-    expect(screen.queryByRole('button', { name: /保存/ })).toBeNull()
-    expect(screen.queryByText(/已保存/)).toBeNull()
+    expect(await screen.findByTestId('onboarding-telegram')).toBeInTheDocument()
+    const empty = await screen.findByTestId('onboarding-telegram-empty')
+    expect(empty).toHaveTextContent('未配置')
+    expect(empty).toHaveTextContent('不会保存任何内容')
+    expect(empty).toHaveTextContent('推送保持禁用')
+    // The test control stays focusable with a reason (aria-disabled).
+    const testButton = await screen.findByTestId('onboarding-telegram-test')
+    expect(testButton).not.toBeDisabled()
+    expect(testButton).toHaveAttribute('aria-disabled', 'true')
+    expect(await screen.findByTestId('onboarding-telegram-test-reason')).toHaveTextContent(
+      '未配置 token',
+    )
+    // Skip is an explicit link that writes nothing.
+    expect(await screen.findByTestId('onboarding-telegram-skip')).toHaveAttribute(
+      'href',
+      '/onboarding/5',
+    )
+  })
+
+  it('keeps the token write-only and completes with a saved token and chat', async () => {
+    const sentinel = '123456789:AAOnboardingSentinelToken_abcdefghijklmnopqrstuv'
+    const setToken = vi.fn(async () => ({
+      ok: true as const,
+      data: {
+        configured: true,
+        masked: '****stuv',
+        last4: 'stuv',
+        source: 'stored' as const,
+        updated_at: '2026-11-06T10:00:00.000Z',
+      },
+      error: null,
+      meta,
+    }))
+    const updateTelegram = vi.fn(async () => telegramConfigured())
+    const completeStep = vi.fn(async () =>
+      progressEnvelope(progressData({ completed_steps: [4], resumed_step: 1 })),
+    )
+    const clearKey = vi.fn()
+    const { navigate } = renderOnboarding({
+      step: 4,
+      setTelegramToken: setToken,
+      updateTelegram,
+      completeStep,
+      clearKey,
+    })
+
+    await stepHeading()
+    const tokenInput = await screen.findByTestId('onboarding-telegram-token')
+    fireEvent.change(tokenInput, { target: { value: sentinel } })
+    fireEvent.click(screen.getByTestId('onboarding-telegram-token-save'))
+
+    await waitFor(() => expect(setToken).toHaveBeenCalledWith(sentinel, 'test-key'))
+    expect(await screen.findByTestId('onboarding-telegram-mask')).toHaveTextContent('****stuv')
+    expect(tokenInput).toHaveValue('')
+    expect(document.body.textContent).not.toContain(sentinel)
+    expect(clearKey).toHaveBeenCalledWith('telegram.token')
+
+    fireEvent.change(screen.getByTestId('onboarding-telegram-chat-input'), {
+      target: { value: '1001' },
+    })
+    fireEvent.click(screen.getByTestId('onboarding-telegram-chat-add'))
+
+    fireEvent.click(screen.getByTestId('onboarding-telegram-finish'))
+    await waitFor(() =>
+      expect(updateTelegram).toHaveBeenCalledWith(
+        expect.objectContaining({ chat_ids: [1001] }),
+        'test-key',
+      ),
+    )
+    await waitFor(() => expect(completeStep).toHaveBeenCalledWith(4, 'test-key'))
+    expect(navigate).toHaveBeenCalled()
+  })
+
+  it('settles a failed test-settings save on the settings key, not the test key', async () => {
+    const rotateKey = vi.fn(() => 'rotated-key')
+    const clearKey = vi.fn()
+    const updateTelegram = vi.fn(async () => {
+      throw new SettingsApiError('conflict', 'IDEMPOTENCY_CONFLICT', { httpStatus: 409 })
+    })
+    renderOnboarding({
+      step: 4,
+      telegram: async () => telegramConfigured(),
+      updateTelegram,
+      rotateKey,
+      clearKey,
+    })
+
+    await stepHeading()
+    await screen.findByTestId('onboarding-telegram-test')
+    fireEvent.click(screen.getByTestId('onboarding-telegram-test'))
+
+    await waitFor(() => expect(rotateKey).toHaveBeenCalledWith('telegram.test-settings'))
+    expect(rotateKey).not.toHaveBeenCalledWith('telegram.test')
+    // The settings save never succeeded, so no key was cleared.
+    expect(clearKey).not.toHaveBeenCalled()
+    const alert = await screen.findByRole('alert')
+    expect(alert).toHaveTextContent('冲突')
+  })
+
+  it('settles a failed test send on the test key and shows the mapped 401 reason', async () => {
+    const rotateKey = vi.fn(() => 'rotated-key')
+    const clearKey = vi.fn()
+    const testTelegram = vi.fn(async () => {
+      throw new SettingsApiError('unauthorized', 'TELEGRAM_TOKEN_INVALID', {
+        httpStatus: 422,
+        kind: 'refusal',
+      })
+    })
+    renderOnboarding({
+      step: 4,
+      telegram: async () => telegramConfigured(),
+      testTelegram,
+      rotateKey,
+      clearKey,
+    })
+
+    await stepHeading()
+    await screen.findByTestId('onboarding-telegram-test')
+    fireEvent.click(screen.getByTestId('onboarding-telegram-test'))
+
+    const alert = await screen.findByRole('alert')
+    expect(alert).toHaveTextContent('401 Unauthorized')
+    // The settings save succeeded first, so its key was cleared; the failed
+    // send then settled the test key, not the settings key.
+    await waitFor(() => expect(clearKey).toHaveBeenCalledWith('telegram.test'))
+    expect(clearKey).toHaveBeenCalledWith('telegram.test-settings')
+    expect(rotateKey).not.toHaveBeenCalled()
+  })
+
+  it('never announces a missing chat on the first ready paint when chats exist', async () => {
+    const seen: string[] = []
+    const observer = new MutationObserver(() => {
+      const reason = document.querySelector('[data-testid="onboarding-telegram-test-reason"]')
+      if (reason) {
+        seen.push(reason.textContent ?? '')
+      }
+      const finish = document.querySelector('[data-testid="onboarding-telegram-finish"]')
+      if (finish) {
+        seen.push(finish.getAttribute('aria-describedby') ?? '')
+      }
+    })
+    observer.observe(document.body, {
+      childList: true,
+      subtree: true,
+      characterData: true,
+      attributes: true,
+    })
+    try {
+      renderOnboarding({ step: 4, telegram: async () => telegramConfigured() })
+      await screen.findByTestId('onboarding-telegram-finish')
+      expect(screen.getByTestId('onboarding-telegram-test-reason')).not.toHaveTextContent(
+        '没有 chat id',
+      )
+      expect(screen.getByTestId('onboarding-telegram-finish')).not.toHaveAttribute(
+        'aria-describedby',
+        'onboarding-telegram-no-chat',
+      )
+      await waitFor(() => expect(seen.join(' ')).not.toContain('没有 chat id'))
+      expect(seen.join(' ')).not.toContain('onboarding-telegram-no-chat')
+    } finally {
+      observer.disconnect()
+    }
+  })
+
+  it('shows the token-missing reason visibly with its description target', async () => {
+    renderOnboarding({ step: 4 })
+
+    await stepHeading()
+    const reason = await screen.findByText('先保存 bot token 才能完成或发送测试。')
+    expect(reason).toHaveAttribute('id', 'onboarding-telegram-no-token')
+    expect(reason).toHaveClass('status-message')
+    expect(reason).not.toHaveClass('visually-hidden')
+    expect(screen.getByTestId('onboarding-telegram-finish')).toHaveAttribute(
+      'aria-describedby',
+      'onboarding-telegram-no-token',
+    )
+  })
+
+  it('shows the chat-missing reason visibly when the token has no chat', async () => {
+    renderOnboarding({
+      step: 4,
+      telegram: async () =>
+        telegramEnvelope({
+          token: {
+            configured: true,
+            masked: '****9f2a',
+            last4: '9f2a',
+            source: 'stored',
+            updated_at: '2026-11-06T10:00:00.000Z',
+          },
+          chat_ids: [],
+          allowed_user_ids: [2002],
+        }),
+    })
+
+    await stepHeading()
+    const reason = await screen.findByText('至少添加一个 chat id 才能完成或发送测试。')
+    expect(reason).toHaveAttribute('id', 'onboarding-telegram-no-chat')
+    expect(reason).toHaveClass('status-message')
+    expect(reason).not.toHaveClass('visually-hidden')
+    expect(screen.getByTestId('onboarding-telegram-finish')).toHaveAttribute(
+      'aria-describedby',
+      'onboarding-telegram-no-chat',
+    )
+  })
+
+  it('clears the token invalid state when saving settings clears the error', async () => {
+    const setToken = vi.fn(async () => {
+      throw new SettingsApiError('token rejected', 'VALIDATION_FAILED', { httpStatus: 422 })
+    })
+    renderOnboarding({
+      step: 4,
+      telegram: async () => telegramConfigured(),
+      setTelegramToken: setToken,
+    })
+
+    await stepHeading()
+    const tokenInput = await screen.findByTestId('onboarding-telegram-token')
+    fireEvent.change(tokenInput, { target: { value: 'bad-token' } })
+    fireEvent.click(screen.getByTestId('onboarding-telegram-token-save'))
+    await waitFor(() => expect(document.getElementById('onboarding-telegram-error')).not.toBeNull())
+    expect(tokenInput).toHaveAttribute('aria-invalid', 'true')
+
+    fireEvent.click(screen.getByTestId('onboarding-telegram-finish'))
+    await waitFor(() => expect(document.getElementById('onboarding-telegram-error')).toBeNull())
+
+    expect(tokenInput).not.toHaveAttribute('aria-invalid')
+    const ids = (tokenInput.getAttribute('aria-describedby') ?? '').split(/\s+/).filter(Boolean)
+    expect(ids.length).toBeGreaterThan(0)
+    for (const id of ids) {
+      expect(document.getElementById(id)).not.toBeNull()
+    }
+  })
+
+  it('is read-only at 375px with the desktop/CLI instruction', async () => {
+    renderOnboarding({ step: 4, isNarrow: true, telegram: async () => telegramConfigured() })
+
+    await stepHeading()
+    expect(screen.getByRole('note')).toHaveTextContent('移动端只读')
+    expect(await screen.findByTestId('onboarding-telegram-token')).toBeDisabled()
+    expect(screen.getByTestId('onboarding-telegram-token-save')).toBeDisabled()
+    expect(screen.getByTestId('onboarding-telegram-finish')).toBeDisabled()
   })
 })
 
@@ -1191,7 +1529,10 @@ describe('OnboardingPage step 5 — watchlist, schedule, budget, review', () => 
 
     const saved = await screen.findByTestId('onboarding-step5-saved')
     expect(saved).toHaveTextContent('步骤 5 已保存')
-    expect(screen.getByRole('link', { name: /继续步骤 1/ })).toHaveAttribute('href', '/onboarding/1')
+    expect(screen.getByRole('link', { name: /继续步骤 1/ })).toHaveAttribute(
+      'href',
+      '/onboarding/1',
+    )
     // The server said the wizard is not complete: no review, no completion claim.
     expect(screen.queryByTestId('onboarding-review')).toBeNull()
     expect(screen.queryByText(/引导完成/)).toBeNull()
@@ -1329,9 +1670,7 @@ describe('OnboardingPage step 5 — watchlist, schedule, budget, review', () => 
     )
     expect(screen.getByRole('alert')).toBeInTheDocument()
     expect(screen.getByTestId('onboarding-finish-error')).toHaveTextContent('日预算必须是')
-    expect(screen.getByTestId('onboarding-finish-error')).not.toHaveTextContent(
-      '至少星标 1 个标的',
-    )
+    expect(screen.getByTestId('onboarding-finish-error')).not.toHaveTextContent('至少星标 1 个标的')
     expect(daily).toHaveAttribute('aria-invalid', 'true')
   })
 

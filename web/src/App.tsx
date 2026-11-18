@@ -26,6 +26,7 @@ import { SettingsPromptHistoryPage } from './routes/settings-prompt-history'
 import { SettingsPromptsPage } from './routes/settings-prompts'
 import { SettingsRiskPage } from './routes/settings-risk'
 import { SettingsScanPage } from './routes/settings-scan'
+import { SettingsTelegramPage } from './routes/settings-telegram'
 import { SymbolInspectorPage } from './routes/symbol-inspector'
 import { SystemPage } from './routes/system'
 import { TriggerDetailPage } from './routes/trigger-detail'
@@ -105,6 +106,8 @@ export default function App() {
               <SettingsBudgetPage />
             ) : route.isSettingsLlm ? (
               <SettingsLLMPage />
+            ) : route.isSettingsTelegram ? (
+              <SettingsTelegramPage />
             ) : route.isSettingsPromptHistory && route.promptId !== null ? (
               <SettingsPromptHistoryPage key={route.promptId} promptId={route.promptId} />
             ) : route.isSettingsPromptDetail && route.promptId !== null ? (

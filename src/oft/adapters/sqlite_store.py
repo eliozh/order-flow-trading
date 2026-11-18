@@ -10,7 +10,7 @@ writer. Diagnostic commands open the database with ``mode=ro`` so ``oft status``
 from __future__ import annotations
 
 import sqlite3
-from collections.abc import Callable
+from collections.abc import Callable, Sequence
 from contextlib import closing
 from dataclasses import replace
 from datetime import datetime, timedelta
@@ -275,6 +275,41 @@ class SqliteStore(
             record = self._insert_audit_event(connection, audit)
             connection.commit()
             return chat_record, user_record, record
+        except BaseException:
+            connection.rollback()
+            raise
+        finally:
+            connection.close()
+
+    def save_telegram_settings_change(
+        self,
+        keys: Sequence[str],
+        build: Callable[
+            [dict[str, ConfigRecord | None]],
+            tuple[Sequence[ConfigRecord], AuditEventDraft] | None,
+        ],
+    ) -> tuple[dict[str, ConfigRecord | None], AuditEventRecord | None]:
+        """Read, decide, and write the managed Telegram settings atomically."""
+        connection = self._connect()
+        try:
+            connection.execute("BEGIN IMMEDIATE")
+            current: dict[str, ConfigRecord | None] = {}
+            for key in keys:
+                row = connection.execute(
+                    "SELECT key, value_json, updated_at, updated_by FROM config WHERE key = ?",
+                    (key,),
+                ).fetchone()
+                current[key] = _config_row_to_config(row) if row is not None else None
+            outcome = build(current)
+            if outcome is None:
+                connection.commit()
+                return current, None
+            records, audit = outcome
+            for record in records:
+                self._upsert_config(connection, record)
+            audit_record = self._insert_audit_event(connection, audit)
+            connection.commit()
+            return current, audit_record
         except BaseException:
             connection.rollback()
             raise

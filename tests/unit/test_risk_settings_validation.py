@@ -420,7 +420,11 @@ def test_legacy_cross_field_document_is_readable_and_repairable(tmp_path: Path) 
     assert summary.caps.per_trade_risk_pct == 0.8
     assert summary.caps.daily_loss_pct == 0.5
     # The overview and detail reads stay available for the operator.
-    assert [section["section"] for section in service.read_sections()] == ["scan", "risk"]
+    assert [section["section"] for section in service.read_sections()] == [
+        "scan",
+        "risk",
+        "telegram",
+    ]
     assert service.read_risk_settings().caps.daily_loss_pct == 0.5
 
     result = service.update_risk_caps({"daily_loss_pct": 3.0}, actor="cli", confirm=True)
@@ -697,7 +701,7 @@ def test_read_sections_never_computes_utilization(
 
     sections = service.read_sections()
 
-    assert [section["section"] for section in sections] == ["scan", "risk"]
+    assert [section["section"] for section in sections] == ["scan", "risk", "telegram"]
 
 
 def test_utilization_survives_a_position_number_beyond_the_float_range(

@@ -260,7 +260,7 @@ def test_settings_sections_include_the_risk_section(
 
     _validate(validator, response.json())
     sections = {item["section"]: item for item in response.json()["data"]["sections"]}
-    assert set(sections) == {"scan", "risk"}
+    assert set(sections) == {"scan", "risk", "telegram"}
     assert sections["risk"]["source"] == "default"
     assert sections["risk"]["last_changed"] is None
     assert sections["risk"]["keys"] == [

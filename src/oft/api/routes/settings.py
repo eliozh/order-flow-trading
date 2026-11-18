@@ -177,8 +177,11 @@ def get_onboarding_progress(request: Request) -> dict[str, Any]:
     """Completed first-run steps and the server-derived resume point.
 
     A fresh install needs no persisted config: steps are empty and the wizard
-    resumes at step 1. Deferred steps are listed with their milestone and are
-    never completed. No secret or key value can appear in this payload.
+    resumes at step 1. The deferred step is listed with its milestone and is
+    never completed. Telegram step 4 is active and optional: an incomplete
+    optional step never makes ``all_complete`` false, but it is still the first
+    incomplete active step and therefore the resume point. No secret or key
+    value can appear in this payload.
     """
     try:
         data = _service(request).read_onboarding_progress().to_contract()
@@ -205,9 +208,12 @@ def update_onboarding_progress(
 ) -> Any:
     """Mark one active step complete; a repeat is a deterministic no-op.
 
-    Steps 3 (Binance) and 4 (Telegram) are deferred to Milestones 5 and 6 and
-    are rejected with a ``step_deferred`` detail, writing nothing. A corrupt
-    persisted progress document is ``CONFIG_INVALID`` and is never overwritten.
+    Step 3 (Binance) is deferred to Milestone 5 and is rejected with a
+    ``step_deferred`` detail, writing nothing. Step 4 (Telegram) is a real
+    optional step: it can be completed once a token and a chat id are
+    configured, and leaving it incomplete never makes ``all_complete`` false.
+    A corrupt persisted progress document is ``CONFIG_INVALID`` and is never
+    overwritten.
     """
     try:
         return idempotent_mutation(

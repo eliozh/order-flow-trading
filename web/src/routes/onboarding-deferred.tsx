@@ -1,8 +1,8 @@
 import type { OnboardingStepNumber } from '../api/onboarding'
 
 export interface DeferredStepProps {
-  /** Only steps 3 (Binance) and 4 (Telegram) are deferred in this slice. */
-  step: 3 | 4
+  /** Only step 3 (Binance) is deferred in this slice. */
+  step: 3
   title: string
   milestone: number
   narrow: boolean

@@ -35,6 +35,7 @@ export interface RouteMatch {
   isSettingsRisk: boolean
   isSettingsBudget: boolean
   isSettingsLlm: boolean
+  isSettingsTelegram: boolean
   isSettingsPrompts: boolean
   isSettingsPromptDetail: boolean
   isSettingsPromptHistory: boolean
@@ -90,6 +91,7 @@ export function resolveRoute(pathname: string): RouteMatch {
   const isSettingsRisk = path === '/settings/risk'
   const isSettingsBudget = path === '/settings/budget'
   const isSettingsLlm = path === '/settings/llm'
+  const isSettingsTelegram = path === '/settings/telegram'
   const isSettingsPrompts = path === '/settings/prompts'
   // One detail segment, or exactly one detail segment plus `/history`. A
   // deeper path falls through to the not-found panel.
@@ -136,6 +138,7 @@ export function resolveRoute(pathname: string): RouteMatch {
     isSettingsRisk ||
     isSettingsBudget ||
     isSettingsLlm ||
+    isSettingsTelegram ||
     isSettingsPrompts ||
     isSettingsPromptDetail ||
     isSettingsPromptHistory ||
@@ -171,6 +174,7 @@ export function resolveRoute(pathname: string): RouteMatch {
     isSettingsRisk,
     isSettingsBudget,
     isSettingsLlm,
+    isSettingsTelegram,
     isSettingsPrompts,
     isSettingsPromptDetail,
     isSettingsPromptHistory,

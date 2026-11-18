@@ -8,7 +8,7 @@ from __future__ import annotations
 
 from typing import Literal
 
-from pydantic import BaseModel, ConfigDict, Field
+from pydantic import BaseModel, ConfigDict, Field, StrictInt
 
 from oft.api.schemas.envelope import Envelope
 from oft.api.schemas.errors import ErrorBody, ErrorEnvelope
@@ -91,6 +91,56 @@ class TelegramReceiptsData(BaseModel):
     total: int
 
 
+class TelegramTogglesData(BaseModel):
+    """The six operator-facing push toggles (defaults are all enabled)."""
+
+    scan_report: bool
+    trigger: bool
+    entry_recheck: bool
+    position: bool
+    risk: bool
+    budget: bool
+
+
+class TelegramTogglesUpdate(BaseModel):
+    """A partial toggle patch; an omitted toggle keeps its stored value."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    scan_report: bool | None = None
+    trigger: bool | None = None
+    entry_recheck: bool | None = None
+    position: bool | None = None
+    risk: bool | None = None
+    budget: bool | None = None
+
+
+class TelegramSettingsUpdate(BaseModel):
+    """A partial Telegram settings patch; omitted fields keep their value."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    chat_ids: list[StrictInt] | None = None
+    allowed_user_ids: list[StrictInt] | None = None
+    toggles: TelegramTogglesUpdate | None = None
+    reason: str = Field(default="", max_length=500)
+
+
+class TelegramSettingsData(BaseModel):
+    """The aggregate F10f payload: masked token plus configuration/receipts."""
+
+    token: TelegramTokenStatusData
+    chat_ids: list[int]
+    allowed_user_ids: list[int]
+    toggles: TelegramTogglesData
+    source: Literal["default", "user"]
+    updated_at: str | None = None
+    updated_by: str | None = None
+    receipts: list[TelegramReceiptData]
+    receipt_total: int
+    latest_test_receipt: TelegramReceiptData | None = None
+
+
 __all__ = [
     "ERROR_RESPONSES",
     "Envelope",
@@ -100,9 +150,13 @@ __all__ = [
     "TelegramAllowlistUpdate",
     "TelegramReceiptData",
     "TelegramReceiptsData",
+    "TelegramSettingsData",
+    "TelegramSettingsUpdate",
     "TelegramState",
     "TelegramStatusData",
     "TelegramTestRequest",
+    "TelegramTogglesData",
+    "TelegramTogglesUpdate",
     "TelegramTokenDelete",
     "TelegramTokenStatusData",
     "TelegramTokenUpdate",

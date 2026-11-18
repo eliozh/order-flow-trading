@@ -430,7 +430,7 @@ def test_settings_sections_expose_source_and_keys_without_values(tmp_path: Path)
         before = client.get("/api/v1/settings", headers=auth)
         assert before.status_code == 200, before.text
         section = before.json()["data"]["sections"]
-        assert len(section) == 2
+        assert len(section) == 3
         assert section[0] == {
             "section": "scan",
             "source": "default",
@@ -479,6 +479,7 @@ def test_settings_sections_are_metadata_only_for_risk(
     assert [section["section"] for section in response.json()["data"]["sections"]] == [
         "scan",
         "risk",
+        "telegram",
     ]
     # The detail route still owns the snapshot and is expected to fail here.
     with TestClient(app) as client, pytest.raises(AssertionError):
