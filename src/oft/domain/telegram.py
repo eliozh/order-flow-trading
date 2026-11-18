@@ -91,8 +91,14 @@ TELEGRAM_ALLOWED_USER_IDS_KEY = "telegram.allowed_user_ids"
 # explicit opt-in so a broken scan does not page an operator by default.
 SCAN_REPORT_PUSH_KEY = "telegram.scan_report"
 SCAN_FAILED_ALERT_KEY = "telegram.scan_failed_alert"
+# Opportunity lifecycle and entry re-check pushes are enabled by default: both
+# are time-sensitive and the ledger is unaffected when delivery fails.
+TRIGGER_ALERT_KEY = "telegram.trigger_alert"
+ENTRY_RECHECK_ALERT_KEY = "telegram.entry_recheck_alert"
 # A scan summary lists at most this many report ids so the message stays short.
 MAX_SCAN_REPORT_IDS = 10
+# A burst push lists at most this many opportunities, then a remaining count.
+MAX_OPPORTUNITY_ALERT_ITEMS = 5
 # A corrupt/legacy decimal (for example ``1e100000000``) would expand to an
 # unbounded string; values with a larger adjusted exponent render as ``N/A``.
 MAX_DECIMAL_ADJUSTED_EXPONENT = 30
@@ -376,11 +382,13 @@ __all__ = [
     "COMMANDS",
     "DESKTOP_VIEW_TEXT",
     "DISPATCHER_HEARTBEAT_KEY",
+    "ENTRY_RECHECK_ALERT_KEY",
     "HELP_COMMAND",
     "MAX_ARGUMENT_CHARS",
     "MAX_DECIMAL_ADJUSTED_EXPONENT",
     "MAX_GLOBAL_REFUSALS_PER_WINDOW",
     "MAX_INBOUND_TEXT",
+    "MAX_OPPORTUNITY_ALERT_ITEMS",
     "MAX_OUTBOUND_CHARS",
     "MAX_REFUSALS_PER_WINDOW",
     "MAX_SCAN_REPORT_IDS",
@@ -400,6 +408,7 @@ __all__ = [
     "STATUS_COMMAND",
     "SYMBOL_ARGUMENT_PATTERN",
     "TELEGRAM_ALLOWED_USER_IDS_KEY",
+    "TRIGGER_ALERT_KEY",
     "TELEGRAM_BOT_TOKEN_MAX_LENGTH",
     "TELEGRAM_BOT_TOKEN_PATTERN",
     "TELEGRAM_CHAT_IDS_KEY",

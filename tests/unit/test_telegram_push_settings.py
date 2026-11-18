@@ -12,7 +12,12 @@ from oft.adapters.sqlite_store import SqliteStore
 from oft.application.settings_service import SettingsService
 from oft.clock import FixedClock
 from oft.config import ConfigError, Settings
-from oft.domain.telegram import SCAN_FAILED_ALERT_KEY, SCAN_REPORT_PUSH_KEY
+from oft.domain.telegram import (
+    ENTRY_RECHECK_ALERT_KEY,
+    SCAN_FAILED_ALERT_KEY,
+    SCAN_REPORT_PUSH_KEY,
+    TRIGGER_ALERT_KEY,
+)
 from oft.ports.store import ConfigRecord
 
 NOW = datetime(2026, 11, 17, 9, 30, tzinfo=UTC)
@@ -41,15 +46,31 @@ def test_absent_toggles_read_their_documented_defaults(tmp_path: Path) -> None:
 
     assert service.read_scan_report_push() is True
     assert service.read_failed_scan_alert() is False
+    assert service.read_trigger_alert() is True
+    assert service.read_entry_recheck_alert() is True
 
 
 def test_persisted_toggles_are_honoured(tmp_path: Path) -> None:
     store, service = _service(tmp_path)
     _set_raw(store, SCAN_REPORT_PUSH_KEY, json.dumps(False))
     _set_raw(store, SCAN_FAILED_ALERT_KEY, json.dumps(True))
+    _set_raw(store, TRIGGER_ALERT_KEY, json.dumps(False))
+    _set_raw(store, ENTRY_RECHECK_ALERT_KEY, json.dumps(False))
 
     assert service.read_scan_report_push() is False
     assert service.read_failed_scan_alert() is True
+    assert service.read_trigger_alert() is False
+    assert service.read_entry_recheck_alert() is False
+
+
+@pytest.mark.parametrize("reader", ["read_trigger_alert", "read_entry_recheck_alert"])
+def test_an_unreadable_lifecycle_toggle_raises_config_error(tmp_path: Path, reader: str) -> None:
+    store, service = _service(tmp_path)
+    key = TRIGGER_ALERT_KEY if reader == "read_trigger_alert" else ENTRY_RECHECK_ALERT_KEY
+    _set_raw(store, key, '"not-a-boolean"')
+
+    with pytest.raises(ConfigError):
+        getattr(service, reader)()
 
 
 @pytest.mark.parametrize("raw", ["not-json", "{}", "[]"])

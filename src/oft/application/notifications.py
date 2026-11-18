@@ -32,12 +32,22 @@ from oft.application.scan_summary import (
     stage_for_error_code,
 )
 from oft.application.telegram_events import (
+    ENTRY_RECHECK_EVENT_TYPE,
+    OPPORTUNITY_INVALIDATED_EVENT_TYPE,
+    OPPORTUNITY_TRIGGERED_BURST_EVENT_TYPE,
+    OPPORTUNITY_TRIGGERED_EVENT_TYPE,
     SCAN_SUMMARY_EVENT_TYPE,
     ScanSummary,
     build_scan_summary_event,
     scan_summary_dedupe_key,
 )
-from oft.application.telegram_messages import render_scan_summary
+from oft.application.telegram_messages import (
+    render_entry_recheck_alert,
+    render_invalidation_alert,
+    render_opportunity_burst,
+    render_scan_summary,
+    render_trigger_alert,
+)
 from oft.domain.telegram import MAX_SCAN_REPORT_IDS, ReceiptState
 from oft.domain.time import utc_timestamp
 from oft.ports.clock import ClockPort
@@ -66,8 +76,14 @@ DELIVERY_FAILED_REASON = "TELEGRAM_DELIVERY_FAILED: the Telegram message could n
 # A summary with no report ids is silent unless the failed-scan alert is on.
 _SCAN_REPORT_TOGGLE = "scan_report"
 _SCAN_FAILED_ALERT_TOGGLE = "scan_failed_alert"
+_TRIGGER_ALERT_TOGGLE = "trigger_alert"
+_ENTRY_RECHECK_ALERT_TOGGLE = "entry_recheck_alert"
 _RENDERERS: dict[str, Callable[[Mapping[str, Any]], str]] = {
-    SCAN_SUMMARY_EVENT_TYPE: render_scan_summary
+    SCAN_SUMMARY_EVENT_TYPE: render_scan_summary,
+    OPPORTUNITY_TRIGGERED_EVENT_TYPE: render_trigger_alert,
+    OPPORTUNITY_INVALIDATED_EVENT_TYPE: render_invalidation_alert,
+    OPPORTUNITY_TRIGGERED_BURST_EVENT_TYPE: render_opportunity_burst,
+    ENTRY_RECHECK_EVENT_TYPE: render_entry_recheck_alert,
 }
 
 
@@ -85,6 +101,10 @@ class NotificationSettings(Protocol):
     def read_scan_report_push(self) -> bool: ...
 
     def read_failed_scan_alert(self) -> bool: ...
+
+    def read_trigger_alert(self) -> bool: ...
+
+    def read_entry_recheck_alert(self) -> bool: ...
 
 
 class NotificationService:
@@ -244,6 +264,16 @@ class NotificationService:
         )
 
     def _event_enabled(self, event_type: str, payload: Mapping[str, Any]) -> bool:
+        # The toggle is checked before a row is built or written, so a disabled
+        # event leaves no orphan outbox row.
+        if event_type in (
+            OPPORTUNITY_TRIGGERED_EVENT_TYPE,
+            OPPORTUNITY_INVALIDATED_EVENT_TYPE,
+            OPPORTUNITY_TRIGGERED_BURST_EVENT_TYPE,
+        ):
+            return self._read_toggle(_TRIGGER_ALERT_TOGGLE)
+        if event_type == ENTRY_RECHECK_EVENT_TYPE:
+            return self._read_toggle(_ENTRY_RECHECK_ALERT_TOGGLE)
         if event_type != SCAN_SUMMARY_EVENT_TYPE:
             return False
         report_ids = payload.get("report_ids") or ()
@@ -257,7 +287,13 @@ class NotificationService:
         try:
             if toggle == _SCAN_REPORT_TOGGLE:
                 return bool(self._settings_service.read_scan_report_push())
-            return bool(self._settings_service.read_failed_scan_alert())
+            if toggle == _SCAN_FAILED_ALERT_TOGGLE:
+                return bool(self._settings_service.read_failed_scan_alert())
+            if toggle == _TRIGGER_ALERT_TOGGLE:
+                return bool(self._settings_service.read_trigger_alert())
+            if toggle == _ENTRY_RECHECK_ALERT_TOGGLE:
+                return bool(self._settings_service.read_entry_recheck_alert())
+            return False
         except Exception as exc:  # noqa: BLE001 - fail closed on an unreadable toggle
             LOGGER.warning(
                 "telegram_notification_toggle_unreadable",
