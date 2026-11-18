@@ -34,6 +34,7 @@ from oft.application.prompt_service import (
     RenderedPrompt,
     secret_values_from_settings,
 )
+from oft.application.telegram_events import NotificationSink
 from oft.config import Settings
 from oft.domain.llm_output import DecisionOutput
 from oft.domain.opportunities import ConditionDraftError, Opportunity
@@ -126,12 +127,15 @@ class AnalysisService:
         budget: BudgetLedger | None = None,
         settings: Settings | None = None,
         runtime: LLMRuntimeRegistry | None = None,
+        notifications: NotificationSink | None = None,
     ) -> None:
         self._store = store
         self._clock = clock
         self._provider = provider
         self._settings = settings
-        self._budget = budget or BudgetLedger(store=store, settings=settings)
+        self._budget = budget or BudgetLedger(
+            store=store, settings=settings, notifications=notifications
+        )
         self._opportunities = OpportunityService(store=store, clock=clock)
         self._secrets = secret_values_from_settings(settings) if settings is not None else ()
         self._prompts = PromptService(store=store, clock=clock, secret_values=self._secrets)

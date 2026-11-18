@@ -12,6 +12,7 @@ from pathlib import Path
 
 from oft.application.budget_service import (
     DEFAULT_THRESHOLDS,
+    BudgetAlertSink,
     BudgetConfigError,
     BudgetEntry,
     BudgetService,
@@ -33,8 +34,14 @@ class BudgetLedger:
         store: StorePort,
         settings: Settings | None = None,
         price_table: PriceTable | None = None,
+        notifications: BudgetAlertSink | None = None,
     ) -> None:
-        self._service = BudgetService(store=store, settings=settings, price_table=price_table)
+        self._service = BudgetService(
+            store=store,
+            settings=settings,
+            price_table=price_table,
+            notifications=notifications,
+        )
 
     @property
     def service(self) -> BudgetService:
@@ -120,6 +127,7 @@ def budget_schema_path() -> Path:
 
 
 __all__ = [
+    "BudgetAlertSink",
     "BudgetConfigError",
     "BudgetEntry",
     "BudgetLedger",

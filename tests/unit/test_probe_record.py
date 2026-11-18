@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import json
 from datetime import UTC, datetime
+from decimal import Decimal
 from pathlib import Path
 from typing import Any
 
@@ -16,7 +17,7 @@ from oft.adapters.sqlite_store import SqliteStore
 from oft.application.llm_orchestrator import CapabilityProbeService
 from oft.clock import FixedClock
 from oft.config import Settings
-from oft.ports.llm import ProbeOutcome
+from oft.ports.llm import LLMUsage, ProbeOutcome
 
 NOW = datetime(2026, 11, 9, 12, 0, 0, tzinfo=UTC)
 FIXTURES = Path(__file__).resolve().parents[1] / "fixtures" / "llm" / "providers" / "openai"
@@ -237,6 +238,91 @@ def test_a_probe_with_reported_usage_is_priced(tmp_path: Path) -> None:
     budget = store.list_budget_records()[0]
     assert budget.unpriced is False
     assert budget.cost_usd == "2.50000000"
+
+
+class _PricedProbeAdapter:
+    """A probe seam whose successive outcomes carry priced usage."""
+
+    def __init__(self, usages: list[LLMUsage]) -> None:
+        self._usages = iter(usages)
+
+    def probe(self, *, model: str, role: Any = None) -> ProbeOutcome:
+        return ProbeOutcome(
+            strict_schema=True,
+            notes="strict schema accepted",
+            max_output_tokens=4096,
+            latency_ms=5,
+            usage=next(self._usages),
+            usage_reported=True,
+        )
+
+
+class _RecordingBudgetSink:
+    """An in-memory BudgetAlertSink; no Telegram, keyring, or network."""
+
+    def __init__(self) -> None:
+        self.calls: list[dict[str, Any]] = []
+
+    def enqueue_budget_threshold(
+        self,
+        *,
+        period: str,
+        period_key: str,
+        spend_usd: str,
+        threshold_usd: str,
+        state: str,
+        occurred_at: str,
+    ) -> None:
+        self.calls.append(
+            {
+                "period": period,
+                "period_key": period_key,
+                "spend_usd": spend_usd,
+                "threshold_usd": threshold_usd,
+                "state": state,
+                "occurred_at": occurred_at,
+            }
+        )
+
+
+def test_a_probe_that_crosses_the_threshold_alerts_exactly_once(tmp_path: Path) -> None:
+    """A billable probe crossing 80% must reach the sink exactly once (ME-1)."""
+    adapter = _PricedProbeAdapter(
+        [
+            LLMUsage(input_tokens=3_000_000, output_tokens=0),  # $7.50 -> OK
+            LLMUsage(input_tokens=400_000, output_tokens=0),  # $8.50 total -> WARN
+            LLMUsage(input_tokens=40_000, output_tokens=0),  # $8.60 total -> still WARN
+        ]
+    )
+    settings = Settings(
+        env="test",
+        port=8765,
+        data_dir=tmp_path / "data",
+        llm_provider="openai",
+        llm_model_analysis="gpt-fixture",
+        openai_api_key="sk-test",
+        llm_price_table=_price_table(tmp_path),
+    )
+    store = SqliteStore(settings)
+    store.initialize()
+    sink = _RecordingBudgetSink()
+    service = CapabilityProbeService(
+        settings=settings,
+        store=store,
+        clock=FixedClock(NOW),
+        adapter_factory=lambda _settings, _name: adapter,
+        notifications=sink,
+    )
+
+    service.run("openai")  # 75% of the $10.00 daily threshold: no crossing
+    service.run("openai")  # 85%: one crossing
+    service.run("openai")  # 86%, still above: no second alert
+
+    assert [(call["period"], call["state"]) for call in sink.calls] == [("day", "WARN")]
+    assert sink.calls[0]["period_key"] == "2026-11-09"
+    assert Decimal(sink.calls[0]["spend_usd"]) == Decimal("8.50")
+    assert Decimal(sink.calls[0]["threshold_usd"]) == Decimal("10.00")
+    assert len(store.list_budget_records()) == 3
 
 
 def _runtime_with_open_breaker() -> Any:

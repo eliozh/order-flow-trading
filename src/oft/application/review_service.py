@@ -69,6 +69,7 @@ from oft.application.review_models import (
     validated_review_fields,
     validated_validation_status,
 )
+from oft.application.telegram_events import NotificationSink
 from oft.config import Settings
 from oft.domain.llm_output import Timeframe
 from oft.domain.prompts import PromptRole
@@ -186,6 +187,7 @@ class ReviewService:
         settings: Settings,
         provider: LLMPort | None,
         runtime: LLMRuntimeRegistry | None = None,
+        notifications: NotificationSink | None = None,
     ) -> None:
         self._store = store
         self._clock = clock
@@ -200,7 +202,7 @@ class ReviewService:
                 clock=clock,
                 provider=provider,
                 settings=settings,
-                budget=BudgetLedger(store=store, settings=settings),
+                budget=BudgetLedger(store=store, settings=settings, notifications=notifications),
                 runtime=runtime,
             )
             if provider is not None

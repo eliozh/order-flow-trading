@@ -51,6 +51,8 @@ WATCHLIST_EMPTY_TEXT = "还没有星标品种。"
 QUERY_ERROR_INVALID_ARGUMENT = "参数无效"
 QUERY_ERROR_UNAVAILABLE = "数据不可用"
 READ_ONLY_NOTICE = "MVP 只读：不支持任何写入或审批操作。"
+# The documented F10e parity line: threshold crossings alert, calls continue.
+BUDGET_CONTINUES_NOTICE = "达到 80% 与 100% 阈值时经 Telegram 告警；不会停止调用。"
 # The one instruction an entry re-check alert may carry: the human acts on the
 # desktop or CLI. The push itself never renders an approval shortcut.
 ENTRY_RECHECK_INSTRUCTION = "请在桌面端或 CLI 处理。"
@@ -688,6 +690,31 @@ def render_position_management_alert(payload: Mapping[str, Any]) -> str:
     return truncate_outbound("\n".join(lines))
 
 
+def render_budget_alert(payload: Mapping[str, Any]) -> str:
+    """Render one budget-threshold push, read-only and bounded.
+
+    The payload is the allowlisted audit-event subset. Every dynamic value is
+    sanitized to a single line; spend and threshold carry USDT, and an
+    unreadable unpriced count is ``N/A`` rather than a fabricated zero. The
+    closing notice is this module's constant so no caller can add an action.
+    """
+    period = _text(payload.get("period"))
+    state = _text(payload.get("state"))
+    lines = [
+        f"预算告警 · {period.upper()} · {state}",
+        f"period: {period}",
+        f"period_key: {_text(payload.get('period_key'))}",
+        f"spend_usd: {_usd_text(_decimal_or_none(payload.get('spend_usd')))}",
+        f"threshold_usd: {_usd_text(_decimal_or_none(payload.get('threshold_usd')))}",
+        f"percentage: {_pct_text(payload.get('percentage'))}",
+        f"state: {state}",
+        f"unpriced_count: {_count_text(payload.get('unpriced_count'))}",
+        f"occurred_at: {_timestamp(payload.get('occurred_at'))}",
+        BUDGET_CONTINUES_NOTICE,
+    ]
+    return truncate_outbound("\n".join(lines))
+
+
 def render_risk_alert(payload: Mapping[str, Any]) -> str:
     """Render one daily-loss/leverage/notional risk alert, bounded and read-only."""
     kind = _text(payload.get("kind"))
@@ -934,6 +961,7 @@ def _unrealized_pnl(
 
 
 __all__ = [
+    "BUDGET_CONTINUES_NOTICE",
     "ENTRY_RECHECK_INSTRUCTION",
     "NARRATIVE_EXCERPT_CHARS",
     "OPPORTUNITIES_EMPTY_TEXT",
@@ -947,6 +975,7 @@ __all__ = [
     "STATUS_HELP_FIELDS",
     "WATCHLIST_EMPTY_TEXT",
     "render_budget",
+    "render_budget_alert",
     "render_degradation_alert",
     "render_entry_recheck_alert",
     "render_help",

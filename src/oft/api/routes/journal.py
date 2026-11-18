@@ -55,6 +55,7 @@ def _review_service(request: Request, provider: str | None) -> ReviewService:
         settings=container.settings,
         provider=resolved_provider,
         runtime=container.llm_runtime,
+        notifications=container.notifications,
     )
 
 

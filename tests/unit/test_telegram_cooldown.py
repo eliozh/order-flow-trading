@@ -13,10 +13,11 @@ from oft.application.notifications import NotificationFreshnessSink, Notificatio
 from oft.application.telegram_events import (
     build_degradation_event,
     build_risk_alert_event,
+    enqueue_budget_threshold,
     enqueue_risk_alert,
 )
 from oft.clock import FixedClock
-from oft.domain.telegram import RISK_PUSH_KEY
+from oft.domain.telegram import BUDGET_PUSH_KEY, RISK_PUSH_KEY
 
 NOW = datetime(2026, 11, 17, 9, 30, tzinfo=UTC)
 NOW_TEXT = "2026-11-17T09:30:00.000Z"
@@ -44,6 +45,9 @@ class _DurableStore:
     def get_telegram_outbox(self, event_key: str) -> Any:
         return self.outbox.get(event_key)
 
+    def list_budget_records_for_period(self, period: str, period_key: str) -> tuple[Any, ...]:
+        return ()
+
 
 class _Channel:
     def status_state(self) -> object:
@@ -54,9 +58,10 @@ class _Channel:
 
 
 class _Settings:
-    def __init__(self, *, risk: bool = True, position: bool = True) -> None:
+    def __init__(self, *, risk: bool = True, position: bool = True, budget: bool = True) -> None:
         self.risk = risk
         self.position = position
+        self.budget = budget
 
     def read_scan_report_push(self) -> bool:
         return True
@@ -75,6 +80,9 @@ class _Settings:
 
     def read_risk_push(self) -> bool:
         return self.risk
+
+    def read_budget_push(self) -> bool:
+        return self.budget
 
 
 def _service(store: _DurableStore, settings: _Settings | None = None) -> NotificationService:
@@ -355,6 +363,75 @@ def test_two_periods_do_not_grow_cooldown_rows_but_alert_once_each() -> None:
     cooldown_rows = [key for key in store.state if key.startswith("telegram.alert_cooldown.")]
     assert cooldown_rows == ["telegram.alert_cooldown.risk:DAILY_LOSS:ACCOUNT:BREACH"]
     assert store.state[cooldown_rows[0]] == "2026-11-18"
+
+
+def test_budget_toggle_key_is_registered() -> None:
+    assert BUDGET_PUSH_KEY == "telegram.budget"
+
+
+def _budget_kwargs(period_key: str, *, state: str = "WARN") -> dict[str, Any]:
+    return {
+        "period": "day",
+        "period_key": period_key,
+        "spend_usd": "8.50",
+        "threshold_usd": "10.00",
+        "state": state,
+        "unpriced_count": 0,
+        "occurred_at": NOW_TEXT,
+    }
+
+
+def test_budget_alert_cooldown_is_one_row_per_period_and_state() -> None:
+    store = _DurableStore()
+    service = _service(store)
+
+    first = enqueue_budget_threshold(service, **_budget_kwargs("2026-11-17"))
+    repeated = enqueue_budget_threshold(service, **_budget_kwargs("2026-11-17"))
+    next_day = enqueue_budget_threshold(service, **_budget_kwargs("2026-11-18"))
+    exceeded = enqueue_budget_threshold(service, **_budget_kwargs("2026-11-18", state="EXCEEDED"))
+
+    assert first is not None
+    assert repeated is None
+    assert next_day is not None
+    assert exceeded is not None
+    assert len(store.outbox) == 3
+    cooldown_rows = sorted(key for key in store.state if key.startswith("telegram.alert_cooldown."))
+    assert cooldown_rows == [
+        "telegram.alert_cooldown.budget:day:EXCEEDED",
+        "telegram.alert_cooldown.budget:day:WARN",
+    ]
+    assert store.state["telegram.alert_cooldown.budget:day:WARN"] == "2026-11-18"
+
+
+def test_a_disabled_budget_toggle_writes_no_row_and_no_cooldown_marker() -> None:
+    store = _DurableStore()
+    service = _service(store, _Settings(budget=False))
+
+    assert enqueue_budget_threshold(service, **_budget_kwargs("2026-11-17")) is None
+    assert store.outbox == {}
+    assert "telegram.alert_cooldown.budget:day:WARN" not in store.state
+
+
+def _budget_service_kwargs(period_key: str, *, state: str = "WARN") -> dict[str, Any]:
+    # The production method computes the unpriced count itself.
+    values = _budget_kwargs(period_key, state=state)
+    values.pop("unpriced_count")
+    return values
+
+
+def test_the_production_service_budget_path_is_once_per_period_across_restart() -> None:
+    store = _DurableStore()
+
+    first = _service(store).enqueue_budget_threshold(**_budget_service_kwargs("2026-11-17"))
+    # A new service instance over the same durable store is a restart.
+    restarted = _service(store).enqueue_budget_threshold(**_budget_service_kwargs("2026-11-17"))
+    next_day = _service(store).enqueue_budget_threshold(**_budget_service_kwargs("2026-11-18"))
+
+    assert first is not None
+    assert restarted is None
+    assert next_day is not None
+    assert len(store.outbox) == 2
+    assert store.state["telegram.alert_cooldown.budget:day:WARN"] == "2026-11-18"
 
 
 def test_degradation_state_survives_a_restart_mid_episode() -> None:

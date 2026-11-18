@@ -20,7 +20,12 @@ from typing import Any, Protocol, cast
 
 import structlog
 
-from oft.application.budget_ledger import BudgetEntry, BudgetLedger, stable_call_id
+from oft.application.budget_ledger import (
+    BudgetAlertSink,
+    BudgetEntry,
+    BudgetLedger,
+    stable_call_id,
+)
 from oft.application.llm_validation import (
     ValidationIssue,
     ValidationOutcome,
@@ -882,12 +887,16 @@ class CapabilityProbeService:
         clock: ClockPort,
         adapter_factory: Callable[[Settings, str], Any] | None = None,
         runtime: LLMRuntimeRegistry | None = None,
+        notifications: BudgetAlertSink | None = None,
     ) -> None:
         self._settings = settings
         self._store = store
         self._clock = clock
         self._adapter_factory = adapter_factory
         self._runtime = runtime
+        # A probe is billable, so its budget row must reach the same threshold
+        # sink as every other call; ``None`` keeps the probe fully local.
+        self._notifications = notifications
 
     def _factory(self) -> Callable[[Settings, str], Any]:
         if self._adapter_factory is not None:
@@ -1060,7 +1069,11 @@ class CapabilityProbeService:
         )
         # A corrupt price table is handled inside the budget service as an
         # unpriced row plus a local audit, never as a probe 500 (F5).
-        BudgetLedger(store=self._store, settings=self._settings).record_billed_call(
+        BudgetLedger(
+            store=self._store,
+            settings=self._settings,
+            notifications=self._notifications,
+        ).record_billed_call(
             call=record,
             result=result,
             occurred_at=checked_at,

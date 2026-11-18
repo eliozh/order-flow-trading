@@ -44,6 +44,7 @@ def _probe_service(request: Request) -> CapabilityProbeService:
         store=container.store,
         clock=container.clock,
         runtime=container.llm_runtime,
+        notifications=container.notifications,
     )
 
 

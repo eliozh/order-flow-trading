@@ -15,11 +15,12 @@ from __future__ import annotations
 import hashlib
 from collections.abc import Sequence
 from dataclasses import dataclass
-from decimal import Decimal
+from decimal import ROUND_HALF_UP, Decimal
 from typing import Any, Protocol
 
 from oft.application.scan_summary import stage_for_error_code
 from oft.application.telegram_messages import (
+    render_budget_alert,
     render_degradation_alert,
     render_entry_recheck_alert,
     render_invalidation_alert,
@@ -44,22 +45,28 @@ OPPORTUNITY_TRIGGERED_BURST_EVENT_TYPE = "opportunity_triggered_burst"
 ENTRY_RECHECK_EVENT_TYPE = "entry_recheck"
 POSITION_MANAGEMENT_EVENT_TYPE = "position_management"
 RISK_ALERT_EVENT_TYPE = "risk_alert"
+BUDGET_THRESHOLD_EVENT_TYPE = "budget_threshold"
 DEGRADATION_EVENT_TYPE = "degradation"
 # A trigger/burst is more urgent than a routine scan summary; an entry re-check
 # awaiting a human action is the most urgent of all. Position/risk events move
-# money or explain a block, so they outrank routine summaries.
+# money or explain a block, so they outrank routine summaries. A budget
+# threshold is a spend warning: above a routine summary, below a live trigger.
 OPPORTUNITY_ALERT_PRIORITY = 20
 ENTRY_RECHECK_PRIORITY = 30
 POSITION_ALERT_PRIORITY = 40
 RISK_ALERT_PRIORITY = 40
 DEGRADATION_PRIORITY = 25
+BUDGET_ALERT_PRIORITY = 15
 OPPORTUNITY_SUBJECT_KIND = "OPPORTUNITY"
 ENTRY_SUBJECT_KIND = "TRIGGER"
 BURST_SUBJECT_KIND = "OPPORTUNITY_BURST"
 POSITION_SUBJECT_KIND = "POSITION"
 RISK_SUBJECT_KIND = "RISK"
+BUDGET_SUBJECT_KIND = "BUDGET"
 DEGRADATION_SUBJECT_KIND = "SYSTEM"
 RISK_ALERT_KINDS: tuple[str, ...] = ("DAILY_LOSS", "MAX_LEVERAGE", "MAX_NOTIONAL")
+BUDGET_ALERT_PERIODS: tuple[str, ...] = ("day", "week", "month")
+BUDGET_ALERT_STATES: tuple[str, ...] = ("WARN", "EXCEEDED")
 DEGRADATION_STATES: tuple[str, ...] = ("DEGRADED", "RECOVERED")
 DAILY_LOSS_APPROACH_RATIO = Decimal("0.8")
 _OPPORTUNITY_ALERT_STATE_TRIGGERED = "TRIGGERED"
@@ -89,7 +96,28 @@ class NotificationEvent:
     text: str
 
 
-class NotificationSink(Protocol):
+class BudgetAlertSink(Protocol):
+    """The one write a budget threshold needs from the notification layer.
+
+    Declared structurally so a ledger never imports the concrete notification
+    module (a Telegram failure cannot then couple back into a transaction).
+    ``NotificationService`` satisfies it, and ``NotificationSink`` extends it so
+    the budget contract has a single declaration.
+    """
+
+    def enqueue_budget_threshold(
+        self,
+        *,
+        period: str,
+        period_key: str,
+        spend_usd: str,
+        threshold_usd: str,
+        state: str,
+        occurred_at: str,
+    ) -> object | None: ...
+
+
+class NotificationSink(BudgetAlertSink, Protocol):
     """The writes a service needs from the notification layer.
 
     Services depend on this narrow structural surface instead of the concrete
@@ -484,6 +512,123 @@ def enqueue_risk_alert(
     )
 
 
+def budget_threshold_dedupe_key(period: str, state: str, period_key: str) -> str:
+    """One message identity per period window and threshold state."""
+    return f"budget:{period}:{state}:{period_key}"
+
+
+def budget_alert_cooldown_key(period: str, state: str) -> str:
+    """The stable cooldown key for one period+state threshold crossing.
+
+    The alerted period window is stored as the marker *value* by
+    ``enqueue_cooled``, not encoded in the key, so the durable ``system_state``
+    rows stay bounded by (period, state) instead of growing every day/week/month.
+
+    Replay boundary: only the latest window is remembered, while the outbox
+    ``event_key`` remains the durable record for the same window. An audit
+    replay of an *older* crossing is therefore suppressed only while its outbox
+    row survives ``TELEGRAM_OUTBOX_RETENTION_SECONDS`` (7 days); replaying that
+    older audit after retention (or out of order after a newer window regressed
+    the marker) can enqueue it again. This requires a direct local audit/DB
+    replay, so it is a bounded-at-most-one-per-period-key residual, not a remote
+    path.
+    """
+    return f"budget:{period}:{state}"
+
+
+def _budget_percentage(spend_usd: str, threshold_usd: str) -> str | None:
+    """``spend / threshold * 100`` as a one-decimal string, or ``None``.
+
+    Only a usable (finite, positive) threshold yields a percentage; the
+    existing audit values are never re-derived or rounded toward a state.
+    """
+    spend = _finite_decimal(spend_usd)
+    threshold = _finite_decimal(threshold_usd)
+    if spend is None or threshold is None or threshold <= 0:
+        return None
+    try:
+        percentage = (spend / threshold) * Decimal("100")
+        if not percentage.is_finite():
+            return None
+        return format(percentage.quantize(Decimal("0.1"), rounding=ROUND_HALF_UP), "f")
+    except (ArithmeticError, ValueError):
+        # An absurd stored exponent is unmeasurable, not an alert failure.
+        return None
+
+
+def build_budget_threshold_event(
+    *,
+    period: str,
+    period_key: str,
+    spend_usd: str,
+    threshold_usd: str,
+    state: str,
+    unpriced_count: int | None,
+    occurred_at: str,
+) -> NotificationEvent:
+    """Build one budget-threshold push from the existing audit draft values.
+
+    The payload is an explicit allowlist: period window, spend/threshold, the
+    derived percentage, state, the honest unpriced count, and the timestamp.
+    No provider/model text, prompt, path, key, or free-text reason is copied.
+    """
+    payload: dict[str, Any] = {
+        "period": period,
+        "period_key": period_key,
+        "spend_usd": spend_usd,
+        "threshold_usd": threshold_usd,
+        "percentage": _budget_percentage(spend_usd, threshold_usd),
+        "state": state,
+        "unpriced_count": unpriced_count,
+        "occurred_at": occurred_at,
+    }
+    return NotificationEvent(
+        event_type=BUDGET_THRESHOLD_EVENT_TYPE,
+        subject={"kind": BUDGET_SUBJECT_KIND, "id": f"{period}:{period_key}"},
+        dedupe_key=budget_threshold_dedupe_key(period, state, period_key),
+        priority=BUDGET_ALERT_PRIORITY,
+        payload=payload,
+        text=render_budget_alert(payload),
+    )
+
+
+def enqueue_budget_threshold(
+    sink: NotificationSink,
+    *,
+    period: str,
+    period_key: str,
+    spend_usd: str,
+    threshold_usd: str,
+    state: str,
+    unpriced_count: int | None,
+    occurred_at: str,
+) -> object | None:
+    """Build and enqueue one budget alert through the durable cooldown path.
+
+    Only the two alert states of the three budget periods are enqueueable; an
+    unknown label returns ``None`` rather than sending an unlabeled message.
+    The cooldown key is the stable period+state and the period window is its
+    stored value, so one crossing alerts once, a later period alerts again, and
+    a restart/replay (including an identical duplicate audit draft) is a
+    durable no-op. The outbox ``dedupe_key`` keeps the window because it is the
+    message identity.
+    """
+    if period not in BUDGET_ALERT_PERIODS or state not in BUDGET_ALERT_STATES:
+        return None
+    event = build_budget_threshold_event(
+        period=period,
+        period_key=period_key,
+        spend_usd=spend_usd,
+        threshold_usd=threshold_usd,
+        state=state,
+        unpriced_count=unpriced_count,
+        occurred_at=occurred_at,
+    )
+    return sink.enqueue_cooled(
+        event, cooldown_key=budget_alert_cooldown_key(period, state), period=period_key
+    )
+
+
 def degradation_dedupe_key(subject: str, state: str, episode: str) -> str:
     """One key per subject+state+episode transition."""
     return f"degraded:{subject}:{state}:{episode}"
@@ -577,6 +722,17 @@ def _condition_level(condition: Condition) -> str | None:
     return None
 
 
+def _finite_decimal(value: object) -> Decimal | None:
+    """Parse one finite decimal string; unusable values are ``None``."""
+    if not isinstance(value, str) or not value.strip():
+        return None
+    try:
+        parsed = Decimal(value)
+    except (ArithmeticError, TypeError, ValueError):
+        return None
+    return parsed if parsed.is_finite() else None
+
+
 def _non_negative(value: object) -> int:
     if isinstance(value, bool) or not isinstance(value, int):
         return 0
@@ -584,6 +740,11 @@ def _non_negative(value: object) -> int:
 
 
 __all__ = [
+    "BUDGET_ALERT_PERIODS",
+    "BUDGET_ALERT_PRIORITY",
+    "BUDGET_ALERT_STATES",
+    "BUDGET_SUBJECT_KIND",
+    "BUDGET_THRESHOLD_EVENT_TYPE",
     "DAILY_LOSS_APPROACH_RATIO",
     "DEGRADATION_EVENT_TYPE",
     "DEGRADATION_PRIORITY",
@@ -605,19 +766,24 @@ __all__ = [
     "SCAN_SUBJECT_KIND",
     "SCAN_SUMMARY_EVENT_TYPE",
     "SCAN_SUMMARY_PRIORITY",
+    "BudgetAlertSink",
     "NotificationEvent",
     "NotificationSink",
     "ScanSummary",
     "build_degradation_event",
     "build_entry_recheck_event",
+    "build_budget_threshold_event",
     "build_opportunity_burst_event",
     "build_opportunity_invalidated_event",
     "build_opportunity_triggered_event",
     "build_position_management_event",
     "build_risk_alert_event",
     "build_scan_summary_event",
+    "budget_alert_cooldown_key",
+    "budget_threshold_dedupe_key",
     "daily_loss_alert_state",
     "degradation_dedupe_key",
+    "enqueue_budget_threshold",
     "enqueue_risk_alert",
     "entry_alert_decision",
     "opportunity_state_version",

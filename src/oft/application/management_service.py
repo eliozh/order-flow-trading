@@ -479,7 +479,7 @@ class ManagementService:
         self._funding_settlement_enabled = funding_settlement_enabled
         self._risk_breach_enabled = risk_breach_enabled
         self._notifications = notifications
-        self._budget = BudgetLedger(store=store, settings=settings)
+        self._budget = BudgetLedger(store=store, settings=settings, notifications=notifications)
         self._orchestrator = (
             LLMOrchestrator(
                 store=store,

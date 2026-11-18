@@ -15,6 +15,14 @@ several. A negative group/supergroup id is never a push target.
 
 Dependency direction stays acyclic: this module imports the pure event/render
 helpers and the ports, never ``scan_service``, ``jobs``, or the API layer.
+
+Documented maintainability exception: this module sits just over the 800-line
+soft ceiling because it is the single push write path - readiness, private-only
+targeting, per-event toggles, cooldown/dedupe markers, and the bounded summary
+loader all live here so a Telegram failure can never couple into another
+service. The budget-alert hand-off is a one-line delegation to the pure
+``telegram_events`` helper. Deferred: extract the per-event toggle/targeting
+policy into a companion module when the alert surface next changes.
 """
 
 from __future__ import annotations
@@ -32,6 +40,7 @@ from oft.application.scan_summary import (
     stage_for_error_code,
 )
 from oft.application.telegram_events import (
+    BUDGET_THRESHOLD_EVENT_TYPE,
     DEGRADATION_EVENT_TYPE,
     DEGRADATION_STATES,
     ENTRY_RECHECK_EVENT_TYPE,
@@ -45,9 +54,11 @@ from oft.application.telegram_events import (
     build_degradation_event,
     build_scan_summary_event,
     degradation_dedupe_key,
+    enqueue_budget_threshold,
     scan_summary_dedupe_key,
 )
 from oft.application.telegram_messages import (
+    render_budget_alert,
     render_degradation_alert,
     render_entry_recheck_alert,
     render_invalidation_alert,
@@ -89,6 +100,7 @@ _TRIGGER_ALERT_TOGGLE = "trigger_alert"
 _ENTRY_RECHECK_ALERT_TOGGLE = "entry_recheck_alert"
 _POSITION_PUSH_TOGGLE = "position"
 _RISK_PUSH_TOGGLE = "risk"
+_BUDGET_PUSH_TOGGLE = "budget"
 # The durable marker prefix for one cooldown/dedupe key; the value is the last
 # alerted period so a restart or a repeated tick is a no-op.
 ALERT_COOLDOWN_STATE_PREFIX = "telegram.alert_cooldown."
@@ -104,6 +116,7 @@ _RENDERERS: dict[str, Callable[[Mapping[str, Any]], str]] = {
     ENTRY_RECHECK_EVENT_TYPE: render_entry_recheck_alert,
     POSITION_MANAGEMENT_EVENT_TYPE: render_position_management_alert,
     RISK_ALERT_EVENT_TYPE: render_risk_alert,
+    BUDGET_THRESHOLD_EVENT_TYPE: render_budget_alert,
     DEGRADATION_EVENT_TYPE: render_degradation_alert,
 }
 
@@ -139,6 +152,8 @@ class NotificationSettings(Protocol):
     def read_position_push(self) -> bool: ...
 
     def read_risk_push(self) -> bool: ...
+
+    def read_budget_push(self) -> bool: ...
 
 
 class NotificationService:
@@ -388,6 +403,66 @@ class NotificationService:
             )
         return record
 
+    def enqueue_budget_threshold(
+        self,
+        *,
+        period: str,
+        period_key: str,
+        spend_usd: str,
+        threshold_usd: str,
+        state: str,
+        occurred_at: str,
+    ) -> TelegramOutboxRecord | None:
+        """Enqueue one budget-threshold alert derived from a durable audit event.
+
+        Spend, threshold, state, and the period window are the audit draft's
+        values; this method never re-sums the ledger. The unpriced count is a
+        read-only count of the same window and degrades to ``None`` (``N/A``)
+        when unreadable, never a fabricated zero. The event build and cooldown
+        path live in the pure :func:`telegram_events.enqueue_budget_threshold`
+        helper so the production method and unit tests share one implementation.
+        Every failure is contained here so the budget path is never affected.
+        """
+        try:
+            record = enqueue_budget_threshold(
+                self,
+                period=period,
+                period_key=period_key,
+                spend_usd=spend_usd,
+                threshold_usd=threshold_usd,
+                state=state,
+                unpriced_count=self._unpriced_count(period, period_key),
+                occurred_at=occurred_at,
+            )
+            return record if isinstance(record, TelegramOutboxRecord) else None
+        except Exception as exc:  # noqa: BLE001 - a push never breaks the budget path
+            LOGGER.warning(
+                "telegram_budget_alert_failed",
+                period=period,
+                error_type=type(exc).__name__,
+            )
+            return None
+
+    def _unpriced_count(self, period: str, period_key: str) -> int | None:
+        """The honest unpriced row count for one window, or ``None`` if unreadable.
+
+        Known residual: the ledger adapter returns ``()`` when the database file
+        is absent, so that narrow case renders ``0`` rather than ``N/A``. A
+        crossing implies a just-written ledger database, so this is effectively
+        unreachable; every raised read error correctly renders ``N/A``. Fixing
+        the distinction needs an adapter change, which is out of scope here.
+        """
+        try:
+            rows = self._store.list_budget_records_for_period(period, period_key)
+        except Exception as exc:  # noqa: BLE001 - N/A is honest, zero is not
+            LOGGER.warning(
+                "telegram_budget_unpriced_unreadable",
+                period=period,
+                error_type=type(exc).__name__,
+            )
+            return None
+        return sum(1 for record in rows if record.unpriced)
+
     def notify_scan(self, scan_id: str) -> TelegramOutboxRecord | None:
         """Enqueue the one summary for a completed scan, recomputed from rows.
 
@@ -467,6 +542,8 @@ class NotificationService:
             return self._read_toggle(_POSITION_PUSH_TOGGLE)
         if event_type in (RISK_ALERT_EVENT_TYPE, DEGRADATION_EVENT_TYPE):
             return self._read_toggle(_RISK_PUSH_TOGGLE)
+        if event_type == BUDGET_THRESHOLD_EVENT_TYPE:
+            return self._read_toggle(_BUDGET_PUSH_TOGGLE)
         if event_type != SCAN_SUMMARY_EVENT_TYPE:
             return False
         report_ids = payload.get("report_ids") or ()
@@ -490,6 +567,8 @@ class NotificationService:
                 return bool(self._settings_service.read_position_push())
             if toggle == _RISK_PUSH_TOGGLE:
                 return bool(self._settings_service.read_risk_push())
+            if toggle == _BUDGET_PUSH_TOGGLE:
+                return bool(self._settings_service.read_budget_push())
             return False
         except Exception as exc:  # noqa: BLE001 - fail closed on an unreadable toggle
             LOGGER.warning(
