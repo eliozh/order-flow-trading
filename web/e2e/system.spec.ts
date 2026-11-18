@@ -81,7 +81,7 @@ function scanValue(page: Page, label: string) {
 async function waitForLoadedSystem(page: Page): Promise<void> {
   await expect(page.getByRole('heading', { name: 'System status', level: 1 })).toBeVisible()
   await expect(page.getByRole('heading', { name: 'Latest fixture scan' })).toBeVisible()
-  await expect(page.locator('.scan-grid')).toBeVisible()
+  await expect(page.locator('.panel[aria-labelledby="scan-heading"] .scan-grid')).toBeVisible()
 }
 
 async function fetchReadiness(page: Page): Promise<ReadinessData> {
@@ -164,7 +164,7 @@ test('shows health OK, readiness OK with named checks, version, data dir, and th
   await expect(page.getByText(`${readiness.checks.length} named checks`)).toBeVisible()
 
   // Every named readiness check is rendered with its own state.
-  const rows = page.locator('table.data-table tbody tr')
+  const rows = page.getByRole('table', { name: 'Named readiness checks' }).locator('tbody tr')
   await expect(rows).toHaveCount(readiness.checks.length)
   for (const name of EXPECTED_CHECKS) {
     const check = readiness.checks.find((candidate) => candidate.name === name)
@@ -329,5 +329,211 @@ test('captures the /system shell at 1440, 768, and 375', async ({ page }) => {
       path: path.join(SCREENS_DIR, viewport.name),
       fullPage: true,
     })
+  }
+})
+
+interface TelegramStatusPayload {
+  configured: boolean
+  chat_count: number
+  allowed_user_count: number
+  poller_state: string
+  last_poll_at: string | null
+  last_send_at: string | null
+  failing_receipts: number
+  receipts: Record<string, number>
+  per_chat: Array<Record<string, unknown>>
+  recent_receipts: Array<Record<string, unknown>>
+  overflow_code: string | null
+  last_error_code: string | null
+  daemon_state: string
+}
+
+function statusEnvelope(telegram: TelegramStatusPayload) {
+  return {
+    ok: true,
+    data: {
+      status: 'ok',
+      env: 'test',
+      version: '0.1.0',
+      host: '127.0.0.1',
+      port: 7622,
+      data_dir: '/tmp/e2e',
+      log_level: 'WARNING',
+      generated_at: '2026-11-17T09:30:00.000Z',
+      universe: {
+        source: 'fixture',
+        as_of: '2026-11-17T00:00:00.000Z',
+        count: 0,
+        tradifi_count: 0,
+        symbols: [],
+      },
+      schedule: null,
+      telegram,
+    },
+    error: null,
+    meta: {
+      request_id: 'REQ-E2E-TELEGRAM',
+      generated_at: '2026-11-17T09:30:00.000Z',
+      duration_ms: 0,
+      provenance: 'CALC',
+      data_quality: 'COMPLETE',
+      warnings: [],
+      pagination: null,
+      idempotent_replay: false,
+    },
+  }
+}
+
+test('exposes the stable Telegram delivery state from /api/v1/status without secrets', async ({
+  page,
+}) => {
+  await authenticate(page)
+  const response = await page.request.get('/api/v1/status')
+  expect(response.status()).toBe(200)
+  const body = (await response.json()) as {
+    ok: boolean
+    data: { telegram: TelegramStatusPayload | null } | null
+  }
+  expect(body.ok).toBe(true)
+  const telegram = body.data?.telegram
+  expect(telegram).not.toBeNull()
+  if (!telegram) {
+    return
+  }
+  expect(typeof telegram.configured).toBe('boolean')
+  expect(typeof telegram.chat_count).toBe('number')
+  expect(typeof telegram.allowed_user_count).toBe('number')
+  expect(typeof telegram.poller_state).toBe('string')
+  expect(typeof telegram.failing_receipts).toBe('number')
+  expect(telegram.receipts).toEqual(
+    expect.objectContaining({
+      queued: expect.any(Number),
+      sending: expect.any(Number),
+      sent: expect.any(Number),
+      failed: expect.any(Number),
+    }),
+  )
+  expect(Array.isArray(telegram.per_chat)).toBe(true)
+  // Stable codes/counts only: never the token, outbound text, or a raw body.
+  const serialized = JSON.stringify(telegram)
+  for (const forbidden of ['bot_token', 'payload_json', 'description"', 'api.telegram.org/bot']) {
+    expect(serialized).not.toContain(forbidden)
+  }
+})
+
+const FAILING_TELEGRAM_PAYLOAD: TelegramStatusPayload = {
+  configured: true,
+  chat_count: 2,
+  allowed_user_count: 1,
+  poller_state: 'CONFLICT',
+  last_poll_at: '2026-11-17T09:29:00.000Z',
+  last_send_at: '2026-11-17T09:28:00.000Z',
+  failing_receipts: 1,
+  receipts: { queued: 1, sending: 0, sent: 4, failed: 1 },
+  per_chat: [
+    {
+      chat_id: 1001,
+      queued: 0,
+      sending: 0,
+      sent: 0,
+      failed: 1,
+      last_error_code: 'TELEGRAM_UPSTREAM_ERROR',
+    },
+    { chat_id: 2002, queued: 1, sending: 0, sent: 4, failed: 0, last_error_code: null },
+  ],
+  recent_receipts: [
+    {
+      event_key: 'scan:e2e:report',
+      kind: 'scan_report',
+      chat_id: 1001,
+      state: 'failed',
+      attempts: 3,
+      message_id: null,
+      last_error_code: 'TELEGRAM_UPSTREAM_ERROR',
+      created_at: '2026-11-17T09:27:00.000Z',
+      sent_at: null,
+    },
+    {
+      event_key: 'scan:e2e:delivered',
+      kind: 'scan_report',
+      chat_id: 2002,
+      state: 'sent',
+      attempts: 0,
+      message_id: 4821,
+      last_error_code: null,
+      created_at: '2026-11-17T09:28:00.000Z',
+      sent_at: '2026-11-17T09:28:00.000Z',
+    },
+  ],
+  overflow_code: null,
+  last_error_code: 'TELEGRAM_UPSTREAM_ERROR',
+  daemon_state: 'UP',
+}
+
+test('renders the receipt card and a persistent alert for failing pushes', async ({ page }) => {
+  await authenticate(page)
+  await page.route('**/api/v1/status', async (route) => {
+    await route.fulfill({
+      status: 200,
+      contentType: 'application/json',
+      body: JSON.stringify(statusEnvelope(FAILING_TELEGRAM_PAYLOAD)),
+    })
+  })
+
+  await page.goto('/system')
+  await waitForLoadedSystem(page)
+
+  const alert = page.getByRole('alert')
+  await expect(alert).toContainText('Telegram pushes failing')
+  await expect(alert).toContainText('TELEGRAM_UPSTREAM_ERROR')
+
+  await expect(page.getByRole('heading', { name: 'Telegram delivery receipts' })).toBeVisible()
+  const chatTable = page.getByRole('table', { name: 'Telegram delivery receipts by chat' })
+  await expect(chatTable).toBeVisible()
+  await expect(chatTable.locator('tbody tr')).toHaveCount(2)
+  await expect(chatTable).toContainText('1001')
+  await expect(chatTable).toContainText('TELEGRAM_UPSTREAM_ERROR')
+
+  const receiptTable = page.getByRole('table', { name: 'Recent Telegram receipts' })
+  await expect(receiptTable).toBeVisible()
+  await expect(receiptTable).toContainText('4821')
+  await expect(receiptTable).toContainText('SENT')
+  await expect(receiptTable).toContainText('FAILED')
+})
+
+test('at 375 and 768 the failing Telegram card has no page-level horizontal scroll', async ({
+  page,
+}) => {
+  await page.route('**/api/v1/status', async (route) => {
+    await route.fulfill({
+      status: 200,
+      contentType: 'application/json',
+      body: JSON.stringify(statusEnvelope(FAILING_TELEGRAM_PAYLOAD)),
+    })
+  })
+  await authenticate(page)
+
+  for (const width of [375, 768]) {
+    await page.setViewportSize({ width, height: width === 375 ? 812 : 1024 })
+    await page.goto('/system')
+    await waitForLoadedSystem(page)
+
+    // The compact branch renders the receipt lists (not the wide tables).
+    await expect(page.getByRole('heading', { name: 'Telegram delivery receipts' })).toBeVisible()
+    await expect(
+      page.getByRole('group', { name: 'Telegram delivery receipts by chat' }),
+    ).toBeVisible()
+    await expect(page.getByRole('group', { name: 'Recent Telegram receipts' })).toContainText(
+      'scan:e2e:report',
+    )
+    await expect(page.getByRole('alert')).toContainText('Telegram pushes failing')
+
+    const widths = await page.evaluate(() => ({
+      document: document.documentElement.scrollWidth,
+      body: document.body.scrollWidth,
+      viewport: window.innerWidth,
+    }))
+    expect(widths.document).toBeLessThanOrEqual(widths.viewport)
+    expect(widths.body).toBeLessThanOrEqual(widths.viewport)
   }
 })

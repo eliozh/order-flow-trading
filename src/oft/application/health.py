@@ -1,4 +1,12 @@
-"""Health, readiness, doctor checks, and daemon probing."""
+"""Health, readiness, doctor checks, and daemon probing.
+
+Documented maintainability exception: this module is the single diagnostics
+surface shared by `/ready`, `/api/v1/status`, `oft doctor`, and
+`oft system info`. The Telegram observability projection lives here so one
+implementation feeds every surface (and the file sits just over the 800-line
+soft ceiling); extracting it would require splitting the readiness/doctor
+contracts and their tests for no behavioral gain.
+"""
 
 from __future__ import annotations
 
@@ -17,9 +25,16 @@ from oft.config import SECRET_FIELDS, Settings
 from oft.domain.layout import PARTITION_ROOTS
 from oft.domain.telegram import (
     POLLER_HEARTBEAT_KEY,
+    POLLER_LAST_ERROR_KEY,
     POLLER_STALE_SECONDS,
+    POLLER_STATE_CONFLICT,
+    POLLER_STATE_DEGRADED,
+    POLLER_STATE_KEY,
+    POLLER_STATE_UNKNOWN,
     TELEGRAM_ALLOWED_USER_IDS_KEY,
     TELEGRAM_CHAT_IDS_KEY,
+    TELEGRAM_LAST_SEND_AT_KEY,
+    TELEGRAM_OUTBOX_OVERFLOW_KEY,
     TelegramValidationError,
     validate_telegram_token,
 )
@@ -64,6 +79,7 @@ class ReadinessReport:
     checked_at: str
     checks: tuple[CheckResult, ...]
     latest_scan: dict[str, Any] | None
+    telegram: dict[str, Any] | None = None
 
 
 @dataclass(frozen=True)
@@ -73,6 +89,7 @@ class DoctorReport:
     checked_at: str
     checks: tuple[CheckResult, ...]
     latest_scan: dict[str, Any] | None
+    telegram: dict[str, Any] | None = None
 
 
 def build_health() -> HealthReport:
@@ -151,7 +168,27 @@ def build_readiness(
         checked_at=utc_timestamp(now),
         checks=tuple(checks),
         latest_scan=asdict(latest) if latest is not None else None,
+        # Readiness is unauthenticated, so it carries only the bounded state a
+        # probe needs: configured, receipt totals, the failing count, and the
+        # poller enum. Chat ids and recent event keys stay on authenticated
+        # surfaces (`/api/v1/status`, `oft doctor`, `oft system info`).
+        telegram=_telegram_readiness(settings, store, clock),
     )
+
+
+def _telegram_readiness(settings: Settings, store: StorePort, clock: ClockPort) -> dict[str, Any]:
+    """The minimal, non-identifying Telegram projection for `/ready`."""
+    summary = telegram_observability(settings, store, clock, daemon_state="UP")
+    receipts = summary.get("receipts")
+    if not isinstance(receipts, dict):
+        receipts = {"queued": 0, "sending": 0, "sent": 0, "failed": 0}
+    failing = summary.get("failing_receipts")
+    return {
+        "configured": bool(summary.get("configured")),
+        "failing_receipts": failing if isinstance(failing, int) else 0,
+        "receipts": receipts,
+        "poller_state": summary.get("poller_state") or POLLER_STATE_UNKNOWN,
+    }
 
 
 def _existing_ancestor(path: Path) -> Path:
@@ -522,6 +559,105 @@ def _stale_triggers_check(
     )
 
 
+def _safe_read(read: Any, default: Any) -> Any:
+    """Run one diagnostics read, falling back on any store/attribute failure."""
+    try:
+        return read()
+    except Exception:  # noqa: BLE001 - diagnostics must stay readable
+        return default
+
+
+def _receipt_projection(record: Any) -> dict[str, Any]:
+    """The bounded, non-secret receipt fields; never the payload text."""
+    return {
+        "event_key": str(record.event_key),
+        "kind": str(record.kind),
+        "chat_id": int(record.chat_id),
+        "state": str(record.state),
+        "attempts": int(record.attempts),
+        "message_id": record.message_id,
+        "last_error_code": record.last_error_code,
+        "created_at": str(record.created_at),
+        "sent_at": record.sent_at,
+    }
+
+
+def telegram_observability(
+    settings: Settings,
+    store: StorePort,
+    clock: ClockPort,
+    *,
+    daemon_state: str = "UP",
+) -> dict[str, Any]:
+    """One stable, non-secret Telegram state document for every diagnostics surface.
+
+    Exposes only booleans, counts, allowlisted chat/user counts, the stable
+    poller state/reason, receipt timestamps, per-chat totals, and a bounded list
+    of recent receipts (id/state/error/message id). It never resolves or renders
+    the token, the outbound text, or a raw Bot API body.
+    """
+    meta = _safe_read(lambda: store.get_secret_meta("telegram", "bot_token"), None)
+    configured = meta is not None or settings.telegram_bot_token is not None
+    chat_count = _safe_read(
+        lambda: _allowlist_count(store, TELEGRAM_CHAT_IDS_KEY, label="chat allowlist"), 0
+    )
+    user_count = _safe_read(
+        lambda: _allowlist_count(store, TELEGRAM_ALLOWED_USER_IDS_KEY, label="user allowlist"), 0
+    )
+    counts = _safe_read(
+        lambda: store.telegram_receipt_counts(),
+        {"queued": 0, "sending": 0, "sent": 0, "failed": 0},
+    )
+    if not isinstance(counts, dict):
+        counts = {"queued": 0, "sending": 0, "sent": 0, "failed": 0}
+    safe_counts = {
+        state: int(counts.get(state, 0) or 0) for state in ("queued", "sending", "sent", "failed")
+    }
+    per_chat = _safe_read(lambda: store.telegram_chat_statuses(), ())
+    per_chat_payload: list[dict[str, Any]] = []
+    for status in per_chat if isinstance(per_chat, (tuple, list)) else ():
+        if isinstance(status, dict):
+            entry = dict(status)
+        else:
+            entry = {
+                "chat_id": int(getattr(status, "chat_id", 0)),
+                "queued": int(getattr(status, "queued", 0)),
+                "sending": int(getattr(status, "sending", 0)),
+                "sent": int(getattr(status, "sent", 0)),
+                "failed": int(getattr(status, "failed", 0)),
+                "last_error_code": getattr(status, "last_error_code", None),
+            }
+        per_chat_payload.append(entry)
+    recent = _safe_read(lambda: store.list_telegram_receipts(limit=5), ())
+    recent_payload = [
+        _receipt_projection(record)
+        for record in (recent if isinstance(recent, (tuple, list)) else ())
+        if hasattr(record, "event_key")
+    ]
+    last_send_at = _safe_read(
+        lambda: store.get_system_state(TELEGRAM_LAST_SEND_AT_KEY), None
+    ) or _safe_read(lambda: store.last_telegram_sent_at(), None)
+    state = _safe_read(lambda: store.get_system_state(POLLER_STATE_KEY), None)
+    last_error_code = _safe_read(lambda: store.get_system_state(POLLER_LAST_ERROR_KEY), None)
+    return {
+        "configured": bool(configured),
+        "chat_count": chat_count if isinstance(chat_count, int) else 0,
+        "allowed_user_count": user_count if isinstance(user_count, int) else 0,
+        "poller_state": state or POLLER_STATE_UNKNOWN,
+        "last_poll_at": _safe_read(lambda: store.get_system_state(POLLER_HEARTBEAT_KEY), None),
+        "last_send_at": last_send_at or None,
+        "failing_receipts": safe_counts["failed"],
+        "receipts": safe_counts,
+        "per_chat": per_chat_payload,
+        "recent_receipts": recent_payload,
+        "overflow_code": _safe_read(
+            lambda: store.get_system_state(TELEGRAM_OUTBOX_OVERFLOW_KEY), None
+        ),
+        "last_error_code": last_error_code or None,
+        "daemon_state": daemon_state,
+    }
+
+
 def _telegram_check(
     settings: Settings,
     store: StorePort,
@@ -544,6 +680,14 @@ def _telegram_check(
         return CheckResult("telegram", "degraded", "telegram secret metadata unreadable")
     configured = meta is not None or settings.telegram_bot_token is not None
     if not configured:
+        summary = telegram_observability(settings, store, clock, daemon_state=daemon_state)
+        if summary["failing_receipts"] > 0:
+            return CheckResult(
+                "telegram",
+                "degraded",
+                f"{summary['failing_receipts']} failing telegram receipt(s); "
+                "the channel is not configured",
+            )
         return CheckResult("telegram", "ok", "not configured (optional)")
     if meta is None and settings.telegram_bot_token is not None:
         # The environment fallback is raw and never validated on write; an
@@ -573,6 +717,24 @@ def _telegram_check(
             "degraded",
             "configured but no user allowlist; a chat-only allowlist refuses every sender",
         )
+    summary = telegram_observability(settings, store, clock, daemon_state=daemon_state)
+    poller_state = summary["poller_state"]
+    reason = summary.get("last_error_code")
+    suffix = f" ({reason})" if reason else ""
+    if poller_state == POLLER_STATE_CONFLICT:
+        return CheckResult(
+            "telegram",
+            "degraded",
+            f"poller CONFLICT: another poller owns this token{suffix}",
+        )
+    if poller_state == POLLER_STATE_DEGRADED:
+        return CheckResult("telegram", "degraded", f"poller DEGRADED{suffix}")
+    if summary["failing_receipts"] > 0:
+        return CheckResult(
+            "telegram",
+            "degraded",
+            f"{summary['failing_receipts']} failing receipt(s); other chats continue",
+        )
     if daemon_state != "UP":
         return CheckResult("telegram", "ok", f"configured; {chat_count} chat(s); daemon is offline")
     raw = store.get_system_state_updated_at(POLLER_HEARTBEAT_KEY)
@@ -587,7 +749,12 @@ def _telegram_check(
     age = (clock.now().astimezone(UTC) - heartbeat.astimezone(UTC)).total_seconds()
     if age > POLLER_STALE_SECONDS:
         return CheckResult("telegram", "degraded", f"stale poller heartbeat ({age:.0f}s old)")
-    return CheckResult("telegram", "ok", f"configured; {chat_count} chat(s); poller {age:.0f}s old")
+    last_send = summary.get("last_send_at") or "never"
+    return CheckResult(
+        "telegram",
+        "ok",
+        f"configured; {chat_count} chat(s); poller {age:.0f}s old; last send {last_send}",
+    )
 
 
 def _allowlist_count(store: StorePort, key: str, *, label: str) -> int | CheckResult:
@@ -710,4 +877,5 @@ def build_doctor(
         checked_at=readiness.checked_at,
         checks=checks,
         latest_scan=readiness.latest_scan,
+        telegram=telegram_observability(settings, store, clock, daemon_state=probe.state),
     )

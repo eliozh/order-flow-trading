@@ -130,7 +130,9 @@ def test_a_transient_failure_is_retried_then_sent(tmp_path: Path) -> None:
     store = _store(tmp_path)
     clock = _MutableClock(NOW)
     port = TelegramFake(fail_send_times=2)
-    dispatcher = OutboxDispatcher(store=store, clock=clock, port_resolver=lambda: port)
+    dispatcher = OutboxDispatcher(
+        store=store, clock=clock, port_resolver=lambda: port, jitter=lambda: 0.0
+    )
     store.append_telegram_outbox(_record())
 
     assert dispatcher.dispatch_once() == 0
@@ -167,6 +169,7 @@ def test_transient_failures_schedule_exponential_backoff(tmp_path: Path) -> None
         store=store,
         clock=clock,
         port_resolver=lambda: TelegramFake(fail_send_times=10),
+        jitter=lambda: 0.0,
     )
     store.append_telegram_outbox(_record())
 
@@ -337,7 +340,9 @@ def test_retries_are_bounded_at_three_attempts(tmp_path: Path) -> None:
     store = _store(tmp_path)
     clock = _MutableClock(NOW)
     port = TelegramFake(fail_send_times=10)
-    dispatcher = OutboxDispatcher(store=store, clock=clock, port_resolver=lambda: port)
+    dispatcher = OutboxDispatcher(
+        store=store, clock=clock, port_resolver=lambda: port, jitter=lambda: 0.0
+    )
     store.append_telegram_outbox(_record())
 
     assert dispatcher.dispatch_once() == 0
@@ -577,11 +582,25 @@ def test_an_overlapping_dispatch_tick_is_skipped(tmp_path: Path) -> None:
 
 def test_claim_orders_by_priority_and_is_bounded(tmp_path: Path) -> None:
     store = _store(tmp_path)
+    # Priority orders *across chats*; a same-chat pair is ordered by enqueue
+    # time instead (covered in test_telegram_queue.py).
     store.append_telegram_outbox(
-        TelegramOutboxRecord(**{**_record("update:1:reply").__dict__, "priority": -1})
+        TelegramOutboxRecord(
+            **{
+                **_record("update:1:reply").__dict__,
+                "priority": -1,
+                "chat_id": 1001,
+            }
+        )
     )
     store.append_telegram_outbox(
-        TelegramOutboxRecord(**{**_record("update:2:reply").__dict__, "priority": 5})
+        TelegramOutboxRecord(
+            **{
+                **_record("update:2:reply").__dict__,
+                "priority": 5,
+                "chat_id": 2002,
+            }
+        )
     )
 
     claimed = store.claim_due_telegram_outbox(now="2026-11-17T09:30:00.000Z", limit=1)

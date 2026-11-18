@@ -67,6 +67,7 @@ from oft.ports.market_data import MarketDataPort
 from oft.ports.store import AuditEventDraft, StorePort, TelegramOutboxRecord
 from oft.ports.telegram import (
     TELEGRAM_NOT_CONFIGURED,
+    TELEGRAM_UPSTREAM_ERROR,
     TelegramError,
     TelegramPort,
 )
@@ -429,7 +430,15 @@ class TelegramService:
         text: str,
         priority: int,
         now: datetime,
-    ) -> TelegramOutboxRecord:
+    ) -> TelegramOutboxRecord | None:
+        """Append one outbox row, or ``None`` when the store rejected it.
+
+        ``append_telegram_outbox`` returns ``False`` both for a duplicate
+        ``event_key`` and for a queue that is at its global/per-chat cap. This
+        method must never fabricate a receipt: an inbound reply returns ``None``
+        (the caller tolerates no receipt), and an operator test send raises a
+        bounded stable error.
+        """
         timestamp = utc_timestamp(now)
         record = TelegramOutboxRecord(
             event_key=event_key,
@@ -446,7 +455,8 @@ class TelegramService:
             created_at=timestamp,
             sent_at=None,
         )
-        self._store.append_telegram_outbox(record)
+        if not self._store.append_telegram_outbox(record):
+            return None
         return record
 
     def _refusal_allowed(self, chat_id: int, now: datetime) -> bool:
@@ -572,7 +582,7 @@ class TelegramService:
             )
         now = self._clock.now()
         nonce = f"{int(now.timestamp() * 1000)}-{uuid.uuid4().hex}"
-        return self._enqueue(
+        record = self._enqueue(
             event_key=test_event_key(target, nonce),
             kind="test",
             chat_id=target,
@@ -581,6 +591,14 @@ class TelegramService:
             priority=5,
             now=now,
         )
+        if record is None:
+            # The outbox is at its bound: report a bounded stable error instead
+            # of handing the caller a receipt for a row that does not exist.
+            raise TelegramError(
+                TELEGRAM_UPSTREAM_ERROR,
+                "the Telegram outbox is full; try again later",
+            )
+        return record
 
     def receipts(self, limit: int = 20) -> tuple[TelegramOutboxRecord, ...]:
         return self._store.list_telegram_receipts(limit)

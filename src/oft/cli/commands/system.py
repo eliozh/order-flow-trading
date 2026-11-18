@@ -370,6 +370,9 @@ def _info_payload(settings: Settings, container: Any, *, json_output: bool) -> d
     now = container.clock.now()
     state = schedule_state(settings, container=container, json_output=json_output)
     schedule = state.next_run_payload(now)
+    daemon = _daemon_payload(settings, container)
+    from oft.application.health import telegram_observability
+
     return {
         "version": __version__,
         "environment": settings.env.value,
@@ -379,7 +382,7 @@ def _info_payload(settings: Settings, container: Any, *, json_output: bool) -> d
             "pid_file": str(pid_path(settings)),
         },
         "config_source": _config_source_payload(),
-        "daemon": _daemon_payload(settings, container),
+        "daemon": daemon,
         "scheduler": {
             "period": schedule["period"],
             "pending_period": schedule["pending_period"],
@@ -388,6 +391,15 @@ def _info_payload(settings: Settings, container: Any, *, json_output: bool) -> d
         },
         "jobs": redact_record(
             latest_jobs_payload(container.store),
+            secret_values=_configured_secret_values(settings),
+        ),
+        "telegram": redact_record(
+            telegram_observability(
+                settings,
+                container.store,
+                container.clock,
+                daemon_state="UP" if daemon["state"] == "RUNNING" else "OFFLINE",
+            ),
             secret_values=_configured_secret_values(settings),
         ),
         "generated_at": utc_timestamp(now),
@@ -412,6 +424,11 @@ def _render_info(payload: dict[str, Any]) -> str:
     schedule = payload["scheduler"]
     pending = schedule["pending_period"] or "none"
     jobs = " · ".join(_job_human(name, summary) for name, summary in payload["jobs"].items())
+    telegram = payload["telegram"]
+    telegram_line = (
+        f"{telegram['poller_state']} · {telegram['chat_count']} chat(s) · "
+        f"{telegram['failing_receipts']} failing receipt(s)"
+    )
     return "\n".join(
         [
             f"{'Version':<16} {payload['version']}",
@@ -426,6 +443,7 @@ def _render_info(payload: dict[str, Any]) -> str:
             f"{schedule['next_run_at']} {schedule['timezone']}",
             f"{'Pending period':<16} {pending}",
             f"{'Jobs':<16} {jobs}",
+            f"{'Telegram':<16} {telegram_line}",
             f"{'Generated at':<16} {payload['generated_at']}",
         ]
     )

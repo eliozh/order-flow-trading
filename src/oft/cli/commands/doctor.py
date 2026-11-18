@@ -95,6 +95,20 @@ def doctor_command(
             )
         )
     else:
-        typer.echo(render_doctor_table(report))
+        rendered = render_doctor_table(report)
+        telegram = report.telegram
+        if telegram:
+            chats = ", ".join(
+                f"{entry['chat_id']}: {entry['failed']} failed"
+                for entry in telegram.get("per_chat", [])
+            )
+            rendered += (
+                f"\nTelegram  state {telegram['poller_state']} · "
+                f"last poll {telegram.get('last_poll_at') or 'never'} · "
+                f"last send {telegram.get('last_send_at') or 'never'} · "
+                f"{telegram.get('failing_receipts', 0)} failing receipt(s)"
+                f"{f' · {chats}' if chats else ''}"
+            )
+        typer.echo(rendered)
     # Diagnostics are informational: OFFLINE/DEGRADED still exit 0 (ADR-0003).
     raise typer.Exit(code=0)

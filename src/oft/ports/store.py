@@ -608,6 +608,22 @@ class SecretMetaRecord:
 
 
 @dataclass(frozen=True)
+class TelegramChatStatus:
+    """Per-chat receipt totals plus the newest stable failure code.
+
+    Only the allowed chat id and counts/codes are carried; message text and the
+    token are never part of this projection.
+    """
+
+    chat_id: int
+    queued: int = 0
+    sending: int = 0
+    sent: int = 0
+    failed: int = 0
+    last_error_code: str | None = None
+
+
+@dataclass(frozen=True)
 class TelegramOutboxRecord:
     """One durable outbound Telegram message and its receipt state.
 
@@ -1685,6 +1701,16 @@ class StorePort(Protocol):
         """
         ...
 
+    def release_telegram_claim(self, event_key: str, *, next_attempt_at: str) -> bool:
+        """Return an unsent ``sending`` row to ``queued`` without a failure.
+
+        Used when a later message for the same chat was claimed in the same tick
+        as an earlier one that failed or was rate-limited: per-chat ordering
+        requires the later row to wait without consuming its retry budget or
+        recording a failure.
+        """
+        ...
+
     def purge_terminal_telegram_outbox(self, *, before: str, limit: int = 1000) -> int:
         """Delete up to ``limit`` ``sent``/``failed`` rows created before ``before``."""
         ...
@@ -1694,6 +1720,22 @@ class StorePort(Protocol):
         ...
 
     def count_telegram_receipts(self) -> int: ...
+
+    def telegram_receipt_counts(self) -> dict[str, int]:
+        """Receipt totals keyed by state (``queued``/``sending``/``sent``/``failed``).
+
+        Every state is present (zero when absent) so a diagnostics surface never
+        has to distinguish "no rows" from "no failed rows".
+        """
+        ...
+
+    def telegram_chat_statuses(self, limit: int = 20) -> tuple[TelegramChatStatus, ...]:
+        """Bounded per-chat receipt totals, newest chat activity first."""
+        ...
+
+    def last_telegram_sent_at(self) -> str | None:
+        """The newest ``sent_at`` across outbox rows, or ``None``."""
+        ...
 
     # -- Write-only secret metadata --------------------------------------
 

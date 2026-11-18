@@ -38,6 +38,10 @@ from oft.domain.telegram import (
     TELEGRAM_ALLOWED_USER_IDS_KEY,
     TELEGRAM_CHAT_IDS_KEY,
     TELEGRAM_OUTBOX_CLAIM_LEASE_SECONDS,
+    TELEGRAM_OUTBOX_MAX_PENDING,
+    TELEGRAM_OUTBOX_MAX_PENDING_PER_CHAT,
+    TELEGRAM_OUTBOX_OVERFLOW_KEY,
+    TELEGRAM_QUEUE_FULL,
     ReceiptState,
 )
 from oft.domain.time import utc_timestamp
@@ -46,6 +50,7 @@ from oft.ports.store import (
     AuditEventRecord,
     ConfigRecord,
     StoreUnavailableError,
+    TelegramChatStatus,
     TelegramOutboxRecord,
 )
 
@@ -317,7 +322,55 @@ class SqliteStore(
             connection.close()
 
     def append_telegram_outbox(self, record: TelegramOutboxRecord) -> bool:
-        with closing(self._connect()) as connection, connection:
+        """Insert one outbox row; a duplicate ``event_key`` is a no-op.
+
+        The duplicate probe runs first, so a replay arriving while the queue is
+        full never sets the overflow marker. A genuinely new non-terminal row
+        respects the global/per-chat caps; an overflow is rejected (``False``)
+        and recorded under :data:`TELEGRAM_OUTBOX_OVERFLOW_KEY` with the stable
+        :data:`TELEGRAM_QUEUE_FULL` code. Probe, count, rejection, and insert
+        share one write transaction, so concurrent bursts cannot race the bound.
+        """
+        connection = self._connect()
+        try:
+            connection.execute("BEGIN IMMEDIATE")
+            duplicate = connection.execute(
+                "SELECT 1 FROM telegram_outbox WHERE event_key = ?", (record.event_key,)
+            ).fetchone()
+            if duplicate is not None:
+                connection.commit()
+                return False
+            if record.state in (ReceiptState.QUEUED, ReceiptState.SENDING):
+                pending = connection.execute(
+                    "SELECT COUNT(*) AS total FROM telegram_outbox "
+                    "WHERE state IN ('queued','sending')"
+                ).fetchone()
+                total = int(pending["total"]) if pending is not None else 0
+                chat_row = connection.execute(
+                    "SELECT COUNT(*) AS total FROM telegram_outbox "
+                    "WHERE state IN ('queued','sending') AND chat_id = ?",
+                    (record.chat_id,),
+                ).fetchone()
+                chat_total = int(chat_row["total"]) if chat_row is not None else 0
+                if (
+                    total >= TELEGRAM_OUTBOX_MAX_PENDING
+                    or chat_total >= TELEGRAM_OUTBOX_MAX_PENDING_PER_CHAT
+                ):
+                    connection.execute(
+                        """
+                        INSERT INTO system_state (key, value, updated_at) VALUES (?, ?, ?)
+                        ON CONFLICT(key) DO UPDATE SET
+                            value = excluded.value,
+                            updated_at = excluded.updated_at
+                        """,
+                        (
+                            TELEGRAM_OUTBOX_OVERFLOW_KEY,
+                            TELEGRAM_QUEUE_FULL,
+                            record.created_at,
+                        ),
+                    )
+                    connection.commit()
+                    return False
             cursor = connection.execute(
                 """
                 INSERT INTO telegram_outbox (
@@ -329,7 +382,16 @@ class SqliteStore(
                 """,
                 _telegram_outbox_values(record),
             )
-        return cursor.rowcount > 0
+            inserted = cursor.rowcount > 0
+            if inserted:
+                _clear_outbox_overflow_if_drained(connection)
+            connection.commit()
+            return inserted
+        except BaseException:
+            connection.rollback()
+            raise
+        finally:
+            connection.close()
 
     def claim_due_telegram_outbox(
         self, *, now: str, limit: int = 10
@@ -347,7 +409,7 @@ class SqliteStore(
         connection = self._connect()
         try:
             connection.execute("BEGIN IMMEDIATE")
-            connection.execute(
+            reaped = connection.execute(
                 """
                 UPDATE telegram_outbox
                 SET attempts = attempts + 1,
@@ -358,19 +420,55 @@ class SqliteStore(
                 """,
                 (MAX_TELEGRAM_OUTBOX_ATTEMPTS, now, now),
             )
+            if reaped.rowcount > 0:
+                _clear_outbox_overflow_if_drained(connection)
             rows = connection.execute(
                 """
+                WITH due AS (
+                    SELECT event_key, kind, chat_id, reply_to_message_id, payload_json,
+                           priority, state, attempts, next_attempt_at, message_id,
+                           last_error_code, created_at, sent_at, rowid AS rid
+                    FROM telegram_outbox
+                    WHERE state = 'queued'
+                      AND attempts < ?
+                      AND next_attempt_at <= ?
+                      AND NOT EXISTS (
+                          SELECT 1 FROM telegram_outbox AS earlier
+                          WHERE earlier.chat_id = telegram_outbox.chat_id
+                            AND earlier.state IN ('queued','sending')
+                            AND (
+                                earlier.created_at < telegram_outbox.created_at
+                                OR (
+                                    earlier.created_at = telegram_outbox.created_at
+                                    AND earlier.rowid < telegram_outbox.rowid
+                                )
+                            )
+                            AND NOT (
+                                earlier.state = 'queued'
+                                AND earlier.attempts < ?
+                                AND earlier.next_attempt_at <= ?
+                            )
+                      )
+                ),
+                ranked AS (
+                    SELECT due.*,
+                           MAX(priority) OVER (PARTITION BY chat_id) AS chat_priority
+                    FROM due
+                )
                 SELECT event_key, kind, chat_id, reply_to_message_id, payload_json,
                        priority, state, attempts, next_attempt_at, message_id,
                        last_error_code, created_at, sent_at
-                FROM telegram_outbox
-                WHERE state = 'queued'
-                  AND attempts < ?
-                  AND next_attempt_at <= ?
-                ORDER BY priority DESC, next_attempt_at ASC, created_at ASC, rowid ASC
+                FROM ranked
+                ORDER BY chat_priority DESC, chat_id ASC, created_at ASC, rid ASC
                 LIMIT ?
                 """,
-                (MAX_TELEGRAM_OUTBOX_ATTEMPTS, now, max(1, limit)),
+                (
+                    MAX_TELEGRAM_OUTBOX_ATTEMPTS,
+                    now,
+                    MAX_TELEGRAM_OUTBOX_ATTEMPTS,
+                    now,
+                    max(1, limit),
+                ),
             ).fetchall()
             lease_until = _shift_timestamp(now, TELEGRAM_OUTBOX_CLAIM_LEASE_SECONDS)
             claimed: list[TelegramOutboxRecord] = []
@@ -430,6 +528,8 @@ class SqliteStore(
                 """,
                 (message_id, sent_at, event_key),
             )
+            if cursor.rowcount == 1:
+                _clear_outbox_overflow_if_drained(connection)
         return cursor.rowcount == 1
 
     def mark_telegram_attempt_failed(
@@ -458,6 +558,21 @@ class SqliteStore(
                     next_attempt_at,
                     event_key,
                 ),
+            )
+            if final and cursor.rowcount == 1:
+                _clear_outbox_overflow_if_drained(connection)
+        return cursor.rowcount == 1
+
+    def release_telegram_claim(self, event_key: str, *, next_attempt_at: str) -> bool:
+        """Return an unsent claimed row to ``queued`` without a failure."""
+        with closing(self._connect()) as connection, connection:
+            cursor = connection.execute(
+                """
+                UPDATE telegram_outbox
+                SET state = 'queued', next_attempt_at = ?
+                WHERE event_key = ? AND state = 'sending'
+                """,
+                (next_attempt_at, event_key),
             )
         return cursor.rowcount == 1
 
@@ -521,8 +636,115 @@ class SqliteStore(
             connection.close()
         return int(row["total"]) if row is not None else 0
 
+    def telegram_receipt_counts(self) -> dict[str, int]:
+        counts = {"queued": 0, "sending": 0, "sent": 0, "failed": 0}
+        connection = self._connect_read_only()
+        if connection is None:
+            return counts
+        try:
+            rows = connection.execute(
+                "SELECT state, COUNT(*) AS total FROM telegram_outbox GROUP BY state"
+            ).fetchall()
+        except sqlite3.OperationalError as exc:
+            if _missing_telegram_outbox(exc):
+                return counts
+            raise
+        finally:
+            connection.close()
+        for row in rows:
+            state = str(row["state"])
+            if state in counts:
+                counts[state] = int(row["total"])
+        return counts
+
+    def telegram_chat_statuses(self, limit: int = 20) -> tuple[TelegramChatStatus, ...]:
+        connection = self._connect_read_only()
+        if connection is None:
+            return ()
+        try:
+            rows = connection.execute(
+                """
+                SELECT t.chat_id,
+                       SUM(CASE WHEN t.state = 'queued' THEN 1 ELSE 0 END) AS queued,
+                       SUM(CASE WHEN t.state = 'sending' THEN 1 ELSE 0 END) AS sending,
+                       SUM(CASE WHEN t.state = 'sent' THEN 1 ELSE 0 END) AS sent,
+                       SUM(CASE WHEN t.state = 'failed' THEN 1 ELSE 0 END) AS failed,
+                       (
+                           SELECT newest.last_error_code
+                           FROM telegram_outbox AS newest
+                           WHERE newest.chat_id = t.chat_id AND newest.state = 'failed'
+                           ORDER BY newest.created_at DESC, newest.rowid DESC
+                           LIMIT 1
+                       ) AS last_error_code,
+                       MAX(t.created_at) AS newest
+                FROM telegram_outbox AS t
+                GROUP BY t.chat_id
+                ORDER BY newest DESC, t.chat_id ASC
+                LIMIT ?
+                """,
+                (max(1, limit),),
+            ).fetchall()
+        except sqlite3.OperationalError as exc:
+            if _missing_telegram_outbox(exc):
+                return ()
+            raise
+        finally:
+            connection.close()
+        return tuple(
+            TelegramChatStatus(
+                chat_id=int(row["chat_id"]),
+                queued=int(row["queued"] or 0),
+                sending=int(row["sending"] or 0),
+                sent=int(row["sent"] or 0),
+                failed=int(row["failed"] or 0),
+                last_error_code=(
+                    None if row["last_error_code"] is None else str(row["last_error_code"])
+                ),
+            )
+            for row in rows
+        )
+
+    def last_telegram_sent_at(self) -> str | None:
+        connection = self._connect_read_only()
+        if connection is None:
+            return None
+        try:
+            row = connection.execute(
+                "SELECT MAX(sent_at) AS newest FROM telegram_outbox WHERE state = 'sent'"
+            ).fetchone()
+        except sqlite3.OperationalError as exc:
+            if _missing_telegram_outbox(exc):
+                return None
+            raise
+        finally:
+            connection.close()
+        if row is None or row["newest"] is None:
+            return None
+        return str(row["newest"])
+
 
 _TELEGRAM_OUTBOX_TABLE = "telegram_outbox"
+
+
+def _clear_outbox_overflow_if_drained(connection: sqlite3.Connection) -> None:
+    """Drop the overflow marker once the pending queue is under both caps."""
+    marker = connection.execute(
+        "SELECT 1 FROM system_state WHERE key = ?", (TELEGRAM_OUTBOX_OVERFLOW_KEY,)
+    ).fetchone()
+    if marker is None:
+        return
+    row = connection.execute(
+        "SELECT COALESCE(SUM(pending), 0) AS total, COALESCE(MAX(pending), 0) AS highest "
+        "FROM (SELECT COUNT(*) AS pending FROM telegram_outbox "
+        "WHERE state IN ('queued','sending') GROUP BY chat_id)"
+    ).fetchone()
+    if row is None:
+        return
+    total = int(row["total"])
+    highest = int(row["highest"])
+    if total >= TELEGRAM_OUTBOX_MAX_PENDING or highest >= TELEGRAM_OUTBOX_MAX_PENDING_PER_CHAT:
+        return
+    connection.execute("DELETE FROM system_state WHERE key = ?", (TELEGRAM_OUTBOX_OVERFLOW_KEY,))
 
 
 def _shift_timestamp(value: str, seconds: int) -> str:
