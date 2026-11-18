@@ -1,6 +1,7 @@
-import { useEffect, useState } from 'react'
+import { useCallback, useEffect, useState } from 'react'
 
 import {
+  ApiShapeError,
   fetchHealth,
   fetchReadiness,
   fetchStatus,
@@ -12,6 +13,10 @@ import {
   type TelegramStatusData,
 } from '../api/status'
 import { useCompact } from '../hooks/use-compact'
+import { usePolling } from '../hooks/use-polling'
+
+/** Revalidation cadence for the additive Telegram receipt card. */
+const TELEGRAM_STATUS_REFRESH_MS = 30_000
 
 type SystemFetcher<T> = (signal?: AbortSignal) => Promise<T>
 
@@ -32,6 +37,18 @@ interface ReadyState {
 interface TelegramLoadState {
   state: 'loading' | 'ready' | 'error'
   data: TelegramStatusData | null
+  error?: unknown
+}
+
+/** A bounded failure summary that keeps the error class distinguishable. */
+function telegramStatusFailure(error: unknown): string {
+  if (error instanceof ApiShapeError) {
+    return `Telegram status contract mismatch (ApiShapeError): ${error.message}`
+  }
+  if (error instanceof Error) {
+    return `Telegram status unavailable (${error.name}): ${error.message}`
+  }
+  return 'Telegram status unavailable (unknown error).'
 }
 
 function statusClass(status: string): string {
@@ -127,7 +144,7 @@ function TelegramDeliveryPanel({ telegram, compact }: TelegramDeliveryPanelProps
   return (
     <>
       {failed > 0 && (
-        <p className="status-message status-message--error" role="alert">
+        <p className="status-message status-message--error" role="alert" lang="en">
           Telegram pushes failing: {failed} failed receipt(s).
           {lastError ? (
             <>
@@ -139,7 +156,7 @@ function TelegramDeliveryPanel({ telegram, compact }: TelegramDeliveryPanelProps
         </p>
       )}
       {failed === 0 && degraded && (
-        <p className="status-message status-message--error" role="alert">
+        <p className="status-message status-message--error" role="alert" lang="en">
           {telegram.poller_state === 'CONFLICT'
             ? 'Telegram poller CONFLICT: another poller owns this token.'
             : 'Telegram poller DEGRADED.'}
@@ -152,7 +169,7 @@ function TelegramDeliveryPanel({ telegram, compact }: TelegramDeliveryPanelProps
           Other schedulers continue; run <code>oft doctor</code> for details.
         </p>
       )}
-      <section className="panel" aria-labelledby="telegram-heading">
+      <section className="panel" aria-labelledby="telegram-heading" lang="en">
         <div className="panel-head">
           <h2 id="telegram-heading">Telegram delivery receipts</h2>
           <span className={pollerStateClass(telegram.poller_state)}>
@@ -228,10 +245,10 @@ function TelegramDeliveryPanel({ telegram, compact }: TelegramDeliveryPanelProps
           </>
         ) : (
           <>
-            {/* eslint-disable-next-line jsx-a11y/no-noninteractive-tabindex -- scrollable table */}
             <div
               className="table-wrap"
               role="region"
+              // eslint-disable-next-line jsx-a11y/no-noninteractive-tabindex -- scrollable table
               tabIndex={0}
               aria-label="Telegram delivery receipts by chat"
             >
@@ -266,10 +283,10 @@ function TelegramDeliveryPanel({ telegram, compact }: TelegramDeliveryPanelProps
               </table>
             </div>
             {telegram.recent_receipts.length > 0 && (
-              // eslint-disable-next-line jsx-a11y/no-noninteractive-tabindex -- scrollable table
               <div
                 className="table-wrap"
                 role="region"
+                // eslint-disable-next-line jsx-a11y/no-noninteractive-tabindex -- scrollable table
                 tabIndex={0}
                 aria-label="Recent Telegram receipts"
               >
@@ -322,33 +339,25 @@ export function SystemPage({
   })
   const compact = useCompact(isCompact)
 
-  useEffect(() => {
-    // Fetch the additive Telegram state only after the diagnostics settle, so a
-    // stalled health/readiness request never issues a second request.
-    if (load.state !== 'ready') {
-      return
-    }
-    const controller = new AbortController()
-    let active = true
-    setTelegramLoad({ state: 'loading', data: null })
-    fetchStatusFn(controller.signal)
-      .then((envelope) => {
-        if (active) {
-          setTelegramLoad({ state: 'ready', data: envelope.data?.telegram ?? null })
-        }
-      })
-      .catch(() => {
-        // The receipt card is additive: a status/auth failure must never hide
-        // the health and readiness diagnostics this page already renders.
-        if (active && !controller.signal.aborted) {
-          setTelegramLoad({ state: 'error', data: null })
-        }
-      })
-    return () => {
-      active = false
-      controller.abort()
-    }
-  }, [load.state, fetchStatusFn])
+  const loadTelegramStatus = useCallback(
+    async (signal: AbortSignal): Promise<void> => {
+      const envelope = await fetchStatusFn(signal)
+      setTelegramLoad({ state: 'ready', data: envelope.data?.telegram ?? null })
+    },
+    [fetchStatusFn],
+  )
+
+  // Revalidate the additive Telegram card once the diagnostics settle. The
+  // pause doubles as the "wait for health/readiness" gate: before it clears,
+  // no request, interval, or focus listener exists. A failed revalidation keeps
+  // the last-good data instead of flickering back to a loading state.
+  usePolling(loadTelegramStatus, {
+    refreshMs: TELEGRAM_STATUS_REFRESH_MS,
+    paused: load.state !== 'ready',
+    onError: (error) => {
+      setTelegramLoad((previous) => ({ state: 'error', data: previous.data, error }))
+    },
+  })
 
   useEffect(() => {
     let active = true
@@ -412,7 +421,7 @@ export function SystemPage({
     telegramLoad.state === 'loading'
       ? 'Loading Telegram delivery receipts…'
       : telegramLoad.state === 'error'
-        ? 'Telegram status unavailable.'
+        ? telegramStatusFailure(telegramLoad.error)
         : telegram === null
           ? 'Telegram is not configured.'
           : telegram.failing_receipts > 0
@@ -494,7 +503,11 @@ export function SystemPage({
       </section>
 
       <p
-        className={telegramLoad.state === 'error' ? 'status-message' : 'visually-hidden'}
+        className={
+          telegramLoad.state === 'error'
+            ? 'status-message status-message--error'
+            : 'visually-hidden'
+        }
         role="status"
         data-testid="telegram-status"
       >

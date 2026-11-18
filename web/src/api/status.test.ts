@@ -203,6 +203,16 @@ describe('Telegram status shape guards', () => {
     expect(isTelegramStatusData(malformed)).toBe(false)
   })
 
+  it('rejects a receipts document missing any required counter', () => {
+    for (const key of ['queued', 'sending', 'sent', 'failed']) {
+      const receipts = { ...validTelegram.receipts } as Record<string, unknown>
+      delete receipts[key]
+      const malformed = { ...validTelegram, receipts }
+      expect(isTelegramStatusData(malformed)).toBe(false)
+      expect(isStatusData({ ...statusData(), telegram: malformed })).toBe(false)
+    }
+  })
+
   it('rejects a malformed recent receipt entry', () => {
     const malformed = {
       ...validTelegram,

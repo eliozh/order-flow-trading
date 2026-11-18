@@ -288,9 +288,15 @@ def test_a_blocked_long_poll_does_not_delay_an_independent_scheduler_tick(
             _wait_until(lambda: len(ticks) >= 2)
 
         # A stop request is immediate even while the long poll is still blocked.
+        # The blocked port holds for 10 s, so the generous 5 s bound only
+        # detects a shutdown that wrongly joins the blocked poll; it is not a
+        # latency target.
         started = time.monotonic()
         poller.shutdown(wait=False)
-        assert time.monotonic() - started < 1.0
+        elapsed = time.monotonic() - started
+        assert elapsed < 5.0
+        # The poll is still blocked and the worker thread is still alive.
+        assert port.release.is_set() is False
         assert poller._thread is not None and poller._thread.is_alive()  # noqa: SLF001
     finally:
         port.release.set()

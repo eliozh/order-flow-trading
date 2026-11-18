@@ -16,7 +16,11 @@ from collections.abc import Callable
 
 import structlog
 
-from oft.application.telegram_dispatch import OutboxDispatcher, TelegramDispatchScheduler
+from oft.application.telegram_dispatch import (
+    OutboxDispatcher,
+    TelegramDispatchScheduler,
+    retry_after_delay_seconds,
+)
 from oft.application.telegram_service import TelegramService
 from oft.domain.telegram import (
     POLL_OFFSET_KEY,
@@ -128,8 +132,9 @@ class TelegramPoller:
             wait_seconds = self._transient_backoff()
             if exc.code == TELEGRAM_RATE_LIMITED and exc.retry_after is not None:
                 # The Bot API's retry_after is a floor, exactly as the
-                # dispatcher treats a send-side 429.
-                wait_seconds = max(wait_seconds, float(exc.retry_after))
+                # dispatcher treats a send-side 429, but it is bounded by the
+                # shared cap so a huge value cannot park the loop for hours.
+                wait_seconds = max(wait_seconds, float(retry_after_delay_seconds(exc.retry_after)))
             self._wait_override = wait_seconds
             if exc.code == TELEGRAM_CONFLICT:
                 # Another long-poller owns this bot token. Back off with the same
@@ -224,6 +229,9 @@ class TelegramPoller:
 
     def _run(self) -> None:
         while not self._stop.is_set():
+            # Guard the poll separately so an escaped store failure neither
+            # kills the supervisor thread nor skips the wait below (which
+            # would spin the loop).
             try:
                 self.poll_once()
             except Exception:  # noqa: BLE001 - never exit the supervisor loop
@@ -233,7 +241,12 @@ class TelegramPoller:
                 if self._wait_override is not None
                 else self._poll_interval_seconds
             )
-            self._stop.wait(wait_seconds)
+            # Keep the wait inside the guarded block: an unexpected wait
+            # error must never kill the supervisor thread.
+            try:
+                self._stop.wait(wait_seconds)
+            except Exception:  # noqa: BLE001 - an unexpected wait error must not kill the loop
+                LOGGER.exception("telegram_poller_wait_failed")
 
     def shutdown(self, *, wait: bool = True) -> None:
         self._stop.set()

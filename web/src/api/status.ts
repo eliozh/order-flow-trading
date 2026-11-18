@@ -303,7 +303,10 @@ export function isTelegramStatusData(value: unknown): value is TelegramStatusDat
     isNullableString(value.last_send_at) &&
     typeof value.failing_receipts === 'number' &&
     isRecord(value.receipts) &&
-    Object.values(value.receipts).every((count) => typeof count === 'number') &&
+    typeof value.receipts.queued === 'number' &&
+    typeof value.receipts.sending === 'number' &&
+    typeof value.receipts.sent === 'number' &&
+    typeof value.receipts.failed === 'number' &&
     Array.isArray(value.per_chat) &&
     value.per_chat.every(isTelegramChatStatusData) &&
     Array.isArray(value.recent_receipts) &&

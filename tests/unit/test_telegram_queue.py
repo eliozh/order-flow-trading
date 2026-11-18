@@ -105,6 +105,28 @@ def test_terminal_rows_do_not_count_toward_the_cap(
     assert store.append_telegram_outbox(_record("queued", chat_id=1003)) is True
 
 
+def test_a_priority_push_evicts_a_lower_priority_reply_at_the_chat_cap(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setattr(store_module, "TELEGRAM_OUTBOX_MAX_PENDING", 1000)
+    monkeypatch.setattr(store_module, "TELEGRAM_OUTBOX_MAX_PENDING_PER_CHAT", 1)
+    store = _store(tmp_path)
+
+    # A priority-0 reply fills the per-chat cap; a priority-40 push may then
+    # evict it instead of being rejected.
+    assert store.append_telegram_outbox(_record("reply", chat_id=1001, priority=0)) is True
+    assert store.append_telegram_outbox(_record("push", chat_id=1001, priority=40)) is True
+
+    reply = store.get_telegram_outbox("reply")
+    push = store.get_telegram_outbox("push")
+    assert reply is not None and push is not None
+    assert (reply.state, reply.last_error_code) == ("failed", TELEGRAM_QUEUE_FULL)
+    assert push.state == "queued"
+    counts = store.telegram_receipt_counts()
+    assert counts["queued"] == 1
+    assert counts["failed"] == 1
+
+
 def test_duplicate_event_keys_are_coalesced_and_do_not_grow_the_queue(tmp_path: Path) -> None:
     store = _store(tmp_path)
 
@@ -162,6 +184,44 @@ def test_the_global_sender_batch_bounds_one_tick(tmp_path: Path) -> None:
     claimed = store.claim_due_telegram_outbox(now=NOW_TEXT, limit=2)
 
     assert len(claimed) == 2
+
+
+def test_the_dispatcher_batch_bound_sends_only_one_of_three_ready_rows(tmp_path: Path) -> None:
+    store = _store(tmp_path)
+    for index in range(3):
+        store.append_telegram_outbox(_record(f"msg-{index}", chat_id=1000 + index))
+    port = TelegramFake()
+
+    dispatcher = OutboxDispatcher(
+        store=store,
+        clock=FixedClock(NOW),
+        port_resolver=lambda: port,
+        jitter=lambda: 0.0,
+        batch=1,
+    )
+
+    assert dispatcher.dispatch_once() == 1
+
+    rows = [store.get_telegram_outbox(f"msg-{index}") for index in range(3)]
+    assert all(row is not None for row in rows)
+    assert sum(1 for row in rows if row is not None and row.state == "sent") == 1
+    assert sum(1 for row in rows if row is not None and row.state == "queued") == 2
+
+
+def test_one_flooded_chat_cannot_starve_another_chat_across_a_claim(tmp_path: Path) -> None:
+    store = _store(tmp_path)
+    # One chat has a deep due backlog; the other has a single due row.
+    for index in range(12):
+        store.append_telegram_outbox(_record(f"flood-{index}", chat_id=1001))
+    store.append_telegram_outbox(_record("single", chat_id=2002))
+
+    claimed = store.claim_due_telegram_outbox(now=NOW_TEXT, limit=3)
+
+    claimed_keys = [row.event_key for row in claimed]
+    # The single-row chat is represented in the very first batch instead of
+    # waiting behind the flooded chat's entire backlog.
+    assert "single" in claimed_keys
+    assert claimed_keys[0] == "flood-0"
 
 
 def test_per_chat_status_counts_only_that_chat(tmp_path: Path) -> None:

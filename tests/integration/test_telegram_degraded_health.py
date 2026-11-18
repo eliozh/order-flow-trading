@@ -267,6 +267,37 @@ def test_queue_overflow_reaches_status_doctor_and_system_info(
     assert json.loads(doctor.stdout)["data"]["telegram"]["overflow_code"] == TELEGRAM_QUEUE_FULL
 
 
+def test_unconfigured_telegram_with_failing_receipts_is_degraded(tmp_path: Path) -> None:
+    settings = _settings(tmp_path, token=None)
+    store = SqliteStore(settings)
+    store.initialize()
+    # No secret metadata and no env token: the channel is unconfigured. A
+    # retained failed receipt still proves delivery is failing, so health must
+    # degrade instead of reporting an optional channel as healthily idle.
+    store.append_telegram_outbox(
+        TelegramOutboxRecord(
+            event_key="failed-unconfigured",
+            kind="scan_report",
+            chat_id=1001,
+            reply_to_message_id=None,
+            payload_json=json.dumps({"text": "never rendered in diagnostics"}),
+            state="failed",  # type: ignore[arg-type]
+            attempts=3,
+            next_attempt_at=NOW_TEXT,
+            message_id=None,
+            last_error_code="TELEGRAM_UPSTREAM_ERROR",
+            created_at=NOW_TEXT,
+            sent_at=None,
+        )
+    )
+
+    checks, _report = _checks(settings, store)
+
+    assert checks["telegram"].status == "degraded"
+    assert "failing telegram receipt" in checks["telegram"].detail
+    assert "not configured" in checks["telegram"].detail
+
+
 def _configure_cli_env(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
     monkeypatch.chdir(tmp_path)
     monkeypatch.setenv("OFT_ENV", "test")

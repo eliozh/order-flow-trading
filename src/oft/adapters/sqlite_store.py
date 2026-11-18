@@ -324,12 +324,9 @@ class SqliteStore(
     def append_telegram_outbox(self, record: TelegramOutboxRecord) -> bool:
         """Insert one outbox row; a duplicate ``event_key`` is a no-op.
 
-        The duplicate probe runs first, so a replay arriving while the queue is
-        full never sets the overflow marker. A genuinely new non-terminal row
-        respects the global/per-chat caps; an overflow is rejected (``False``)
-        and recorded under :data:`TELEGRAM_OUTBOX_OVERFLOW_KEY` with the stable
-        :data:`TELEGRAM_QUEUE_FULL` code. Probe, count, rejection, and insert
-        share one write transaction, so concurrent bursts cannot race the bound.
+        A non-terminal row respects the global/per-chat caps: a higher-priority
+        push may evict an older strictly-lower-priority queued row, otherwise
+        the overflow is rejected and recorded with :data:`TELEGRAM_QUEUE_FULL`.
         """
         connection = self._connect()
         try:
@@ -341,36 +338,39 @@ class SqliteStore(
                 connection.commit()
                 return False
             if record.state in (ReceiptState.QUEUED, ReceiptState.SENDING):
-                pending = connection.execute(
-                    "SELECT COUNT(*) AS total FROM telegram_outbox "
-                    "WHERE state IN ('queued','sending')"
-                ).fetchone()
-                total = int(pending["total"]) if pending is not None else 0
-                chat_row = connection.execute(
-                    "SELECT COUNT(*) AS total FROM telegram_outbox "
-                    "WHERE state IN ('queued','sending') AND chat_id = ?",
+                counts = connection.execute(
+                    "SELECT COUNT(*) AS total, SUM(chat_id = ?) AS chat_total "
+                    "FROM telegram_outbox WHERE state IN ('queued','sending')",
                     (record.chat_id,),
                 ).fetchone()
-                chat_total = int(chat_row["total"]) if chat_row is not None else 0
-                if (
-                    total >= TELEGRAM_OUTBOX_MAX_PENDING
-                    or chat_total >= TELEGRAM_OUTBOX_MAX_PENDING_PER_CHAT
-                ):
-                    connection.execute(
-                        """
-                        INSERT INTO system_state (key, value, updated_at) VALUES (?, ?, ?)
-                        ON CONFLICT(key) DO UPDATE SET
-                            value = excluded.value,
-                            updated_at = excluded.updated_at
-                        """,
+                assert counts is not None  # an aggregate always returns one row
+                total, chat_total = int(counts["total"]), int(counts["chat_total"] or 0)
+                over_chat = chat_total >= TELEGRAM_OUTBOX_MAX_PENDING_PER_CHAT
+                if over_chat or total >= TELEGRAM_OUTBOX_MAX_PENDING:
+                    # Evict one older strictly-lower-priority queued row from the
+                    # saturated scope; sending rows and equal-priority bursts are
+                    # never evicted, and the queue never exceeds its caps.
+                    evicted = connection.execute(
+                        "UPDATE telegram_outbox SET state = 'failed', last_error_code = ? "
+                        "WHERE rowid IN (SELECT rowid FROM telegram_outbox WHERE "
+                        "state = 'queued' AND priority < ? AND (? = 0 OR chat_id = ?) "
+                        "ORDER BY priority ASC, created_at ASC, rowid ASC LIMIT 1)",
                         (
-                            TELEGRAM_OUTBOX_OVERFLOW_KEY,
                             TELEGRAM_QUEUE_FULL,
-                            record.created_at,
+                            record.priority,
+                            1 if over_chat else 0,
+                            record.chat_id,
                         ),
-                    )
-                    connection.commit()
-                    return False
+                    ).rowcount
+                    if not evicted:
+                        connection.execute(
+                            "INSERT INTO system_state (key, value, updated_at) VALUES (?, ?, ?) "
+                            "ON CONFLICT(key) DO UPDATE SET value = excluded.value, "
+                            "updated_at = excluded.updated_at",
+                            (TELEGRAM_OUTBOX_OVERFLOW_KEY, TELEGRAM_QUEUE_FULL, record.created_at),
+                        )
+                        connection.commit()
+                        return False
             cursor = connection.execute(
                 """
                 INSERT INTO telegram_outbox (
@@ -449,17 +449,17 @@ class SqliteStore(
                                 AND earlier.next_attempt_at <= ?
                             )
                       )
-                ),
-                ranked AS (
-                    SELECT due.*,
-                           MAX(priority) OVER (PARTITION BY chat_id) AS chat_priority
-                    FROM due
                 )
                 SELECT event_key, kind, chat_id, reply_to_message_id, payload_json,
                        priority, state, attempts, next_attempt_at, message_id,
-                       last_error_code, created_at, sent_at
-                FROM ranked
-                ORDER BY chat_priority DESC, chat_id ASC, created_at ASC, rid ASC
+                       last_error_code, created_at, sent_at,
+                       MAX(priority) OVER (PARTITION BY chat_id) AS chat_priority,
+                       ROW_NUMBER() OVER (
+                           PARTITION BY chat_id ORDER BY created_at ASC, rid ASC
+                       ) AS chat_rank
+                FROM due
+                ORDER BY chat_rank ASC, chat_priority DESC, chat_id ASC,
+                         created_at ASC, rid ASC
                 LIMIT ?
                 """,
                 (

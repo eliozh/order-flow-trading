@@ -1,6 +1,7 @@
-import { render, screen, waitFor, within } from '@testing-library/react'
+import { fireEvent, render, screen, waitFor, within } from '@testing-library/react'
 import { describe, expect, it } from 'vitest'
 
+import { ApiShapeError } from '../../api/status'
 import type {
   HealthEnvelope,
   ReadinessEnvelope,
@@ -287,7 +288,7 @@ describe('SystemPage Telegram receipts', () => {
     expect(screen.getByRole('alert')).toHaveTextContent('Telegram pushes failing')
   })
 
-  it('keeps the rest of the system page usable when the status request fails', async () => {
+  it('surfaces the status failure as an error note while the rest of the page stays usable', async () => {
     render(
       <SystemPage
         fetchHealthFn={async () => healthEnvelope}
@@ -302,10 +303,83 @@ describe('SystemPage Telegram receipts', () => {
     expect(
       screen.queryByRole('heading', { name: 'Telegram delivery receipts' }),
     ).not.toBeInTheDocument()
+    // The failure is additive and never blocks the diagnostics above it.
     expect(screen.queryByRole('alert')).not.toBeInTheDocument()
-    // The failure is not swallowed: an additive, non-blocking note stays visible.
     const note = await screen.findByTestId('telegram-status')
-    expect(note).toHaveTextContent('Telegram status unavailable')
-    expect(note).toHaveClass('status-message')
+    await waitFor(() => expect(note).toHaveTextContent('Telegram status unavailable'))
+    await waitFor(() => expect(note).toHaveTextContent('status unavailable'))
+    expect(note).toHaveClass('status-message', 'status-message--error')
+  })
+
+  it('distinguishes a contract drift from a transient status failure', async () => {
+    const { unmount } = render(
+      <SystemPage
+        fetchHealthFn={async () => healthEnvelope}
+        fetchReadinessFn={async () => readinessEnvelope}
+        fetchStatusFn={async () => {
+          throw new ApiShapeError('The status response was not in the expected shape.')
+        }}
+      />,
+    )
+
+    const shapeNote = await screen.findByTestId('telegram-status')
+    await waitFor(() => expect(shapeNote).toHaveTextContent('ApiShapeError'))
+    await waitFor(() => expect(shapeNote).toHaveTextContent('expected shape'))
+    unmount()
+
+    render(
+      <SystemPage
+        fetchHealthFn={async () => healthEnvelope}
+        fetchReadinessFn={async () => readinessEnvelope}
+        fetchStatusFn={async () => {
+          throw new Error('network down')
+        }}
+      />,
+    )
+
+    const transientNote = await screen.findByTestId('telegram-status')
+    await waitFor(() => expect(transientNote).toHaveTextContent('network down'))
+    expect(transientNote).toHaveTextContent('Error')
+    expect(transientNote).not.toHaveTextContent('ApiShapeError')
+  })
+
+  it('revalidates the receipt card on window focus and keeps last-good data', async () => {
+    let calls = 0
+    const fetchStatusFn = async (): Promise<StatusEnvelope> => {
+      calls += 1
+      return statusEnvelope(calls === 1 ? HEALTHY_TELEGRAM : FAILING_TELEGRAM)
+    }
+
+    render(
+      <SystemPage
+        fetchHealthFn={async () => healthEnvelope}
+        fetchReadinessFn={async () => readinessEnvelope}
+        fetchStatusFn={fetchStatusFn}
+      />,
+    )
+
+    await screen.findByRole('heading', { name: 'Telegram delivery receipts' })
+    expect(screen.queryByRole('alert')).not.toBeInTheDocument()
+    const initialCalls = calls
+
+    fireEvent.focus(window)
+
+    await waitFor(() => expect(calls).toBeGreaterThan(initialCalls))
+    // The revalidated counts replace the last-good card instead of flickering
+    // to a loading state.
+    const alert = await screen.findByRole('alert')
+    expect(alert).toHaveTextContent('Telegram pushes failing')
+    expect(screen.getByRole('heading', { name: 'Telegram delivery receipts' })).toBeInTheDocument()
+  })
+
+  it('marks the English Telegram panel and alert text with lang="en"', async () => {
+    renderSystem(FAILING_TELEGRAM)
+
+    const alert = await screen.findByRole('alert')
+    expect(alert).toHaveAttribute('lang', 'en')
+    const heading = await screen.findByRole('heading', { name: 'Telegram delivery receipts' })
+    const panel = heading.closest('section')
+    expect(panel).not.toBeNull()
+    expect(panel).toHaveAttribute('lang', 'en')
   })
 })
