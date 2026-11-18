@@ -1,4 +1,4 @@
-import { fireEvent, render, screen, waitFor } from '@testing-library/react'
+import { fireEvent, render, screen, waitFor, within } from '@testing-library/react'
 import { describe, expect, it, vi } from 'vitest'
 
 import type { ApiMeta } from '../../api/status'
@@ -377,20 +377,158 @@ describe('SettingsTelegramPage — allowlists, toggles, and test send', () => {
   })
 
   it('shows a stable failure reason and does not mark other chats failed', async () => {
+    const otherChatReceipt: TelegramReceipt = {
+      ...receipt('sent'),
+      event_key: 'test:2002:old',
+      chat_id: 2002,
+    }
     const test = vi.fn(async () => {
       throw new SettingsApiError('unauthorized', 'TELEGRAM_TOKEN_INVALID', {
         httpStatus: 422,
       })
     })
-    renderPage({ fetchSettings: async () => configured(), test })
+    renderPage({
+      fetchSettings: async () => configured({ receipts: [otherChatReceipt], receipt_total: 1 }),
+      test,
+    })
 
     await screen.findByTestId('telegram-test')
     fireEvent.click(screen.getByTestId('telegram-test'))
 
     const error = await screen.findByTestId('telegram-test-error')
     expect(error).toHaveTextContent('401 Unauthorized')
-    // The aggregate's own per-chat receipts are untouched.
-    expect(screen.queryByTestId('telegram-receipts')).toBeNull()
+    // One chat's failure must not mark every other chat's receipt failed: the
+    // seeded receipt for another chat still renders as delivered.
+    const receipts = await screen.findByTestId('telegram-receipts')
+    expect(receipts).toHaveTextContent('test:2002:old')
+    expect(within(receipts).getByTestId('telegram-receipt-state-sent')).toHaveTextContent('已送达')
+  })
+
+  it('announces a failed save exactly once while keeping the field description', async () => {
+    const updateSettings = vi.fn(async () => {
+      throw new SettingsApiError('at least one chat id is required', 'VALIDATION_FAILED', {
+        httpStatus: 422,
+        details: [
+          {
+            field: 'chat_ids',
+            code: 'chat_required_for_pushes',
+            message: 'at least one chat id is required',
+          },
+        ],
+      })
+    })
+    renderPage({ fetchSettings: async () => configured(), updateSettings })
+
+    await screen.findByTestId('telegram-save')
+    fireEvent.click(screen.getByTestId('telegram-save'))
+
+    await waitFor(() => expect(screen.getAllByRole('alert')).toHaveLength(1))
+    const alert = screen.getByRole('alert')
+    expect(alert).toHaveTextContent('未写入任何内容')
+    // The focused summary is announced by moving focus to it (WCAG 3.3.1).
+    expect(screen.getByTestId('telegram-error')).toHaveFocus()
+    // The per-field copy is still a description target for the input, just not
+    // a second assertive announcement.
+    const chatInput = screen.getByTestId('telegram-chat-input')
+    expect(chatInput.getAttribute('aria-describedby')).toContain('telegram-chat-error')
+    const fieldError = document.getElementById('telegram-chat-error')
+    expect(fieldError).not.toBeNull()
+    expect(fieldError).not.toHaveAttribute('role', 'alert')
+  })
+
+  it('announces a local allowlist validation error and keeps one save alert', async () => {
+    const updateSettings = vi.fn(async () => {
+      throw new SettingsApiError('at least one chat id is required', 'VALIDATION_FAILED', {
+        httpStatus: 422,
+        details: [
+          {
+            field: 'chat_ids',
+            code: 'chat_required_for_pushes',
+            message: 'at least one chat id is required',
+          },
+        ],
+      })
+    })
+    renderPage({ fetchSettings: async () => configured(), updateSettings })
+
+    const chatInput = await screen.findByTestId('telegram-chat-input')
+    fireEvent.change(chatInput, { target: { value: 'abc' } })
+    fireEvent.click(screen.getByTestId('telegram-chat-add'))
+
+    // Local validation is announced even though server-refusal copy on this
+    // screen stays silent (the focused save summary is the other alert).
+    const localAlert = await screen.findByRole('alert')
+    expect(localAlert).toHaveTextContent('Chat ID 必须是')
+    expect(localAlert).toHaveTextContent('不会保存')
+    expect(chatInput.getAttribute('aria-describedby')).toContain('telegram-chat-error')
+    expect(chatInput).toHaveAccessibleDescription(/Chat ID 必须是非零整数/)
+
+    // Clearing the local error and failing a save still mounts exactly one alert.
+    fireEvent.change(chatInput, { target: { value: '' } })
+    expect(screen.queryByRole('alert')).toBeNull()
+    fireEvent.click(screen.getByTestId('telegram-save'))
+    await waitFor(() => expect(screen.getAllByRole('alert')).toHaveLength(1))
+    expect(screen.getByRole('alert')).toHaveTextContent('未写入任何内容')
+  })
+
+  it('keeps the pending key when a settings save outcome is unknown', async () => {
+    const clearKey = vi.fn()
+    const rotateKey = vi.fn(() => 'rotated')
+    const updateSettings = vi.fn(async () => {
+      throw new SettingsApiError('network error', undefined, { kind: 'unknown' })
+    })
+    renderPage({
+      fetchSettings: async () => configured(),
+      updateSettings,
+      clearKey,
+      rotateKey,
+    })
+
+    await screen.findByTestId('telegram-save')
+    fireEvent.click(screen.getByTestId('telegram-save'))
+
+    const error = await screen.findByTestId('telegram-error')
+    expect(error).toHaveTextContent('结果未知')
+    expect(error).toHaveTextContent('network error')
+    // The write may have committed; the pending key is kept for a replay.
+    expect(clearKey).not.toHaveBeenCalled()
+    expect(rotateKey).not.toHaveBeenCalled()
+    expect(screen.queryByTestId('telegram-save-status')).toBeNull()
+  })
+
+  it('keeps the test key when the send outcome is unknown', async () => {
+    const clearKey = vi.fn()
+    const rotateKey = vi.fn(() => 'rotated')
+    const test = vi.fn(async () => {
+      throw new SettingsApiError('network error', undefined, { kind: 'unknown' })
+    })
+    renderPage({ fetchSettings: async () => configured(), test, clearKey, rotateKey })
+
+    await screen.findByTestId('telegram-test')
+    fireEvent.click(screen.getByTestId('telegram-test'))
+
+    const error = await screen.findByTestId('telegram-test-error')
+    expect(error).toHaveTextContent('结果未知')
+    expect(error).toHaveTextContent('network error')
+    expect(clearKey).not.toHaveBeenCalled()
+    expect(rotateKey).not.toHaveBeenCalled()
+  })
+
+  it('rotates the test key on a send conflict and shows the conflict notice', async () => {
+    const clearKey = vi.fn()
+    const rotateKey = vi.fn(() => 'rotated')
+    const test = vi.fn(async () => {
+      throw new SettingsApiError('conflict', 'IDEMPOTENCY_CONFLICT', { httpStatus: 409 })
+    })
+    renderPage({ fetchSettings: async () => configured(), test, clearKey, rotateKey })
+
+    await screen.findByTestId('telegram-test')
+    fireEvent.click(screen.getByTestId('telegram-test'))
+
+    const error = await screen.findByTestId('telegram-test-error')
+    expect(error).toHaveTextContent('冲突')
+    await waitFor(() => expect(rotateKey).toHaveBeenCalledWith('test'))
+    expect(clearKey).not.toHaveBeenCalled()
   })
 
   it('keeps the idempotency key on an unknown outcome and rotates on a conflict', async () => {

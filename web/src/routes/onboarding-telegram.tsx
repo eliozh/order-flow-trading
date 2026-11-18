@@ -10,6 +10,7 @@ import type {
   TelegramToggleName,
   TelegramToggles,
 } from '../api/telegram'
+import { telegramTestFailureReason } from '../api/telegram'
 import { SettingsApiError } from '../api/settings'
 import { AllowlistEditor } from '../components/allowlist-editor'
 import { TelegramTestReceipt } from '../components/telegram-receipt'
@@ -212,8 +213,11 @@ export function TelegramStep({
     if (narrow || busy || !data || !draft || testDisabledReason !== '') {
       return
     }
-    const label = 'telegram.test'
     const settingsLabel = 'telegram.test-settings'
+    const label = 'telegram.test'
+    // Settle the key that was actually in flight: the settings save's key
+    // until it succeeds and is cleared, then the test send's key.
+    let activeLabel = settingsLabel
     setBusy(true)
     setTestError('')
     try {
@@ -231,13 +235,19 @@ export function TelegramStep({
         throw new Error('Telegram 保存响应为空。')
       }
       clearIdempotencyKeyFn(settingsLabel)
+      activeLabel = label
       const envelope = await testFn(idempotencyKeyFn(label), draft.chatIds[0])
       if (envelope.data) {
         setTestReceipt(envelope.data)
       }
       clearIdempotencyKeyFn(label)
     } catch (failure: unknown) {
-      setTestError(settle(label, failure))
+      const settled = settleOnboardingMutation(failure, activeLabel, {
+        rotate: rotateIdempotencyKeyFn,
+        clear: clearIdempotencyKeyFn,
+      })
+      const apiError = failure instanceof SettingsApiError ? failure : null
+      setTestError(telegramTestFailureReason(apiError, settled.message))
     } finally {
       setBusy(false)
     }
@@ -401,7 +411,7 @@ export function TelegramStep({
         )}
       </section>
 
-      {load.state === 'ready' && data && (
+      {load.state === 'ready' && data && draft && (
         <>
           {!tokenConfigured && (
             <p className="status-message" data-testid="onboarding-telegram-empty">
@@ -409,12 +419,12 @@ export function TelegramStep({
             </p>
           )}
           {!tokenConfigured && (
-            <p className="visually-hidden" id="onboarding-telegram-no-token">
+            <p className="status-message" id="onboarding-telegram-no-token">
               先保存 bot token 才能完成或发送测试。
             </p>
           )}
           {tokenConfigured && chatCount === 0 && (
-            <p className="visually-hidden" id="onboarding-telegram-no-chat">
+            <p className="status-message" id="onboarding-telegram-no-chat">
               至少添加一个 chat id 才能完成或发送测试。
             </p>
           )}

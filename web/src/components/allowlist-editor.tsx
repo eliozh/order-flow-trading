@@ -14,6 +14,12 @@ interface AllowlistEditorProps {
   testId?: string
   /** A server refusal for this field; announced and tied to the add input. */
   serverError?: string
+  /**
+   * Whether the server-error copy is its own assertive announcement. Screens
+   * that already render a focused error summary pass ``false`` so one failed
+   * save is announced once; the copy stays an ``aria-describedby`` target.
+   */
+  announceServerError?: boolean
 }
 
 /**
@@ -34,6 +40,7 @@ export function AllowlistEditor({
   maximum,
   testId,
   serverError,
+  announceServerError = true,
 }: AllowlistEditorProps) {
   const inputId = `${id}-input`
   const labelId = `${id}-label`
@@ -194,7 +201,11 @@ export function AllowlistEditor({
         {hint}
       </p>
       {shownError ? (
-        <p className="status-message status-message--error" id={errorId} role="alert">
+        <p
+          className="status-message status-message--error"
+          id={errorId}
+          role={error || announceServerError ? 'alert' : undefined}
+        >
           错误：{shownError}
         </p>
       ) : null}

@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import logging
 from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any
@@ -136,24 +137,38 @@ def test_no_response_log_or_audit_row_contains_the_token(
     tmp_path: Path, backend: MemorySecretBackend, caplog: pytest.LogCaptureFixture
 ) -> None:
     app = _app(tmp_path)
+    root = logging.getLogger()
+    original_handlers = root.handlers[:]
+    try:
+        with TestClient(app) as client:
+            _set(client, app, FIRST, "token-1")
+            bodies = [
+                client.get(SETTINGS_PATH, headers=_headers(app, "read")),
+                client.get(
+                    "/api/v1/telegram/status",
+                    headers={"Authorization": f"Bearer {app.state.api_token}"},
+                ),
+                client.get(
+                    "/api/v1/settings",
+                    headers={"Authorization": f"Bearer {app.state.api_token}"},
+                ),
+            ]
 
-    with TestClient(app) as client:
-        _set(client, app, FIRST, "token-1")
-        bodies = [
-            client.get(SETTINGS_PATH, headers=_headers(app, "read")),
-            client.get(
-                "/api/v1/telegram/status",
-                headers={"Authorization": f"Bearer {app.state.api_token}"},
-            ),
-            client.get(
-                "/api/v1/settings",
-                headers={"Authorization": f"Bearer {app.state.api_token}"},
-            ),
-        ]
+        # ``create_app`` calls ``configure_logging(force=True)``, which removes
+        # pytest's caplog handler. Re-attach it after the redacting root
+        # handlers so this assertion covers a real, scrubbed record instead of
+        # an always-empty capture.
+        root.addHandler(caplog.handler)
+        caplog.set_level(logging.INFO)
+        logging.getLogger("oft.test").info("telegram token %s", FIRST)
+        assert caplog.records, "no log record was captured; the assertion would be vacuous"
+        assert "telegram token" in caplog.text
+        assert FIRST not in caplog.text
 
-    for response in bodies:
-        assert FIRST not in response.text
-        assert FIRST[:10] not in response.text
-    audits = app.state.container.store.list_audit_events()
-    assert FIRST not in json.dumps([json.loads(event.payload_json) for event in audits])
-    assert FIRST not in caplog.text
+        for response in bodies:
+            assert FIRST not in response.text
+            assert FIRST[:10] not in response.text
+        audits = app.state.container.store.list_audit_events()
+        assert FIRST not in json.dumps([json.loads(event.payload_json) for event in audits])
+    finally:
+        root.handlers[:] = original_handlers

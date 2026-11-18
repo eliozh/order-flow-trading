@@ -2765,7 +2765,7 @@ code {
   padding: 2px 0;
 }
 
-.onboarding-page .check {
+.check {
   display: flex;
   align-items: flex-start;
   gap: 8px;
@@ -2773,9 +2773,17 @@ code {
   font-size: 12px;
 }
 
-.onboarding-page .check small {
+.check small {
   display: block;
   color: var(--oft-text-muted);
+}
+
+/* WCAG 2.2 SC 2.5.8: each toggle label is its own touch target on narrow
+   surfaces (the wizard and `/settings/telegram`). */
+@media (max-width: 768px) {
+  .check {
+    min-height: 44px;
+  }
 }
 
 /* Slice 46: the wizard introduces no ambient motion, but a stepper/result

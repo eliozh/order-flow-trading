@@ -58,12 +58,16 @@ class TelegramOptions:
 
 @dataclass(frozen=True)
 class TelegramPlan:
-    """Validated step-4 inputs for the non-interactive path."""
+    """Validated step-4 inputs for the non-interactive path.
+
+    ``None`` means the corresponding flag was absent, so the stored allowlist
+    must be preserved instead of overwritten with an empty list.
+    """
 
     configure: bool = False
     token_stdin: bool = False
-    chat_ids: tuple[int, ...] = ()
-    user_ids: tuple[int, ...] = ()
+    chat_ids: tuple[int, ...] | None = None
+    user_ids: tuple[int, ...] | None = None
 
 
 def read_telegram_token(*, stdin_is_tty: Callable[[], bool]) -> str:
@@ -151,7 +155,8 @@ def print_telegram_line(service: TelegramService | None, *, skipped: bool = Fals
     typer.echo(
         f"4/5 {_TELEGRAM_STEP_TITLE} (optional): token "
         f"{telegram_label(service)} · "
-        f"chats {', '.join(str(item) for item in allowlist.chat_ids) or '-'}"
+        f"chats {', '.join(str(item) for item in allowlist.chat_ids) or '-'} · "
+        f"users {', '.join(str(item) for item in allowlist.allowed_user_ids) or '-'}"
     )
 
 
@@ -257,8 +262,10 @@ def plan_telegram(
         TelegramPlan(
             configure=True,
             token_stdin=options.token_stdin,
-            chat_ids=options.chat_ids,
-            user_ids=options.user_ids,
+            # An absent flag is ``None`` (keep the stored list); an explicit
+            # empty tuple is impossible from the CLI option shape.
+            chat_ids=options.chat_ids or None,
+            user_ids=options.user_ids or None,
         ),
         missing,
     )
@@ -278,11 +285,13 @@ def apply_telegram_plan(
     if plan.token_stdin:
         telegram.set_token(read_token(), actor="cli")
     telegram.update_settings(
-        chat_ids=list(plan.chat_ids),
-        allowed_user_ids=list(plan.user_ids),
+        chat_ids=list(plan.chat_ids) if plan.chat_ids is not None else None,
+        allowed_user_ids=list(plan.user_ids) if plan.user_ids is not None else None,
         actor="cli",
     )
     typer.echo(f"  telegram token {telegram_label(telegram)}")
+    # Report the post-apply state: an omitted flag preserved the stored list.
+    print_telegram_line(telegram)
 
 
 __all__ = [

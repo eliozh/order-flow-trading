@@ -161,16 +161,20 @@ export function SettingsTelegramPage({
     }
   }, [error])
 
-  function settle(label: string, failure: unknown): string {
+  function settle(label: string, failure: unknown): { message: string } {
     if (failure instanceof SettingsApiError && failure.code === 'IDEMPOTENCY_CONFLICT') {
       rotateIdempotencyKeyFn(label)
-      return `该保存与同一 Idempotency-Key 的先前请求冲突；已生成新的 key，可重试。 ${failure.message}`
+      return {
+        message: `该保存与同一 Idempotency-Key 的先前请求冲突；已生成新的 key，可重试。 ${failure.message}`,
+      }
     }
     if (failure instanceof SettingsApiError && failure.kind === 'refusal') {
       clearIdempotencyKeyFn(label)
-      return `服务器拒绝了本次保存，未写入任何内容。${failure.message}`
+      return { message: `服务器拒绝了本次保存，未写入任何内容。${failure.message}` }
     }
-    return `结果未知；重试会使用同一 Idempotency-Key 重放。 ${errorMessage(failure)}`
+    return {
+      message: `结果未知；重试会使用同一 Idempotency-Key 重放。 ${errorMessage(failure)}`,
+    }
   }
 
   async function saveToken(): Promise<void> {
@@ -198,7 +202,7 @@ export function SettingsTelegramPage({
       setLiveMessage('token 已保存；只显示掩码与最后 4 位。')
     } catch (failure: unknown) {
       setTokenSaveFailed(true)
-      setError(settle(label, failure))
+      setError(settle(label, failure).message)
     } finally {
       setTokenBusy(false)
     }
@@ -230,7 +234,7 @@ export function SettingsTelegramPage({
       setNotice(message)
       setLiveMessage(message)
     } catch (failure: unknown) {
-      setError(settle(label, failure))
+      setError(settle(label, failure).message)
     } finally {
       setTokenBusy(false)
     }
@@ -274,7 +278,7 @@ export function SettingsTelegramPage({
         setChatError(chatDetail?.message ?? (chatDetail ? failure.message : ''))
         setUserError(userDetail?.message ?? '')
       }
-      setError(settle(label, failure))
+      setError(settle(label, failure).message)
     } finally {
       setSaving(false)
     }
@@ -309,12 +313,8 @@ export function SettingsTelegramPage({
       clearIdempotencyKeyFn(label)
     } catch (failure: unknown) {
       const apiError = failure instanceof SettingsApiError ? failure : null
-      setTestError(telegramTestFailureReason(apiError, errorMessage(failure)))
-      if (apiError?.code === 'IDEMPOTENCY_CONFLICT') {
-        rotateIdempotencyKeyFn(label)
-      } else if (apiError?.kind === 'refusal') {
-        clearIdempotencyKeyFn(label)
-      }
+      const settled = settle(label, failure)
+      setTestError(telegramTestFailureReason(apiError, settled.message))
     } finally {
       setTesting(false)
     }
@@ -485,6 +485,7 @@ export function SettingsTelegramPage({
                     maximum={10}
                     testId="telegram-chat-editor"
                     serverError={chatError}
+                    announceServerError={false}
                   />
                   <AllowlistEditor
                     id="telegram-user"
@@ -499,6 +500,7 @@ export function SettingsTelegramPage({
                     maximum={20}
                     testId="telegram-user-editor"
                     serverError={userError}
+                    announceServerError={false}
                   />
                 </div>
               </section>
@@ -512,6 +514,7 @@ export function SettingsTelegramPage({
                     role="group"
                     aria-labelledby="telegram-toggles-heading"
                     aria-describedby="telegram-toggles-hint"
+                    style={{ display: 'grid', gap: '8px' }}
                   >
                     {(Object.keys(TOGGLE_COPY) as TelegramToggleName[]).map((name) => (
                       <label className="check" key={name}>
@@ -553,15 +556,6 @@ export function SettingsTelegramPage({
                   {saving ? '保存中…' : '保存'}
                 </button>
                 <span className="hint">一次保存写入一条 TELEGRAM_SETTINGS_UPDATED audit。</span>
-                {(chatError || userError) && (
-                  <p
-                    className="status-message status-message--error"
-                    id="telegram-settings-error"
-                    role="alert"
-                  >
-                    {[chatError, userError].filter(Boolean).join(' ')}
-                  </p>
-                )}
               </div>
 
               <section className="panel" aria-labelledby="telegram-test-heading">

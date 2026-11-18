@@ -19,6 +19,14 @@ from fastapi.testclient import TestClient
 from fakes.telegram import MemorySecretBackend
 from oft.api.app import create_app
 from oft.application import secrets_service as secrets_module
+from oft.application.telegram_events import (
+    BUDGET_THRESHOLD_EVENT_TYPE,
+    ENTRY_RECHECK_EVENT_TYPE,
+    OPPORTUNITY_TRIGGERED_EVENT_TYPE,
+    POSITION_MANAGEMENT_EVENT_TYPE,
+    RISK_ALERT_EVENT_TYPE,
+    SCAN_SUMMARY_EVENT_TYPE,
+)
 from oft.clock import FixedClock
 from oft.config import Settings
 
@@ -384,3 +392,45 @@ def test_a_saved_toggle_suppresses_the_event_at_enqueue_time(
     # The scan still completed; only its Telegram push was suppressed.
     assert scan.json()["data"]["scan"]["status"] == "DONE"
     assert harness.container.store.list_telegram_receipts() == ()
+
+
+# One representative event per operator-facing toggle; each gate must read the
+# toggle with the same name, so a name/key/event swap fails this parametrization.
+_TOGGLE_EVENT_CASES: dict[str, tuple[str, dict[str, Any]]] = {
+    "scan_report": (SCAN_SUMMARY_EVENT_TYPE, {"report_ids": ["RPT-1"], "status": "DONE"}),
+    "trigger": (OPPORTUNITY_TRIGGERED_EVENT_TYPE, {}),
+    "entry_recheck": (ENTRY_RECHECK_EVENT_TYPE, {}),
+    "position": (POSITION_MANAGEMENT_EVENT_TYPE, {}),
+    "risk": (RISK_ALERT_EVENT_TYPE, {}),
+    "budget": (BUDGET_THRESHOLD_EVENT_TYPE, {}),
+}
+
+
+@pytest.mark.parametrize("name", list(_TOGGLE_EVENT_CASES))
+def test_each_saved_toggle_suppresses_only_its_own_event(
+    tmp_path: Path, backend: MemorySecretBackend, name: str
+) -> None:
+    """A name↔key↔event swap must fail: every other gate stays enabled."""
+    from test_scan_telegram_push import _harness
+
+    harness = _harness(tmp_path)
+    try:
+        harness.configure()
+        response = harness.client.put(
+            PATH,
+            json={"toggles": {name: False}},
+            headers={**harness.auth, "Idempotency-Key": f"toggle-{name}"},
+        )
+        assert response.status_code == 200, response.text
+
+        state = harness.container.telegram_service.settings_state()
+        assert state.toggles[name] is False
+        for other_name in _TOGGLE_EVENT_CASES:
+            if other_name != name:
+                assert state.toggles[other_name] is True
+
+        notifications = harness.container.notifications
+        for event_name, (event_type, payload) in _TOGGLE_EVENT_CASES.items():
+            assert notifications._event_enabled(event_type, payload) is (event_name != name)
+    finally:
+        harness.close()

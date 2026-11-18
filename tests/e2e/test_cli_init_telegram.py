@@ -17,11 +17,13 @@ from fakes.telegram import MemorySecretBackend
 from oft.adapters.sqlite_store import SqliteStore
 from oft.application import secrets_service as secrets_module
 from oft.application.settings_service import ONBOARDING_PROGRESS_KEY, SettingsService
+from oft.application.telegram_service import TelegramService
 from oft.bootstrap import build_container
 from oft.cli.commands import init as init_module
 from oft.cli.main import app
 from oft.config import Settings
 from oft.ports.store import ConfigRecord
+from oft.ports.telegram import TelegramError
 
 SENTINEL = "123456789:AAFakeSentinelToken_abcdefghijklmnopqrstuv"
 OTHER = "987654321:BBOtherSentinelToken_abcdefghijklmnopqrstuv"
@@ -212,6 +214,34 @@ def test_omitted_flags_after_required_steps_skip_step_4_without_completing_it(
     assert store.get_config("telegram.chat_ids") is None
 
 
+def test_non_interactive_chat_flag_preserves_an_existing_user_allowlist(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """An omitted ``--telegram-user-id`` must keep the stored user allowlist."""
+    settings, _ = _configure(monkeypatch, tmp_path)
+    container = build_container(settings, initialize=True)
+    container.telegram_service.update_settings(
+        chat_ids=[1001],
+        allowed_user_ids=[2002],
+        actor="test",
+    )
+    _seed_required_complete(settings)
+    # A configured environment token satisfies step 4 without stdin.
+    monkeypatch.setenv("OFT_TELEGRAM_BOT_TOKEN", SENTINEL)
+
+    result = _run(["--resume", "--telegram-chat-id", "3003"])
+
+    assert result.exit_code == 0, result.output
+    assert _progress(settings) == [1, 2, 4, 5]
+    service = _service(settings)
+    allowlist = service.read_telegram_allowlist()
+    assert allowlist.chat_ids == (3003,)
+    # The absent user-id flag is "keep existing", never an empty list.
+    assert allowlist.allowed_user_ids == (2002,)
+    assert "chats 3003" in result.stdout
+    assert "users 2002" in result.stdout
+
+
 def test_interactive_resume_prompts_the_optional_step_after_required_steps(
     monkeypatch: pytest.MonkeyPatch, tmp_path: Path
 ) -> None:
@@ -342,17 +372,35 @@ def test_non_interactive_token_is_never_a_value_option(
 ) -> None:
     import inspect
 
+    import typer
+
     parameters = inspect.signature(init_module.init_command).parameters
     assert "telegram_token_stdin" in parameters
     assert "telegram_token" not in parameters
     assert parameters["telegram_token_stdin"].default is False
 
-    raw = CliRunner().invoke(app, ["init", "--help"], env={"COLUMNS": "220"}).stdout
-    help_text = raw.replace("\x1b", "").replace("[0m", "").replace("[1m", "")
-    assert "--telegram-token-stdin" in help_text
-    # No value-taking token option exists anywhere in init.
-    assert "--telegram-token " not in help_text
-    assert "--telegram-token=" not in help_text
+    # Width-independent: the rendered help column truncates option names at a
+    # narrow terminal (CI), so assert on the Typer/Click option itself. The
+    # token must be a boolean stdin switch, never a value-taking option.
+    init = typer.main.get_command(app).commands["init"]
+    init_params = list(init.params)
+    stdin_option = next(
+        param for param in init_params if getattr(param, "name", None) == "telegram_token_stdin"
+    )
+    assert "--telegram-token-stdin" in stdin_option.opts
+    assert stdin_option.is_flag is True
+    assert stdin_option.secondary_opts == []
+
+    value_token_aliases = [
+        param
+        for param in init_params
+        if not getattr(param, "is_flag", False)
+        and (
+            "--telegram-token" in getattr(param, "opts", ())
+            or "--telegram-token" in getattr(param, "secondary_opts", ())
+        )
+    ]
+    assert value_token_aliases == []
 
 
 def test_interactive_telegram_step_reads_the_token_hidden_and_can_send_a_test(
@@ -384,6 +432,64 @@ def test_interactive_telegram_step_reads_the_token_hidden_and_can_send_a_test(
     assert "禁用" not in result.stdout
     service = _service(settings)
     assert service.read_telegram_allowlist().chat_ids == (1001,)
+
+
+def test_interactive_telegram_accepting_the_test_send_queues_one_message(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    settings, backend = _configure(monkeypatch, tmp_path)
+    _seed_required_complete(settings)
+
+    def _hidden(prompt: str = "") -> str:
+        return SENTINEL
+
+    monkeypatch.setattr(init_module.getpass, "getpass", _hidden)
+
+    # Step 4 only: opt in, token (hidden), chat, users, then accept the test.
+    result = _interactive(
+        monkeypatch,
+        ["--resume"],
+        input_text="y\n1001\n2002\ny\n",
+    )
+
+    assert result.exit_code == 0, result.output
+    # The accepted test is reported by its queued record state and event key.
+    assert "test message queued" in result.stdout
+    assert "test:1001:" in result.stdout
+    # The token is stored write-only and never printed.
+    assert SENTINEL not in result.output
+    assert SENTINEL[:12] not in result.output
+    assert backend.values["telegram.bot_token"] == SENTINEL
+    assert _progress(settings) == [1, 2, 4, 5]
+
+
+def test_interactive_telegram_test_send_failure_never_claims_delivery(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    settings, _ = _configure(monkeypatch, tmp_path)
+    _seed_required_complete(settings)
+
+    def _hidden(prompt: str = "") -> str:
+        return SENTINEL
+
+    monkeypatch.setattr(init_module.getpass, "getpass", _hidden)
+
+    def _boom(self: TelegramService, *, actor: str, chat_id: int | None = None) -> Any:
+        raise TelegramError("TELEGRAM_TOKEN_INVALID", "the bot token was rejected")
+
+    monkeypatch.setattr(TelegramService, "enqueue_test", _boom)
+
+    result = _interactive(
+        monkeypatch,
+        ["--resume"],
+        input_text="y\n1001\n2002\ny\n",
+    )
+
+    assert result.exit_code == 0, result.output
+    assert "test message not sent" in result.output
+    assert "test message queued" not in result.output
+    assert "test message sent" not in result.output
+    assert _progress(settings) == [1, 2, 4, 5]
 
 
 def test_interactive_telegram_skip_writes_nothing_and_states_the_consequence(
