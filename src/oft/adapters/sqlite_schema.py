@@ -12,9 +12,11 @@ import logging
 import os
 import sqlite3
 import time
+from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any
 
+from oft.adapters.sqlite_backup import snapshot_before_migration
 from oft.adapters.sqlite_connections import configure_connection
 from oft.config import Settings
 from oft.domain.budget_periods import period_parts
@@ -2699,6 +2701,25 @@ def _enable_wal(connection: sqlite3.Connection) -> None:
             time.sleep(_WAL_SWITCH_BACKOFF_SECONDS * attempt)
 
 
+def _snapshot_before_migration(db_path: Path, version: int) -> None:
+    """Write a verified rollback point before applying pending migrations.
+
+    A failure aborts the migration: an upgrade without a recoverable snapshot
+    is worse than a refused boot. The empty-database case never reaches this
+    helper. ``datetime.now`` is intentional here: this entry point has no clock
+    seam, and only file creation/age matter.
+    """
+    if version >= _SCHEMA_VERSION:
+        return
+    try:
+        snapshot_before_migration(db_path, version, now=datetime.now(UTC))
+    except (OSError, RuntimeError) as exc:
+        raise RuntimeError(
+            f"refusing to migrate {db_path} without a verified pre-migration "
+            f"snapshot under {db_path.parent / 'backups'}: {exc}"
+        ) from exc
+
+
 def initialize_database(settings: Settings) -> None:
     """Create the data directory and the schema, currently v30.
 
@@ -2734,6 +2755,12 @@ def initialize_database(settings: Settings) -> None:
     settings.data_dir.mkdir(parents=True, exist_ok=True)
     settings.data_dir.chmod(0o700)
     db_path = database_path(settings)
+    try:
+        # A freshly created (or empty) file has nothing worth preserving; only an
+        # existing non-empty database about to be migrated gets a rollback point.
+        had_existing_data = db_path.is_file() and db_path.stat().st_size > 0
+    except OSError:
+        had_existing_data = False
     connection = sqlite3.connect(db_path)
     try:
         # Install the busy handler *before* any lock-taking pragma. The WAL
@@ -2744,6 +2771,8 @@ def initialize_database(settings: Settings) -> None:
         configure_connection(connection)
         connection.execute("PRAGMA synchronous=NORMAL")
         _enable_wal(connection)
+        if had_existing_data:
+            _snapshot_before_migration(db_path, _schema_version(connection))
         _ensure_opportunities_expires_at(connection)
         if _schema_version(connection) < 2 and _table_exists(connection, "symbols"):
             _migrate_symbols_v2(connection)

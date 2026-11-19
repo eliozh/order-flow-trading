@@ -22,6 +22,7 @@ from typing import Any, Literal
 from pydantic import BaseModel, ConfigDict
 
 from oft import __version__
+from oft.adapters.sqlite_backup import BackupError, backup_age_report, format_size
 from oft.config import SECRET_FIELDS, Settings
 from oft.domain.layout import PARTITION_ROOTS
 from oft.domain.telegram import (
@@ -48,6 +49,8 @@ CheckState = Literal["ok", "degraded", "offline", "unknown"]
 
 MIN_FREE_DISK_BYTES = 1 * 1024**3
 DISK_WARN_USED_PCT = 95.0
+# A daily backup cadence tolerates one missed day; past 48 h the doctor warns.
+BACKUP_STALE_HOURS = 48
 MANIFEST_SCAN_ROOTS = PARTITION_ROOTS
 # ``/health`` identifies this service so a port squatter (or a different local
 # daemon) can never be mistaken for a healthy OFT process.
@@ -888,6 +891,34 @@ def _kill_switch_check(settings: Settings, store: StorePort, clock: ClockPort) -
     return CheckResult("kill_switch", "ok", "kill switch clear")
 
 
+def _backup_check(settings: Settings, clock: ClockPort) -> CheckResult:
+    """Report the newest successful backup's age plus snapshot count and size.
+
+    Diagnostic only: a stale or missing backup degrades the doctor report but
+    never fails readiness (``build_readiness`` is intentionally untouched).
+    """
+    try:
+        report = backup_age_report(settings, now=clock.now())
+    except (OSError, BackupError) as exc:
+        return CheckResult(
+            "backup", "degraded", f"backup directory unreadable ({exc.__class__.__name__})"
+        )
+    size = format_size(report.total_bytes)
+    if report.last_backup_at is None or report.age_seconds is None:
+        return CheckResult(
+            "backup",
+            "degraded",
+            f"never; snapshots={report.snapshot_count}; backups={size}",
+        )
+    hours = report.age_seconds / 3600
+    status: CheckState = "degraded" if hours > BACKUP_STALE_HOURS else "ok"
+    return CheckResult(
+        "backup",
+        status,
+        f"last backup {hours:.1f}h ago; snapshots={report.snapshot_count}; backups={size}",
+    )
+
+
 def build_doctor(
     settings: Settings,
     store: StorePort,
@@ -956,6 +987,7 @@ def build_doctor(
         _stale_triggers_check(store, clock, settings.trigger_stale_after_seconds),
         _kill_switch_check(settings, store, clock),
         _secrets_check(settings),
+        _backup_check(settings, clock),
         _telegram_check(settings, store, clock, daemon_state=probe.state),
         ingest_check,
         ws_check,

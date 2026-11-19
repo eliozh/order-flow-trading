@@ -20,6 +20,8 @@ npm --prefix web run dev
 # CLI
 uv run oft status
 uv run oft status --json
+uv run oft backup [--out DIR] [--json]
+uv run oft restore <file> [--yes] [--json]
 
 # Telegram (read-only; the token is accepted only on stdin)
 uv run oft telegram status

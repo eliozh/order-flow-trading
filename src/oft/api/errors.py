@@ -191,6 +191,24 @@ ERROR_CATALOG: dict[str, ErrorSpec] = {
     "ORDER_NOT_FOUND": ErrorSpec(
         404, "EXECUTION", False, "The order is not known locally or at the exchange."
     ),
+    "BACKUP_NOT_FOUND": ErrorSpec(
+        404, "DATA", False, "The backup or restore candidate does not exist."
+    ),
+    "BACKUP_INTEGRITY_FAILED": ErrorSpec(
+        422, "DATA", False, "The backup failed PRAGMA integrity_check."
+    ),
+    "BACKUP_HASH_MISMATCH": ErrorSpec(
+        422, "DATA", False, "The backup does not match its SHA256 sidecar."
+    ),
+    "BACKUP_IO_ERROR": ErrorSpec(
+        500, "STORAGE", True, "A backup or restore file operation failed."
+    ),
+    "DAEMON_RUNNING": ErrorSpec(
+        409,
+        "SYSTEM",
+        False,
+        "The daemon is running, so the database cannot be restored under it.",
+    ),
 }
 
 

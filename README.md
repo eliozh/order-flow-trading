@@ -53,6 +53,8 @@ the unauthenticated health/readiness surfaces.
 uv run oft status
 uv run oft status --json
 uv run oft doctor
+uv run oft backup [--out DIR] [--json]
+uv run oft restore <file> [--yes] [--json]
 uv run oft scan run --fixture tests/fixtures/market/btcusdt_agg-trades_sample.csv \
   --symbol BTCUSDT --period 4h --metrics-only --json
 uv run oft scan status <scan-id> --json

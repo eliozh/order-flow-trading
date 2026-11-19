@@ -509,6 +509,46 @@
       "retryable": false,
       "summary": "The Telegram bot token is invalid.",
       "userAction": "Rotate the bot token with `oft telegram token set` (stdin) and retry."
+    },
+    {
+      "code": "BACKUP_NOT_FOUND",
+      "httpStatus": 404,
+      "category": "DATA",
+      "retryable": false,
+      "summary": "The backup or restore candidate does not exist.",
+      "userAction": "List `<data>/backups` and pass an existing `.db` file."
+    },
+    {
+      "code": "BACKUP_INTEGRITY_FAILED",
+      "httpStatus": 422,
+      "category": "DATA",
+      "retryable": false,
+      "summary": "The backup failed PRAGMA integrity_check.",
+      "userAction": "Choose a different backup (or re-run `oft backup`); do not restore it."
+    },
+    {
+      "code": "BACKUP_HASH_MISMATCH",
+      "httpStatus": 422,
+      "category": "DATA",
+      "retryable": false,
+      "summary": "The backup does not match its SHA256 sidecar.",
+      "userAction": "Treat the file as modified or corrupt; use a verified backup instead."
+    },
+    {
+      "code": "BACKUP_IO_ERROR",
+      "httpStatus": 500,
+      "category": "STORAGE",
+      "retryable": true,
+      "summary": "A backup or restore file operation failed.",
+      "userAction": "Check disk space and permissions on the data/backup directories, then retry."
+    },
+    {
+      "code": "DAEMON_RUNNING",
+      "httpStatus": 409,
+      "category": "SYSTEM",
+      "retryable": false,
+      "summary": "The daemon is running, so the database cannot be restored under it.",
+      "userAction": "Stop the daemon with `oft daemon stop`, restore, then start it again."
     }
   ]
 }
