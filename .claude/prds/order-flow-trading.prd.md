@@ -116,7 +116,7 @@ We'll know we're right when **连续 8 周自用中，机会触发后的漏单�
 | 2 | 分析闭环（paper） | 星标扫描 → LLM 报告 → 机会台账 → 代码触发 → LLM 复核 → 模拟入场 | complete | .claude/plans/order-flow-trading-m2.plan.md |
 | 3 | 仓位管理与复盘 | 自动仓位管理 + 完整交易日志 + 盈亏/胜率/复盘视图 | complete | .claude/plans/order-flow-trading-m3.plan.md |
 | 4 | 双入口 | CLI 全功能；Web UI 完成配置、持仓、机会、日志与基础图表 | complete | .claude/plans/order-flow-trading-m4.plan.md |
-| 5 | Telegram 只读通道 | 报告/提醒/查询/预算告警在移动端可用 | pending | .claude/plans/order-flow-trading-m5.plan.md |
+| 5 | Telegram 只读通道 | 报告/提醒/查询/预算告警在移动端可用 | complete | .claude/plans/order-flow-trading-m5.plan.md |
 | 6 | 实盘能力 | 币安模拟盘对接 + Live trading（默认关闭、代码强制风控、可一键停用） | pending | — |
 | 7 | 图表与体验进阶 | 类 TradingView 的多周期/叠加/交互与 geek style 打磨 | pending | — |
 
