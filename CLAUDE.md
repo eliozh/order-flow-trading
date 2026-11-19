@@ -10,7 +10,11 @@ a React/TypeScript/Vite client under `web/`.
 uv sync
 npm --prefix web install
 
-# Dev API (loopback only, 127.0.0.1:7611)
+# Dev daemon (API + schedulers + live ingestion + Telegram runtime;
+# loopback only, 127.0.0.1:7611)
+uv run oft daemon start
+
+# Dev API only (no schedulers, ingestion, or Telegram)
 uv run oft serve
 
 # Dev web shell (proxies /api, /health, and /ready to 127.0.0.1:7611;
@@ -41,10 +45,12 @@ uv run pytest
 uv run pytest tests/e2e/test_telegram_channel.py
 uv run pytest tests/integration/test_telegram_secret_leakage.py
 npm --prefix web run test
+make ci
 
 # Lint
 uv run ruff check .
 uv run ruff format --check .
+uv run lint-imports
 npm --prefix web run lint
 
 # Typecheck
@@ -85,14 +91,25 @@ script. Before driving it, load the version-matched guide:
 ## Notes
 
 - Settings come from `OFT_*` environment variables (see `.env.example`); safe
-  defaults are paper environment, loopback binding, and no credentials.
-- The walking skeleton has one fixture-backed symbol universe
-  (`src/oft/fixtures/symbol-universe.json`) shared by the API and CLI.
-- There is no live exchange connection or order code. Telegram exists as a
-  read-only channel: seven bot commands (`/status`, `/positions`,
+  defaults are paper environment, loopback binding, and no credentials. Stored
+  secrets prefer the OS keyring; the encrypted-file fallback requires
+  `OFT_MASTER_KEY` (min 32 chars), and key writes are refused when neither is
+  available.
+- Execution is paper-only: `application/execution_gateway.py` refuses every
+  intent whose environment is not `PAPER`, and no live order-placement code
+  exists. Market data is the public Binance USDⓈ-M WS/REST feed (no key used);
+  LLM provider adapters exist for OpenAI, Anthropic, DeepSeek, and the
+  deterministic stub. The budget ledger alerts but never stops a call.
+- `oft daemon start` is the full runtime (API + schedulers + live ingestion +
+  Telegram runtime); `oft serve` is the API-only shell.
+- One fixture-backed symbol universe (`src/oft/fixtures/symbol-universe.json`)
+  is shared by the API and CLI; live ingestion follows starred symbols.
+- Telegram is a read-only channel: seven bot commands (`/status`, `/positions`,
   `/opportunities`, `/report [SYMBOL]`, `/budget`, `/watchlist`, `/help`) plus
   read-only pushes. Write-like tokens are refused, the bot token is stdin-only
   and masked on every surface, and `OFT_ENV=test` selects the deterministic
   network-free `TelegramFake`.
 - `oft telegram watchdog --once` is the one-shot host check for cron/systemd
   `OnFailure=`; see `docs/runbooks/telegram.md`.
+- `oft backup` / `oft restore` are manual; backups are not encrypted at rest,
+  and daily scheduling/retention are not automated.

@@ -51,7 +51,7 @@ Import rules are enforced in CI with `import-linter` contracts:
 - `oft.api` must not import `oft.adapters.live_broker` or exchange modules; order submission is reachable only through `application.execution_gateway`.
 - `oft.application.execution_gateway` is the only module allowed to import a broker adapter.
 
-Process supervision is a systemd unit (`oft.service`) with `Restart=on-failure`, `RestartSec=5`, `TimeoutStopSec=30`, a dedicated user, `NoNewPrivileges=true`, `ProtectSystem=strict`, and `ReadWritePaths=$OFT_DATA`. Docker Compose is a documented alternative with `restart: unless-stopped`; macOS uses a launchd plist. The process runs in the foreground (`oft serve`) so any supervisor can own it.
+Process supervision is a systemd unit (`oft.service`) with `Restart=on-failure`, `RestartSec=5`, `TimeoutStopSec=30`, a dedicated user, `NoNewPrivileges=true`, `ProtectSystem=strict`, and `ReadWritePaths=$OFT_DATA`. Docker Compose is a documented alternative with `restart: unless-stopped`; macOS uses a launchd plist. The process runs in the foreground (`oft daemon start`) so any supervisor can own it. Amended 2026-11-19: the shipped foreground runtime is `oft daemon start`; `oft serve` remains the API-only shell.
 
 ## Alternatives Considered
 

@@ -274,7 +274,7 @@ class SettingsService(LLMSettingsMixin, OnboardingProgressMixin):
 
     def _env_period(self) -> str:
         try:
-            return resolve_schedule_settings(self._environ).period
+            return resolve_schedule_settings(self._environ, settings=self._settings).period
         except ValueError as exc:
             raise ConfigError(str(exc)) from exc
 
@@ -1154,13 +1154,15 @@ def resolve_schedule_state_overlay(
 ) -> ScheduleState:
     """The persisted schedule with the saved period overlaid, promoted.
 
-    Resolves the persisted row *before* validating the environment period (M3),
+    Resolves the persisted row *before* validating the configured period (M3),
     so a valid saved ``8h`` keeps diagnostics working even when
-    ``OFT_SCAN_PERIOD`` is invalid. The jitter comes only from
-    :func:`resolve_scan_jitter` and is clamped below the smallest supported
-    period, so an out-of-range ``OFT_SCAN_JITTER_SECONDS`` cannot make a saved
-    period raise from ``ScheduleState``. Shared by the daemon/CLI status paths
-    and ``/api/v1/status`` (M14).
+    ``OFT_SCAN_PERIOD`` is invalid. A non-persisted period comes from the
+    supplied ``settings`` object, so a cadence set only in ``.env`` is honored.
+    The jitter comes from the same configured values (``OFT_SCAN_JITTER_SECONDS``
+    via the environment or ``.env``) and is clamped below the smallest supported
+    period, so an out-of-range jitter cannot make a saved period raise from
+    ``ScheduleState``. Shared by the daemon/CLI status paths and
+    ``/api/v1/status`` (M14).
     """
     persisted: str | None = None
     if store is not None:
@@ -1169,10 +1171,10 @@ def resolve_schedule_state_overlay(
         default_period = persisted
     else:
         try:
-            default_period = resolve_schedule_settings().period
+            default_period = resolve_schedule_settings(settings=settings).period
         except ValueError as exc:
             raise ConfigError(str(exc)) from exc
-    jitter = min(resolve_scan_jitter(), OVERLAY_MAX_JITTER_SECONDS)
+    jitter = min(resolve_scan_jitter(settings=settings), OVERLAY_MAX_JITTER_SECONDS)
     default = ScheduleState(period=default_period, jitter_seconds_max=jitter)
     state = load_schedule_state(schedule_state_path(settings), default=default)
     resolved_now = now or clock.now()

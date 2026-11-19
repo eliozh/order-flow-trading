@@ -158,3 +158,184 @@ def test_empty_secret_placeholders_are_unset() -> None:
 
     assert settings.api_token is None
     assert settings.openai_api_key is None
+
+
+def test_scan_cadence_defaults_are_preserved(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    _clear_oft_environment(monkeypatch)
+    monkeypatch.chdir(tmp_path)
+
+    settings = Settings()
+
+    assert settings.scan_period == "4h"
+    assert settings.scan_jitter_seconds == 30
+
+
+def test_valid_scan_cadence_loads_from_the_environment(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    _clear_oft_environment(monkeypatch)
+    monkeypatch.chdir(tmp_path)
+    monkeypatch.setenv("OFT_SCAN_PERIOD", "8h")
+    monkeypatch.setenv("OFT_SCAN_JITTER_SECONDS", "10")
+
+    settings = load_settings()
+
+    assert settings.scan_period == "8h"
+    assert settings.scan_jitter_seconds == 10
+
+
+def test_valid_explicit_scan_cadence_loads() -> None:
+    settings = load_settings(scan_period="8h", scan_jitter_seconds=0)
+
+    assert settings.scan_period == "8h"
+    assert settings.scan_jitter_seconds == 0
+
+
+@pytest.mark.parametrize("period", ["1h", "", "4H"])
+def test_invalid_scan_period_is_config_invalid(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path, period: str
+) -> None:
+    _clear_oft_environment(monkeypatch)
+    monkeypatch.chdir(tmp_path)
+    monkeypatch.setenv("OFT_SCAN_PERIOD", period)
+
+    with pytest.raises(ConfigError) as caught:
+        load_settings(validate_scan_cadence=True)
+
+    assert caught.value.code == "CONFIG_INVALID"
+    assert "OFT_SCAN_PERIOD" in caught.value.message
+
+
+def test_invalid_explicit_scan_period_is_config_invalid() -> None:
+    with pytest.raises(ConfigError) as caught:
+        load_settings(scan_period="1h")
+
+    assert caught.value.code == "CONFIG_INVALID"
+    assert "OFT_SCAN_PERIOD" in caught.value.message
+
+
+def test_negative_scan_jitter_fails_at_load(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    _clear_oft_environment(monkeypatch)
+    monkeypatch.chdir(tmp_path)
+    monkeypatch.setenv("OFT_SCAN_JITTER_SECONDS", "-1")
+
+    with pytest.raises(ConfigError) as caught:
+        load_settings(validate_scan_cadence=True)
+
+    assert caught.value.code == "CONFIG_INVALID"
+    assert "OFT_SCAN_JITTER_SECONDS" in caught.value.message
+
+
+def test_scan_jitter_must_be_shorter_than_the_period(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    _clear_oft_environment(monkeypatch)
+    monkeypatch.chdir(tmp_path)
+    monkeypatch.setenv("OFT_SCAN_PERIOD", "4h")
+    monkeypatch.setenv("OFT_SCAN_JITTER_SECONDS", str(4 * 3600))
+
+    with pytest.raises(ConfigError) as caught:
+        load_settings(validate_scan_cadence=True)
+
+    assert caught.value.code == "CONFIG_INVALID"
+    assert "less than the scan period" in caught.value.message
+
+
+def test_empty_archive_fixture_dir_is_unset(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """An empty OFT_ARCHIVE_FIXTURE_DIR disables fixtures, not ``Path('.')``."""
+    _clear_oft_environment(monkeypatch)
+    monkeypatch.chdir(tmp_path)
+    monkeypatch.setenv("OFT_ARCHIVE_FIXTURE_DIR", "")
+
+    assert load_settings().archive_fixture_dir is None
+    assert Settings(archive_fixture_dir="   ").archive_fixture_dir is None
+
+
+def test_plain_load_defers_scan_period_validation_for_m3_diagnostics(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """Diagnostics must be able to overlay a persisted period over a stale env.
+
+    ``daemon status`` / ``scan status`` / ``config show`` resolve the persisted
+    row first (M3), so a plain load keeps the raw environment value available
+    for that overlay. The strict path (``daemon start`` and the scheduler
+    helpers) rejects it.
+    """
+    _clear_oft_environment(monkeypatch)
+    monkeypatch.chdir(tmp_path)
+    monkeypatch.setenv("OFT_SCAN_PERIOD", "1h")
+
+    settings = load_settings()
+
+    assert settings.scan_period == "1h"
+    with pytest.raises(ConfigError):
+        load_settings(validate_scan_cadence=True)
+
+
+def test_strict_load_rejects_a_non_integer_scan_jitter(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    _clear_oft_environment(monkeypatch)
+    monkeypatch.chdir(tmp_path)
+    monkeypatch.setenv("OFT_SCAN_JITTER_SECONDS", "soon")
+
+    with pytest.raises(ConfigError) as caught:
+        load_settings(validate_scan_cadence=True)
+
+    assert caught.value.code == "CONFIG_INVALID"
+
+
+def test_padded_scan_period_is_stripped_and_accepted(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    _clear_oft_environment(monkeypatch)
+    monkeypatch.chdir(tmp_path)
+    monkeypatch.setenv("OFT_SCAN_PERIOD", " 4h ")
+
+    settings = load_settings(validate_scan_cadence=True)
+
+    assert settings.scan_period == "4h"
+
+
+def test_padded_unsupported_scan_period_is_rejected(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    _clear_oft_environment(monkeypatch)
+    monkeypatch.chdir(tmp_path)
+    monkeypatch.setenv("OFT_SCAN_PERIOD", " 1h ")
+
+    with pytest.raises(ConfigError) as caught:
+        load_settings(validate_scan_cadence=True)
+
+    assert caught.value.code == "CONFIG_INVALID"
+    assert "OFT_SCAN_PERIOD" in caught.value.message
+
+
+@pytest.mark.parametrize("jitter", ["", "   "])
+def test_blank_scan_jitter_uses_the_default(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path, jitter: str
+) -> None:
+    """A blank ``OFT_SCAN_JITTER_SECONDS`` must not break plain diagnostics."""
+    _clear_oft_environment(monkeypatch)
+    monkeypatch.chdir(tmp_path)
+    monkeypatch.setenv("OFT_SCAN_JITTER_SECONDS", jitter)
+
+    settings = load_settings()
+
+    assert settings.scan_jitter_seconds == 30
+    assert Settings(scan_jitter_seconds=jitter).scan_jitter_seconds == 30
+
+
+def test_invalid_explicit_scan_cadence_pair_is_config_invalid() -> None:
+    """The (period, jitter) pair is validated even with explicit overrides."""
+    with pytest.raises(ConfigError) as caught:
+        load_settings(scan_period="4h", scan_jitter_seconds=4 * 3600)
+
+    assert caught.value.code == "CONFIG_INVALID"
+    assert "less than the scan period" in caught.value.message

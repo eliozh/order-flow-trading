@@ -3,11 +3,13 @@
 from __future__ import annotations
 
 from datetime import UTC, datetime, timedelta
+from pathlib import Path
 
 import pytest
 
 from oft.application.scheduler import (
     BOUNDARY_HOURS,
+    DEFAULT_JITTER_SECONDS,
     MANAGEMENT_JOB_ID,
     MANAGEMENT_STAGGER_SECONDS,
     POSITION_MONITOR_JOB_ID,
@@ -23,6 +25,8 @@ from oft.application.scheduler import (
     latest_due_window,
     next_boundary,
     plan_catch_up,
+    resolve_scan_jitter,
+    resolve_schedule_settings,
     run_at,
     validate_period,
     window_for,
@@ -231,6 +235,61 @@ def test_jitter_must_be_shorter_than_the_period() -> None:
         )
     with pytest.raises(ValueError, match="less than the scan period"):
         ScheduleState(period="4h", jitter_seconds_max=4 * 3600)
+
+
+@pytest.mark.parametrize("raw", ["", "   "])
+def test_blank_jitter_env_uses_the_same_default_as_settings(raw: str) -> None:
+    """A blank jitter means the default on the runtime path too (N2)."""
+    jitter = resolve_scan_jitter({"OFT_SCAN_JITTER_SECONDS": raw})
+
+    assert jitter == DEFAULT_JITTER_SECONDS == 30
+
+
+def test_resolve_schedule_settings_uses_only_the_injected_mapping(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """An injected mapping is authoritative and never reads process env."""
+    from oft.application.scheduler import resolve_schedule_settings
+
+    monkeypatch.setenv("OFT_SCAN_PERIOD", "1h")
+    monkeypatch.setenv("OFT_SCAN_JITTER_SECONDS", "soon")
+
+    config = resolve_schedule_settings({"OFT_SCAN_PERIOD": "8h", "OFT_SCAN_JITTER_SECONDS": "10"})
+
+    assert config.period == "8h"
+    assert config.jitter_seconds == 10
+
+
+def test_dotenv_scan_cadence_reaches_the_resolvers(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A cadence set only in ``.env`` must drive the scheduler resolvers (M1)."""
+    (tmp_path / ".env").write_text(
+        "OFT_SCAN_PERIOD=8h\nOFT_SCAN_JITTER_SECONDS=99\n", encoding="utf-8"
+    )
+    monkeypatch.chdir(tmp_path)
+    monkeypatch.delenv("OFT_SCAN_PERIOD", raising=False)
+    monkeypatch.delenv("OFT_SCAN_JITTER_SECONDS", raising=False)
+
+    config = resolve_schedule_settings()
+
+    assert config.period == "8h"
+    assert config.jitter_seconds == 99
+    assert resolve_scan_jitter() == 99
+
+
+def test_resolvers_keep_the_defaults_without_environment_or_dotenv(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.chdir(tmp_path)
+    monkeypatch.delenv("OFT_SCAN_PERIOD", raising=False)
+    monkeypatch.delenv("OFT_SCAN_JITTER_SECONDS", raising=False)
+
+    config = resolve_schedule_settings()
+
+    assert config.period == "4h"
+    assert config.jitter_seconds == 30
+    assert resolve_scan_jitter() == 30
 
 
 def test_date_trigger_has_no_misfire_cap_so_fire_always_reschedules() -> None:

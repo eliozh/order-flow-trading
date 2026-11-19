@@ -1,22 +1,107 @@
 # Order Flow Trading
 
-Single-operator, local order-flow trading terminal. This repository is at the
-walking-skeleton stage: typed configuration, structured logging, a FastAPI
-daemon, a Typer CLI, and a React/Vite shell all share one deterministic,
-fixture-backed scan path. No exchange connection, LLM call, or order path
-exists yet.
+Single-operator, local **paper-trading terminal**. The Python 3.12 `oft`
+package ingests Binance USDⓈ-M market data, computes deterministic order-flow
+metrics and triggers, asks an LLM for analysis, and manages simulated positions.
+A React/TypeScript/Vite shell and a Typer CLI share one local FastAPI API.
 
-One fixture-backed `aggTrade` sample flows through:
+Live order submission does not exist: `application/execution_gateway.py`
+refuses every intent whose environment is not `PAPER`. Binance credentials are
+accepted by the settings model but are not used by the shipped market-data
+path; the public WS and REST endpoints need no key.
+
+## What runs
 
 ```
-CSV -> normalized rows -> Parquet part + SQLite manifest -> delta/CVD -> API/CLI/UI
+Binance WS/REST -> normalized rows -> Parquet + SQLite manifest -> metrics
+  -> opportunities -> LLM analysis -> triggers -> entry re-check
+  -> paper OMS/execution -> position monitor -> management
+  -> journal, reports, audit chain -> API/CLI/web/Telegram
 ```
 
-## Requirements
+- **Market data** — live WS ingestion on `wss://fstream.binance.com` (aggTrade,
+  kline, markPrice, forceOrder) plus public REST on
+  `https://fapi.binance.com` for `exchangeInfo` and 48 h `aggTrades` gap
+  recovery. Archived daily files come from `https://data.binance.vision` when a
+  backfill or replay uses the HTTPS archive source.
+- **Decisions** — deterministic metrics, opportunity and trigger evaluation,
+  LLM analysis for the `analysis` / `entry_recheck` / `management` / `review`
+  roles, and a code-only entry re-check. Provider adapters exist for OpenAI,
+  Anthropic, and DeepSeek, plus a deterministic `stub`. The budget ledger
+  records every call and alerts on thresholds; it never stops a call.
+- **Execution** — paper account, paper OMS, position monitor, management,
+  journal, exports, reports, and the append-only audit chain. Paper only.
+- **Telegram** — a read-only channel with exactly seven commands (`/status`,
+  `/positions`, `/opportunities`, `/report [SYMBOL]`, `/budget`, `/watchlist`,
+  `/help`). It requires an allowlisted chat **and** user. Write-like tokens are
+  refused. `OFT_ENV=test` selects the deterministic, network-free
+  `TelegramFake`.
+- **Local surfaces** — FastAPI on `127.0.0.1:7611` (bearer token or bounded
+  session, loopback Host allowlist) and the Vite web shell.
 
-- Python 3.12
-- [uv](https://docs.astral.sh/uv/)
-- Node.js 20+ and npm (web client only)
+## `daemon start` vs `serve`
+
+```bash
+uv run oft daemon start          # full runtime
+uv run oft serve                 # HTTP API only
+```
+
+`oft daemon start` runs the API, the scan and trigger schedulers, the position
+monitor and management cadence, live WS ingestion, and the Telegram runtime.
+`oft serve` runs only the FastAPI app: no schedulers, no ingestion, and no
+Telegram. Because `/ready` requires a fresh scheduler heartbeat outside
+`OFT_ENV=test`, an API-only `oft serve` reports not-ready in real environments.
+
+Both bind `127.0.0.1:7611` by default. `oft daemon start` accepts only
+`--host`, `--port`, `--allow-non-loopback`, `--replay-file`, and `--symbols`.
+
+## Capability matrix
+
+| Capability | Shipped behavior |
+|---|---|
+| Paper trading | Yes — paper account, OMS, position management, journal |
+| Live trading | Absent — non-`PAPER` intents are refused |
+| Binance market data | Public WS + REST ingestion; no API key used |
+| LLM providers | OpenAI, Anthropic, DeepSeek, deterministic stub |
+| Telegram | Read-only, seven commands, allowlisted chat + user |
+| Local API / web shell | Authenticated read and write surfaces |
+| Backups | Manual `oft backup` / `oft restore`; automatic pre-migration and pre-restore snapshots |
+
+External endpoints contacted (only when the corresponding feature is used):
+
+| Endpoint | Used by |
+|---|---|
+| `wss://fstream.binance.com` | Live market-data ingestion |
+| `https://fapi.binance.com` | Exchange info and aggTrade gap recovery |
+| `https://data.binance.vision` | Archive backfill / replay (HTTPS source) |
+| `https://api.openai.com` | LLM provider `openai` |
+| `https://api.anthropic.com` | LLM provider `anthropic` |
+| `https://api.deepseek.com` | LLM provider `deepseek` |
+| `https://api.telegram.org` | Telegram channel, when configured |
+
+## Secrets
+
+No secret is needed for paper market data, local scans without an LLM, or the
+loopback API. The API bearer token is generated into
+`$OFT_DATA/run/api-token` (0600) on first start unless `OFT_API_TOKEN` is set.
+
+| Secret | When required |
+|---|---|
+| `OFT_TELEGRAM_BOT_TOKEN`, or the token stored with `oft telegram token set --stdin` | Telegram channel |
+| `OFT_OPENAI_API_KEY` / `OFT_ANTHROPIC_API_KEY` / `OFT_DEEPSEEK_API_KEY` | The selected LLM provider (`stub` needs none) |
+| `OFT_MASTER_KEY` (min 32 chars) | Only for the encrypted-file secret fallback when no OS keyring is available |
+| `OFT_BINANCE_API_KEY` / `OFT_BINANCE_API_SECRET` | Not used by the shipped code; reserved for a future live path |
+
+Stored secrets prefer the OS keyring. Without a usable keyring, the encrypted
+file needs `OFT_MASTER_KEY`; otherwise key writes are refused. Secrets are
+write-only through the API/CLI, masked to a fixed prefix plus last four
+characters, and redacted from logs.
+
+Read-only surfaces: the Telegram channel, `GET /health`, `GET /ready`, and the
+CLI diagnostics (`oft status`, `oft doctor`, `oft daemon status`). The
+authenticated web shell and API expose write surfaces — scans and triggers,
+settings and risk caps, watchlist stars, the kill switch, and paper
+position monitor/manage actions.
 
 ## Setup
 
@@ -26,87 +111,55 @@ uv sync
 npm --prefix web install
 ```
 
-Settings come from `OFT_*` environment variables; `OFT_DATA` and
-`OFT_DATA_DIR` are both accepted for the data directory. Defaults are paper
-environment, loopback binding, and no credentials.
+Python 3.12, [uv](https://docs.astral.sh/uv/), and Node.js 20+/npm are required.
+Settings come from `OFT_*` environment variables; `OFT_DATA` and `OFT_DATA_DIR`
+are both accepted for the data directory. Safe defaults are paper environment,
+loopback binding, and no credentials.
 
-## Run the daemon
-
-```bash
-uv run oft serve
-```
-
-Binds `127.0.0.1:7611` by default.
-
-- `GET /health` — liveness (unauthenticated)
-- `GET /ready` — readiness with named checks (unauthenticated)
-- `GET /api/v1/status` — envelope status (bearer token required)
-- `POST /api/v1/scans`, `GET /api/v1/scans/{scan_id}` — fixture scans
-
-The daemon writes a bearer token to `$OFT_DATA/run/api-token` (0600) on first
-start; `OFT_API_TOKEN` overrides it. The built SPA under `/system` reads only
-the unauthenticated health/readiness surfaces.
-
-## Run the CLI
+## CLI
 
 ```bash
 uv run oft status
-uv run oft status --json
 uv run oft doctor
 uv run oft backup [--out DIR] [--json]
-uv run oft restore <file> [--yes] [--json]
-uv run oft scan run --fixture tests/fixtures/market/btcusdt_agg-trades_sample.csv \
-  --symbol BTCUSDT --period 4h --metrics-only --json
-uv run oft scan status <scan-id> --json
+uv run oft restore <file> [--yes] [--json] [--no-snapshot]
+uv run oft scan run --symbol BTCUSDT --metrics-only --json
+uv run oft scan status --json
 ```
 
-`oft status` and `oft doctor` work without the daemon (reporting `OFFLINE` /
-`DEGRADED`) and read SQLite read-only. `oft scan run` uses the daemon when it
-is up and falls back to the same application service for local fixture runs.
-The fixture's golden delta is `1.50` (buy `4.25`, sell `2.75`).
+`oft status` and `oft doctor` work without the daemon and read SQLite
+read-only. Manual scans and watchlist/position actions go through the daemon
+API, so they need a running daemon. `oft config set`, `oft risk set`,
+`oft init`, `oft backup`, and `oft restore` write SQLite directly; `oft backup`
+writes a verified `VACUUM INTO` copy plus a SHA-256
+sidecar under `$OFT_DATA/backups/`; `oft restore` refuses while the daemon runs
+and keeps a pre-restore safety snapshot. Backups are not encrypted, and daily
+scheduling/retention remain operator work.
 
-## Telegram channel (read-only)
-
-The optional Telegram bot is a read-only notification and query surface. It
-accepts exactly seven executable commands:
-
-```
-/status  /positions  /opportunities  /report [SYMBOL]  /budget  /watchlist  /help
-```
-
-Write-like tokens (`/approve`, `/accept`, `/reject`, `/cancel`, `/buy`, `/sell`,
-`/close`) are recognized only to return the fixed read-only refusal. Prose that
-merely mentions a command is ignored, and only an explicitly allowlisted chat
-**and** user may query.
+## Telegram (read-only)
 
 ```bash
-# The token is accepted only on stdin: no argv, no reveal command.
 printf '%s\n' "$TELEGRAM_BOT_TOKEN" | uv run oft telegram token set --stdin
 uv run oft telegram status
-uv run oft telegram allowlist show
 uv run oft telegram allowlist add --chat-id 1001 --user-id 2002
 uv run oft telegram toggles show
-uv run oft telegram toggles set --no-scan-report --trigger
-uv run oft telegram test
-uv run oft telegram receipts --limit 20
-uv run oft telegram watchdog --once   # one-shot cron/systemd check
+uv run oft telegram watchdog --once
 ```
 
-`status`, `allowlist`, `toggles`, `receipts`, and `watchdog` never print the
-token; only the fixed mask and last four characters are rendered. With
-`OFT_ENV=test` the composition root selects the deterministic in-process
-`TelegramFake`, so these commands and the test suite never touch
-`api.telegram.org`. See [`docs/runbooks/telegram.md`](docs/runbooks/telegram.md)
-for the cron/systemd watchdog examples.
+Only an explicitly allowlisted chat **and** user may query. Write-like tokens
+(`/approve`, `/accept`, `/reject`, `/cancel`, `/buy`, `/sell`, `/close`) return
+a fixed read-only refusal. Prose that merely mentions a command is ignored. See
+[`docs/runbooks/telegram.md`](docs/runbooks/telegram.md).
 
-## Run the web shell
+## Web shell
 
 ```bash
 npm --prefix web run dev
 ```
 
 Vite proxies `/api`, `/health`, and `/ready` to `http://127.0.0.1:7611`
-(override with `VITE_DEV_API_TARGET`). `/system` is read-only at 375px.
+(override with `VITE_DEV_API_TARGET`). The built SPA is served by FastAPI when
+`web/dist` exists.
 
 ## Checks
 
@@ -114,10 +167,11 @@ Vite proxies `/api`, `/health`, and `/ready` to `http://127.0.0.1:7611`
 uv run ruff check .
 uv run ruff format --check .
 uv run mypy
+uv run lint-imports
 uv run pytest --cov=oft --cov-fail-under=80
 npm --prefix web run lint
 npm --prefix web run typecheck
-npm --prefix web run test -- --run
+npm --prefix web run test
 npm --prefix web run build
 ```
 
@@ -125,12 +179,14 @@ npm --prefix web run build
 
 ```
 src/oft/
-  domain/        pure models, delta/CVD metrics, events
-  ports/         Protocol definitions (market_data, store, clock)
-  adapters/      fixture market data, SQLite store, Parquet store
-  application/   status, health/readiness/doctor, fixture scan
+  domain/        pure models, metrics, opportunities, risk, OMS state machines
+  ports/         Protocol definitions (market data, store, clock, broker, LLM)
+  adapters/      Binance WS/REST, archive, LLM providers, SQLite/Parquet,
+                 keyring, Telegram Bot API
+  application/   scans, triggers, entry, paper OMS, positions, management,
+                 journal, reports, budget, health/readiness/doctor, scheduler
   api/           FastAPI app, auth/CSRF, envelope, errors, routes
-  cli/           Typer command tree + API client + output
+  cli/           Typer command tree, API client, output, daemon lifecycle
 web/             React + TypeScript + Vite shell
-tests/           unit, integration, contract, e2e, fixtures
+tests/           unit, integration, contract, e2e, replay, fixtures
 ```
