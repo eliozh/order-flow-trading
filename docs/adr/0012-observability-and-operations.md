@@ -35,7 +35,7 @@ Use **structured local logs + a health/status API + supervised process + tested 
 ### Process supervision
 
 - systemd unit `oft.service`:
-  - `Type=simple`, `ExecStart=/path/to/oft daemon start` (see the amendment: `oft serve` is API-only)
+  - `Type=simple`, `ExecStart=/path/to/oft serve --config $OFT_DATA/config.toml`
   - `Restart=on-failure`, `RestartSec=5`, `TimeoutStopSec=30`, `KillMode=mixed`
   - dedicated `User=oft`, `Group=oft`, `UMask=0077`
   - `NoNewPrivileges=true`, `ProtectSystem=strict`, `ProtectHome=read-only`, `ReadWritePaths=$OFT_DATA`, `PrivateTmp=true`, `RestrictAddressFamilies=AF_INET AF_INET6 AF_UNIX`, `LockPersonality=true`, `MemoryDenyWriteExecute=true` (drop this last one if a pinned dependency requires executable memory; verify during packaging)
@@ -100,6 +100,9 @@ decision record above; the original text stays as the historical rationale.
 - The systemd example is `ExecStart=/path/to/oft daemon start`. There is no
   `--config` flag; the shipped options are `--host`, `--port`,
   `--allow-non-loopback`, `--replay-file`, and `--symbols`.
+- The original `ExecStart=... oft serve --config ...` bullet above is superseded
+  by this amendment (no `--config` flag; `oft serve` is API-only; use
+  `oft daemon start`) and is retained as historical rationale.
 - No separate startup self-check gate is implemented. The checks that were
   planned for it (config, storage, audit chain, disk, clock, kill switch,
   ingestion, Telegram) are available through `/ready` and `oft doctor`; `doctor`

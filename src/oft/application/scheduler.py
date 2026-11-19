@@ -21,7 +21,7 @@ from collections.abc import Callable, Mapping
 from dataclasses import dataclass, replace
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
-from typing import TYPE_CHECKING, Any
+from typing import Any
 
 from apscheduler.schedulers.background import BackgroundScheduler
 from apscheduler.triggers.date import DateTrigger
@@ -30,15 +30,15 @@ from apscheduler.triggers.interval import IntervalTrigger
 from oft.config import (
     DEFAULT_SCAN_JITTER_SECONDS,
     DEFAULT_SCAN_PERIOD,
+    SCAN_JITTER_ENV,
+    SCAN_PERIOD_ENV,
+    Settings,
     validate_scan_jitter_setting,
     validate_scan_period_setting,
 )
 from oft.domain.settings import SCAN_PERIOD_HOURS, SUPPORTED_SCAN_PERIODS
 from oft.domain.time import utc_timestamp
 from oft.ports.clock import ClockPort
-
-if TYPE_CHECKING:
-    from oft.config import Settings
 
 SCAN_PERIODS = SUPPORTED_SCAN_PERIODS
 # Derived from the one domain mapping so a domain cadence change cannot leave
@@ -368,13 +368,43 @@ class ScheduleState:
 
 @dataclass(frozen=True)
 class ScheduleConfig:
-    """Scan cadence resolved from ``OFT_SCAN_*`` environment variables."""
+    """Scan cadence resolved from the configured ``OFT_SCAN_*`` values."""
 
     period: str = DEFAULT_SCAN_PERIOD
     jitter_seconds: int = DEFAULT_JITTER_SECONDS
 
 
-def resolve_scan_jitter(environ: Mapping[str, str] | None = None) -> int:
+def _cadence_mapping(settings: Settings) -> dict[str, str]:
+    """The cadence keys one loaded ``Settings`` resolved (``.env`` included)."""
+    return {
+        SCAN_PERIOD_ENV: settings.scan_period,
+        SCAN_JITTER_ENV: str(settings.scan_jitter_seconds),
+    }
+
+
+def _cadence_source(
+    environ: Mapping[str, str] | None, settings: Settings | None
+) -> Mapping[str, str]:
+    """Pick the cadence source: explicit mapping, explicit settings, else loaded.
+
+    An explicit ``environ`` mapping is authoritative and never consults the
+    environment or ``.env``. An explicit ``settings`` uses the values that
+    object already loaded. With neither, a fresh :class:`Settings` is loaded, so
+    ``OFT_SCAN_*`` values from ``.env`` reach the resolvers exactly as they reach
+    the rest of the application.
+    """
+    if environ is not None:
+        return environ
+    if settings is not None:
+        return _cadence_mapping(settings)
+    return _cadence_mapping(Settings())
+
+
+def resolve_scan_jitter(
+    environ: Mapping[str, str] | None = None,
+    *,
+    settings: Settings | None = None,
+) -> int:
     """Parse ``OFT_SCAN_JITTER_SECONDS`` without requiring a valid env period.
 
     Diagnostics resolve the persisted period first (M3); this helper lets the
@@ -383,29 +413,37 @@ def resolve_scan_jitter(environ: Mapping[str, str] | None = None) -> int:
     the default, mirroring ``Settings``; a non-integer or negative value raises
     ``ValueError`` (``CONFIG_INVALID``). The bounds rule is shared with
     ``oft.config`` (one source of truth).
+
+    With no mapping the value comes from the loaded :class:`Settings`, so a
+    ``.env`` value is honored; an injected ``environ`` or ``settings`` object is
+    authoritative.
     """
-    source = environ if environ is not None else os.environ
-    raw_jitter = source.get("OFT_SCAN_JITTER_SECONDS", str(DEFAULT_JITTER_SECONDS)).strip()
+    source = _cadence_source(environ, settings)
+    raw_jitter = source.get(SCAN_JITTER_ENV, str(DEFAULT_SCAN_JITTER_SECONDS)).strip()
     if not raw_jitter:
         return DEFAULT_JITTER_SECONDS
     try:
         jitter = int(raw_jitter)
     except ValueError as exc:
-        raise ValueError(f"OFT_SCAN_JITTER_SECONDS must be an integer, got {raw_jitter!r}") from exc
+        raise ValueError(f"{SCAN_JITTER_ENV} must be an integer, got {raw_jitter!r}") from exc
     return validate_scan_jitter_setting(jitter)
 
 
 def resolve_schedule_settings(
     environ: Mapping[str, str] | None = None,
+    *,
+    settings: Settings | None = None,
 ) -> ScheduleConfig:
     """Resolve the scan cadence; invalid values raise ``ValueError``.
 
     The rule (supported period plus a jitter shorter than that period) is
-    shared with ``oft.config``. An injected mapping is always used as-is and
-    never falls back to the process environment.
+    shared with ``oft.config``. With no mapping the cadence is read from the
+    loaded :class:`Settings`, so a ``.env`` value takes effect; an injected
+    mapping or ``settings`` object is authoritative and never falls back to the
+    process environment or ``.env``.
     """
-    source = environ if environ is not None else os.environ
-    period = validate_scan_period_setting(source.get("OFT_SCAN_PERIOD", DEFAULT_SCAN_PERIOD))
+    source = _cadence_source(environ, settings)
+    period = validate_scan_period_setting(source.get(SCAN_PERIOD_ENV, DEFAULT_SCAN_PERIOD))
     jitter = resolve_scan_jitter(source)
     validate_scan_jitter_setting(jitter, period)
     return ScheduleConfig(period=period, jitter_seconds=jitter)
@@ -417,8 +455,12 @@ def schedule_state_path(settings: Settings) -> Path:
 
 
 def resolve_schedule_state(settings: Settings) -> ScheduleState:
-    """The persisted state, falling back to ``OFT_SCAN_*`` defaults."""
-    config = resolve_schedule_settings()
+    """The persisted state, falling back to the settings' ``OFT_SCAN_*`` values.
+
+    The fallback comes from the supplied ``settings`` object (which already
+    loaded ``.env``), so an unpersisted cadence set only in ``.env`` is honored.
+    """
+    config = resolve_schedule_settings(settings=settings)
     default = ScheduleState(period=config.period, jitter_seconds_max=config.jitter_seconds)
     return load_schedule_state(schedule_state_path(settings), default=default)
 

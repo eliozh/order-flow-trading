@@ -17,7 +17,10 @@ from oft.application.scheduler import (
     save_schedule_state,
     schedule_state_path,
 )
-from oft.application.settings_service import SettingsService
+from oft.application.settings_service import (
+    SettingsService,
+    resolve_schedule_state_overlay,
+)
 from oft.bootstrap import build_container
 from oft.cli.commands.daemon import _schedule_state
 from oft.clock import FixedClock
@@ -333,6 +336,58 @@ def test_the_scheduler_and_domain_agree_on_periods_and_boundaries() -> None:
     assert dict(SCAN_PERIOD_HOURS) == PERIOD_HOURS
     for period, hours in SCAN_PERIOD_HOURS.items():
         assert BOUNDARY_HOURS[period] == tuple(range(0, 24, hours))
+
+
+# -- M1: the overlay honors a cadence set only in ``.env`` ---------------------
+
+
+def test_overlay_honors_a_dotenv_cadence_without_a_persisted_row(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A cadence set only in ``.env`` must reach the status overlay (M1)."""
+    (tmp_path / ".env").write_text(
+        "OFT_SCAN_PERIOD=8h\nOFT_SCAN_JITTER_SECONDS=99\n", encoding="utf-8"
+    )
+    monkeypatch.chdir(tmp_path)
+    settings = _settings(tmp_path)
+
+    state = resolve_schedule_state_overlay(
+        settings=settings,
+        store=None,
+        clock=FixedClock(NOW),
+    )
+
+    assert state.period == "8h"
+    assert state.jitter_seconds_max == 99
+
+
+def test_overlay_lets_a_persisted_period_win_over_an_invalid_dotenv_period(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """M3: a saved 8h must not fail because ``.env`` holds an invalid period."""
+    (tmp_path / ".env").write_text(
+        "OFT_SCAN_PERIOD=1h\nOFT_SCAN_JITTER_SECONDS=30\n", encoding="utf-8"
+    )
+    monkeypatch.chdir(tmp_path)
+    settings = _settings(tmp_path)
+    container = build_container(settings, initialize=True, clock=FixedClock(NOW))
+    container.store.set_config(
+        ConfigRecord(
+            key=SCAN_PERIOD_KEY,
+            value_json=json.dumps("8h"),
+            updated_at="2026-11-06T10:00:00.000Z",
+            updated_by="web",
+        )
+    )
+
+    state = resolve_schedule_state_overlay(
+        settings=settings,
+        store=container.store,
+        clock=FixedClock(NOW),
+    )
+
+    assert state.period == "8h"
+    assert state.jitter_seconds_max == 30
 
 
 # -- M4/M8: the daemon sync seam never raises out of the interval job ----------
