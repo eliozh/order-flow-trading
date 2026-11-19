@@ -72,7 +72,12 @@
         "SCAN_ALREADY_RUNNING",
         "TELEGRAM_NOT_CONFIGURED",
         "TELEGRAM_DELIVERY_FAILED",
-        "TELEGRAM_TOKEN_INVALID"
+        "TELEGRAM_TOKEN_INVALID",
+        "BACKUP_NOT_FOUND",
+        "BACKUP_INTEGRITY_FAILED",
+        "BACKUP_HASH_MISMATCH",
+        "BACKUP_IO_ERROR",
+        "DAEMON_RUNNING"
       ]
     },
     "errorCategory": {

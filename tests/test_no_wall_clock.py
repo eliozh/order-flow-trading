@@ -10,6 +10,7 @@ from __future__ import annotations
 
 import ast
 import json
+import os
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from typing import Any
@@ -336,6 +337,15 @@ def test_doctor_reports_every_required_section(tmp_path: Path) -> None:
     store = SqliteStore(settings)
     store.initialize()
     ParquetStore(settings).ensure_layout()
+    # The doctor now reports backup freshness; a fresh backup keeps the healthy
+    # baseline READY while the missing/stale cases are covered in
+    # tests/integration/test_backup_restore.py.
+    backups = settings.data_dir / "backups"
+    backups.mkdir(parents=True)
+    backup = backups / "oft-20261106T120000000000Z.db"
+    backup.write_bytes(b"backup")
+    stamp = NOW.timestamp()
+    os.utime(backup, (stamp, stamp))
 
     report = _doctor(settings, store)
     checks = {check.name: check for check in report.checks}
@@ -353,6 +363,7 @@ def test_doctor_reports_every_required_section(tmp_path: Path) -> None:
         "budget.ledger",
         "triggers.stale",
         "kill_switch",
+        "backup",
     ):
         assert name in checks, name
     assert checks["storage.sqlite"].status == "ok"
@@ -367,6 +378,7 @@ def test_doctor_reports_every_required_section(tmp_path: Path) -> None:
     assert checks["budget.ledger"].status == "ok"
     assert checks["triggers.stale"].status == "ok"
     assert checks["kill_switch"].status == "ok"
+    assert checks["backup"].status == "ok"
     assert report.status == "READY"
 
 
