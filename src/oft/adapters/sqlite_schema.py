@@ -29,6 +29,7 @@ from oft.domain.prompts import (
     PromptStatus,
     content_hash,
 )
+from oft.ports.store import SchemaState
 
 _LOGGER = logging.getLogger(__name__)
 
@@ -480,6 +481,36 @@ _V21_REBUILDS: tuple[tuple[str, str, tuple[str, ...]], ...] = (
 
 def database_path(settings: Settings) -> Path:
     return settings.data_dir / "oft.db"
+
+
+def read_schema_state(settings: Settings) -> SchemaState:
+    """Compare the recorded migration version with ``_SCHEMA_VERSION``.
+
+    A missing or unreadable database is reported as not up to date: readiness
+    must not infer "current schema" from an absent file. A *newer* recorded
+    version is also not up to date: a downgraded binary must not report ready
+    against a schema it may not understand. Only version numbers are returned;
+    no table content or error text leaves this helper.
+    """
+    expected = _SCHEMA_VERSION
+    path = database_path(settings)
+    if not path.is_file():
+        return SchemaState(version=0, expected=expected, up_to_date=False)
+    connection: sqlite3.Connection | None = None
+    try:
+        # ``as_uri()`` percent-encodes ``?``/``#``/``%`` in the data dir; a raw
+        # ``f"file:{path}?mode=ro"`` would let them corrupt the URI (and open a
+        # stray empty database instead of the real one).
+        uri = path.resolve().as_uri() + "?mode=ro"
+        connection = sqlite3.connect(uri, uri=True)
+        configure_connection(connection, foreign_keys=False)
+        version = _schema_version(connection)
+    except (OSError, sqlite3.Error):
+        return SchemaState(version=0, expected=expected, up_to_date=False)
+    finally:
+        if connection is not None:
+            connection.close()
+    return SchemaState(version=version, expected=expected, up_to_date=version == expected)
 
 
 _SYMBOLS_COLUMNS = (

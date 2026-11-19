@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from collections.abc import Sequence
+from collections.abc import Callable, Sequence
 from dataclasses import dataclass
 from datetime import datetime
 from pathlib import Path
@@ -69,7 +69,15 @@ class AggTradeRecoveryPort(Protocol):
         *,
         last_event_time: datetime | None,
         now: datetime,
-    ) -> AggTradeRecovery: ...
+        stop: Callable[[], bool] | None = None,
+    ) -> AggTradeRecovery:
+        """Recover a bounded window; ``stop`` is a cooperative shutdown hook.
+
+        Implementations should check ``stop`` between network calls and return
+        a partial result (``complete=False``) once it returns ``True`` so a
+        daemon shutdown does not wait for the full 48 h window scan.
+        """
+        ...
 
 
 class EventSinkPort(Protocol):

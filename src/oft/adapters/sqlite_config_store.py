@@ -15,7 +15,14 @@ import sqlite3
 from collections.abc import Callable
 from contextlib import closing
 
-from oft.ports.store import AuditEventDraft, AuditEventRecord, ConfigRecord
+from oft.adapters.sqlite_schema import read_schema_state
+from oft.config import Settings
+from oft.ports.store import (
+    AuditEventDraft,
+    AuditEventRecord,
+    ConfigRecord,
+    SchemaState,
+)
 
 
 class ConfigStoreMixin:
@@ -31,6 +38,10 @@ class ConfigStoreMixin:
     _connect: Callable[[], sqlite3.Connection]
     _connect_read_only: Callable[[], sqlite3.Connection | None]
     _insert_audit_event: Callable[[sqlite3.Connection, AuditEventDraft], AuditEventRecord]
+    _settings: Settings
+
+    def schema_state(self) -> SchemaState:
+        return read_schema_state(self._settings)
 
     def get_config(self, key: str) -> ConfigRecord | None:
         connection = self._connect_read_only()

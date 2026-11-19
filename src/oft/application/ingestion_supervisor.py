@@ -592,7 +592,7 @@ class IngestionSupervisor:
         backoff_base: float = DEFAULT_BACKOFF_BASE,
         backoff_max: float = DEFAULT_BACKOFF_MAX,
         jitter: Callable[[], float] = random.random,
-        sleep: Callable[[float], None] = time.sleep,
+        sleep: Callable[[float], object] = time.sleep,
         max_reconnect_attempts: int = DEFAULT_MAX_RECONNECT_ATTEMPTS,
         symbol_provider: Callable[[], Sequence[str]] | None = None,
     ) -> None:
@@ -725,12 +725,12 @@ class IngestionSupervisor:
             while not stopper():
                 if not connected:
                     try:
-                        if not self._connect_and_subscribe():
+                        if not self._connect_and_subscribe(stop=stopper):
                             # Idle until stars change (or the daemon restarts).
                             self._sleep(max(0.05, self._backoff_base))
                             continue
                         # 48h REST gap recovery on startup and every reconnect.
-                        self._recover()
+                        self._recover(stop=stopper)
                         self._write_state()
                         connected = True
                     except Exception as exc:
@@ -975,9 +975,15 @@ class IngestionSupervisor:
         except OSError as exc:  # a checkpoint failure must not stop ingestion
             logger.warning("ingest_checkpoint_write_failed", reason=_safe_reason(exc))
 
-    def _connect_and_subscribe(self) -> bool:
-        """Connect; return False and enter IDLE when the active set is empty."""
+    def _connect_and_subscribe(self, *, stop: Callable[[], bool] | None = None) -> bool:
+        """Connect; return False and enter IDLE when the active set is empty.
+
+        ``stop`` is checked before the connect and subscribe handshakes so a
+        shutdown does not block on an in-flight socket operation.
+        """
         assert self._client is not None
+        if stop is not None and stop():
+            return False
         if self._symbol_provider is not None:
             # Star changes take effect on the next connect/reconnect.
             refreshed = tuple(self._symbol_provider())
@@ -992,8 +998,16 @@ class IngestionSupervisor:
             self._state_streams = {}
             self._write_state()
             return False
+        if stop is not None and stop():
+            return False
         self.state = ConnectionState.CONNECTING
         self._client.connect(self._streams)
+        if stop is not None and stop():
+            # A clean shutdown must not persist CONNECTING: report the
+            # disconnected state before returning to the run loop.
+            self.state = ConnectionState.DISCONNECTED
+            self._write_state()
+            return False
         self._client.subscribe(self._streams)
         self.state = ConnectionState.SUBSCRIBED
         return True
@@ -1018,17 +1032,21 @@ class IngestionSupervisor:
         self.state = ConnectionState.FAILED
         self._write_state()
 
-    def _recover(self) -> None:
+    def _recover(self, *, stop: Callable[[], bool] | None = None) -> None:
         if self._recovery is None:
             return
         now = self._clock.now()
         for symbol in self._symbols:
+            # A stop requested during shutdown must not wait for the remaining
+            # symbols' REST recovery before the loop can exit and drain.
+            if stop is not None and stop():
+                return
             stream = f"{symbol.lower()}@aggTrade"
             entry = self._checkpoint_entries.get(stream)
             last_event_time = entry.last_event_time if entry is not None else None
             try:
                 result = self._recovery.recover_agg_trades(
-                    symbol, last_event_time=last_event_time, now=now
+                    symbol, last_event_time=last_event_time, now=now, stop=stop
                 )
             except Exception as exc:
                 logger.warning("ws_recovery_failed", symbol=symbol, reason=_safe_reason(exc))

@@ -16,6 +16,12 @@ from oft.config import Settings
 
 _JSON_HEADERS = {"Accept": "application/json", "Content-Type": "application/json"}
 
+#: Loopback requests must never be forwarded through an ambient proxy: the
+#: default urllib opener honors ``http_proxy``/``ALL_PROXY`` and would send the
+#: ``Authorization: Bearer`` header to whatever host they name. An explicit
+#: empty ``ProxyHandler`` makes both request paths connect directly.
+_NO_PROXY_OPENER = urllib.request.build_opener(urllib.request.ProxyHandler({}))
+
 #: Daemon-supplied diagnostics are untrusted text: one bounded line, no controls.
 _CONTROL_CHARACTERS = re.compile(r"[\x00-\x1f\x7f-\x9f]")
 _MAX_ERROR_TEXT = 500
@@ -138,7 +144,7 @@ class ApiClient:
             f"{self._base_url}{path}", data=data, headers=headers, method=method
         )
         try:
-            with urllib.request.urlopen(request, timeout=self._timeout) as response:
+            with _NO_PROXY_OPENER.open(request, timeout=self._timeout) as response:
                 return cast(dict[str, Any], json.loads(response.read().decode("utf-8")))
         except urllib.error.HTTPError as exc:
             raise self._api_client_error(exc) from exc
@@ -191,7 +197,7 @@ class ApiClient:
             headers["Authorization"] = f"Bearer {self._token}"
         request = urllib.request.Request(f"{self._base_url}{path}", headers=headers, method=method)
         try:
-            with urllib.request.urlopen(request, timeout=self._timeout) as response:
+            with _NO_PROXY_OPENER.open(request, timeout=self._timeout) as response:
                 body = response.read()
                 response_headers = {name.lower(): value for name, value in response.headers.items()}
                 return body, response_headers

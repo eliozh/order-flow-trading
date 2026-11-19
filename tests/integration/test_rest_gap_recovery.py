@@ -227,3 +227,37 @@ def test_full_pages_until_the_request_budget_are_incomplete() -> None:
 
     assert result.complete is False
     assert result.reason == "RATE_LIMIT_BUDGET_EXHAUSTED"
+
+
+def test_recovery_stops_cooperatively_between_windows() -> None:
+    fetch = FakeFetch()
+    client = BinanceRestClient(fetch=fetch)
+
+    result = client.recover_agg_trades(
+        "BTCUSDT",
+        last_event_time=NOW - timedelta(hours=3),
+        now=NOW,
+        stop=lambda: len(fetch.urls) >= 1,
+    )
+
+    assert len(fetch.urls) == 1
+    assert result.requests == 1
+    assert result.complete is False
+    assert result.reason == "SHUTDOWN"
+
+
+def test_recovery_stops_cooperatively_while_paging_from_id() -> None:
+    fetch = PagedFetch(always_full=True)
+    client = BinanceRestClient(fetch=fetch)
+
+    result = client.recover_agg_trades(
+        "BTCUSDT",
+        last_event_time=NOW - timedelta(hours=1),
+        now=NOW,
+        stop=lambda: len(fetch.urls) >= 1,
+    )
+
+    assert len(fetch.urls) == 1
+    assert result.requests == 1
+    assert result.complete is False
+    assert result.reason == "SHUTDOWN"

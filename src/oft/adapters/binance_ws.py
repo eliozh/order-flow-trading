@@ -9,6 +9,7 @@ a wrong path is detected, alerted, and refused.
 
 from __future__ import annotations
 
+import inspect
 import json
 import time
 from collections.abc import Callable, Mapping, Sequence
@@ -193,14 +194,20 @@ class _SyncWebsocketTransport:
     def connect(self) -> None:
         from websockets.sync.client import connect
 
-        self._connection = connect(
-            self._url,
-            max_size=self._max_size,
-            ping_interval=self._ping_interval,
-            ping_timeout=self._ping_timeout,
-            open_timeout=self._open_timeout,
-            close_timeout=5,
-        )
+        options: dict[str, Any] = {
+            "max_size": self._max_size,
+            "ping_interval": self._ping_interval,
+            "ping_timeout": self._ping_timeout,
+            "open_timeout": self._open_timeout,
+            "close_timeout": 5,
+        }
+        # websockets >= 15 enables proxy support by default and would route
+        # market-data egress through http_proxy/ALL_PROXY/OS settings. Disable
+        # it explicitly. The declared floor is websockets>=13.0, which predates
+        # the ``proxy`` parameter, so pass it only when the callable accepts it.
+        if "proxy" in inspect.signature(connect).parameters:
+            options["proxy"] = None
+        self._connection = connect(self._url, **options)
 
     def send(self, text: str) -> None:
         if self._connection is None:

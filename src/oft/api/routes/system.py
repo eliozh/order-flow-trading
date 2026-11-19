@@ -19,9 +19,12 @@ router = APIRouter()
 _CHECK_ERROR_CODES = {
     "config": "CONFIG_INVALID",
     "storage.sqlite": "STORAGE_UNAVAILABLE",
+    "storage.disk": "STORAGE_UNAVAILABLE",
+    "storage.schema": "STORAGE_UNAVAILABLE",
     "storage.parquet": "STORAGE_UNAVAILABLE",
     "clock": "CLOCK_DRIFT",
     "market_data": "DATA_UNAVAILABLE",
+    "scheduler.heartbeat": "DAEMON_NOT_RUNNING",
 }
 
 

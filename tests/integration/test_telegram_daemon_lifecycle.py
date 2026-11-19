@@ -7,6 +7,7 @@ from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any
 
+import pytest
 from apscheduler.schedulers.background import BackgroundScheduler
 from apscheduler.triggers.interval import IntervalTrigger
 
@@ -18,6 +19,7 @@ from oft.adapters.fixture_market_data import FixtureMarketData
 from oft.adapters.sqlite_store import SqliteStore
 from oft.adapters.telegram_bot_api import TelegramBotApiAdapter
 from oft.adapters.telegram_fake import TelegramFake
+from oft.application.scheduler import scheduler_heartbeat_path
 from oft.application.secrets_service import SecretsService
 from oft.application.settings_service import SettingsService
 from oft.application.telegram_dispatch import OutboxDispatcher
@@ -200,6 +202,163 @@ class _StubRuntime:
         self._events.append("telegram_stop")
 
 
+def test_daemon_start_starts_every_background_surface_and_serve_stays_api_only(
+    tmp_path: Path, monkeypatch: Any
+) -> None:
+    """F1: the blessed daemon entrypoint is the only one that starts the runtime."""
+    from typer.testing import CliRunner
+
+    from oft.cli.main import app as cli_app
+
+    calls: list[str] = []
+    container = type(
+        "Container",
+        (),
+        {"settings": Settings(env="test", port=8765, data_dir=tmp_path / "data")},
+    )()
+
+    monkeypatch.setattr(
+        "oft.cli.main._resolve_serve_settings", lambda *args, **kwargs: container.settings
+    )
+    monkeypatch.setattr(
+        "oft.cli.main._run_uvicorn", lambda *args, **kwargs: calls.append("uvicorn")
+    )
+    monkeypatch.setattr("oft.bootstrap.build_container", lambda *args, **kwargs: container)
+    monkeypatch.setattr(daemon_module, "_schedule_state", lambda settings: object())
+
+    def _starter(name: str) -> Any:
+        def _start(*args: Any, **kwargs: Any) -> _StubScheduler:
+            calls.append(name)
+            return _StubScheduler(name, calls, stopped=False)
+
+        return _start
+
+    monkeypatch.setattr(
+        "oft.cli.main._run_live_ingestion",
+        lambda *args, **kwargs: calls.append("ingestion"),
+    )
+    monkeypatch.setattr(daemon_module, "_start_scheduler", _starter("scan"))
+    monkeypatch.setattr(daemon_module, "_start_settings_sync_scheduler", _starter("settings_sync"))
+    monkeypatch.setattr(daemon_module, "_start_trigger_scheduler", _starter("trigger"))
+    monkeypatch.setattr(daemon_module, "_start_position_monitor_scheduler", _starter("monitor"))
+    monkeypatch.setattr(daemon_module, "_start_management_scheduler", _starter("management"))
+    monkeypatch.setattr(
+        daemon_module,
+        "_start_telegram_runtime",
+        lambda *args, **kwargs: calls.append("telegram_start"),
+    )
+
+    daemon_module.daemon_start()
+
+    for surface in (
+        "ingestion",
+        "scan",
+        "settings_sync",
+        "trigger",
+        "monitor",
+        "management",
+        "telegram_start",
+        "uvicorn",
+    ):
+        assert surface in calls, surface
+
+    calls.clear()
+    result = CliRunner().invoke(cli_app, ["serve"])
+
+    assert result.exit_code == 0, result.output
+    assert calls == ["uvicorn"]
+
+
+def test_daemon_start_stops_the_live_ingestion_handle_before_schedulers(
+    tmp_path: Path, monkeypatch: Any
+) -> None:
+    events: list[str] = []
+
+    class _Handle:
+        def stop(self, *, timeout: float | None = None) -> bool:
+            events.append("ingestion_stop")
+            return True
+
+    container = type(
+        "Container",
+        (),
+        {"settings": Settings(env="test", port=8765, data_dir=tmp_path / "data")},
+    )()
+    monkeypatch.setattr(
+        "oft.cli.main._resolve_serve_settings", lambda *args, **kwargs: container.settings
+    )
+    monkeypatch.setattr("oft.cli.main._run_live_ingestion", lambda *args, **kwargs: _Handle())
+    monkeypatch.setattr("oft.cli.main._run_uvicorn", lambda *args, **kwargs: None)
+    monkeypatch.setattr(daemon_module, "_schedule_state", lambda settings: object())
+    monkeypatch.setattr("oft.bootstrap.build_container", lambda *args, **kwargs: container)
+
+    def _starter(name: str) -> Any:
+        def _start(*args: Any, **kwargs: Any) -> _StubScheduler:
+            events.append(f"{name}_start")
+            return _StubScheduler(name, events)
+
+        return _start
+
+    monkeypatch.setattr(daemon_module, "_start_scheduler", _starter("scan"))
+    monkeypatch.setattr(daemon_module, "_start_settings_sync_scheduler", _starter("settings_sync"))
+    monkeypatch.setattr(daemon_module, "_start_trigger_scheduler", _starter("trigger"))
+    monkeypatch.setattr(daemon_module, "_start_position_monitor_scheduler", _starter("monitor"))
+    monkeypatch.setattr(daemon_module, "_start_management_scheduler", _starter("management"))
+    monkeypatch.setattr(
+        daemon_module,
+        "_start_telegram_runtime",
+        lambda *args, **kwargs: _StubRuntime(events),
+    )
+
+    daemon_module.daemon_start()
+
+    assert events.index("ingestion_stop") < events.index("telegram_stop")
+    assert events.index("ingestion_stop") < events.index("management_stop")
+    assert events.index("ingestion_stop") < events.index("scan_stop")
+
+
+def test_daemon_start_waits_for_settings_sync_before_removing_the_heartbeat(
+    tmp_path: Path, monkeypatch: Any
+) -> None:
+    shutdowns: list[tuple[str, bool]] = []
+
+    class _Scheduler:
+        def __init__(self, name: str) -> None:
+            self._name = name
+
+        def shutdown(self, *, wait: bool = False) -> None:
+            shutdowns.append((self._name, wait))
+
+    container = type(
+        "Container",
+        (),
+        {"settings": Settings(env="test", port=8765, data_dir=tmp_path / "data")},
+    )()
+    monkeypatch.setattr(
+        "oft.cli.main._resolve_serve_settings", lambda *args, **kwargs: container.settings
+    )
+    monkeypatch.setattr("oft.cli.main._run_live_ingestion", lambda *args, **kwargs: None)
+    monkeypatch.setattr("oft.cli.main._run_uvicorn", lambda *args, **kwargs: None)
+    monkeypatch.setattr(daemon_module, "_schedule_state", lambda settings: object())
+    monkeypatch.setattr("oft.bootstrap.build_container", lambda *args, **kwargs: container)
+
+    def _starter(name: str) -> Any:
+        return lambda *args, **kwargs: _Scheduler(name)
+
+    monkeypatch.setattr(daemon_module, "_start_scheduler", _starter("scan"))
+    monkeypatch.setattr(daemon_module, "_start_settings_sync_scheduler", _starter("settings_sync"))
+    monkeypatch.setattr(daemon_module, "_start_trigger_scheduler", _starter("trigger"))
+    monkeypatch.setattr(daemon_module, "_start_position_monitor_scheduler", _starter("monitor"))
+    monkeypatch.setattr(daemon_module, "_start_management_scheduler", _starter("management"))
+    monkeypatch.setattr(daemon_module, "_start_telegram_runtime", lambda *args, **kwargs: None)
+
+    daemon_module.daemon_start()
+
+    # The in-flight settings-sync tick must be joined before the heartbeat is
+    # unlinked, so it cannot recreate the heartbeat after cleanup.
+    assert ("settings_sync", True) in shutdowns
+
+
 def test_daemon_start_starts_and_stops_telegram_first(tmp_path: Path, monkeypatch: Any) -> None:
     events: list[str] = []
     container = type(
@@ -244,3 +403,82 @@ def test_daemon_start_starts_and_stops_telegram_first(tmp_path: Path, monkeypatc
     telegram_stop = events.index("telegram_stop")
     assert events[telegram_stop + 1] == "management_stop"
     assert events[-1] == "scan_stop"
+
+
+def _patch_daemon_surfaces(
+    monkeypatch: Any,
+    settings: Settings,
+    container: Any,
+    events: list[str],
+    *,
+    trigger_start: Any = None,
+) -> None:
+    monkeypatch.setattr("oft.cli.main._resolve_serve_settings", lambda *a, **k: settings)
+    monkeypatch.setattr("oft.cli.main._run_uvicorn", lambda *a, **k: None)
+    monkeypatch.setattr("oft.bootstrap.build_container", lambda *a, **k: container)
+    monkeypatch.setattr(daemon_module, "_schedule_state", lambda _settings: object())
+
+    def _starter(name: str) -> Any:
+        def _start(*args: Any, **kwargs: Any) -> _StubScheduler:
+            events.append(f"{name}_start")
+            return _StubScheduler(name, events)
+
+        return _start
+
+    monkeypatch.setattr(daemon_module, "_start_scheduler", _starter("scan"))
+    monkeypatch.setattr(daemon_module, "_start_settings_sync_scheduler", _starter("settings_sync"))
+    monkeypatch.setattr(
+        daemon_module,
+        "_start_trigger_scheduler",
+        trigger_start or _starter("trigger"),
+    )
+    monkeypatch.setattr(daemon_module, "_start_position_monitor_scheduler", _starter("monitor"))
+    monkeypatch.setattr(daemon_module, "_start_management_scheduler", _starter("management"))
+    monkeypatch.setattr(daemon_module, "_start_telegram_runtime", lambda *a, **k: None)
+
+
+def test_daemon_start_removes_the_scheduler_heartbeat_on_shutdown(
+    tmp_path: Path, monkeypatch: Any
+) -> None:
+    events: list[str] = []
+    settings = Settings(env="test", port=8765, data_dir=tmp_path / "data")
+    heartbeat = scheduler_heartbeat_path(settings)
+    heartbeat.parent.mkdir(parents=True, exist_ok=True)
+    heartbeat.write_text('{"updated_at": "2026-11-17T09:30:00.000Z"}', encoding="utf-8")
+    container = type("Container", (), {"settings": settings})()
+    _patch_daemon_surfaces(monkeypatch, settings, container, events)
+    monkeypatch.setattr("oft.cli.main._run_live_ingestion", lambda *a, **k: None)
+
+    daemon_module.daemon_start()
+
+    assert not heartbeat.exists()
+
+
+def test_daemon_start_stops_ingestion_and_started_schedulers_when_a_starter_fails(
+    tmp_path: Path, monkeypatch: Any
+) -> None:
+    events: list[str] = []
+    settings = Settings(env="test", port=8765, data_dir=tmp_path / "data")
+    container = type("Container", (), {"settings": settings})()
+
+    class _Handle:
+        def stop(self, *, timeout: float | None = None) -> bool:
+            events.append("ingestion_stop")
+            return True
+
+    def _fail(*args: Any, **kwargs: Any) -> Any:
+        events.append("trigger_start")
+        raise RuntimeError("scheduler boom")
+
+    _patch_daemon_surfaces(monkeypatch, settings, container, events, trigger_start=_fail)
+    monkeypatch.setattr("oft.cli.main._run_live_ingestion", lambda *a, **k: _Handle())
+
+    with pytest.raises(RuntimeError, match="scheduler boom"):
+        daemon_module.daemon_start()
+
+    # The live worker and every scheduler that started before the failure were
+    # stopped; the failing trigger scheduler never returned to be shut down.
+    assert "ingestion_stop" in events
+    assert "scan_stop" in events
+    assert "settings_sync_stop" in events
+    assert "trigger_stop" not in events

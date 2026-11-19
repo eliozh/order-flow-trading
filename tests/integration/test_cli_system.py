@@ -1425,6 +1425,10 @@ def test_stop_daemon_refuses_when_the_pid_fence_changes_before_signal(
 
     assert daemon_module._stop_daemon(settings, 12345, timeout_seconds=0.001) is False
     assert kills == []
+    # The fence was positively re-checked and no longer matches (recycled PID or
+    # vanished meta), so the stale artifacts must not survive the refusal.
+    assert not pid_path(settings).exists()
+    assert not pid_meta_path(settings).exists()
 
 
 def test_stop_daemon_never_signals_a_non_positive_pid(
@@ -1465,6 +1469,7 @@ def test_daemon_stop_signals_and_removes_both_pid_artifacts(
     settings = _configure_cli(monkeypatch, tmp_path)
     _seed_pid_files(settings)
     monkeypatch.setattr(daemon_module, "pid_matches", lambda *_args, **_kwargs: True)
+    monkeypatch.setattr(daemon_module, "process_alive", lambda _pid: False)
     kills: list[tuple[int, int]] = []
     monkeypatch.setattr(daemon_module.os, "kill", lambda pid, sig: kills.append((pid, sig)))
 
@@ -1475,6 +1480,29 @@ def test_daemon_stop_signals_and_removes_both_pid_artifacts(
     assert kills == [(12345, daemon_module.signal.SIGTERM)]
     assert not pid_path(settings).exists()
     assert not pid_meta_path(settings).exists()
+
+
+def test_daemon_stop_waits_for_exit_and_reports_a_timeout(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    settings = _configure_cli(monkeypatch, tmp_path)
+    _seed_pid_files(settings)
+    monkeypatch.setattr(daemon_module, "pid_matches", lambda *_args, **_kwargs: True)
+    monkeypatch.setattr(daemon_module, "process_alive", lambda _pid: True)
+    kills: list[tuple[int, int]] = []
+    monkeypatch.setattr(daemon_module.os, "kill", lambda pid, sig: kills.append((pid, sig)))
+    ticks = iter([0.0, 100.0])
+    monkeypatch.setattr(daemon_module.time, "monotonic", lambda: next(ticks, 100.0))
+
+    result = _invoke("daemon", "stop", "--json")
+
+    assert result.exit_code == 1, result.output
+    assert kills == [(12345, daemon_module.signal.SIGTERM)]
+    payload = json.loads(result.stdout)
+    assert payload["error"]["code"] == "INTERNAL_ERROR"
+    assert "did not exit within" in payload["error"]["message"]
+    assert pid_path(settings).exists()
+    assert pid_meta_path(settings).exists()
 
 
 def test_daemon_stop_process_lookup_emits_not_running_and_removes_artifacts(
@@ -1999,6 +2027,189 @@ def test_uvicorn_log_config_cannot_write_plaintext_lines_to_daemon_log(
         structlog.configure(**saved_structlog)
 
 
+def test_configure_logging_rotates_and_creates_private_log_files(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    from logging.handlers import RotatingFileHandler
+
+    import structlog
+
+    from oft.logging import DAEMON_LOG_MAX_BYTES, configure_logging
+
+    settings = _configure_cli(monkeypatch, tmp_path)
+    root = logging.getLogger()
+    saved_handlers = list(root.handlers)
+    saved_level = root.level
+    saved_structlog = structlog.get_config()
+    try:
+        configure_logging(settings)
+        path = log_path(settings)
+        handlers = [
+            handler
+            for handler in root.handlers
+            if isinstance(handler, RotatingFileHandler) and Path(handler.baseFilename) == path
+        ]
+        assert len(handlers) == 1
+        handler = handlers[0]
+        assert handler.maxBytes == DAEMON_LOG_MAX_BYTES
+        assert handler.backupCount == 5
+
+        logging.getLogger("oft.test").info("rotation_probe")
+        for root_handler in root.handlers:
+            root_handler.flush()
+
+        assert "rotation_probe" in path.read_text(encoding="utf-8")
+        assert (path.stat().st_mode & 0o777) == 0o600
+        assert ((settings.data_dir / "logs").stat().st_mode & 0o777) == 0o700
+    finally:
+        for handler in list(root.handlers):
+            if handler not in saved_handlers:
+                handler.close()
+        root.handlers = saved_handlers
+        root.setLevel(saved_level)
+        structlog.configure(**saved_structlog)
+
+
+def test_private_rotating_handler_keeps_rotated_files_private_and_passes_errors(
+    tmp_path: Path,
+) -> None:
+    from oft.logging import _PrivateRotatingFileHandler
+
+    path = tmp_path / "logs" / "daemon.log"
+    path.parent.mkdir(parents=True)
+    handler = _PrivateRotatingFileHandler(
+        str(path),
+        maxBytes=1,
+        backupCount=2,
+        encoding="utf-8",
+        errors="backslashreplace",
+    )
+    try:
+        handler.emit(logging.LogRecord("t", logging.INFO, __file__, 1, "alpha", None, None))
+        handler.emit(logging.LogRecord("t", logging.INFO, __file__, 1, "beta", None, None))
+        assert handler.stream is not None
+        assert handler.stream.errors == "backslashreplace"
+    finally:
+        handler.close()
+
+    rotated = tmp_path / "logs" / "daemon.log.1"
+    assert rotated.exists()
+    assert (rotated.stat().st_mode & 0o777) == 0o600
+    assert (path.stat().st_mode & 0o777) == 0o600
+
+
+def test_daemon_logs_streams_a_bounded_tail_without_reading_the_whole_file(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    from oft.cli.commands.daemon import _DAEMON_LOG_TAIL_WINDOW_BYTES
+
+    settings = _configure_cli(monkeypatch, tmp_path)
+    path = log_path(settings)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    filler = [f"filler-{index:05d}-" + "x" * 80 for index in range(4000)]
+    path.write_text("\n".join([*filler, "penultimate", "final"]) + "\n", encoding="utf-8")
+    assert path.stat().st_size > _DAEMON_LOG_TAIL_WINDOW_BYTES
+
+    original = Path.read_text
+
+    def guarded(self: Path, *args: Any, **kwargs: Any) -> str:
+        if self == path:
+            raise AssertionError("daemon logs must not read the whole file")
+        return original(self, *args, **kwargs)
+
+    monkeypatch.setattr(Path, "read_text", guarded)
+
+    result = _invoke("daemon", "logs", "-n", "2")
+
+    assert result.exit_code == 0, result.output
+    assert result.stdout.strip().splitlines() == ["penultimate", "final"]
+
+
+def test_daemon_log_tail_keeps_a_complete_first_line_at_a_window_boundary(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    from oft.cli.commands.daemon import _read_daemon_log_tail
+
+    content = b"first\nsecond\nthird\n"
+    path = tmp_path / "daemon.log"
+    # "first\n" is 6 bytes, so a 13-byte window (6 + 7) starts exactly at the
+    # beginning of "second": the preceding byte is "\n", the branch is taken,
+    # and that complete first line must be kept.
+    window = 13
+    start = len(content) - window
+    assert start == 6
+    assert content[start - 1 : start] == b"\n"
+    path.write_bytes(content)
+    monkeypatch.setattr(daemon_module, "_DAEMON_LOG_TAIL_WINDOW_BYTES", window)
+
+    assert _read_daemon_log_tail(path, 2) == ["second", "third"]
+
+
+def test_daemon_log_tail_drops_a_partial_first_line_inside_the_window(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    from oft.cli.commands.daemon import _read_daemon_log_tail
+
+    content = b"first\nsecond\nthird\n"
+    path = tmp_path / "daemon.log"
+    # A 10-byte window starts inside "second" (at the "o" of "ond"), so the torn
+    # first line is dropped and only the complete "third" line remains.
+    window = 10
+    start = len(content) - window
+    assert content[start : start + 1] == b"o"
+    assert content[start - 1 : start] != b"\n"
+    path.write_bytes(content)
+    monkeypatch.setattr(daemon_module, "_DAEMON_LOG_TAIL_WINDOW_BYTES", window)
+
+    assert _read_daemon_log_tail(path, 2) == ["third"]
+
+
+def test_settings_sync_tick_writes_the_heartbeat_at_both_ends(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    from types import SimpleNamespace
+
+    now = datetime(2026, 11, 19, 12, 0, tzinfo=UTC)
+    clock = SimpleNamespace(now=lambda: now)
+    container = SimpleNamespace(
+        settings=Settings(env="test", data_dir=tmp_path / "data"),
+        store=object(),
+        clock=clock,
+    )
+    writes: list[Any] = []
+
+    monkeypatch.setattr(
+        daemon_module,
+        "write_scheduler_heartbeat",
+        lambda _settings, *, now: writes.append(now),
+    )
+    monkeypatch.setattr(
+        "oft.application.settings_service.SettingsService",
+        lambda **_kwargs: SimpleNamespace(persisted_scan_period=lambda: "4h"),
+    )
+    monkeypatch.setattr(
+        daemon_module,
+        "SettingsPeriodSync",
+        lambda **_kwargs: SimpleNamespace(sync=lambda: True),
+    )
+    captured: dict[str, Any] = {}
+
+    class _Scheduler:
+        def __init__(self, job: Any) -> None:
+            captured["job"] = job
+
+        def start(self) -> None:
+            return None
+
+    monkeypatch.setattr(daemon_module, "SettingsSyncDaemonScheduler", _Scheduler)
+
+    daemon_module._start_settings_sync_scheduler(container=container, scan_scheduler=object())
+    writes.clear()
+
+    assert captured["job"]() is True
+    assert writes == [now, now]
+
+
 def test_daemon_restart_build_container_config_error_exits_five(
     monkeypatch: pytest.MonkeyPatch, tmp_path: Path
 ) -> None:
@@ -2105,6 +2316,27 @@ def test_daemon_restart_stop_failure_exits_one(
 
     assert result.exit_code == 1, result.output
     assert json.loads(result.stdout)["error"]["code"] == "INTERNAL_ERROR"
+
+
+def test_daemon_restart_uses_the_larger_stop_budget(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    settings = _configure_cli(monkeypatch, tmp_path)
+    write_pid(settings)
+    captured: dict[str, Any] = {}
+
+    def _stop(*args: Any, **kwargs: Any) -> bool:
+        captured.update(kwargs)
+        return False
+
+    monkeypatch.setattr(daemon_module, "_stop_daemon", _stop)
+    try:
+        result = _invoke("daemon", "restart", "--yes", "--json")
+    finally:
+        _cleanup_pid_state(settings)
+
+    assert result.exit_code == 1, result.output
+    assert captured["timeout_seconds"] == daemon_module._STOP_TIMEOUT_SECONDS
 
 
 def test_daemon_restart_spawn_failure_exits_one(
@@ -2477,7 +2709,15 @@ def test_daemon_stop_adopts_and_stops_a_legacy_null_fence_oft_daemon(
     pid_meta_path(settings).write_text(
         json.dumps({"pid": pid, "start_time": None}), encoding="utf-8"
     )
-    monkeypatch.setattr(daemon_module, "process_alive", lambda _pid: True)
+    alive_calls = {"count": 0}
+
+    def alive(_pid: int) -> bool:
+        alive_calls["count"] += 1
+        # True through adoption and the pre-signal fence checks; gone on the
+        # first post-SIGTERM poll so the wait completes immediately.
+        return alive_calls["count"] < 6
+
+    monkeypatch.setattr(daemon_module, "process_alive", alive)
     monkeypatch.setattr(daemon_module, "_process_start_time", lambda _pid: "current-start-time")
     monkeypatch.setattr(daemon_module, "_looks_like_oft_daemon", lambda _pid: True)
     monkeypatch.setattr(daemon_module, "_same_uid", lambda _pid: True)
@@ -3329,7 +3569,7 @@ def test_stop_daemon_permission_denied_returns_false(
     assert pid_meta_path(settings).exists()
 
 
-def test_daemon_stop_permission_denied_exits_one_with_internal_error(
+def test_daemon_stop_permission_denied_keeps_artifacts_and_exits_nonzero(
     monkeypatch: pytest.MonkeyPatch, tmp_path: Path
 ) -> None:
     settings = _configure_cli(monkeypatch, tmp_path)
@@ -3347,5 +3587,6 @@ def test_daemon_stop_permission_denied_exits_one_with_internal_error(
     payload = json.loads(result.stdout)
     assert payload["error"]["code"] == "INTERNAL_ERROR"
     assert "permission denied" in payload["error"]["message"]
-    assert "12345" in payload["error"]["message"]
+    assert pid_path(settings).exists()
+    assert pid_meta_path(settings).exists()
     assert "Traceback" not in result.output
