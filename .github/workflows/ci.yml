@@ -47,9 +47,15 @@ jobs:
       # Offline equivalent of the documented local gate: ruff, mypy,
       # import-linter, fixture checksums, pytest (unit/integration/contract/
       # replay) with the 80% floor and the metric branch gate, then frontend
-      # lint/typecheck/test/build. No network or daemon is used.
+      # lint/typecheck/test/build, then a wheel build whose Requires-Dist
+      # metadata and clean-venv CLI run are verified. No network or daemon is
+      # used.
       - name: make ci
         run: make ci
+
+      # Explicit, independently addressable wheel packaging gate.
+      - name: verify wheel runtime dependencies
+        run: make wheel-check
 
   e2e:
     name: e2e
