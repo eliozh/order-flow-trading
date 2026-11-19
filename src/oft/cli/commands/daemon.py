@@ -48,7 +48,12 @@ from oft.application.scheduler import (
     write_scheduler_heartbeat,
 )
 from oft.cli.commands.doctor import emit_error
-from oft.config import ConfigError, Settings, load_settings
+from oft.config import (
+    ConfigError,
+    Settings,
+    load_settings,
+    validate_scan_jitter_setting,
+)
 from oft.domain.time import utc_timestamp
 
 if TYPE_CHECKING:
@@ -372,6 +377,27 @@ def daemon_start(
     from oft.cli.main import _resolve_serve_settings, _run_live_ingestion, _run_uvicorn
 
     settings = _resolve_serve_settings(host, port, allow_non_loopback)
+    # A persisted ``scan.period`` is overlaid before the environment period is
+    # consulted (M3), so a stale ``OFT_SCAN_PERIOD`` must not stop the daemon
+    # when a valid saved period exists; the raw env period is not used in that
+    # case. The jitter is never persisted, so a negative value or a value above
+    # the scheduler overlay's cap can never be overlaid: reject both here,
+    # before any PID or container work (an above-cap value would otherwise be
+    # silently clamped). The effective (persisted-first) period is validated by
+    # ``_schedule_state`` below (overlay -> ``ScheduleState``), which reports
+    # CONFIG_INVALID and exits 5 before a scheduler starts.
+    from oft.application.settings_service import OVERLAY_MAX_JITTER_SECONDS
+
+    try:
+        validate_scan_jitter_setting(settings.scan_jitter_seconds)
+        if settings.scan_jitter_seconds > OVERLAY_MAX_JITTER_SECONDS:
+            raise ValueError(
+                f"OFT_SCAN_JITTER_SECONDS must be <= {OVERLAY_MAX_JITTER_SECONDS} s; "
+                "larger values would be clamped by the scheduler overlay"
+            )
+    except ValueError as exc:
+        emit_error("CONFIG_INVALID", str(exc), json_output=False)
+        raise typer.Exit(code=5) from exc
     pid = read_pid(settings)
     # ``start`` never signals the PID, so its availability guard is deliberately
     # conservative: refuse to start while any recorded PID is alive, even when

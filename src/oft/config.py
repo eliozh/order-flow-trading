@@ -20,6 +20,7 @@ from pydantic import (
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
 from oft.domain.llm_settings import MAX_CONCURRENCY
+from oft.domain.settings import SCAN_PERIOD_HOURS, SUPPORTED_SCAN_PERIODS
 
 if TYPE_CHECKING:
     from oft.domain.pricing import PriceTable
@@ -27,6 +28,10 @@ if TYPE_CHECKING:
 DEFAULT_HOST = "127.0.0.1"
 DEFAULT_PORT = 7611
 CONFIG_INVALID = "CONFIG_INVALID"
+SCAN_PERIOD_ENV = "OFT_SCAN_PERIOD"
+SCAN_JITTER_ENV = "OFT_SCAN_JITTER_SECONDS"
+DEFAULT_SCAN_PERIOD = "4h"
+DEFAULT_SCAN_JITTER_SECONDS = 30
 DEFAULT_OPENAI_BASE_URL = "https://api.openai.com"
 DEFAULT_ANTHROPIC_BASE_URL = "https://api.anthropic.com"
 DEFAULT_DEEPSEEK_BASE_URL = "https://api.deepseek.com"
@@ -144,6 +149,14 @@ class Settings(BaseSettings):
     risk_max_spread_bps: float = Field(default=15.0, gt=0, le=10000, allow_inf_nan=False)
     risk_stale_mark_seconds: int = Field(default=60, ge=1)
 
+    # Scan cadence (ADR-0007). ``scan_period`` must be a supported UTC cadence
+    # and ``scan_jitter_seconds`` must be non-negative and shorter than the
+    # period. The pair is enforced by ``validate_scan_*`` when a consumer uses
+    # it (strict ``load_settings``, ``daemon start``, and the scheduler) so
+    # diagnostics can still overlay a persisted period (M3).
+    scan_period: str = DEFAULT_SCAN_PERIOD
+    scan_jitter_seconds: int = DEFAULT_SCAN_JITTER_SECONDS
+
     # Trigger evaluation cadence (ADR-0007: 15 s default, 5-60 s configurable).
     trigger_interval_seconds: int = Field(default=15, ge=5, le=60)
     trigger_stale_after_seconds: int = Field(default=60, ge=1)
@@ -171,6 +184,36 @@ class Settings(BaseSettings):
         if level not in _VALID_LOG_LEVELS:
             raise ValueError(f"log_level must be one of {sorted(_VALID_LOG_LEVELS)}")
         return level
+
+    @field_validator("scan_period")
+    @classmethod
+    def _strip_scan_period(cls, value: str) -> str:
+        """Normalize surrounding whitespace; membership is checked at load.
+
+        Membership is deliberately not enforced here: diagnostics resolve a
+        persisted ``scan.period`` before the environment value (M3), so an
+        invalid ``OFT_SCAN_PERIOD`` must not stop ``oft daemon status`` from
+        reporting a valid saved period. ``load_settings`` raises
+        ``CONFIG_INVALID`` when the value is actually used, and the effective
+        phase (overlay -> ``ScheduleState``) validates it.
+        """
+        return value.strip()
+
+    @field_validator("scan_jitter_seconds", mode="before")
+    @classmethod
+    def _blank_scan_jitter_is_default(cls, value: object) -> object:
+        """Treat a blank ``OFT_SCAN_JITTER_SECONDS`` as the default value.
+
+        ``.env.example`` documents blank-to-default for optional values.
+        ``oft doctor`` never resolves the cadence, so it only needs the load to
+        succeed; ``oft status`` does resolve it through ``_schedule_status`` and
+        degrades to a missing schedule on error. Non-blank non-integers still
+        fail at the typed parse; an out-of-range integer still fails when the
+        cadence is validated.
+        """
+        if isinstance(value, str) and not value.strip():
+            return DEFAULT_SCAN_JITTER_SECONDS
+        return value
 
     @field_validator(
         "data_dir",
@@ -333,6 +376,14 @@ class Settings(BaseSettings):
                 raise ValueError(exc.message) from exc
         return self
 
+    @field_validator("archive_fixture_dir", mode="before")
+    @classmethod
+    def _empty_optional_path_is_unset(cls, value: object) -> object:
+        """Treat a blank ``OFT_ARCHIVE_FIXTURE_DIR`` as unset, not ``Path('.')``."""
+        if isinstance(value, (str, Path)) and not str(value).strip():
+            return None
+        return value
+
     @field_validator("archive_fixture_dir")
     @classmethod
     def _expand_optional_path(cls, value: Path | None) -> Path | None:
@@ -344,6 +395,52 @@ class Settings(BaseSettings):
         if value is not None and not value.get_secret_value().strip():
             return None
         return value
+
+
+def validate_scan_period_setting(value: str) -> str:
+    """Validate one ``OFT_SCAN_PERIOD`` value; return the stripped cadence.
+
+    Shared by ``load_settings`` and the scheduler helpers so the supported-value
+    rule and its message have one source of truth.
+    """
+    period = value.strip()
+    if period not in SUPPORTED_SCAN_PERIODS:
+        expected = ", ".join(SUPPORTED_SCAN_PERIODS)
+        raise ValueError(f"{SCAN_PERIOD_ENV} must be one of: {expected}; got {value!r}")
+    return period
+
+
+def validate_scan_jitter_setting(value: int, period: str | None = None) -> int:
+    """Validate one ``OFT_SCAN_JITTER_SECONDS`` value.
+
+    A negative jitter is always invalid. When ``period`` is supplied the jitter
+    must also be strictly shorter than that period, so a scheduler fire time
+    can never land in a later window. Diagnostics keep the historical clamp
+    (they pass no period); the scheduler helpers and the daemon-start
+    overlay-cap check use this helper, while ``ScheduleState`` enforces the same
+    bound independently.
+    """
+    if value < 0:
+        raise ValueError(f"{SCAN_JITTER_ENV} must be >= 0")
+    if period is not None:
+        hours = SCAN_PERIOD_HOURS.get(period)
+        if hours is None:
+            raise ValueError(
+                f"{SCAN_PERIOD_ENV} must be one of: {', '.join(SUPPORTED_SCAN_PERIODS)}"
+            )
+        limit = hours * 3600
+        if value >= limit:
+            raise ValueError(
+                f"{SCAN_JITTER_ENV} must be less than the scan period ({limit} s for {period})"
+            )
+    return value
+
+
+def validate_scan_schedule(period: str, jitter_seconds: int) -> str:
+    """Validate the ``(period, jitter)`` pair; return the normalized period."""
+    resolved_period = validate_scan_period_setting(period)
+    validate_scan_jitter_setting(jitter_seconds, resolved_period)
+    return resolved_period
 
 
 class ConfigError(Exception):
@@ -371,13 +468,26 @@ def _format_validation_error(exc: ValidationError) -> str:
     return "; ".join(details) or "invalid configuration"
 
 
-def load_settings(**overrides: Any) -> Settings:
+def load_settings(*, validate_scan_cadence: bool = False, **overrides: Any) -> Settings:
     """Load settings from the environment, applying explicit overrides last.
 
     Invalid settings are wrapped so every entry point can report the stable
     ``CONFIG_INVALID`` code instead of leaking a traceback.
+
+    ``OFT_SCAN_PERIOD`` / ``OFT_SCAN_JITTER_SECONDS`` are validated when the
+    caller asks for it (``validate_scan_cadence=True``) or when an explicit
+    override is supplied. Environment-only values are also validated by the
+    paths that actually consume them (``daemon start`` and the scheduler
+    helpers), so diagnostics can still resolve a persisted ``scan.period`` over
+    a stale environment value (M3).
     """
     try:
-        return Settings(**overrides)
+        settings = Settings(**overrides)
     except ValidationError as exc:
         raise ConfigError(_format_validation_error(exc)) from exc
+    if validate_scan_cadence or "scan_period" in overrides or "scan_jitter_seconds" in overrides:
+        try:
+            validate_scan_schedule(settings.scan_period, settings.scan_jitter_seconds)
+        except ValueError as exc:
+            raise ConfigError(str(exc)) from exc
+    return settings

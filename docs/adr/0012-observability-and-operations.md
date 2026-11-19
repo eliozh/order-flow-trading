@@ -35,7 +35,7 @@ Use **structured local logs + a health/status API + supervised process + tested 
 ### Process supervision
 
 - systemd unit `oft.service`:
-  - `Type=simple`, `ExecStart=/path/to/oft serve --config $OFT_DATA/config.toml`
+  - `Type=simple`, `ExecStart=/path/to/oft daemon start` (see the amendment: `oft serve` is API-only)
   - `Restart=on-failure`, `RestartSec=5`, `TimeoutStopSec=30`, `KillMode=mixed`
   - dedicated `User=oft`, `Group=oft`, `UMask=0077`
   - `NoNewPrivileges=true`, `ProtectSystem=strict`, `ProtectHome=read-only`, `ReadWritePaths=$OFT_DATA`, `PrivateTmp=true`, `RestrictAddressFamilies=AF_INET AF_INET6 AF_UNIX`, `LockPersonality=true`, `MemoryDenyWriteExecute=true` (drop this last one if a pinned dependency requires executable memory; verify during packaging)
@@ -84,6 +84,66 @@ Run before serving traffic: config parse, secret load (keyring/encrypted), DB op
 | Suspected bad behavior | `oft kill` | inspect audit/decision logs; reconcile; resume with `RESUME` |
 | Audit chain break / DB corruption | stop; do not trade | restore verified backup; investigate |
 | Telegram failing | check token/chat/allowlist | pushes queue/retry; UI shows receipts |
+
+## Amendment (2026-11-19)
+
+This section records the shipped behavior. It amends, but does not rewrite, the
+decision record above; the original text stays as the historical rationale.
+
+### Entrypoint and supervision
+
+- The blessed runtime entrypoint is **`oft daemon start`**. It runs the API,
+  the scan/trigger/position-monitor/management schedulers, live WS ingestion,
+  and the Telegram runtime. `oft serve` is the **API-only** shell (no
+  schedulers, ingestion, or Telegram), so an API-only process reports not-ready
+  in a real environment because the scheduler heartbeat is missing.
+- The systemd example is `ExecStart=/path/to/oft daemon start`. There is no
+  `--config` flag; the shipped options are `--host`, `--port`,
+  `--allow-non-loopback`, `--replay-file`, and `--symbols`.
+- No separate startup self-check gate is implemented. The checks that were
+  planned for it (config, storage, audit chain, disk, clock, kill switch,
+  ingestion, Telegram) are available through `/ready` and `oft doctor`; `doctor`
+  runs them without the daemon.
+
+### Logs
+
+- The actual file is `$OFT_DATA/logs/daemon.log`, written by a
+  `RotatingFileHandler` at **50 MB × 5** with file mode **0600** in a **0700**
+  directory (every rotation is re-created 0600).
+- `oft daemon logs` reads a bounded tail window (256 KiB) rather than loading the
+  whole file into memory.
+
+### Readiness
+
+- `/ready` runs these named checks: `config`, `storage.sqlite`,
+  `storage.schema`, `storage.disk`, `storage.parquet`, `clock`, `market_data`,
+  and `scheduler.heartbeat`.
+- A non-ready report returns the standard error envelope. The HTTP status comes
+  from the catalog code selected by the first failed check: 503 for storage,
+  data, and daemon cases; 409 for clock drift; 500 for invalid config.
+- There is no DuckDB-catalog check or secret-backend check in `/ready`.
+
+### Backup and restore (shipped, still partly manual)
+
+- `oft backup [--out DIR] [--json]` writes a verified `VACUUM INTO` copy plus a
+  SHA-256 sidecar. `oft restore <file> [--yes] [--json] [--no-snapshot]` verifies
+  the candidate with `PRAGMA integrity_check` and the sidecar, refuses while the
+  daemon is running, and writes a pre-restore safety snapshot.
+- The default directory is `$OFT_DATA/backups/`. A migration that must rewrite
+  data takes a verified pre-migration snapshot first and **aborts** if that
+  snapshot cannot be created or verified.
+- **Not automated:** backups are not encrypted at rest, and neither daily
+  scheduling nor the 7-daily/4-weekly/12-monthly retention policy is
+  implemented. Backups and retention remain manual operator work.
+- **RPO/RTO:** RPO is 24 h only if the operator schedules a daily backup; RTO is
+  a target of under 30 minutes for a single-machine restore. `oft doctor`
+  reports the age of the newest backup (degraded beyond 48 h) plus the snapshot
+  count and backup size.
+
+### What remains manual
+
+Daily backup scheduling, encryption at rest, the 7-4-12 retention policy, and a
+quarterly restore drill. Live arming remains absent from this build.
 
 ## Alternatives Considered
 

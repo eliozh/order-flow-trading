@@ -27,6 +27,12 @@ from apscheduler.schedulers.background import BackgroundScheduler
 from apscheduler.triggers.date import DateTrigger
 from apscheduler.triggers.interval import IntervalTrigger
 
+from oft.config import (
+    DEFAULT_SCAN_JITTER_SECONDS,
+    DEFAULT_SCAN_PERIOD,
+    validate_scan_jitter_setting,
+    validate_scan_period_setting,
+)
 from oft.domain.settings import SCAN_PERIOD_HOURS, SUPPORTED_SCAN_PERIODS
 from oft.domain.time import utc_timestamp
 from oft.ports.clock import ClockPort
@@ -41,8 +47,7 @@ PERIOD_HOURS: dict[str, int] = dict(SCAN_PERIOD_HOURS)
 BOUNDARY_HOURS: dict[str, tuple[int, ...]] = {
     period: tuple(range(0, 24, hours)) for period, hours in SCAN_PERIOD_HOURS.items()
 }
-DEFAULT_SCAN_PERIOD = "4h"
-DEFAULT_JITTER_SECONDS = 30
+DEFAULT_JITTER_SECONDS = DEFAULT_SCAN_JITTER_SECONDS
 MISFIRE_GRACE_SECONDS = 300
 # A fresh heartbeat proves the daemon's interval scheduler is alive. The daemon
 # writes it on startup and on every settings-sync tick (~15 s), so a minute of
@@ -374,29 +379,35 @@ def resolve_scan_jitter(environ: Mapping[str, str] | None = None) -> int:
 
     Diagnostics resolve the persisted period first (M3); this helper lets the
     overlay build a jittered default even when ``OFT_SCAN_PERIOD`` itself would
-    be rejected, so only the jitter's own errors surface. A non-integer or
-    negative value raises ``ValueError`` (``CONFIG_INVALID``).
+    be rejected, so only the jitter's own errors surface. A blank value means
+    the default, mirroring ``Settings``; a non-integer or negative value raises
+    ``ValueError`` (``CONFIG_INVALID``). The bounds rule is shared with
+    ``oft.config`` (one source of truth).
     """
     source = environ if environ is not None else os.environ
     raw_jitter = source.get("OFT_SCAN_JITTER_SECONDS", str(DEFAULT_JITTER_SECONDS)).strip()
+    if not raw_jitter:
+        return DEFAULT_JITTER_SECONDS
     try:
         jitter = int(raw_jitter)
     except ValueError as exc:
         raise ValueError(f"OFT_SCAN_JITTER_SECONDS must be an integer, got {raw_jitter!r}") from exc
-    if jitter < 0:
-        raise ValueError("OFT_SCAN_JITTER_SECONDS must be >= 0")
-    return jitter
+    return validate_scan_jitter_setting(jitter)
 
 
 def resolve_schedule_settings(
     environ: Mapping[str, str] | None = None,
 ) -> ScheduleConfig:
-    """Resolve the scan cadence; invalid values raise ``ValueError``."""
+    """Resolve the scan cadence; invalid values raise ``ValueError``.
+
+    The rule (supported period plus a jitter shorter than that period) is
+    shared with ``oft.config``. An injected mapping is always used as-is and
+    never falls back to the process environment.
+    """
     source = environ if environ is not None else os.environ
-    period = validate_period(source.get("OFT_SCAN_PERIOD", DEFAULT_SCAN_PERIOD).strip())
+    period = validate_scan_period_setting(source.get("OFT_SCAN_PERIOD", DEFAULT_SCAN_PERIOD))
     jitter = resolve_scan_jitter(source)
-    if jitter >= PERIOD_HOURS[period] * 3600:
-        raise ValueError("OFT_SCAN_JITTER_SECONDS must be less than the scan period")
+    validate_scan_jitter_setting(jitter, period)
     return ScheduleConfig(period=period, jitter_seconds=jitter)
 
 
