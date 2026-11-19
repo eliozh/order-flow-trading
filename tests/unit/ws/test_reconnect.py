@@ -91,7 +91,12 @@ class FakeRecovery:
     calls: list[tuple[str, datetime | None, datetime]] = field(default_factory=list)
 
     def recover_agg_trades(
-        self, symbol: str, *, last_event_time: datetime | None, now: datetime
+        self,
+        symbol: str,
+        *,
+        last_event_time: datetime | None,
+        now: datetime,
+        stop: object = None,
     ) -> AggTradeRecovery:
         self.calls.append((symbol, last_event_time, now))
         return self.result

@@ -18,11 +18,14 @@ from __future__ import annotations
 
 import contextlib
 import logging
+import os
 import re
 import sys
 import threading
 from collections.abc import Iterable, Mapping, MutableMapping
-from typing import Any
+from io import TextIOWrapper
+from logging.handlers import RotatingFileHandler
+from typing import Any, cast
 
 import structlog
 
@@ -30,6 +33,14 @@ from oft.config import Settings
 from oft.domain.telegram import TELEGRAM_BOT_TOKEN_PATTERN
 
 REDACTED = "[REDACTED]"
+# ADR-0012: 50 MB per file, five rotations, then the oldest is discarded.
+DAEMON_LOG_MAX_BYTES = 50 * 1024 * 1024
+DAEMON_LOG_BACKUP_COUNT = 5
+# The log directory and every log file are operator-private. Rotation creates a
+# new base file, so the handler's ``_open`` (not just the first open) must apply
+# 0600 or a rotated stream could be world-readable.
+LOG_DIR_MODE = 0o700
+LOG_FILE_MODE = 0o600
 _SENSITIVE_HINTS = ("token", "secret", "password", "api_key", "authorization")
 _BEARER_PATTERN = re.compile(r"(?i)\bbearer\s+[A-Za-z0-9._~+/=-]+")
 # Values shorter than this are not treated as exact redaction values: replacing
@@ -145,14 +156,48 @@ class _ScrubbingFormatter(logging.Formatter):
         return _scrub_text(super().format(record))
 
 
+class _PrivateRotatingFileHandler(RotatingFileHandler):
+    """A rotating log whose file (and every rotation) is created 0600."""
+
+    def _open(self) -> TextIOWrapper:
+        flags = os.O_WRONLY | os.O_CREAT | getattr(os, "O_CLOEXEC", 0)
+        flags |= os.O_APPEND if "a" in self.mode else os.O_TRUNC
+        descriptor = os.open(self.baseFilename, flags, LOG_FILE_MODE)
+        try:
+            # ``O_CREAT`` mode is filtered by the umask; fchmod fixes a file
+            # left by an older version or a permissive umask.
+            os.fchmod(descriptor, LOG_FILE_MODE)
+            return cast(
+                TextIOWrapper,
+                os.fdopen(
+                    descriptor,
+                    self.mode,
+                    encoding=self.encoding,
+                    errors=self.errors,
+                ),
+            )
+        except Exception:
+            os.close(descriptor)
+            raise
+
+
 def configure_logging(settings: Settings) -> None:
     """Configure structlog JSON output to stdout and the daemon log file."""
     level = getattr(logging, settings.log_level)
     log_dir = settings.data_dir / "logs"
-    log_dir.mkdir(parents=True, exist_ok=True)
+    log_dir.mkdir(parents=True, exist_ok=True, mode=LOG_DIR_MODE)
+    with contextlib.suppress(OSError):
+        os.chmod(log_dir, LOG_DIR_MODE)
     redactor = RedactingFilter()
     handlers: list[logging.Handler] = [logging.StreamHandler(sys.stdout)]
-    handlers.append(logging.FileHandler(log_dir / "daemon.log", encoding="utf-8"))
+    handlers.append(
+        _PrivateRotatingFileHandler(
+            log_dir / "daemon.log",
+            maxBytes=DAEMON_LOG_MAX_BYTES,
+            backupCount=DAEMON_LOG_BACKUP_COUNT,
+            encoding="utf-8",
+        )
+    )
     for handler in handlers:
         handler.addFilter(redactor)
     logging.basicConfig(format="%(message)s", handlers=handlers, level=level, force=True)

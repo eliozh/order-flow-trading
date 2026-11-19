@@ -2,17 +2,18 @@
 
 Documented maintainability exception: this module is the single diagnostics
 surface shared by `/ready`, `/api/v1/status`, `oft doctor`, and
-`oft system info`. The Telegram observability projection lives here so one
-implementation feeds every surface (and the file sits just over the 800-line
-soft ceiling); extracting it would require splitting the readiness/doctor
-contracts and their tests for no behavioral gain.
+`oft system info`. Every readiness check and the Telegram observability
+projection live here so one implementation feeds all four surfaces; at ~960
+lines it exceeds the 800-line soft ceiling, but extracting the readiness checks
+would split the shared contracts and their tests without a behavioral gain.
 """
 
 from __future__ import annotations
 
+import http.client
 import json
 import shutil
-import socket
+from collections.abc import Callable
 from dataclasses import asdict, dataclass
 from datetime import UTC, datetime
 from pathlib import Path
@@ -48,12 +49,17 @@ CheckState = Literal["ok", "degraded", "offline", "unknown"]
 MIN_FREE_DISK_BYTES = 1 * 1024**3
 DISK_WARN_USED_PCT = 95.0
 MANIFEST_SCAN_ROOTS = PARTITION_ROOTS
+# ``/health`` identifies this service so a port squatter (or a different local
+# daemon) can never be mistaken for a healthy OFT process.
+SERVICE_NAME = "oft"
+_HEALTH_BODY_LIMIT_BYTES = 64 * 1024
 
 
 class HealthReport(BaseModel):
     model_config = ConfigDict(frozen=True)
 
     status: str
+    service: str = SERVICE_NAME
     version: str
 
 
@@ -93,22 +99,50 @@ class DoctorReport:
 
 
 def build_health() -> HealthReport:
-    return HealthReport(status="ok", version=__version__)
+    return HealthReport(status="ok", service=SERVICE_NAME, version=__version__)
 
 
-def probe_daemon(settings: Settings, timeout: float = 0.25) -> DaemonProbe:
-    """Check whether something listens on the configured loopback address."""
+def _fetch_health(settings: Settings, timeout: float) -> dict[str, Any] | None:
+    """GET ``/health`` over loopback; ``None`` for any transport/parse failure.
+
+    ``http.client`` is used instead of ``urllib``/``httpx`` so ambient proxy
+    environment variables can never route the probe away from the loopback
+    daemon. Only a bounded JSON object is returned.
+    """
+    connection: http.client.HTTPConnection | None = None
     try:
-        with socket.create_connection((settings.host, settings.port), timeout=timeout):
-            return DaemonProbe(
-                state="UP",
-                detail=f"listening on {settings.host}:{settings.port}",
-            )
-    except OSError as exc:
-        return DaemonProbe(
-            state="OFFLINE",
-            detail=f"no listener on {settings.host}:{settings.port} ({exc.__class__.__name__})",
-        )
+        connection = http.client.HTTPConnection(settings.host, settings.port, timeout=timeout)
+        connection.request("GET", "/health")
+        response = connection.getresponse()
+        if response.status != 200:
+            return None
+        payload = json.loads(response.read(_HEALTH_BODY_LIMIT_BYTES))
+    except (OSError, http.client.HTTPException, ValueError, RecursionError):
+        # A squatter's 200 can carry deeply nested JSON: ``json.loads`` raises
+        # ``RecursionError`` (not ``ValueError``) and would otherwise crash the
+        # probe's callers (``oft status``/``doctor``/the Telegram watchdog).
+        return None
+    finally:
+        if connection is not None:
+            connection.close()
+    return payload if isinstance(payload, dict) else None
+
+
+def probe_daemon(settings: Settings, timeout: float = 1.0) -> DaemonProbe:
+    """Probe ``GET /health`` and confirm it is this OFT service and version."""
+    address = f"{settings.host}:{settings.port}"
+    payload = _fetch_health(settings, timeout)
+    if payload is None:
+        return DaemonProbe(state="OFFLINE", detail=f"no OFT health endpoint on {address}")
+    data = payload.get("data")
+    if payload.get("ok") is not True or not isinstance(data, dict):
+        # Never echo the response body: a squatter's payload is arbitrary.
+        return DaemonProbe(state="OFFLINE", detail=f"{address} did not return an OFT envelope")
+    if data.get("service") != SERVICE_NAME:
+        return DaemonProbe(state="OFFLINE", detail=f"{address} is served by a different service")
+    if data.get("version") != __version__:
+        return DaemonProbe(state="OFFLINE", detail=f"{address} runs a different OFT version")
+    return DaemonProbe(state="UP", detail=f"oft {__version__} healthy on {address}")
 
 
 def _check(name: str, ok: bool, detail: str, failure: CheckState = "degraded") -> CheckResult:
@@ -135,6 +169,8 @@ def build_readiness(
             "integrity ok" if sqlite_ok else "database missing or integrity check failed",
         )
     )
+    checks.append(_schema_check(store))
+    checks.append(_disk_check(settings))
 
     parquet_root = settings.data_dir / "market"
     checks.append(
@@ -157,6 +193,7 @@ def build_readiness(
     except Exception as exc:  # pragma: no cover - defensive boundary
         universe_detail = str(exc)
     checks.append(_check("market_data", universe_ok, universe_detail))
+    checks.append(_scheduler_heartbeat_check(settings, clock))
 
     latest = store.latest_scan()
     ready = all(check.status == "ok" for check in checks)
@@ -198,10 +235,13 @@ def _existing_ancestor(path: Path) -> Path:
     return probe
 
 
-def _disk_check(settings: Settings, *, disk_usage: Any = shutil.disk_usage) -> CheckResult:
+def _disk_check(
+    settings: Settings, *, disk_usage: Callable[[Path], Any] | None = None
+) -> CheckResult:
     """Report free space without ever reading a file's contents or secrets."""
+    usage_fn = disk_usage or shutil.disk_usage
     try:
-        usage = disk_usage(_existing_ancestor(settings.data_dir))
+        usage = usage_fn(_existing_ancestor(settings.data_dir))
     except OSError as exc:  # pragma: no cover - defensive boundary
         return CheckResult("storage.disk", "degraded", f"disk usage unavailable ({exc})")
     free_gib = usage.free / 1024**3
@@ -209,6 +249,67 @@ def _disk_check(settings: Settings, *, disk_usage: Any = shutil.disk_usage) -> C
     detail = f"{free_gib:.1f} GiB free ({used_pct:.0f}% used)"
     healthy = usage.free >= MIN_FREE_DISK_BYTES and used_pct < DISK_WARN_USED_PCT
     return _check("storage.disk", healthy, detail)
+
+
+def _schema_check(store: StorePort) -> CheckResult:
+    """Report only the recorded/expected schema version numbers."""
+    try:
+        state = store.schema_state()
+    except Exception:  # pragma: no cover - defensive boundary
+        return CheckResult("storage.schema", "degraded", "schema state unavailable")
+    detail = f"schema version {state.version} (expected {state.expected})"
+    return CheckResult(
+        "storage.schema",
+        "ok" if state.up_to_date else "degraded",
+        detail,
+    )
+
+
+def _scheduler_heartbeat_check(settings: Settings, clock: ClockPort) -> CheckResult:
+    """Require a fresh daemon heartbeat outside the test environment.
+
+    The API-only ``oft serve`` process has no schedulers, so in a real
+    environment it must report not-ready: that is the intended distinction
+    between the API shell and the blessed daemon entrypoint. ``OFT_ENV=test``
+    has no daemon by design (the TestClient suite), so it is explicitly exempt.
+    """
+    from oft.application.scheduler import (
+        SCHEDULER_HEARTBEAT_STALE_SECONDS,
+        read_scheduler_heartbeat,
+    )
+
+    if settings.env.value == "test":
+        return CheckResult("scheduler.heartbeat", "ok", "not required in test env")
+    recorded = read_scheduler_heartbeat(settings)
+    if recorded is None:
+        return CheckResult("scheduler.heartbeat", "degraded", "scheduler heartbeat missing")
+    try:
+        heartbeat = datetime.fromisoformat(recorded.replace("Z", "+00:00"))
+    except (TypeError, ValueError):
+        return CheckResult("scheduler.heartbeat", "degraded", "scheduler heartbeat unreadable")
+    if heartbeat.tzinfo is None:
+        # A naive timestamp is interpreted as local time by ``astimezone``, so
+        # its age is unknowable: treat it as degraded rather than guessed.
+        return CheckResult(
+            "scheduler.heartbeat",
+            "degraded",
+            "scheduler heartbeat is not timezone-aware",
+        )
+    age = (clock.now().astimezone(UTC) - heartbeat.astimezone(UTC)).total_seconds()
+    if age < 0:
+        # Clock skew must not make a future heartbeat look indefinitely fresh.
+        return CheckResult(
+            "scheduler.heartbeat",
+            "degraded",
+            f"scheduler heartbeat is in the future ({-age:.0f}s ahead)",
+        )
+    if age > SCHEDULER_HEARTBEAT_STALE_SECONDS:
+        return CheckResult(
+            "scheduler.heartbeat",
+            "degraded",
+            f"stale scheduler heartbeat ({age:.0f}s old)",
+        )
+    return CheckResult("scheduler.heartbeat", "ok", f"scheduler heartbeat {age:.0f}s old")
 
 
 def _manifest_orphans_check(settings: Settings, store: StorePort) -> CheckResult:
@@ -845,7 +946,6 @@ def build_doctor(
         )
     checks = (
         *readiness.checks,
-        _disk_check(settings),
         _manifest_orphans_check(settings, store),
         _stale_jobs_check(store, clock),
         _management_jobs_check(store, clock),

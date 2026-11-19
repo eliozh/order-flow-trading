@@ -302,8 +302,15 @@ class BinanceRestClient:
         *,
         last_event_time: datetime | None,
         now: datetime,
+        stop: Callable[[], bool] | None = None,
     ) -> AggTradeRecovery:
-        """Recover the last 48 h in one-hour windows with a request budget."""
+        """Recover the last 48 h in one-hour windows with a request budget.
+
+        ``stop`` is a cooperative shutdown hook: it is checked before each
+        window and before each ``fromId`` page so a daemon stop does not wait
+        for the whole 48 h scan. A stop returns the partial recovery with
+        ``reason="SHUTDOWN"`` and ``complete=False``.
+        """
         if now.tzinfo is None:
             raise BinanceRestError("VALIDATION_FAILED", "recovery time must be timezone-aware")
         end = now.astimezone(UTC)
@@ -324,8 +331,12 @@ class BinanceRestClient:
         requests = 0
         weight_used: int | None = None
         reason: str | None = "RECOVERY_WINDOW_EXCEEDED_48H" if clamped else None
+        stopped = False
         cursor = start
         while cursor < end:
+            if stop is not None and stop():
+                stopped = True
+                break
             if requests >= self._max_requests:
                 reason = reason or "RATE_LIMIT_BUDGET_EXHAUSTED"
                 break
@@ -352,6 +363,9 @@ class BinanceRestClient:
             # A full page means the window may have been truncated: page with
             # fromId until the endpoint returns fewer than `limit` rows.
             while len(page.trades) >= AGG_TRADES_LIMIT:
+                if stop is not None and stop():
+                    stopped = True
+                    break
                 if requests >= self._max_requests:
                     reason = reason or "RATE_LIMIT_BUDGET_EXHAUSTED"
                     break
@@ -367,8 +381,12 @@ class BinanceRestClient:
                 if not page.trades:
                     break
                 trades.extend(page.trades)
+            if stopped:
+                break
             cursor = window_end
-        if cursor < end and reason is None and requests >= self._max_requests:
+        if stopped:
+            reason = "SHUTDOWN"
+        elif cursor < end and reason is None and requests >= self._max_requests:
             reason = "RATE_LIMIT_BUDGET_EXHAUSTED"
         return AggTradeRecovery(
             trades=tuple(trades),

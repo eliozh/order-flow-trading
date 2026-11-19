@@ -15,6 +15,7 @@ import sys
 import time
 from collections.abc import Sequence
 from datetime import UTC, datetime
+from enum import StrEnum
 from pathlib import Path
 from typing import Annotated, Any, Literal
 
@@ -43,6 +44,8 @@ from oft.application.scheduler import (
     SettingsSyncDaemonScheduler,
     TriggerDaemonScheduler,
     align_to_boundary,
+    scheduler_heartbeat_path,
+    write_scheduler_heartbeat,
 )
 from oft.cli.commands.doctor import emit_error
 from oft.config import ConfigError, Settings, load_settings
@@ -384,31 +387,56 @@ def daemon_start(
     # Call the private alias so the existing test seam (which patches
     # ``_schedule_state``) stays effective; the public name is for new callers.
     state = _schedule_state(settings)
-    _run_live_ingestion(settings, replay_file, symbols, container=container)
-    scheduler = _start_scheduler(settings, state, container=container)
-    settings_sync = _start_settings_sync_scheduler(container=container, scan_scheduler=scheduler)
-    trigger_scheduler = _start_trigger_scheduler(settings, container=container)
-    monitor_scheduler = _start_position_monitor_scheduler(settings, container=container)
-    management_scheduler = _start_management_scheduler(
-        settings, state, container=container, scan_scheduler=scheduler
-    )
+    # Every background surface is created inside the guarded block so a failure
+    # in any one of them still stops and flushes the already-started ones (in
+    # particular the live-ingestion worker's drain/checkpoint) instead of
+    # leaking daemon threads.
+    ingestion: Any | None = None
+    scheduler: ScanDaemonScheduler | None = None
+    settings_sync: SettingsSyncDaemonScheduler | None = None
+    trigger_scheduler: TriggerDaemonScheduler | None = None
+    monitor_scheduler: PositionMonitorDaemonScheduler | None = None
+    management_scheduler: ManagementDaemonScheduler | None = None
     telegram_runtime: Any | None = None
     try:
+        ingestion = _run_live_ingestion(settings, replay_file, symbols, container=container)
+        scheduler = _start_scheduler(settings, state, container=container)
+        settings_sync = _start_settings_sync_scheduler(
+            container=container, scan_scheduler=scheduler
+        )
+        trigger_scheduler = _start_trigger_scheduler(settings, container=container)
+        monitor_scheduler = _start_position_monitor_scheduler(settings, container=container)
+        management_scheduler = _start_management_scheduler(
+            settings, state, container=container, scan_scheduler=scheduler
+        )
         # Started inside the guarded block: if the Telegram runtime fails to
         # start, the finally below still shuts down the already-started
         # schedulers instead of leaking them.
         telegram_runtime = _start_telegram_runtime(container=container)
         _run_uvicorn(settings)
     finally:
-        # The Telegram runtime is stopped first: its poller thread and dispatch
+        # Live ingestion is stopped first: its supervisor drains the queue,
+        # flushes Parquet, and advances the checkpoint before the process exits.
+        if ingestion is not None and not ingestion.stop():
+            _LOGGER.warning("live_ingestion_shutdown_incomplete")
+        # The Telegram runtime is stopped next: its poller thread and dispatch
         # scheduler must not outlive the process or hold the SQLite handle.
         if telegram_runtime is not None:
             _shutdown_telegram_runtime(telegram_runtime)
-        management_scheduler.shutdown()
-        monitor_scheduler.shutdown()
-        trigger_scheduler.shutdown()
-        settings_sync.shutdown()
-        scheduler.shutdown()
+        if management_scheduler is not None:
+            management_scheduler.shutdown()
+        if monitor_scheduler is not None:
+            monitor_scheduler.shutdown()
+        if trigger_scheduler is not None:
+            trigger_scheduler.shutdown()
+        if settings_sync is not None:
+            settings_sync.shutdown()
+        if scheduler is not None:
+            scheduler.shutdown()
+        # A leftover fresh heartbeat would make an API-only ``oft serve`` in
+        # the same data dir report ready; shutdown removes it best-effort.
+        with contextlib.suppress(OSError):
+            scheduler_heartbeat_path(settings).unlink(missing_ok=True)
         pid_path(settings).unlink(missing_ok=True)
 
 
@@ -554,7 +582,20 @@ def _start_settings_sync_scheduler(
         period_provider=service.persisted_scan_period,
     )
 
-    scheduler = SettingsSyncDaemonScheduler(job=lambda: _run_settings_sync(sync))
+    def _tick() -> bool:
+        # Liveness is recorded at both ends of the tick. Writing only before the
+        # sync work would let a tick longer than the stale threshold (60 s) look
+        # like a dead scheduler; the trailing write bounds the observable gap.
+        write_scheduler_heartbeat(container.settings, now=container.clock.now())
+        try:
+            return _run_settings_sync(sync)
+        finally:
+            write_scheduler_heartbeat(container.settings, now=container.clock.now())
+
+    scheduler = SettingsSyncDaemonScheduler(job=_tick)
+    # Write once before the first tick so a restart's readiness probe succeeds
+    # immediately instead of waiting up to one interval.
+    write_scheduler_heartbeat(container.settings, now=container.clock.now())
     scheduler.start()
     return scheduler
 
@@ -873,28 +914,42 @@ def daemon_stop(
     if not pid_matches(settings, pid):
         _emit_not_running(json_output)
         return
-    try:
-        os.kill(pid, signal.SIGTERM)
-    except ProcessLookupError:
-        # The daemon exited between the fence check and the signal: mirror
-        # ``_stop_daemon`` -- clear the stale artifacts and report NOT_RUNNING.
-        _remove_pid_files(settings)
+    stop_outcome = _stop_daemon_outcome(settings, pid, timeout_seconds=_STOP_TIMEOUT_SECONDS)
+    if stop_outcome is _StopOutcome.STOPPED:
+        if json_output:
+            typer.echo(json.dumps({"ok": True, "data": {"state": "STOPPED", "pid": pid}}, indent=2))
+        else:
+            typer.echo(f"stopped daemon (pid {pid})")
+        return
+    if stop_outcome in (_StopOutcome.ALREADY_GONE, _StopOutcome.FENCE_MISMATCH):
+        # The daemon exited between the fence check and SIGTERM (artifacts were
+        # already removed), or the PID was recycled before the signal.
         _emit_not_running(json_output)
         return
-    except PermissionError:
-        # Another owner's process: never retry a blind signal, and keep the
-        # artifacts so a privileged user can still resolve it.
+    if stop_outcome is _StopOutcome.TIMEOUT:
+        # Timeout: keep the PID artifacts so a retry can still stop it, and
+        # make the failure script-visible with a JSON envelope.
+        emit_error(
+            "INTERNAL_ERROR",
+            f"daemon pid {pid} did not exit within {_STOP_TIMEOUT_SECONDS:.0f}s; "
+            "pid artifacts kept; retry `oft daemon stop`",
+            json_output=json_output,
+        )
+        raise typer.Exit(code=1)
+    if stop_outcome is _StopOutcome.PERMISSION_DENIED:
+        # Another owner's process: do not retry or clear its artifacts.
         emit_error(
             "INTERNAL_ERROR",
             f"cannot signal pid {pid}: permission denied",
             json_output=json_output,
         )
-        raise typer.Exit(code=1) from None
-    _remove_pid_files(settings)
-    if json_output:
-        typer.echo(json.dumps({"ok": True, "data": {"state": "STOPPED", "pid": pid}}, indent=2))
-    else:
-        typer.echo(f"stopped daemon (pid {pid})")
+        raise typer.Exit(code=1)
+    emit_error(
+        "INTERNAL_ERROR",
+        f"cannot stop daemon: invalid pid {pid}",
+        json_output=json_output,
+    )
+    raise typer.Exit(code=1)
 
 
 @daemon_app.command("status")
@@ -948,22 +1003,57 @@ def daemon_logs(
     """Print the daemon's structured log tail."""
     settings = settings_or_exit(json_output)
     path = log_path(settings)
-    try:
-        text = path.read_text(encoding="utf-8")
-    except OSError:
+    tail = _read_daemon_log_tail(path, lines)
+    if tail is None:
         if json_output:
             typer.echo(json.dumps({"ok": True, "data": {"path": str(path), "lines": []}}, indent=2))
         else:
             typer.echo(f"no daemon log at {path}")
         return
-    tail = text.splitlines()[-lines:]
     if json_output:
         typer.echo(json.dumps({"ok": True, "data": {"path": str(path), "lines": tail}}, indent=2))
     else:
         typer.echo("\n".join(tail))
 
 
+# A rotated log can be hundreds of megabytes; read only the window needed for
+# the requested tail instead of materializing the whole file.
+_DAEMON_LOG_TAIL_WINDOW_BYTES = 256 * 1024
+
+
+def _read_daemon_log_tail(path: Path, line_count: int) -> list[str] | None:
+    """The last ``line_count`` lines from a bounded read window.
+
+    Returns ``None`` when the file cannot be read. When the window starts
+    mid-file, its leading partial line is dropped so a torn record is never
+    reported as a complete line. A window that starts exactly on a line
+    boundary (the preceding byte is ``\\n``) keeps its first complete line.
+    """
+    try:
+        with path.open("rb") as handle:
+            handle.seek(0, os.SEEK_END)
+            size = handle.tell()
+            start = max(0, size - _DAEMON_LOG_TAIL_WINDOW_BYTES)
+            handle.seek(start)
+            raw = handle.read(_DAEMON_LOG_TAIL_WINDOW_BYTES)
+            at_line_boundary = True
+            if start > 0:
+                handle.seek(start - 1)
+                at_line_boundary = handle.read(1) == b"\n"
+    except OSError:
+        return None
+    tail = raw.decode("utf-8", errors="replace").splitlines()
+    if not at_line_boundary and tail:
+        tail = tail[1:]
+    return tail[-line_count:]
+
+
 _RESTART_TIMEOUT_SECONDS = 10.0
+# Time allowed for the daemon to exit on ``daemon stop`` *and* on the stop half
+# of ``daemon restart``: both must outlast the live-ingestion join (which covers
+# an in-flight connect/subscribe handshake) before reporting a timeout. The
+# restart spawn/ready waits keep the shorter ``_RESTART_TIMEOUT_SECONDS``.
+_STOP_TIMEOUT_SECONDS = 20.0
 _RESTART_POLL_SECONDS = 0.05
 _CHILD_TERMINATE_TIMEOUT_SECONDS = 5.0
 _STARTUP_OUTPUT_LIMIT = 500
@@ -1166,46 +1256,72 @@ def _reap_child(pid: int) -> bool:
     return reaped == pid
 
 
+class _StopOutcome(StrEnum):
+    """Why ``_stop_daemon_outcome`` returned; ``daemon stop`` renders each one."""
+
+    STOPPED = "STOPPED"
+    ALREADY_GONE = "ALREADY_GONE"
+    TIMEOUT = "TIMEOUT"
+    PERMISSION_DENIED = "PERMISSION_DENIED"
+    FENCE_MISMATCH = "FENCE_MISMATCH"
+    INVALID_PID = "INVALID_PID"
+
+
+def _stop_daemon_outcome(
+    settings: Settings,
+    pid: int,
+    *,
+    timeout_seconds: float = _RESTART_TIMEOUT_SECONDS,
+) -> _StopOutcome:
+    """SIGTERM the daemon and classify the result; never SIGKILL.
+
+    The start-time fence is re-checked immediately before ``os.kill`` so a PID
+    recycled while the caller prompted is never signalled. A child of this
+    process is reaped while polling, so a zombie cannot make ``process_alive``
+    report it as running until the timeout. The stale PID artifacts are removed
+    on success or when the process is already gone; a timeout or a permission
+    failure keeps them so ``daemon stop`` / ``daemon status`` can retry. A
+    non-positive PID is never signalled: ``os.kill(0, ...)`` and
+    ``os.kill(-1, ...)`` address a process group / every process.
+    """
+    if not _valid_pid(pid):
+        return _StopOutcome.INVALID_PID
+    if not pid_matches(settings, pid):
+        # The caller verified the fence earlier; refuse without signalling if
+        # it no longer matches (recycled PID or a vanished meta file).
+        return _StopOutcome.FENCE_MISMATCH
+    try:
+        os.kill(pid, signal.SIGTERM)
+    except ProcessLookupError:
+        _remove_pid_files(settings)
+        return _StopOutcome.ALREADY_GONE
+    except PermissionError:
+        # Another owner's process: do not retry or clear its artifacts.
+        return _StopOutcome.PERMISSION_DENIED
+    deadline = time.monotonic() + timeout_seconds
+    while time.monotonic() < deadline:
+        if _reap_child(pid) or not process_alive(pid):
+            _remove_pid_files(settings)
+            return _StopOutcome.STOPPED
+        time.sleep(_RESTART_POLL_SECONDS)
+    # The daemon may still be alive: keep the PID artifacts so a later
+    # ``daemon stop``/``status`` can observe and retry it.
+    return _StopOutcome.TIMEOUT
+
+
 def _stop_daemon(
     settings: Settings,
     pid: int,
     *,
     timeout_seconds: float = _RESTART_TIMEOUT_SECONDS,
 ) -> bool:
-    """SIGTERM the daemon and wait for it to exit; never SIGKILL.
+    """Boolean facade for ``daemon restart`` and the existing stop tests.
 
-    The start-time fence is re-checked immediately before ``os.kill`` so a PID
-    recycled while the caller prompted is never signalled. A child of this
-    process is reaped while polling, so a zombie cannot make ``process_alive``
-    report it as running until the timeout. The stale PID artifacts are removed
-    on success or when the process is already gone; a timeout keeps them so
-    ``daemon stop`` / ``daemon status`` can retry against the still-live daemon.
-    A non-positive PID is never signalled: ``os.kill(0, ...)`` and
-    ``os.kill(-1, ...)`` address a process group / every process.
+    Truthy only when the daemon is confirmed stopped or already gone; a
+    timeout, permission denial, fence mismatch, or invalid PID is ``False``.
     """
-    if not _valid_pid(pid):
-        return False
-    if not pid_matches(settings, pid):
-        # The caller verified the fence earlier; refuse without signalling if
-        # it no longer matches (recycled PID or a vanished meta file).
-        return False
-    try:
-        os.kill(pid, signal.SIGTERM)
-    except ProcessLookupError:
-        _remove_pid_files(settings)
-        return True
-    except PermissionError:
-        # Another owner's process: do not retry or clear its artifacts.
-        return False
-    deadline = time.monotonic() + timeout_seconds
-    while time.monotonic() < deadline:
-        if _reap_child(pid) or not process_alive(pid):
-            _remove_pid_files(settings)
-            return True
-        time.sleep(_RESTART_POLL_SECONDS)
-    # The daemon may still be alive: keep the PID artifacts so a later
-    # ``daemon stop``/``status`` can observe and retry it.
-    return False
+    outcome = _stop_daemon_outcome(settings, pid, timeout_seconds=timeout_seconds)
+    return outcome in (_StopOutcome.STOPPED, _StopOutcome.ALREADY_GONE)
 
 
 def _restart_stderr_path(settings: Settings) -> Path:
@@ -1563,11 +1679,11 @@ def daemon_restart(
                 typer.echo("restart cancelled")
             raise typer.Exit(code=0)
 
-    if not _stop_daemon(settings, pid, timeout_seconds=_RESTART_TIMEOUT_SECONDS):
+    if not _stop_daemon(settings, pid, timeout_seconds=_STOP_TIMEOUT_SECONDS):
         emit_error(
             "INTERNAL_ERROR",
             f"daemon pid {pid} did not stop within "
-            f"{_RESTART_TIMEOUT_SECONDS:g}s; it was not force-killed",
+            f"{_STOP_TIMEOUT_SECONDS:g}s; it was not force-killed",
             json_output=json_output,
         )
         raise typer.Exit(code=1)

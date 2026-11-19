@@ -2,6 +2,9 @@
 
 from __future__ import annotations
 
+import contextlib
+import threading
+from dataclasses import dataclass
 from pathlib import Path
 from typing import Annotated, Any
 
@@ -222,16 +225,47 @@ def _build_freshness_guard(container: Any) -> Any:
     return FreshnessGuard(clock=container.clock, alert_sink=alert_sink)
 
 
+# A live receive can block for up to ~30 s; stop() closes the socket stream
+# first, then joins only long enough for the supervisor's finally to drain and
+# checkpoint the buffer. 15 s covers one in-flight connect/subscribe handshake
+# in addition to a bounded reconnect backoff.
+LIVE_INGESTION_JOIN_TIMEOUT_SECONDS = 15.0
+
+
+@dataclass(frozen=True)
+class LiveIngestionHandle:
+    """Owns the live-ingestion worker so shutdown can flush before process exit."""
+
+    stop_event: threading.Event
+    thread: threading.Thread
+    supervisor: Any
+    clients: tuple[Any, ...] = ()
+
+    def stop(self, *, timeout: float = LIVE_INGESTION_JOIN_TIMEOUT_SECONDS) -> bool:
+        """Signal, unblock, join; ``True`` when the worker actually exited."""
+        self.stop_event.set()
+        for client in self.clients:
+            close = getattr(client, "close", None)
+            if callable(close):
+                with contextlib.suppress(Exception):
+                    close()
+        self.thread.join(timeout)
+        return not self.thread.is_alive()
+
+
 def _run_live_ingestion(
     settings: Settings,
     replay_file: Path | None,
     symbols: str | None,
     *,
     container: Any | None = None,
-) -> None:
-    """Run one ordered replay, or start the continuous live WS ingester."""
-    import threading
+) -> LiveIngestionHandle | None:
+    """Run one ordered replay, or start the continuous live WS ingester.
 
+    The live path returns a handle whose ``stop`` flushes the supervisor's
+    buffer; the replay, idle, empty-symbol, and test-environment paths are
+    synchronous or intentionally inert and return ``None``.
+    """
     from oft.adapters.parquet_store import (
         FlushPolicy,
         LiveParquetBuffer,
@@ -252,11 +286,11 @@ def _run_live_ingestion(
         if not symbol_list:
             # No explicit override and nothing starred: start idle, never default.
             WsStateStore(state_path, container.clock).write("IDLE", {}, {})
-            return
+            return None
         if settings.env.value == "test":
             # Never open a socket from a test environment.
             WsStateStore(state_path, container.clock).write("DISCONNECTED", {}, {})
-            return
+            return None
         live_client, recovery_client = _build_limited_clients(container)
         live_parquet = LiveParquetBuffer(
             settings=settings,
@@ -273,6 +307,10 @@ def _run_live_ingestion(
                 )
 
             symbol_provider = _starred_provider
+        # Created before the supervisor so reconnect backoff is interruptible:
+        # ``stop`` sets the event and the sleeper returns immediately instead of
+        # blocking for up to the backoff maximum while the join times out.
+        stop_event = threading.Event()
         supervisor = IngestionSupervisor(
             settings=settings,
             source=(),
@@ -284,11 +322,12 @@ def _run_live_ingestion(
             symbols=symbol_list,
             symbol_provider=symbol_provider,
             freshness=_build_freshness_guard(container),
+            sleep=stop_event.wait,
         )
 
         def _run_ws_thread() -> None:
             try:
-                supervisor.run_forever()
+                supervisor.run_forever(stop=stop_event.is_set)
             except Exception as exc:  # noqa: BLE001 - thread must fail visibly
                 import structlog
 
@@ -297,12 +336,18 @@ def _run_live_ingestion(
                 )
                 WsStateStore(state_path, container.clock).write("FAILED", {}, {})
 
-        threading.Thread(
+        worker = threading.Thread(
             target=_run_ws_thread,
             name="oft-ws-ingest",
             daemon=True,
-        ).start()
-        return
+        )
+        worker.start()
+        return LiveIngestionHandle(
+            stop_event=stop_event,
+            thread=worker,
+            supervisor=supervisor,
+            clients=(live_client,),
+        )
     buffer = LiveParquetBuffer(
         settings=settings,
         store=container.store,
@@ -318,6 +363,7 @@ def _run_live_ingestion(
         symbols=symbol_list,
     )
     supervisor.run()
+    return None
 
 
 @app.command()

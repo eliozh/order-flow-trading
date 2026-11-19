@@ -72,6 +72,10 @@ class TelegramBotApiAdapter:
                 kwargs: dict[str, Any] = {
                     "base_url": BOT_API_HOST,
                     "timeout": self._timeout,
+                    # The bot token is interpolated into the URL path. Ignore
+                    # ambient proxy/.netrc/SSL_CERT_FILE settings so a
+                    # TLS-inspecting proxy can never see it (SEC-01).
+                    "trust_env": False,
                 }
                 if self._transport is not None:
                     kwargs["transport"] = self._transport

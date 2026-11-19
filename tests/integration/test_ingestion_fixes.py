@@ -3,9 +3,13 @@
 from __future__ import annotations
 
 import json
+import threading
+import time
 from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
+from types import SimpleNamespace
+from typing import Any
 
 import pytest
 
@@ -30,7 +34,7 @@ class FakeRecovery:
     def __init__(self) -> None:
         self.calls = 0
 
-    def recover_agg_trades(self, symbol, *, last_event_time, now):  # type: ignore[no-untyped-def]
+    def recover_agg_trades(self, symbol, *, last_event_time, now, stop=None):  # type: ignore[no-untyped-def]
         self.calls += 1
         return _RecoveryResult(trades=(), complete=True, start=now, end=now, reason=None)
 
@@ -107,13 +111,34 @@ def test_startup_connect_failure_retries_then_recovers(tmp_path: Path) -> None:
     supervisor = _supervisor(settings, Clock(), [], client=client, recovery=recovery)
 
     def counted_stop() -> bool:
-        return client.connects >= 3
+        # The stop predicate is now also consulted by ``_recover`` before its
+        # per-symbol work, so let the recovery complete before stopping.
+        return client.connects >= 3 and recovery.calls >= 1
 
     result = supervisor.run_forever(stop=counted_stop)
 
     assert client.connects >= 3
     assert recovery.calls >= 1
     assert result.recoveries >= 1
+
+
+def test_recover_forwards_the_stop_predicate(tmp_path: Path) -> None:
+    settings = _settings(tmp_path)
+    seen: list[Any] = []
+
+    class Recovery:
+        def recover_agg_trades(self, symbol, *, last_event_time, now, stop=None):  # type: ignore[no-untyped-def]
+            seen.append(stop)
+            return _RecoveryResult(trades=(), complete=True, start=now, end=now, reason=None)
+
+    supervisor = _supervisor(settings, Clock(), [], recovery=Recovery())
+
+    def predicate() -> bool:
+        return False
+
+    supervisor._recover(stop=predicate)
+
+    assert seen == [predicate]
 
 
 def test_lost_checkpoint_does_not_duplicate_klines(tmp_path: Path) -> None:
@@ -343,6 +368,208 @@ def test_active_symbols_default_to_stars_and_explicit_overrides() -> None:
     assert _active_symbols(None, ("BTCUSDT", "XAUUSDT")) == ("BTCUSDT", "XAUUSDT")
     assert _active_symbols(None, ()) == ()
     assert _active_symbols("ETHUSDT", ("BTCUSDT",)) == ("ETHUSDT",)
+
+
+def test_run_forever_flushes_buffered_rows_to_parquet_on_stop(tmp_path: Path) -> None:
+    """F4: the supervisor's finally drains and checkpoints before returning."""
+    import pyarrow.dataset as dataset
+
+    from oft.adapters.parquet_store import LiveParquetBuffer
+    from oft.application.ingestion_supervisor import IngestionSupervisor
+
+    settings = _settings(tmp_path)
+
+    class EventClock:
+        def now(self) -> datetime:
+            return datetime(2026, 11, 6, 12, 0, tzinfo=UTC)
+
+    clock = EventClock()
+    fixture = Path(__file__).resolve().parents[2] / "tests" / "fixtures" / "ws" / "aggtrade.jsonl"
+    payload = json.loads(fixture.read_text(encoding="utf-8").splitlines()[0])["data"]
+
+    class OneEventThenStop:
+        def __init__(self) -> None:
+            self.delivered = False
+
+        def connect(self, streams) -> None:  # type: ignore[no-untyped-def]
+            return None
+
+        def subscribe(self, streams) -> None:  # type: ignore[no-untyped-def]
+            return None
+
+        def receive_event(self):  # type: ignore[no-untyped-def]
+            if not self.delivered:
+                self.delivered = True
+                return "btcusdt@aggTrade", payload
+            raise OSError("closed")
+
+    client = OneEventThenStop()
+    store = SqliteStore(settings)
+    supervisor = IngestionSupervisor(
+        settings=settings,
+        source=(),
+        store=store,
+        parquet=LiveParquetBuffer(settings=settings, store=store, clock=clock),
+        clock=clock,
+        client=client,
+        sleep=lambda _seconds: None,
+    )
+
+    stats = supervisor.run_forever(stop=lambda: client.delivered)
+
+    assert stats.accepted == 1
+    root = settings.data_dir / "market" / "um" / "agg_trades" / "symbol=BTCUSDT"
+    parts = [str(path) for path in root.glob("date=*/*.parquet")]
+    assert parts, "the buffered row must be flushed on shutdown"
+    table = dataset.dataset(parts, format="parquet").to_table(columns=["agg_trade_id"])
+    assert table.column("agg_trade_id").to_pylist() == [100]
+
+
+def test_live_ingestion_handle_stop_closes_the_stream_and_joins() -> None:
+    import threading
+
+    from oft.cli.main import LiveIngestionHandle
+
+    stop_event = threading.Event()
+    closed: list[bool] = []
+
+    class _Stream:
+        def close(self) -> None:
+            closed.append(True)
+
+    thread = threading.Thread(target=lambda: stop_event.wait(timeout=5), daemon=True)
+    thread.start()
+    handle = LiveIngestionHandle(
+        stop_event=stop_event,
+        thread=thread,
+        supervisor=object(),
+        clients=(_Stream(),),
+    )
+
+    assert handle.stop(timeout=1) is True
+    assert closed == [True]
+    assert thread.is_alive() is False
+
+
+def test_run_forever_backoff_is_interruptible_by_stop(tmp_path: Path) -> None:
+    settings = _settings(tmp_path)
+    stop_event = threading.Event()
+    sleeps: list[float] = []
+
+    class Client:
+        def connect(self, streams) -> None:  # type: ignore[no-untyped-def]
+            return None
+
+        def subscribe(self, streams) -> None:  # type: ignore[no-untyped-def]
+            return None
+
+        def receive_event(self):  # type: ignore[no-untyped-def]
+            raise OSError("closed")
+
+    def sleeper(delay: float) -> bool:
+        sleeps.append(delay)
+        stop_event.set()
+        return True
+
+    supervisor = IngestionSupervisor(
+        settings=settings,
+        source=(),
+        store=SqliteStore(settings),
+        parquet=LiveParquetBuffer(settings=settings, store=SqliteStore(settings), clock=Clock()),
+        clock=Clock(),
+        client=Client(),
+        symbols=("BTCUSDT",),
+        sleep=sleeper,
+        backoff_base=0.01,
+    )
+
+    stats = supervisor.run_forever(stop=stop_event.is_set)
+
+    # The sleeper was reached and returned immediately because it set the event.
+    assert sleeps
+    assert stop_event.is_set()
+    assert stats.reconnects == 1
+
+
+def test_connect_and_subscribe_honours_a_requested_stop(tmp_path: Path) -> None:
+    settings = _settings(tmp_path)
+
+    class Client:
+        def __init__(self) -> None:
+            self.calls: list[str] = []
+            self.stopped = False
+
+        def connect(self, streams) -> None:  # type: ignore[no-untyped-def]
+            self.calls.append("connect")
+            self.stopped = True
+
+        def subscribe(self, streams) -> None:  # type: ignore[no-untyped-def]
+            self.calls.append("subscribe")
+
+        def receive_event(self):  # type: ignore[no-untyped-def]
+            raise OSError("closed")
+
+    client = Client()
+    supervisor = IngestionSupervisor(
+        settings=settings,
+        source=(),
+        store=SqliteStore(settings),
+        parquet=LiveParquetBuffer(settings=settings, store=SqliteStore(settings), clock=Clock()),
+        clock=Clock(),
+        client=client,
+        symbols=("BTCUSDT",),
+        sleep=lambda _seconds: None,
+    )
+
+    # Already stopped: neither handshake call is made.
+    assert supervisor._connect_and_subscribe(stop=lambda: True) is False
+    assert client.calls == []
+
+    # Stop requested during the connect handshake: subscribe is skipped.
+    assert supervisor._connect_and_subscribe(stop=lambda: client.stopped) is False
+    assert client.calls == ["connect"]
+
+
+def test_run_live_ingestion_wires_a_stop_aware_sleeper(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    import oft.cli.main as cli_main
+
+    settings = Settings(env="paper", port=8765, data_dir=tmp_path / "data")
+    store = SqliteStore(settings)
+    store.initialize()
+    container = SimpleNamespace(
+        settings=settings,
+        store=store,
+        clock=Clock(),
+        symbol_registry=SimpleNamespace(list_starred=lambda: [SimpleNamespace(symbol="BTCUSDT")]),
+        notifications=None,
+    )
+    captured: dict[str, Any] = {}
+
+    class FakeSupervisor:
+        def __init__(self, **kwargs: Any) -> None:
+            captured.update(kwargs)
+
+        def run_forever(self, *, stop: Any = None) -> None:
+            captured["stop"] = stop
+
+    class FakeClient:
+        def close(self) -> None:
+            return None
+
+    monkeypatch.setattr("oft.application.ingestion_supervisor.IngestionSupervisor", FakeSupervisor)
+    monkeypatch.setattr(
+        cli_main, "_build_limited_clients", lambda _container: (FakeClient(), FakeClient())
+    )
+
+    handle = cli_main._run_live_ingestion(settings, None, "BTCUSDT", container=container)
+
+    assert handle is not None
+    assert captured["sleep"] is not time.sleep
+    assert captured["sleep"] == handle.stop_event.wait
+    assert handle.stop() is True
+    assert captured["stop"]() is True
 
 
 def test_daemon_starts_idle_without_starred_symbols(tmp_path: Path) -> None:

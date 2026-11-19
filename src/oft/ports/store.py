@@ -116,6 +116,20 @@ class WatchlistSnapshot:
 
 
 @dataclass(frozen=True)
+class SchemaState:
+    """The recorded migration version compared with the code's expected version.
+
+    ``up_to_date`` is ``False`` for a missing/unreadable database as well as a
+    version mismatch, so a readiness probe never treats "no schema yet" as
+    healthy. Only version numbers cross this boundary (never file contents).
+    """
+
+    version: int
+    expected: int
+    up_to_date: bool
+
+
+@dataclass(frozen=True)
 class ManifestEntry:
     """One published Parquet part."""
 
@@ -940,6 +954,8 @@ class StorePort(Protocol):
         self, *, symbol: str | None = None, date: str | None = None
     ) -> tuple[ManifestEntry, ...]: ...
     def integrity_check(self) -> bool: ...
+
+    def schema_state(self) -> SchemaState: ...
 
     def upsert_symbols(
         self, contracts: tuple[SymbolContract, ...], *, observed_at: str

@@ -12,9 +12,11 @@ truth.
 
 from __future__ import annotations
 
+import contextlib
 import hashlib
 import json
 import os
+import threading
 from collections.abc import Callable, Mapping
 from dataclasses import dataclass, replace
 from datetime import UTC, datetime, timedelta
@@ -42,6 +44,11 @@ BOUNDARY_HOURS: dict[str, tuple[int, ...]] = {
 DEFAULT_SCAN_PERIOD = "4h"
 DEFAULT_JITTER_SECONDS = 30
 MISFIRE_GRACE_SECONDS = 300
+# A fresh heartbeat proves the daemon's interval scheduler is alive. The daemon
+# writes it on startup and on every settings-sync tick (~15 s), so a minute of
+# silence means the scheduler thread died or an API-only process is serving.
+SCHEDULER_HEARTBEAT_STALE_SECONDS = 60
+SCHEDULER_HEARTBEAT_FILENAME = "scheduler_heartbeat.json"
 # Management is armed after the scan's jittered fire time so a position opened by
 # that scan is usually managed in the same window. A scan that runs longer than
 # the stagger defers the new position to the next boundary.
@@ -53,6 +60,44 @@ def _require_aware(instant: datetime) -> datetime:
     if instant.tzinfo is None:
         raise ValueError("scheduling instants must be timezone-aware UTC")
     return instant.astimezone(UTC)
+
+
+def scheduler_heartbeat_path(settings: Settings) -> Path:
+    """Where the daemon records scheduler liveness (never read by schedulers)."""
+    return settings.data_dir / "run" / SCHEDULER_HEARTBEAT_FILENAME
+
+
+def write_scheduler_heartbeat(settings: Settings, *, now: datetime) -> None:
+    """Atomically record one scheduler tick; a write failure never raises.
+
+    The heartbeat is a readiness input, not a trading input: a full disk or a
+    permission change must degrade ``/ready`` rather than kill the scheduler
+    thread that owns this tick.
+    """
+    path = scheduler_heartbeat_path(settings)
+    # The temp name is unique per process *and* thread: the startup write and
+    # a concurrent settings-sync tick must not interleave write/replace/unlink
+    # and silently lose one heartbeat.
+    temp = path.with_name(f".{path.name}.{os.getpid()}.{threading.get_ident()}.tmp")
+    try:
+        path.parent.mkdir(parents=True, exist_ok=True)
+        temp.write_text(json.dumps({"updated_at": utc_timestamp(now)}), encoding="utf-8")
+        os.replace(temp, path)
+    except OSError:
+        with contextlib.suppress(OSError):
+            temp.unlink(missing_ok=True)
+
+
+def read_scheduler_heartbeat(settings: Settings) -> str | None:
+    """The recorded ISO timestamp, or ``None`` when absent/corrupt/unreadable."""
+    try:
+        payload = json.loads(scheduler_heartbeat_path(settings).read_text(encoding="utf-8"))
+    except (OSError, ValueError, RecursionError):
+        return None
+    if not isinstance(payload, dict):
+        return None
+    value = payload.get("updated_at")
+    return value if isinstance(value, str) else None
 
 
 def validate_period(period: str) -> str:
