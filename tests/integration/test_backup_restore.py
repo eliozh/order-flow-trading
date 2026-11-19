@@ -30,7 +30,7 @@ from datetime import UTC, datetime, timedelta
 from pathlib import Path
 
 import pytest
-from typer.testing import CliRunner
+from typer.testing import CliRunner, Result
 
 from oft.adapters import sqlite_backup as backup_adapter
 from oft.adapters import sqlite_schema
@@ -112,7 +112,7 @@ def _settings(tmp_path: Path) -> Settings:
     return Settings(env="test", data_dir=tmp_path / "data")
 
 
-def _invoke(*args: str) -> object:
+def _invoke(*args: str) -> Result:
     return CliRunner().invoke(app, list(args))
 
 
@@ -155,8 +155,8 @@ def _integrity_ok(path: Path) -> bool:
     return bool(row is not None and row[0] == "ok")
 
 
-def _envelope(result: object) -> dict:
-    return json.loads(result.stdout)  # type: ignore[attr-defined]
+def _envelope(result: Result) -> dict[str, object]:
+    return json.loads(result.stdout)
 
 
 def _sidecar(path: Path) -> Path:
@@ -371,6 +371,221 @@ def test_restore_refuses_while_the_daemon_runs(
     assert _read_value(db_path) == "keep"
 
 
+def test_restore_rechecks_the_daemon_immediately_before_the_swap(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    settings = _settings(tmp_path)
+    db_path = settings.data_dir / "oft.db"
+    _create_db(db_path, "keep")
+    candidate = tmp_path / "candidate.db"
+    _create_db(candidate, "restored")
+    probes = iter((False, True))
+    monkeypatch.setattr(backup_module, "_daemon_running", lambda _settings: next(probes))
+
+    result = _invoke("restore", str(candidate), "--yes", "--json")
+
+    assert result.exit_code == 1
+    assert _envelope(result)["error"]["code"] == "DAEMON_RUNNING"
+    assert _read_value(db_path) == "keep"
+    assert [path for path in settings.data_dir.iterdir() if ".restore-" in path.name] == []
+
+
+def test_restore_rejects_a_candidate_with_journal_siblings(tmp_path: Path) -> None:
+    settings = _settings(tmp_path)
+    db_path = settings.data_dir / "oft.db"
+    _create_db(db_path, "keep")
+    candidate = tmp_path / "candidate.db"
+    _create_db(candidate, "restored")
+    wal = candidate.with_name(candidate.name + "-wal")
+    wal.write_bytes(b"unflushed wal")
+
+    result = _invoke("restore", str(candidate), "--yes", "--json")
+
+    assert result.exit_code == 1
+    error = _envelope(result)["error"]
+    assert error["code"] == "BACKUP_IO_ERROR"
+    assert str(wal) in error["message"]
+    assert _read_value(db_path) == "keep"
+
+
+def test_restore_no_snapshot_replaces_a_corrupt_live_database(tmp_path: Path) -> None:
+    settings = _settings(tmp_path)
+    db_path = settings.data_dir / "oft.db"
+    settings.data_dir.mkdir(parents=True)
+    db_path.write_bytes(b"this is not a sqlite database" * 8)
+    candidate = tmp_path / "candidate.db"
+    _create_db(candidate, "restored")
+
+    result = _invoke("restore", str(candidate), "--yes", "--no-snapshot", "--json")
+
+    assert result.exit_code == 0, result.stderr
+    data = _envelope(result)["data"]
+    assert data["safety_snapshot"] is None
+    assert data["snapshot_skipped"] is True
+    assert "--no-snapshot" in result.stderr
+    assert _read_value(db_path) == "restored"
+    assert list((settings.data_dir / "backups").glob("pre-restore-*.db")) == []
+
+
+def test_restore_names_stranded_journals_when_the_put_back_fails(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    settings = _settings(tmp_path)
+    db_path = settings.data_dir / "oft.db"
+    _create_db(db_path, "keep")
+    journal = db_path.with_name(db_path.name + "-wal")
+    journal.write_bytes(b"live wal")
+    candidate = tmp_path / "candidate.db"
+    _create_db(candidate, "restored")
+    real_replace = os.replace
+
+    def failing_replace(source: object, destination: object) -> None:
+        if Path(str(destination)) == db_path:
+            raise OSError("simulated swap failure")
+        if ".restore-bak-" in Path(str(source)).name:
+            raise OSError("simulated put-back failure")
+        real_replace(source, destination)
+
+    monkeypatch.setattr(os, "replace", failing_replace)
+
+    # ``--no-snapshot`` keeps the stray ``-wal`` file in place: taking a
+    # pre-restore snapshot would open the live database and remove it.
+    result = _invoke("restore", str(candidate), "--yes", "--no-snapshot", "--json")
+
+    assert result.exit_code == 1
+    error = _envelope(result)["error"]
+    assert error["code"] == "BACKUP_IO_ERROR"
+    assert ".restore-bak-" in error["message"]
+    assert _read_value(db_path) == "keep"
+
+
+def test_snapshot_helpers_preserve_the_backup_error_subclass(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    db_path = tmp_path / "oft.db"
+    _create_db(db_path, "value")
+
+    def fail(*_args: object, **_kwargs: object) -> object:
+        raise BackupIntegrityError("simulated verification failure")
+
+    monkeypatch.setattr(backup_adapter, "create_consistent_copy", fail)
+
+    with pytest.raises(BackupIntegrityError):
+        backup_adapter.snapshot_before_migration(db_path, 2, now=NOW)
+    with pytest.raises(BackupIntegrityError):
+        backup_adapter.snapshot_before_restore(db_path, now=NOW)
+
+
+# ---------------------------------------------------------------------------
+# Durability and permissions — publication ordering
+# ---------------------------------------------------------------------------
+
+
+def test_publication_fsyncs_files_before_rename_and_directories_after(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    settings = _settings(tmp_path)
+    db_path = settings.data_dir / "oft.db"
+    _create_db(db_path, "value")
+
+    events: list[tuple[str, Path, Path | None]] = []
+    real_fsync_file = backup_adapter.fsync_file
+    real_fsync_dir = backup_adapter.fsync_dir
+    real_replace = os.replace
+
+    def spy_fsync_file(path: Path) -> None:
+        events.append(("fsync_file", Path(path), None))
+        real_fsync_file(path)
+
+    def spy_fsync_dir(path: Path) -> None:
+        events.append(("fsync_dir", Path(path), None))
+        real_fsync_dir(path)
+
+    def spy_replace(source: object, destination: object) -> None:
+        events.append(("replace", Path(str(source)), Path(str(destination))))
+        real_replace(source, destination)
+
+    monkeypatch.setattr(backup_adapter, "fsync_file", spy_fsync_file)
+    monkeypatch.setattr(backup_adapter, "fsync_dir", spy_fsync_dir)
+    monkeypatch.setattr(backup_module, "fsync_file", spy_fsync_file)
+    monkeypatch.setattr(backup_module, "fsync_dir", spy_fsync_dir)
+    monkeypatch.setattr(os, "replace", spy_replace)
+
+    def replacements_for(destination: Path) -> list[int]:
+        return [
+            index
+            for index, (kind, _source, dest) in enumerate(events)
+            if kind == "replace" and dest == destination
+        ]
+
+    def assert_parent_fsync_after(index: int, parent: Path) -> None:
+        assert any(
+            kind == "fsync_dir" and path == parent for kind, path, _source in events[index + 1 :]
+        )
+
+    backed_up = _invoke("backup", "--json")
+    assert backed_up.exit_code == 0, backed_up.stderr
+    backup_path = Path(_envelope(backed_up)["data"]["path"])
+    sidecar = _sidecar(backup_path)
+
+    db_rename = replacements_for(backup_path)
+    assert len(db_rename) == 1
+    temporary_db = events[db_rename[0]][1]
+    assert any(
+        kind == "fsync_file" and path == temporary_db
+        for kind, path, _source in events[: db_rename[0]]
+    )
+    assert_parent_fsync_after(db_rename[0], backup_path.parent)
+
+    sidecar_rename = replacements_for(sidecar)
+    assert len(sidecar_rename) == 1
+    temporary_sidecar = events[sidecar_rename[0]][1]
+    assert any(
+        kind == "fsync_file" and path == temporary_sidecar
+        for kind, path, _source in events[: sidecar_rename[0]]
+    )
+    assert_parent_fsync_after(sidecar_rename[0], sidecar.parent)
+
+    events.clear()
+    restored = _invoke("restore", str(backup_path), "--yes", "--json")
+    assert restored.exit_code == 0, restored.stderr
+    swap_rename = replacements_for(db_path)
+    assert len(swap_rename) == 1
+    temporary_restore = events[swap_rename[0]][1]
+    assert any(
+        kind == "fsync_file" and path == temporary_restore
+        for kind, path, _source in events[: swap_rename[0]]
+    )
+    assert any(
+        kind == "fsync_dir" and path == db_path.parent
+        for kind, path, _source in events[swap_rename[0] + 1 :]
+    )
+
+
+def test_vacuum_copy_is_created_under_a_private_umask(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    settings = _settings(tmp_path)
+    _create_db(settings.data_dir / "oft.db", "value")
+    real_umask = os.umask
+    calls: list[int] = []
+    original_umask = real_umask(0o022)
+
+    def spy_umask(mask: int) -> int:
+        calls.append(mask)
+        return real_umask(mask)
+
+    monkeypatch.setattr(backup_adapter.os, "umask", spy_umask)
+    try:
+        result = _invoke("backup", "--json")
+    finally:
+        real_umask(original_umask)
+
+    assert result.exit_code == 0, result.stderr
+    assert calls[0] == 0o077
+    assert calls[-1] == 0o022
+
+
 # ---------------------------------------------------------------------------
 # B3 — pre-migration snapshot
 # ---------------------------------------------------------------------------
@@ -468,6 +683,114 @@ def test_pre_migration_snapshots_are_bounded_to_ten(tmp_path: Path) -> None:
     assert all(_sidecar(path).is_file() for path in remaining)
 
 
+def test_pre_restore_snapshots_are_bounded_to_ten(tmp_path: Path) -> None:
+    settings = _settings(tmp_path)
+    db_path = settings.data_dir / "oft.db"
+    _create_db(db_path, "current")
+    backups = settings.data_dir / "backups"
+    backups.mkdir(parents=True)
+    base = datetime(2020, 1, 1, tzinfo=UTC)
+    for index in range(12):
+        old = backups / f"pre-restore-2020010{index}T000000000000Z.db"
+        old.write_bytes(b"old snapshot")
+        _sidecar(old).write_text("0" * 64 + "  old\n", encoding="utf-8")
+        stamp = (base + timedelta(days=index)).timestamp()
+        os.utime(old, (stamp, stamp))
+
+    from oft.adapters.sqlite_backup import snapshot_before_restore
+
+    newest = snapshot_before_restore(db_path, now=NOW)
+
+    remaining = sorted(backups.glob("pre-restore-*.db"))
+    assert len(remaining) == 10
+    assert newest in remaining
+    assert len(list(backups.glob("*.sha256"))) == 10
+    assert all(_sidecar(path).is_file() for path in remaining)
+
+
+def test_initialize_database_snapshots_an_idempotent_repair(tmp_path: Path) -> None:
+    settings = _settings(tmp_path)
+    initialize_database(settings)
+    db_path = settings.data_dir / "oft.db"
+    connection = sqlite3.connect(db_path)
+    try:
+        connection.execute("DELETE FROM schema_migrations WHERE version = 18")
+        connection.commit()
+    finally:
+        connection.close()
+
+    initialize_database(settings)
+
+    snapshots = sorted((settings.data_dir / "backups").glob("pre-migration-30-*.db"))
+    assert len(snapshots) == 1
+    snapshot = sqlite3.connect(snapshots[0])
+    try:
+        version = snapshot.execute("SELECT MAX(version) FROM schema_migrations").fetchone()[0]
+    finally:
+        snapshot.close()
+    assert version == 30
+
+
+def test_initialize_database_skips_the_snapshot_when_nothing_will_change(
+    tmp_path: Path,
+) -> None:
+    settings = _settings(tmp_path)
+    initialize_database(settings)
+    initialize_database(settings)
+
+    assert list((settings.data_dir / "backups").glob("pre-migration-*.db")) == []
+
+
+def _insert_opportunity_with_null_expiry(db_path: Path, payload_json: str) -> None:
+    connection = sqlite3.connect(db_path)
+    try:
+        connection.execute(
+            """
+            INSERT INTO opportunities (
+                opportunity_id, symbol, state, created_at, updated_at,
+                payload_json, expires_at
+            ) VALUES (?, ?, ?, ?, ?, ?, NULL)
+            """,
+            (
+                "opp-null-expiry",
+                "BTCUSDT",
+                "OPEN",
+                "2026-11-19T00:00:00.000Z",
+                "2026-11-19T00:00:00.000Z",
+                payload_json,
+            ),
+        )
+        connection.commit()
+    finally:
+        connection.close()
+
+
+def test_initialize_database_does_not_snapshot_an_unrepairable_null_expiry(
+    tmp_path: Path,
+) -> None:
+    """A NULL expires_at the repair skips must not trigger a snapshot forever."""
+    settings = _settings(tmp_path)
+    initialize_database(settings)
+    db_path = settings.data_dir / "oft.db"
+    _insert_opportunity_with_null_expiry(db_path, '{"no_expiry": true}')
+
+    initialize_database(settings)
+
+    assert list((settings.data_dir / "backups").glob("pre-migration-*.db")) == []
+
+
+def test_initialize_database_snapshots_a_repairable_null_expiry(tmp_path: Path) -> None:
+    settings = _settings(tmp_path)
+    initialize_database(settings)
+    db_path = settings.data_dir / "oft.db"
+    _insert_opportunity_with_null_expiry(db_path, '{"expires_at": "2026-11-19T12:00:00+00:00"}')
+
+    initialize_database(settings)
+
+    snapshots = sorted((settings.data_dir / "backups").glob("pre-migration-30-*.db"))
+    assert len(snapshots) == 1
+
+
 # ---------------------------------------------------------------------------
 # B4 — doctor reports backup age
 # ---------------------------------------------------------------------------
@@ -529,3 +852,19 @@ def test_doctor_flags_a_stale_backup(tmp_path: Path) -> None:
 
     assert check.status == "degraded"
     assert "50.0h" in check.detail
+
+
+def test_backup_age_report_counts_only_backup_files(tmp_path: Path) -> None:
+    settings = _settings(tmp_path)
+    backups = settings.data_dir / "backups"
+    backups.mkdir(parents=True)
+    backup_path = backups / "oft-20261119T100000000000Z.db"
+    backup_path.write_bytes(b"backup")
+    _sidecar(backup_path).write_text("0" * 64 + "  backup\n", encoding="utf-8")
+    (backups / "pre-migration-30-20261119T090000000000Z.db").write_bytes(b"snapshot")
+    (backups / "unrelated.bin").write_bytes(b"x" * 100)
+
+    report = backup_adapter.backup_age_report(settings, now=NOW)
+
+    assert report.total_bytes == len(b"backup")
+    assert report.snapshot_count == 1

@@ -2701,16 +2701,72 @@ def _enable_wal(connection: sqlite3.Connection) -> None:
             time.sleep(_WAL_SWITCH_BACKOFF_SECONDS * attempt)
 
 
+def _opportunity_expiry_repair_pending(connection: sqlite3.Connection) -> bool:
+    """Mirror ``_ensure_opportunities_expires_at``'s exact write predicate.
+
+    A NULL ``expires_at`` alone does not imply a write: the backfill skips rows
+    whose payload cannot yield a valid timestamp, so those rows must not keep
+    triggering a pre-migration snapshot on every boot.
+    """
+    columns = {row[1] for row in connection.execute("PRAGMA table_info(opportunities)")}
+    if "expires_at" not in columns:
+        return True
+    rows = connection.execute("SELECT payload_json, expires_at FROM opportunities").fetchall()
+    for payload_json, current in rows:
+        value = current
+        if value is None:
+            try:
+                payload = json.loads(str(payload_json))
+            except (json.JSONDecodeError, TypeError, ValueError):
+                continue
+            if not isinstance(payload, dict):
+                continue
+            raw = payload.get("expires_at")
+            if not isinstance(raw, str):
+                continue
+            value = raw
+        try:
+            normalized = normalize_timestamp(value)
+        except (TypeError, ValueError):
+            continue
+        if normalized != current:
+            return True
+    return False
+
+
+def _repairs_will_run(connection: sqlite3.Connection) -> bool:
+    """Whether ``initialize_database`` will rewrite rows or apply a migration.
+
+    Mirrors the repairs' exact write predicates: a pending schema version, any
+    missing version row from v18 onward, an ``opportunity_conditions`` table
+    without the composite primary key, a ``funding_accruals`` table without
+    ``side``/``size``, or an ``opportunities`` row the expiry backfill will
+    actually update.
+    """
+    if _schema_version(connection) < _SCHEMA_VERSION:
+        return True
+    for version in range(18, _SCHEMA_VERSION + 1):
+        if not _migration_recorded(connection, version):
+            return True
+    if _table_exists(connection, "opportunity_conditions") and _opportunity_conditions_pk(
+        connection
+    ) != ("opportunity_id", "condition_id"):
+        return True
+    if _table_exists(connection, "funding_accruals") and not _funding_has_side_size(connection):
+        return True
+    if not _table_exists(connection, "opportunities"):
+        return False
+    return _opportunity_expiry_repair_pending(connection)
+
+
 def _snapshot_before_migration(db_path: Path, version: int) -> None:
     """Write a verified rollback point before applying pending migrations.
 
     A failure aborts the migration: an upgrade without a recoverable snapshot
-    is worse than a refused boot. The empty-database case never reaches this
-    helper. ``datetime.now`` is intentional here: this entry point has no clock
-    seam, and only file creation/age matter.
+    is worse than a refused boot. The empty-database and nothing-to-do cases
+    never reach this helper. ``datetime.now`` is intentional here: this entry
+    point has no clock seam, and only file creation/age matter.
     """
-    if version >= _SCHEMA_VERSION:
-        return
     try:
         snapshot_before_migration(db_path, version, now=datetime.now(UTC))
     except (OSError, RuntimeError) as exc:
@@ -2771,7 +2827,7 @@ def initialize_database(settings: Settings) -> None:
         configure_connection(connection)
         connection.execute("PRAGMA synchronous=NORMAL")
         _enable_wal(connection)
-        if had_existing_data:
+        if had_existing_data and _repairs_will_run(connection):
             _snapshot_before_migration(db_path, _schema_version(connection))
         _ensure_opportunities_expires_at(connection)
         if _schema_version(connection) < 2 and _table_exists(connection, "symbols"):

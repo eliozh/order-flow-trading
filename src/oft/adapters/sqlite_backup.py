@@ -29,6 +29,8 @@ BACKUP_GLOB = "oft-*.db"
 PRE_MIGRATION_GLOB = "pre-migration-*.db"
 PRE_RESTORE_GLOB = "pre-restore-*.db"
 PRE_MIGRATION_KEEP = 10
+PRE_RESTORE_KEEP = 10
+JOURNAL_SUFFIXES = ("-wal", "-shm", "-journal")
 _SHA256_CHUNK_BYTES = 1024 * 1024
 # SQLite errors that mean "the source bytes are not a sound database"; they map
 # to an integrity failure rather than a generic I/O failure.
@@ -110,13 +112,37 @@ def sha256_file(path: Path) -> str:
     return digest.hexdigest()
 
 
+def fsync_file(path: Path) -> None:
+    """Flush a file's bytes to disk before it is renamed into place.
+
+    May raise ``OSError``; callers map that to ``BackupIOError``.
+    """
+    descriptor = os.open(path, os.O_RDONLY)
+    try:
+        os.fsync(descriptor)
+    finally:
+        os.close(descriptor)
+
+
+def fsync_dir(path: Path) -> None:
+    """Flush a directory entry so a completed rename survives a crash.
+
+    May raise ``OSError``; callers map that to ``BackupIOError``.
+    """
+    descriptor = os.open(path, os.O_RDONLY)
+    try:
+        os.fsync(descriptor)
+    finally:
+        os.close(descriptor)
+
+
 def _ensure_private_dir(directory: Path) -> None:
     """Create an OFT-owned directory and always tighten it to 0700."""
     directory.mkdir(parents=True, exist_ok=True, mode=0o700)
     directory.chmod(0o700)
 
 
-def _ensure_dir_exists(directory: Path) -> None:
+def ensure_dir_exists(directory: Path) -> None:
     """Create missing directories, tightening only the ones this run created.
 
     A caller-supplied destination (``oft backup --out``) may live in a shared or
@@ -189,16 +215,34 @@ def _write_sidecar(path: Path, digest: str) -> None:
     temporary = sidecar.with_name(f".{sidecar.name}.tmp-{os.getpid()}-{uuid.uuid4().hex}")
     try:
         temporary.write_text(f"{digest}  {path.name}\n", encoding="utf-8")
+        fsync_file(temporary)
         os.replace(temporary, sidecar)
+        fsync_dir(sidecar.parent)
     except OSError as exc:
         discard(temporary)
         raise BackupIOError(f"cannot write checksum sidecar {sidecar}: {exc}") from exc
+
+
+def _journal_siblings(path: Path) -> list[Path]:
+    """SQLite journal files beside a candidate, which make it non-self-contained."""
+    return [
+        sibling
+        for suffix in JOURNAL_SUFFIXES
+        if (sibling := path.with_name(path.name + suffix)).exists()
+    ]
 
 
 def validate_candidate(path: Path) -> BackupVerification:
     """Verify a restore candidate's integrity and (when present) checksum."""
     if not path.is_file():
         raise BackupNotFoundError(f"backup file does not exist: {path}")
+    siblings = _journal_siblings(path)
+    if siblings:
+        names = ", ".join(str(sibling) for sibling in siblings)
+        raise BackupIOError(
+            f"backup candidate {path} has SQLite journal siblings and is not a "
+            f"self-contained copy: {names}"
+        )
     verify_integrity(path)
     try:
         digest = sha256_file(path)
@@ -226,20 +270,24 @@ def _write_verified_copy(db_path: Path, destination: Path) -> tuple[int, str]:
     sidecar_written = False
     try:
         source = sqlite3.connect(str(db_path))
+        previous_umask = os.umask(0o077)
         try:
             source.execute("PRAGMA busy_timeout = 5000")
             source.execute("VACUUM INTO ?", (str(temporary),))
         finally:
+            os.umask(previous_umask)
             source.close()
         # Tighten the copy before any further reads, so a slow verification
         # never leaves a group/world-readable database on disk.
         temporary.chmod(0o600)
+        fsync_file(temporary)
         verify_integrity(temporary)
         digest = sha256_file(temporary)
         size = temporary.stat().st_size
         _write_sidecar(destination, digest)
         sidecar_written = True
         os.replace(temporary, destination)
+        fsync_dir(destination.parent)
     except Exception:
         _discard_partial(temporary, destination if sidecar_written else None)
         raise
@@ -264,7 +312,7 @@ def create_consistent_copy(
         raise BackupNotFoundError(f"database does not exist: {db_path}")
     destination = Path(destination)
     try:
-        _ensure_dir_exists(destination.parent)
+        ensure_dir_exists(destination.parent)
         size, digest = _write_verified_copy(db_path, destination)
     except BackupError:
         raise
@@ -295,7 +343,7 @@ def snapshot_before_migration(
     try:
         result = create_consistent_copy(db_path, destination, now=now)
     except BackupError as exc:
-        raise BackupError(f"pre-migration snapshot failed for {db_path}: {exc}") from exc
+        raise type(exc)(f"pre-migration snapshot failed for {db_path}: {exc}") from exc
     _prune_snapshots(directory, PRE_MIGRATION_GLOB, keep=PRE_MIGRATION_KEEP)
     return result.path
 
@@ -305,9 +353,11 @@ def snapshot_before_restore(db_path: Path, *, now: datetime) -> Path:
     directory = db_path.parent / BACKUPS_DIRNAME
     destination = _snapshot_path(directory, "pre-restore", now)
     try:
-        return create_consistent_copy(db_path, destination, now=now).path
+        result = create_consistent_copy(db_path, destination, now=now)
     except BackupError as exc:
-        raise BackupError(f"pre-restore safety snapshot failed for {db_path}: {exc}") from exc
+        raise type(exc)(f"pre-restore safety snapshot failed for {db_path}: {exc}") from exc
+    _prune_snapshots(directory, PRE_RESTORE_GLOB, keep=PRE_RESTORE_KEEP)
+    return result.path
 
 
 def _prune_snapshots(directory: Path, pattern: str, *, keep: int) -> None:
@@ -338,7 +388,9 @@ def backup_age_report(settings: Settings, *, now: datetime) -> BackupAgeReport:
     last_backup_at: datetime | None = None
     if directory.is_dir():
         try:
-            entries = list(directory.iterdir())
+            # Only ``oft-*.db`` backups count toward the reported size; snapshots,
+            # sidecars, and unrelated files are excluded.
+            entries = list(directory.glob(BACKUP_GLOB))
         except OSError as exc:
             raise BackupIOError(f"cannot list backups in {directory}: {exc}") from exc
         for entry in entries:

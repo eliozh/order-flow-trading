@@ -29,16 +29,21 @@ from typing import Annotated, NoReturn
 import typer
 
 from oft.adapters.sqlite_backup import (
+    JOURNAL_SUFFIXES,
     BackupError,
     BackupHashMismatchError,
     BackupIntegrityError,
+    BackupIOError,
     BackupNotFoundError,
     BackupResult,
     BackupVerification,
     backups_dir,
     create_consistent_copy,
     discard,
+    ensure_dir_exists,
     filename_timestamp,
+    fsync_dir,
+    fsync_file,
     sha256_file,
     snapshot_before_restore,
     validate_candidate,
@@ -54,7 +59,6 @@ from oft.config import Settings
 _DAEMON_RUNNING_MESSAGE = (
     "the daemon is running; stop it with `oft daemon stop` before restoring the database"
 )
-_JOURNAL_SUFFIXES = ("-wal", "-shm", "-journal")
 
 
 def _daemon_running(settings: Settings) -> bool:
@@ -63,6 +67,13 @@ def _daemon_running(settings: Settings) -> bool:
         return True
     pid = read_pid(settings)
     return pid is not None and pid_matches(settings, pid)
+
+
+def _refuse_if_daemon_running(settings: Settings, *, json_output: bool) -> None:
+    """Exit with ``DAEMON_RUNNING`` when restoring would race a live daemon."""
+    if _daemon_running(settings):
+        emit_error("DAEMON_RUNNING", _DAEMON_RUNNING_MESSAGE, json_output=json_output)
+        raise typer.Exit(code=1)
 
 
 def _code_for(exc: BackupError) -> str:
@@ -98,11 +109,8 @@ def _prepare_backup_directory(out: Path | None, settings: Settings, *, json_outp
     directory = out.expanduser()
     # Only a directory this invocation creates is ours to tighten; an existing
     # ``--out`` (shared mount, /tmp, ...) keeps its mode unchanged.
-    existed = directory.is_dir()
     try:
-        directory.mkdir(parents=True, exist_ok=True, mode=0o700)
-        if not existed:
-            directory.chmod(0o700)
+        ensure_dir_exists(directory)
     except OSError as exc:
         _emit_os_failure(
             f"cannot create backup directory {directory}: {exc}",
@@ -175,11 +183,7 @@ def _copy_candidate(candidate: Path, data_dir: Path) -> Path:
     try:
         shutil.copyfile(candidate, temporary)
         os.chmod(temporary, 0o600)
-        descriptor = os.open(temporary, os.O_RDONLY)
-        try:
-            os.fsync(descriptor)
-        finally:
-            os.close(descriptor)
+        fsync_file(temporary)
     except OSError:
         discard(temporary)
         raise
@@ -190,7 +194,7 @@ def _move_journals_aside(db_path: Path) -> list[tuple[Path, Path]]:
     """Move live SQLite journals aside so they cannot replay onto a restored DB."""
     moved: list[tuple[Path, Path]] = []
     try:
-        for suffix in _JOURNAL_SUFFIXES:
+        for suffix in JOURNAL_SUFFIXES:
             journal = db_path.with_name(db_path.name + suffix)
             if not journal.exists():
                 continue
@@ -199,19 +203,30 @@ def _move_journals_aside(db_path: Path) -> list[tuple[Path, Path]]:
             )
             os.replace(journal, backup)
             moved.append((journal, backup))
-    except OSError:
-        _restore_journals(moved)
+    except OSError as exc:
+        stranded = _restore_journals(moved)
+        if stranded:
+            raise _stranded_journal_error(stranded) from exc
         raise
     return moved
 
 
-def _restore_journals(moved: list[tuple[Path, Path]]) -> None:
-    """Put moved-aside journals back after a failed swap; best effort."""
+def _restore_journals(moved: list[tuple[Path, Path]]) -> list[Path]:
+    """Put moved-aside journals back after a failed swap; return stranded backups."""
+    stranded: list[Path] = []
     for original, backup in moved:
         try:
             os.replace(backup, original)
         except OSError:
-            continue
+            stranded.append(backup)
+    return stranded
+
+
+def _stranded_journal_error(stranded: list[Path]) -> BackupIOError:
+    names = ", ".join(str(path) for path in stranded)
+    return BackupIOError(
+        f"restore failed; these moved-aside journals could not be put back: {names}"
+    )
 
 
 def _discard_journals(moved: list[tuple[Path, Path]]) -> None:
@@ -225,10 +240,14 @@ def _swap_database(db_path: Path, temporary: Path) -> None:
     journals = _move_journals_aside(db_path)
     try:
         os.replace(temporary, db_path)
-    except OSError:
-        _restore_journals(journals)
+    except OSError as exc:
+        stranded = _restore_journals(journals)
+        if stranded:
+            raise _stranded_journal_error(stranded) from exc
         raise
     _discard_journals(journals)
+    # Make the completed rename durable before reporting success.
+    fsync_dir(db_path.parent)
 
 
 def _verify_installed_copy(temporary: Path, expected_sha256: str) -> None:
@@ -268,19 +287,33 @@ def _install_candidate(
     *,
     now: datetime,
     json_output: bool,
-) -> Path | None:
-    """Snapshot, verify, and atomically install ``candidate``; return the snapshot."""
+    no_snapshot: bool,
+) -> tuple[Path | None, bool]:
+    """Snapshot, verify, and atomically install ``candidate``.
+
+    Returns the safety snapshot (when written) and whether one was skipped by
+    ``--no-snapshot``.
+    """
     had_database = _has_database(db_path)
     safety_snapshot: Path | None = None
+    snapshot_skipped = no_snapshot and had_database
     temporary: Path | None = None
     try:
         settings.data_dir.mkdir(parents=True, exist_ok=True, mode=0o700)
         settings.data_dir.chmod(0o700)
-        if had_database:
+        if had_database and not no_snapshot:
             # The safety snapshot must complete before the live file is touched.
             safety_snapshot = snapshot_before_restore(db_path, now=now)
+        elif snapshot_skipped:
+            typer.echo(
+                "warning: --no-snapshot set; skipping the pre-restore safety snapshot",
+                err=True,
+            )
         temporary = _copy_candidate(candidate, settings.data_dir)
         _verify_installed_copy(temporary, expected_sha256)
+        # Re-check immediately before the swap: a daemon may have started while
+        # the copy was being prepared and verified.
+        _refuse_if_daemon_running(settings, json_output=json_output)
         _swap_database(db_path, temporary)
         temporary = None
     except BackupError as exc:
@@ -294,10 +327,17 @@ def _install_candidate(
         if temporary is not None:
             discard(temporary)
     _warn_untightened_permissions(db_path)
-    return safety_snapshot
+    return safety_snapshot, snapshot_skipped
 
 
-def _confirm_restore(candidate: Path, db_path: Path, *, yes: bool, json_output: bool) -> None:
+def _confirm_restore(
+    candidate: Path,
+    db_path: Path,
+    *,
+    yes: bool,
+    json_output: bool,
+    no_snapshot: bool,
+) -> None:
     if yes:
         return
     if json_output:
@@ -307,11 +347,17 @@ def _confirm_restore(candidate: Path, db_path: Path, *, yes: bool, json_output: 
             json_output=json_output,
         )
         raise typer.Exit(code=1)
-    typer.confirm(
-        f"Restore {candidate} over {db_path}? The current database is kept "
-        "as a pre-restore snapshot.",
-        abort=True,
-    )
+    if no_snapshot:
+        prompt = (
+            f"Restore {candidate} over {db_path}? --no-snapshot is set: "
+            "no pre-restore safety snapshot will be kept."
+        )
+    else:
+        prompt = (
+            f"Restore {candidate} over {db_path}? The current database is kept "
+            "as a pre-restore snapshot."
+        )
+    typer.confirm(prompt, abort=True)
 
 
 def _emit_restore_success(
@@ -320,6 +366,7 @@ def _emit_restore_success(
     candidate: Path,
     db_path: Path,
     safety_snapshot: Path | None,
+    snapshot_skipped: bool,
     json_output: bool,
 ) -> None:
     if json_output:
@@ -330,6 +377,7 @@ def _emit_restore_success(
                         "restored": str(db_path),
                         "source": str(candidate),
                         "safety_snapshot": str(safety_snapshot) if safety_snapshot else None,
+                        "snapshot_skipped": snapshot_skipped,
                         "size_bytes": verified.size_bytes,
                         "sha256": verified.sha256,
                     },
@@ -345,6 +393,8 @@ def _emit_restore_success(
     typer.echo(f"source   {candidate}")
     if safety_snapshot is not None:
         typer.echo(f"snapshot {safety_snapshot}")
+    elif snapshot_skipped:
+        typer.echo("snapshot none (--no-snapshot skipped)")
     else:
         typer.echo("snapshot none (no existing database)")
 
@@ -362,6 +412,13 @@ def restore_command(
         bool,
         typer.Option("--json", help="Emit the shared JSON envelope."),
     ] = False,
+    no_snapshot: Annotated[
+        bool,
+        typer.Option(
+            "--no-snapshot",
+            help="Skip the pre-restore safety snapshot (required to replace a corrupt database).",
+        ),
+    ] = False,
 ) -> None:
     """Restore the local database from a verified backup file."""
     settings = settings_or_exit(json_output)
@@ -371,24 +428,24 @@ def restore_command(
     except BackupError as exc:
         _emit_failure(exc, json_output=json_output)
 
-    if _daemon_running(settings):
-        emit_error("DAEMON_RUNNING", _DAEMON_RUNNING_MESSAGE, json_output=json_output)
-        raise typer.Exit(code=1)
+    _refuse_if_daemon_running(settings, json_output=json_output)
 
     db_path = database_path(settings)
-    _confirm_restore(candidate, db_path, yes=yes, json_output=json_output)
-    safety_snapshot = _install_candidate(
+    _confirm_restore(candidate, db_path, yes=yes, json_output=json_output, no_snapshot=no_snapshot)
+    safety_snapshot, snapshot_skipped = _install_candidate(
         candidate,
         verified.sha256,
         settings,
         db_path,
         now=datetime.now(UTC),
         json_output=json_output,
+        no_snapshot=no_snapshot,
     )
     _emit_restore_success(
         verified=verified,
         candidate=candidate,
         db_path=db_path,
         safety_snapshot=safety_snapshot,
+        snapshot_skipped=snapshot_skipped,
         json_output=json_output,
     )
