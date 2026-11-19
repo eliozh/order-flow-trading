@@ -479,27 +479,35 @@ export function SystemPage({
           <h2 id="checks-heading">Readiness checks</h2>
           <span className="mono-muted">{readiness.checked_at}</span>
         </div>
-        <table className="data-table">
-          <caption className="visually-hidden">Named readiness checks</caption>
-          <thead>
-            <tr>
-              <th scope="col">Check</th>
-              <th scope="col">State</th>
-              <th scope="col">Detail</th>
-            </tr>
-          </thead>
-          <tbody>
-            {readiness.checks.map((check) => (
-              <tr key={check.name}>
-                <td className="mono">{check.name}</td>
-                <td>
-                  <span className={statusClass(check.status)}>{check.status.toUpperCase()}</span>
-                </td>
-                <td>{check.detail}</td>
+        <div
+          className="table-wrap"
+          role="region"
+          // eslint-disable-next-line jsx-a11y/no-noninteractive-tabindex -- scrollable table
+          tabIndex={0}
+          aria-label="Named readiness checks"
+        >
+          <table className="data-table">
+            <caption className="visually-hidden">Named readiness checks</caption>
+            <thead>
+              <tr>
+                <th scope="col">Check</th>
+                <th scope="col">State</th>
+                <th scope="col">Detail</th>
               </tr>
-            ))}
-          </tbody>
-        </table>
+            </thead>
+            <tbody>
+              {readiness.checks.map((check) => (
+                <tr key={check.name}>
+                  <td className="mono">{check.name}</td>
+                  <td>
+                    <span className={statusClass(check.status)}>{check.status.toUpperCase()}</span>
+                  </td>
+                  <td>{check.detail}</td>
+                </tr>
+              ))}
+            </tbody>
+          </table>
+        </div>
       </section>
 
       <p

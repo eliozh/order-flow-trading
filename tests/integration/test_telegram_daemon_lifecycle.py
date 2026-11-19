@@ -317,6 +317,48 @@ def test_daemon_start_stops_the_live_ingestion_handle_before_schedulers(
     assert events.index("ingestion_stop") < events.index("scan_stop")
 
 
+def test_daemon_start_waits_for_settings_sync_before_removing_the_heartbeat(
+    tmp_path: Path, monkeypatch: Any
+) -> None:
+    shutdowns: list[tuple[str, bool]] = []
+
+    class _Scheduler:
+        def __init__(self, name: str) -> None:
+            self._name = name
+
+        def shutdown(self, *, wait: bool = False) -> None:
+            shutdowns.append((self._name, wait))
+
+    container = type(
+        "Container",
+        (),
+        {"settings": Settings(env="test", port=8765, data_dir=tmp_path / "data")},
+    )()
+    monkeypatch.setattr(
+        "oft.cli.main._resolve_serve_settings", lambda *args, **kwargs: container.settings
+    )
+    monkeypatch.setattr("oft.cli.main._run_live_ingestion", lambda *args, **kwargs: None)
+    monkeypatch.setattr("oft.cli.main._run_uvicorn", lambda *args, **kwargs: None)
+    monkeypatch.setattr(daemon_module, "_schedule_state", lambda settings: object())
+    monkeypatch.setattr("oft.bootstrap.build_container", lambda *args, **kwargs: container)
+
+    def _starter(name: str) -> Any:
+        return lambda *args, **kwargs: _Scheduler(name)
+
+    monkeypatch.setattr(daemon_module, "_start_scheduler", _starter("scan"))
+    monkeypatch.setattr(daemon_module, "_start_settings_sync_scheduler", _starter("settings_sync"))
+    monkeypatch.setattr(daemon_module, "_start_trigger_scheduler", _starter("trigger"))
+    monkeypatch.setattr(daemon_module, "_start_position_monitor_scheduler", _starter("monitor"))
+    monkeypatch.setattr(daemon_module, "_start_management_scheduler", _starter("management"))
+    monkeypatch.setattr(daemon_module, "_start_telegram_runtime", lambda *args, **kwargs: None)
+
+    daemon_module.daemon_start()
+
+    # The in-flight settings-sync tick must be joined before the heartbeat is
+    # unlinked, so it cannot recreate the heartbeat after cleanup.
+    assert ("settings_sync", True) in shutdowns
+
+
 def test_daemon_start_starts_and_stops_telegram_first(tmp_path: Path, monkeypatch: Any) -> None:
     events: list[str] = []
     container = type(

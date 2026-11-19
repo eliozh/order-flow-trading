@@ -1,4 +1,4 @@
-import { act, render, screen } from '@testing-library/react'
+import { act, render, screen, within } from '@testing-library/react'
 import { describe, expect, it, vi } from 'vitest'
 
 import type { HealthEnvelope, ReadinessEnvelope, ScanRecordData } from '../api/status'
@@ -96,6 +96,22 @@ describe('SystemPage', () => {
     expect(screen.getAllByText('1.50').length).toBeGreaterThan(0)
     expect(screen.getByText('storage.sqlite')).toBeInTheDocument()
     expect(screen.getByText('market_data')).toBeInTheDocument()
+  })
+
+  it('keeps the named readiness checks in a bounded scroll region', async () => {
+    render(
+      <SystemPage
+        fetchHealthFn={async () => healthEnvelope}
+        fetchReadinessFn={async () => readinessEnvelope}
+        isCompact={false}
+      />,
+    )
+
+    const region = await screen.findByRole('region', { name: 'Named readiness checks' })
+    const table = within(region).getByRole('table', { name: 'Named readiness checks' })
+    expect(table).toHaveClass('data-table')
+    // The Detail column value stays reachable inside the scroll container.
+    expect(within(region).getByText('settings loaded')).toBeInTheDocument()
   })
 
   it('renders a positive delta with an up arrow and accessible sign text', async () => {

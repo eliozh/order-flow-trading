@@ -17,7 +17,7 @@ from collections.abc import Sequence
 from datetime import UTC, datetime
 from enum import StrEnum
 from pathlib import Path
-from typing import Annotated, Any, Literal
+from typing import TYPE_CHECKING, Annotated, Any, Literal
 
 import structlog
 import typer
@@ -50,6 +50,11 @@ from oft.application.scheduler import (
 from oft.cli.commands.doctor import emit_error
 from oft.config import ConfigError, Settings, load_settings
 from oft.domain.time import utc_timestamp
+
+if TYPE_CHECKING:
+    # ``main`` imports this module to register the command tree, so the runtime
+    # import stays lazy; the annotation is still checked by mypy.
+    from oft.cli.main import LiveIngestionHandle
 
 _LOGGER = structlog.get_logger(__name__)
 
@@ -391,7 +396,7 @@ def daemon_start(
     # in any one of them still stops and flushes the already-started ones (in
     # particular the live-ingestion worker's drain/checkpoint) instead of
     # leaking daemon threads.
-    ingestion: Any | None = None
+    ingestion: LiveIngestionHandle | None = None
     scheduler: ScanDaemonScheduler | None = None
     settings_sync: SettingsSyncDaemonScheduler | None = None
     trigger_scheduler: TriggerDaemonScheduler | None = None
@@ -430,7 +435,9 @@ def daemon_start(
         if trigger_scheduler is not None:
             trigger_scheduler.shutdown()
         if settings_sync is not None:
-            settings_sync.shutdown()
+            # Join an in-flight tick before the heartbeat is unlinked below;
+            # the wait is bounded by the scheduler's max busy time (5 s).
+            settings_sync.shutdown(wait=True)
         if scheduler is not None:
             scheduler.shutdown()
         # A leftover fresh heartbeat would make an API-only ``oft serve`` in
@@ -922,8 +929,10 @@ def daemon_stop(
             typer.echo(f"stopped daemon (pid {pid})")
         return
     if stop_outcome in (_StopOutcome.ALREADY_GONE, _StopOutcome.FENCE_MISMATCH):
-        # The daemon exited between the fence check and SIGTERM (artifacts were
-        # already removed), or the PID was recycled before the signal.
+        # The daemon exited between the fence check and SIGTERM, or the fence
+        # was positively re-checked and no longer matched (recycled PID or a
+        # vanished meta file). Both cases have already removed the PID
+        # artifacts inside the stop helper.
         _emit_not_running(json_output)
         return
     if stop_outcome is _StopOutcome.TIMEOUT:
@@ -1279,16 +1288,20 @@ def _stop_daemon_outcome(
     recycled while the caller prompted is never signalled. A child of this
     process is reaped while polling, so a zombie cannot make ``process_alive``
     report it as running until the timeout. The stale PID artifacts are removed
-    on success or when the process is already gone; a timeout or a permission
-    failure keeps them so ``daemon stop`` / ``daemon status`` can retry. A
-    non-positive PID is never signalled: ``os.kill(0, ...)`` and
-    ``os.kill(-1, ...)`` address a process group / every process.
+    on success, when the process is already gone, or when the fence no longer
+    matches; a timeout or a permission failure keeps them so ``daemon stop`` /
+    ``daemon status`` can retry. A non-positive PID is never signalled:
+    ``os.kill(0, ...)`` and ``os.kill(-1, ...)`` address a process group /
+    every process.
     """
     if not _valid_pid(pid):
         return _StopOutcome.INVALID_PID
     if not pid_matches(settings, pid):
         # The caller verified the fence earlier; refuse without signalling if
-        # it no longer matches (recycled PID or a vanished meta file).
+        # it no longer matches (recycled PID or a vanished meta file). Drop the
+        # stale artifacts: the mismatch was positively re-checked, so they
+        # would otherwise make a later start/stop misreport the daemon.
+        _remove_pid_files(settings)
         return _StopOutcome.FENCE_MISMATCH
     try:
         os.kill(pid, signal.SIGTERM)

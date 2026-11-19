@@ -1425,6 +1425,10 @@ def test_stop_daemon_refuses_when_the_pid_fence_changes_before_signal(
 
     assert daemon_module._stop_daemon(settings, 12345, timeout_seconds=0.001) is False
     assert kills == []
+    # The fence was positively re-checked and no longer matches (recycled PID or
+    # vanished meta), so the stale artifacts must not survive the refusal.
+    assert not pid_path(settings).exists()
+    assert not pid_meta_path(settings).exists()
 
 
 def test_stop_daemon_never_signals_a_non_positive_pid(
@@ -2126,13 +2130,38 @@ def test_daemon_log_tail_keeps_a_complete_first_line_at_a_window_boundary(
 ) -> None:
     from oft.cli.commands.daemon import _read_daemon_log_tail
 
+    content = b"first\nsecond\nthird\n"
     path = tmp_path / "daemon.log"
-    # "first\n" is 6 bytes; with a 14-byte window the read starts exactly at
-    # the beginning of "second", so that complete line must be kept.
-    path.write_bytes(b"first\nsecond\nthird\n")
-    monkeypatch.setattr(daemon_module, "_DAEMON_LOG_TAIL_WINDOW_BYTES", 14)
+    # "first\n" is 6 bytes, so a 13-byte window (6 + 7) starts exactly at the
+    # beginning of "second": the preceding byte is "\n", the branch is taken,
+    # and that complete first line must be kept.
+    window = 13
+    start = len(content) - window
+    assert start == 6
+    assert content[start - 1 : start] == b"\n"
+    path.write_bytes(content)
+    monkeypatch.setattr(daemon_module, "_DAEMON_LOG_TAIL_WINDOW_BYTES", window)
 
     assert _read_daemon_log_tail(path, 2) == ["second", "third"]
+
+
+def test_daemon_log_tail_drops_a_partial_first_line_inside_the_window(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    from oft.cli.commands.daemon import _read_daemon_log_tail
+
+    content = b"first\nsecond\nthird\n"
+    path = tmp_path / "daemon.log"
+    # A 10-byte window starts inside "second" (at the "o" of "ond"), so the torn
+    # first line is dropped and only the complete "third" line remains.
+    window = 10
+    start = len(content) - window
+    assert content[start : start + 1] == b"o"
+    assert content[start - 1 : start] != b"\n"
+    path.write_bytes(content)
+    monkeypatch.setattr(daemon_module, "_DAEMON_LOG_TAIL_WINDOW_BYTES", window)
+
+    assert _read_daemon_log_tail(path, 2) == ["third"]
 
 
 def test_settings_sync_tick_writes_the_heartbeat_at_both_ends(

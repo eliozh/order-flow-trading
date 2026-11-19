@@ -72,7 +72,7 @@ def test_http_exceptions_are_mapped_to_typed_errors(
     def boom(*_args: Any, **_kwargs: Any) -> Any:
         raise http.client.HTTPException("bad status line")
 
-    monkeypatch.setattr("oft.cli.api_client.urllib.request.urlopen", boom)
+    monkeypatch.setattr("oft.cli.api_client._NO_PROXY_OPENER.open", boom)
     client = _client()
 
     with pytest.raises(ApiClientError) as excinfo:
@@ -114,7 +114,7 @@ def test_a_failing_error_body_read_is_typed_in_both_request_paths(
     def raise_broken(*_args: Any, **_kwargs: Any) -> Any:
         raise _broken_http_error()
 
-    monkeypatch.setattr("oft.cli.api_client.urllib.request.urlopen", raise_broken)
+    monkeypatch.setattr("oft.cli.api_client._NO_PROXY_OPENER.open", raise_broken)
     client = _client()
 
     with pytest.raises(ApiClientError) as excinfo:

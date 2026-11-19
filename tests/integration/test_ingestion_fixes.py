@@ -18,6 +18,7 @@ from oft.adapters.parquet_store import LiveParquetBuffer
 from oft.adapters.sqlite_store import SqliteStore
 from oft.application.ingestion_supervisor import (
     CheckpointStore,
+    ConnectionState,
     IngestionSupervisor,
 )
 from oft.config import Settings
@@ -528,6 +529,9 @@ def test_connect_and_subscribe_honours_a_requested_stop(tmp_path: Path) -> None:
     # Stop requested during the connect handshake: subscribe is skipped.
     assert supervisor._connect_and_subscribe(stop=lambda: client.stopped) is False
     assert client.calls == ["connect"]
+    # A clean shutdown must not persist CONNECTING after the connect handshake;
+    # the supervisor reports DISCONNECTED instead.
+    assert supervisor.state is ConnectionState.DISCONNECTED
 
 
 def test_run_live_ingestion_wires_a_stop_aware_sleeper(

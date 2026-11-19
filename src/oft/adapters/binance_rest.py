@@ -43,6 +43,10 @@ DEFAULT_MAX_SYMBOLS = 5_000
 _WEIGHT_HEADER = "x-mbx-used-weight-1m"
 _USER_AGENT = "oft/0.1 (+local)"
 _SYMBOL_PATTERN = re.compile(r"^[A-Z0-9]{2,24}$")
+#: Market-data egress must not be rerouted by ambient proxy settings. The
+#: default urllib opener reads ``http_proxy``/``ALL_PROXY``; an explicit empty
+#: ``ProxyHandler`` keeps this adapter's requests direct.
+_NO_PROXY_OPENER = urllib.request.build_opener(urllib.request.ProxyHandler({}))
 
 
 @dataclass(frozen=True)
@@ -88,7 +92,7 @@ def default_fetch(url: str, timeout: float, max_bytes: int) -> HttpResponse:
     request = urllib.request.Request(url, headers={"Accept": "application/json"})
     request.add_header("User-Agent", _USER_AGENT)
     try:
-        with urllib.request.urlopen(request, timeout=timeout) as response:
+        with _NO_PROXY_OPENER.open(request, timeout=timeout) as response:
             return HttpResponse(
                 status=int(response.status),
                 headers=dict(response.headers.items()),

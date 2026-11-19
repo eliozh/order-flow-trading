@@ -1003,6 +1003,10 @@ class IngestionSupervisor:
         self.state = ConnectionState.CONNECTING
         self._client.connect(self._streams)
         if stop is not None and stop():
+            # A clean shutdown must not persist CONNECTING: report the
+            # disconnected state before returning to the run loop.
+            self.state = ConnectionState.DISCONNECTED
+            self._write_state()
             return False
         self._client.subscribe(self._streams)
         self.state = ConnectionState.SUBSCRIBED
